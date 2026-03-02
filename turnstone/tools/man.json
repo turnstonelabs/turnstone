@@ -1,0 +1,22 @@
+{
+  "name": "man",
+  "description": "Read a man page. Use this instead of bash('man ...') or web_search. Returns the full formatted manual entry.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "page": {
+        "type": "string",
+        "description": "The man page name (e.g. 'grep', 'socket', 'printf')."
+      },
+      "section": {
+        "type": "string",
+        "description": "Manual section (e.g. '1' commands, '2' syscalls, '3' library). Optional."
+      }
+    },
+    "required": ["page"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "page"
+}

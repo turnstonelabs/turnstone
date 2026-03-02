@@ -1,0 +1,28 @@
+{
+  "name": "edit_file",
+  "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple locations (use near_line to disambiguate). Requires read_file on the same path first.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute or relative file path."
+      },
+      "old_string": {
+        "type": "string",
+        "description": "The exact text to find and replace."
+      },
+      "new_string": {
+        "type": "string",
+        "description": "The replacement text."
+      },
+      "near_line": {
+        "type": "integer",
+        "description": "When old_string matches multiple locations, pick the one nearest this line number."
+      }
+    },
+    "required": ["path", "old_string", "new_string"]
+  },
+  "task_agent": true,
+  "primary_key": "old_string"
+}

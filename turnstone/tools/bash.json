@@ -1,0 +1,16 @@
+{
+  "name": "bash",
+  "description": "Execute a bash command and return stdout + stderr. Use this tool freely for any task: checking time, reading files, running programs, system info, etc.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "The bash command to execute."
+      }
+    },
+    "required": ["command"]
+  },
+  "task_agent": true,
+  "primary_key": "command"
+}

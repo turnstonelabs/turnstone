@@ -1,0 +1,22 @@
+{
+  "name": "search",
+  "description": "Search file contents for a regex pattern. Returns matching lines with file paths and line numbers. Searches recursively when path is a directory.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Regex pattern to search for (extended regex)."
+      },
+      "path": {
+        "type": "string",
+        "description": "File or directory to search in (default: current directory)."
+      }
+    },
+    "required": ["query"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "query"
+}

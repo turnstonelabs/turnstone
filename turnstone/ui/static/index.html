@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>turnstone</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="header">
+  <div id="hamburger-wrap">
+    <button id="hamburger-btn" onclick="toggleHamburger()" aria-label="Menu" aria-haspopup="true" aria-expanded="false" aria-controls="hamburger-menu">
+      <span></span><span></span><span></span>
+    </button>
+    <div id="hamburger-menu" role="menu">
+      <button class="hmenu-item" role="menuitem" tabindex="-1" onclick="hamburgerDashboard()">
+        <span class="hmenu-icon">&#8962;</span> Dashboard
+      </button>
+      <div class="hmenu-sep" role="separator"></div>
+      <button class="hmenu-item" role="menuitem" tabindex="-1" id="theme-menu-item" onclick="hamburgerTheme()">
+        <span class="hmenu-icon" id="theme-menu-icon">&#9790;</span> <span id="theme-menu-label">Light mode</span>
+      </button>
+    </div>
+  </div>
+  <h1>pcode</h1>
+  <span id="model-name"></span>
+  <span id="status-bar"></span>
+  <button id="logout-btn" onclick="logout()" style="display:none; background:none; border:1px solid var(--border); color:var(--fg-dim); border-radius:var(--radius); padding:4px 8px; cursor:pointer; font:inherit; font-size:12px;">logout</button>
+</div>
+
+<div id="tab-bar" role="tablist">
+  <button id="new-tab-btn" onclick="newWorkstream()" title="New workstream (Ctrl+T)" aria-label="New workstream">+</button>
+</div>
+
+<div id="dashboard" class="dashboard-overlay" role="dialog" aria-modal="true" aria-label="Dashboard">
+  <div class="dashboard-content">
+    <div class="dashboard-input-row">
+      <input type="text" id="dashboard-input" class="dashboard-input"
+             placeholder="What are you working on?" aria-label="Start a new conversation">
+      <button class="dashboard-new-btn" onclick="dashboardNewChat()" aria-label="New empty chat">New Chat</button>
+    </div>
+    <div class="dash-header">
+      <span class="dash-header-title">WORKSTREAMS</span>
+      <span class="dash-header-summary" id="dash-summary"></span>
+    </div>
+    <div class="dash-colheaders" aria-hidden="true">
+      <span class="dash-col dash-col-state">STATE</span>
+      <span class="dash-col dash-col-name">NAME</span>
+      <span class="dash-col dash-col-node">NODE</span>
+      <span class="dash-col dash-col-task">TASK</span>
+      <span class="dash-col dash-col-tokens">TOKENS</span>
+      <span class="dash-col dash-col-ctx">CTX</span>
+    </div>
+    <div class="dash-table" id="dash-ws-table" role="group" aria-label="Workstreams"></div>
+    <div class="dash-footer" id="dash-footer">
+      <span class="dash-footer-nodes" id="dash-footer-nodes"></span>
+      <span class="dash-footer-stats" id="dash-footer-stats"></span>
+    </div>
+    <section class="dashboard-section" id="dashboard-sessions" aria-label="Recent sessions">
+      <h2 class="dashboard-section-title">Recent Sessions</h2>
+      <div class="dashboard-cards" id="dashboard-session-cards"></div>
+    </section>
+  </div>
+</div>
+
+<div id="messages" role="log" aria-live="polite" aria-label="Chat messages"></div>
+
+<!-- Plan review dialog -->
+<div id="plan-overlay">
+  <div id="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-dialog-title">
+    <h3 id="plan-dialog-title">Plan Review</h3>
+    <div id="plan-content"></div>
+    <input type="text" id="plan-feedback" placeholder="Feedback (empty = approve)...">
+    <div id="plan-buttons">
+      <button id="btn-plan-reject" onclick="resolvePlan('reject')">Reject</button>
+      <button id="btn-plan-approve" onclick="resolvePlan('')">Approve</button>
+    </div>
+  </div>
+</div>
+
+<div id="input-area">
+  <textarea id="input" rows="1" placeholder="Type a message... (Shift+Enter for newline)" aria-label="Message input"></textarea>
+  <button id="send-btn" onclick="sendMessage()">Send</button>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

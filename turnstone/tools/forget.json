@@ -1,0 +1,15 @@
+{
+  "name": "forget",
+  "description": "Remove a persistent memory by key. Use when the user asks to forget, remove, or delete a stored memory.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "The memory key to remove (e.g. 'user_name')."
+      }
+    },
+    "required": ["key"]
+  },
+  "primary_key": "key"
+}

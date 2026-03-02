@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>turnstone console</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="header">
+  <h1>turnstone console</h1>
+  <span id="cluster-summary" aria-live="polite"></span>
+  <span id="status-bar" role="status" aria-live="assertive"></span>
+  <button id="logout-btn" onclick="logout()" style="display:none; background:none; border:1px solid var(--border); color:var(--fg-dim); border-radius:var(--radius); padding:4px 8px; cursor:pointer; font:inherit; font-size:12px;">logout</button>
+  <button id="theme-toggle" onclick="toggleTheme()" aria-label="Toggle light/dark theme" style="margin-left:auto; background:none; border:1px solid var(--border); color:var(--fg); border-radius:var(--radius); padding:4px 8px; cursor:pointer; font:inherit; font-size:12px;">&#9790;</button>
+</div>
+
+<nav id="breadcrumb" class="breadcrumb" style="display:none" aria-label="Breadcrumb">
+  <a href="#" id="breadcrumb-home" onclick="showOverview(); return false">Cluster</a>
+  <span class="breadcrumb-sep" aria-hidden="true">&gt;</span>
+  <span id="breadcrumb-label" aria-current="page"></span>
+</nav>
+
+<div id="main">
+  <!-- CLUSTER OVERVIEW -->
+  <div id="view-overview">
+    <div class="state-cards" id="state-cards"></div>
+    <div class="aggregate-bar" id="aggregate-bar"></div>
+    <div class="section-header">NODES</div>
+    <div class="node-colheaders" aria-hidden="true">
+      <span class="ncol ncol-node">NODE</span>
+      <span class="ncol ncol-ws">WS</span>
+      <span class="ncol ncol-run">RUN</span>
+      <span class="ncol ncol-attn">ATTN</span>
+      <span class="ncol ncol-tokens">TOKENS</span>
+      <span class="ncol ncol-health">LOAD</span>
+    </div>
+    <div id="node-table" role="group" aria-label="Nodes" aria-live="polite">
+      <div class="dashboard-empty">Loading cluster data...</div>
+    </div>
+    <div id="node-pagination" class="pagination"></div>
+  </div>
+
+  <!-- NODE DRILL-DOWN -->
+  <div id="view-node" style="display:none">
+    <div class="dash-header">
+      <span class="dash-header-title">WORKSTREAMS</span>
+      <span class="dash-header-summary" id="node-ws-summary"></span>
+    </div>
+    <div class="dash-colheaders" aria-hidden="true">
+      <span class="dash-col dash-col-state">STATE</span>
+      <span class="dash-col dash-col-name">NAME</span>
+      <span class="dash-col dash-col-node">NODE</span>
+      <span class="dash-col dash-col-task">TASK</span>
+      <span class="dash-col dash-col-tokens">TOKENS</span>
+      <span class="dash-col dash-col-ctx">CTX</span>
+    </div>
+    <div id="node-ws-table" class="dash-table" role="group" aria-label="Workstreams" aria-live="polite"></div>
+    <a id="node-link" class="node-link" target="_blank" rel="noopener">Open node dashboard</a>
+  </div>
+
+  <!-- FILTERED WORKSTREAMS -->
+  <div id="view-filtered" style="display:none">
+    <div class="dash-header">
+      <span class="dash-header-title" id="filtered-title">WORKSTREAMS</span>
+      <span class="dash-header-summary" id="filtered-summary"></span>
+    </div>
+    <div class="dash-colheaders" aria-hidden="true">
+      <span class="dash-col dash-col-state">STATE</span>
+      <span class="dash-col dash-col-name">NAME</span>
+      <span class="dash-col dash-col-node">NODE</span>
+      <span class="dash-col dash-col-task">TASK</span>
+      <span class="dash-col dash-col-tokens">TOKENS</span>
+      <span class="dash-col dash-col-ctx">CTX</span>
+    </div>
+    <div id="filtered-ws-table" class="dash-table" role="group" aria-label="Workstreams" aria-live="polite"></div>
+    <div id="filtered-pagination" class="pagination"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "turnstone"
+version = "0.2.0"
+description = "AI chat client with tool use, agent tools, and persistent memory."
+readme = "README.md"
+license = "BUSL-1.1"
+requires-python = ">=3.11"
+dependencies = ["openai>=1.0", "httpx>=0.24"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+mq = ["redis>=5.0"]
+console = ["redis>=5.0"]
+sim = ["redis>=5.0"]
+
+[project.scripts]
+turnstone = "turnstone.cli:main"
+turnstone-eval = "turnstone.eval:main"
+turnstone-server = "turnstone.server:main"
+turnstone-bridge = "turnstone.mq.bridge:main"
+turnstone-console = "turnstone.console.server:main"
+turnstone-sim = "turnstone.sim.cli:main"
+
+[tool.hatch.build.targets.wheel]
+include = [
+  "turnstone/**/*.py",
+  "turnstone/tools/*.json",
+  "turnstone/ui/static/*.html",
+  "turnstone/ui/static/*.css",
+  "turnstone/ui/static/*.js",
+  "turnstone/console/static/*.html",
+  "turnstone/console/static/*.css",
+  "turnstone/console/static/*.js",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

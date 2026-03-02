@@ -1,0 +1,378 @@
+"""Message protocol for turnstone message queue integration.
+
+Defines all structured message types exchanged between the client and bridge.
+Inbound messages flow from client → bridge via a reliable queue.
+Outbound events flow from bridge → client via pub/sub channels.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+
+
+# ---------------------------------------------------------------------------
+# Inbound messages (client → bridge)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class InboundMessage:
+    """Base for all messages sent by clients to the bridge."""
+
+    type: str = ""
+    correlation_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    timestamp: float = field(default_factory=time.time)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str) -> InboundMessage:
+        data = json.loads(raw)
+        msg_type = data.get("type", "")
+        klass = _INBOUND_REGISTRY.get(msg_type)
+        if klass is None:
+            raise ValueError(f"Unknown inbound message type: {msg_type!r}")
+        valid = {f for f in klass.__dataclass_fields__}
+        return klass(**{k: v for k, v in data.items() if k in valid})
+
+
+@dataclass
+class SendMessage(InboundMessage):
+    """Send a user message to a workstream."""
+
+    type: str = "send"
+    ws_id: str = ""
+    message: str = ""
+    auto_approve: bool = False
+    auto_approve_tools: list[str] = field(default_factory=list)
+    name: str = ""
+    target_node: str = ""
+
+
+@dataclass
+class ApproveMessage(InboundMessage):
+    """Respond to a tool approval request."""
+
+    type: str = "approve"
+    ws_id: str = ""
+    request_id: str = ""
+    approved: bool = True
+    feedback: str | None = None
+    always: bool = False
+
+
+@dataclass
+class PlanFeedbackMessage(InboundMessage):
+    """Respond to a plan review request."""
+
+    type: str = "plan_feedback"
+    ws_id: str = ""
+    request_id: str = ""
+    feedback: str = ""
+
+
+@dataclass
+class CommandMessage(InboundMessage):
+    """Execute a slash command."""
+
+    type: str = "command"
+    ws_id: str = ""
+    command: str = ""
+
+
+@dataclass
+class CreateWorkstreamMessage(InboundMessage):
+    """Create a new workstream."""
+
+    type: str = "create_workstream"
+    name: str = ""
+    auto_approve: bool = False
+    auto_approve_tools: list[str] = field(default_factory=list)
+    target_node: str = ""
+
+
+@dataclass
+class CloseWorkstreamMessage(InboundMessage):
+    """Close a workstream."""
+
+    type: str = "close_workstream"
+    ws_id: str = ""
+
+
+@dataclass
+class ListWorkstreamsMessage(InboundMessage):
+    """Request the list of active workstreams."""
+
+    type: str = "list_workstreams"
+
+
+@dataclass
+class HealthMessage(InboundMessage):
+    """Request health status."""
+
+    type: str = "health"
+
+
+@dataclass
+class ListNodesMessage(InboundMessage):
+    """Request the list of active bridge nodes."""
+
+    type: str = "list_nodes"
+
+
+# ---------------------------------------------------------------------------
+# Outbound events (bridge → client)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class OutboundEvent:
+    """Base for all events published by the bridge."""
+
+    type: str = ""
+    ws_id: str = ""
+    correlation_id: str = ""
+    timestamp: float = field(default_factory=time.time)
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self))
+
+    @classmethod
+    def from_json(cls, raw: str) -> OutboundEvent:
+        data = json.loads(raw)
+        msg_type = data.get("type", "")
+        klass = _OUTBOUND_REGISTRY.get(msg_type, OutboundEvent)
+        valid = {f for f in klass.__dataclass_fields__}
+        return klass(**{k: v for k, v in data.items() if k in valid})
+
+
+@dataclass
+class AckEvent(OutboundEvent):
+    """Acknowledgment that an inbound message was received."""
+
+    type: str = "ack"
+    status: str = "ok"
+    detail: str = ""
+
+
+@dataclass
+class ContentEvent(OutboundEvent):
+    """Streamed content token from the assistant."""
+
+    type: str = "content"
+    text: str = ""
+
+
+@dataclass
+class ReasoningEvent(OutboundEvent):
+    """Streamed reasoning token."""
+
+    type: str = "reasoning"
+    text: str = ""
+
+
+@dataclass
+class ToolInfoEvent(OutboundEvent):
+    """Tool call info (auto-approved tools)."""
+
+    type: str = "tool_info"
+    items: list = field(default_factory=list)
+
+
+@dataclass
+class ApprovalRequestEvent(OutboundEvent):
+    """Tool approval request forwarded from the server.
+
+    The client must respond with an ApproveMessage whose
+    request_id matches this event's correlation_id.
+    """
+
+    type: str = "approval_request"
+    items: list = field(default_factory=list)
+
+
+@dataclass
+class ToolResultEvent(OutboundEvent):
+    """Tool execution result."""
+
+    type: str = "tool_result"
+    name: str = ""
+    output: str = ""
+
+
+@dataclass
+class PlanReviewEvent(OutboundEvent):
+    """Plan review request forwarded from the server.
+
+    The client must respond with a PlanFeedbackMessage whose
+    request_id matches this event's correlation_id.
+    """
+
+    type: str = "plan_review"
+    content: str = ""
+
+
+@dataclass
+class StatusEvent(OutboundEvent):
+    """Token usage status update."""
+
+    type: str = "status"
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    context_window: int = 0
+    pct: float = 0.0
+    effort: str = ""
+
+
+@dataclass
+class StateChangeEvent(OutboundEvent):
+    """Workstream state transition."""
+
+    type: str = "state_change"
+    state: str = ""
+
+
+@dataclass
+class TurnCompleteEvent(OutboundEvent):
+    """Emitted when a workstream finishes processing (returns to IDLE).
+
+    This is a synthetic event produced by the bridge when it detects
+    the ws_state transition to 'idle' after a send.
+    """
+
+    type: str = "turn_complete"
+
+
+@dataclass
+class StreamEndEvent(OutboundEvent):
+    """LLM stream ended."""
+
+    type: str = "stream_end"
+
+
+@dataclass
+class WorkstreamCreatedEvent(OutboundEvent):
+    """New workstream created."""
+
+    type: str = "ws_created"
+    name: str = ""
+
+
+@dataclass
+class WorkstreamClosedEvent(OutboundEvent):
+    """Workstream closed."""
+
+    type: str = "ws_closed"
+
+
+@dataclass
+class WorkstreamListEvent(OutboundEvent):
+    """Workstream list response."""
+
+    type: str = "ws_list"
+    workstreams: list = field(default_factory=list)
+
+
+@dataclass
+class WorkstreamRenameEvent(OutboundEvent):
+    """Workstream renamed."""
+
+    type: str = "ws_rename"
+    name: str = ""
+
+
+@dataclass
+class HealthResponseEvent(OutboundEvent):
+    """Health status response."""
+
+    type: str = "health_response"
+    data: dict = field(default_factory=dict)
+
+
+@dataclass
+class ErrorEvent(OutboundEvent):
+    """Error event."""
+
+    type: str = "error"
+    message: str = ""
+
+
+@dataclass
+class InfoEvent(OutboundEvent):
+    """Informational event."""
+
+    type: str = "info"
+    message: str = ""
+
+
+@dataclass
+class NodeListEvent(OutboundEvent):
+    """List of active bridge nodes."""
+
+    type: str = "node_list"
+    nodes: list = field(default_factory=list)
+
+
+@dataclass
+class ClusterStateEvent(OutboundEvent):
+    """Workstream state change with node attribution for cluster dashboard."""
+
+    type: str = "cluster_state"
+    ws_id: str = ""
+    state: str = ""
+    node_id: str = ""
+    tokens: int = 0
+    context_ratio: float = 0.0
+    activity: str = ""
+    activity_state: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Type registries (built after all classes are defined)
+# ---------------------------------------------------------------------------
+
+_INBOUND_REGISTRY: dict[str, type[InboundMessage]] = {
+    cls.__dataclass_fields__["type"].default: cls
+    for cls in [
+        SendMessage,
+        ApproveMessage,
+        PlanFeedbackMessage,
+        CommandMessage,
+        CreateWorkstreamMessage,
+        CloseWorkstreamMessage,
+        ListWorkstreamsMessage,
+        HealthMessage,
+        ListNodesMessage,
+    ]
+}
+
+_OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
+    cls.__dataclass_fields__["type"].default: cls
+    for cls in [
+        AckEvent,
+        ContentEvent,
+        ReasoningEvent,
+        ToolInfoEvent,
+        ApprovalRequestEvent,
+        ToolResultEvent,
+        PlanReviewEvent,
+        StatusEvent,
+        StateChangeEvent,
+        TurnCompleteEvent,
+        StreamEndEvent,
+        WorkstreamCreatedEvent,
+        WorkstreamClosedEvent,
+        WorkstreamListEvent,
+        WorkstreamRenameEvent,
+        HealthResponseEvent,
+        ErrorEvent,
+        InfoEvent,
+        NodeListEvent,
+        ClusterStateEvent,
+    ]
+}

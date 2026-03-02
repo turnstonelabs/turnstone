@@ -1,0 +1,20 @@
+{
+  "name": "write_file",
+  "description": "Write content to a file, creating it if needed. Overwrites existing content.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute or relative file path."
+      },
+      "content": {
+        "type": "string",
+        "description": "The full file content to write."
+      }
+    },
+    "required": ["path", "content"]
+  },
+  "task_agent": true,
+  "primary_key": "content"
+}

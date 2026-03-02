@@ -1,0 +1,180 @@
+{
+  "description": "pcode behavior tests — tool selection, sequencing, and multi-step reasoning",
+  "defaults": {
+    "n_runs": 5,
+    "max_turns": 15
+  },
+  "cases": [
+    {
+      "id": "read-before-edit",
+      "description": "Must read_file before edit_file on the same path",
+      "user_prompt": "Fix the typo in config.py — change 'recieve' to 'receive'",
+      "setup": {
+        "files": {
+          "config.py": "# Config module\ndef recieve_data(source):\n    \"\"\"Recieve data from source.\"\"\"\n    return source.read()\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "read_file", "args": { "path": "config.py" } },
+        { "tool": "edit_file", "args": { "path": "config.py" } }
+      ],
+      "match_mode": "ordered_subset"
+    },
+    {
+      "id": "write-file-not-bash",
+      "description": "Use write_file for file creation, not bash echo/cat",
+      "user_prompt": "Create a file called hello.py that prints hello world",
+      "expected_actions": [
+        { "tool": "write_file", "args_pattern": { "path": "hello\\.py" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "bash-for-commands",
+      "description": "Use bash for running system commands",
+      "user_prompt": "What Python version is installed?",
+      "expected_actions": [
+        { "tool": "bash", "args_pattern": { "command": "python" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "search-for-patterns",
+      "description": "Use search tool for finding code patterns across files",
+      "user_prompt": "Find all functions that start with 'test_' in the project",
+      "setup": {
+        "files": {
+          "tests.py": "def test_one():\n    assert True\n\ndef test_two():\n    assert 1 + 1 == 2\n",
+          "main.py": "def main():\n    print('hello')\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "search", "args_pattern": { "query": "test_" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "multi-file-edit",
+      "description": "Read and edit multiple files — must read before editing each, and edit both",
+      "user_prompt": "Change the default port from 8000 to 9000 in both server.py and config.py",
+      "setup": {
+        "files": {
+          "server.py": "from config import PORT\n\ndef run():\n    print(f'Listening on port {PORT}')\n",
+          "config.py": "PORT = 8000\nHOST = 'localhost'\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "read_file" },
+        { "tool": "read_file" },
+        { "tool": "edit_file" },
+        { "tool": "edit_file" }
+      ],
+      "match_mode": "ordered_subset"
+    },
+    {
+      "id": "search-then-edit",
+      "description": "Search to find where something is defined, then read and edit",
+      "user_prompt": "Find where MAX_RETRIES is defined and change it from 3 to 5",
+      "setup": {
+        "files": {
+          "app.py": "import os\n\ndef start():\n    pass\n",
+          "utils.py": "import time\n\ndef helper():\n    pass\n",
+          "config/settings.py": "# Settings\nDEBUG = True\nMAX_RETRIES = 3\nTIMEOUT = 30\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "search", "args_pattern": { "query": "MAX_RETRIES" } },
+        { "tool": "read_file" },
+        { "tool": "edit_file", "args_pattern": { "old_string": "3" } }
+      ],
+      "match_mode": "ordered_subset"
+    },
+    {
+      "id": "bash-git-log",
+      "description": "Use bash for git commands, not other tools",
+      "user_prompt": "Show me the git log for the last 5 commits",
+      "expected_actions": [
+        { "tool": "bash", "args_pattern": { "command": "git\\s+log" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "write-then-run",
+      "description": "Create a script and run it to verify it works",
+      "user_prompt": "Create a Python script called fib.py that prints the first 10 Fibonacci numbers, then run it to verify",
+      "expected_actions": [
+        { "tool": "write_file", "args_pattern": { "path": "fib\\.py" } },
+        { "tool": "bash", "args_pattern": { "command": "python" } }
+      ],
+      "match_mode": "ordered_subset"
+    },
+    {
+      "id": "no-bash-for-file-write",
+      "description": "Should NOT use bash (echo/cat/heredoc) to create files — only write_file",
+      "user_prompt": "Create a new file called README.md with a title and description of this project",
+      "expected_actions": [
+        { "tool": "write_file", "args_pattern": { "path": "README" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "plan-before-refactor",
+      "description": "Use the plan tool before a large refactoring task",
+      "user_prompt": "I need to refactor this codebase to separate the database layer from the API layer. Use the plan tool to think through the approach before making any changes.",
+      "setup": {
+        "files": {
+          "app.py": "import sqlite3\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\nDB = 'data.db'\n\ndef get_db():\n    return sqlite3.connect(DB)\n\n@app.route('/users')\ndef list_users():\n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    db.close()\n    return jsonify(users)\n\n@app.route('/users/<int:uid>')\ndef get_user(uid):\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()\n    db.close()\n    return jsonify(user)\n\nif __name__ == '__main__':\n    app.run(port=8000)\n"
+        }
+      },
+      "expected_actions": [{ "tool": "plan" }],
+      "match_mode": "subset"
+    },
+    {
+      "id": "edit-not-rewrite",
+      "description": "Use edit_file for small changes, not write_file to rewrite the entire file",
+      "user_prompt": "Add a docstring to the process_data function in utils.py",
+      "setup": {
+        "files": {
+          "utils.py": "import os\nimport sys\n\n\ndef helper():\n    \"\"\"A helper function.\"\"\"\n    return 42\n\n\ndef process_data(items):\n    results = []\n    for item in items:\n        if item > 0:\n            results.append(item * 2)\n    return results\n\n\ndef cleanup():\n    \"\"\"Clean up resources.\"\"\"\n    pass\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "read_file", "args": { "path": "utils.py" } },
+        { "tool": "edit_file", "args": { "path": "utils.py" } }
+      ],
+      "match_mode": "ordered_subset"
+    },
+    {
+      "id": "bash-run-tests",
+      "description": "Use bash to run a test suite",
+      "user_prompt": "Run the tests",
+      "setup": {
+        "files": {
+          "test_math.py": "def test_add():\n    assert 1 + 1 == 2\n\ndef test_mul():\n    assert 2 * 3 == 6\n"
+        }
+      },
+      "expected_actions": [
+        { "tool": "bash", "args_pattern": { "command": "pytest|python.*test" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "web-fetch-url",
+      "description": "Use web_fetch when asked to retrieve content from a URL",
+      "user_prompt": "Fetch the contents of https://example.com and summarize what's on the page",
+      "expected_actions": [
+        { "tool": "web_fetch", "args_pattern": { "url": "example\\.com" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "man-page-lookup",
+      "description": "Use man tool to look up command documentation",
+      "user_prompt": "Look up the man page for tar and tell me what the --xattrs flag does",
+      "expected_actions": [
+        { "tool": "man", "args_pattern": { "page": "tar" } }
+      ],
+      "match_mode": "subset"
+    }
+  ]
+}

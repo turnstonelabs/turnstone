@@ -1,0 +1,22 @@
+{
+  "name": "web_fetch",
+  "description": "Fetch a URL and extract specific information from it. You must provide a question or extraction guidance — the page is fetched, analyzed, and only relevant information is returned (not raw page content).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "The URL to fetch (must start with http:// or https://)."
+      },
+      "question": {
+        "type": "string",
+        "description": "What to extract or answer from the page content."
+      }
+    },
+    "required": ["url", "question"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "url"
+}

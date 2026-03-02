@@ -1,0 +1,26 @@
+{
+  "name": "read_file",
+  "description": "Read the contents of a file. Returns numbered lines. Must be called before edit_file on the same path.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Absolute or relative file path."
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Line number to start reading from (1-based, default: 1)."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Maximum number of lines to read. Omit to read entire file."
+      }
+    },
+    "required": ["path"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "path"
+}

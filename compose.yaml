@@ -1,0 +1,194 @@
+# =============================================================================
+# Turnstone Docker Compose Stack
+#
+# Usage:
+#   Full stack:       docker compose up
+#   With simulator:   docker compose --profile sim up
+#   Sim only:         docker compose --profile sim up redis console sim
+#   Scale bridges:    docker compose up --scale bridge=3
+# =============================================================================
+
+name: turnstone
+
+networks:
+  turnstone-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  turnstone-data:
+
+services:
+  # -------------------------------------------------------------------
+  # Redis — message broker, pub/sub, node registry
+  # -------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command:
+      - sh
+      - -c
+      - >-
+        redis-server
+        --save 60 1
+        --loglevel warning
+        $${REDIS_PASSWORD:+--requirepass $$REDIS_PASSWORD}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
+    networks:
+      - turnstone-net
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli $${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep -q PONG
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-server — Web UI + chat workstreams + LLM interaction
+  # -------------------------------------------------------------------
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-server
+        --host 0.0.0.0
+        --port 8080
+        --base-url "$${LLM_BASE_URL}"
+        --api-key "$${OPENAI_API_KEY}"
+        $${SKIP_PERMISSIONS:+--skip-permissions}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      - turnstone-data:/data
+    environment:
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - SKIP_PERMISSIONS=${SKIP_PERMISSIONS:-}
+      - TURNSTONE_AUTH_ENABLED=${TURNSTONE_AUTH_ENABLED:-}
+      - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - turnstone-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-bridge — Redis <-> HTTP bridge for multi-node routing
+  # Node ID auto-generated from container hostname (no --node-id needed)
+  # -------------------------------------------------------------------
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - turnstone-bridge
+      - --server-url=http://server:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-300}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
+    networks:
+      - turnstone-net
+    depends_on:
+      server:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-console — Cluster dashboard
+  # -------------------------------------------------------------------
+  console:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      - turnstone-console
+      - --host=0.0.0.0
+      - --port=8090
+      - --redis-host=redis
+      - --redis-port=6379
+      - --poll-interval=${CONSOLE_POLL_INTERVAL:-10}
+    ports:
+      - "${CONSOLE_PORT:-8090}:8090"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - TURNSTONE_AUTH_ENABLED=${TURNSTONE_AUTH_ENABLED:-}
+      - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
+    networks:
+      - turnstone-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
+  # turnstone-sim — Multi-node cluster simulator (no LLM needed)
+  # Start with: docker compose --profile sim up
+  # -------------------------------------------------------------------
+  sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - sim
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-sim
+        --nodes "$${SIM_NODES}"
+        --scenario "$${SIM_SCENARIO}"
+        --duration "$${SIM_DURATION}"
+        --mps "$${SIM_MPS}"
+        --redis-host redis
+        --redis-port 6379
+        --log-level "$${SIM_LOG_LEVEL}"
+        $${SIM_SEED:+--seed $$SIM_SEED}
+        $${SIM_METRICS_FILE:+--metrics-file $$SIM_METRICS_FILE}
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - SIM_NODES=${SIM_NODES:-100}
+      - SIM_SCENARIO=${SIM_SCENARIO:-steady}
+      - SIM_DURATION=${SIM_DURATION:-60}
+      - SIM_MPS=${SIM_MPS:-5.0}
+      - SIM_LOG_LEVEL=${SIM_LOG_LEVEL:-INFO}
+      - SIM_SEED=${SIM_SEED:-}
+      - SIM_METRICS_FILE=${SIM_METRICS_FILE:-}
+    networks:
+      - turnstone-net
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: "no"

@@ -1,0 +1,987 @@
+"""Terminal CLI frontend for turnstone.
+
+Provides TerminalUI (implementing the SessionUI protocol), readline setup,
+model auto-detection, workstream management, and the main() REPL entry point.
+"""
+
+import argparse
+import os
+import readline
+import sys
+import textwrap
+import threading
+
+from openai import OpenAI
+
+from turnstone.core.session import ChatSession, SessionUI
+from turnstone.core.tools import TOOLS
+from turnstone.core.workstream import WorkstreamManager, WorkstreamState
+from turnstone.ui.colors import (
+    BOLD,
+    CYAN,
+    DIM,
+    GRAY,
+    GREEN,
+    RED,
+    RESET,
+    YELLOW,
+    bold,
+    cyan,
+    dim,
+    green,
+    red,
+    yellow,
+)
+from turnstone.ui.markdown import MarkdownRenderer
+from turnstone.ui.spinner import Spinner
+
+
+# ─── Readline ─────────────────────────────────────────────────────────────
+
+SLASH_COMMANDS = [
+    "/persona",
+    "/instructions",
+    "/clear",
+    "/new",
+    "/sessions",
+    "/resume",
+    "/name",
+    "/delete",
+    "/history",
+    "/model",
+    "/raw",
+    "/reason",
+    "/compact",
+    "/creative",
+    "/debug",
+    "/help",
+    "/exit",
+    "/quit",
+    "/q",
+    "/ws",
+    "/cluster",
+]
+
+
+def _completer(text, state):
+    """Tab-complete slash commands."""
+    if text.startswith("/"):
+        matches = [c for c in SLASH_COMMANDS if c.startswith(text)]
+    else:
+        matches = []
+    if state < len(matches):
+        return matches[state] + " "
+    return None
+
+
+def setup_readline():
+    """Set up readline with tab completion."""
+    readline.set_history_length(1000)
+    readline.set_completer(_completer)
+    readline.set_completer_delims("")  # treat entire line as completion input
+    readline.parse_and_bind("tab: complete")
+
+
+# ─── TerminalUI ───────────────────────────────────────────────────────────
+
+
+class TerminalUI(SessionUI):
+    """Terminal-based UI using ANSI colors, MarkdownRenderer, and Spinner."""
+
+    def __init__(self):
+        self.md = MarkdownRenderer()
+        self.spinner = None
+        self._print_lock = threading.Lock()
+        self.auto_approve = False
+
+    def on_thinking_start(self):
+        self.spinner = Spinner("Thinking")
+        self.spinner.start()
+
+    def on_thinking_stop(self):
+        if self.spinner:
+            self.spinner.stop()
+            self.spinner = None
+
+    def on_reasoning_token(self, text):
+        sys.stdout.write(f"{DIM}{text}{RESET}")
+        sys.stdout.flush()
+
+    def on_content_token(self, text):
+        rendered = self.md.feed(text)
+        if rendered:
+            sys.stdout.write(rendered)
+            sys.stdout.flush()
+
+    def on_stream_end(self):
+        remainder = self.md.flush()
+        if remainder:
+            sys.stdout.write(remainder)
+        self.md.in_code_block = False
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    def approve_tools(self, items):
+        """Display tool previews and prompt for batch approval.
+
+        Returns (approved: bool, feedback: str | None).
+        """
+        pending = [
+            it for it in items if it.get("needs_approval") and not it.get("error")
+        ]
+
+        with self._print_lock:
+            # Print all headers and previews
+            for item in items:
+                if item.get("error"):
+                    sys.stdout.write(f"  {red(item['header'])}\n")
+                else:
+                    sys.stdout.write(f"  {yellow(item['header'])}\n")
+                if item.get("preview"):
+                    sys.stdout.write(item["preview"] + "\n")
+            sys.stdout.flush()
+
+            if not pending or self.auto_approve:
+                return True, None
+
+            # Prompt
+            try:
+                if len(pending) == 1:
+                    label = pending[0].get("approval_label", pending[0]["func_name"])
+                    prompt_text = (
+                        f"    \001{BOLD}\002Allow {label}?\001{RESET}\002 "
+                        f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
+                    )
+                else:
+                    labels = ", ".join(
+                        it.get("approval_label", it["func_name"]) for it in pending
+                    )
+                    prompt_text = (
+                        f"    \001{BOLD}\002Allow {len(pending)} tools ({labels})?\001{RESET}\002 "
+                        f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
+                    )
+                resp = input(prompt_text).strip()
+            except (EOFError, KeyboardInterrupt):
+                sys.stdout.write("\n")
+                resp = "n"
+
+            # Parse decision and optional feedback: "y, use absolute path"
+            decision = resp.lower()
+            feedback = None
+            for sep in (",", " "):
+                if sep in resp:
+                    decision = resp[: resp.index(sep)].strip().lower()
+                    feedback = resp[resp.index(sep) + 1 :].strip() or None
+                    break
+
+            if decision in ("a", "always"):
+                self.auto_approve = True
+                return True, feedback
+            elif decision in ("y", "yes"):
+                return True, feedback
+            else:
+                denial_msg = "Denied by user"
+                if feedback:
+                    denial_msg += f": {feedback}"
+                for item in pending:
+                    item["denied"] = True
+                    item["denial_msg"] = denial_msg
+                return False, None
+
+    def on_tool_result(self, name, output):
+        pass  # Optional: display summary
+
+    def on_status(self, usage, context_window, effort):
+        total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
+        pct = total_tok / context_window * 100 if context_window > 0 else 0
+        parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
+        if effort != "medium":
+            parts.append(f"reasoning: {effort}")
+        sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
+        sys.stdout.flush()
+
+    def on_plan_review(self, content):
+        sys.stdout.write(f"\n{DIM}{'─' * 60}{RESET}\n")
+        for line in content.splitlines():
+            sys.stdout.write(f"  {line}\n")
+        sys.stdout.write(f"{DIM}{'─' * 60}{RESET}\n")
+        sys.stdout.flush()
+        try:
+            prompt_text = (
+                f"    \001{BOLD}\002Plan ready.\001{RESET}\002 "
+                f"\001{DIM}\002[enter to approve, or give feedback]\001{RESET}\002 "
+            )
+            resp = input(prompt_text).strip()
+        except EOFError:
+            resp = ""
+        except KeyboardInterrupt:
+            resp = "reject"
+        return resp
+
+    def on_info(self, message):
+        print(message)
+
+    def on_error(self, message):
+        sys.stdout.write(f"{RED}{message}{RESET}\n")
+        sys.stdout.flush()
+
+    def on_state_change(self, state):
+        pass  # base TerminalUI ignores state changes
+
+    def on_rename(self, name: str):
+        pass  # base TerminalUI ignores renames
+
+
+# ─── WorkstreamTerminalUI ─────────────────────────────────────────────────
+
+
+# State display config: (symbol, color_fn, label)
+_STATE_DISPLAY = {
+    WorkstreamState.IDLE: ("·", dim, "idle"),
+    WorkstreamState.THINKING: ("◌", cyan, "thinking"),
+    WorkstreamState.RUNNING: ("▸", green, "running"),
+    WorkstreamState.ATTENTION: ("◆", yellow, "attention"),
+    WorkstreamState.ERROR: ("✖", red, "error"),
+}
+
+
+class WorkstreamTerminalUI(TerminalUI):
+    """TerminalUI with workstream awareness: buffers output when in background,
+    blocks on approval until foregrounded."""
+
+    def __init__(self, ws_id: str, manager: WorkstreamManager):
+        super().__init__()
+        self.ws_id = ws_id
+        self.manager = manager
+        self._output_buffer: list[tuple[str, str]] = []  # (event_type, text)
+        self._fg_event = threading.Event()
+        self._fg_event.set()  # starts as foreground
+
+    @property
+    def is_foreground(self) -> bool:
+        return self.manager.active_id == self.ws_id
+
+    def set_foreground(self, fg: bool):
+        if fg:
+            self._fg_event.set()
+        else:
+            self._fg_event.clear()
+
+    def on_state_change(self, state: str):
+        try:
+            ws_state = WorkstreamState(state)
+        except ValueError:
+            return
+        self.manager.set_state(self.ws_id, ws_state)
+
+    # -- output buffering when in background --------------------------------
+
+    def on_thinking_start(self):
+        if self.is_foreground:
+            super().on_thinking_start()
+
+    def on_thinking_stop(self):
+        if self.is_foreground:
+            super().on_thinking_stop()
+        elif self.spinner:
+            self.spinner.stop()
+            self.spinner = None
+
+    def _buffer(self, event_type: str, text: str):
+        with self._print_lock:
+            self._output_buffer.append((event_type, text))
+
+    def on_reasoning_token(self, text):
+        if self.is_foreground:
+            super().on_reasoning_token(text)
+        else:
+            self._buffer("reasoning", text)
+
+    def on_content_token(self, text):
+        if self.is_foreground:
+            super().on_content_token(text)
+        else:
+            self._buffer("content", text)
+
+    def on_stream_end(self):
+        if self.is_foreground:
+            super().on_stream_end()
+        else:
+            self._buffer("stream_end", "")
+
+    def on_status(self, usage, context_window, effort):
+        if self.is_foreground:
+            super().on_status(usage, context_window, effort)
+        # silently drop status for background streams
+
+    def on_info(self, message):
+        if self.is_foreground:
+            super().on_info(message)
+        else:
+            self._buffer("info", message)
+
+    def on_error(self, message):
+        if self.is_foreground:
+            super().on_error(message)
+        else:
+            self._buffer("error", message)
+
+    def on_tool_result(self, name, output):
+        if self.is_foreground:
+            super().on_tool_result(name, output)
+
+    def on_plan_review(self, content):
+        # Must wait until foregrounded to show plan review
+        if not self.is_foreground:
+            self._buffer(
+                "info",
+                f"{YELLOW}[Plan ready — switch to this workstream to review]{RESET}",
+            )
+            self._fg_event.wait()
+        return super().on_plan_review(content)
+
+    def approve_tools(self, items):
+        """Block until foregrounded if in background, then show approval prompt."""
+        if not self.is_foreground:
+            tool_names = ", ".join(
+                it.get("approval_label", it.get("func_name", "?"))
+                for it in items
+                if it.get("needs_approval") and not it.get("error")
+            )
+            if tool_names:
+                self._buffer(
+                    "info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}"
+                )
+            self._fg_event.wait()
+        return super().approve_tools(items)
+
+    def flush_buffer(self):
+        """Replay buffered output when switching to foreground."""
+        with self._print_lock:
+            if not self._output_buffer:
+                return
+            buf = list(self._output_buffer)
+            self._output_buffer.clear()
+        sys.stdout.write(
+            f"\n  {DIM}--- buffered output ({len(buf)} events) ---{RESET}\n"
+        )
+        replay_md = MarkdownRenderer()
+        for event_type, text in buf:
+            if event_type == "reasoning":
+                sys.stdout.write(f"{DIM}{text}{RESET}")
+            elif event_type == "content":
+                rendered = replay_md.feed(text)
+                if rendered:
+                    sys.stdout.write(rendered)
+            elif event_type == "stream_end":
+                remainder = replay_md.flush()
+                if remainder:
+                    sys.stdout.write(remainder)
+                replay_md.in_code_block = False
+                sys.stdout.write("\n")
+            elif event_type == "info":
+                sys.stdout.write(f"{text}\n")
+            elif event_type == "error":
+                sys.stdout.write(f"{RED}{text}{RESET}\n")
+        sys.stdout.write(f"  {DIM}--- end buffered output ---{RESET}\n\n")
+        sys.stdout.flush()
+
+
+# ─── Workstream commands ──────────────────────────────────────────────────
+
+
+def _print_ws_status_line(manager: WorkstreamManager):
+    """Print a one-line status of background workstreams that are active."""
+    active_id = manager.active_id
+    parts = []
+    for ws in manager.list_all():
+        if ws.id == active_id:
+            continue
+        if ws.state in (WorkstreamState.IDLE,):
+            continue
+        sym, color_fn, label = _STATE_DISPLAY[ws.state]
+        idx = manager.index_of(ws.id)
+        parts.append(color_fn(f"{sym} {idx}:{ws.name} ({label})"))
+    if parts:
+        sys.stderr.write(f"  {'  '.join(parts)}\n")
+        sys.stderr.flush()
+
+
+def _handle_ws_command(
+    manager: WorkstreamManager,
+    cmd_line: str,
+    skip_permissions: bool,
+):
+    """Handle /ws subcommands.  Returns (switched: bool)."""
+    parts = cmd_line.strip().split()
+    sub = parts[1] if len(parts) > 1 else "list"
+
+    if sub == "list":
+        active_id = manager.active_id
+        all_ws = manager.list_all()
+        max_name = max((len(ws.name) for ws in all_ws), default=0)
+        for ws in all_ws:
+            idx = manager.index_of(ws.id)
+            sym, color_fn, label = _STATE_DISPLAY[ws.state]
+            marker = " *" if ws.id == active_id else "  "
+            padded = ws.name.ljust(max_name)
+            print(f"  {marker}{idx}. {color_fn(f'{sym} {padded}')}  {dim(label)}")
+        return False
+
+    elif sub == "new":
+        name = parts[2] if len(parts) > 2 else ""
+        try:
+            ws = manager.create(
+                name=name,
+                ui_factory=lambda wid: WorkstreamTerminalUI(wid, manager),
+            )
+        except RuntimeError as e:
+            print(red(str(e)))
+            return False
+        if skip_permissions:
+            ws.ui.auto_approve = True
+        # Mark old active as background
+        old = manager.get_active()
+        if old and old.ui and hasattr(old.ui, "set_foreground"):
+            old.ui.set_foreground(False)
+        manager.switch(ws.id)
+        ws.ui.set_foreground(True)
+        print(f"Created workstream {cyan(ws.name)} (#{manager.index_of(ws.id)})")
+        return True
+
+    elif sub.isdigit():
+        idx = int(sub)
+        old = manager.get_active()
+        ws = manager.switch_by_index(idx)
+        if ws:
+            if old and old.ui and hasattr(old.ui, "set_foreground"):
+                old.ui.set_foreground(False)
+            if hasattr(ws.ui, "set_foreground"):
+                ws.ui.set_foreground(True)
+            if hasattr(ws.ui, "flush_buffer"):
+                ws.ui.flush_buffer()
+            print(f"Switched to {cyan(ws.name)}")
+            return True
+        else:
+            print(red(f"No workstream #{idx}"))
+            return False
+
+    elif sub == "close":
+        target_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        if target_idx is not None:
+            all_ws = manager.list_all()
+            if 1 <= target_idx <= len(all_ws):
+                ws_id = all_ws[target_idx - 1].id
+            else:
+                print(red(f"No workstream #{target_idx}"))
+                return False
+        else:
+            ws_id = manager.active_id
+
+        ws_name = manager.get(ws_id).name if manager.get(ws_id) else "?"
+        if manager.close(ws_id):
+            print(f"Closed workstream {ws_name}")
+            # Ensure new active is foregrounded
+            new_active = manager.get_active()
+            if new_active and hasattr(new_active.ui, "set_foreground"):
+                new_active.ui.set_foreground(True)
+            return True
+        else:
+            print(red("Cannot close the last workstream"))
+            return False
+
+    elif sub == "rename":
+        new_name = " ".join(parts[2:]) if len(parts) > 2 else ""
+        if not new_name:
+            print(red("Usage: /ws rename <name>"))
+            return False
+        ws = manager.get_active()
+        if ws:
+            old_name = ws.name
+            ws.name = new_name
+            print(f"Renamed {old_name} -> {cyan(new_name)}")
+        return False
+
+    else:
+        print(f"Unknown /ws subcommand: {sub}")
+        print(f"Usage: /ws [list|new [name]|<N>|close [N]|rename <name>]")
+        return False
+
+
+# ─── Cluster commands ─────────────────────────────────────────────────────
+
+
+def _handle_cluster_command(
+    cmd_line: str, console_url: str | None, auth_token: str = ""
+):
+    """Handle /cluster subcommands querying the turnstone-console API."""
+    import httpx
+
+    if not console_url:
+        print(
+            red(
+                "No console URL configured. Use --console-url or set [console] url in config."
+            )
+        )
+        return
+
+    headers: dict[str, str] = {}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    parts = cmd_line.strip().split()
+    sub = parts[1] if len(parts) > 1 else "status"
+
+    try:
+        if sub == "status":
+            resp = httpx.get(
+                f"{console_url}/api/cluster/overview", timeout=5, headers=headers
+            )
+            data = resp.json()
+            states = data.get("states", {})
+            agg = data.get("aggregate", {})
+            print(f"\n  {bold('Cluster Overview')}")
+            print(
+                f"  Nodes: {cyan(str(data.get('nodes', 0)))}  "
+                f"Workstreams: {cyan(str(data.get('workstreams', 0)))}"
+            )
+            print()
+            for state_name in ["running", "thinking", "attention", "idle", "error"]:
+                count = states.get(state_name, 0)
+                sym, color_fn, label = _STATE_DISPLAY.get(
+                    {
+                        "running": WorkstreamState.RUNNING,
+                        "thinking": WorkstreamState.THINKING,
+                        "attention": WorkstreamState.ATTENTION,
+                        "idle": WorkstreamState.IDLE,
+                        "error": WorkstreamState.ERROR,
+                    }[state_name],
+                    ("?", dim, state_name),
+                )
+                print(f"    {color_fn(f'{sym} {label}')}: {count}")
+            print()
+            tokens = agg.get("total_tokens", 0)
+            tools = agg.get("total_tool_calls", 0)
+            tok_str = f"{tokens / 1000:.1f}k" if tokens >= 1000 else str(tokens)
+            print(f"  {dim(f'{tok_str} tokens · {tools} tool calls')}")
+            print()
+
+        elif sub == "nodes":
+            limit = 20
+            resp = httpx.get(
+                f"{console_url}/api/cluster/nodes?sort=activity&limit={limit}",
+                timeout=5,
+                headers=headers,
+            )
+            data = resp.json()
+            nodes = data.get("nodes", [])
+            total = data.get("total", len(nodes))
+            if not nodes:
+                print(dim("  No nodes discovered."))
+                return
+            # Column widths
+            max_name = max(len(n["node_id"]) for n in nodes)
+            print(
+                f"\n  {'NODE'.ljust(max_name)}  {'WS':>4}  {'RUN':>4}  {'ATTN':>4}  {'TOKENS':>8}"
+            )
+            print(
+                f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'--------':>8}"
+            )
+            for n in nodes:
+                name = n["node_id"].ljust(max_name)
+                ws = str(n.get("ws_total", 0))
+                run = n.get("ws_running", 0)
+                attn = n.get("ws_attention", 0)
+                tok = n.get("total_tokens", 0)
+                tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
+                run_str = green(str(run)) if run else dim("0")
+                attn_str = yellow(str(attn)) if attn else dim("0")
+                print(
+                    f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {dim(tok_str):>8}"
+                )
+            if total > len(nodes):
+                print(dim(f"\n  Showing {len(nodes)} of {total} nodes"))
+            print()
+
+        elif sub == "workstreams" or sub == "ws":
+            params = "sort=state&per_page=20"
+            # Parse optional filters: /cluster ws running, /cluster ws node=X
+            for arg in parts[2:]:
+                if "=" in arg:
+                    key, val = arg.split("=", 1)
+                    if key in ("state", "node", "search"):
+                        params += f"&{key}={val}"
+                else:
+                    params += f"&state={arg}"
+            resp = httpx.get(
+                f"{console_url}/api/cluster/workstreams?{params}",
+                timeout=5,
+                headers=headers,
+            )
+            data = resp.json()
+            ws_list = data.get("workstreams", [])
+            total = data.get("total", len(ws_list))
+            if not ws_list:
+                print(dim("  No matching workstreams."))
+                return
+            max_name = max(len(w.get("name", "")[:20]) for w in ws_list)
+            max_node = max(len(w.get("node", "")[:16]) for w in ws_list)
+            print(
+                f"\n  {'STATE':<8}  {'NAME'.ljust(max_name)}  {'NODE'.ljust(max_node)}  {'TOKENS':>8}  {'CTX':>4}"
+            )
+            for w in ws_list:
+                state = w.get("state", "idle")
+                ws_state = {
+                    "running": WorkstreamState.RUNNING,
+                    "thinking": WorkstreamState.THINKING,
+                    "attention": WorkstreamState.ATTENTION,
+                    "idle": WorkstreamState.IDLE,
+                    "error": WorkstreamState.ERROR,
+                }.get(state, WorkstreamState.IDLE)
+                sym, color_fn, label = _STATE_DISPLAY[ws_state]
+                name = w.get("name", "")[:20].ljust(max_name)
+                node = w.get("node", "")[:16].ljust(max_node)
+                tok = w.get("tokens", 0)
+                tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
+                ctx = w.get("context_ratio", 0)
+                ctx_str = f"{int(ctx * 100)}%" if ctx > 0 else ""
+                print(
+                    f"  {color_fn(f'{sym} {label:<5}')}  {bold(name)}  {dim(node)}  {dim(tok_str):>8}  {ctx_str:>4}"
+                )
+            if total > len(ws_list):
+                print(dim(f"\n  Showing {len(ws_list)} of {total} workstreams"))
+            print()
+
+        elif sub == "node":
+            if len(parts) < 3:
+                print(red("Usage: /cluster node <node_id>"))
+                return
+            node_id = parts[2]
+            resp = httpx.get(
+                f"{console_url}/api/cluster/node/{node_id}", timeout=5, headers=headers
+            )
+            data = resp.json()
+            if "error" in data:
+                print(red(data["error"]))
+                return
+            ws_list = data.get("workstreams", [])
+            print(f"\n  {bold(node_id)}  ({data.get('server_url', '')})")
+            if not ws_list:
+                print(dim("  No workstreams."))
+                return
+            for w in ws_list:
+                state = w.get("state", "idle")
+                ws_state = {
+                    "running": WorkstreamState.RUNNING,
+                    "thinking": WorkstreamState.THINKING,
+                    "attention": WorkstreamState.ATTENTION,
+                    "idle": WorkstreamState.IDLE,
+                    "error": WorkstreamState.ERROR,
+                }.get(state, WorkstreamState.IDLE)
+                sym, color_fn, _ = _STATE_DISPLAY[ws_state]
+                name = w.get("name", "")
+                title = w.get("title", "")
+                activity = w.get("activity", "")
+                print(f"    {color_fn(sym)} {bold(name)}  {dim(title)}")
+                if activity:
+                    print(f"      {dim(activity)}")
+            print()
+
+        else:
+            print(f"Unknown /cluster subcommand: {sub}")
+            print("Usage: /cluster [status|nodes|workstreams [state|node=X]|node <id>]")
+
+    except httpx.ConnectError:
+        print(red(f"Cannot connect to console at {console_url}"))
+    except Exception as e:
+        print(red(f"Cluster command failed: {e}"))
+
+
+# ─── Model auto-detection ─────────────────────────────────────────────────
+
+
+def detect_model(client: OpenAI) -> str:
+    """Auto-detect the model from vLLM's /v1/models endpoint."""
+    try:
+        models = client.models.list()
+        model_ids = [m.id for m in models.data]
+        if not model_ids:
+            print(red("No models found at server. Use --model to specify."))
+            sys.exit(1)
+        if len(model_ids) == 1:
+            return model_ids[0]
+        # Multiple models -- pick first, but inform user
+        print(f"Available models: {', '.join(model_ids)}")
+        print(f"Using: {bold(model_ids[0])} (override with --model)")
+        return model_ids[0]
+    except Exception as e:
+        print(red(f"Could not connect to server: {e}"))
+        print("Is vLLM running? Start it or use --base-url to point elsewhere.")
+        sys.exit(1)
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Interactive CLI for vLLM models with tool calling.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python3 chat.py                          # auto-detect model
+              python3 chat.py --persona lawful_evil     # with persona
+              python3 chat.py --model kappa_20b_131k    # explicit model
+              python3 chat.py --temperature 0.7         # lower temperature
+        """),
+    )
+    parser.add_argument(
+        "--base-url",
+        default="http://localhost:8000/v1",
+        help="vLLM API base URL (default: http://localhost:8000/v1)",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model name (default: auto-detect from server)",
+    )
+    parser.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name injected as system message",
+    )
+    parser.add_argument(
+        "--instructions",
+        default=None,
+        help="Developer instructions injected as developer message",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.5,
+        help="Sampling temperature (default: 0.5)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=32768,
+        help="Max completion tokens (default: 32768)",
+    )
+    parser.add_argument(
+        "--tool-timeout",
+        type=int,
+        default=30,
+        help="Bash command timeout in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default="medium",
+        choices=["low", "medium", "high"],
+        help="Reasoning effort level (default: medium)",
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=131072,
+        help="Context window size in tokens (default: 131072)",
+    )
+    parser.add_argument(
+        "--compact-max-tokens",
+        type=int,
+        default=32768,
+        help="Max tokens for compaction summary (default: 32768)",
+    )
+    parser.add_argument(
+        "--auto-compact-pct",
+        type=float,
+        default=0.8,
+        help="Auto-compact when prompt exceeds this fraction of context window (default: 0.8)",
+    )
+    parser.add_argument(
+        "--agent-max-turns",
+        type=int,
+        default=-1,
+        help="Max tool turns for agent sub-sessions, -1 for unlimited (default: -1)",
+    )
+    parser.add_argument(
+        "--tool-truncation",
+        type=int,
+        default=0,
+        help="Tool output truncation limit in chars, 0 for auto (50%% of context window) (default: 0)",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="SESSION",
+        help="Resume a previous session by alias or session_id",
+    )
+    parser.add_argument(
+        "--skip-permissions",
+        action="store_true",
+        help="Auto-approve all tool calls (no confirmation prompts)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (default: $OPENAI_API_KEY, or 'dummy' for local servers)",
+    )
+    parser.add_argument(
+        "--session-retention-days",
+        type=int,
+        default=90,
+        metavar="DAYS",
+        help="Delete unnamed sessions older than DAYS days on startup, 0 to disable (default: 90)",
+    )
+    parser.add_argument(
+        "--console-url",
+        default=None,
+        help="Turnstone console URL for /cluster commands (e.g., http://localhost:8090)",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
+        help="Bearer token for authenticating to turnstone services (default: $TURNSTONE_AUTH_TOKEN)",
+    )
+    from turnstone.core.config import apply_config
+
+    apply_config(parser, ["api", "model", "session", "tools", "console", "auth"])
+    args = parser.parse_args()
+
+    # Prune stale / empty sessions on startup
+    from turnstone.core.memory import prune_sessions
+
+    prune_sessions(retention_days=args.session_retention_days, log_fn=print)
+
+    # Set up readline
+    setup_readline()
+
+    # Create client
+    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "dummy"
+    client = OpenAI(
+        base_url=args.base_url,
+        api_key=api_key,
+    )
+
+    # Detect or use provided model
+    if args.model:
+        model = args.model
+    else:
+        model = detect_model(client)
+
+    # Session factory — captures shared config for creating workstream sessions
+    def session_factory(ui):
+        return ChatSession(
+            client=client,
+            model=model,
+            ui=ui,
+            persona=args.persona,
+            instructions=args.instructions,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            tool_timeout=args.tool_timeout,
+            reasoning_effort=args.reasoning_effort,
+            context_window=args.context_window,
+            compact_max_tokens=args.compact_max_tokens,
+            auto_compact_pct=args.auto_compact_pct,
+            agent_max_turns=args.agent_max_turns,
+            tool_truncation=args.tool_truncation,
+        )
+
+    # Create workstream manager and initial workstream
+    manager = WorkstreamManager(session_factory)
+    ws = manager.create(
+        ui_factory=lambda wid: WorkstreamTerminalUI(wid, manager),
+    )
+    if args.skip_permissions:
+        ws.ui.auto_approve = True
+
+    # Handle --resume
+    if args.resume:
+        from turnstone.core.memory import resolve_session
+
+        target_id = resolve_session(args.resume)
+        if not target_id:
+            print(red(f"Session not found: {args.resume}"))
+            sys.exit(1)
+        if not ws.session.resume_session(target_id):
+            print(red(f"Session '{args.resume}' has no messages."))
+            sys.exit(1)
+        print(
+            f"Resumed session {bold(target_id)} ({len(ws.session.messages)} messages)"
+        )
+
+    # Background attention notification — write to stderr while user types
+    def _bg_attention_notify(ws_id, state):
+        if state == WorkstreamState.ATTENTION and ws_id != manager.active_id:
+            bg_ws = manager.get(ws_id)
+            if bg_ws:
+                idx = manager.index_of(ws_id)
+                sys.stderr.write(
+                    f"\a\r\033[s\033[1A\033[K"
+                    f"  {YELLOW}\u25c6 {idx}:{bg_ws.name} needs attention{RESET}"
+                    f"\033[u"
+                )
+                sys.stderr.flush()
+
+    manager._on_state_change = _bg_attention_notify
+
+    # Print banner
+    print(f"\n{bold('Chat')} with {cyan(model)}")
+    if args.persona:
+        print(f"Persona: {cyan(args.persona)}")
+    print(f"Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
+
+    # Prompt string -- use a short display name
+    display_name = model.split("/")[-1]  # strip path prefixes if any
+    if len(display_name) > 30:
+        display_name = display_name[:27] + "..."
+
+    # Main loop
+    while True:
+        try:
+            # Show background workstream status if any need attention
+            if manager.count > 1:
+                _print_ws_status_line(manager)
+
+            # Build prompt with workstream info
+            active = manager.get_active()
+            if manager.count > 1:
+                idx = manager.index_of(active.id)
+                prompt_str = f"\001{BOLD}\002{idx}:{active.name}\001{RESET}\002 > "
+            else:
+                prompt_str = f"\001{BOLD}\002[{display_name}]\001{RESET}\002 > "
+            user_input = input(prompt_str)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        user_input = user_input.strip()
+        if not user_input:
+            continue
+
+        if user_input.startswith("/ws"):
+            _handle_ws_command(manager, user_input, args.skip_permissions)
+            continue
+
+        if user_input.startswith("/cluster"):
+            _handle_cluster_command(user_input, args.console_url, args.auth_token)
+            continue
+
+        active = manager.get_active()
+        if user_input.startswith("/"):
+            should_exit = active.session.handle_command(user_input)
+            if should_exit:
+                break
+        else:
+            try:
+                active.session.send(user_input)
+            except KeyboardInterrupt:
+                print(f"\n{yellow('Interrupted.')}")
+            except Exception as e:
+                print(f"\n{red(f'Error: {e}')}")
+
+    print("Goodbye.")
+
+
+if __name__ == "__main__":
+    main()

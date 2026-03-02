@@ -1,0 +1,15 @@
+{
+  "name": "task",
+  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent inherits all tools and can read, write, edit, search, and run commands. Use task for work that requires file modifications or command execution. Provide a clear, self-contained prompt.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string",
+        "description": "Complete task description for the sub-agent."
+      }
+    },
+    "required": ["prompt"]
+  },
+  "primary_key": "prompt"
+}

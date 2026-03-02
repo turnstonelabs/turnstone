@@ -1,0 +1,26 @@
+{
+  "name": "web_search",
+  "description": "Search the web using a text query. Returns ranked results with titles, URLs, and content snippets.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "The search query."
+      },
+      "max_results": {
+        "type": "integer",
+        "description": "Max results to return (default 5, max 20)."
+      },
+      "topic": {
+        "type": "string",
+        "description": "Search topic: general, news, or finance (default general)."
+      }
+    },
+    "required": ["query"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "query"
+}

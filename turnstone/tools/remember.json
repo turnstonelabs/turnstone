@@ -1,0 +1,19 @@
+{
+  "name": "remember",
+  "description": "Save a persistent memory. Memories persist across sessions. Use to remember IPs, paths, commands, conventions, or any fact worth recalling later.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": {
+        "type": "string",
+        "description": "Short identifier (e.g. 'user_name')."
+      },
+      "value": {
+        "type": "string",
+        "description": "Content to remember."
+      }
+    },
+    "required": ["key", "value"]
+  },
+  "primary_key": "key"
+}
