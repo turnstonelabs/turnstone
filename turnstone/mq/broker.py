@@ -7,9 +7,14 @@ RedisBroker is the default provider.
 
 from __future__ import annotations
 
+import contextlib
 import json
-import threading
-from typing import Callable, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    import redis as _redis_t
 
 
 class MessageBroker(Protocol):
@@ -74,11 +79,11 @@ class MessageBroker(Protocol):
         """Remove workstream ownership (on close)."""
         ...
 
-    def register_node(self, node_id: str, metadata: dict, ttl: int = 60) -> None:
+    def register_node(self, node_id: str, metadata: dict[str, Any], ttl: int = 60) -> None:
         """Register or refresh a node's heartbeat with metadata."""
         ...
 
-    def list_nodes(self) -> list[dict]:
+    def list_nodes(self) -> list[dict[str, Any]]:
         """List all active nodes (those with unexpired heartbeats)."""
         ...
 
@@ -117,12 +122,12 @@ class RedisBroker:
         prefix: str = "turnstone",
         password: str | None = None,
         response_ttl: int = 600,
-    ):
+    ) -> None:
         import redis
 
         self._prefix = prefix
         self._response_ttl = response_ttl
-        self._pool = redis.ConnectionPool(
+        self._pool: _redis_t.ConnectionPool = redis.ConnectionPool(
             host=host,
             port=port,
             db=db,
@@ -130,9 +135,12 @@ class RedisBroker:
             decode_responses=True,
             retry_on_timeout=True,
         )
-        self._redis = redis.Redis(connection_pool=self._pool)
+        self._redis: _redis_t.Redis[str] = cast(
+            "_redis_t.Redis[str]",
+            redis.Redis(connection_pool=self._pool),
+        )
         self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-        self._listener_thread: threading.Thread | None = None
+        self._listener_thread: Any = None
         self._running = True
 
     # -- inbound queue -------------------------------------------------------
@@ -161,11 +169,12 @@ class RedisBroker:
         self._redis.publish(channel, event)
 
     def subscribe_outbound(self, channel: str, callback: Callable[[str], None]) -> None:
-        self._pubsub.subscribe(**{channel: lambda msg: callback(msg["data"])})
+        def _handler(msg: dict[str, Any]) -> None:
+            callback(msg["data"])
+
+        self._pubsub.subscribe(**{channel: _handler})
         if self._listener_thread is None or not self._listener_thread.is_alive():
-            self._listener_thread = self._pubsub.run_in_thread(
-                sleep_time=0.1, daemon=True
-            )
+            self._listener_thread = self._pubsub.run_in_thread(sleep_time=0.1, daemon=True)
 
     def unsubscribe_outbound(self, channel: str) -> None:
         self._pubsub.unsubscribe(channel)
@@ -197,19 +206,19 @@ class RedisBroker:
     def del_ws_owner(self, ws_id: str) -> None:
         self._redis.delete(f"{self._prefix}:ws:{ws_id}")
 
-    def register_node(self, node_id: str, metadata: dict, ttl: int = 60) -> None:
+    def register_node(self, node_id: str, metadata: dict[str, Any], ttl: int = 60) -> None:
         key = f"{self._prefix}:node:{node_id}"
         self._redis.set(key, json.dumps(metadata), ex=ttl)
 
-    def list_nodes(self) -> list[dict]:
+    def list_nodes(self) -> list[dict[str, Any]]:
         pattern = f"{self._prefix}:node:*"
         prefix_len = len(f"{self._prefix}:node:")
-        nodes = []
+        nodes: list[dict[str, Any]] = []
         for key in self._redis.scan_iter(match=pattern, count=100):
             raw = self._redis.get(key)
             if raw:
                 try:
-                    meta = json.loads(raw)
+                    meta: dict[str, Any] = json.loads(raw)
                 except json.JSONDecodeError:
                     meta = {}
                 meta["node_id"] = key[prefix_len:]
@@ -230,8 +239,6 @@ class RedisBroker:
         if self._listener_thread is not None:
             self._listener_thread.stop()
             self._listener_thread = None
-        try:
+        with contextlib.suppress(Exception):
             self._pubsub.close()
-        except Exception:
-            pass
         self._pool.disconnect()

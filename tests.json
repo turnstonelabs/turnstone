@@ -1,5 +1,5 @@
 {
-  "description": "pcode behavior tests — tool selection, sequencing, and multi-step reasoning",
+  "description": "turnstone behavior tests — tool selection, sequencing, and multi-step reasoning",
   "defaults": {
     "n_runs": 5,
     "max_turns": 15

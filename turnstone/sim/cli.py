@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import sys
+from typing import Any
 
 from turnstone.sim.cluster import SimCluster
 from turnstone.sim.config import SimConfig
@@ -85,9 +86,7 @@ def main() -> None:
     parser.add_argument("--redis-password", default=None)
     parser.add_argument("--redis-db", type=int, default=0)
     parser.add_argument("--prefix", default="turnstone")
-    parser.add_argument(
-        "--seed", type=int, default=None, help="Random seed for reproducibility"
-    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--metrics-file", default="", help="Write JSON metrics to file")
     parser.add_argument(
         "--log-level",
@@ -152,7 +151,7 @@ async def _run(config: SimConfig) -> None:
         await cluster.stop()
 
 
-def _print_report(report: dict, config: SimConfig) -> None:
+def _print_report(report: dict[str, Any], config: SimConfig) -> None:
     lat = report.get("latency", {})
     tp = report.get("throughput", {})
     util = report.get("utilization", {})

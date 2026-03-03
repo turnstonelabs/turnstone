@@ -1,6 +1,6 @@
 """Tests for turnstone.eval — score_run and _match_action."""
 
-from turnstone.eval import score_run, _match_action
+from turnstone.eval import _match_action, score_run
 
 
 class TestMatchAction:

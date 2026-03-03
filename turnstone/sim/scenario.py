@@ -5,15 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from turnstone.mq.broker import RedisBroker
 from turnstone.mq.protocol import SendMessage
-from turnstone.sim.config import SimConfig
-from turnstone.sim.metrics import MetricsCollector
 
 if TYPE_CHECKING:
     from turnstone.sim.cluster import SimCluster
+    from turnstone.sim.config import SimConfig
+    from turnstone.sim.metrics import MetricsCollector
 
 log = logging.getLogger("turnstone.sim.scenario")
 
@@ -157,6 +157,7 @@ class LifecycleScenario:
         from turnstone.mq.protocol import (
             CloseWorkstreamMessage,
             CreateWorkstreamMessage,
+            InboundMessage,
         )
 
         broker = _make_broker(config)
@@ -166,7 +167,7 @@ class LifecycleScenario:
             # Phase 1: Create workstreams
             create_count = min(50, config.num_nodes * 2)
             for i in range(create_count):
-                msg = CreateWorkstreamMessage(
+                msg: InboundMessage = CreateWorkstreamMessage(
                     name=f"lifecycle-ws-{i}",
                     auto_approve=True,
                 )
@@ -225,7 +226,7 @@ def _make_broker(config: SimConfig) -> RedisBroker:
     )
 
 
-SCENARIOS: dict[str, type] = {
+SCENARIOS: dict[str, type[Any]] = {
     "steady": SteadyStateScenario,
     "burst": BurstScenario,
     "node_failure": NodeFailureScenario,

@@ -6,11 +6,13 @@ Precedence: CLI args > env vars > config file > hardcoded defaults.
 
 from __future__ import annotations
 
-import argparse
 import logging
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import argparse
 
 log = logging.getLogger(__name__)
 
@@ -18,10 +20,10 @@ CONFIG_DIR = Path("~/.config/turnstone").expanduser()
 CONFIG_PATH = CONFIG_DIR / "config.toml"
 
 # Cache: None = not loaded yet, {} = loaded but empty/missing
-_cache: dict | None = None
+_cache: dict[str, Any] | None = None
 
 
-def load_config(section: str | None = None) -> dict:
+def load_config(section: str | None = None) -> dict[str, Any]:
     """Load config.toml and return the full dict or a specific section.
 
     Returns empty dict if file doesn't exist or can't be parsed.
@@ -36,7 +38,8 @@ def load_config(section: str | None = None) -> dict:
             except Exception as exc:
                 log.warning("Failed to parse %s: %s", CONFIG_PATH, exc)
     if section:
-        return _cache.get(section, {})
+        result = _cache.get(section, {})
+        return result if isinstance(result, dict) else {}
     return _cache
 
 
@@ -57,7 +60,6 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "context_window": "context_window",
     },
     "session": {
-        "persona": "persona",
         "instructions": "instructions",
         "retention_days": "session_retention_days",
         "compact_max_tokens": "compact_max_tokens",

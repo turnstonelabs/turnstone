@@ -1,13 +1,16 @@
 """Tool definitions — auto-loaded from turnstone/tools/*.json."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any
 
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 _META_KEYS = {"agent", "task_agent", "auto_approve", "primary_key"}
 
 
-def _load_tools() -> tuple[list[dict], dict]:
+def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load all .json files from the tools directory.
 
     Returns (tool_defs, metadata) where:

@@ -37,7 +37,6 @@ from turnstone.mq.protocol import (
     WorkstreamRenameEvent,
 )
 
-
 # ---------------------------------------------------------------------------
 # Inbound message round-trip tests
 # ---------------------------------------------------------------------------

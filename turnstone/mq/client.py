@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Any
 
 from turnstone.mq.broker import MessageBroker, RedisBroker
 from turnstone.mq.protocol import (
@@ -37,6 +37,9 @@ from turnstone.mq.protocol import (
     TurnCompleteEvent,
     WorkstreamCreatedEvent,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass
@@ -76,7 +79,7 @@ class TurnstoneClient:
         broker: MessageBroker | None = None,
         prefix: str = "turnstone",
         **redis_kwargs: object,
-    ):
+    ) -> None:
         """Create a client.
 
         Pass ``broker`` for a custom broker, or provide Redis kwargs
@@ -112,7 +115,7 @@ class TurnstoneClient:
             auto_approve_tools=auto_approve_tools or [],
             target_node=target_node,
         )
-        node = target_node or (self._broker.get_ws_owner(ws_id) if ws_id else "")
+        node = target_node or (self._broker.get_ws_owner(ws_id) if ws_id else "") or ""
         self._broker.push_inbound(msg.to_json(), node_id=node)
         return msg.correlation_id
 
@@ -157,7 +160,7 @@ class TurnstoneClient:
         self._broker.push_inbound(msg.to_json())
         return msg.correlation_id
 
-    def list_nodes(self) -> list[dict]:
+    def list_nodes(self) -> list[dict[str, Any]]:
         """List active bridge nodes (reads directly from broker)."""
         return self._broker.list_nodes()
 
@@ -234,15 +237,10 @@ class TurnstoneClient:
             if on_event:
                 on_event(event)
 
-            if (
-                isinstance(event, WorkstreamCreatedEvent)
-                and event.correlation_id == cid
-            ):
+            if isinstance(event, WorkstreamCreatedEvent) and event.correlation_id == cid:
                 actual_ws_id = event.ws_id
                 result.ws_id = event.ws_id
-                self._broker.subscribe_outbound(
-                    f"{self._prefix}:events:{actual_ws_id}", _on_ws
-                )
+                self._broker.subscribe_outbound(f"{self._prefix}:events:{actual_ws_id}", _on_ws)
 
         def _on_ws(raw: str) -> None:
             event = OutboundEvent.from_json(raw)
@@ -263,12 +261,10 @@ class TurnstoneClient:
         # Subscribe BEFORE pushing — ensures we don't miss early events
         self._broker.subscribe_outbound(f"{self._prefix}:events:global", _on_global)
         if actual_ws_id:
-            self._broker.subscribe_outbound(
-                f"{self._prefix}:events:{actual_ws_id}", _on_ws
-            )
+            self._broker.subscribe_outbound(f"{self._prefix}:events:{actual_ws_id}", _on_ws)
 
         # Now push the message (route to target node or ws owner if known)
-        node = target_node or (self._broker.get_ws_owner(ws_id) if ws_id else "")
+        node = target_node or (self._broker.get_ws_owner(ws_id) if ws_id else "") or ""
         self._broker.push_inbound(msg.to_json(), node_id=node)
 
         done.wait(timeout=timeout)
@@ -290,10 +286,7 @@ class TurnstoneClient:
         ws_id: str = "",
     ) -> None:
         """Subscribe to events for a specific workstream or global events."""
-        if ws_id:
-            channel = f"{self._prefix}:events:{ws_id}"
-        else:
-            channel = f"{self._prefix}:events:global"
+        channel = f"{self._prefix}:events:{ws_id}" if ws_id else f"{self._prefix}:events:global"
 
         def _cb(raw: str) -> None:
             event = OutboundEvent.from_json(raw)
@@ -303,10 +296,7 @@ class TurnstoneClient:
 
     def unsubscribe(self, ws_id: str = "") -> None:
         """Unsubscribe from a workstream or global channel."""
-        if ws_id:
-            channel = f"{self._prefix}:events:{ws_id}"
-        else:
-            channel = f"{self._prefix}:events:global"
+        channel = f"{self._prefix}:events:{ws_id}" if ws_id else f"{self._prefix}:events:global"
         self._broker.unsubscribe_outbound(channel)
 
     # -- lifecycle -----------------------------------------------------------

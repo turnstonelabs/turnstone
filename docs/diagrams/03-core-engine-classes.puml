@@ -1,0 +1,167 @@
+@startuml
+!theme plain
+title Turnstone — Core Engine Classes
+
+skinparam classAttributeIconSize 0
+
+' SessionUI Protocol
+interface "SessionUI" as SessionUI <<Protocol>> {
+    + on_thinking_start()
+    + on_thinking_stop()
+    + on_reasoning_token(text: str)
+    + on_content_token(text: str)
+    + on_stream_end()
+    + approve_tools(items: list) → (bool, str|None)
+    + on_tool_result(name: str, output: str)
+    + on_status(usage: dict, ctx_window: int, effort: str)
+    + on_plan_review(content: str) → str
+    + on_info(message: str)
+    + on_error(message: str)
+    + on_state_change(state: str)
+    + on_rename(name: str)
+}
+
+' Implementations
+class "TerminalUI" as TerminalUI {
+    Writes to stdout with ANSI colors
+    Prompts for approval via input()
+    --
+    cli.py
+}
+
+class "WorkstreamTerminalUI" as WsTermUI {
+    - _output_buffer: list[tuple]
+    - ws_id: str
+    - manager: WorkstreamManager
+    + flush_buffer()
+    --
+    Buffers output when workstream
+    is not foregrounded
+}
+
+class "WebUI" as WebUI {
+    - _event_queue: Queue
+    - _approval_event: Event
+    - _plan_event: Event
+    - _ws_prompt_tokens: int
+    - _ws_tool_calls: dict
+    + resolve_approval(approved, feedback)
+    + resolve_plan(feedback)
+    --
+    Enqueues JSON events for SSE.
+    Blocks on threading.Event for
+    approval/plan review.
+    --
+    server.py
+}
+
+class "NullUI" as NullUI {
+    approve_tools() → (True, None)
+    All other methods: no-op
+    --
+    eval.py
+}
+
+' ChatSession
+class "ChatSession" as ChatSession {
+    - client: OpenAI
+    - model: str
+    - ui: SessionUI
+    - messages: list[dict]
+    - _msg_tokens: list[int]
+    - _session_id: str
+    - _read_files: set[str]
+    - system_messages: list[dict]
+    --
+    + send(user_input: str)
+    + handle_command(command: str)
+    + resume_session(session_id: str)
+    - _stream_response(stream) → dict
+    - _create_stream_with_retry(msgs) → Stream
+    - _execute_tools(tool_calls) → (results, feedback)
+    - _prepare_tool(tc) → item dict
+    - _run_agent(messages, tools, ...) → str
+    - _compact_messages(auto: bool)
+    - _full_messages() → list[dict]
+    - _update_token_table(msg)
+    - _emit_state(state: str)
+    - _generate_title()
+}
+
+' HeadlessSession
+class "HeadlessSession" as HeadlessSession {
+    + tool_call_log: list[dict]
+    + auto_approve: bool = True
+    + send_headless(input, max_turns, ...)
+    - _override_system_prompt(content)
+    --
+    eval.py: non-streaming,
+    records all tool calls
+}
+
+' WorkstreamManager
+class "WorkstreamManager" as WsMgr {
+    - _session_factory: Callable[[SessionUI], ChatSession]
+    - _workstreams: dict[str, Workstream]
+    - _order: list[str]
+    - _active_id: str
+    - _on_state_change: Callable
+    --
+    + create(name, ui_factory) → Workstream
+    + close(ws_id)
+    + get(ws_id) → Workstream
+    + get_active() → Workstream
+    + switch(ws_id)
+    + set_state(ws_id, state)
+    + close_idle(max_age_seconds)
+    --
+    MAX_WORKSTREAMS = 10
+}
+
+' Workstream
+class "Workstream" as Ws <<dataclass>> {
+    + id: str
+    + name: str
+    + state: WorkstreamState
+    + session: ChatSession
+    + ui: SessionUI
+    + worker_thread: Thread
+    + error_message: str
+    + last_active: float
+    - _lock: Lock
+}
+
+' WorkstreamState
+enum "WorkstreamState" as WsState {
+    IDLE
+    THINKING
+    RUNNING
+    ATTENTION
+    ERROR
+}
+
+' Relationships
+SessionUI <|.. TerminalUI
+TerminalUI <|-- WsTermUI
+SessionUI <|.. WebUI
+SessionUI <|.. NullUI
+
+ChatSession --> SessionUI : uses
+ChatSession <|-- HeadlessSession
+
+WsMgr --> "*" Ws : manages
+Ws --> "1" ChatSession : wraps
+Ws --> "1" SessionUI : wraps
+Ws --> "1" WsState : has
+
+WsMgr ..> ChatSession : creates via\nsession_factory(ui)
+
+note bottom of ChatSession
+  Central engine: multi-turn LLM loop
+  with tool dispatch, agent sub-sessions,
+  context compaction, and memory persistence.
+
+  core/session.py (~2700 lines)
+end note
+
+@enduml

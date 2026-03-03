@@ -4,10 +4,8 @@ import threading
 import time
 
 import pytest
-from unittest.mock import MagicMock
 
-from turnstone.core.workstream import WorkstreamManager, WorkstreamState, Workstream
-
+from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -130,7 +128,7 @@ class TestManagerCreation:
     def test_create_second_does_not_change_active(self):
         mgr = WorkstreamManager(_fake_factory)
         ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        _ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
         assert mgr.active_id == ws1.id
 
     def test_create_assigns_session(self):
@@ -176,9 +174,9 @@ class TestManagerLookup:
 
     def test_list_all_creation_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
+        _ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
+        _ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
         result = mgr.list_all()
         assert [w.name for w in result] == ["a", "b", "c"]
 
@@ -222,7 +220,7 @@ class TestManagerSwitching:
 
     def test_switch_by_index(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         result = mgr.switch_by_index(2)
@@ -244,7 +242,7 @@ class TestManagerSwitching:
 class TestManagerClose:
     def test_close_removes_workstream(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         assert mgr.close(ws2.id) is True
@@ -274,9 +272,9 @@ class TestManagerClose:
 
     def test_close_updates_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        _ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
 
         mgr.close(ws2.id)
         names = [w.name for w in mgr.list_all()]
@@ -285,7 +283,7 @@ class TestManagerClose:
     def test_close_unblocks_approval_event(self):
         """Closing a workstream whose UI has a pending approval should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         # Create a workstream with a WebUI-like approval mechanism
         from turnstone.server import WebUI
@@ -300,7 +298,7 @@ class TestManagerClose:
     def test_close_unblocks_plan_event(self):
         """Closing a workstream with pending plan review should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         from turnstone.server import WebUI
 
@@ -551,6 +549,7 @@ class TestWebUI:
     def test_on_state_change_broadcasts(self):
         """on_state_change should put an event on the global queue."""
         import queue
+
         from turnstone.server import WebUI
 
         gq = queue.Queue()
@@ -742,6 +741,7 @@ class TestNoColor:
     def test_no_color_env_disables_ansi(self):
         import importlib
         import os
+
         import turnstone.ui.colors as colors_mod
 
         old_env = os.environ.get("NO_COLOR")

@@ -1,0 +1,105 @@
+@startuml
+!theme plain
+title Turnstone — Multi-Node Message Routing
+
+skinparam sequenceArrowThickness 1.5
+
+participant "TurnstoneClient" as Client
+collections "Redis" as Redis
+participant "Bridge-A\n(node_id: nodeA)" as BridgeA
+participant "Bridge-B\n(node_id: nodeB)" as BridgeB
+participant "Server-A" as ServerA
+
+== Scenario A: New Message — No Workstream Affinity ==
+
+Client -> Redis : RPUSH turnstone:inbound\n{type:"send", message:"...", ws_id:""}
+note right of Redis : Shared queue — any bridge can pick up
+
+BridgeA -> Redis : BLPOP [turnstone:inbound:nodeA,\n         turnstone:inbound]
+Redis --> BridgeA : SendMessage (from shared queue)
+
+BridgeA -> ServerA : POST /api/workstreams/new\n{name:"", auto_approve:false}
+ServerA --> BridgeA : {ws_id:"abc12345", name:"ws-abc1"}
+
+BridgeA -> Redis : SET turnstone:ws:abc12345 "nodeA"
+note right : Register workstream ownership
+
+BridgeA -> ServerA : GET /api/events?ws_id=abc12345
+note right : Start per-WS SSE thread
+
+BridgeA -> Redis : PUBLISH turnstone:events:global\nWorkstreamCreatedEvent
+
+BridgeA -> Redis : PUBLISH turnstone:events:cluster\nClusterStateEvent(ws_id, state:"idle", node_id:"nodeA")
+
+BridgeA -> ServerA : POST /api/send\n{message:"...", ws_id:"abc12345"}
+ServerA --> BridgeA : {status:"ok"}
+
+BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nAckEvent(status:"ok")
+
+... SSE events flow: content, tool_result, status, state_change ...
+
+BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nContentEvent, ToolResultEvent, ...
+BridgeA -> Redis : PUBLISH turnstone:events:global\nStateChangeEvent(state:"idle")
+BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nTurnCompleteEvent
+
+== Scenario B: Directed Message to Specific Node ==
+
+Client -> Redis : RPUSH turnstone:inbound:nodeB\n{type:"send", target_node:"nodeB", ...}
+note right : Per-node queue — only nodeB picks up
+
+BridgeB -> Redis : BLPOP [turnstone:inbound:nodeB,\n         turnstone:inbound]
+Redis --> BridgeB : SendMessage (from per-node queue, priority)
+
+note right of BridgeB : Process locally on nodeB
+
+== Scenario C: Re-routing (Lands on Wrong Node) ==
+
+Client -> Redis : RPUSH turnstone:inbound\n{type:"send", ws_id:"abc12345"}
+
+BridgeB -> Redis : BLPOP [..., turnstone:inbound]
+Redis --> BridgeB : SendMessage (ws_id: abc12345)
+
+BridgeB -> Redis : GET turnstone:ws:abc12345
+Redis --> BridgeB : "nodeA"
+
+note right of BridgeB : Owner is nodeA, not me — re-route
+
+BridgeB -> Redis : RPUSH turnstone:inbound:nodeA\n(re-routed message)
+
+BridgeA -> Redis : BLPOP [turnstone:inbound:nodeA, ...]
+Redis --> BridgeA : SendMessage (from per-node queue)
+note right of BridgeA : Process locally — I own this workstream
+
+== Scenario D: Approval via Response Queue ==
+
+BridgeA <- ServerA : SSE: {type:"approve_request", items:[...]}
+
+note right of BridgeA
+  Bridge checks auto-approve:
+  1. _ws_auto_approve[ws_id]? → auto
+  2. All tools in safe set? → auto
+     (read_file, search, man,
+      remember, recall, forget)
+  3. Otherwise → manual approval
+end note
+
+BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nApprovalRequestEvent(correlation_id: req_xyz)
+
+Client <- Redis : (subscribed) ApprovalRequestEvent
+
+Client -> Redis : RPUSH turnstone:resp:req_xyz\nApproveMessage(approved:true)
+note right : Response queue — bypasses inbound queue
+
+BridgeA -> Redis : BLPOP turnstone:resp:req_xyz\n(spawned approval thread, timeout 300s)
+Redis --> BridgeA : ApproveMessage
+
+BridgeA -> ServerA : POST /api/approve\n{approved:true, ws_id:"abc12345"}
+
+== Heartbeat (continuous) ==
+
+BridgeA -> Redis : SET turnstone:node:nodeA\n{server_url, started} EX 60
+note right : Every 30s — TTL 60s
+
+BridgeB -> Redis : SET turnstone:node:nodeB\n{server_url, started} EX 60
+
+@enduml

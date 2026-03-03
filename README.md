@@ -1,5 +1,10 @@
 # Turnstone
 
+[![CI](https://github.com/turnstonelabs/turnstone/actions/workflows/ci.yml/badge.svg)](https://github.com/turnstonelabs/turnstone/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/turnstone)](https://pypi.org/project/turnstone/)
+[![Python](https://img.shields.io/pypi/pyversions/turnstone)](https://pypi.org/project/turnstone/)
+[![License](https://img.shields.io/badge/license-BSL--1.1-blue)](LICENSE)
+
 Multi-node AI orchestration platform. Deploy tool-using AI agents across a cluster of servers, driven by message queues or interactive interfaces.
 
 Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone) — a bird that flips rocks to expose what's hiding underneath.
@@ -141,8 +146,29 @@ docs/
 ├── docker.md          # Docker Compose deployment and configuration
 ├── simulator.md       # Cluster simulator usage and scenarios
 ├── tools.md           # Tool schemas, execution pipeline, approval flow
-└── eval.md            # Evaluation harness internals
+├── eval.md            # Evaluation harness internals
+└── diagrams/          # UML architecture diagrams (PlantUML sources + PNGs)
+    └── png/           # Pre-rendered diagram images
 ```
+
+### Architecture Diagrams
+
+Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
+
+| Diagram | Description |
+|---------|-------------|
+| [System Context](docs/diagrams/png/01-system-context.png) | Top-level components and external dependencies |
+| [Package Structure](docs/diagrams/png/02-package-structure.png) | Python modules and dependency graph |
+| [Core Engine Classes](docs/diagrams/png/03-core-engine-classes.png) | SessionUI protocol, ChatSession, WorkstreamManager |
+| [Conversation Turn](docs/diagrams/png/04-conversation-turn.png) | Full message lifecycle through the engine |
+| [Tool Pipeline](docs/diagrams/png/05-tool-pipeline.png) | Three-phase prepare/approve/execute |
+| [MQ Protocol](docs/diagrams/png/06-mq-protocol.png) | 9 inbound + 19 outbound message types |
+| [Message Routing](docs/diagrams/png/07-message-routing.png) | Multi-node routing scenarios |
+| [Redis Key Schema](docs/diagrams/png/08-redis-key-schema.png) | All Redis keys, types, and TTLs |
+| [Workstream States](docs/diagrams/png/09-workstream-states.png) | State machine transitions |
+| [Simulator](docs/diagrams/png/10-simulator-architecture.png) | SimCluster, dispatchers, scenarios |
+| [Console Data Flow](docs/diagrams/png/11-console-data-flow.png) | Dashboard data collection threads |
+| [Deployment](docs/diagrams/png/12-deployment.png) | Docker Compose service topology |
 
 ## Multi-node routing
 

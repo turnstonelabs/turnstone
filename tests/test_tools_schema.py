@@ -1,13 +1,13 @@
 """Tests for turnstone.core.tools — JSON auto-loading and schema validation."""
 
 from turnstone.core.tools import (
-    TOOLS,
-    AGENT_TOOLS,
-    TASK_AGENT_TOOLS,
-    AGENT_AUTO_TOOLS,
-    TASK_AUTO_TOOLS,
-    PRIMARY_KEY_MAP,
     _META,
+    AGENT_AUTO_TOOLS,
+    AGENT_TOOLS,
+    PRIMARY_KEY_MAP,
+    TASK_AGENT_TOOLS,
+    TASK_AUTO_TOOLS,
+    TOOLS,
 )
 
 
@@ -23,9 +23,7 @@ class TestToolsSchema:
 
     def test_all_tools_have_description(self):
         for tool in TOOLS:
-            assert "description" in tool["function"], (
-                f"Tool missing description: {tool}"
-            )
+            assert "description" in tool["function"], f"Tool missing description: {tool}"
             assert len(tool["function"]["description"]) > 0
 
     def test_all_tools_have_parameters(self):
@@ -84,8 +82,8 @@ class TestToolsMetadata:
 
     def test_auto_approve_sets_match(self):
         expected = {"read_file", "search", "math", "man", "web_fetch", "web_search"}
-        assert AGENT_AUTO_TOOLS == expected
-        assert TASK_AUTO_TOOLS == expected
+        assert expected == AGENT_AUTO_TOOLS
+        assert expected == TASK_AUTO_TOOLS
 
     def test_primary_key_map(self):
         expected = {
@@ -104,7 +102,7 @@ class TestToolsMetadata:
             "recall": "query",
             "forget": "key",
         }
-        assert PRIMARY_KEY_MAP == expected
+        assert expected == PRIMARY_KEY_MAP
 
     def test_no_metadata_in_function_dicts(self):
         """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
@@ -112,9 +110,7 @@ class TestToolsMetadata:
         for tool in TOOLS:
             func = tool["function"]
             leaked = meta_keys & set(func)
-            assert not leaked, (
-                f"Tool '{func['name']}' leaks metadata into function dict: {leaked}"
-            )
+            assert not leaked, f"Tool '{func['name']}' leaks metadata into function dict: {leaked}"
 
     def test_meta_has_all_tools(self):
         tool_names = {t["function"]["name"] for t in TOOLS}

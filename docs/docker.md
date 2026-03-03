@@ -17,6 +17,8 @@ docker compose --profile sim up redis console sim
 
 Console dashboard: http://localhost:8090
 
+> See also: [Deployment diagram](diagrams/png/12-deployment.png)
+
 ## Services
 
 | Service | Port | Profile | Description |

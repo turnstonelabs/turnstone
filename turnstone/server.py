@@ -9,7 +9,10 @@ Supports multiple concurrent workstreams (tabs), each with independent
 ChatSession and event streams.
 """
 
+from __future__ import annotations
+
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -17,17 +20,18 @@ import sys
 import textwrap
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, parse_qs
+from typing import Any
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 from openai import OpenAI
 
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
-from turnstone.core.workstream import WorkstreamManager, WorkstreamState
+from turnstone.core.workstream import Workstream, WorkstreamManager
 
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
@@ -53,15 +57,15 @@ class WebUI:
 
     # Shared global event queue for state-change broadcasts across all
     # workstreams.  Set by main() before any WebUI instances are created.
-    _global_queue: queue.Queue | None = None
+    _global_queue: queue.Queue[dict[str, Any]] | None = None
 
-    def __init__(self, ws_id: str = ""):
+    def __init__(self, ws_id: str = "") -> None:
         self.ws_id = ws_id
-        self._event_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self._sse_generation = 0  # incremented on each new SSE connection
         self._approval_event = threading.Event()
         self._approval_result: tuple[bool, str | None] = (False, None)
-        self._pending_approval: dict | None = None  # re-sent on SSE reconnect
+        self._pending_approval: dict[str, Any] | None = None  # re-sent on SSE reconnect
         self._plan_event = threading.Event()
         self._plan_result: str = ""
         self.auto_approve = False
@@ -76,10 +80,10 @@ class WebUI:
         self._ws_current_activity: str = ""
         self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
 
-    def _enqueue(self, data: dict):
+    def _enqueue(self, data: dict[str, Any]) -> None:
         self._event_queue.put(data)
 
-    def _broadcast_state(self, state: str):
+    def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel."""
         if WebUI._global_queue is not None:
             with self._ws_lock:
@@ -99,7 +103,7 @@ class WebUI:
                 }
             )
 
-    def _broadcast_activity(self):
+    def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
         if WebUI._global_queue is not None:
             with self._ws_lock:
@@ -116,33 +120,31 @@ class WebUI:
 
     # --- SessionUI protocol ---
 
-    def on_thinking_start(self):
+    def on_thinking_start(self) -> None:
         with self._ws_lock:
             self._ws_current_activity = "Thinking\u2026"
             self._ws_activity_state = "thinking"
         self._broadcast_activity()
         self._enqueue({"type": "thinking_start"})
 
-    def on_thinking_stop(self):
+    def on_thinking_stop(self) -> None:
         self._enqueue({"type": "thinking_stop"})
 
-    def on_reasoning_token(self, text: str):
+    def on_reasoning_token(self, text: str) -> None:
         self._enqueue({"type": "reasoning", "text": text})
 
-    def on_content_token(self, text: str):
+    def on_content_token(self, text: str) -> None:
         self._enqueue({"type": "content", "text": text})
 
-    def on_stream_end(self):
+    def on_stream_end(self) -> None:
         with self._ws_lock:
             self._ws_current_activity = ""
             self._ws_activity_state = ""
         self._broadcast_activity()
         self._enqueue({"type": "stream_end"})
 
-    def approve_tools(self, items: list[dict]) -> tuple[bool, str | None]:
-        pending = [
-            it for it in items if it.get("needs_approval") and not it.get("error")
-        ]
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Always send tool info to the browser
         serialized = []
@@ -152,9 +154,7 @@ class WebUI:
                     "header": item.get("header", ""),
                     "preview": item.get("preview", ""),
                     "func_name": item.get("func_name", ""),
-                    "approval_label": item.get(
-                        "approval_label", item.get("func_name", "")
-                    ),
+                    "approval_label": item.get("approval_label", item.get("func_name", "")),
                     "needs_approval": item.get("needs_approval", False),
                     "error": item.get("error"),
                 }
@@ -166,9 +166,7 @@ class WebUI:
             label = first.get("func_name", "")
             preview = first.get("preview", "")[:80]
             with self._ws_lock:
-                self._ws_current_activity = (
-                    f"\u2699 {label}: {preview}" if label else ""
-                )
+                self._ws_current_activity = f"\u2699 {label}: {preview}" if label else ""
                 self._ws_activity_state = "tool" if label else ""
             self._broadcast_activity()
             self._enqueue({"type": "tool_info", "items": serialized})
@@ -179,9 +177,7 @@ class WebUI:
         label = first_pending.get("func_name", "")
         preview = first_pending.get("preview", "")[:60]
         with self._ws_lock:
-            self._ws_current_activity = (
-                f"\u23f3 Awaiting approval: {label} \u2014 {preview}"
-            )
+            self._ws_current_activity = f"\u23f3 Awaiting approval: {label} \u2014 {preview}"
             self._ws_activity_state = "approval"
         self._broadcast_activity()
 
@@ -203,7 +199,7 @@ class WebUI:
 
         return approved, feedback
 
-    def on_tool_result(self, name: str, output: str):
+    def on_tool_result(self, name: str, output: str) -> None:
         _metrics.record_tool_call(name)
         with self._ws_lock:
             self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
@@ -212,19 +208,15 @@ class WebUI:
         self._broadcast_activity()
         self._enqueue({"type": "tool_result", "name": name, "output": output})
 
-    def on_status(self, usage: dict, context_window: int, effort: str):
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
         _metrics.record_tokens(usage["prompt_tokens"], usage["completion_tokens"])
-        _metrics.record_context_ratio(
-            total_tok / context_window if context_window > 0 else 0.0
-        )
+        _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
         with self._ws_lock:
             self._ws_prompt_tokens += usage["prompt_tokens"]
             self._ws_completion_tokens += usage["completion_tokens"]
-            self._ws_context_ratio = (
-                total_tok / context_window if context_window > 0 else 0.0
-            )
+            self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
         self._enqueue(
             {
                 "type": "status",
@@ -243,29 +235,27 @@ class WebUI:
         self._plan_event.wait()
         return self._plan_result
 
-    def on_info(self, message: str):
+    def on_info(self, message: str) -> None:
         self._enqueue({"type": "info", "message": message})
 
-    def on_error(self, message: str):
+    def on_error(self, message: str) -> None:
         _metrics.record_error()
         self._enqueue({"type": "error", "message": message})
 
-    def on_state_change(self, state: str):
+    def on_state_change(self, state: str) -> None:
         self._broadcast_state(state)
 
-    def on_rename(self, name: str):
+    def on_rename(self, name: str) -> None:
         """Update the workstream's display name and broadcast to all clients."""
         if WebUI._global_queue is not None:
-            WebUI._global_queue.put(
-                {"type": "ws_rename", "ws_id": self.ws_id, "name": name}
-            )
+            WebUI._global_queue.put({"type": "ws_rename", "ws_id": self.ws_id, "name": name})
 
-    def resolve_approval(self, approved: bool, feedback: str | None = None):
+    def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Called by the HTTP handler when the user approves/denies."""
         self._approval_result = (approved, feedback)
         self._approval_event.set()
 
-    def resolve_plan(self, feedback: str):
+    def resolve_plan(self, feedback: str) -> None:
         """Called by the HTTP handler when the user responds to a plan."""
         self._plan_result = feedback
         self._plan_event.set()
@@ -276,7 +266,9 @@ class WebUI:
 # ---------------------------------------------------------------------------
 
 
-def _build_history(session, has_pending_approval: bool = False) -> list[dict]:
+def _build_history(
+    session: ChatSession, has_pending_approval: bool = False
+) -> list[dict[str, Any]]:
     """Build a history replay list from session messages.
 
     When ``has_pending_approval`` is True, the last assistant entry's
@@ -312,10 +304,10 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
     """
 
     # Suppress default logging to stderr
-    def log_message(self, format, *args):
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: N802
         pass
 
-    def _set_headers(self, status=200, content_type="application/json"):
+    def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
         self._response_status = status
         self.send_response(status)
         self.send_header("Content-Type", content_type)
@@ -323,28 +315,30 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            result: dict[str, Any] = json.loads(raw.decode("utf-8"))
+            return result
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return {}
 
-    def _send_json(self, data: dict, status=200):
+    def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
         self._set_headers(status, "application/json")
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
-    def _get_ws(self, ws_id: str | None):
+    def _get_ws(self, ws_id: str | None) -> tuple[Workstream, WebUI] | tuple[None, None]:
         """Look up workstream by id.  Returns (Workstream, WebUI) or (None, None)."""
         if not ws_id:
             return None, None
         mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
         ws = mgr.get(ws_id)
-        if ws:
-            return ws, ws.ui
+        if ws and ws.ui:
+            ui: WebUI = ws.ui  # type: ignore[assignment]
+            return ws, ui
         return None, None
 
     def _check_auth(self, method: str, path: str) -> bool:
@@ -354,14 +348,12 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         auth_config = self.server.auth_config  # type: ignore[attr-defined]
         auth_header = self.headers.get("Authorization")
         cookie_header = self.headers.get("Cookie")
-        allowed, status, msg = check_request(
-            auth_config, method, path, auth_header, cookie_header
-        )
+        allowed, status, msg = check_request(auth_config, method, path, auth_header, cookie_header)
         if not allowed:
             self._send_json({"error": msg}, status)
         return allowed
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         _t0 = time.monotonic()
         self._response_status = 200
         parsed = urlparse(self.path)
@@ -374,7 +366,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 "GET", parsed.path, self._response_status, time.monotonic() - _t0
             )
 
-    def _do_GET(self, parsed):
+    def _do_GET(self, parsed: ParseResult) -> None:  # noqa: N802
         if parsed.path == "/":
             self._set_headers(200, "text/html; charset=utf-8")
             self.wfile.write(_HTML.encode("utf-8"))
@@ -420,6 +412,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     break
 
             # Send connected event with model info
+            assert ws.session is not None
             session: ChatSession = ws.session
             connected_data = json.dumps(
                 {
@@ -428,22 +421,20 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     "skip_permissions": ui.auto_approve,
                 }
             )
-            self.wfile.write(f"data: {connected_data}\n\n".encode("utf-8"))
+            self.wfile.write(f"data: {connected_data}\n\n".encode())
             self.wfile.flush()
 
             # Send conversation history for replay
-            history = _build_history(
-                session, has_pending_approval=ui._pending_approval is not None
-            )
+            history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
             if history:
                 history_data = json.dumps({"type": "history", "messages": history})
-                self.wfile.write(f"data: {history_data}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {history_data}\n\n".encode())
                 self.wfile.flush()
 
             # Re-inject a pending approval request if one was interrupted by a tab switch.
             if ui._pending_approval is not None:
                 pa_data = json.dumps(ui._pending_approval)
-                self.wfile.write(f"data: {pa_data}\n\n".encode("utf-8"))
+                self.wfile.write(f"data: {pa_data}\n\n".encode())
                 self.wfile.flush()
 
             # Long-running SSE loop
@@ -452,7 +443,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     try:
                         event = ui._event_queue.get(timeout=5)
                         data = json.dumps(event)
-                        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                        self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                     except queue.Empty:
                         # Send keepalive comment to prevent timeout
@@ -469,12 +460,10 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
 
-            gq: queue.Queue = self.server.global_queue  # type: ignore[attr-defined]
-
             # Each global SSE client gets its own consumer queue
             # (since queue.Queue is single-consumer, we fan out via a listener list)
-            client_queue: queue.Queue = queue.Queue(maxsize=500)
-            listeners: list = self.server.global_listeners  # type: ignore[attr-defined]
+            client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+            listeners: list[queue.Queue[dict[str, Any]]] = self.server.global_listeners  # type: ignore[attr-defined]
             listeners_lock: threading.Lock = self.server.global_listeners_lock  # type: ignore[attr-defined]
             with listeners_lock:
                 listeners.append(client_queue)
@@ -484,7 +473,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     try:
                         event = client_queue.get(timeout=5)
                         data = json.dumps(event)
-                        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                        self.wfile.write(f"data: {data}\n\n".encode())
                         self.wfile.flush()
                     except queue.Empty:
                         self.wfile.write(b": keepalive\n\n")
@@ -540,7 +529,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             self._set_headers(404, "text/plain")
             self.wfile.write(b"Not found")
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         _t0 = time.monotonic()
         self._response_status = 200
         try:
@@ -552,7 +541,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 "POST", self.path, self._response_status, time.monotonic() - _t0
             )
 
-    def _do_POST(self):
+    def _do_POST(self) -> None:  # noqa: N802
         if self.path == "/api/send":
             body = self._read_body()
             message = body.get("message", "").strip()
@@ -577,9 +566,13 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "busy"})
                 return
 
-            def run():
+            session = ws.session
+            assert session is not None
+
+            def run() -> None:
+                assert ui is not None
                 try:
-                    ws.session.send(message)
+                    session.send(message)
                 except Exception as e:
                     ui.on_error(f"Error: {e}")
                     ui._enqueue({"type": "stream_end"})
@@ -633,6 +626,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             if not ws or not ui:
                 self._send_json({"error": "Unknown workstream"}, 404)
                 return
+            assert ws.session is not None
 
             try:
                 should_exit = ws.session.handle_command(command)
@@ -669,6 +663,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     name=body.get("name", ""),
                     ui_factory=lambda wid: WebUI(ws_id=wid),
                 )
+                assert isinstance(ws.ui, WebUI)
                 if skip or body.get("auto_approve", False):
                     ws.ui.auto_approve = True
                 self._send_json({"ws_id": ws.id, "name": ws.name})
@@ -677,8 +672,8 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
 
         elif self.path == "/api/workstreams/close":
             body = self._read_body()
-            ws_id = body.get("ws_id")
-            mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
+            ws_id = str(body.get("ws_id", ""))
+            mgr = self.server.workstreams  # type: ignore[attr-defined]
             if mgr.close(ws_id):
                 self._send_json({"status": "ok"})
             else:
@@ -697,9 +692,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 self.send_header("Set-Cookie", make_set_cookie(token))
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                self.wfile.write(
-                    json.dumps({"status": "ok", "role": role}).encode("utf-8")
-                )
+                self.wfile.write(json.dumps({"status": "ok", "role": role}).encode("utf-8"))
             else:
                 self._send_json({"error": "Invalid token"}, 401)
 
@@ -717,11 +710,11 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             self._set_headers(404, "text/plain")
             self.wfile.write(b"Not found")
 
-    def _handle_health(self):
+    def _handle_health(self) -> None:
         """Return server health status as JSON."""
         mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
         wss = mgr.list_all()
-        states: dict = {
+        states: dict[str, int] = {
             "idle": 0,
             "thinking": 0,
             "running": 0,
@@ -740,7 +733,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         }
         self._send_json(data)
 
-    def _handle_dashboard(self):
+    def _handle_dashboard(self) -> None:
         """Return enriched workstream data + aggregate stats for the dashboard."""
         from turnstone.core.memory import get_session_name
 
@@ -795,11 +788,11 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def _handle_metrics(self):
+    def _handle_metrics(self) -> None:
         """Return Prometheus text exposition format metrics."""
         mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
         wss = mgr.list_all()
-        states: dict = {
+        states: dict[str, int] = {
             "idle": 0,
             "thinking": 0,
             "running": 0,
@@ -832,7 +825,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         self._set_headers(200, "text/plain; version=0.0.4; charset=utf-8")
         self.wfile.write(content.encode("utf-8"))
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
         """Handle CORS preflight."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -886,23 +879,23 @@ def detect_model(client: OpenAI) -> str:
 
 
 def _idle_cleanup_thread(
-    mgr: WorkstreamManager, timeout_sec: float, global_queue: queue.Queue
-):
+    mgr: WorkstreamManager, timeout_sec: float, global_queue: queue.Queue[dict[str, Any]]
+) -> None:
     """Periodically close IDLE workstreams that have been inactive too long."""
     check_every = min(300.0, timeout_sec / 4)  # check at ¼ of timeout, max 5 min
     while True:
         time.sleep(check_every)
         closed = mgr.close_idle(timeout_sec)
         for ws_id in closed:
-            try:
+            with contextlib.suppress(queue.Full):
                 global_queue.put_nowait({"type": "ws_closed", "ws_id": ws_id})
-            except queue.Full:
-                pass
 
 
 def _global_fanout_thread(
-    source_queue: queue.Queue, listeners: list, lock: threading.Lock
-):
+    source_queue: queue.Queue[dict[str, Any]],
+    listeners: list[queue.Queue[dict[str, Any]]],
+    lock: threading.Lock,
+) -> None:
     """Reads events from the source queue and copies them to all listener queues."""
     while True:
         try:
@@ -910,10 +903,8 @@ def _global_fanout_thread(
             with lock:
                 snapshot = list(listeners)
             for lq in snapshot:
-                try:
-                    lq.put_nowait(event)
-                except queue.Full:
-                    pass  # drop if a listener is backed up
+                with contextlib.suppress(queue.Full):
+                    lq.put_nowait(event)  # drop if a listener is backed up
         except Exception:
             pass
 
@@ -923,7 +914,7 @@ def _global_fanout_thread(
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="turnstone web server — browser-based chat UI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -944,11 +935,6 @@ def main():
         "--model",
         default=None,
         help="Model name (default: auto-detect from server)",
-    )
-    parser.add_argument(
-        "--persona",
-        default=None,
-        help="Persona name injected as system message",
     )
     parser.add_argument(
         "--instructions",
@@ -1068,24 +1054,21 @@ def main():
     )
 
     # Detect or use provided model
-    if args.model:
-        model = args.model
-    else:
-        model = detect_model(client)
+    model = args.model or detect_model(client)
 
     # Set up global event queue for state-change broadcasts
-    global_queue: queue.Queue = queue.Queue()
-    global_listeners: list = []
+    global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    global_listeners: list[queue.Queue[dict[str, Any]]] = []
     global_listeners_lock = threading.Lock()
     WebUI._global_queue = global_queue
 
     # Session factory — captures shared config
-    def session_factory(ui):
+    def session_factory(ui: SessionUI | None) -> ChatSession:
+        assert ui is not None
         return ChatSession(
             client=client,
             model=model,
             ui=ui,
-            persona=args.persona,
             instructions=args.instructions,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -1104,10 +1087,12 @@ def main():
         name="default",
         ui_factory=lambda wid: WebUI(ws_id=wid),
     )
+    assert isinstance(ws.ui, WebUI)
     if args.skip_permissions:
         ws.ui.auto_approve = True
 
     # Handle --resume
+    assert ws.session is not None
     if args.resume:
         from turnstone.core.memory import resolve_session
 
@@ -1157,8 +1142,6 @@ def main():
 
     print(f"turnstone web server running on http://{args.host}:{args.port}")
     print(f"Model: {model}")
-    if args.persona:
-        print(f"Persona: {args.persona}")
     print("Press Ctrl+C to stop.")
 
     try:

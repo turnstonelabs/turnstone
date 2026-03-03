@@ -6,6 +6,8 @@ The console is read-only — it observes but does not own workstreams or drive L
 
 ## Architecture
 
+> See also: [Console Data Flow diagram](diagrams/png/11-console-data-flow.png)
+
 ```
 turnstone-server ──→ turnstone-bridge ──→ Redis ──→ turnstone-console ──→ Browser
      (per node)         (per node)       (shared)      (one instance)

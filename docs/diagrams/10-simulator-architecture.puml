@@ -1,0 +1,113 @@
+@startuml
+!theme plain
+title Turnstone — Simulator Architecture
+
+skinparam component {
+    BackgroundColor<<cluster>> #E1BEE7
+    BackgroundColor<<node>> #CE93D8
+    BackgroundColor<<engine>> #F3E5F5
+    BackgroundColor<<scenario>> #FFF3E0
+    BackgroundColor<<metrics>> #E8F5E9
+    BackgroundColor<<redis>> #FFCDD2
+}
+
+package "SimCluster" as cluster <<cluster>> {
+
+    component [**ThreadPoolExecutor**\nmax_workers=64\n(blocking Redis ops)] as executor <<cluster>>
+
+    component [**redis.ConnectionPool**\nmax_connections=64\ndecode_responses=True\n(shared across all nodes)] as pool <<redis>>
+
+    package "InboundDispatchers" {
+        component [**Dispatcher 0**\nnodes 0-49] as d0
+        component [**Dispatcher 1**\nnodes 50-99] as d1
+        component [**...**\n(ceil(N/50) total)] as dn
+
+        note bottom of d0
+            Each dispatcher calls BLPOP on a single Redis
+            connection for up to 50 node queues + shared queue.
+            Keys: [prefix:inbound:sim-0000, ..., prefix:inbound]
+            Per-node keys have BLPOP priority over shared.
+        end note
+    }
+
+    package "SimNodes (N instances)" {
+        component [**SimNode sim-0000**] as n0 <<node>>
+        component [**SimNode sim-0001**] as n1 <<node>>
+        component [**...**] as nn <<node>>
+
+        component [**SimEngine**\n(per node, seeded RNG)\n\nLLM simulation:\n  gaussian(μ=2s, σ=0.5s) latency\n  gaussian(μ=200, σ=50) tokens\n  random word content\n  P(tool_calls) = 0.6/0.3\n\nTool simulation:\n  gaussian(μ=0.5s, σ=0.2s) latency\n  P(failure) = 0.02] as engine <<engine>>
+
+        component [**SimWorkstream**\n(0..max_ws per node)\n\nState: idle→thinking→running→idle\nToken accounting: word_count × 3\nContent: 8-chunk streaming] as ws <<node>>
+    }
+
+    component [**MetricsCollector**\n(thread-safe, shared)\n\nTracks: turn latencies,\nthroughput, utilization,\nerrors, node kills] as metrics <<metrics>>
+}
+
+package "Scenarios (5 workload patterns)" <<scenario>> {
+    component [**SteadyState**\nConstant rate:\n1/mps interval\nfor duration secs] as steady <<scenario>>
+
+    component [**Burst**\nburst_size messages\nas fast as possible\nthen wait] as burst <<scenario>>
+
+    component [**NodeFailure**\nSteadyState + periodic\nnode kills (up to N/2)] as failure <<scenario>>
+
+    component [**Directed**\nMessages targeted to\nspecific nodes via\ntarget_node field] as directed <<scenario>>
+
+    component [**Lifecycle**\n3 phases:\n1. Create workstreams\n2. Send messages\n3. Close half] as lifecycle <<scenario>>
+}
+
+database "Redis" as redis <<redis>>
+
+' Scenario -> Redis
+steady --> redis : RPUSH prefix:inbound\n(SendMessage)
+burst --> redis : RPUSH prefix:inbound\n(burst)
+failure --> redis : RPUSH prefix:inbound
+directed --> redis : RPUSH prefix:inbound:{node}\n(directed)
+lifecycle --> redis : RPUSH prefix:inbound\n(Create/Send/Close)
+
+' Dispatchers -> Redis -> Nodes
+d0 --> redis : BLPOP [per-node..., shared]
+d1 --> redis : BLPOP [per-node..., shared]
+d0 --> n0 : handle_message(raw)
+d0 --> n1 : handle_message(raw)
+
+' Nodes internal
+n0 --> engine : simulate_llm_response()\nsimulate_tool_execution()
+n0 --> ws : process_turn()
+
+' Nodes -> Redis (events)
+n0 --> redis : PUBLISH prefix:events:global\n(StateChangeEvent)
+n0 --> redis : PUBLISH prefix:events:{ws_id}\n(ContentEvent, ToolResultEvent, ...)
+n0 --> redis : PUBLISH prefix:events:cluster\n(ClusterStateEvent)
+n0 --> redis : SET prefix:node:sim-0000\nEX 60 (heartbeat)
+n0 --> redis : SET prefix:ws:{ws_id}\n(ownership)
+
+' Shared pool
+n0 ..> pool : PooledBroker\n(shared connection)
+n1 ..> pool : PooledBroker
+d0 ..> pool
+d0 ..> executor : asyncio.to_thread()
+
+' Metrics
+ws --> metrics : record_turn(ws_id, node_id, latency)
+steady --> metrics : record_inject()
+burst --> metrics : record_inject()
+directed --> metrics : record_inject()
+lifecycle --> metrics : record_inject()
+cluster --> metrics : record_node_kill(node_id)
+cluster --> metrics : snapshot_utilization()\n(every metrics_interval)
+
+note bottom of cluster
+    **SimConfig** controls all simulation parameters:
+    num_nodes, max_ws_per_node, redis settings,
+    llm_latency_mean/stddev, tool_failure_rate,
+    scenario, duration, messages_per_second, seed
+end note
+
+note right of redis
+    Simulator uses **real Redis** —
+    not a mock. Console dashboard
+    can monitor a running simulation
+    via the same cluster channel.
+end note
+
+@enduml
