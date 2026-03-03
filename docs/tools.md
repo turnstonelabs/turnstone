@@ -1,8 +1,10 @@
 # Tools Reference
 
-turnstone exposes 14 tools to the LLM via the OpenAI function-calling interface.
-Each tool is defined as a JSON file under `turnstone/tools/` and loaded at startup
-by `turnstone/core/tools.py`.
+turnstone exposes 14 built-in tools plus any number of external MCP tools to the
+LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
+files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
+MCP tools are discovered from configured MCP servers at startup by
+`turnstone/core/mcp_client.py`.
 
 ---
 
@@ -400,3 +402,98 @@ Remove a persistent memory by key.
 | `remember`   | Memory     | Yes          | No    | No         | `key`       |
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
 | `forget`     | Memory     | Yes          | No    | No         | `key`       |
+
+---
+
+## MCP Tools (External)
+
+Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/)
+(MCP) for connecting external tool servers — GitHub, databases, filesystems, or any
+MCP-compatible service.
+
+### How it works
+
+1. **Configuration**: MCP servers are defined in `config.toml` under `[mcp.servers.*]`
+   sections, or via a standard MCP JSON config file (`--mcp-config`).
+
+2. **Discovery**: At startup, `MCPClientManager` connects to each configured server
+   (via stdio subprocess or HTTP), performs the MCP `initialize` handshake, and calls
+   `tools/list` to discover available tools.
+
+3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
+   function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
+
+4. **Merging**: MCP tools are appended after the 14 built-in tools via
+   `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
+
+5. **Dispatch**: When the LLM calls an MCP tool, `_prepare_mcp_tool()` builds a
+   generic approval preview and `_exec_mcp_tool()` calls `MCPClientManager.call_tool_sync()`,
+   which dispatches the call to the background asyncio event loop.
+
+### Approval behavior
+
+MCP tools **require user approval by default** (`needs_approval: True`). turnstone
+does not auto-approve MCP tools based on their schema, since it cannot guarantee
+that external tools are read-only. However, global overrides such as
+`--skip-permissions` or the UI's "always allow" setting will auto-approve all
+tools, including MCP tools.
+
+### Sub-agent availability
+
+MCP tools are available to:
+- **Main session** — full access
+- **Task sub-agents** — via `self._task_tools` (merged list)
+- **Plan sub-agents** — via `self._agent_tools` (merged list)
+
+### Naming convention
+
+MCP tool names follow the pattern `mcp__{server}__{original}`:
+
+- `mcp__github__search_repos` — `search_repos` tool from `github` server
+- `mcp__postgres__query` — `query` tool from `postgres` server
+
+Server names must not contain `__` (double underscore), which is reserved as the
+delimiter. Servers with `__` in their name are rejected at connection time.
+
+### Configuration
+
+**TOML** (`~/.config/turnstone/config.toml`):
+
+```toml
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp.servers.github.env]
+GITHUB_TOKEN = "ghp_..."
+
+[mcp.servers.remote]
+type = "http"
+url = "https://mcp.example.com/mcp"
+```
+
+**JSON** (standard `mcpServers` format, via `--mcp-config`):
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_TOKEN": "ghp_..."}
+    }
+  }
+}
+```
+
+### Introspection
+
+Use the `/mcp` slash command to list all connected MCP tools:
+
+```
+/mcp
+MCP tools (3):
+  mcp__github__search_repos  [MCP: github] Search GitHub repositories
+  mcp__github__create_issue  [MCP: github] Create a GitHub issue
+  mcp__postgres__query       [MCP: postgres] Run a SQL query
+```

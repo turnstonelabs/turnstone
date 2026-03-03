@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["openai>=2.24", "httpx>=0.28"]
+dependencies = ["openai>=2.24", "httpx>=0.28", "mcp>=1.6"]
 
 [project.urls]
 Homepage = "https://github.com/turnstonelabs/turnstone"
@@ -34,6 +34,7 @@ dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
 mq = ["redis>=7.2"]
 console = ["redis>=7.2"]
 sim = ["redis>=7.2"]
+
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
@@ -97,6 +98,10 @@ exclude_lines = [
 
 [[tool.mypy.overrides]]
 module = ["sympy", "sympy.*", "numpy", "numpy.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

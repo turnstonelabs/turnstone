@@ -34,6 +34,7 @@ package "turnstone/core/" <<Rectangle>> {
     component [edit.py\nFile editing] as edit <<core>>
     component [web.py\nWeb helpers] as web <<core>>
     component [auth.py\nAuthentication] as auth <<core>>
+    component [mcp_client.py\nMCPClientManager] as mcp <<core>>
 }
 
 ' MQ subsystem
@@ -105,6 +106,8 @@ session --> safety
 session --> sandbox
 session --> edit
 session --> web
+session --> mcp : optional
+mcp --> config
 tools --> schemas
 
 ' MQ dependencies
