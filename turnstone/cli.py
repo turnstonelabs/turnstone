@@ -184,6 +184,9 @@ class TerminalUI(SessionUI):
     def on_tool_result(self, name: str, output: str) -> None:
         pass  # Optional: display summary
 
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        pass  # Terminal shows spinner during tool execution
+
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
@@ -322,6 +325,10 @@ class WorkstreamTerminalUI(TerminalUI):
     def on_tool_result(self, name: str, output: str) -> None:
         if self.is_foreground:
             super().on_tool_result(name, output)
+
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        if self.is_foreground:
+            super().on_tool_output_chunk(call_id, chunk)
 
     def on_plan_review(self, content: str) -> str:
         # Must wait until foregrounded to show plan review

@@ -138,6 +138,8 @@ Phase 3: EXECUTE (parallel)
     run_one(items[0])
   else:
     ThreadPoolExecutor(max_workers=4).map(run_one, items)
+  Bash tool streams stdout line-by-line via ui.on_tool_output_chunk()
+  Final output (stdout + stderr) delivered via ui.on_tool_result()
   For plan tool: post-execution gate via ui.on_plan_review()
 ```
 
@@ -174,7 +176,7 @@ The engine emits state changes via `_emit_state()` which calls
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
 
-Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 13
+Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 14
 methods. Every frontend must implement all of them.
 
 ```python
@@ -186,6 +188,7 @@ class SessionUI(Protocol):
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict]) -> tuple[bool, str | None]: ...
     def on_tool_result(self, name: str, output: str) -> None: ...
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict, context_window: int, effort: str) -> None: ...
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...

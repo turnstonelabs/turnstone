@@ -68,6 +68,9 @@ class NullUI:
     def on_tool_result(self, name: str, output: str) -> None:
         pass
 
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        pass
+
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         pass
 

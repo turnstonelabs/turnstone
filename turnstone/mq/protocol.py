@@ -196,6 +196,15 @@ class ApprovalRequestEvent(OutboundEvent):
 
 
 @dataclass
+class ToolOutputChunkEvent(OutboundEvent):
+    """Incremental streaming output from a bash tool."""
+
+    type: str = "tool_output_chunk"
+    call_id: str = ""
+    chunk: str = ""
+
+
+@dataclass
 class ToolResultEvent(OutboundEvent):
     """Tool execution result."""
 
@@ -368,6 +377,7 @@ _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
         ReasoningEvent,
         ToolInfoEvent,
         ApprovalRequestEvent,
+        ToolOutputChunkEvent,
         ToolResultEvent,
         PlanReviewEvent,
         StatusEvent,

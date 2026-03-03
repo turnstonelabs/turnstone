@@ -90,6 +90,9 @@ class RecordingUI:
     def on_tool_result(self, name, output):
         self.tool_results.append((name, output))
 
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
     def on_status(self, usage, context_window, effort):
         self.events.append(("status",))
 

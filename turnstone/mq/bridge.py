@@ -39,6 +39,7 @@ from turnstone.mq.protocol import (
     StatusEvent,
     StreamEndEvent,
     ToolInfoEvent,
+    ToolOutputChunkEvent,
     ToolResultEvent,
     TurnCompleteEvent,
     WorkstreamClosedEvent,
@@ -434,6 +435,15 @@ class Bridge:
             self._handle_approval(ws_id, data)
         elif etype == "plan_review":
             self._handle_plan_review(ws_id, data)
+        elif etype == "tool_output_chunk":
+            self._publish_ws(
+                ws_id,
+                ToolOutputChunkEvent(
+                    ws_id=ws_id,
+                    call_id=data.get("call_id", ""),
+                    chunk=data.get("chunk", ""),
+                ),
+            )
         elif etype == "tool_result":
             self._publish_ws(
                 ws_id,
