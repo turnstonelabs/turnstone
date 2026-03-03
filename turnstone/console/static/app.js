@@ -197,9 +197,14 @@ function loadOverview() {
 
 // --- Status Bar ---
 function renderStatusBar(overview) {
-  var json = JSON.stringify(overview);
-  if (json === _lastOverviewJson) return;
-  _lastOverviewJson = json;
+  var cacheKey =
+    JSON.stringify(overview) +
+    "|" +
+    currentView +
+    "|" +
+    (currentFilter.state || "");
+  if (cacheKey === _lastOverviewJson) return;
+  _lastOverviewJson = cacheKey;
 
   var states = overview.states || {};
   var agg = overview.aggregate || {};
@@ -454,7 +459,7 @@ function renderNodeGroups(nodes, total) {
     var groupEl = document.createElement("div");
     groupEl.className = "node-group";
     var isExpanded = !!expandedGroups[group.prefix];
-    groupEl.setAttribute("role", "treeitem");
+    groupEl.setAttribute("role", "listitem");
     groupEl.setAttribute("aria-expanded", String(isExpanded));
 
     // Group header
