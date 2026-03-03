@@ -37,3 +37,14 @@ TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_a
 AGENT_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
+
+
+def merge_mcp_tools(
+    builtin: list[dict[str, Any]], mcp_tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge built-in tools with MCP tools.
+
+    Built-in tools come first so the LLM sees them with natural priority.
+    Returns a new list; neither input is mutated.
+    """
+    return builtin + mcp_tools

@@ -2,8 +2,8 @@
 
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
 memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) and
-gives the model 14 tools for reading, writing, searching, planning, and
-executing code.
+gives the model 14 built-in tools plus external tools via MCP (Model Context
+Protocol) for reading, writing, searching, planning, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.
 The engine (`ChatSession`) drives the conversation loop -- streaming, tool
@@ -34,6 +34,7 @@ turnstone/
     session.py        ChatSession engine, SessionUI protocol, tool dispatch
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
+    mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
     memory.py         SQLite persistence (conversations, memories, FTS5 search)
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
@@ -379,6 +380,7 @@ from each schema and builds:
 - `TASK_AGENT_TOOLS` -- subset with `task_agent: true`
 - `AGENT_AUTO_TOOLS` / `TASK_AUTO_TOOLS` -- sets of tool names with `auto_approve: true`
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
+- `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 
 ### 14 Tools by Category
 
@@ -425,8 +427,8 @@ separation allows the UI to show previews before any side effects occur.
 a subset of tools and its own system prompt. The sub-agent runs
 independently, then returns the final content as the tool result.
 
-- **task**: uses `TASK_AGENT_TOOLS` (includes bash, read, write, edit, search)
-- **plan**: uses `AGENT_TOOLS` (read-only subset for exploration). Writes output
+- **task**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
+- **plan**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
   to `.plan-<session_id>.md` — unique per `ChatSession` so concurrent workstreams
   don't collide. On repeat invocations the prior `plan` tool call and its result
   are forwarded from `self.messages` so the agent refines the existing plan rather
@@ -441,6 +443,29 @@ independently, then returns the final content as the tool result.
 - **Finish reason handling**: `finish_reason: "length"` stops the agent early
   and returns whatever content was generated. `finish_reason: "content_filter"`
   returns a placeholder.
+
+### MCP Tool Integration
+
+`MCPClientManager` (`turnstone/core/mcp_client.py`) connects to external MCP servers
+and exposes their tools alongside built-in tools. The MCP SDK is fully async; turnstone
+bridges this with a background asyncio event loop in a daemon thread.
+
+**Lifecycle:**
+1. `create_mcp_client()` reads server configs from TOML or JSON
+2. `MCPClientManager.start()` launches the background event loop thread
+3. `_connect_all()` connects to each server (stdio subprocess or HTTP), runs
+   `initialize()` + `list_tools()`, converts schemas to OpenAI format
+4. `ChatSession.__init__` receives the manager and builds `self._tools` (built-in + MCP)
+5. `_prepare_tool()` routes MCP tools to `_prepare_mcp_tool()` / `_exec_mcp_tool()`
+6. `_exec_mcp_tool()` calls `call_tool_sync()` which dispatches to the async loop
+   via `asyncio.run_coroutine_threadsafe()`
+
+**Tool naming:** `mcp__{server}__{tool}` — double underscore delimiter, validated
+at connection time (server names with `__` are rejected).
+
+**Error isolation:** Per-server connection failures are caught and logged; other
+servers still connect. Tool execution errors return error strings to the LLM
+rather than crashing the session.
 
 ### Tool Output Truncation
 
