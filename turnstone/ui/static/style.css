@@ -517,7 +517,7 @@ body {
 }
 @keyframes stream-pulse {
   0%, 100% { border-left-color: var(--accent); }
-  50% { border-left-color: rgba(229, 160, 66, 0.15); }
+  50% { border-left-color: var(--accent-dim); }
 }
 .tool-output.collapsed { max-height: 150px; position: relative; }
 .tool-output.collapsed::after {

@@ -66,6 +66,7 @@ class RecordingUI:
         self.content_tokens: list[str] = []
         self.reasoning_tokens: list[str] = []
         self.tool_results: list[tuple[str, str]] = []
+        self.tool_chunks: list[tuple[str, str]] = []
         self.errors: list[str] = []
         self.infos: list[str] = []
 
@@ -91,7 +92,7 @@ class RecordingUI:
         self.tool_results.append((name, output))
 
     def on_tool_output_chunk(self, call_id, chunk):
-        pass
+        self.tool_chunks.append((call_id, chunk))
 
     def on_status(self, usage, context_window, effort):
         self.events.append(("status",))
