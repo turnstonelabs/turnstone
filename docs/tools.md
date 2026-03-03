@@ -96,7 +96,7 @@ Each item's `execute` callable is invoked:
   combined output (stdout + stderr) is delivered via `ui.on_tool_result(call_id, name, output)`.
   The `call_id` links `tool_info`/`approve_request` items to their streaming chunks and
   final result, enabling correct routing when multiple bash tools run in parallel.
-  Other tools deliver results atomically via `on_tool_result()` only.
+  Other tools deliver results atomically via `ui.on_tool_result(call_id, name, output)` only.
 - Special post-execution gate for `plan`: the plan output is shown to the user
   for review, and the user can reject or annotate it.
 
