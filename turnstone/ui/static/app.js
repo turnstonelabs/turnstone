@@ -183,7 +183,12 @@ function submitLogin() {
               "",
               location.pathname,
             );
-            switchTab(targetWs);
+            _historyNavigation = true;
+            try {
+              switchTab(targetWs);
+            } finally {
+              _historyNavigation = false;
+            }
           } else {
             if (currentWsId) connectContentSSE(currentWsId);
             history.replaceState(
@@ -1917,7 +1922,12 @@ authFetch("/api/workstreams")
         "",
         location.pathname,
       );
-      switchTab(targetWs);
+      _historyNavigation = true;
+      try {
+        switchTab(targetWs);
+      } finally {
+        _historyNavigation = false;
+      }
     } else {
       if (currentWsId) connectContentSSE(currentWsId);
       history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
