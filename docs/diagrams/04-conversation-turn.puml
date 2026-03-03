@@ -109,7 +109,7 @@ group loop [while tool_calls present]
 
         note right of TP
           Parallel execution:
-          bash → subprocess.run()
+          bash → Popen + line-by-line streaming
           read_file → open().read()
           search → grep subprocess
           edit_file → string replace
@@ -121,8 +121,10 @@ group loop [while tool_calls present]
         end note
 
         note right of TP
-          on_tool_result() called
-          inside each _exec_* handler
+          bash: on_tool_output_chunk()
+          called per stdout line,
+          then on_tool_result() at end.
+          Other tools: on_tool_result() only.
         end note
 
         TP --> CS : [(call_id, output), ...]

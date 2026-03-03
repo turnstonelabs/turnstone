@@ -115,6 +115,7 @@ partition "Phase 3: Execute" #E3F2FD {
 
     :_truncate_output() on each result\n(max context_window × chars_per_token × 0.5 chars\ndefault: ~context_window × 2 chars);
 
+    :bash: ui.on_tool_output_chunk(call_id, line) per stdout line;
     :ui.on_tool_result(name, output) for each;
 
     if (plan tool was executed?) then (yes)

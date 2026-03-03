@@ -208,6 +208,9 @@ class WebUI:
         self._broadcast_activity()
         self._enqueue({"type": "tool_result", "name": name, "output": output})
 
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
+        self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
+
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0

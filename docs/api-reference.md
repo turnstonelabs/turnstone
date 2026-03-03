@@ -173,7 +173,13 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 | `needs_approval` | bool        | Whether this call requires explicit approval     |
 | `error`          | string/null | Error description if the call was malformed      |
 
-**`tool_result`** -- output from a completed tool execution.
+**`tool_output_chunk`** -- incremental streaming output from a bash tool execution. Sent line-by-line as stdout is produced. The `call_id` identifies the specific tool invocation (multiple bash tools may run in parallel).
+
+```json
+{"type": "tool_output_chunk", "call_id": "call_abc123", "chunk": "Building project...\n"}
+```
+
+**`tool_result`** -- final output from a completed tool execution. For bash tools, this arrives after all `tool_output_chunk` events and includes both stdout and stderr.
 
 ```json
 {"type": "tool_result", "name": "bash", "output": "file1.py\nfile2.py\n"}

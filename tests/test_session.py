@@ -30,6 +30,9 @@ class NullUI:
     def on_tool_result(self, name, output):
         pass
 
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
     def on_status(self, usage, context_window, effort):
         pass
 
