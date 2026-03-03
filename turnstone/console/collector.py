@@ -143,11 +143,13 @@ class ClusterCollector:
 
             elif etype == "ws_created" and node_id:
                 if node_id in self._nodes:
-                    self._nodes[node_id].workstreams[ws_id] = {
+                    node = self._nodes[node_id]
+                    node.workstreams[ws_id] = {
                         "id": ws_id,
                         "name": data.get("name", ""),
                         "state": "idle",
                         "node": node_id,
+                        "server_url": node.server_url,
                         "title": "",
                         "tokens": 0,
                         "context_ratio": 0.0,
@@ -283,6 +285,7 @@ class ClusterCollector:
             node.workstreams = {}
             for ws in ws_list:
                 ws["node"] = node_id
+                ws["server_url"] = node.server_url
                 node.workstreams[ws.get("id", "")] = ws
 
     # -- query methods (thread-safe) -----------------------------------------

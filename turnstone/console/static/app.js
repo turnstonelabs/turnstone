@@ -37,6 +37,7 @@ function authFetch(url, opts) {
 // --- State ---
 var currentView = "overview"; // "overview" | "node" | "filtered"
 var currentNodeId = null;
+var currentServerUrl = "";
 var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
 var expandedGroups = {};
 var _lastOverviewJson = "";
@@ -160,6 +161,7 @@ function handleClusterEvent(data) {
 function showOverview() {
   currentView = "overview";
   currentNodeId = null;
+  currentServerUrl = "";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
   document.getElementById("view-overview").style.display = "";
   document.getElementById("view-node").style.display = "none";
@@ -583,15 +585,19 @@ function renderNodeGroups(nodes, total) {
 function drillDownToNode(nodeId, serverUrl) {
   currentView = "node";
   currentNodeId = nodeId;
+  currentServerUrl = serverUrl || "";
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "";
   document.getElementById("view-filtered").style.display = "none";
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
+  var link = document.getElementById("node-link");
   if (serverUrl) {
-    var link = document.getElementById("node-link");
     link.href = serverUrl;
     link.style.display = "";
+  } else {
+    link.removeAttribute("href");
+    link.style.display = "none";
   }
   document.getElementById("main").scrollTop = 0;
   document.getElementById("node-ws-table").innerHTML =
@@ -816,6 +822,28 @@ function renderWsTable(container, wsList) {
     if (ws.activity_state === "approval") sub.classList.add("sub-attention");
     sub.textContent = ws.activity || "";
     row.appendChild(sub);
+
+    // Deep link: click opens server UI at this workstream
+    var wsServerUrl = ws.server_url || currentServerUrl;
+    if (wsServerUrl) {
+      row.classList.add("has-link");
+      (function (url, wsId) {
+        row.onclick = function () {
+          var target = new URL(url);
+          target.searchParams.set("ws_id", wsId);
+          window.open(target.href, "_blank", "noopener");
+        };
+        row.onkeydown = function (e) {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            row.onclick();
+          }
+        };
+      })(wsServerUrl, ws.id);
+    } else {
+      row.removeAttribute("role");
+      row.removeAttribute("tabindex");
+    }
 
     container.appendChild(row);
   });
