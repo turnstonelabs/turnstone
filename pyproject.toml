@@ -29,7 +29,7 @@ Repository = "https://github.com/turnstonelabs/turnstone"
 Issues = "https://github.com/turnstonelabs/turnstone/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=9.0"]
+test = ["pytest>=9.0", "pytest-cov>=6.0"]
 dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
 mq = ["redis>=7.2"]
 console = ["redis>=7.2"]
@@ -79,6 +79,21 @@ disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
 no_implicit_optional = true
+
+[tool.coverage.run]
+source = ["turnstone"]
+branch = true
+omit = ["turnstone/*/static/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING",
+    "raise NotImplementedError",
+    'if __name__ == "__main__"',
+]
 
 [[tool.mypy.overrides]]
 module = ["sympy", "sympy.*", "numpy", "numpy.*"]
