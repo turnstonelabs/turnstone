@@ -21,7 +21,7 @@ def main() -> None:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            if data.get("status") == "ok":
+            if data.get("status") in ("ok", "degraded"):
                 sys.exit(0)
             print(f"Unhealthy: {data}", file=sys.stderr)
             sys.exit(1)

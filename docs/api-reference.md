@@ -594,6 +594,29 @@ Status code: `200` with an empty body.
 | Unknown path (GET or POST)         | `404` with plain-text body `Not found`                     |
 | Empty `message` on `/api/send`     | `400` with `{"error": "Empty message"}`                    |
 | Empty `command` on `/api/command`  | `400` with `{"error": "Empty command"}`                    |
+| Rate limit exceeded                | `429` with `Retry-After` header (see below)                |
+
+### `429 Too Many Requests`
+
+Returned when the per-IP rate limiter rejects a request. `/health` and
+`/metrics` are exempt.
+
+**Response headers:**
+
+```
+Retry-After: 2
+```
+
+**Response body:**
+
+```json
+{"error": "Rate limit exceeded", "retry_after": 2}
+```
+
+| Field         | Type   | Description                                    |
+|---------------|--------|------------------------------------------------|
+| `error`       | string | `"Rate limit exceeded"`                        |
+| `retry_after` | number | Seconds until the client should retry          |
 
 ---
 
@@ -621,15 +644,16 @@ same reconnection strategy applies to both the per-workstream SSE stream
 ### `GET /health`
 
 Returns server health status. Always returns `200 OK` while the server process
-is running. Suitable for load-balancer health checks and Kubernetes liveness
-probes.
+is running. `"status": "degraded"` indicates the server is up but the LLM
+backend is unreachable. Suitable for load-balancer health checks and Kubernetes
+liveness probes.
 
 **Response:** `application/json`
 
 ```json
 {
   "status": "ok",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "uptime_seconds": 3614.72,
   "model": "llama-3.1-70b-instruct",
   "workstreams": {
@@ -639,13 +663,17 @@ probes.
     "running": 0,
     "attention": 0,
     "error": 0
+  },
+  "backend": {
+    "status": "up",
+    "circuit_state": "closed"
   }
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | Always `"ok"` while server is running |
+| `status` | string | `"ok"` or `"degraded"` (degraded when backend unreachable) |
 | `version` | string | turnstone server version |
 | `uptime_seconds` | number | Seconds since the server process started |
 | `model` | string | Model name detected or configured at startup |
@@ -655,6 +683,8 @@ probes.
 | `workstreams.running` | integer | Workstreams executing tools |
 | `workstreams.attention` | integer | Workstreams blocked on approval or plan review |
 | `workstreams.error` | integer | Workstreams in error state |
+| `backend.status` | string | `"up"` or `"down"` — LLM backend reachability |
+| `backend.circuit_state` | string | `"closed"`, `"open"`, or `"half_open"` |
 
 ---
 
@@ -691,6 +721,11 @@ scrape_configs:
 | `turnstone_tool_calls_total` | counter | `tool` | Tool executions by name (e.g. `tool="bash"`) |
 | `turnstone_errors_total` | counter | — | Errors reported by workstreams |
 | `turnstone_context_window_used_ratio` | gauge | — | Last known fraction of context window in use (0.0–1.0) |
+| `turnstone_sse_connections_active` | gauge | — | Number of open SSE connections |
+| `turnstone_ratelimit_rejected_total` | counter | — | Requests rejected by the per-IP rate limiter |
+| `turnstone_backend_up` | gauge | — | LLM backend reachability (1 = up, 0 = down) |
+| `turnstone_circuit_state` | gauge | — | Circuit breaker state (0 = closed, 1 = open, 2 = half_open) |
+| `turnstone_workstreams_evicted_total` | counter | — | Workstreams auto-evicted when at capacity |
 
 #### Example output
 

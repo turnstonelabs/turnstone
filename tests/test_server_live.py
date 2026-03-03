@@ -736,3 +736,139 @@ class TestServerHealthMetrics:
     def test_unknown_endpoint_returns_404(self):
         status, _, _ = self._get("/does-not-exist")
         assert status == 404
+
+    def test_health_contains_backend_field(self):
+        _, _, body = self._get("/health")
+        data = json.loads(body)
+        assert "backend" in data
+        assert data["backend"]["status"] in ("up", "down")
+        assert data["backend"]["circuit_state"] in ("closed", "open", "half_open")
+
+    def test_metrics_contains_sse_connections(self):
+        _, _, body = self._get("/metrics")
+        assert "turnstone_sse_connections_active" in body
+
+    def test_metrics_contains_ratelimit_counter(self):
+        _, _, body = self._get("/metrics")
+        assert "turnstone_ratelimit_rejected_total" in body
+
+    def test_metrics_contains_backend_up(self):
+        _, _, body = self._get("/metrics")
+        assert "turnstone_backend_up" in body
+
+    def test_metrics_contains_circuit_state(self):
+        _, _, body = self._get("/metrics")
+        assert "turnstone_circuit_state" in body
+
+    def test_metrics_contains_eviction_counter(self):
+        _, _, body = self._get("/metrics")
+        assert "turnstone_workstreams_evicted_total" in body
+
+
+class TestServerRateLimiting:
+    """Verify per-IP rate limiting returns 429 with Retry-After header.
+
+    Spins up a real HTTP server with a tight rate limiter (rate=2, burst=3)
+    and verifies that requests beyond the burst are rejected.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        from unittest.mock import MagicMock
+
+        import turnstone.server as srv_mod
+        from turnstone.core.metrics import MetricsCollector
+        from turnstone.core.ratelimit import RateLimiter
+        from turnstone.core.workstream import WorkstreamState
+
+        srv_mod._metrics = MetricsCollector()
+        srv_mod._metrics.model = "test-model"
+
+        mock_ui = MagicMock()
+        mock_ui._ws_lock = threading.Lock()
+        mock_ui._ws_prompt_tokens = 0
+        mock_ui._ws_completion_tokens = 0
+        mock_ui._ws_messages = 0
+        mock_ui._ws_tool_calls = {}
+        mock_ui._ws_context_ratio = 0.0
+
+        mock_session = MagicMock()
+        mock_session.session_id = "test-session-id"
+
+        mock_ws = MagicMock()
+        mock_ws.id = "test-ws"
+        mock_ws.name = "test"
+        mock_ws.state = WorkstreamState.IDLE
+        mock_ws.ui = mock_ui
+        mock_ws.session = mock_session
+
+        mock_mgr = MagicMock()
+        mock_mgr.list_all.return_value = [mock_ws]
+
+        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
+        from turnstone.core.auth import AuthConfig
+
+        cls.server.workstreams = mock_mgr
+        cls.server.skip_permissions = False
+        cls.server.global_listeners = []
+        cls.server.global_queue = queue.Queue()
+        cls.server.global_listeners_lock = threading.Lock()
+        cls.server.auth_config = AuthConfig()
+        cls.server.rate_limiter = RateLimiter(enabled=True, rate=2.0, burst=3)
+
+        port = cls.server.server_address[1]
+        cls.base = f"http://127.0.0.1:{port}"
+
+        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls._thread.start()
+
+    @classmethod
+    def teardown_class(cls):
+        cls.server.shutdown()
+        cls._thread.join(timeout=5)
+
+    def _get(self, path) -> httpx.Response:
+        return httpx.get(self.base + path, timeout=5)
+
+    def test_burst_requests_succeed(self):
+        """First burst requests should all succeed."""
+        for _ in range(3):
+            resp = self._get("/health")
+            assert resp.status_code == 200
+
+    def test_exceeded_rate_returns_429(self):
+        """After exhausting burst on a non-exempt endpoint, get 429."""
+        # Exhaust burst on a non-exempt endpoint
+        for _ in range(5):
+            self._get("/api/workstreams")
+        # At least one should be 429
+        statuses = [self._get("/api/workstreams").status_code for _ in range(3)]
+        assert 429 in statuses
+
+    def test_429_includes_retry_after(self):
+        """429 response includes Retry-After header."""
+        # Burn through burst
+        for _ in range(10):
+            resp = self._get("/api/workstreams")
+            if resp.status_code == 429:
+                assert "retry-after" in resp.headers
+                data = resp.json()
+                assert "retry_after" in data
+                return
+        pytest.skip("Did not hit rate limit in 10 requests")
+
+    def test_health_exempt_from_ratelimit(self):
+        """Health endpoint is always accessible regardless of rate limit."""
+        # Burn through bucket on non-exempt path
+        for _ in range(10):
+            self._get("/api/workstreams")
+        # Health should still work
+        resp = self._get("/health")
+        assert resp.status_code == 200
+
+    def test_metrics_exempt_from_ratelimit(self):
+        """Metrics endpoint is always accessible regardless of rate limit."""
+        for _ in range(10):
+            self._get("/api/workstreams")
+        resp = self._get("/metrics")
+        assert resp.status_code == 200

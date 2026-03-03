@@ -28,6 +28,7 @@
   <h1>turnstone</h1>
   <span id="model-name"></span>
   <span id="status-bar"></span>
+  <span id="health-indicator" class="health-ok" role="status" aria-live="polite" aria-atomic="true"></span>
   <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
 </div>
 
@@ -87,6 +88,7 @@
   <button id="send-btn" onclick="sendMessage()">Send</button>
 </div>
 
+<div id="toast" role="status" aria-live="polite"></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

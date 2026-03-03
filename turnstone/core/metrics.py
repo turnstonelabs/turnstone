@@ -27,6 +27,12 @@ class MetricsCollector:
         self._req_duration: dict[tuple[str, str], dict[str, Any]] = {}
         # gauge
         self._context_ratio: float = 0.0
+        self._sse_connections: int = 0  # gauge: active SSE connections
+        self._backend_up: bool = True  # gauge: 1 if up, 0 if down
+        self._circuit_state: int = 0  # gauge: 0=closed, 1=open, 2=half_open
+        # counters (continued)
+        self._ratelimit_rejects: int = 0  # counter: total 429 responses
+        self._evictions: int = 0  # counter: workstreams evicted
 
     def record_request(self, method: str, endpoint: str, status: int, duration: float) -> None:
         with self._lock:
@@ -65,6 +71,31 @@ class MetricsCollector:
     def record_context_ratio(self, ratio: float) -> None:
         with self._lock:
             self._context_ratio = ratio
+
+    def record_sse_connect(self) -> None:
+        with self._lock:
+            self._sse_connections += 1
+
+    def record_sse_disconnect(self) -> None:
+        with self._lock:
+            self._sse_connections = max(0, self._sse_connections - 1)
+
+    def record_ratelimit_reject(self) -> None:
+        with self._lock:
+            self._ratelimit_rejects += 1
+
+    def set_backend_status(self, up: bool) -> None:
+        with self._lock:
+            self._backend_up = up
+
+    def set_circuit_state(self, state: int) -> None:
+        """0=closed, 1=open, 2=half_open."""
+        with self._lock:
+            self._circuit_state = state
+
+    def record_eviction(self) -> None:
+        with self._lock:
+            self._evictions += 1
 
     def generate_text(
         self,
@@ -107,11 +138,18 @@ class MetricsCollector:
             errors = self._errors
             req_duration = {k: dict(v) for k, v in self._req_duration.items()}
             context_ratio = self._context_ratio
+            sse_connections = self._sse_connections
+            ratelimit_rejects = self._ratelimit_rejects
+            backend_up = self._backend_up
+            circuit_state = self._circuit_state
+            evictions = self._evictions
 
         # turnstone_build_info
         lines.append("# HELP turnstone_build_info Server version and model info")
         lines.append("# TYPE turnstone_build_info gauge")
-        lines.append(f'turnstone_build_info{{version="0.2.0",model="{model}"}} 1')
+        from turnstone import __version__
+
+        lines.append(f'turnstone_build_info{{version="{__version__}",model="{model}"}} 1')
 
         # turnstone_uptime_seconds
         gauge("turnstone_uptime_seconds", "Server uptime in seconds", uptime)
@@ -182,6 +220,41 @@ class MetricsCollector:
             "turnstone_context_window_used_ratio",
             "Fraction of context window currently used (0.0 - 1.0)",
             context_ratio,
+        )
+
+        # turnstone_sse_connections_active
+        gauge(
+            "turnstone_sse_connections_active",
+            "Number of active SSE connections",
+            sse_connections,
+        )
+
+        # turnstone_ratelimit_rejected_total
+        counter(
+            "turnstone_ratelimit_rejected_total",
+            "Total requests rejected by rate limiter",
+            ratelimit_rejects,
+        )
+
+        # turnstone_backend_up
+        gauge(
+            "turnstone_backend_up",
+            "Whether the LLM backend is reachable (1=up, 0=down)",
+            1 if backend_up else 0,
+        )
+
+        # turnstone_circuit_state
+        gauge(
+            "turnstone_circuit_state",
+            "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+            circuit_state,
+        )
+
+        # turnstone_workstreams_evicted_total
+        counter(
+            "turnstone_workstreams_evicted_total",
+            "Total workstreams evicted to make room for new ones",
+            evictions,
         )
 
         # Per-workstream metrics (only when data is provided)

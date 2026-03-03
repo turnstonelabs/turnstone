@@ -23,15 +23,25 @@ function toggleTheme() {
       document.documentElement.dataset.theme === "light" ? "\u2600" : "\u263E";
 })();
 
-/* Auth-aware fetch — shows login overlay on 401 */
-function authFetch(url, opts) {
-  return fetch(url, opts).then(function (r) {
+/* Auth-aware fetch — shows login overlay on 401, retries on 429 */
+async function authFetch(url, opts) {
+  var maxRetries = 2;
+  for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    var r = await fetch(url, opts);
     if (r.status === 401) {
       showLogin();
       throw new Error("auth");
     }
+    if (r.status === 429 && attempt < maxRetries) {
+      var retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
+      showToast("Rate limited \u2014 retrying in " + retryAfter + "s");
+      await new Promise(function (resolve) {
+        setTimeout(resolve, retryAfter * 1000);
+      });
+      continue;
+    }
     return r;
-  });
+  }
 }
 
 // --- State ---
@@ -85,6 +95,36 @@ function formatUptime(seconds) {
 function formatCount(n) {
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
+}
+
+// --- Toast ---
+var _toastQueue = [];
+var _toastTimer = null;
+var _toastShowing = false;
+function showToast(message) {
+  var el = document.getElementById("toast");
+  if (!el) return;
+  if (_toastShowing) {
+    _toastQueue.push(message);
+    return;
+  }
+  _displayToast(el, message);
+}
+function _displayToast(el, message) {
+  el.textContent = message;
+  el.classList.add("visible");
+  _toastShowing = true;
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function () {
+    el.classList.remove("visible");
+    _toastShowing = false;
+    _toastTimer = null;
+    if (_toastQueue.length) {
+      setTimeout(function () {
+        _displayToast(el, _toastQueue.shift());
+      }, 300);
+    }
+  }, 4000);
 }
 
 // --- SSE Connection ---
@@ -154,6 +194,9 @@ function handleClusterEvent(data) {
     data.type === "node_lost"
   ) {
     scheduleRefresh();
+  }
+  if (data.type === "ws_closed" && data.reason === "evicted") {
+    showToast("Evicted" + (data.name ? ": " + data.name : "") + " (capacity)");
   }
 }
 
@@ -292,6 +335,7 @@ function groupNodes(nodes) {
         ws_idle: 0,
         total_tokens: 0,
         all_reachable: true,
+        any_degraded: false,
       };
       groupOrder.push(prefix);
     }
@@ -305,6 +349,7 @@ function groupNodes(nodes) {
     g.ws_idle += node.ws_idle || 0;
     g.total_tokens += node.total_tokens || 0;
     if (!node.reachable) g.all_reachable = false;
+    if (node.health && node.health.status === "degraded") g.any_degraded = true;
   });
   groupOrder.forEach(function (prefix) {
     groupMap[prefix].nodes.sort(function (a, b) {
@@ -346,7 +391,12 @@ function buildNodeRow(node) {
       " tokens",
   );
 
-  var dotClass = node.reachable ? "node-dot" : "node-dot unreachable";
+  var isDegraded = node.health && node.health.status === "degraded";
+  var dotClass = node.reachable
+    ? isDegraded
+      ? "node-dot degraded"
+      : "node-dot"
+    : "node-dot unreachable";
   var displayTokens = node.total_tokens || node.ws_tokens || 0;
   var maxWs = node.max_ws || 10;
   var healthPct =
@@ -362,11 +412,30 @@ function buildNodeRow(node) {
         '%"></span>'
       : "";
 
+  var circuitTitle = "";
+  if (node.health && node.health.backend) {
+    circuitTitle =
+      "backend: " +
+      node.health.backend.status +
+      ", circuit: " +
+      node.health.backend.circuit_state;
+  }
+  var degradedBadge = isDegraded
+    ? '<span class="node-degraded-badge" title="' +
+      escapeHtml(circuitTitle) +
+      '" aria-label="' +
+      escapeHtml(circuitTitle) +
+      '">degraded</span>'
+    : "";
+
   row.innerHTML =
-    '<span class="node-cell node-cell-name"><span class="' +
+    '<span class="node-cell node-cell-name"' +
+    (circuitTitle ? ' title="' + escapeHtml(circuitTitle) + '"' : "") +
+    '><span class="' +
     dotClass +
     '"></span>' +
     escapeHtml(node.node_id) +
+    degradedBadge +
     "</span>" +
     '<span class="node-cell node-cell-num' +
     (node.ws_total > 0 ? " has-value" : "") +
@@ -509,6 +578,10 @@ function renderNodeGroups(nodes, total) {
           '%"></span>'
         : "";
 
+    var groupDegradedBadge = group.any_degraded
+      ? '<span class="node-degraded-badge">degraded</span>'
+      : "";
+
     header.innerHTML =
       '<span class="node-group-name">' +
       '<span class="' +
@@ -518,6 +591,7 @@ function renderNodeGroups(nodes, total) {
       '<span class="node-group-badge">' +
       group.nodes.length +
       " nodes</span>" +
+      groupDegradedBadge +
       "</span>" +
       '<span class="node-group-cell num' +
       (group.ws_total > 0 ? " has-value" : "") +
