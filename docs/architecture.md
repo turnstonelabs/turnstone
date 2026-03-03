@@ -541,8 +541,18 @@ database rows:
 - Consecutive `tool_call` rows are grouped into one assistant message's
   `tool_calls` array, paired with subsequent `tool_result` rows via
   `tool_call_id` (or positional matching for legacy data)
+- **Interrupted session repair:** If the last assistant message has
+  `tool_calls` but fewer tool results than expected (session was
+  interrupted mid-execution), the incomplete turn is stripped so the
+  LLM can re-generate cleanly
 - The session adopts the old `_session_id`, so new messages continue in
   the same session
+
+**Config persistence:** LLM-affecting parameters (`temperature`,
+`reasoning_effort`, `max_tokens`, `instructions`, `creative_mode`) are
+persisted to the `session_config` table on creation and whenever changed
+via slash commands. `resume_session()` restores these values so resumed
+sessions behave identically to the original.
 
 **`/clear` vs `/new`:** `/clear` wipes in-memory context but preserves
 messages in the database for future resume. `/new` starts a fresh session

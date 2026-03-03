@@ -73,6 +73,12 @@ def open_db() -> sqlite3.Connection:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_alias ON sessions(alias)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated)")
+        # Session config — persists LLM-affecting parameters across resume
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_config "
+            "(session_id TEXT NOT NULL, key TEXT NOT NULL, value TEXT, "
+            "PRIMARY KEY (session_id, key))"
+        )
         try:
             # Check if FTS table already exists
             fts_exists = conn.execute(
@@ -513,6 +519,31 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
         else:
             i += 1
 
+    # Repair: strip trailing incomplete tool call turns.
+    # If an assistant message has tool_calls but fewer tool results follow
+    # than expected, the session was interrupted mid-execution.  Remove
+    # the incomplete turn so the LLM can re-generate cleanly.
+    while messages:
+        # Count trailing tool messages
+        tail_tools = 0
+        for j in range(len(messages) - 1, -1, -1):
+            if messages[j].get("role") == "tool":
+                tail_tools += 1
+            else:
+                break
+        # Check the assistant message that should precede them
+        asst_idx = len(messages) - 1 - tail_tools
+        if asst_idx < 0:
+            break
+        asst = messages[asst_idx]
+        if asst.get("role") != "assistant" or not asst.get("tool_calls"):
+            break
+        if tail_tools >= len(asst["tool_calls"]):
+            break  # complete turn, nothing to repair
+        # Incomplete: remove partial tool messages + the assistant message
+        del messages[asst_idx:]
+        # Loop to check for nested incomplete turns
+
     return messages
 
 
@@ -526,6 +557,10 @@ def delete_session(session_id: str) -> bool:
                 (session_id,),
             )
             conn.execute(
+                "DELETE FROM session_config WHERE session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
                 "DELETE FROM sessions WHERE session_id = ?",
                 (session_id,),
             )
@@ -535,3 +570,37 @@ def delete_session(session_id: str) -> bool:
             conn.close()
     except Exception:
         return False
+
+
+def save_session_config(session_id: str, config: dict[str, str]) -> None:
+    """Persist session configuration key/value pairs."""
+    try:
+        conn = open_db()
+        try:
+            for key, value in config.items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_config "
+                    "(session_id, key, value) VALUES (?, ?, ?)",
+                    (session_id, key, value),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def load_session_config(session_id: str) -> dict[str, str]:
+    """Load session configuration. Returns empty dict if none stored."""
+    try:
+        conn = open_db()
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM session_config WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            return {row[0]: row[1] for row in rows}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
