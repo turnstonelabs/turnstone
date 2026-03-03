@@ -1,9 +1,9 @@
 """Web server frontend for turnstone.
 
 Provides a browser-based chat UI that mirrors the terminal CLI experience.
-Uses only Python stdlib (http.server, json, threading, queue) for the server,
-communicating with the browser via Server-Sent Events (SSE) for streaming
-and HTTP POST for user actions.
+Uses Starlette (ASGI) with uvicorn for the server, communicating with the
+browser via Server-Sent Events (SSE) for streaming and HTTP POST for user
+actions.
 
 Supports multiple concurrent workstreams (tabs), each with independent
 ChatSession and event streams.
@@ -12,7 +12,9 @@ ChatSession and event streams.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
+import functools
 import json
 import os
 import queue
@@ -20,19 +22,30 @@ import sys
 import textwrap
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from contextlib import asynccontextmanager
 from pathlib import Path
-from socketserver import ThreadingMixIn
-from typing import Any
-from urllib.parse import ParseResult, parse_qs, urlparse
+from typing import TYPE_CHECKING, Any
 
 from openai import OpenAI
+from sse_starlette import EventSourceResponse
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.routing import Mount, Route
+from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.workstream import Workstream, WorkstreamManager
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator, MutableMapping
+
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
@@ -267,7 +280,7 @@ class WebUI:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# History builder
 # ---------------------------------------------------------------------------
 
 
@@ -302,150 +315,170 @@ def _build_history(
     return history
 
 
-class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
-    """HTTP handler for the turnstone web server.
+# ---------------------------------------------------------------------------
+# Pure ASGI middleware (NOT BaseHTTPMiddleware — that breaks SSE streaming)
+# ---------------------------------------------------------------------------
 
-    Serves the embedded HTML client and provides API endpoints for
-    SSE streaming, message sending, tool approval, and workstream management.
-    """
 
-    # Suppress default logging to stderr
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: N802
-        pass
+class AuthMiddleware:
+    """Check auth tokens on every HTTP request."""
 
-    def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
-        self._response_status = status
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
 
-    def _read_body(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", 0))
-        if length == 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            result: dict[str, Any] = json.loads(raw.decode("utf-8"))
-            return result
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
-            return {}
-
-    def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
-        self._set_headers(status, "application/json")
-        self.wfile.write(json.dumps(data).encode("utf-8"))
-
-    def _get_ws(self, ws_id: str | None) -> tuple[Workstream, WebUI] | tuple[None, None]:
-        """Look up workstream by id.  Returns (Workstream, WebUI) or (None, None)."""
-        if not ws_id:
-            return None, None
-        mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-        ws = mgr.get(ws_id)
-        if ws and ws.ui:
-            ui: WebUI = ws.ui  # type: ignore[assignment]
-            return ws, ui
-        return None, None
-
-    def _check_auth(self, method: str, path: str) -> bool:
-        """Return True if authorized.  Sends 401/403 and returns False otherwise."""
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        # Skip auth for CORS preflight — CORSMiddleware handles it
+        if request.method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
         from turnstone.core.auth import check_request
 
-        auth_config = self.server.auth_config  # type: ignore[attr-defined]
-        auth_header = self.headers.get("Authorization")
-        cookie_header = self.headers.get("Cookie")
+        auth_config = request.app.state.auth_config
+        method = request.method
+        path = request.url.path
+        auth_header = request.headers.get("Authorization")
+        cookie_header = request.headers.get("Cookie")
         allowed, status, msg = check_request(auth_config, method, path, auth_header, cookie_header)
         if not allowed:
-            self._send_json({"error": msg}, status)
-        return allowed
+            response = JSONResponse({"error": msg}, status_code=status)
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
-    def _check_rate_limit(self, path: str) -> bool:
-        """Return True if allowed.  Sends 429 + Retry-After if rate-limited."""
-        limiter = getattr(self.server, "rate_limiter", None)
+
+class RateLimitMiddleware:
+    """Per-IP token-bucket rate limiting."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request = Request(scope)
+        if request.method == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+        limiter = getattr(request.app.state, "rate_limiter", None)
         if limiter is None:
-            return True
-        client_ip = self.client_address[0]
+            await self.app(scope, receive, send)
+            return
+        client_ip = request.client.host if request.client else "unknown"
+        path = request.url.path
         allowed, retry_after = limiter.check(client_ip, path)
         if not allowed:
             _metrics.record_ratelimit_reject()
-            self._response_status = 429
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", str(int(retry_after) + 1))
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            body = json.dumps(
-                {"error": "Rate limit exceeded", "retry_after": round(retry_after, 1)}
+            response = JSONResponse(
+                {"error": "Rate limit exceeded", "retry_after": round(retry_after, 1)},
+                status_code=429,
+                headers={"Retry-After": str(int(retry_after) + 1)},
             )
-            self.wfile.write(body.encode("utf-8"))
-            return False
-        return True
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
-    def do_GET(self) -> None:
-        _t0 = time.monotonic()
-        self._response_status = 200
-        parsed = urlparse(self.path)
+
+class MetricsMiddleware:
+    """Record request method, path, status, and latency."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        t0 = time.monotonic()
+        status_code = 500
+        original_send = send
+
+        async def capture_send(message: MutableMapping[str, Any]) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await original_send(message)
+
+        request = Request(scope)
         try:
-            if not self._check_auth("GET", parsed.path):
-                return
-            if not self._check_rate_limit(parsed.path):
-                return
-            self._do_GET(parsed)
+            await self.app(scope, receive, capture_send)
         finally:
             _metrics.record_request(
-                "GET", parsed.path, self._response_status, time.monotonic() - _t0
+                request.method, request.url.path, status_code, time.monotonic() - t0
             )
 
-    def _do_GET(self, parsed: ParseResult) -> None:  # noqa: N802
-        if parsed.path == "/":
-            self._set_headers(200, "text/html; charset=utf-8")
-            self.wfile.write(_HTML.encode("utf-8"))
 
-        elif parsed.path == "/static/style.css":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/css; charset=utf-8")
-            self.send_header("Cache-Control", "max-age=3600")
-            self.end_headers()
-            self.wfile.write(_CSS.encode("utf-8"))
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        elif parsed.path == "/static/app.js":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/javascript; charset=utf-8")
-            self.send_header("Cache-Control", "max-age=3600")
-            self.end_headers()
-            self.wfile.write(_JS.encode("utf-8"))
 
-        elif parsed.path == "/api/events":
-            qs = parse_qs(parsed.query)
-            ws_id = qs.get("ws_id", [None])[0]
-            ws, ui = self._get_ws(ws_id)
-            if not ws or not ui:
-                self._send_json({"error": "Unknown workstream"}, 404)
-                return
+async def _read_json(request: Request) -> dict[str, Any]:
+    """Read JSON body from request, returning {} on invalid/missing JSON."""
+    try:
+        body: dict[str, Any] = await request.json()
+        return body
+    except (ValueError, json.JSONDecodeError):
+        return {}
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
 
-            # Bump generation so any previous SSE handler exits
-            ui._sse_generation += 1
-            my_gen = ui._sse_generation
+# ---------------------------------------------------------------------------
+# Helper — workstream lookup (replaces self._get_ws on the old handler)
+# ---------------------------------------------------------------------------
 
-            # Drain stale events from the queue
-            while not ui._event_queue.empty():
-                try:
-                    ui._event_queue.get_nowait()
-                except queue.Empty:
-                    break
 
-            # Send connected event with model info
-            assert ws.session is not None
-            session: ChatSession = ws.session
-            connected_data = json.dumps(
+def _get_ws(
+    mgr: WorkstreamManager, ws_id: str | None
+) -> tuple[Workstream, WebUI] | tuple[None, None]:
+    """Look up workstream by id.  Returns (Workstream, WebUI) or (None, None)."""
+    if not ws_id:
+        return None, None
+    ws = mgr.get(ws_id)
+    if ws and ws.ui:
+        ui: WebUI = ws.ui  # type: ignore[assignment]
+        return ws, ui
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Route handlers — all async
+# ---------------------------------------------------------------------------
+
+
+async def index(request: Request) -> HTMLResponse:
+    """GET / — serve the embedded HTML client."""
+    return HTMLResponse(_HTML)
+
+
+async def events_sse(request: Request) -> Response:
+    """GET /api/events — per-workstream SSE event stream."""
+    mgr = request.app.state.workstreams
+    ws_id = request.query_params.get("ws_id")
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+
+    ui._sse_generation += 1
+    my_gen = ui._sse_generation
+    # Drain stale events.  A race with the worker thread is acceptable:
+    # worst case we discard one fresh event, and the client catches up
+    # via the history replay above.
+    while not ui._event_queue.empty():
+        try:
+            ui._event_queue.get_nowait()
+        except queue.Empty:
+            break
+
+    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+        assert ws.session is not None
+        session: ChatSession = ws.session
+        # Connected event
+        yield {
+            "data": json.dumps(
                 {
                     "type": "connected",
                     "model": session.model,
@@ -453,468 +486,400 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     "skip_permissions": ui.auto_approve,
                 }
             )
-            self.wfile.write(f"data: {connected_data}\n\n".encode())
-            self.wfile.flush()
+        }
+        # History replay
+        history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
+        if history:
+            yield {"data": json.dumps({"type": "history", "messages": history})}
+        # Re-inject pending approval
+        if ui._pending_approval is not None:
+            yield {"data": json.dumps(ui._pending_approval)}
 
-            # Send conversation history for replay
-            history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
-            if history:
-                history_data = json.dumps({"type": "history", "messages": history})
-                self.wfile.write(f"data: {history_data}\n\n".encode())
-                self.wfile.flush()
-
-            # Re-inject a pending approval request if one was interrupted by a tab switch.
-            if ui._pending_approval is not None:
-                pa_data = json.dumps(ui._pending_approval)
-                self.wfile.write(f"data: {pa_data}\n\n".encode())
-                self.wfile.flush()
-
-            # Long-running SSE loop
-            _metrics.record_sse_connect()
-            try:
-                while my_gen == ui._sse_generation:
-                    try:
-                        event = ui._event_queue.get(timeout=5)
-                        data = json.dumps(event)
-                        self.wfile.write(f"data: {data}\n\n".encode())
-                        self.wfile.flush()
-                    except queue.Empty:
-                        # Send keepalive comment to prevent timeout
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass  # Client disconnected
-            finally:
-                _metrics.record_sse_disconnect()
-
-        elif parsed.path == "/api/events/global":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-
-            # Each global SSE client gets its own consumer queue
-            # (since queue.Queue is single-consumer, we fan out via a listener list)
-            client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-            listeners: list[queue.Queue[dict[str, Any]]] = self.server.global_listeners  # type: ignore[attr-defined]
-            listeners_lock: threading.Lock = self.server.global_listeners_lock  # type: ignore[attr-defined]
-            with listeners_lock:
-                listeners.append(client_queue)
-
-            _metrics.record_sse_connect()
-            try:
-                while True:
-                    try:
-                        event = client_queue.get(timeout=5)
-                        data = json.dumps(event)
-                        self.wfile.write(f"data: {data}\n\n".encode())
-                        self.wfile.flush()
-                    except queue.Empty:
-                        self.wfile.write(b": keepalive\n\n")
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
-            finally:
-                _metrics.record_sse_disconnect()
-                with listeners_lock:
-                    if client_queue in listeners:
-                        listeners.remove(client_queue)
-
-        elif parsed.path == "/api/workstreams":
-            mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-            result = []
-            for ws in mgr.list_all():
-                result.append(
-                    {
-                        "id": ws.id,
-                        "name": ws.name,
-                        "state": ws.state.value,
-                        "session_id": ws.session.session_id if ws.session else None,
-                    }
-                )
-            self._send_json({"workstreams": result})
-
-        elif parsed.path == "/api/dashboard":
-            self._handle_dashboard()
-
-        elif parsed.path == "/api/sessions":
-            from turnstone.core.memory import list_sessions
-
-            rows = list_sessions(limit=50)
-            sessions = [
-                {
-                    "session_id": sid,
-                    "alias": alias,
-                    "title": title,
-                    "created": created,
-                    "updated": updated,
-                    "message_count": count,
-                }
-                for sid, alias, title, created, updated, count in rows
-            ]
-            self._send_json({"sessions": sessions})
-
-        elif parsed.path == "/health":
-            self._handle_health()
-
-        elif parsed.path == "/metrics":
-            self._handle_metrics()
-
-        else:
-            self._set_headers(404, "text/plain")
-            self.wfile.write(b"Not found")
-
-    def do_POST(self) -> None:
-        _t0 = time.monotonic()
-        self._response_status = 200
-        parsed_path = urlparse(self.path).path
+        _metrics.record_sse_connect()
         try:
-            if not self._check_auth("POST", parsed_path):
-                return
-            if not self._check_rate_limit(parsed_path):
-                return
-            self._do_POST()
-        finally:
-            _metrics.record_request(
-                "POST", parsed_path, self._response_status, time.monotonic() - _t0
-            )
-
-    def _do_POST(self) -> None:  # noqa: N802
-        if self.path == "/api/send":
-            body = self._read_body()
-            message = body.get("message", "").strip()
-            ws_id = body.get("ws_id")
-            if not message:
-                self._send_json({"error": "Empty message"}, 400)
-                return
-
-            ws, ui = self._get_ws(ws_id)
-            if not ws or not ui:
-                self._send_json({"error": "Unknown workstream"}, 404)
-                return
-
-            # Check if already processing
-            if ws.worker_thread and ws.worker_thread.is_alive():
-                ui._enqueue(
-                    {
-                        "type": "busy_error",
-                        "message": "Already processing a request. Please wait.",
-                    }
-                )
-                self._send_json({"status": "busy"})
-                return
-
-            session = ws.session
-            assert session is not None
-
-            def run() -> None:
-                assert ui is not None
+            loop = asyncio.get_running_loop()
+            while my_gen == ui._sse_generation:
                 try:
-                    session.send(message)
-                except Exception as e:
-                    ui.on_error(f"Error: {e}")
-                    ui._enqueue({"type": "stream_end"})
-                    ui.on_state_change("error")
+                    event = await loop.run_in_executor(
+                        None, functools.partial(ui._event_queue.get, timeout=5)
+                    )
+                    yield {"data": json.dumps(event)}
+                except queue.Empty:
+                    pass
+                if await request.is_disconnected():
+                    break
+        finally:
+            _metrics.record_sse_disconnect()
 
-            t = threading.Thread(target=run, daemon=True)
-            ws.worker_thread = t
-            t.start()
-            _metrics.record_message_sent()
-            with ui._ws_lock:
-                ui._ws_messages += 1
-            self._send_json({"status": "ok"})
+    return EventSourceResponse(event_generator(), ping=5)
 
-        elif self.path == "/api/approve":
-            body = self._read_body()
-            approved = body.get("approved", False)
-            feedback = body.get("feedback")
-            always = body.get("always", False)
-            ws_id = body.get("ws_id")
 
-            ws, ui = self._get_ws(ws_id)
-            if not ws or not ui:
-                self._send_json({"error": "Unknown workstream"}, 404)
-                return
-            if always and approved:
-                ui.auto_approve = True
-            ui.resolve_approval(approved, feedback)
-            self._send_json({"status": "ok"})
+async def global_events_sse(request: Request) -> Response:
+    """GET /api/events/global — global SSE event stream."""
+    client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+    listeners = request.app.state.global_listeners
+    listeners_lock = request.app.state.global_listeners_lock
+    with listeners_lock:
+        listeners.append(client_queue)
 
-        elif self.path == "/api/plan":
-            body = self._read_body()
-            feedback = body.get("feedback", "")
-            ws_id = body.get("ws_id")
+    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+        _metrics.record_sse_connect()
+        try:
+            loop = asyncio.get_running_loop()
+            while True:
+                try:
+                    event = await loop.run_in_executor(
+                        None, functools.partial(client_queue.get, timeout=5)
+                    )
+                    yield {"data": json.dumps(event)}
+                except queue.Empty:
+                    pass
+                if await request.is_disconnected():
+                    break
+        finally:
+            _metrics.record_sse_disconnect()
+            with listeners_lock:
+                if client_queue in listeners:
+                    listeners.remove(client_queue)
 
-            ws, ui = self._get_ws(ws_id)
-            if not ws or not ui:
-                self._send_json({"error": "Unknown workstream"}, 404)
-                return
-            ui.resolve_plan(feedback)
-            self._send_json({"status": "ok"})
+    return EventSourceResponse(event_generator(), ping=5)
 
-        elif self.path == "/api/command":
-            body = self._read_body()
-            command = body.get("command", "").strip()
-            ws_id = body.get("ws_id")
-            if not command:
-                self._send_json({"error": "Empty command"}, 400)
-                return
 
-            ws, ui = self._get_ws(ws_id)
-            if not ws or not ui:
-                self._send_json({"error": "Unknown workstream"}, 404)
-                return
-            assert ws.session is not None
-
-            try:
-                should_exit = ws.session.handle_command(command)
-                if should_exit:
-                    ui.on_info("Session ended. You can close this tab.")
-                # Handle UI updates for session-changing commands
-                cmd_word = command.strip().split(None, 1)[0].lower()
-                if cmd_word in ("/clear", "/new"):
-                    ui._enqueue({"type": "clear_ui"})
-                elif cmd_word == "/resume":
-                    ui._enqueue({"type": "clear_ui"})
-                    history = _build_history(ws.session)
-                    if history:
-                        ui._enqueue({"type": "history", "messages": history})
-                # Sync in-memory workstream name after any command that can change it.
-                # This ensures /api/workstreams and future page loads see the right name.
-                if cmd_word in ("/name", "/resume"):
-                    from turnstone.core.memory import get_session_name
-
-                    updated_name = get_session_name(ws.session.session_id)
-                    if updated_name:
-                        ws.name = updated_name
-            except Exception as e:
-                ui.on_error(f"Command error: {e}")
-
-            self._send_json({"status": "ok"})
-
-        elif self.path == "/api/workstreams/new":
-            body = self._read_body()
-            mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-            skip: bool = self.server.skip_permissions  # type: ignore[attr-defined]
-            try:
-                ws = mgr.create(
-                    name=body.get("name", ""),
-                    ui_factory=lambda wid: WebUI(ws_id=wid),
-                    model=body.get("model") or None,
-                )
-                assert isinstance(ws.ui, WebUI)
-                if skip or body.get("auto_approve", False):
-                    ws.ui.auto_approve = True
-                # Emit eviction event if a workstream was evicted to make room
-                evicted = mgr.last_evicted
-                if evicted is not None:
-                    gq: queue.Queue[dict[str, Any]] = self.server.global_queue  # type: ignore[attr-defined]
-                    with contextlib.suppress(queue.Full):
-                        gq.put_nowait(
-                            {
-                                "type": "ws_closed",
-                                "ws_id": evicted.id,
-                                "name": evicted.name,
-                                "reason": "evicted",
-                            }
-                        )
-                self._send_json({"ws_id": ws.id, "name": ws.name})
-            except RuntimeError as e:
-                self._send_json({"error": str(e)}, 400)
-
-        elif self.path == "/api/workstreams/close":
-            body = self._read_body()
-            ws_id = str(body.get("ws_id", ""))
-            mgr = self.server.workstreams  # type: ignore[attr-defined]
-            if mgr.close(ws_id):
-                self._send_json({"status": "ok"})
-            else:
-                self._send_json({"error": "Cannot close last workstream"}, 400)
-
-        elif self.path == "/api/auth/login":
-            from turnstone.core.auth import make_set_cookie
-
-            body = self._read_body()
-            token = body.get("token", "")
-            auth_config = self.server.auth_config  # type: ignore[attr-defined]
-            role = auth_config.check(token)
-            if role:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", make_set_cookie(token))
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "role": role}).encode("utf-8"))
-            else:
-                self._send_json({"error": "Invalid token"}, 401)
-
-        elif self.path == "/api/auth/logout":
-            from turnstone.core.auth import make_clear_cookie
-
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", make_clear_cookie())
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-
-        else:
-            self._set_headers(404, "text/plain")
-            self.wfile.write(b"Not found")
-
-    def _handle_health(self) -> None:
-        """Return server health status as JSON.
-
-        Returns ``"status": "degraded"`` when the LLM backend is unhealthy
-        (circuit breaker not CLOSED, i.e. OPEN or HALF_OPEN).  HTTP status
-        is always 200 — the server itself is running; only the backend may
-        be unavailable.
-        """
-        mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-        wss = mgr.list_all()
-        states: dict[str, int] = {
-            "idle": 0,
-            "thinking": 0,
-            "running": 0,
-            "attention": 0,
-            "error": 0,
-        }
-        for ws in wss:
-            state = ws.state.value
-            states[state] = states.get(state, 0) + 1
-        monitor = getattr(self.server, "health_monitor", None)
-        backend_ok = monitor.is_healthy if monitor else True
-        data: dict[str, Any] = {
-            "status": "ok" if backend_ok else "degraded",
-            "version": __version__,
-            "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
-            "model": _metrics.model,
-            "workstreams": {"total": len(wss), **states},
-            "backend": {
-                "status": "up" if backend_ok else "down",
-                "circuit_state": monitor.circuit_state.value if monitor else "closed",
-            },
-        }
-        self._send_json(data)
-
-    def _handle_dashboard(self) -> None:
-        """Return enriched workstream data + aggregate stats for the dashboard."""
-        from turnstone.core.memory import get_session_name
-
-        mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-        wss = mgr.list_all()
-        total_tokens = 0
-        total_tool_calls = 0
-        active_count = 0
-        ws_list = []
-        for ws in wss:
-            ui: WebUI = ws.ui  # type: ignore[assignment]
-            with ui._ws_lock:
-                tok = ui._ws_prompt_tokens + ui._ws_completion_tokens
-                tc = sum(ui._ws_tool_calls.values())
-                ctx = ui._ws_context_ratio
-                activity = ui._ws_current_activity
-                activity_state = ui._ws_activity_state
-            total_tokens += tok
-            total_tool_calls += tc
-            if ws.state.value != "idle":
-                active_count += 1
-            title = ""
-            if ws.session:
-                title = get_session_name(ws.session.session_id) or ""
-            ws_list.append(
-                {
-                    "id": ws.id,
-                    "name": ws.name,
-                    "state": ws.state.value,
-                    "session_id": ws.session.session_id if ws.session else None,
-                    "title": title,
-                    "tokens": tok,
-                    "context_ratio": round(ctx, 3),
-                    "activity": activity,
-                    "activity_state": activity_state,
-                    "tool_calls": tc,
-                    "node": "local",
-                    "model": ws.session.model if ws.session else "",
-                    "model_alias": ws.session.model_alias if ws.session else "",
-                }
-            )
-        uptime_sec = round(time.monotonic() - _metrics.start_time)
-        self._send_json(
+async def list_workstreams(request: Request) -> JSONResponse:
+    """GET /api/workstreams — list all workstreams."""
+    mgr: WorkstreamManager = request.app.state.workstreams
+    result = []
+    for ws in mgr.list_all():
+        result.append(
             {
-                "workstreams": ws_list,
-                "aggregate": {
-                    "total_tokens": total_tokens,
-                    "total_tool_calls": total_tool_calls,
-                    "active_count": active_count,
-                    "total_count": len(ws_list),
-                    "uptime_seconds": uptime_sec,
-                    "node": "local",
-                },
+                "id": ws.id,
+                "name": ws.name,
+                "state": ws.state.value,
+                "session_id": ws.session.session_id if ws.session else None,
             }
         )
+    return JSONResponse({"workstreams": result})
 
-    def _handle_metrics(self) -> None:
-        """Return Prometheus text exposition format metrics."""
-        mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
-        wss = mgr.list_all()
-        states: dict[str, int] = {
-            "idle": 0,
-            "thinking": 0,
-            "running": 0,
-            "attention": 0,
-            "error": 0,
+
+async def dashboard(request: Request) -> JSONResponse:
+    """GET /api/dashboard — enriched workstream data + aggregate stats."""
+    from turnstone.core.memory import get_session_name
+
+    mgr: WorkstreamManager = request.app.state.workstreams
+    wss = mgr.list_all()
+    total_tokens = 0
+    total_tool_calls = 0
+    active_count = 0
+    ws_list = []
+    for ws in wss:
+        ui: WebUI = ws.ui  # type: ignore[assignment]
+        with ui._ws_lock:
+            tok = ui._ws_prompt_tokens + ui._ws_completion_tokens
+            tc = sum(ui._ws_tool_calls.values())
+            ctx = ui._ws_context_ratio
+            activity = ui._ws_current_activity
+            activity_state = ui._ws_activity_state
+        total_tokens += tok
+        total_tool_calls += tc
+        if ws.state.value != "idle":
+            active_count += 1
+        title = ""
+        if ws.session:
+            title = get_session_name(ws.session.session_id) or ""
+        ws_list.append(
+            {
+                "id": ws.id,
+                "name": ws.name,
+                "state": ws.state.value,
+                "session_id": ws.session.session_id if ws.session else None,
+                "title": title,
+                "tokens": tok,
+                "context_ratio": round(ctx, 3),
+                "activity": activity,
+                "activity_state": activity_state,
+                "tool_calls": tc,
+                "node": "local",
+                "model": ws.session.model if ws.session else "",
+                "model_alias": ws.session.model_alias if ws.session else "",
+            }
+        )
+    uptime_sec = round(time.monotonic() - _metrics.start_time)
+    return JSONResponse(
+        {
+            "workstreams": ws_list,
+            "aggregate": {
+                "total_tokens": total_tokens,
+                "total_tool_calls": total_tool_calls,
+                "active_count": active_count,
+                "total_count": len(ws_list),
+                "uptime_seconds": uptime_sec,
+                "node": "local",
+            },
         }
-        ws_data = []
-        for ws in wss:
-            state = ws.state.value
-            states[state] = states.get(state, 0) + 1
-            ui: WebUI = ws.ui  # type: ignore[assignment]
-            with ui._ws_lock:
-                ws_data.append(
+    )
+
+
+async def list_sessions_endpoint(request: Request) -> JSONResponse:
+    """GET /api/sessions — list saved sessions."""
+    from turnstone.core.memory import list_sessions
+
+    rows = list_sessions(limit=50)
+    sessions = [
+        {
+            "session_id": sid,
+            "alias": alias,
+            "title": title,
+            "created": created,
+            "updated": updated,
+            "message_count": count,
+        }
+        for sid, alias, title, created, updated, count in rows
+    ]
+    return JSONResponse({"sessions": sessions})
+
+
+async def health(request: Request) -> JSONResponse:
+    """GET /health — server health status."""
+    mgr: WorkstreamManager = request.app.state.workstreams
+    wss = mgr.list_all()
+    states: dict[str, int] = {
+        "idle": 0,
+        "thinking": 0,
+        "running": 0,
+        "attention": 0,
+        "error": 0,
+    }
+    for ws in wss:
+        state = ws.state.value
+        states[state] = states.get(state, 0) + 1
+    monitor = getattr(request.app.state, "health_monitor", None)
+    backend_ok = monitor.is_healthy if monitor else True
+    data: dict[str, Any] = {
+        "status": "ok" if backend_ok else "degraded",
+        "version": __version__,
+        "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
+        "model": _metrics.model,
+        "workstreams": {"total": len(wss), **states},
+        "backend": {
+            "status": "up" if backend_ok else "down",
+            "circuit_state": monitor.circuit_state.value if monitor else "closed",
+        },
+    }
+    return JSONResponse(data)
+
+
+async def metrics_endpoint(request: Request) -> Response:
+    """GET /metrics — Prometheus text exposition format."""
+    mgr: WorkstreamManager = request.app.state.workstreams
+    wss = mgr.list_all()
+    states: dict[str, int] = {
+        "idle": 0,
+        "thinking": 0,
+        "running": 0,
+        "attention": 0,
+        "error": 0,
+    }
+    ws_data = []
+    for ws in wss:
+        state = ws.state.value
+        states[state] = states.get(state, 0) + 1
+        ui: WebUI = ws.ui  # type: ignore[assignment]
+        with ui._ws_lock:
+            ws_data.append(
+                {
+                    "ws_id": ws.id,
+                    "name": ws.name,
+                    "session_id": ws.session.session_id if ws.session else "",
+                    "prompt_tokens": ui._ws_prompt_tokens,
+                    "completion_tokens": ui._ws_completion_tokens,
+                    "messages": ui._ws_messages,
+                    "tool_calls": dict(ui._ws_tool_calls),
+                    "context_ratio": ui._ws_context_ratio,
+                }
+            )
+    content = _metrics.generate_text(
+        workstream_states=states,
+        total_workstreams=len(wss),
+        workstream_metrics=ws_data,
+    )
+    return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
+async def send_message(request: Request) -> JSONResponse:
+    """POST /api/send — send a user message to the workstream."""
+    body = await _read_json(request)
+    message = body.get("message", "").strip()
+    ws_id = body.get("ws_id")
+    if not message:
+        return JSONResponse({"error": "Empty message"}, status_code=400)
+    mgr = request.app.state.workstreams
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+    if ws.worker_thread and ws.worker_thread.is_alive():
+        ui._enqueue(
+            {
+                "type": "busy_error",
+                "message": "Already processing a request. Please wait.",
+            }
+        )
+        return JSONResponse({"status": "busy"})
+    session = ws.session
+    assert session is not None
+
+    def run() -> None:
+        assert ui is not None
+        try:
+            session.send(message)
+        except Exception as e:
+            ui.on_error(f"Error: {e}")
+            ui._enqueue({"type": "stream_end"})
+            ui.on_state_change("error")
+
+    t = threading.Thread(target=run, daemon=True)
+    ws.worker_thread = t
+    t.start()
+    _metrics.record_message_sent()
+    with ui._ws_lock:
+        ui._ws_messages += 1
+    return JSONResponse({"status": "ok"})
+
+
+async def approve(request: Request) -> JSONResponse:
+    """POST /api/approve — approve or deny a tool call."""
+    body = await _read_json(request)
+    approved = body.get("approved", False)
+    feedback = body.get("feedback")
+    always = body.get("always", False)
+    ws_id = body.get("ws_id")
+    mgr = request.app.state.workstreams
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+    if always and approved:
+        ui.auto_approve = True
+    ui.resolve_approval(approved, feedback)
+    return JSONResponse({"status": "ok"})
+
+
+async def plan_feedback(request: Request) -> JSONResponse:
+    """POST /api/plan — respond to a plan review."""
+    body = await _read_json(request)
+    feedback = body.get("feedback", "")
+    ws_id = body.get("ws_id")
+    mgr = request.app.state.workstreams
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+    ui.resolve_plan(feedback)
+    return JSONResponse({"status": "ok"})
+
+
+async def command(request: Request) -> JSONResponse:
+    """POST /api/command — execute a slash command."""
+    body = await _read_json(request)
+    cmd = body.get("command", "").strip()
+    ws_id = body.get("ws_id")
+    if not cmd:
+        return JSONResponse({"error": "Empty command"}, status_code=400)
+
+    mgr = request.app.state.workstreams
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+    assert ws.session is not None
+
+    try:
+        should_exit = ws.session.handle_command(cmd)
+        if should_exit:
+            ui.on_info("Session ended. You can close this tab.")
+        # Handle UI updates for session-changing commands
+        cmd_word = cmd.strip().split(None, 1)[0].lower()
+        if cmd_word in ("/clear", "/new"):
+            ui._enqueue({"type": "clear_ui"})
+        elif cmd_word == "/resume":
+            ui._enqueue({"type": "clear_ui"})
+            history = _build_history(ws.session)
+            if history:
+                ui._enqueue({"type": "history", "messages": history})
+        # Sync in-memory workstream name after any command that can change it.
+        # This ensures /api/workstreams and future page loads see the right name.
+        if cmd_word in ("/name", "/resume"):
+            from turnstone.core.memory import get_session_name
+
+            updated_name = get_session_name(ws.session.session_id)
+            if updated_name:
+                ws.name = updated_name
+    except Exception as e:
+        ui.on_error(f"Command error: {e}")
+
+    return JSONResponse({"status": "ok"})
+
+
+async def create_workstream(request: Request) -> JSONResponse:
+    """POST /api/workstreams/new — create a new workstream."""
+    body = await _read_json(request)
+    mgr: WorkstreamManager = request.app.state.workstreams
+    skip: bool = request.app.state.skip_permissions
+    try:
+        ws = mgr.create(
+            name=body.get("name", ""),
+            ui_factory=lambda wid: WebUI(ws_id=wid),
+            model=body.get("model") or None,
+        )
+        assert isinstance(ws.ui, WebUI)
+        if skip or body.get("auto_approve", False):
+            ws.ui.auto_approve = True
+        # Emit eviction event if a workstream was evicted to make room
+        evicted = mgr.last_evicted
+        if evicted is not None:
+            gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+            with contextlib.suppress(queue.Full):
+                gq.put_nowait(
                     {
-                        "ws_id": ws.id,
-                        "name": ws.name,
-                        "session_id": ws.session.session_id if ws.session else "",
-                        "prompt_tokens": ui._ws_prompt_tokens,
-                        "completion_tokens": ui._ws_completion_tokens,
-                        "messages": ui._ws_messages,
-                        "tool_calls": dict(ui._ws_tool_calls),
-                        "context_ratio": ui._ws_context_ratio,
+                        "type": "ws_closed",
+                        "ws_id": evicted.id,
+                        "name": evicted.name,
+                        "reason": "evicted",
                     }
                 )
-        content = _metrics.generate_text(
-            workstream_states=states,
-            total_workstreams=len(wss),
-            workstream_metrics=ws_data,
-        )
-        self._set_headers(200, "text/plain; version=0.0.4; charset=utf-8")
-        self.wfile.write(content.encode("utf-8"))
-
-    def do_OPTIONS(self) -> None:
-        """Handle CORS preflight."""
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.end_headers()
+        return JSONResponse({"ws_id": ws.id, "name": ws.name})
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
-# ---------------------------------------------------------------------------
-# Threaded HTTP server (module-level so tests can import it)
-# ---------------------------------------------------------------------------
+async def close_workstream(request: Request) -> JSONResponse:
+    """POST /api/workstreams/close — close a workstream."""
+    body = await _read_json(request)
+    ws_id = str(body.get("ws_id", ""))
+    mgr = request.app.state.workstreams
+    if mgr.close(ws_id):
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
 
 
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """HTTP server that handles each request in a separate thread.
+async def auth_login(request: Request) -> Response:
+    """POST /api/auth/login — authenticate with a token."""
+    from turnstone.core.auth import make_set_cookie
 
-    Required for SSE (long-polling GET) and concurrent POST handlers to work
-    simultaneously.
-    """
+    body = await _read_json(request)
+    token = body.get("token", "")
+    auth_config = request.app.state.auth_config
+    role = auth_config.check(token)
+    if role:
+        response = JSONResponse({"status": "ok", "role": role})
+        response.headers["Set-Cookie"] = make_set_cookie(token)
+        return response
+    return JSONResponse({"error": "Invalid token"}, status_code=401)
 
-    daemon_threads = True
+
+async def auth_logout(request: Request) -> Response:
+    """POST /api/auth/logout — clear auth cookie."""
+    from turnstone.core.auth import make_clear_cookie
+
+    response = JSONResponse({"status": "ok"})
+    response.headers["Set-Cookie"] = make_clear_cookie()
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +906,7 @@ def _idle_cleanup_thread(
     rate_limiter: Any = None,
 ) -> None:
     """Periodically close IDLE workstreams and clean up rate limiter buckets."""
-    check_every = min(300.0, timeout_sec / 4)  # check at ¼ of timeout, max 5 min
+    check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
     while True:
         time.sleep(check_every)
         closed = mgr.close_idle(timeout_sec)
@@ -968,6 +933,115 @@ def _global_fanout_thread(
                     lq.put_nowait(event)  # drop if a listener is backed up
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Lifespan context manager
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
+    """Start background threads and handle shutdown."""
+    # Start global event fan-out thread
+    fanout = threading.Thread(
+        target=_global_fanout_thread,
+        args=(
+            app.state.global_queue,
+            app.state.global_listeners,
+            app.state.global_listeners_lock,
+        ),
+        daemon=True,
+    )
+    fanout.start()
+    # Start idle cleanup thread if configured
+    if app.state.idle_timeout > 0:
+        cleanup = threading.Thread(
+            target=_idle_cleanup_thread,
+            args=(
+                app.state.workstreams,
+                app.state.idle_timeout * 60,
+                app.state.global_queue,
+                app.state.rate_limiter,
+            ),
+            daemon=True,
+        )
+        cleanup.start()
+    yield
+    # Shutdown
+    if app.state.health_monitor:
+        app.state.health_monitor.stop()
+    if app.state.mcp_client:
+        app.state.mcp_client.shutdown()
+    if app.state.registry:
+        app.state.registry.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+
+def create_app(
+    *,
+    workstreams: WorkstreamManager,
+    global_queue: queue.Queue[dict[str, Any]],
+    global_listeners: list[queue.Queue[dict[str, Any]]],
+    global_listeners_lock: threading.Lock,
+    skip_permissions: bool,
+    auth_config: Any,
+    health_monitor: Any = None,
+    rate_limiter: Any = None,
+    mcp_client: Any = None,
+    registry: Any = None,
+    idle_timeout: int = 0,
+) -> Starlette:
+    """Create and configure the Starlette ASGI application."""
+    app = Starlette(
+        routes=[
+            Route("/", index),
+            Route("/api/events", events_sse),
+            Route("/api/events/global", global_events_sse),
+            Route("/api/workstreams", list_workstreams),
+            Route("/api/dashboard", dashboard),
+            Route("/api/sessions", list_sessions_endpoint),
+            Route("/health", health),
+            Route("/metrics", metrics_endpoint),
+            Route("/api/send", send_message, methods=["POST"]),
+            Route("/api/approve", approve, methods=["POST"]),
+            Route("/api/plan", plan_feedback, methods=["POST"]),
+            Route("/api/command", command, methods=["POST"]),
+            Route("/api/workstreams/new", create_workstream, methods=["POST"]),
+            Route("/api/workstreams/close", close_workstream, methods=["POST"]),
+            Route("/api/auth/login", auth_login, methods=["POST"]),
+            Route("/api/auth/logout", auth_logout, methods=["POST"]),
+            Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
+        ],
+        middleware=[
+            Middleware(MetricsMiddleware),
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Authorization"],
+            ),
+            Middleware(AuthMiddleware),
+            Middleware(RateLimitMiddleware),
+        ],
+        lifespan=_lifespan,
+    )
+    app.state.workstreams = workstreams
+    app.state.global_queue = global_queue
+    app.state.global_listeners = global_listeners
+    app.state.global_listeners_lock = global_listeners_lock
+    app.state.skip_permissions = skip_permissions
+    app.state.auth_config = auth_config
+    app.state.health_monitor = health_monitor
+    app.state.rate_limiter = rate_limiter
+    app.state.mcp_client = mcp_client
+    app.state.registry = registry
+    app.state.idle_timeout = idle_timeout
+    return app
 
 
 # ---------------------------------------------------------------------------
@@ -1275,39 +1349,27 @@ def main() -> None:
     # Record detected model in metrics
     _metrics.model = model
 
-    # Create and configure threaded HTTP server (SSE needs a persistent
-    # connection, so POSTs must be handled on separate threads).
-    server = ThreadedHTTPServer((args.host, args.port), TurnstoneHTTPHandler)
-    server.workstreams = manager  # type: ignore[attr-defined]
-    server.global_queue = global_queue  # type: ignore[attr-defined]
-    server.global_listeners = global_listeners  # type: ignore[attr-defined]
-    server.global_listeners_lock = global_listeners_lock  # type: ignore[attr-defined]
-    server.skip_permissions = args.skip_permissions  # type: ignore[attr-defined]
-
+    # Auth config
     from turnstone.core.auth import load_auth_config
 
     auth_config = load_auth_config()
-    server.auth_config = auth_config  # type: ignore[attr-defined]
-    server.health_monitor = health_monitor  # type: ignore[attr-defined]
-    server.rate_limiter = rate_limiter  # type: ignore[attr-defined]
     if auth_config.enabled:
         print(f"Auth: enabled ({len(auth_config.tokens)} token(s) configured)")
 
-    # Start global event fan-out thread
-    fanout = threading.Thread(
-        target=_global_fanout_thread,
-        args=(global_queue, global_listeners, global_listeners_lock),
-        daemon=True,
+    # Build the ASGI app
+    app = create_app(
+        workstreams=manager,
+        global_queue=global_queue,
+        global_listeners=global_listeners,
+        global_listeners_lock=global_listeners_lock,
+        skip_permissions=args.skip_permissions,
+        auth_config=auth_config,
+        health_monitor=health_monitor,
+        rate_limiter=rate_limiter,
+        mcp_client=mcp_client,
+        registry=registry,
+        idle_timeout=args.workstream_idle_timeout,
     )
-    fanout.start()
-
-    if args.workstream_idle_timeout > 0:
-        cleanup = threading.Thread(
-            target=_idle_cleanup_thread,
-            args=(manager, args.workstream_idle_timeout * 60, global_queue, rate_limiter),
-            daemon=True,
-        )
-        cleanup.start()
 
     print(f"turnstone web server running on http://{args.host}:{args.port}")
     print(f"Model: {model}")
@@ -1327,15 +1389,9 @@ def main() -> None:
     print(f"Max workstreams: {args.max_workstreams}")
     print("Press Ctrl+C to stop.")
 
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down.")
-        health_monitor.stop()
-        if mcp_client:
-            mcp_client.shutdown()
-        registry.shutdown()
-        server.shutdown()
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

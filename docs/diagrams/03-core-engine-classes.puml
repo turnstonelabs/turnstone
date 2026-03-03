@@ -52,6 +52,8 @@ class "WebUI" as WebUI {
     Enqueues JSON events for SSE.
     Blocks on threading.Event for
     approval/plan review.
+    SSE handlers bridge Queue to
+    async via run_in_executor().
     --
     server.py
 }

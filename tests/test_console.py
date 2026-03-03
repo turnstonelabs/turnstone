@@ -2,10 +2,8 @@
 
 import json
 import queue
-import threading
 from unittest.mock import MagicMock
 
-import httpx
 import pytest
 
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
@@ -540,52 +538,50 @@ class TestConsoleHTTPEndpoints:
         return collector
 
     @pytest.fixture()
-    def server(self, mock_collector):
-        from turnstone.console.server import (
-            ConsoleHTTPHandler,
-            ThreadedHTTPServer,
-            _load_static,
-        )
+    def client(self, mock_collector):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
 
         _load_static()
 
         from turnstone.core.auth import AuthConfig
 
-        httpd = ThreadedHTTPServer(("127.0.0.1", 0), ConsoleHTTPHandler)
-        httpd.collector = mock_collector
-        httpd.auth_config = AuthConfig()  # auth disabled by default
-        port = httpd.server_address[1]
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        yield f"http://127.0.0.1:{port}"
-        httpd.shutdown()
+        app = create_app(
+            collector=mock_collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
 
-    def _get(self, server, path):
-        resp = httpx.get(f"{server}{path}", timeout=5)
+    def _get(self, client, path):
+        resp = client.get(path)
         return resp.status_code, resp.json()
 
-    def _get_raw(self, server, path):
-        resp = httpx.get(f"{server}{path}", timeout=5)
+    def _get_raw(self, client, path):
+        resp = client.get(path)
         return resp.status_code, resp.text, resp.headers.get("content-type")
 
-    def test_get_overview(self, server, mock_collector):
-        status, data = self._get(server, "/api/cluster/overview")
+    def test_get_overview(self, client, mock_collector):
+        status, data = self._get(client, "/api/cluster/overview")
         assert status == 200
         assert data["nodes"] == 3
         assert data["workstreams"] == 15
         assert data["states"]["running"] == 5
         mock_collector.get_overview.assert_called_once()
 
-    def test_get_nodes(self, server, mock_collector):
-        status, data = self._get(server, "/api/cluster/nodes?sort=activity&limit=10&offset=0")
+    def test_get_nodes(self, client, mock_collector):
+        status, data = self._get(client, "/api/cluster/nodes?sort=activity&limit=10&offset=0")
         assert status == 200
         assert len(data["nodes"]) == 1
         assert data["total"] == 1
         mock_collector.get_nodes.assert_called_once_with(sort_by="activity", limit=10, offset=0)
 
-    def test_get_workstreams(self, server, mock_collector):
+    def test_get_workstreams(self, client, mock_collector):
         status, data = self._get(
-            server, "/api/cluster/workstreams?state=running&page=1&per_page=25"
+            client, "/api/cluster/workstreams?state=running&page=1&per_page=25"
         )
         assert status == 200
         assert len(data["workstreams"]) == 1
@@ -601,46 +597,46 @@ class TestConsoleHTTPEndpoints:
             per_page=25,
         )
 
-    def test_get_workstreams_per_page_capped(self, server, mock_collector):
-        self._get(server, "/api/cluster/workstreams?per_page=999")
+    def test_get_workstreams_per_page_capped(self, client, mock_collector):
+        self._get(client, "/api/cluster/workstreams?per_page=999")
         call_kwargs = mock_collector.get_workstreams.call_args
         assert call_kwargs.kwargs["per_page"] == 200
 
-    def test_get_node_detail(self, server, mock_collector):
-        status, data = self._get(server, "/api/cluster/node/node-a")
+    def test_get_node_detail(self, client, mock_collector):
+        status, data = self._get(client, "/api/cluster/node/node-a")
         assert status == 200
         assert data["node_id"] == "node-a"
         mock_collector.get_node_detail.assert_called_once_with("node-a")
 
-    def test_get_node_detail_not_found(self, server, mock_collector):
+    def test_get_node_detail_not_found(self, client, mock_collector):
         mock_collector.get_node_detail.return_value = None
-        status, data = self._get(server, "/api/cluster/node/nonexistent")
+        status, data = self._get(client, "/api/cluster/node/nonexistent")
         assert status == 404
         assert "error" in data
 
-    def test_health_endpoint(self, server, mock_collector):
-        status, data = self._get(server, "/health")
+    def test_health_endpoint(self, client, mock_collector):
+        status, data = self._get(client, "/health")
         assert status == 200
         assert data["status"] == "ok"
         assert data["service"] == "turnstone-console"
         assert data["nodes"] == 3
 
-    def test_index_html(self, server):
-        status, body, ct = self._get_raw(server, "/")
+    def test_index_html(self, client):
+        status, body, ct = self._get_raw(client, "/")
         assert status == 200
         assert "text/html" in ct
         assert "turnstone console" in body
 
-    def test_static_css(self, server):
-        status, body, ct = self._get_raw(server, "/static/style.css")
+    def test_static_css(self, client):
+        status, body, ct = self._get_raw(client, "/static/style.css")
         assert status == 200
         assert "text/css" in ct
 
-    def test_static_js(self, server):
-        status, body, ct = self._get_raw(server, "/static/app.js")
+    def test_static_js(self, client):
+        status, body, ct = self._get_raw(client, "/static/app.js")
         assert status == 200
         assert "javascript" in ct
 
-    def test_404(self, server):
-        resp = httpx.get(f"{server}/nonexistent", timeout=5)
+    def test_404(self, client):
+        resp = client.get("/nonexistent")
         assert resp.status_code == 404
