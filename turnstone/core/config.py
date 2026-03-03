@@ -99,6 +99,9 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     "auth": {
         "token": "auth_token",
     },
+    "mcp": {
+        "config_path": "mcp_config",
+    },
 }
 
 

@@ -54,6 +54,7 @@ SLASH_COMMANDS = [
     "/compact",
     "/creative",
     "/debug",
+    "/mcp",
     "/help",
     "/exit",
     "/quit",
@@ -825,9 +826,15 @@ def main() -> None:
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
         help="Bearer token for authenticating to turnstone services (default: $TURNSTONE_AUTH_TOKEN)",
     )
+    parser.add_argument(
+        "--mcp-config",
+        default=None,
+        metavar="PATH",
+        help="Path to MCP server config file (standard mcpServers JSON format)",
+    )
     from turnstone.core.config import apply_config
 
-    apply_config(parser, ["api", "model", "session", "tools", "console", "auth"])
+    apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp"])
     args = parser.parse_args()
 
     # Prune stale / empty sessions on startup
@@ -848,6 +855,11 @@ def main() -> None:
     # Detect or use provided model
     model = args.model or detect_model(client)
 
+    # Initialize MCP client (connects to configured MCP servers, if any)
+    from turnstone.core.mcp_client import create_mcp_client
+
+    mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
+
     # Session factory — captures shared config for creating workstream sessions
     def session_factory(ui: SessionUI | None) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
@@ -865,6 +877,7 @@ def main() -> None:
             auto_compact_pct=args.auto_compact_pct,
             agent_max_turns=args.agent_max_turns,
             tool_truncation=args.tool_truncation,
+            mcp_client=mcp_client,
         )
 
     # Create workstream manager and initial workstream
@@ -908,6 +921,10 @@ def main() -> None:
 
     # Print banner
     print(f"\n{bold('Chat')} with {cyan(model)}")
+    if mcp_client:
+        mcp_tools = mcp_client.get_tools()
+        if mcp_tools:
+            print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
     print("Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
 
     # Prompt string -- use a short display name
@@ -960,6 +977,9 @@ def main() -> None:
                 print(f"\n{yellow('Interrupted.')}")
             except Exception as e:
                 print(f"\n{red(f'Error: {e}')}")
+
+    if mcp_client:
+        mcp_client.shutdown()
 
     print("Goodbye.")
 

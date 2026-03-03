@@ -1041,9 +1041,15 @@ def main() -> None:
         metavar="MINUTES",
         help="Close IDLE workstreams after MINUTES of inactivity, 0 to disable (default: 120)",
     )
+    parser.add_argument(
+        "--mcp-config",
+        default=None,
+        metavar="PATH",
+        help="Path to MCP server config file (standard mcpServers JSON format)",
+    )
     from turnstone.core.config import apply_config
 
-    apply_config(parser, ["api", "model", "session", "tools", "server"])
+    apply_config(parser, ["api", "model", "session", "tools", "server", "mcp"])
     args = parser.parse_args()
 
     # Prune stale / empty sessions on startup
@@ -1060,6 +1066,11 @@ def main() -> None:
 
     # Detect or use provided model
     model = args.model or detect_model(client)
+
+    # Initialize MCP client (connects to configured MCP servers, if any)
+    from turnstone.core.mcp_client import create_mcp_client
+
+    mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
 
     # Set up global event queue for state-change broadcasts
     global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -1084,6 +1095,7 @@ def main() -> None:
             auto_compact_pct=args.auto_compact_pct,
             agent_max_turns=args.agent_max_turns,
             tool_truncation=args.tool_truncation,
+            mcp_client=mcp_client,
         )
 
     # Create workstream manager and initial workstream
@@ -1147,12 +1159,18 @@ def main() -> None:
 
     print(f"turnstone web server running on http://{args.host}:{args.port}")
     print(f"Model: {model}")
+    if mcp_client:
+        mcp_tools = mcp_client.get_tools()
+        if mcp_tools:
+            print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
     print("Press Ctrl+C to stop.")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
+        if mcp_client:
+            mcp_client.shutdown()
         server.shutdown()
 
 

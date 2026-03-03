@@ -54,12 +54,15 @@ from turnstone.core.tools import (
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
     TOOLS,
+    merge_mcp_tools,
 )
 from turnstone.core.web import check_ssrf, strip_html
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
 if TYPE_CHECKING:
     from openai import OpenAI
+
+    from turnstone.core.mcp_client import MCPClientManager
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -104,6 +107,7 @@ class ChatSession:
         auto_compact_pct: float = 0.8,
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
+        mcp_client: MCPClientManager | None = None,
     ):
         self.client = client
         self.model = model
@@ -136,6 +140,17 @@ class ChatSession:
         self._system_tokens = 0  # tokens for system_messages
         self._assistant_pending_tokens = 0
         self.creative_mode = False
+        # MCP tool integration: merge external tools with built-in
+        self._mcp_client = mcp_client
+        if mcp_client:
+            mcp_tools = mcp_client.get_tools()
+            self._tools = merge_mcp_tools(TOOLS, mcp_tools)
+            self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+            self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
+        else:
+            self._tools = TOOLS
+            self._task_tools = TASK_AGENT_TOOLS
+            self._agent_tools = AGENT_TOOLS
         self._init_system_messages()
         self._save_config()
 
@@ -361,7 +376,7 @@ class ChatSession:
                 return self.client.chat.completions.create(  # type: ignore[call-overload]
                     model=self.model,
                     messages=msgs,
-                    **({"tools": TOOLS} if not self.creative_mode else {}),
+                    **({"tools": self._tools} if not self.creative_mode else {}),
                     max_completion_tokens=self.max_tokens,
                     temperature=self.temperature,
                     stream=True,
@@ -741,7 +756,7 @@ class ChatSession:
             f"{GRAY}[request] model={self.model}  "
             f"max_tokens={self.max_tokens}  temp={self.temperature}  "
             f"reasoning={self.reasoning_effort}  "
-            f"tools={0 if self.creative_mode else len(TOOLS)}{RESET}"
+            f"tools={0 if self.creative_mode else len(self._tools)}{RESET}"
         )
         lines.append(f"{GRAY}[request] {len(msgs)} messages:{RESET}")
         for i, m in enumerate(msgs):
@@ -795,7 +810,7 @@ class ChatSession:
 
         # Calibrate chars_per_token ratio from actual usage.
         all_msgs = self._full_messages()  # system + self.messages (before append)
-        tool_def_chars = sum(len(json.dumps(t)) for t in TOOLS)
+        tool_def_chars = sum(len(json.dumps(t)) for t in self._tools)
         total_chars = sum(self._msg_char_count(m) for m in all_msgs) + tool_def_chars
         if total_chars > 0 and prompt_tok > 0:
             self._chars_per_token = total_chars / prompt_tok
@@ -1149,6 +1164,9 @@ class ChatSession:
         }
         preparer = preparers.get(func_name)
         if not preparer:
+            # Check if this is an MCP tool
+            if self._mcp_client and self._mcp_client.is_mcp_tool(func_name):
+                return self._prepare_mcp_tool(call_id, func_name, args)
             return {
                 "call_id": call_id,
                 "func_name": func_name,
@@ -1733,6 +1751,56 @@ class ChatSession:
             "limit": min(limit, 50),
         }
 
+    # -- MCP tool prepare/execute ----------------------------------------------
+
+    def _prepare_mcp_tool(
+        self, call_id: str, func_name: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Prepare an MCP tool call for approval."""
+        # Parse prefixed name for display: mcp__github__search → github/search
+        parts = func_name.split("__", 2)
+        display = f"{parts[1]}/{parts[2]}" if len(parts) == 3 else func_name
+
+        preview_lines = []
+        for key, val in args.items():
+            val_str = str(val)
+            if len(val_str) > 200:
+                val_str = val_str[:200] + "..."
+            preview_lines.append(f"    {key}: {val_str}")
+        preview = "\n".join(preview_lines) if preview_lines else "    (no arguments)"
+
+        return {
+            "call_id": call_id,
+            "func_name": func_name,
+            "header": f"\u2699 mcp:{display}",
+            "preview": f"{DIM}{preview}{RESET}",
+            "needs_approval": True,
+            "approval_label": "mcp_tool",
+            "execute": self._exec_mcp_tool,
+            "mcp_func_name": func_name,
+            "mcp_args": args,
+        }
+
+    def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Execute an MCP tool call via the MCPClientManager."""
+        call_id: str = item["call_id"]
+        func_name: str = item["mcp_func_name"]
+        args: dict[str, Any] = item["mcp_args"]
+
+        assert self._mcp_client is not None
+        try:
+            output = self._mcp_client.call_tool_sync(func_name, args, timeout=self.tool_timeout)
+        except TimeoutError:
+            output = f"MCP tool timed out after {self.tool_timeout}s"
+            self.ui.on_error(output)
+        except Exception as e:
+            output = f"MCP tool error: {e}"
+            self.ui.on_error(output)
+
+        output = self._truncate_output(output)
+        self.ui.on_tool_result(call_id, func_name, output)
+        return call_id, output
+
     # -- Execute methods (do the work, report output via UI) -------------------
 
     def _exec_bash(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -1933,7 +2001,7 @@ class ChatSession:
             Final content string from the agent.
         """
         if tools is None:
-            tools = AGENT_TOOLS
+            tools = self._agent_tools
         if auto_tools is None:
             auto_tools = self._AGENT_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
@@ -2112,7 +2180,7 @@ class ChatSession:
             return call_id, self._run_agent(
                 agent_messages,
                 label="task",
-                tools=TASK_AGENT_TOOLS,
+                tools=self._task_tools,
                 auto_tools=self._TASK_AUTO_TOOLS,
             )
         except KeyboardInterrupt:
@@ -2715,6 +2783,21 @@ class ChatSession:
             state = "on" if self.debug else "off"
             self.ui.on_info(f"Debug mode: {bold(state)} (prints raw SSE deltas)")
 
+        elif cmd == "/mcp":
+            if not self._mcp_client:
+                self.ui.on_info("No MCP servers configured.")
+            else:
+                tools = self._mcp_client.get_tools()
+                if not tools:
+                    self.ui.on_info("MCP client connected but no tools available.")
+                else:
+                    lines = [f"MCP tools ({len(tools)}):"]
+                    for t in tools:
+                        name = t["function"]["name"]
+                        desc = t["function"].get("description", "")[:80]
+                        lines.append(f"  {name}  {dim(desc)}")
+                    self.ui.on_info("\n".join(lines))
+
         elif cmd == "/help":
             self.ui.on_info(
                 "\n".join(
@@ -2737,6 +2820,7 @@ class ChatSession:
                         "  /reason [low|med|high] Set/show reasoning effort",
                         "  /creative              Toggle creative writing mode (no tools)",
                         "  /debug                 Toggle raw SSE delta logging",
+                        "  /mcp                   List connected MCP tools",
                         "  /help                  Show this help",
                         "  /exit                  Exit (also: Ctrl+D)",
                         "────────────────────────────────────────────────────────",

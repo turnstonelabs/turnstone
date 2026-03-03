@@ -42,6 +42,8 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ remember    │ ✗ Auto-approve   │
             │ recall      │ ✗ Auto-approve   │
             │ forget      │ ✗ Auto-approve   │
+            ├─────────────┼──────────────────┤
+            │ mcp__*      │ ✓ Yes (external) │
             └─────────────┴──────────────────┘
         end note
 
@@ -108,7 +110,8 @@ partition "Phase 3: Execute" #E3F2FD {
           ├─ _exec_plan: _run_agent(AGENT_TOOLS, read-only)
           ├─ _exec_remember: SQLite INSERT OR REPLACE
           ├─ _exec_recall: SQLite FTS5/LIKE search
-          └─ _exec_forget: SQLite DELETE
+          ├─ _exec_forget: SQLite DELETE
+          └─ _exec_mcp_tool: MCPClientManager.call_tool_sync()
     end note
 
     :Collect results: [(call_id, output), ...];

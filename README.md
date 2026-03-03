@@ -110,6 +110,7 @@ turnstone/
 │   ├── session.py     # ChatSession — multi-turn loop, tool dispatch, agents
 │   ├── tools.py       # Tool definitions (auto-loaded from JSON)
 │   ├── workstream.py  # WorkstreamManager — parallel independent sessions
+│   ├── mcp_client.py  # MCP client manager (external tool servers)
 │   ├── config.py      # Unified TOML config (~/.config/turnstone/config.toml)
 │   ├── memory.py      # SQLite persistence (memories, conversations, FTS5)
 │   ├── metrics.py     # Prometheus-compatible metrics collector
@@ -193,7 +194,7 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 
 ## Tools
 
-14 built-in tools, 2 agent tools:
+14 built-in tools, 2 agent tools, plus external tools via MCP:
 
 | Tool | Description | Auto-approved |
 |------|-------------|:---:|
@@ -211,6 +212,31 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 | `forget` | Remove a memory | yes |
 | `task` | Spawn autonomous sub-agent | |
 | `plan` | Explore codebase, write .plan.md | |
+| `mcp__*` | External tools from MCP servers | |
+
+### MCP Tool Servers
+
+Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) for connecting external tool servers. MCP tools are discovered at startup, converted to OpenAI function-calling format, and merged with built-in tools. Each MCP tool is prefixed with `mcp__{server}__{tool}` to avoid name collisions.
+
+Configure via `config.toml` or `--mcp-config`:
+
+```toml
+[mcp.servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp.servers.github.env]
+GITHUB_TOKEN = "ghp_..."
+```
+
+Or use a standard MCP JSON config file:
+
+```bash
+turnstone --mcp-config ~/.config/turnstone/mcp.json
+turnstone-server --mcp-config ~/.config/turnstone/mcp.json
+```
+
+Use `/mcp` in the REPL to list connected tools. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
 
 ## Configuration
 
@@ -249,6 +275,15 @@ host = "0.0.0.0"
 port = 8090
 url = "http://localhost:8090"  # used by CLI /cluster commands
 poll_interval = 10
+
+[mcp]
+config_path = ""       # path to MCP JSON config file (alternative to TOML sections)
+
+[mcp.servers.example]  # one section per MCP server
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-example"]
+# type = "stdio"       # "stdio" (default) or "http"
+# url = ""             # for HTTP transport
 ```
 
 Precedence: CLI args > environment variables > config.toml > defaults.
