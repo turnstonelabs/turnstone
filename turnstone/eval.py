@@ -964,7 +964,9 @@ def run_optimization(
     )
 
     if not model:
-        model = _detect_model(client)
+        from turnstone.core.model_registry import detect_model
+
+        model, _ = detect_model(client)
 
     # Load test cases
     with open(test_file) as f:
@@ -1125,18 +1127,6 @@ def run_optimization(
 
     print(f"\nResults written to {output_file}")
     return results
-
-
-def _detect_model(client: OpenAI) -> str:
-    """Auto-detect the model from the API."""
-    try:
-        models = client.models.list()
-        model_ids = [m.id for m in models.data]
-        if model_ids:
-            return model_ids[0]
-    except Exception:
-        pass
-    raise SystemExit("Could not auto-detect model. Use --model to specify.")
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────

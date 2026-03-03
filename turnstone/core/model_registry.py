@@ -210,3 +210,42 @@ def load_model_registry(
         fallback=fallback,
         agent_model=agent_model,
     )
+
+
+# ---------------------------------------------------------------------------
+# Model auto-detection
+# ---------------------------------------------------------------------------
+
+
+def detect_model(client: OpenAI, log_fn: Any = print) -> tuple[str, int | None]:
+    """Auto-detect the model and context window from the /v1/models endpoint.
+
+    Returns ``(model_id, context_window)`` where *context_window* is
+    ``None`` when the backend does not expose ``meta.n_ctx_train``.
+
+    Calls ``log_fn`` for informational messages (defaults to ``print``).
+    Raises ``SystemExit`` on failure.
+    """
+    try:
+        models = client.models.list()
+        if not models.data:
+            log_fn("Error: No models found at server. Use --model to specify.")
+            raise SystemExit(1)
+        m = models.data[0]
+        if len(models.data) > 1:
+            log_fn(f"Available models: {', '.join(x.id for x in models.data)}")
+            log_fn(f"Using: {m.id} (override with --model)")
+        # Extract context window from backend metadata (llama.cpp, vLLM, etc.)
+        ctx: int | None = None
+        meta = m.model_dump().get("meta")
+        if isinstance(meta, dict):
+            n_ctx = meta.get("n_ctx_train")
+            if isinstance(n_ctx, int) and n_ctx > 0:
+                ctx = n_ctx
+        return m.id, ctx
+    except SystemExit:
+        raise
+    except Exception as e:
+        log_fn(f"Error: Could not connect to server: {e}")
+        log_fn("Is the model server running? Start it or use --base-url to point elsewhere.")
+        raise SystemExit(1) from e
