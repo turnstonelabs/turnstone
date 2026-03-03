@@ -181,7 +181,7 @@ class TerminalUI(SessionUI):
                     item["denial_msg"] = denial_msg
                 return False, None
 
-    def on_tool_result(self, name: str, output: str) -> None:
+    def on_tool_result(self, call_id: str, name: str, output: str) -> None:
         pass  # Optional: display summary
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
@@ -322,9 +322,9 @@ class WorkstreamTerminalUI(TerminalUI):
         else:
             self._buffer("error", message)
 
-    def on_tool_result(self, name: str, output: str) -> None:
+    def on_tool_result(self, call_id: str, name: str, output: str) -> None:
         if self.is_foreground:
-            super().on_tool_result(name, output)
+            super().on_tool_result(call_id, name, output)
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         if self.is_foreground:

@@ -132,6 +132,7 @@ action required).
   "type": "tool_info",
   "items": [
     {
+      "call_id": "call_abc123",
       "header": "bash: ls -la",
       "preview": "",
       "func_name": "bash",
@@ -151,6 +152,7 @@ client must respond via `POST /api/approve`.
   "type": "approve_request",
   "items": [
     {
+      "call_id": "call_def456",
       "header": "bash: rm -rf /tmp/build",
       "preview": "",
       "func_name": "bash",
@@ -166,6 +168,7 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 
 | Field            | Type        | Description                                      |
 |------------------|-------------|--------------------------------------------------|
+| `call_id`        | string      | Unique tool call ID (links chunks to results)    |
 | `header`         | string      | Human-readable header line for the tool call     |
 | `preview`        | string      | Diff or argument preview (may be empty)          |
 | `func_name`      | string      | Function name (e.g. `"bash"`, `"edit_file"`)     |
@@ -179,10 +182,10 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 {"type": "tool_output_chunk", "call_id": "call_abc123", "chunk": "Building project...\n"}
 ```
 
-**`tool_result`** -- final output from a completed tool execution. For bash tools, this arrives after all `tool_output_chunk` events and includes both stdout and stderr.
+**`tool_result`** -- final output from a completed tool execution. The `call_id` matches the corresponding `tool_info`/`approve_request` item and any preceding `tool_output_chunk` events. For bash tools, this arrives after all streaming chunks and includes both stdout and stderr.
 
 ```json
-{"type": "tool_result", "name": "bash", "output": "file1.py\nfile2.py\n"}
+{"type": "tool_result", "call_id": "call_abc123", "name": "bash", "output": "file1.py\nfile2.py\n"}
 ```
 
 **`status`** -- token usage statistics, sent after each model turn.
