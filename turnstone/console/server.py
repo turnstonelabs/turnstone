@@ -4,6 +4,8 @@ Serves the cluster-level dashboard UI and provides REST/SSE APIs
 backed by the ClusterCollector.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import logging
@@ -11,12 +13,11 @@ import math
 import os
 import queue
 import textwrap
-import threading
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import urlparse, parse_qs
+from typing import Any
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 from turnstone.console.collector import ClusterCollector
 from turnstone.mq.broker import RedisBroker
@@ -48,17 +49,17 @@ def _load_static() -> None:
 class ConsoleHTTPHandler(BaseHTTPRequestHandler):
     """HTTP handler for the cluster dashboard."""
 
-    def log_message(self, format, *args):
+    def log_message(self, fmt: str, *args: object) -> None:  # noqa: N802
         pass  # suppress default logging
 
-    def _set_headers(self, status=200, content_type="application/json"):
+    def _set_headers(self, status: int = 200, content_type: str = "application/json") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-    def _send_json(self, data: dict, status=200):
+    def _send_json(self, data: dict[str, Any], status: int = 200) -> None:
         self._set_headers(status, "application/json")
         self.wfile.write(json.dumps(data).encode("utf-8"))
 
@@ -69,24 +70,22 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
         auth_config = self.server.auth_config  # type: ignore[attr-defined]
         auth_header = self.headers.get("Authorization")
         cookie_header = self.headers.get("Cookie")
-        allowed, status, msg = check_request(
-            auth_config, method, path, auth_header, cookie_header
-        )
+        allowed, status, msg = check_request(auth_config, method, path, auth_header, cookie_header)
         if not allowed:
             self._send_json({"error": msg}, status)
         return allowed
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            return json.loads(raw.decode("utf-8"))  # type: ignore[no-any-return]
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return {}
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         # Login/logout pass through _check_auth because they are in PUBLIC_PATHS.
         if not self._check_auth("POST", self.path):
             return
@@ -103,9 +102,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
                 self.send_header("Set-Cookie", make_set_cookie(token))
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                self.wfile.write(
-                    json.dumps({"status": "ok", "role": role}).encode("utf-8")
-                )
+                self.wfile.write(json.dumps({"status": "ok", "role": role}).encode("utf-8"))
             else:
                 self._send_json({"error": "Invalid token"}, 401)
 
@@ -122,7 +119,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
         else:
             self._send_json({"error": "Not found"}, 404)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         parsed = urlparse(self.path)
         try:
             if not self._check_auth("GET", parsed.path):
@@ -134,7 +131,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _parse_int(
-        qs: dict, name: str, default: int, minimum: int = 0, maximum: int = 10000
+        qs: dict[str, list[str]], name: str, default: int, minimum: int = 0, maximum: int = 10000
     ) -> int:
         try:
             val = int(qs.get(name, [str(default)])[0])
@@ -142,7 +139,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
             val = default
         return max(minimum, min(val, maximum))
 
-    def _do_GET(self, parsed):
+    def _do_GET(self, parsed: ParseResult) -> None:  # noqa: N802
         collector: ClusterCollector = self.server.collector  # type: ignore[attr-defined]
 
         if parsed.path == "/":
@@ -171,9 +168,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
             sort_by = qs.get("sort", ["activity"])[0]
             limit = self._parse_int(qs, "limit", 100, minimum=1, maximum=1000)
             offset = self._parse_int(qs, "offset", 0)
-            nodes, total = collector.get_nodes(
-                sort_by=sort_by, limit=limit, offset=offset
-            )
+            nodes, total = collector.get_nodes(sort_by=sort_by, limit=limit, offset=offset)
             self._send_json({"nodes": nodes, "total": total})
 
         elif parsed.path == "/api/cluster/workstreams":
@@ -232,7 +227,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
             self._set_headers(404, "text/plain")
             self.wfile.write(b"Not found")
 
-    def _handle_sse(self, collector: ClusterCollector):
+    def _handle_sse(self, collector: ClusterCollector) -> None:
         """Server-Sent Events stream for cluster updates."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -241,14 +236,14 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-        client_queue: queue.Queue = queue.Queue(maxsize=500)
+        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
         collector.register_listener(client_queue)
         try:
             while True:
                 try:
                     event = client_queue.get(timeout=5)
                     data = json.dumps(event)
-                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                    self.wfile.write(f"data: {data}\n\n".encode())
                     self.wfile.flush()
                 except queue.Empty:
                     self.wfile.write(b": keepalive\n\n")
@@ -258,7 +253,7 @@ class ConsoleHTTPHandler(BaseHTTPRequestHandler):
         finally:
             collector.unregister_listener(client_queue)
 
-    def do_OPTIONS(self):
+    def do_OPTIONS(self) -> None:
         """Handle CORS preflight."""
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -281,7 +276,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="turnstone console — cluster dashboard service.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

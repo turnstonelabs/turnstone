@@ -1,15 +1,21 @@
-"""Integration tests against a live llama.cpp backend on port 8000.
+"""Tests for turnstone ChatSession and server endpoints.
 
-These tests use turnstone's HeadlessSession to run actual LLM inference
-and tool execution against the backend. They verify end-to-end behavior:
-model connectivity, tool calling, response quality, and session mechanics.
+Mock-based tests verify streaming, tool calling, multi-turn conversation,
+and session configuration WITHOUT a running LLM backend.  The mocks replace
+only the OpenAI streaming layer -- tool execution (bash, math, read_file)
+still runs real subprocesses.
 
-Requires: llama-server (or compatible OpenAI API) running on localhost:8000.
+The TestBackendConnectivity class is marked @pytest.mark.live and requires a
+running llama-server (or compatible OpenAI API) on localhost:8000.
 
-Run with: pytest tests/test_server_live.py -v --timeout=120
+The TestServerHealthMetrics class spins up an in-process HTTP server and
+needs no LLM backend at all.
 
-The TestServerHealthMetrics class does NOT require a live LLM and can be run
-independently: pytest tests/test_server_live.py::TestServerHealthMetrics -v
+Run all non-live tests:
+    pytest tests/test_server_live.py -v -m "not live"
+
+Run everything (needs backend):
+    pytest tests/test_server_live.py -v --timeout=120
 """
 
 import json
@@ -17,15 +23,15 @@ import os
 import queue
 import tempfile
 import threading
-import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import httpx
 import pytest
 from openai import OpenAI
 
-from turnstone.core.session import ChatSession
-from turnstone.core.tools import TOOLS
 import turnstone.core.memory as _memory_module
-
+from turnstone.core.session import ChatSession
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -35,8 +41,8 @@ BASE_URL = os.environ.get("TURNSTONE_TEST_BASE_URL", "http://localhost:8000/v1")
 
 
 @pytest.fixture(scope="module")
-def client():
-    """Create an OpenAI client pointed at the local backend."""
+def live_client():
+    """Create an OpenAI client pointed at the local backend (live tests only)."""
     return OpenAI(
         base_url=BASE_URL,
         api_key=os.environ.get("TURNSTONE_TEST_API_KEY", "not-needed"),
@@ -44,9 +50,9 @@ def client():
 
 
 @pytest.fixture(scope="module")
-def model_id(client):
-    """Auto-detect the model name from the backend."""
-    models = client.models.list()
+def live_model_id(live_client):
+    """Auto-detect the model name from the backend (live tests only)."""
+    models = live_client.models.list()
     ids = [m.id for m in models.data]
     assert len(ids) > 0, "No models found on the backend"
     return ids[0]
@@ -125,16 +131,13 @@ def tmp_db():
     os.unlink(path)
 
 
-def _make_session(
-    client, model_id, tmp_db, **kwargs
-) -> tuple[ChatSession, RecordingUI]:
+def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, RecordingUI]:
     """Create a ChatSession with RecordingUI and sensible test defaults."""
     ui = RecordingUI()
     defaults = dict(
         client=client,
         model=model_id,
         ui=ui,
-        persona=None,
         instructions=None,
         temperature=0.3,
         max_tokens=2048,
@@ -148,174 +151,339 @@ def _make_session(
 
 
 # ---------------------------------------------------------------------------
-# Tests — Backend connectivity
+# Mock streaming helpers
 # ---------------------------------------------------------------------------
 
 
+def _make_chunk(
+    *,
+    content=None,
+    reasoning_content=None,
+    tool_calls=None,
+    finish_reason=None,
+    usage=None,
+):
+    """Build a single mock streaming chunk matching the OpenAI format.
+
+    The chunk structure mirrors openai.types.chat.ChatCompletionChunk:
+      chunk.choices[0].delta.content
+      chunk.choices[0].delta.reasoning_content
+      chunk.choices[0].delta.tool_calls
+      chunk.choices[0].finish_reason
+      chunk.usage
+    """
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning_content,
+        reasoning=None,
+        tool_calls=tool_calls,
+        role=None,
+        model_extra=None,
+    )
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    chunk = SimpleNamespace(choices=[choice], usage=usage)
+    return chunk
+
+
+def _make_tool_call_deltas(call_id, name, arguments):
+    """Build a list of tool_call delta objects for a single tool call.
+
+    Returns a list with one element (single tool call at index 0).
+    """
+    fn = SimpleNamespace(name=name, arguments=arguments)
+    return [SimpleNamespace(index=0, id=call_id, function=fn)]
+
+
+def _usage(prompt=100, completion=50, total=None):
+    """Build a mock usage object."""
+    return SimpleNamespace(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total or (prompt + completion),
+    )
+
+
+def make_mock_stream(
+    content_tokens=None,
+    reasoning_tokens=None,
+    tool_calls=None,
+    finish_reason="stop",
+    usage=None,
+):
+    """Create an iterable of mock chunks simulating an OpenAI streaming response.
+
+    Parameters
+    ----------
+    content_tokens : list[str] | None
+        Content token strings, each emitted as a separate chunk.
+    reasoning_tokens : list[str] | None
+        Reasoning token strings, emitted before content.
+    tool_calls : list[tuple[str, str, str]] | None
+        Each entry is (call_id, function_name, arguments_json).
+        When provided, finish_reason defaults to "tool_calls".
+    finish_reason : str
+        Finish reason on the last content/tool chunk.
+    usage : SimpleNamespace | None
+        Usage object for the final chunk.  Defaults to a sensible value.
+    """
+    chunks = []
+
+    if reasoning_tokens:
+        for token in reasoning_tokens:
+            chunks.append(_make_chunk(reasoning_content=token))
+
+    if content_tokens:
+        for i, token in enumerate(content_tokens):
+            is_last = (i == len(content_tokens) - 1) and not tool_calls
+            chunks.append(
+                _make_chunk(
+                    content=token,
+                    finish_reason=finish_reason if is_last else None,
+                )
+            )
+
+    if tool_calls:
+        for i, (call_id, name, arguments) in enumerate(tool_calls):
+            is_last = i == len(tool_calls) - 1
+            tc_deltas = _make_tool_call_deltas(call_id, name, arguments)
+            chunks.append(
+                _make_chunk(
+                    tool_calls=tc_deltas,
+                    finish_reason="tool_calls" if is_last else None,
+                )
+            )
+
+    # Final usage-only chunk (no choices)
+    if usage is None:
+        usage = _usage()
+    chunks.append(SimpleNamespace(choices=[], usage=usage))
+
+    return iter(chunks)
+
+
+def _mock_client():
+    """Create a mock OpenAI client with a patchable chat.completions.create."""
+    client = MagicMock(spec=OpenAI)
+    client.chat = MagicMock()
+    client.chat.completions = MagicMock()
+    client.chat.completions.create = MagicMock()
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Tests -- Backend connectivity (live, requires running LLM)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.live
 class TestBackendConnectivity:
     """Verify the LLM backend is reachable and returns valid responses."""
 
-    def test_models_endpoint(self, client):
-        models = client.models.list()
+    def test_models_endpoint(self, live_client):
+        models = live_client.models.list()
         assert len(models.data) > 0
 
-    def test_model_id_detected(self, model_id):
-        assert isinstance(model_id, str)
-        assert len(model_id) > 0
+    def test_model_id_detected(self, live_model_id):
+        assert isinstance(live_model_id, str)
+        assert len(live_model_id) > 0
 
-    def test_basic_completion(self, client, model_id):
-        """Raw API call — no turnstone involved."""
-        resp = client.chat.completions.create(
-            model=model_id,
+    def test_basic_completion(self, live_client, live_model_id):
+        """Raw API call -- no turnstone involved."""
+        resp = live_client.chat.completions.create(
+            model=live_model_id,
             messages=[{"role": "user", "content": "Say 'hello'"}],
             max_completion_tokens=200,
             temperature=0.0,
             stream=False,
         )
-        assert (
-            resp.choices[0].message.content or resp.choices[0].message.reasoning_content
-        )
+        assert resp.choices[0].message.content or resp.choices[0].message.reasoning_content
         assert resp.usage.total_tokens > 0
 
 
 # ---------------------------------------------------------------------------
-# Tests — Streaming session
+# Tests -- Streaming session (mocked)
 # ---------------------------------------------------------------------------
 
 
 class TestStreamingSession:
-    """Test ChatSession.send() with streaming against the live backend."""
+    """Test ChatSession.send() with mocked streaming responses."""
 
-    def test_simple_response(self, client, model_id, tmp_db):
-        """Model responds to a basic prompt via streaming."""
-        session, ui = _make_session(client, model_id, tmp_db)
-        session.send("Reply with exactly: PONG")
+    def test_simple_response(self, tmp_db):
+        """Mock returns content tokens; verify RecordingUI captures them."""
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            content_tokens=["Hello", " ", "world"],
+        )
 
-        # Should have gotten some content or reasoning
-        total = ui.full_content + ui.full_reasoning
-        assert len(total) > 0, "No output from model"
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True  # prevent background title generation
 
-    def test_reasoning_tokens_appear(self, client, model_id, tmp_db):
-        """Model produces reasoning tokens (extended thinking)."""
-        session, ui = _make_session(client, model_id, tmp_db)
+        session.send("Say hello")
+
+        assert "Hello world" in ui.full_content
+
+    def test_reasoning_tokens_appear(self, tmp_db):
+        """Mock returns reasoning tokens then content; verify both captured."""
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            reasoning_tokens=["Let me", " think..."],
+            content_tokens=["The answer", " is 56"],
+        )
+
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True
+
         session.send("What is 7 * 8?")
 
-        # This model uses reasoning_content, so we expect reasoning tokens
-        assert len(ui.reasoning_tokens) > 0, "No reasoning tokens received"
+        assert len(ui.reasoning_tokens) > 0
+        assert "think" in ui.full_reasoning.lower()
+        assert "56" in ui.full_content
 
-    def test_stream_end_event(self, client, model_id, tmp_db):
+    def test_stream_end_event(self, tmp_db):
         """stream_end event is emitted after response."""
-        session, ui = _make_session(client, model_id, tmp_db)
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            content_tokens=["Hi"],
+        )
+
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True
+
         session.send("Say hi")
 
         event_types = [e[0] for e in ui.events]
         assert "stream_end" in event_types
 
-    def test_thinking_lifecycle(self, client, model_id, tmp_db):
+    def test_thinking_lifecycle(self, tmp_db):
         """thinking_start and thinking_stop bracket the response."""
-        session, ui = _make_session(client, model_id, tmp_db)
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            content_tokens=["Hi", " there"],
+        )
+
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True
+
         session.send("Say hi")
 
         event_types = [e[0] for e in ui.events]
         assert "thinking_start" in event_types
         assert "thinking_stop" in event_types
-        # thinking_start should come before thinking_stop
         start_idx = event_types.index("thinking_start")
         stop_idx = event_types.index("thinking_stop")
         assert start_idx < stop_idx
 
 
 # ---------------------------------------------------------------------------
-# Tests — Tool calling
+# Tests -- Tool calling (mocked LLM, real tool execution)
 # ---------------------------------------------------------------------------
 
 
 class TestToolCalling:
-    """Test that the model can invoke tools and turnstone executes them."""
+    """Test that mocked tool_calls trigger real tool execution."""
 
-    def test_math_tool(self, client, model_id, tmp_db):
-        """Model uses the math tool for computation."""
-        session, ui = _make_session(
-            client,
-            model_id,
-            tmp_db,
-            instructions="You have tools. Use the math tool to compute results. Always use tools when asked to calculate.",
+    def test_math_tool(self, tmp_db):
+        """First call returns tool_call for math(code='2+2'), second returns content."""
+        client = _mock_client()
+
+        # First create() call: model requests math tool
+        stream1 = make_mock_stream(
+            tool_calls=[("call_math_1", "math", json.dumps({"code": "2+2"}))],
         )
-        session.send("Use the math tool to calculate: 17 * 23. Report the result.")
+        # Second create() call: model produces final answer
+        stream2 = make_mock_stream(
+            content_tokens=["The result is ", "4"],
+        )
+        client.chat.completions.create.side_effect = [stream1, stream2]
 
-        # Check if math tool was invoked
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True
+
+        session.send("Calculate 2+2")
+
+        # math tool was invoked and returned a result
         math_results = [r for r in ui.tool_results if r[0] == "math"]
-        if math_results:
-            # Verify the result contains 391
-            assert "391" in math_results[0][1], (
-                f"Expected 391, got: {math_results[0][1]}"
-            )
-        else:
-            # Model may have answered directly — check content
-            total = ui.full_content + ui.full_reasoning
-            assert "391" in total, f"Expected 391 somewhere in output"
+        assert len(math_results) > 0
+        assert "4" in math_results[0][1]
 
-    def test_bash_tool(self, client, model_id, tmp_db):
-        """Model uses bash to answer a system question."""
-        session, ui = _make_session(
-            client,
-            model_id,
-            tmp_db,
-            instructions="You have tools. Use the bash tool to run commands. Always use bash when asked about system info.",
+        # Final content contains the answer
+        assert "4" in ui.full_content
+
+    def test_bash_tool(self, tmp_db):
+        """First call returns tool_call for bash, second returns content."""
+        client = _mock_client()
+
+        stream1 = make_mock_stream(
+            tool_calls=[("call_bash_1", "bash", json.dumps({"command": "echo hello"}))],
         )
-        session.send(
-            "Use the bash tool to run 'echo hello_from_test' and report what it prints."
+        stream2 = make_mock_stream(
+            content_tokens=["The command printed: ", "hello"],
         )
+        client.chat.completions.create.side_effect = [stream1, stream2]
+
+        session, ui = _make_session(client, "mock-model", tmp_db)
+        session._title_generated = True
+
+        session.send("Run echo hello")
 
         bash_results = [r for r in ui.tool_results if r[0] == "bash"]
-        if bash_results:
-            assert "hello_from_test" in bash_results[0][1]
-        else:
-            total = ui.full_content + ui.full_reasoning
-            assert "hello_from_test" in total, "Expected bash output in response"
+        assert len(bash_results) > 0
+        assert "hello" in bash_results[0][1]
 
-    def test_read_file_tool(self, client, model_id, tmp_db):
-        """Model uses read_file to read a known file."""
-        # Create a temp file for the model to read
+    def test_read_file_tool(self, tmp_db):
+        """First call returns tool_call for read_file, second returns content."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
             f.write("SECRET_CONTENT_42\n")
             path = f.name
 
         try:
-            session, ui = _make_session(
-                client,
-                model_id,
-                tmp_db,
-                instructions="You have tools. Use the read_file tool to read files. Always use read_file when asked to read a file.",
-            )
-            session.send(
-                f"Use the read_file tool to read {path} and tell me what it says."
-            )
+            client = _mock_client()
 
-            # read_file was invoked (UI gets a summary like "1 lines")
+            stream1 = make_mock_stream(
+                tool_calls=[("call_read_1", "read_file", json.dumps({"path": path}))],
+            )
+            stream2 = make_mock_stream(
+                content_tokens=["The file says: SECRET_CONTENT_42"],
+            )
+            client.chat.completions.create.side_effect = [stream1, stream2]
+
+            session, ui = _make_session(client, "mock-model", tmp_db)
+            session._title_generated = True
+
+            session.send(f"Read {path}")
+
             read_results = [r for r in ui.tool_results if r[0] == "read_file"]
-            assert len(read_results) > 0, "read_file tool was not called"
+            assert len(read_results) > 0
 
-            # The model sees the actual file content and should relay it
-            total = ui.full_content + ui.full_reasoning
-            assert "SECRET_CONTENT_42" in total, (
-                f"Model didn't relay file content. Got: {total[:500]}"
-            )
+            # Model relays the content
+            assert "SECRET_CONTENT_42" in ui.full_content
         finally:
             os.unlink(path)
 
 
 # ---------------------------------------------------------------------------
-# Tests — Multi-turn conversation
+# Tests -- Multi-turn conversation (mocked)
 # ---------------------------------------------------------------------------
 
 
 class TestMultiTurn:
-    """Test multi-turn conversation state."""
+    """Test multi-turn conversation state with mocked responses."""
 
-    def test_context_retained(self, client, model_id, tmp_db):
-        """Second message can reference the first."""
-        session, ui = _make_session(client, model_id, tmp_db, max_tokens=1024)
+    def test_context_retained(self, tmp_db):
+        """Second send references context from the first."""
+        client = _mock_client()
+
+        stream1 = make_mock_stream(
+            content_tokens=["I'll remember ", "Zephyr"],
+        )
+        stream2 = make_mock_stream(
+            content_tokens=["Your name is ", "Zephyr"],
+        )
+        client.chat.completions.create.side_effect = [stream1, stream2]
+
+        session, ui = _make_session(client, "mock-model", tmp_db, max_tokens=1024)
+        session._title_generated = True
+
         session.send("My name is Zephyr. Remember it.")
 
         # Reset UI tracking for second turn
@@ -324,58 +492,86 @@ class TestMultiTurn:
 
         session.send("What is my name?")
 
-        total = ui.full_content + ui.full_reasoning
-        assert "zephyr" in total.lower(), f"Model forgot the name. Got: {total[:300]}"
+        assert "zephyr" in ui.full_content.lower()
 
-    def test_message_list_grows(self, client, model_id, tmp_db):
+    def test_message_list_grows(self, tmp_db):
         """Each send adds user + assistant messages."""
-        session, ui = _make_session(client, model_id, tmp_db, max_tokens=512)
+        client = _mock_client()
+
+        stream1 = make_mock_stream(content_tokens=["Hello"])
+        stream2 = make_mock_stream(content_tokens=["World"])
+        client.chat.completions.create.side_effect = [stream1, stream2]
+
+        session, ui = _make_session(client, "mock-model", tmp_db, max_tokens=512)
+        session._title_generated = True
 
         initial_count = len(session.messages)
         session.send("Hello")
+        after_first = len(session.messages)
+        assert after_first >= initial_count + 2
 
-        # Should have at least user + assistant
-        assert len(session.messages) >= initial_count + 2
+        session.send("World")
+        after_second = len(session.messages)
+        assert after_second >= after_first + 2
 
 
 # ---------------------------------------------------------------------------
-# Tests — Session configuration
+# Tests -- Session configuration (mocked)
 # ---------------------------------------------------------------------------
 
 
 class TestSessionConfig:
-    """Test session construction and configuration."""
+    """Test session construction and configuration with mocked responses."""
 
-    def test_creative_mode_no_tools(self, client, model_id, tmp_db):
-        """In creative mode, tools are not sent to the API."""
-        session, ui = _make_session(client, model_id, tmp_db, max_tokens=256)
+    def test_creative_mode_no_tools(self, tmp_db):
+        """In creative mode, create() is called WITHOUT tools kwarg."""
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            content_tokens=["A haiku about code"],
+        )
+
+        session, ui = _make_session(client, "mock-model", tmp_db, max_tokens=256)
+        session._title_generated = True
         session.creative_mode = True
+        # Re-init system messages so creative_mode takes effect
+        session._init_system_messages()
+
         session.send("Write a haiku about code.")
 
+        # Verify create() was called without 'tools' in kwargs
+        call_kwargs = client.chat.completions.create.call_args
+        assert "tools" not in call_kwargs.kwargs, "tools should not be passed in creative mode"
+
         # Should get content back without tool calls
-        total = ui.full_content + ui.full_reasoning
-        assert len(total) > 0
+        assert len(ui.full_content) > 0
         assert len(ui.tool_results) == 0
 
-    def test_custom_instructions(self, client, model_id, tmp_db):
-        """Custom instructions are included in the session."""
+    def test_custom_instructions(self, tmp_db):
+        """Custom instructions appear in system messages."""
+        client = _mock_client()
+        client.chat.completions.create.return_value = make_mock_stream(
+            content_tokens=["Hello. ENDMARKER"],
+        )
+
         session, ui = _make_session(
             client,
-            model_id,
+            "mock-model",
             tmp_db,
             instructions="Always end your response with ENDMARKER.",
             max_tokens=512,
         )
-        session.send("Say hello briefly.")
+        session._title_generated = True
 
-        total = ui.full_content
-        # We can't strictly guarantee the model follows instructions,
-        # but we verify the session didn't error out
+        # Verify custom instructions appear in system messages
+        dev_msg = session.system_messages[0]
+        assert "ENDMARKER" in dev_msg["content"]
+
+        session.send("Say hello briefly.")
         assert len(ui.errors) == 0
 
 
 # ---------------------------------------------------------------------------
-# Tests — /health and /metrics endpoints (no live LLM required)
+# Tests -- /health and /metrics endpoints (no live LLM required)
 # ---------------------------------------------------------------------------
 
 
@@ -391,23 +587,40 @@ class TestServerHealthMetrics:
     @classmethod
     def setup_class(cls):
         from unittest.mock import MagicMock
+
         import turnstone.server as srv_mod
-        from turnstone.core.workstream import WorkstreamState
 
         # Reset module-level metrics so each test run starts fresh
-        srv_mod._metrics = srv_mod.MetricsCollector()
+        from turnstone.core.metrics import MetricsCollector
+        from turnstone.core.workstream import WorkstreamState
+
+        srv_mod._metrics = MetricsCollector()
         srv_mod._metrics.model = "test-model"
 
         # Mock WorkstreamManager.list_all() to return one idle workstream
+        mock_ui = MagicMock()
+        mock_ui._ws_lock = threading.Lock()
+        mock_ui._ws_prompt_tokens = 0
+        mock_ui._ws_completion_tokens = 0
+        mock_ui._ws_messages = 0
+        mock_ui._ws_tool_calls = {}
+        mock_ui._ws_context_ratio = 0.0
+
+        mock_session = MagicMock()
+        mock_session.session_id = "test-session-id"
+
         mock_ws = MagicMock()
+        mock_ws.id = "test-ws"
+        mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
+        mock_ws.ui = mock_ui
+        mock_ws.session = mock_session
+
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        # Start a server on a random port (port 0 → OS assigns free port)
-        cls.server = srv_mod.ThreadedHTTPServer(
-            ("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler
-        )
+        # Start a server on a random port (port 0 -> OS assigns free port)
+        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
         from turnstone.core.auth import AuthConfig
 
         cls.server.workstreams = mock_mgr

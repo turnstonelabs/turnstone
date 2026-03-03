@@ -13,7 +13,7 @@ class MarkdownRenderer:
     (fenced code blocks) track state across lines.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.in_code_block = False
         self._buf = ""
 
@@ -52,9 +52,7 @@ class MarkdownRenderer:
         # Inline formatting (order matters: bold before italic)
         line = re.sub(r"\*\*(.+?)\*\*", f"{BOLD}\\1{RESET}", line)
         line = re.sub(r"__(.+?)__", f"{BOLD}\\1{RESET}", line)
-        line = re.sub(
-            r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", f"{ITALIC}\\1{RESET}", line
-        )
+        line = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", f"{ITALIC}\\1{RESET}", line)
         line = re.sub(r"`(.+?)`", f"{CYAN}\\1{RESET}", line)
 
         # Bullet lists — cyan bullet

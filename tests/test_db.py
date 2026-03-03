@@ -1,12 +1,11 @@
 """Tests for turnstone.core.memory — database operations."""
 
-import turnstone.core.memory as memory
 from turnstone.core.memory import (
+    normalize_key,
     open_db,
     save_message,
     search_history,
     search_history_recent,
-    normalize_key,
 )
 
 

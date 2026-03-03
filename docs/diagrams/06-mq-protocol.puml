@@ -1,0 +1,242 @@
+@startuml
+!theme plain
+title Turnstone — Message Queue Protocol Types
+skinparam classAttributeIconSize 0
+skinparam packageStyle rectangle
+
+package "Inbound Messages (Client → Bridge)" #FFF3E0 {
+
+    abstract class "InboundMessage" as IM {
+        + type: str
+        + correlation_id: str  {auto: uuid4().hex[:12]}
+        + timestamp: float  {auto: time.time()}
+        --
+        + to_json() → str
+        + {static} from_json(raw) → InboundMessage
+    }
+
+    class SendMessage {
+        type = "send"
+        --
+        + ws_id: str
+        + message: str
+        + auto_approve: bool = False
+        + auto_approve_tools: list[str] = []
+        + name: str = ""
+        + target_node: str = ""
+    }
+
+    class ApproveMessage {
+        type = "approve"
+        --
+        + ws_id: str
+        + request_id: str
+        + approved: bool = True
+        + feedback: str | None
+        + always: bool = False
+    }
+
+    class PlanFeedbackMessage {
+        type = "plan_feedback"
+        --
+        + ws_id: str
+        + request_id: str
+        + feedback: str
+    }
+
+    class CommandMessage {
+        type = "command"
+        --
+        + ws_id: str
+        + command: str
+    }
+
+    class CreateWorkstreamMessage {
+        type = "create_workstream"
+        --
+        + name: str = ""
+        + auto_approve: bool = False
+        + auto_approve_tools: list[str] = []
+        + target_node: str = ""
+    }
+
+    class CloseWorkstreamMessage {
+        type = "close_workstream"
+        --
+        + ws_id: str
+    }
+
+    class ListWorkstreamsMessage {
+        type = "list_workstreams"
+    }
+
+    class HealthMessage {
+        type = "health"
+    }
+
+    class ListNodesMessage {
+        type = "list_nodes"
+    }
+
+    IM <|-- SendMessage
+    IM <|-- ApproveMessage
+    IM <|-- PlanFeedbackMessage
+    IM <|-- CommandMessage
+    IM <|-- CreateWorkstreamMessage
+    IM <|-- CloseWorkstreamMessage
+    IM <|-- ListWorkstreamsMessage
+    IM <|-- HealthMessage
+    IM <|-- ListNodesMessage
+}
+
+package "Outbound Events (Bridge → Client)" #E3F2FD {
+
+    abstract class "OutboundEvent" as OE {
+        + type: str
+        + ws_id: str
+        + correlation_id: str
+        + timestamp: float
+        --
+        + to_json() → str
+        + {static} from_json(raw) → OutboundEvent
+    }
+
+    package "Streaming" #BBDEFB {
+        class ContentEvent {
+            type = "content"
+            + text: str
+        }
+        class ReasoningEvent {
+            type = "reasoning"
+            + text: str
+        }
+        class StreamEndEvent {
+            type = "stream_end"
+        }
+    }
+
+    package "Tools" #C8E6C9 {
+        class ToolInfoEvent {
+            type = "tool_info"
+            + items: list
+        }
+        class ApprovalRequestEvent {
+            type = "approval_request"
+            + items: list
+            ..
+            correlation_id = request_id
+        }
+        class ToolResultEvent {
+            type = "tool_result"
+            + name: str
+            + output: str
+        }
+        class PlanReviewEvent {
+            type = "plan_review"
+            + content: str
+        }
+    }
+
+    package "Status" #FFF9C4 {
+        class AckEvent {
+            type = "ack"
+            + status: str
+            + detail: str
+        }
+        class StatusEvent {
+            type = "status"
+            + prompt_tokens: int
+            + completion_tokens: int
+            + total_tokens: int
+            + context_window: int
+            + pct: float
+            + effort: str
+        }
+        class StateChangeEvent {
+            type = "state_change"
+            + state: str
+        }
+        class TurnCompleteEvent {
+            type = "turn_complete"
+        }
+    }
+
+    package "Lifecycle" #F8BBD0 {
+        class WorkstreamCreatedEvent {
+            type = "ws_created"
+            + name: str
+        }
+        class WorkstreamClosedEvent {
+            type = "ws_closed"
+        }
+        class WorkstreamListEvent {
+            type = "ws_list"
+            + workstreams: list
+        }
+        class WorkstreamRenameEvent {
+            type = "ws_rename"
+            + name: str
+        }
+    }
+
+    package "System" #E0E0E0 {
+        class HealthResponseEvent {
+            type = "health_response"
+            + data: dict
+        }
+        class ErrorEvent {
+            type = "error"
+            + message: str
+        }
+        class InfoEvent {
+            type = "info"
+            + message: str
+        }
+        class NodeListEvent {
+            type = "node_list"
+            + nodes: list
+        }
+        class ClusterStateEvent {
+            type = "cluster_state"
+            + state: str
+            + node_id: str
+            + tokens: int
+            + context_ratio: float
+            + activity: str
+            + activity_state: str
+        }
+    }
+
+    OE <|-- ContentEvent
+    OE <|-- ReasoningEvent
+    OE <|-- StreamEndEvent
+    OE <|-- ToolInfoEvent
+    OE <|-- ApprovalRequestEvent
+    OE <|-- ToolResultEvent
+    OE <|-- PlanReviewEvent
+    OE <|-- AckEvent
+    OE <|-- StatusEvent
+    OE <|-- StateChangeEvent
+    OE <|-- TurnCompleteEvent
+    OE <|-- WorkstreamCreatedEvent
+    OE <|-- WorkstreamClosedEvent
+    OE <|-- WorkstreamListEvent
+    OE <|-- WorkstreamRenameEvent
+    OE <|-- HealthResponseEvent
+    OE <|-- ErrorEvent
+    OE <|-- InfoEvent
+    OE <|-- NodeListEvent
+    OE <|-- ClusterStateEvent
+}
+
+note bottom of IM
+  **Deserialization**: Strict type-dispatch via _INBOUND_REGISTRY.
+  Unknown type raises ValueError.
+end note
+
+note bottom of OE
+  **Deserialization**: Lenient type-dispatch via _OUTBOUND_REGISTRY.
+  Unknown type falls back to base OutboundEvent.
+end note
+
+@enduml

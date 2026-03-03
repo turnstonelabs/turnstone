@@ -6,8 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from turnstone.core.auth import (
-    AuthConfig,
     WRITE_PATHS,
+    AuthConfig,
     _extract_bearer,
     _extract_cookie,
     check_request,
@@ -17,7 +17,6 @@ from turnstone.core.auth import (
     make_set_cookie,
     required_role,
 )
-
 
 # ---------------------------------------------------------------------------
 # TestIsPublicPath
@@ -186,9 +185,7 @@ class TestExtractCookie:
         assert _extract_cookie("", "turnstone_auth") is None
 
     def test_spaces_around_value(self):
-        assert (
-            _extract_cookie("turnstone_auth = tok_abc ", "turnstone_auth") == "tok_abc"
-        )
+        assert _extract_cookie("turnstone_auth = tok_abc ", "turnstone_auth") == "tok_abc"
 
     def test_no_equals(self):
         assert _extract_cookie("malformed", "turnstone_auth") is None
@@ -288,44 +285,32 @@ class TestCheckRequest:
         assert status == 401
 
     def test_api_read_token_ok(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "GET", "/api/workstreams", "Bearer tok_read"
-        )
+        allowed, status, msg = check_request(enabled, "GET", "/api/workstreams", "Bearer tok_read")
         assert allowed is True
         assert status == 200
 
     def test_api_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "GET", "/api/workstreams", "Bearer tok_full"
-        )
+        allowed, status, msg = check_request(enabled, "GET", "/api/workstreams", "Bearer tok_full")
         assert allowed is True
 
     def test_write_read_token_403(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "POST", "/api/send", "Bearer tok_read"
-        )
+        allowed, status, msg = check_request(enabled, "POST", "/api/send", "Bearer tok_read")
         assert allowed is False
         assert status == 403
         assert "Forbidden" in msg
 
     def test_write_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "POST", "/api/send", "Bearer tok_full"
-        )
+        allowed, status, msg = check_request(enabled, "POST", "/api/send", "Bearer tok_full")
         assert allowed is True
         assert status == 200
 
     def test_approve_read_token_403(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "POST", "/api/approve", "Bearer tok_read"
-        )
+        allowed, status, msg = check_request(enabled, "POST", "/api/approve", "Bearer tok_read")
         assert allowed is False
         assert status == 403
 
     def test_approve_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(
-            enabled, "POST", "/api/approve", "Bearer tok_full"
-        )
+        allowed, status, msg = check_request(enabled, "POST", "/api/approve", "Bearer tok_full")
         assert allowed is True
 
     def test_no_auth_header_string(self, enabled):
@@ -576,9 +561,7 @@ class TestServerAuth:
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        cls.server = srv_mod.ThreadedHTTPServer(
-            ("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler
-        )
+        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
         cls.server.workstreams = mock_mgr
         cls.server.skip_permissions = False
         cls.server.global_listeners = []
@@ -835,9 +818,7 @@ class TestServerLogin:
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        cls.server = srv_mod.ThreadedHTTPServer(
-            ("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler
-        )
+        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
         cls.server.workstreams = mock_mgr
         cls.server.skip_permissions = False
         cls.server.global_listeners = []

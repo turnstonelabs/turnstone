@@ -1,3 +1,3 @@
-"""turnstone - Single-file AI chat client with tool use."""
+"""turnstone - Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"

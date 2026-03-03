@@ -1,8 +1,14 @@
 """SQLite database for persistent memories and conversation history."""
 
+from __future__ import annotations
+
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 TURNSTONE_DB = os.path.join(os.getcwd(), ".turnstone.db")
 db_override: str | None = None
@@ -52,9 +58,7 @@ def open_db() -> sqlite3.Connection:
             "role TEXT NOT NULL, content TEXT, "
             "tool_name TEXT, tool_args TEXT)"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id)")
         # Migration: add tool_call_id column if missing (for session resume)
         try:
             conn.execute("SELECT tool_call_id FROM conversations LIMIT 0")
@@ -68,23 +72,18 @@ def open_db() -> sqlite3.Connection:
             "title TEXT, created TEXT NOT NULL, updated TEXT NOT NULL)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_alias ON sessions(alias)")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated)"
-        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated)")
         try:
             # Check if FTS table already exists
             fts_exists = conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type='table' AND name='conversations_fts'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversations_fts'"
             ).fetchone()
             if not fts_exists:
                 conn.execute(
                     "CREATE VIRTUAL TABLE conversations_fts "
                     "USING fts5(content, content=conversations, content_rowid=id)"
                 )
-                conn.execute(
-                    "INSERT INTO conversations_fts(conversations_fts) VALUES('rebuild')"
-                )
+                conn.execute("INSERT INTO conversations_fts(conversations_fts) VALUES('rebuild')")
                 conn.commit()
             _fts5_available = True
         except Exception:
@@ -103,9 +102,7 @@ def load_memories() -> list[tuple[str, str]]:
     try:
         conn = open_db()
         try:
-            return conn.execute(
-                "SELECT key, value FROM memories ORDER BY key"
-            ).fetchall()
+            return conn.execute("SELECT key, value FROM memories ORDER BY key").fetchall()
         finally:
             conn.close()
     except Exception:
@@ -172,7 +169,7 @@ def fts5_query(query: str) -> str:
     return " ".join(safe)
 
 
-def search_history(query: str, limit: int = 20) -> list[tuple]:
+def search_history(query: str, limit: int = 20) -> list[tuple[Any, ...]]:
     """Search conversation history. Returns (timestamp, session_id, role, content, tool_name)."""
     if not query or not query.strip():
         return []
@@ -200,7 +197,7 @@ def search_history(query: str, limit: int = 20) -> list[tuple]:
         return []
 
 
-def search_history_recent(limit: int = 20) -> list[tuple]:
+def search_history_recent(limit: int = 20) -> list[tuple[Any, ...]]:
     """Return most recent conversation messages."""
     try:
         conn = open_db()
@@ -285,7 +282,8 @@ def get_session_name(session_id: str) -> str | None:
                 (session_id,),
             ).fetchone()
             if row:
-                return row[0] or row[1] or None
+                value = row[0] or row[1]
+                return str(value) if value is not None else None
         finally:
             conn.close()
     except Exception:
@@ -304,25 +302,24 @@ def resolve_session(alias_or_id: str) -> str | None:
                 (alias_or_id,),
             ).fetchone()
             if row:
-                return row[0]
+                return str(row[0])
             # 2. Exact session_id match
             row = conn.execute(
                 "SELECT session_id FROM sessions WHERE session_id = ?",
                 (alias_or_id,),
             ).fetchone()
             if row:
-                return row[0]
+                return str(row[0])
             # 3. Session_id prefix match
             rows = conn.execute(
                 "SELECT session_id FROM sessions WHERE session_id LIKE ?",
                 (alias_or_id + "%",),
             ).fetchall()
             if len(rows) == 1:
-                return rows[0][0]
+                return str(rows[0][0])
             # 4. Fallback: check conversations table for legacy sessions
             row = conn.execute(
-                "SELECT DISTINCT session_id FROM conversations "
-                "WHERE session_id = ? LIMIT 1",
+                "SELECT DISTINCT session_id FROM conversations WHERE session_id = ? LIMIT 1",
                 (alias_or_id,),
             ).fetchone()
             if row:
@@ -336,7 +333,7 @@ def resolve_session(alias_or_id: str) -> str | None:
                     (row[0], row[0], row[0]),
                 )
                 conn.commit()
-                return row[0]
+                return str(row[0])
             return None
         finally:
             conn.close()
@@ -346,7 +343,7 @@ def resolve_session(alias_or_id: str) -> str | None:
 
 def prune_sessions(
     retention_days: int = 90,
-    log_fn=None,
+    log_fn: Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """Prune orphaned and stale sessions.
 
@@ -395,15 +392,14 @@ def prune_sessions(
             parts.append(f"{orphans} empty session{'s' if orphans != 1 else ''}")
         if stale:
             parts.append(
-                f"{stale} session{'s' if stale != 1 else ''} "
-                f"older than {retention_days} days"
+                f"{stale} session{'s' if stale != 1 else ''} older than {retention_days} days"
             )
         log_fn(f"[turnstone] Session cleanup: removed {', '.join(parts)}.")
 
     return (orphans, stale)
 
 
-def list_sessions(limit: int = 20) -> list[tuple]:
+def list_sessions(limit: int = 20) -> list[tuple[Any, ...]]:
     """List recent sessions.
 
     Returns (session_id, alias, title, created, updated, msg_count)
@@ -428,7 +424,7 @@ def list_sessions(limit: int = 20) -> list[tuple]:
         return []
 
 
-def load_session_messages(session_id: str) -> list[dict]:
+def load_session_messages(session_id: str) -> list[dict[str, Any]]:
     """Load messages for a session and reconstruct OpenAI message format.
 
     Handles tool_call / tool_result rows by grouping consecutive tool_call
@@ -448,7 +444,7 @@ def load_session_messages(session_id: str) -> list[dict]:
     except Exception:
         return []
 
-    messages: list[dict] = []
+    messages: list[dict[str, Any]] = []
     i = 0
     while i < len(rows):
         role, content, tool_name, tool_args, tc_id = rows[i]
@@ -465,7 +461,7 @@ def load_session_messages(session_id: str) -> list[dict]:
             # Collect consecutive tool_call rows into one assistant message.
             # If the previous message was an assistant with content (text +
             # tool calls in the same turn), merge tool_calls into it.
-            assistant_msg: dict = {
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [],

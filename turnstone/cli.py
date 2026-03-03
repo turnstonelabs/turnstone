@@ -4,24 +4,23 @@ Provides TerminalUI (implementing the SessionUI protocol), readline setup,
 model auto-detection, workstream management, and the main() REPL entry point.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import readline
 import sys
 import textwrap
 import threading
+from typing import TYPE_CHECKING, Any
 
 from openai import OpenAI
 
 from turnstone.core.session import ChatSession, SessionUI
-from turnstone.core.tools import TOOLS
-from turnstone.core.workstream import WorkstreamManager, WorkstreamState
+from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 from turnstone.ui.colors import (
     BOLD,
-    CYAN,
     DIM,
-    GRAY,
-    GREEN,
     RED,
     RESET,
     YELLOW,
@@ -35,11 +34,12 @@ from turnstone.ui.colors import (
 from turnstone.ui.markdown import MarkdownRenderer
 from turnstone.ui.spinner import Spinner
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ─── Readline ─────────────────────────────────────────────────────────────
 
 SLASH_COMMANDS = [
-    "/persona",
     "/instructions",
     "/clear",
     "/new",
@@ -63,18 +63,15 @@ SLASH_COMMANDS = [
 ]
 
 
-def _completer(text, state):
+def _completer(text: str, state: int) -> str | None:
     """Tab-complete slash commands."""
-    if text.startswith("/"):
-        matches = [c for c in SLASH_COMMANDS if c.startswith(text)]
-    else:
-        matches = []
+    matches = [c for c in SLASH_COMMANDS if c.startswith(text)] if text.startswith("/") else []
     if state < len(matches):
         return matches[state] + " "
     return None
 
 
-def setup_readline():
+def setup_readline() -> None:
     """Set up readline with tab completion."""
     readline.set_history_length(1000)
     readline.set_completer(_completer)
@@ -88,32 +85,32 @@ def setup_readline():
 class TerminalUI(SessionUI):
     """Terminal-based UI using ANSI colors, MarkdownRenderer, and Spinner."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.md = MarkdownRenderer()
-        self.spinner = None
+        self.spinner: Spinner | None = None
         self._print_lock = threading.Lock()
         self.auto_approve = False
 
-    def on_thinking_start(self):
+    def on_thinking_start(self) -> None:
         self.spinner = Spinner("Thinking")
         self.spinner.start()
 
-    def on_thinking_stop(self):
+    def on_thinking_stop(self) -> None:
         if self.spinner:
             self.spinner.stop()
             self.spinner = None
 
-    def on_reasoning_token(self, text):
+    def on_reasoning_token(self, text: str) -> None:
         sys.stdout.write(f"{DIM}{text}{RESET}")
         sys.stdout.flush()
 
-    def on_content_token(self, text):
+    def on_content_token(self, text: str) -> None:
         rendered = self.md.feed(text)
         if rendered:
             sys.stdout.write(rendered)
             sys.stdout.flush()
 
-    def on_stream_end(self):
+    def on_stream_end(self) -> None:
         remainder = self.md.flush()
         if remainder:
             sys.stdout.write(remainder)
@@ -121,14 +118,12 @@ class TerminalUI(SessionUI):
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    def approve_tools(self, items):
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Display tool previews and prompt for batch approval.
 
         Returns (approved: bool, feedback: str | None).
         """
-        pending = [
-            it for it in items if it.get("needs_approval") and not it.get("error")
-        ]
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         with self._print_lock:
             # Print all headers and previews
@@ -153,9 +148,7 @@ class TerminalUI(SessionUI):
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
                     )
                 else:
-                    labels = ", ".join(
-                        it.get("approval_label", it["func_name"]) for it in pending
-                    )
+                    labels = ", ".join(it.get("approval_label", it["func_name"]) for it in pending)
                     prompt_text = (
                         f"    \001{BOLD}\002Allow {len(pending)} tools ({labels})?\001{RESET}\002 "
                         f"\001{DIM}\002[y/n/a(lways), optional message]\001{RESET}\002 "
@@ -188,10 +181,10 @@ class TerminalUI(SessionUI):
                     item["denial_msg"] = denial_msg
                 return False, None
 
-    def on_tool_result(self, name, output):
+    def on_tool_result(self, name: str, output: str) -> None:
         pass  # Optional: display summary
 
-    def on_status(self, usage, context_window, effort):
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
         parts = [f"{total_tok:,} / {context_window:,} tokens ({pct:.0f}%)"]
@@ -200,7 +193,7 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"\n  {DIM}[{' · '.join(parts)}]{RESET}\n")
         sys.stdout.flush()
 
-    def on_plan_review(self, content):
+    def on_plan_review(self, content: str) -> str:
         sys.stdout.write(f"\n{DIM}{'─' * 60}{RESET}\n")
         for line in content.splitlines():
             sys.stdout.write(f"  {line}\n")
@@ -218,17 +211,17 @@ class TerminalUI(SessionUI):
             resp = "reject"
         return resp
 
-    def on_info(self, message):
+    def on_info(self, message: str) -> None:
         print(message)
 
-    def on_error(self, message):
+    def on_error(self, message: str) -> None:
         sys.stdout.write(f"{RED}{message}{RESET}\n")
         sys.stdout.flush()
 
-    def on_state_change(self, state):
+    def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
 
-    def on_rename(self, name: str):
+    def on_rename(self, name: str) -> None:
         pass  # base TerminalUI ignores renames
 
 
@@ -236,7 +229,7 @@ class TerminalUI(SessionUI):
 
 
 # State display config: (symbol, color_fn, label)
-_STATE_DISPLAY = {
+_STATE_DISPLAY: dict[WorkstreamState, tuple[str, Callable[[str], str], str]] = {
     WorkstreamState.IDLE: ("·", dim, "idle"),
     WorkstreamState.THINKING: ("◌", cyan, "thinking"),
     WorkstreamState.RUNNING: ("▸", green, "running"),
@@ -249,7 +242,7 @@ class WorkstreamTerminalUI(TerminalUI):
     """TerminalUI with workstream awareness: buffers output when in background,
     blocks on approval until foregrounded."""
 
-    def __init__(self, ws_id: str, manager: WorkstreamManager):
+    def __init__(self, ws_id: str, manager: WorkstreamManager) -> None:
         super().__init__()
         self.ws_id = ws_id
         self.manager = manager
@@ -261,13 +254,13 @@ class WorkstreamTerminalUI(TerminalUI):
     def is_foreground(self) -> bool:
         return self.manager.active_id == self.ws_id
 
-    def set_foreground(self, fg: bool):
+    def set_foreground(self, fg: bool) -> None:
         if fg:
             self._fg_event.set()
         else:
             self._fg_event.clear()
 
-    def on_state_change(self, state: str):
+    def on_state_change(self, state: str) -> None:
         try:
             ws_state = WorkstreamState(state)
         except ValueError:
@@ -276,61 +269,61 @@ class WorkstreamTerminalUI(TerminalUI):
 
     # -- output buffering when in background --------------------------------
 
-    def on_thinking_start(self):
+    def on_thinking_start(self) -> None:
         if self.is_foreground:
             super().on_thinking_start()
 
-    def on_thinking_stop(self):
+    def on_thinking_stop(self) -> None:
         if self.is_foreground:
             super().on_thinking_stop()
         elif self.spinner:
             self.spinner.stop()
             self.spinner = None
 
-    def _buffer(self, event_type: str, text: str):
+    def _buffer(self, event_type: str, text: str) -> None:
         with self._print_lock:
             self._output_buffer.append((event_type, text))
 
-    def on_reasoning_token(self, text):
+    def on_reasoning_token(self, text: str) -> None:
         if self.is_foreground:
             super().on_reasoning_token(text)
         else:
             self._buffer("reasoning", text)
 
-    def on_content_token(self, text):
+    def on_content_token(self, text: str) -> None:
         if self.is_foreground:
             super().on_content_token(text)
         else:
             self._buffer("content", text)
 
-    def on_stream_end(self):
+    def on_stream_end(self) -> None:
         if self.is_foreground:
             super().on_stream_end()
         else:
             self._buffer("stream_end", "")
 
-    def on_status(self, usage, context_window, effort):
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         if self.is_foreground:
             super().on_status(usage, context_window, effort)
         # silently drop status for background streams
 
-    def on_info(self, message):
+    def on_info(self, message: str) -> None:
         if self.is_foreground:
             super().on_info(message)
         else:
             self._buffer("info", message)
 
-    def on_error(self, message):
+    def on_error(self, message: str) -> None:
         if self.is_foreground:
             super().on_error(message)
         else:
             self._buffer("error", message)
 
-    def on_tool_result(self, name, output):
+    def on_tool_result(self, name: str, output: str) -> None:
         if self.is_foreground:
             super().on_tool_result(name, output)
 
-    def on_plan_review(self, content):
+    def on_plan_review(self, content: str) -> str:
         # Must wait until foregrounded to show plan review
         if not self.is_foreground:
             self._buffer(
@@ -340,7 +333,7 @@ class WorkstreamTerminalUI(TerminalUI):
             self._fg_event.wait()
         return super().on_plan_review(content)
 
-    def approve_tools(self, items):
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         """Block until foregrounded if in background, then show approval prompt."""
         if not self.is_foreground:
             tool_names = ", ".join(
@@ -349,22 +342,18 @@ class WorkstreamTerminalUI(TerminalUI):
                 if it.get("needs_approval") and not it.get("error")
             )
             if tool_names:
-                self._buffer(
-                    "info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}"
-                )
+                self._buffer("info", f"{YELLOW}Waiting for approval: {tool_names}{RESET}")
             self._fg_event.wait()
         return super().approve_tools(items)
 
-    def flush_buffer(self):
+    def flush_buffer(self) -> None:
         """Replay buffered output when switching to foreground."""
         with self._print_lock:
             if not self._output_buffer:
                 return
             buf = list(self._output_buffer)
             self._output_buffer.clear()
-        sys.stdout.write(
-            f"\n  {DIM}--- buffered output ({len(buf)} events) ---{RESET}\n"
-        )
+        sys.stdout.write(f"\n  {DIM}--- buffered output ({len(buf)} events) ---{RESET}\n")
         replay_md = MarkdownRenderer()
         for event_type, text in buf:
             if event_type == "reasoning":
@@ -390,7 +379,7 @@ class WorkstreamTerminalUI(TerminalUI):
 # ─── Workstream commands ──────────────────────────────────────────────────
 
 
-def _print_ws_status_line(manager: WorkstreamManager):
+def _print_ws_status_line(manager: WorkstreamManager) -> None:
     """Print a one-line status of background workstreams that are active."""
     active_id = manager.active_id
     parts = []
@@ -411,7 +400,7 @@ def _handle_ws_command(
     manager: WorkstreamManager,
     cmd_line: str,
     skip_permissions: bool,
-):
+) -> bool:
     """Handle /ws subcommands.  Returns (switched: bool)."""
     parts = cmd_line.strip().split()
     sub = parts[1] if len(parts) > 1 else "list"
@@ -438,27 +427,27 @@ def _handle_ws_command(
         except RuntimeError as e:
             print(red(str(e)))
             return False
-        if skip_permissions:
+        if skip_permissions and isinstance(ws.ui, TerminalUI):
             ws.ui.auto_approve = True
         # Mark old active as background
         old = manager.get_active()
-        if old and old.ui and hasattr(old.ui, "set_foreground"):
+        if old and isinstance(old.ui, WorkstreamTerminalUI):
             old.ui.set_foreground(False)
         manager.switch(ws.id)
-        ws.ui.set_foreground(True)
+        if isinstance(ws.ui, WorkstreamTerminalUI):
+            ws.ui.set_foreground(True)
         print(f"Created workstream {cyan(ws.name)} (#{manager.index_of(ws.id)})")
         return True
 
     elif sub.isdigit():
         idx = int(sub)
         old = manager.get_active()
-        ws = manager.switch_by_index(idx)
+        ws: Workstream | None = manager.switch_by_index(idx)  # type: ignore[no-redef]
         if ws:
-            if old and old.ui and hasattr(old.ui, "set_foreground"):
+            if old and isinstance(old.ui, WorkstreamTerminalUI):
                 old.ui.set_foreground(False)
-            if hasattr(ws.ui, "set_foreground"):
+            if isinstance(ws.ui, WorkstreamTerminalUI):
                 ws.ui.set_foreground(True)
-            if hasattr(ws.ui, "flush_buffer"):
                 ws.ui.flush_buffer()
             print(f"Switched to {cyan(ws.name)}")
             return True
@@ -468,6 +457,7 @@ def _handle_ws_command(
 
     elif sub == "close":
         target_idx = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+        ws_id: str | None = None
         if target_idx is not None:
             all_ws = manager.list_all()
             if 1 <= target_idx <= len(all_ws):
@@ -477,13 +467,17 @@ def _handle_ws_command(
                 return False
         else:
             ws_id = manager.active_id
+            if ws_id is None:
+                return False
 
-        ws_name = manager.get(ws_id).name if manager.get(ws_id) else "?"
+        assert ws_id is not None
+        ws_obj = manager.get(ws_id)
+        ws_name = ws_obj.name if ws_obj else "?"
         if manager.close(ws_id):
             print(f"Closed workstream {ws_name}")
             # Ensure new active is foregrounded
             new_active = manager.get_active()
-            if new_active and hasattr(new_active.ui, "set_foreground"):
+            if new_active and isinstance(new_active.ui, WorkstreamTerminalUI):
                 new_active.ui.set_foreground(True)
             return True
         else:
@@ -495,34 +489,28 @@ def _handle_ws_command(
         if not new_name:
             print(red("Usage: /ws rename <name>"))
             return False
-        ws = manager.get_active()
-        if ws:
-            old_name = ws.name
-            ws.name = new_name
+        ws_active: Workstream | None = manager.get_active()
+        if ws_active:
+            old_name = ws_active.name
+            ws_active.name = new_name
             print(f"Renamed {old_name} -> {cyan(new_name)}")
         return False
 
     else:
         print(f"Unknown /ws subcommand: {sub}")
-        print(f"Usage: /ws [list|new [name]|<N>|close [N]|rename <name>]")
+        print("Usage: /ws [list|new [name]|<N>|close [N]|rename <name>]")
         return False
 
 
 # ─── Cluster commands ─────────────────────────────────────────────────────
 
 
-def _handle_cluster_command(
-    cmd_line: str, console_url: str | None, auth_token: str = ""
-):
+def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: str = "") -> None:
     """Handle /cluster subcommands querying the turnstone-console API."""
     import httpx
 
     if not console_url:
-        print(
-            red(
-                "No console URL configured. Use --console-url or set [console] url in config."
-            )
-        )
+        print(red("No console URL configured. Use --console-url or set [console] url in config."))
         return
 
     headers: dict[str, str] = {}
@@ -534,9 +522,7 @@ def _handle_cluster_command(
 
     try:
         if sub == "status":
-            resp = httpx.get(
-                f"{console_url}/api/cluster/overview", timeout=5, headers=headers
-            )
+            resp = httpx.get(f"{console_url}/api/cluster/overview", timeout=5, headers=headers)
             data = resp.json()
             states = data.get("states", {})
             agg = data.get("aggregate", {})
@@ -584,9 +570,7 @@ def _handle_cluster_command(
             print(
                 f"\n  {'NODE'.ljust(max_name)}  {'WS':>4}  {'RUN':>4}  {'ATTN':>4}  {'TOKENS':>8}"
             )
-            print(
-                f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'--------':>8}"
-            )
+            print(f"  {'-' * max_name}  {'----':>4}  {'----':>4}  {'----':>4}  {'--------':>8}")
             for n in nodes:
                 name = n["node_id"].ljust(max_name)
                 ws = str(n.get("ws_total", 0))
@@ -596,9 +580,7 @@ def _handle_cluster_command(
                 tok_str = f"{tok / 1000:.1f}k" if tok >= 1000 else str(tok)
                 run_str = green(str(run)) if run else dim("0")
                 attn_str = yellow(str(attn)) if attn else dim("0")
-                print(
-                    f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {dim(tok_str):>8}"
-                )
+                print(f"  {cyan(name)}  {ws:>4}  {run_str:>4}  {attn_str:>4}  {dim(tok_str):>8}")
             if total > len(nodes):
                 print(dim(f"\n  Showing {len(nodes)} of {total} nodes"))
             print()
@@ -723,14 +705,13 @@ def detect_model(client: OpenAI) -> str:
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Interactive CLI for vLLM models with tool calling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
               python3 chat.py                          # auto-detect model
-              python3 chat.py --persona lawful_evil     # with persona
               python3 chat.py --model kappa_20b_131k    # explicit model
               python3 chat.py --temperature 0.7         # lower temperature
         """),
@@ -744,11 +725,6 @@ def main():
         "--model",
         default=None,
         help="Model name (default: auto-detect from server)",
-    )
-    parser.add_argument(
-        "--persona",
-        default=None,
-        help="Persona name injected as system message",
     )
     parser.add_argument(
         "--instructions",
@@ -863,18 +839,15 @@ def main():
     )
 
     # Detect or use provided model
-    if args.model:
-        model = args.model
-    else:
-        model = detect_model(client)
+    model = args.model or detect_model(client)
 
     # Session factory — captures shared config for creating workstream sessions
-    def session_factory(ui):
+    def session_factory(ui: SessionUI | None) -> ChatSession:
+        assert ui is not None, "session_factory requires a non-None UI"
         return ChatSession(
             client=client,
             model=model,
             ui=ui,
-            persona=args.persona,
             instructions=args.instructions,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
@@ -892,7 +865,7 @@ def main():
     ws = manager.create(
         ui_factory=lambda wid: WorkstreamTerminalUI(wid, manager),
     )
-    if args.skip_permissions:
+    if args.skip_permissions and isinstance(ws.ui, TerminalUI):
         ws.ui.auto_approve = True
 
     # Handle --resume
@@ -903,15 +876,16 @@ def main():
         if not target_id:
             print(red(f"Session not found: {args.resume}"))
             sys.exit(1)
+        if ws.session is None:
+            print(red("No session available."))
+            sys.exit(1)
         if not ws.session.resume_session(target_id):
             print(red(f"Session '{args.resume}' has no messages."))
             sys.exit(1)
-        print(
-            f"Resumed session {bold(target_id)} ({len(ws.session.messages)} messages)"
-        )
+        print(f"Resumed session {bold(target_id)} ({len(ws.session.messages)} messages)")
 
     # Background attention notification — write to stderr while user types
-    def _bg_attention_notify(ws_id, state):
+    def _bg_attention_notify(ws_id: str, state: WorkstreamState) -> None:
         if state == WorkstreamState.ATTENTION and ws_id != manager.active_id:
             bg_ws = manager.get(ws_id)
             if bg_ws:
@@ -927,9 +901,7 @@ def main():
 
     # Print banner
     print(f"\n{bold('Chat')} with {cyan(model)}")
-    if args.persona:
-        print(f"Persona: {cyan(args.persona)}")
-    print(f"Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
+    print("Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
 
     # Prompt string -- use a short display name
     display_name = model.split("/")[-1]  # strip path prefixes if any
@@ -945,7 +917,7 @@ def main():
 
             # Build prompt with workstream info
             active = manager.get_active()
-            if manager.count > 1:
+            if manager.count > 1 and active is not None:
                 idx = manager.index_of(active.id)
                 prompt_str = f"\001{BOLD}\002{idx}:{active.name}\001{RESET}\002 > "
             else:
@@ -968,6 +940,8 @@ def main():
             continue
 
         active = manager.get_active()
+        if active is None or active.session is None:
+            continue
         if user_input.startswith("/"):
             should_exit = active.session.handle_command(user_input)
             if should_exit:

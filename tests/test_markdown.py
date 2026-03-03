@@ -1,7 +1,7 @@
 """Tests for turnstone.ui.markdown — MarkdownRenderer."""
 
+from turnstone.ui.colors import BOLD, CYAN, DIM, ITALIC, MAGENTA
 from turnstone.ui.markdown import MarkdownRenderer
-from turnstone.ui.colors import BOLD, MAGENTA, CYAN, DIM, ITALIC, RESET
 
 
 class TestMarkdownRenderer:

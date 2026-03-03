@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
+from typing import Any
 
 
 class MetricsCollector:
@@ -48,7 +49,7 @@ class MetricsCollector:
         with self._lock:
             self._ws_counts.append(dict(ws_counts))
 
-    def summary(self) -> dict:
+    def summary(self) -> dict[str, Any]:
         """Generate final metrics report with percentiles and aggregates."""
         with self._lock:
             latencies = sorted(self._turn_latencies)
@@ -60,7 +61,7 @@ class MetricsCollector:
                 duration = 0.0
 
             # Utilization from latest snapshot
-            util: dict = {}
+            util: dict[str, Any] = {}
             if self._ws_counts:
                 last = self._ws_counts[-1]
                 counts = list(last.values())

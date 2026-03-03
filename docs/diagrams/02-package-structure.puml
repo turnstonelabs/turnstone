@@ -1,0 +1,140 @@
+@startuml
+!theme plain
+title Turnstone — Package & Module Structure
+
+' Color definitions
+skinparam component {
+    BackgroundColor<<entry>> #B8D4E3
+    BackgroundColor<<core>> #C8E6C9
+    BackgroundColor<<mq>> #FFE0B2
+    BackgroundColor<<sim>> #E1BEE7
+    BackgroundColor<<console>> #B2EBF2
+    BackgroundColor<<ui>> #F0F4C3
+    BackgroundColor<<artifact>> #ECEFF1
+}
+
+' Entry points
+package "Entry Points" <<Rectangle>> {
+    component [cli.py\nturnstone] as cli <<entry>>
+    component [server.py\nturnstone-server] as server <<entry>>
+    component [eval.py\nturnstone-eval] as eval <<entry>>
+    component [chat.py\n(re-exports)] as chat <<entry>>
+}
+
+' Core engine
+package "turnstone/core/" <<Rectangle>> {
+    component [session.py\nChatSession, SessionUI] as session <<core>>
+    component [workstream.py\nWorkstreamManager] as workstream <<core>>
+    component [tools.py\nTool loader] as tools <<core>>
+    component [memory.py\nSQLite + FTS5] as memory <<core>>
+    component [metrics.py\nPrometheus metrics] as metrics <<core>>
+    component [config.py\nTOML config] as config <<core>>
+    component [safety.py\nPath validation] as safety <<core>>
+    component [sandbox.py\nCommand sandbox] as sandbox <<core>>
+    component [edit.py\nFile editing] as edit <<core>>
+    component [web.py\nWeb helpers] as web <<core>>
+    component [auth.py\nAuthentication] as auth <<core>>
+}
+
+' MQ subsystem
+package "turnstone/mq/" <<Rectangle>> {
+    component [protocol.py\n28 message types] as protocol <<mq>>
+    component [broker.py\nMessageBroker, RedisBroker] as broker <<mq>>
+    component [bridge.py\nturnstone-bridge] as bridge <<mq>>
+    component [client.py\nTurnstoneClient] as client <<mq>>
+}
+
+' Simulator
+package "turnstone/sim/" <<Rectangle>> {
+    component [cluster.py\nSimCluster] as simcluster <<sim>>
+    component [node.py\nSimNode, SimWorkstream] as simnode <<sim>>
+    component [engine.py\nSimEngine] as simengine <<sim>>
+    component [scenario.py\n5 scenarios] as scenario <<sim>>
+    component [sim/config.py\nSimConfig] as simconfig <<sim>>
+    component [sim/metrics.py\nSim metrics] as simmetrics <<sim>>
+    component [sim/cli.py\nturnstone-sim] as simcli <<sim>>
+}
+
+' Console
+package "turnstone/console/" <<Rectangle>> {
+    component [collector.py\nClusterCollector] as collector <<console>>
+    component [console/server.py\nDashboard HTTP+SSE] as consoleserver <<console>>
+}
+
+' UI
+package "turnstone/ui/" <<Rectangle>> {
+    component [colors.py\nANSI colors] as colors <<ui>>
+    component [markdown.py\nMD rendering] as markdown <<ui>>
+    component [spinner.py\nTerminal spinner] as spinner <<ui>>
+}
+
+' Tool schemas
+package "turnstone/tools/" <<Rectangle>> {
+    component [*.json\n14 tool schemas] as schemas <<artifact>>
+}
+
+' Entry point dependencies
+cli --> session
+cli --> workstream
+cli --> config
+cli --> memory
+cli --> colors
+cli --> markdown
+cli --> spinner
+cli --> tools
+
+server --> session
+server --> workstream
+server --> config
+server --> memory
+server --> metrics
+server --> auth
+server --> tools
+
+eval --> session
+eval --> memory
+eval --> config
+eval --> tools
+
+chat --> session
+
+' Core internal deps
+session --> tools
+session --> memory
+session --> safety
+session --> sandbox
+session --> edit
+session --> web
+tools --> schemas
+
+' MQ dependencies
+bridge --> protocol
+bridge --> broker
+bridge --> config
+client --> protocol
+client --> broker
+
+' Sim dependencies
+simcli --> simcluster
+simcli --> simconfig
+simcli --> scenario
+simcluster --> simnode
+simcluster --> broker
+simcluster --> simmetrics
+simcluster --> simconfig
+simnode --> simengine
+simnode --> protocol
+simnode --> simconfig
+simnode --> simmetrics
+scenario --> broker
+scenario --> protocol
+scenario --> simconfig
+scenario --> simmetrics
+
+' Console dependencies
+consoleserver --> collector
+consoleserver --> config
+consoleserver --> auth
+collector --> broker
+
+@enduml

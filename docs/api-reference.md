@@ -2,6 +2,8 @@
 
 ## Overview
 
+> See also: [MQ Protocol diagram](diagrams/png/06-mq-protocol.png) | [Message Routing diagram](diagrams/png/07-message-routing.png) | [Redis Key Schema diagram](diagrams/png/08-redis-key-schema.png)
+
 `turnstone-server` exposes a browser-based chat UI backed by a Python stdlib HTTP
 server (`socketserver.ThreadingMixIn` + `http.server.HTTPServer`). The server
 uses **Server-Sent Events (SSE)** for real-time streaming and **HTTP POST** for

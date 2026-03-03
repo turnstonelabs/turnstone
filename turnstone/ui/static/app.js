@@ -243,7 +243,7 @@ function toggleTheme() {
   var current = document.documentElement.dataset.theme;
   var next = current === "light" ? "" : "light";
   document.documentElement.dataset.theme = next;
-  localStorage.setItem("pcode-theme", next || "dark");
+  localStorage.setItem("turnstone-theme", next || "dark");
   updateThemeMenuItem();
 }
 function updateThemeMenuItem() {
@@ -265,7 +265,7 @@ function updateThemeMenuItem() {
     );
 }
 (function () {
-  if (localStorage.getItem("pcode-theme") === "light")
+  if (localStorage.getItem("turnstone-theme") === "light")
     document.documentElement.dataset.theme = "light";
   updateThemeMenuItem();
 })();
@@ -613,7 +613,7 @@ function switchTab(wsId) {
 
   // Push history entry so back button can retrace tab navigation.
   if (!_historyNavigation) {
-    history.pushState({ pcode: "workstream", wsId: wsId }, "");
+    history.pushState({ turnstone: "workstream", wsId: wsId }, "");
   }
 }
 
@@ -1829,7 +1829,7 @@ authFetch("/api/workstreams")
     }
     connectGlobalSSE();
     // Seed the history stack so back-from-workstream returns here.
-    history.replaceState({ pcode: "dashboard" }, "");
+    history.replaceState({ turnstone: "dashboard" }, "");
     showDashboard();
   });
 
@@ -1837,7 +1837,7 @@ authFetch("/api/workstreams")
 window.addEventListener("popstate", function (e) {
   _historyNavigation = true;
   try {
-    if (e.state && e.state.pcode === "workstream") {
+    if (e.state && e.state.turnstone === "workstream") {
       // Navigating to a workstream state (forward, or back between tabs).
       if (dashboardVisible) hideDashboard();
       if (e.state.wsId && workstreams[e.state.wsId]) switchTab(e.state.wsId);

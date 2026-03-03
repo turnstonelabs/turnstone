@@ -7,13 +7,16 @@ import logging
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING, Any, cast
 
 import redis
 
 from turnstone.mq.broker import RedisBroker
-from turnstone.sim.config import SimConfig
 from turnstone.sim.metrics import MetricsCollector
 from turnstone.sim.node import SimNode
+
+if TYPE_CHECKING:
+    from turnstone.sim.config import SimConfig
 
 log = logging.getLogger("turnstone.sim.cluster")
 
@@ -29,16 +32,15 @@ class PooledBroker(RedisBroker):
         pool: redis.ConnectionPool,
         prefix: str = "turnstone",
         response_ttl: int = 600,
-    ):
+    ) -> None:
         # Bypass RedisBroker.__init__ — set up manually with the shared pool.
-        import threading
 
         self._prefix = prefix
         self._response_ttl = response_ttl
-        self._pool = pool
-        self._redis = redis.Redis(connection_pool=pool)
+        self._pool: redis.ConnectionPool = pool
+        self._redis: redis.Redis[str] = cast("redis.Redis[str]", redis.Redis(connection_pool=pool))
         self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-        self._listener_thread: threading.Thread | None = None
+        self._listener_thread: Any = None
         self._running = True
 
     def close(self) -> None:
@@ -56,11 +58,11 @@ class InboundDispatcher:
 
     def __init__(
         self,
-        redis_client: redis.Redis,
+        redis_client: redis.Redis[str],
         node_ids: list[str],
         nodes: dict[str, SimNode],
         prefix: str,
-    ):
+    ) -> None:
         self._redis = redis_client
         self._node_ids = node_ids
         self._nodes = nodes
@@ -72,9 +74,7 @@ class InboundDispatcher:
         self._keys.append(f"{prefix}:inbound")
 
         # Pre-compute key → node_id mapping
-        self._key_to_node: dict[str, str] = {
-            f"{prefix}:inbound:{nid}": nid for nid in node_ids
-        }
+        self._key_to_node: dict[str, str] = {f"{prefix}:inbound:{nid}": nid for nid in node_ids}
 
     async def run(self) -> None:
         while self._running:
@@ -146,15 +146,16 @@ class SimCluster:
         await cluster.stop()
     """
 
-    def __init__(self, config: SimConfig):
+    def __init__(self, config: SimConfig) -> None:
         self._config = config
         self._metrics = MetricsCollector()
         self._nodes: dict[str, SimNode] = {}
         self._node_order: list[str] = []
         self._dispatchers: list[InboundDispatcher] = []
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task[None]] = []
         self._pool: redis.ConnectionPool | None = None
-        self._redis_client: redis.Redis | None = None
+        self._redis_client: redis.Redis[str] | None = None
+        self._executor: ThreadPoolExecutor | None = None
         self._running = True
 
     @property
@@ -174,7 +175,7 @@ class SimCluster:
         self._executor = ThreadPoolExecutor(max_workers=64)
 
         # Shared Redis pool
-        self._pool = redis.ConnectionPool(
+        pool: redis.ConnectionPool = redis.ConnectionPool(
             host=self._config.redis_host,
             port=self._config.redis_port,
             db=self._config.redis_db,
@@ -183,13 +184,14 @@ class SimCluster:
             retry_on_timeout=True,
             max_connections=64,
         )
-        self._redis_client = redis.Redis(connection_pool=self._pool)
+        self._pool = pool
+        self._redis_client = cast("redis.Redis[str]", redis.Redis(connection_pool=pool))
 
         # Create nodes
         for i in range(self._config.num_nodes):
             node_id = f"sim-{i:04d}"
             broker = PooledBroker(
-                self._pool,
+                pool,
                 prefix=self._config.prefix,
             )
             node = SimNode(node_id, broker, self._config, self._metrics)
@@ -203,7 +205,7 @@ class SimCluster:
             start = i * NODES_PER_DISPATCHER
             batch_ids = all_ids[start : start + NODES_PER_DISPATCHER]
             # Each dispatcher gets its own Redis client from the shared pool
-            client = redis.Redis(connection_pool=self._pool)
+            client: redis.Redis[str] = cast("redis.Redis[str]", redis.Redis(connection_pool=pool))
             dispatcher = InboundDispatcher(
                 client,
                 batch_ids,
@@ -246,9 +248,7 @@ class SimCluster:
         while self._running:
             await asyncio.sleep(self._config.metrics_interval)
             counts = {
-                nid: node.workstream_count
-                for nid, node in self._nodes.items()
-                if node._running
+                nid: node.workstream_count for nid, node in self._nodes.items() if node._running
             }
             self._metrics.snapshot_utilization(counts)
 
@@ -261,12 +261,14 @@ class SimCluster:
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        assert self._redis_client is not None
+        redis_client = self._redis_client
         registered = 0
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             keys = await loop.run_in_executor(
                 self._executor,
-                self._redis_client.keys,
+                redis_client.keys,
                 f"{self._config.prefix}:node:sim-*",
             )
             registered = len(keys)
@@ -298,7 +300,7 @@ class SimCluster:
                 d.remove_node(node_id)
             log.info("Killed node %s", node_id)
 
-    def report(self) -> dict:
+    def report(self) -> dict[str, Any]:
         """Generate final metrics report."""
         return self._metrics.summary()
 
@@ -312,8 +314,8 @@ class SimCluster:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        if hasattr(self, "_executor"):
+        if self._executor is not None:
             self._executor.shutdown(wait=False)
-        if self._pool:
+        if self._pool is not None:
             self._pool.disconnect()
         log.info("Cluster stopped")
