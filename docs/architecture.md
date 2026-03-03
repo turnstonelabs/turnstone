@@ -38,6 +38,8 @@ turnstone/
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         SQLite persistence (conversations, memories, FTS5 search)
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
+    healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker
+    ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
     safety.py         Command safety validation (blocked patterns, sanitization)
     sandbox.py        Math code sandboxing (AST validation, subprocess execution)
@@ -298,6 +300,12 @@ touched. The last workstream is always preserved even if expired. On close, a
 `ws_closed` event is broadcast on the global SSE channel so browser clients
 remove the tab immediately. Controlled by `--workstream-idle-timeout` (default:
 120 minutes, 0 = disable).
+
+**Workstream eviction at capacity:** When `WorkstreamManager.create()` would
+exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
+10), the oldest IDLE workstream is automatically evicted to make room. The
+`turnstone_workstreams_evicted_total` counter is incremented on each eviction.
+If no IDLE workstream is available the create request fails as before.
 
 ### CLI Workstreams
 
@@ -713,6 +721,42 @@ warns if the summary was truncated.
 
 `_run_single_test()`: wraps `session.send_headless()` in a retry loop (3
 attempts) to avoid transient API errors from poisoning evaluation scores.
+
+### Health Monitor & Circuit Breaker
+
+`BackendHealthMonitor` (`turnstone/core/healthcheck.py`) runs a daemon thread
+that probes the LLM backend by calling `client.models.list()` every
+`backend_probe_interval` seconds (default 30). Probe results drive a three-state
+circuit breaker:
+
+```
+CLOSED  ──(N consecutive failures)──>  OPEN
+OPEN    ──(cooldown expires)────────>  HALF_OPEN
+HALF_OPEN ──(probe succeeds)────────>  CLOSED
+HALF_OPEN ──(probe fails)──────────>  OPEN
+```
+
+- `record_success()` / `record_failure()` update `_consecutive_failures` and
+  transition the `_state` (`CircuitState` enum: `CLOSED`, `OPEN`, `HALF_OPEN`).
+- `should_allow_request()` returns `False` when the circuit is `OPEN`, causing
+  `ChatSession._create_stream_with_retry` to skip the backend and surface an
+  error immediately.
+- The `/health` endpoint reads the monitor's state: `"status": "ok"` when the
+  circuit is closed, `"status": "degraded"` when open or half-open.
+
+### Rate Limiting
+
+`RateLimiter` (`turnstone/core/ratelimit.py`) enforces per-client-IP request
+limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
+`requests_per_second` (refill rate) and `burst` (bucket capacity) from
+`[ratelimit]` config.
+
+- Applied in `do_GET` / `do_POST` after authentication but before route dispatch.
+- `/health` and `/metrics` are exempt (monitoring must always be reachable).
+- On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
+  `{"error": "Rate limit exceeded", "retry_after": N}`.
+- The `turnstone_ratelimit_rejected_total` counter is incremented on each
+  rejection.
 
 ---
 

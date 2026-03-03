@@ -23,17 +23,99 @@ let contentRetryDelay = 1000;
 let globalRetryDelay = 1000;
 let dashboardVisible = false;
 let _historyNavigation = false; // true while popstate is driving navigation
+let _lastHealth = null;
 
-/* Auth-aware fetch — shows login overlay on 401 */
-function authFetch(url, opts) {
-  return fetch(url, opts).then(function (r) {
+/* Auth-aware fetch — shows login overlay on 401, retries on 429 */
+async function authFetch(url, opts) {
+  var maxRetries = 2;
+  for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    var r = await fetch(url, opts);
     if (r.status === 401) {
       showLogin();
       throw new Error("auth");
     }
+    if (r.status === 429 && attempt < maxRetries) {
+      var retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
+      showToast("Rate limited \u2014 retrying in " + retryAfter + "s");
+      await new Promise(function (resolve) {
+        setTimeout(resolve, retryAfter * 1000);
+      });
+      continue;
+    }
     return r;
-  });
+  }
 }
+
+var _toastQueue = [];
+var _toastTimer = null;
+var _toastShowing = false;
+function showToast(message) {
+  var el = document.getElementById("toast");
+  if (!el) return;
+  if (_toastShowing) {
+    _toastQueue.push(message);
+    return;
+  }
+  _displayToast(el, message);
+}
+function _displayToast(el, message) {
+  el.textContent = message;
+  el.classList.add("show");
+  _toastShowing = true;
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(function () {
+    el.classList.remove("show");
+    _toastShowing = false;
+    _toastTimer = null;
+    if (_toastQueue.length) {
+      setTimeout(function () {
+        _displayToast(el, _toastQueue.shift());
+      }, 300);
+    }
+  }, 3000);
+}
+
+function pollHealth() {
+  authFetch("/health")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      pollHealth._failCount = 0;
+      _lastHealth = data;
+      var el = document.getElementById("health-indicator");
+      if (!el) return;
+      if (data.status === "degraded") {
+        el.textContent = "backend down";
+        el.className = "health-degraded";
+        el.title =
+          "Circuit: " +
+          ((data.backend && data.backend.circuit_state) || "unknown");
+        el.setAttribute(
+          "aria-label",
+          "Backend degraded. Circuit: " +
+            ((data.backend && data.backend.circuit_state) || "unknown"),
+        );
+      } else {
+        el.textContent = "";
+        el.className = "health-ok";
+        el.title = "";
+        el.removeAttribute("aria-label");
+      }
+    })
+    .catch(function () {
+      if (!pollHealth._failCount) pollHealth._failCount = 0;
+      pollHealth._failCount++;
+      if (pollHealth._failCount >= 2) {
+        var el = document.getElementById("health-indicator");
+        if (!el) return;
+        el.textContent = "health unknown";
+        el.className = "health-degraded";
+        el.title = "Health endpoint unreachable";
+      }
+    });
+}
+setInterval(pollHealth, 30000);
 
 var _loginTrapHandler = null;
 var _loginBusy = false;
@@ -937,6 +1019,14 @@ function updateDashFooter(agg) {
   if (agg.uptime_seconds)
     parts.push(formatUptime(agg.uptime_seconds) + " uptime");
   statsEl.textContent = parts.join(" \u00b7 ");
+  if (_lastHealth && _lastHealth.status === "degraded") {
+    statsEl.textContent +=
+      " \u00b7 backend down (circuit " +
+      (_lastHealth.backend && _lastHealth.backend.circuit_state
+        ? _lastHealth.backend.circuit_state
+        : "unknown") +
+      ")";
+  }
 }
 function renderDashboardSessions(sessions) {
   var c = document.getElementById("dashboard-session-cards");
@@ -1114,6 +1204,11 @@ function connectGlobalSSE() {
       var wsId = data.ws_id;
       delete workstreams[wsId];
       renderTabBar();
+      if (data.reason === "evicted") {
+        showToast(
+          "Evicted" + (data.name ? ": " + data.name : "") + " (capacity)",
+        );
+      }
       if (wsId === currentWsId) {
         var remaining = Object.keys(workstreams);
         if (remaining.length) switchTab(remaining[0]);
@@ -1933,6 +2028,7 @@ document.addEventListener("keydown", function (e) {
 
 // --- Init: fetch workstream list, then connect ---
 initLogin();
+pollHealth();
 authFetch("/api/workstreams")
   .then(function (r) {
     return r.json();

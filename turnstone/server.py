@@ -28,6 +28,7 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 from openai import OpenAI
 
+from turnstone import __version__
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
@@ -358,12 +359,37 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             self._send_json({"error": msg}, status)
         return allowed
 
+    def _check_rate_limit(self, path: str) -> bool:
+        """Return True if allowed.  Sends 429 + Retry-After if rate-limited."""
+        limiter = getattr(self.server, "rate_limiter", None)
+        if limiter is None:
+            return True
+        client_ip = self.client_address[0]
+        allowed, retry_after = limiter.check(client_ip, path)
+        if not allowed:
+            _metrics.record_ratelimit_reject()
+            self._response_status = 429
+            self.send_response(429)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", str(int(retry_after) + 1))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            body = json.dumps(
+                {"error": "Rate limit exceeded", "retry_after": round(retry_after, 1)}
+            )
+            self.wfile.write(body.encode("utf-8"))
+            return False
+        return True
+
     def do_GET(self) -> None:
         _t0 = time.monotonic()
         self._response_status = 200
         parsed = urlparse(self.path)
         try:
             if not self._check_auth("GET", parsed.path):
+                return
+            if not self._check_rate_limit(parsed.path):
                 return
             self._do_GET(parsed)
         finally:
@@ -444,6 +470,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
 
             # Long-running SSE loop
+            _metrics.record_sse_connect()
             try:
                 while my_gen == ui._sse_generation:
                     try:
@@ -457,6 +484,8 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass  # Client disconnected
+            finally:
+                _metrics.record_sse_disconnect()
 
         elif parsed.path == "/api/events/global":
             self.send_response(200)
@@ -474,6 +503,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             with listeners_lock:
                 listeners.append(client_queue)
 
+            _metrics.record_sse_connect()
             try:
                 while True:
                     try:
@@ -487,6 +517,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass
             finally:
+                _metrics.record_sse_disconnect()
                 with listeners_lock:
                     if client_queue in listeners:
                         listeners.remove(client_queue)
@@ -538,13 +569,16 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         _t0 = time.monotonic()
         self._response_status = 200
+        parsed_path = urlparse(self.path).path
         try:
-            if not self._check_auth("POST", self.path):
+            if not self._check_auth("POST", parsed_path):
+                return
+            if not self._check_rate_limit(parsed_path):
                 return
             self._do_POST()
         finally:
             _metrics.record_request(
-                "POST", self.path, self._response_status, time.monotonic() - _t0
+                "POST", parsed_path, self._response_status, time.monotonic() - _t0
             )
 
     def _do_POST(self) -> None:  # noqa: N802
@@ -673,6 +707,19 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 assert isinstance(ws.ui, WebUI)
                 if skip or body.get("auto_approve", False):
                     ws.ui.auto_approve = True
+                # Emit eviction event if a workstream was evicted to make room
+                evicted = mgr.last_evicted
+                if evicted is not None:
+                    gq: queue.Queue[dict[str, Any]] = self.server.global_queue  # type: ignore[attr-defined]
+                    with contextlib.suppress(queue.Full):
+                        gq.put_nowait(
+                            {
+                                "type": "ws_closed",
+                                "ws_id": evicted.id,
+                                "name": evicted.name,
+                                "reason": "evicted",
+                            }
+                        )
                 self._send_json({"ws_id": ws.id, "name": ws.name})
             except RuntimeError as e:
                 self._send_json({"error": str(e)}, 400)
@@ -718,7 +765,13 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"Not found")
 
     def _handle_health(self) -> None:
-        """Return server health status as JSON."""
+        """Return server health status as JSON.
+
+        Returns ``"status": "degraded"`` when the LLM backend is unhealthy
+        (circuit breaker not CLOSED, i.e. OPEN or HALF_OPEN).  HTTP status
+        is always 200 — the server itself is running; only the backend may
+        be unavailable.
+        """
         mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
         wss = mgr.list_all()
         states: dict[str, int] = {
@@ -731,12 +784,18 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         for ws in wss:
             state = ws.state.value
             states[state] = states.get(state, 0) + 1
-        data = {
-            "status": "ok",
-            "version": "0.2.0",
+        monitor = getattr(self.server, "health_monitor", None)
+        backend_ok = monitor.is_healthy if monitor else True
+        data: dict[str, Any] = {
+            "status": "ok" if backend_ok else "degraded",
+            "version": __version__,
             "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
             "model": _metrics.model,
             "workstreams": {"total": len(wss), **states},
+            "backend": {
+                "status": "up" if backend_ok else "down",
+                "circuit_state": monitor.circuit_state.value if monitor else "closed",
+            },
         }
         self._send_json(data)
 
@@ -888,16 +947,21 @@ def detect_model(client: OpenAI) -> str:
 
 
 def _idle_cleanup_thread(
-    mgr: WorkstreamManager, timeout_sec: float, global_queue: queue.Queue[dict[str, Any]]
+    mgr: WorkstreamManager,
+    timeout_sec: float,
+    global_queue: queue.Queue[dict[str, Any]],
+    rate_limiter: Any = None,
 ) -> None:
-    """Periodically close IDLE workstreams that have been inactive too long."""
+    """Periodically close IDLE workstreams and clean up rate limiter buckets."""
     check_every = min(300.0, timeout_sec / 4)  # check at ¼ of timeout, max 5 min
     while True:
         time.sleep(check_every)
         closed = mgr.close_idle(timeout_sec)
         for ws_id in closed:
             with contextlib.suppress(queue.Full):
-                global_queue.put_nowait({"type": "ws_closed", "ws_id": ws_id})
+                global_queue.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "idle"})
+        if rate_limiter is not None:
+            rate_limiter.cleanup()
 
 
 def _global_fanout_thread(
@@ -1051,9 +1115,60 @@ def main() -> None:
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
+    parser.add_argument(
+        "--max-workstreams",
+        type=int,
+        default=10,
+        help="Maximum concurrent workstreams, auto-evicts idle when full (default: 10)",
+    )
+    parser.add_argument(
+        "--ratelimit-enabled",
+        action="store_true",
+        default=False,
+        help="Enable per-IP rate limiting",
+    )
+    parser.add_argument(
+        "--ratelimit-rps",
+        type=float,
+        default=10.0,
+        help="Rate limit: requests per second per client IP (default: 10.0)",
+    )
+    parser.add_argument(
+        "--ratelimit-burst",
+        type=int,
+        default=20,
+        help="Rate limit: burst size (default: 20)",
+    )
+    parser.add_argument(
+        "--health-probe-interval",
+        type=float,
+        default=30.0,
+        help="Backend health probe interval in seconds (default: 30)",
+    )
+    parser.add_argument(
+        "--health-probe-timeout",
+        type=float,
+        default=5.0,
+        help="Backend health probe timeout in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--circuit-breaker-threshold",
+        type=int,
+        default=5,
+        help="Consecutive failures to open circuit breaker (default: 5)",
+    )
+    parser.add_argument(
+        "--circuit-breaker-cooldown",
+        type=float,
+        default=60.0,
+        help="Circuit breaker cooldown in seconds (default: 60)",
+    )
     from turnstone.core.config import apply_config
 
-    apply_config(parser, ["api", "model", "session", "tools", "server", "mcp"])
+    apply_config(
+        parser,
+        ["api", "model", "session", "tools", "server", "mcp", "ratelimit", "health"],
+    )
     args = parser.parse_args()
 
     # Prune stale / empty sessions on startup
@@ -1084,6 +1199,27 @@ def main() -> None:
 
     mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
 
+    # Backend health monitor with circuit breaker
+    from turnstone.core.healthcheck import BackendHealthMonitor
+
+    health_monitor = BackendHealthMonitor(
+        client=client,
+        probe_interval=args.health_probe_interval,
+        probe_timeout=args.health_probe_timeout,
+        failure_threshold=args.circuit_breaker_threshold,
+        cooldown=args.circuit_breaker_cooldown,
+    )
+    health_monitor.start()
+
+    # Per-IP rate limiter
+    from turnstone.core.ratelimit import RateLimiter
+
+    rate_limiter = RateLimiter(
+        enabled=args.ratelimit_enabled,
+        rate=args.ratelimit_rps,
+        burst=args.ratelimit_burst,
+    )
+
     # Set up global event queue for state-change broadcasts
     global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
     global_listeners: list[queue.Queue[dict[str, Any]]] = []
@@ -1111,10 +1247,11 @@ def main() -> None:
             mcp_client=mcp_client,
             registry=registry,
             model_alias=model_alias or registry.default,
+            health_monitor=health_monitor,
         )
 
     # Create workstream manager and initial workstream
-    manager = WorkstreamManager(session_factory)
+    manager = WorkstreamManager(session_factory, max_workstreams=args.max_workstreams)
     ws = manager.create(
         name="default",
         ui_factory=lambda wid: WebUI(ws_id=wid),
@@ -1153,6 +1290,8 @@ def main() -> None:
 
     auth_config = load_auth_config()
     server.auth_config = auth_config  # type: ignore[attr-defined]
+    server.health_monitor = health_monitor  # type: ignore[attr-defined]
+    server.rate_limiter = rate_limiter  # type: ignore[attr-defined]
     if auth_config.enabled:
         print(f"Auth: enabled ({len(auth_config.tokens)} token(s) configured)")
 
@@ -1167,7 +1306,7 @@ def main() -> None:
     if args.workstream_idle_timeout > 0:
         cleanup = threading.Thread(
             target=_idle_cleanup_thread,
-            args=(manager, args.workstream_idle_timeout * 60, global_queue),
+            args=(manager, args.workstream_idle_timeout * 60, global_queue, rate_limiter),
             daemon=True,
         )
         cleanup.start()
@@ -1181,12 +1320,20 @@ def main() -> None:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
             print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
+    print(
+        f"Health monitor: probe every {args.health_probe_interval}s, "
+        f"circuit breaker threshold={args.circuit_breaker_threshold}"
+    )
+    if rate_limiter.enabled:
+        print(f"Rate limiter: {args.ratelimit_rps} req/s, burst={args.ratelimit_burst}")
+    print(f"Max workstreams: {args.max_workstreams}")
     print("Press Ctrl+C to stop.")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
+        health_monitor.stop()
         if mcp_client:
             mcp_client.shutdown()
         registry.shutdown()

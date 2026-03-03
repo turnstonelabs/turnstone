@@ -62,6 +62,7 @@ from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan
 if TYPE_CHECKING:
     from openai import OpenAI
 
+    from turnstone.core.healthcheck import BackendHealthMonitor
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelRegistry
 
@@ -111,11 +112,13 @@ class ChatSession:
         mcp_client: MCPClientManager | None = None,
         registry: ModelRegistry | None = None,
         model_alias: str | None = None,
+        health_monitor: BackendHealthMonitor | None = None,
     ):
         self.client = client
         self.model = model
         self._registry = registry
         self._model_alias = model_alias
+        self._health_monitor = health_monitor
         self.ui = ui
         self.instructions = instructions
         self.temperature = temperature
@@ -382,14 +385,26 @@ class ChatSession:
         """Call chat.completions.create with retry on transient errors.
 
         If all retries fail and a fallback chain is configured, tries each
-        fallback model in order before giving up.
+        fallback model in order before giving up.  Checks the circuit breaker
+        before attempting a call — fast-fails when the backend is unreachable.
         """
+        # Circuit breaker check — fast-fail if backend is known to be down
+        if self._health_monitor and not self._health_monitor.should_allow_request:
+            raise ConnectionError("Backend unreachable (circuit breaker open)")
+
         try:
-            return self._try_stream(self.client, self.model, msgs)
+            result = self._try_stream(self.client, self.model, msgs)
+            if self._health_monitor:
+                self._health_monitor.record_success()
+            return result
         except Exception as primary_err:
+            if self._health_monitor:
+                self._health_monitor.record_failure()
             if not self._registry or not self._registry.fallback:
                 raise
-            # Try each fallback model
+            # Try each fallback model.  Fallbacks may use different backends;
+            # we intentionally do NOT call record_success/failure for fallbacks —
+            # recovery of the primary backend is detected by the background probe.
             for alias in self._registry.fallback:
                 if alias == self._model_alias:
                     continue

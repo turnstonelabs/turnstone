@@ -125,8 +125,7 @@ class "WorkstreamManager" as WsMgr {
     + switch(ws_id)
     + set_state(ws_id, state)
     + close_idle(max_age_seconds)
-    --
-    MAX_WORKSTREAMS = 10
+    - _max_workstreams: int
 }
 
 ' Workstream
@@ -199,6 +198,62 @@ class "ModelConfig" as ModelCfg <<frozen>> {
     + context_window: int
 }
 
+' Circuit breaker state
+enum "CircuitState" as CircuitState {
+    CLOSED
+    OPEN
+    HALF_OPEN
+}
+
+' BackendHealthMonitor
+class "BackendHealthMonitor" as HealthMon {
+    - _state: CircuitState
+    - _consecutive_failures: int
+    - _probe_interval: float
+    - _probe_timeout: float
+    - _threshold: int
+    - _cooldown: float
+    --
+    + start()
+    + stop()
+    + record_success()
+    + record_failure()
+    + should_allow_request() → bool
+    --
+    Daemon thread probes
+    client.models.list() on interval.
+    --
+    core/healthcheck.py
+}
+
+' RateLimiter
+class "RateLimiter" as RateLimiter {
+    - _buckets: dict[str, TokenBucket]
+    - _rate: float
+    - _burst: int
+    --
+    + check(client_ip: str, path: str) → (bool, float)
+    --
+    Per-IP token bucket.
+    Returns (allowed, retry_after).
+    --
+    core/ratelimit.py
+}
+
+' TokenBucket
+class "TokenBucket" as TokenBucket {
+    - _tokens: float
+    - _rate: float
+    - _burst: int
+    - _last_refill: float
+    --
+    + consume() → bool
+    + retry_after: float {property}
+    --
+    Single-IP bucket with
+    refill rate and burst cap.
+}
+
 ' Relationships
 SessionUI <|.. TerminalUI
 TerminalUI <|-- WsTermUI
@@ -218,6 +273,10 @@ Ws --> "1" WsState : has
 WsMgr ..> ChatSession : creates via\nsession_factory(ui, model_alias)
 
 ModelReg --> "*" ModelCfg : holds
+
+ChatSession --> HealthMon : checks circuit
+HealthMon --> "1" CircuitState : has
+RateLimiter --> "*" TokenBucket : per IP
 
 note bottom of ChatSession
   Central engine: multi-turn LLM loop

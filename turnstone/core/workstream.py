@@ -63,11 +63,11 @@ class Workstream:
 class WorkstreamManager:
     """Manages multiple concurrent workstreams, each with its own ChatSession."""
 
-    MAX_WORKSTREAMS = 10
-
     def __init__(
         self,
         session_factory: Callable[[SessionUI | None, str | None], ChatSession],
+        *,
+        max_workstreams: int = 10,
     ):
         """
         Args:
@@ -75,15 +75,33 @@ class WorkstreamManager:
                 Captures shared config (registry, temperature, …) so the
                 manager can create sessions without knowing those details.
                 *model_alias* selects a model from the registry (None = default).
+            max_workstreams: Maximum number of concurrent workstreams.  When at
+                capacity, ``create()`` will auto-evict the oldest IDLE
+                workstream before raising.
         """
+        if max_workstreams < 1:
+            raise ValueError(f"max_workstreams must be >= 1, got {max_workstreams}")
         self._session_factory: Callable[[SessionUI | None, str | None], ChatSession] = (
             session_factory
         )
+        self._max_workstreams: int = max_workstreams
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []  # creation order
         self._active_id: str | None = None
         self._lock = threading.Lock()
         self._on_state_change: Callable[[str, WorkstreamState], None] | None = None
+        self._evictions: int = 0
+        self._last_evicted: Workstream | None = None
+
+    @property
+    def eviction_count(self) -> int:
+        """Number of workstreams auto-evicted by ``create()``."""
+        return self._evictions
+
+    @property
+    def last_evicted(self) -> Workstream | None:
+        """The most recently evicted workstream, or ``None``."""
+        return self._last_evicted
 
     # -- creation / destruction ---------------------------------------------
 
@@ -95,22 +113,76 @@ class WorkstreamManager:
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
+        If the manager is at capacity, the oldest IDLE workstream is
+        automatically evicted.  If **all** workstreams are non-idle, a
+        ``RuntimeError`` is raised.
+
         Args:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
         """
+        evicted_ws: Workstream | None = None
+        with self._lock:
+            if len(self._workstreams) >= self._max_workstreams:
+                evicted_ws = self._evict_oldest_idle_locked()
+                if evicted_ws is None:
+                    raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
         ws = Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
         ws.session = self._session_factory(ws.ui, model)
         with self._lock:
-            if len(self._workstreams) >= self.MAX_WORKSTREAMS:
-                raise RuntimeError(f"Maximum of {self.MAX_WORKSTREAMS} workstreams reached")
             self._workstreams[ws.id] = ws
             self._order.append(ws.id)
             if self._active_id is None:
                 self._active_id = ws.id
+        # UI cleanup for the evicted workstream must happen outside the lock
+        # because it may trigger callbacks.
+        self._last_evicted = evicted_ws
+        if evicted_ws is not None:
+            self._cleanup_ui(evicted_ws)
+            from turnstone.core.metrics import metrics
+
+            metrics.record_eviction()
         return ws
+
+    # -- eviction helpers ---------------------------------------------------
+
+    def _evict_oldest_idle_locked(self) -> Workstream | None:
+        """Find and remove the oldest IDLE workstream.
+
+        **Must be called while ``self._lock`` is held.**  Returns the evicted
+        ``Workstream`` (caller is responsible for UI cleanup) or ``None`` if no
+        IDLE workstreams exist.
+        """
+        oldest: Workstream | None = None
+        for wid in self._order:
+            ws = self._workstreams[wid]
+            if ws.state == WorkstreamState.IDLE and (
+                oldest is None or ws.last_active < oldest.last_active
+            ):
+                oldest = ws
+        if oldest is None:
+            return None
+        del self._workstreams[oldest.id]
+        self._order.remove(oldest.id)
+        if self._active_id == oldest.id:
+            self._active_id = self._order[0] if self._order else None
+        self._evictions += 1
+        return oldest
+
+    @staticmethod
+    def _cleanup_ui(ws: Workstream) -> None:
+        """Unblock pending approval/plan/foreground events on a workstream."""
+        if ws.ui:
+            if hasattr(ws.ui, "_approval_event"):
+                ws.ui._approval_result = False, None  # type: ignore[attr-defined]
+                ws.ui._approval_event.set()
+            if hasattr(ws.ui, "_plan_event"):
+                ws.ui._plan_result = "reject"  # type: ignore[attr-defined]
+                ws.ui._plan_event.set()
+            if hasattr(ws.ui, "_fg_event"):
+                ws.ui._fg_event.set()
 
     def close(self, ws_id: str) -> bool:
         """Close a workstream.  Returns False if it's the last one."""
@@ -124,15 +196,7 @@ class WorkstreamManager:
             if self._active_id == ws_id:
                 self._active_id = self._order[0]
         # Unblock any waiting approval/plan events so worker thread can exit
-        if ws.ui:
-            if hasattr(ws.ui, "_approval_event"):
-                ws.ui._approval_result = False, None  # type: ignore[attr-defined]
-                ws.ui._approval_event.set()
-            if hasattr(ws.ui, "_plan_event"):
-                ws.ui._plan_result = "reject"  # type: ignore[attr-defined]
-                ws.ui._plan_event.set()
-            if hasattr(ws.ui, "_fg_event"):
-                ws.ui._fg_event.set()
+        self._cleanup_ui(ws)
         return True
 
     # -- lookup -------------------------------------------------------------

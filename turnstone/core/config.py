@@ -75,6 +75,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "host": "host",
         "port": "port",
         "workstream_idle_timeout": "workstream_idle_timeout",
+        "max_workstreams": "max_workstreams",
     },
     "bridge": {
         "server_url": "server_url",
@@ -101,6 +102,17 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
     "mcp": {
         "config_path": "mcp_config",
+    },
+    "ratelimit": {
+        "enabled": "ratelimit_enabled",
+        "requests_per_second": "ratelimit_rps",
+        "burst": "ratelimit_burst",
+    },
+    "health": {
+        "backend_probe_interval": "health_probe_interval",
+        "backend_probe_timeout": "health_probe_timeout",
+        "circuit_breaker_threshold": "circuit_breaker_threshold",
+        "circuit_breaker_cooldown": "circuit_breaker_cooldown",
     },
 }
 
