@@ -32,12 +32,14 @@ from turnstone.core.memory import (
     get_tavily_key,
     list_sessions,
     load_memories,
+    load_session_config,
     load_session_messages,
     normalize_key,
     open_db,
     register_session,
     resolve_session,
     save_message,
+    save_session_config,
     search_history,
     search_history_recent,
     set_session_alias,
@@ -135,10 +137,24 @@ class ChatSession:
         self._assistant_pending_tokens = 0
         self.creative_mode = False
         self._init_system_messages()
+        self._save_config()
 
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    def _save_config(self) -> None:
+        """Persist LLM-affecting config so resumed sessions behave identically."""
+        save_session_config(
+            self._session_id,
+            {
+                "temperature": str(self.temperature),
+                "reasoning_effort": self.reasoning_effort,
+                "max_tokens": str(self.max_tokens),
+                "instructions": self.instructions or "",
+                "creative_mode": str(self.creative_mode),
+            },
+        )
 
     def _truncate_output(self, output: str) -> str:
         """Truncate tool output to self.tool_truncation chars, keeping head + tail."""
@@ -211,7 +227,9 @@ class ChatSession:
 
         Replaces the current conversation with the loaded messages,
         adopting the old session_id so new messages continue in the same
-        session.  Returns True on success.
+        session.  Restores persisted config (temperature, reasoning_effort,
+        etc.) so the resumed session behaves identically to the original.
+        Returns True on success.
         """
         messages = load_session_messages(session_id)
         if not messages:
@@ -224,6 +242,20 @@ class ChatSession:
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
+        # Restore persisted config
+        config = load_session_config(session_id)
+        if config:
+            if "temperature" in config:
+                self.temperature = float(config["temperature"])
+            if "reasoning_effort" in config:
+                self.reasoning_effort = config["reasoning_effort"]
+            if "max_tokens" in config:
+                self.max_tokens = int(config["max_tokens"])
+            if "instructions" in config:
+                self.instructions = config["instructions"] or None
+            if "creative_mode" in config:
+                self.creative_mode = config["creative_mode"] == "True"
+            self._init_system_messages()
         return True
 
     def _init_system_messages(self) -> None:
@@ -2512,6 +2544,7 @@ class ChatSession:
             else:
                 self.instructions = arg.strip()
                 self._init_system_messages()
+                self._save_config()
                 self.ui.on_info("Instructions updated.")
 
         elif cmd == "/clear":
@@ -2529,6 +2562,7 @@ class ChatSession:
             self._session_id = uuid.uuid4().hex[:12]
             self._title_generated = False
             register_session(self._session_id)
+            self._save_config()
             self.ui.on_info("New session started.")
 
         elif cmd == "/sessions":
@@ -2638,6 +2672,7 @@ class ChatSession:
                 if value in valid:
                     self.reasoning_effort = value
                     self._init_system_messages()
+                    self._save_config()
                     self.ui.on_info(f"Reasoning effort set to {cyan(self.reasoning_effort)}")
                 else:
                     self.ui.on_info(f"Invalid. Choose from: {', '.join(valid)}")
@@ -2648,6 +2683,7 @@ class ChatSession:
         elif cmd == "/creative":
             self.creative_mode = not self.creative_mode
             self._init_system_messages()
+            self._save_config()
             # Clear history when toggling ON if it contains tool messages,
             # because the API rejects tool-call history without tool definitions
             if self.creative_mode and any(

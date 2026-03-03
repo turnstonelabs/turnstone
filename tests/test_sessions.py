@@ -5,11 +5,14 @@ from unittest.mock import MagicMock
 from turnstone.core.memory import (
     delete_session,
     list_sessions,
+    load_session_config,
     load_session_messages,
     open_db,
+    prune_sessions,
     register_session,
     resolve_session,
     save_message,
+    save_session_config,
     set_session_alias,
     update_session_title,
 )
@@ -344,3 +347,202 @@ class TestSaveMessageUpdatesSession:
         # updated should be same or later (sqlite datetime resolution is seconds,
         # so they may be equal in fast tests — just verify no error)
         assert new_updated is not None
+
+
+# ── Interrupted session repair ───────────────────────────────────────
+
+
+class TestInterruptedSessionRepair:
+    """load_session_messages() should strip trailing incomplete tool call turns."""
+
+    def test_complete_tool_turn_preserved(self, tmp_db):
+        """2 tool_calls + 2 tool_results = complete, no stripping."""
+        save_message("s1", "user", "hello")
+        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
+        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
+        save_message("s1", "tool_result", "file.txt", tool_call_id="call_1")
+        save_message("s1", "tool_result", "/home", tool_call_id="call_2")
+        msgs = load_session_messages("s1")
+        assert len(msgs) == 4  # user + assistant(2 calls) + 2 tool results
+
+    def test_partial_tool_results_stripped(self, tmp_db):
+        """2 tool_calls + 1 tool_result = incomplete, strip the turn."""
+        save_message("s1", "user", "hello")
+        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
+        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
+        save_message("s1", "tool_result", "file.txt", tool_call_id="call_1")
+        msgs = load_session_messages("s1")
+        assert len(msgs) == 1  # only user message remains
+        assert msgs[0]["role"] == "user"
+
+    def test_zero_tool_results_stripped(self, tmp_db):
+        """2 tool_calls + 0 tool_results = incomplete, strip the turn."""
+        save_message("s1", "user", "hello")
+        save_message("s1", "assistant", "Let me check")
+        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
+        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
+        msgs = load_session_messages("s1")
+        # assistant with content was merged into tool_call assistant, so stripped
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"
+
+    def test_complete_turn_before_incomplete_preserved(self, tmp_db):
+        """Complete turn followed by incomplete turn: keep complete, strip incomplete."""
+        save_message("s1", "user", "first")
+        save_message("s1", "assistant", "response")
+        save_message("s1", "user", "second")
+        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
+        msgs = load_session_messages("s1")
+        assert len(msgs) == 3  # user + assistant + user (incomplete turn stripped)
+        assert msgs[0]["role"] == "user"
+        assert msgs[1]["role"] == "assistant"
+        assert msgs[2]["role"] == "user"
+
+
+# ── Session config persistence ───────────────────────────────────────
+
+
+class TestSessionConfig:
+    def test_save_load_roundtrip(self, tmp_db):
+        config = {"temperature": "0.3", "reasoning_effort": "high", "creative_mode": "False"}
+        save_session_config("s1", config)
+        loaded = load_session_config("s1")
+        assert loaded == config
+
+    def test_update_existing_key(self, tmp_db):
+        save_session_config("s1", {"temperature": "0.3"})
+        save_session_config("s1", {"temperature": "0.7"})
+        loaded = load_session_config("s1")
+        assert loaded["temperature"] == "0.7"
+
+    def test_missing_session_returns_empty(self, tmp_db):
+        loaded = load_session_config("nonexistent")
+        assert loaded == {}
+
+    def test_delete_session_removes_config(self, tmp_db):
+        register_session("s1")
+        save_message("s1", "user", "hi")
+        save_session_config("s1", {"temperature": "0.5"})
+        delete_session("s1")
+        assert load_session_config("s1") == {}
+
+    def test_resume_restores_config(self, tmp_db):
+        """ChatSession.resume_session() should restore persisted config."""
+        client = MagicMock()
+        client.models.list.return_value.data = [MagicMock(id="test-model")]
+        ui = MagicMock()
+        ui.on_info = MagicMock()
+        ui.on_error = MagicMock()
+        ui.on_state_change = MagicMock()
+        ui.on_rename = MagicMock()
+
+        # Create a session with specific config
+        register_session("orig")
+        save_message("orig", "user", "hello")
+        save_message("orig", "assistant", "hi there")
+        save_session_config(
+            "orig",
+            {
+                "temperature": "0.3",
+                "reasoning_effort": "high",
+                "max_tokens": "2048",
+                "instructions": "be concise",
+                "creative_mode": "True",
+            },
+        )
+
+        # Create a new session with different defaults, then resume
+        session = ChatSession(
+            client=client,
+            model="test",
+            ui=ui,
+            instructions=None,
+            temperature=0.7,
+            max_tokens=4096,
+            tool_timeout=30,
+        )
+        assert session.temperature == 0.7  # default
+        result = session.resume_session("orig")
+        assert result is True
+        assert session.temperature == 0.3
+        assert session.reasoning_effort == "high"
+        assert session.max_tokens == 2048
+        assert session.instructions == "be concise"
+        assert session.creative_mode is True
+
+
+# ── Prune sessions ───────────────────────────────────────────────────
+
+
+class TestPruneSessions:
+    def test_orphan_removed(self, tmp_db):
+        """Session registered with no messages should be pruned."""
+        register_session("orphan")
+        orphans, stale = prune_sessions()
+        assert orphans == 1
+        assert list_sessions() == []
+
+    def test_session_with_messages_kept(self, tmp_db):
+        """Session with messages should not be pruned."""
+        register_session("active")
+        save_message("active", "user", "hello")
+        orphans, _stale = prune_sessions()
+        assert orphans == 0
+        assert len(list_sessions()) == 1
+
+    def test_stale_unnamed_removed(self, tmp_db):
+        """Old unnamed session should be pruned by retention policy."""
+        register_session("old1")
+        save_message("old1", "user", "ancient message")
+        # Force the updated timestamp to the past so it looks stale
+        conn = open_db()
+        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old1'")
+        conn.commit()
+        conn.close()
+        _orphans, stale = prune_sessions(retention_days=30)
+        assert stale == 1
+
+    def test_named_session_preserved(self, tmp_db):
+        """Session with alias should be kept regardless of age."""
+        register_session("old2")
+        set_session_alias("old2", "important")
+        save_message("old2", "user", "old but named")
+        # Force old timestamp
+        conn = open_db()
+        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old2'")
+        conn.commit()
+        conn.close()
+        _orphans, stale = prune_sessions(retention_days=30)
+        assert stale == 0
+        assert len(list_sessions()) == 1
+
+    def test_fresh_unnamed_preserved(self, tmp_db):
+        """Recent unnamed session should not be pruned."""
+        register_session("fresh")
+        save_message("fresh", "user", "just now")
+        _orphans, stale = prune_sessions(retention_days=30)
+        assert stale == 0
+        assert len(list_sessions()) == 1
+
+    def test_prune_removes_session_config(self, tmp_db):
+        """Pruning orphan/stale sessions should also remove their config rows."""
+        register_session("orphan_cfg")
+        save_session_config("orphan_cfg", {"temperature": "0.5"})
+
+        register_session("stale_cfg")
+        save_message("stale_cfg", "user", "old")
+        save_session_config("stale_cfg", {"temperature": "0.9"})
+        conn = open_db()
+        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'stale_cfg'")
+        conn.commit()
+        conn.close()
+
+        # Both should have config before prune
+        assert load_session_config("orphan_cfg") == {"temperature": "0.5"}
+        assert load_session_config("stale_cfg") == {"temperature": "0.9"}
+
+        prune_sessions(retention_days=30)
+
+        # Config rows should be cleaned up
+        assert load_session_config("orphan_cfg") == {}
+        assert load_session_config("stale_cfg") == {}

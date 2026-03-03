@@ -77,6 +77,7 @@ class "ChatSession" as ChatSession {
     + send(user_input: str)
     + handle_command(command: str)
     + resume_session(session_id: str)
+    - _save_config()
     - _stream_response(stream) → dict
     - _create_stream_with_retry(msgs) → Stream
     - _execute_tools(tool_calls) → (results, feedback)
