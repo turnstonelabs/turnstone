@@ -135,7 +135,8 @@ class TestLoadMcpConfig:
         assert result == {}
 
     def test_json_file_not_found(self, tmp_path):
-        result = load_mcp_config(str(tmp_path / "nonexistent.json"))
+        with patch("turnstone.core.mcp_client.load_config", return_value={}):
+            result = load_mcp_config(str(tmp_path / "nonexistent.json"))
         assert result == {}
 
     def test_toml_config_path_redirect(self):
@@ -149,7 +150,8 @@ class TestLoadMcpConfig:
     def test_invalid_json(self, tmp_path):
         config_file = tmp_path / "bad.json"
         config_file.write_text("not json")
-        result = load_mcp_config(str(config_file))
+        with patch("turnstone.core.mcp_client.load_config", return_value={}):
+            result = load_mcp_config(str(config_file))
         assert result == {}
 
 

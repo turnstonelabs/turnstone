@@ -236,7 +236,7 @@ turnstone --mcp-config ~/.config/turnstone/mcp.json
 turnstone-server --mcp-config ~/.config/turnstone/mcp.json
 ```
 
-Use `/mcp` in the REPL to list connected tools. MCP tools always require user approval.
+Use `/mcp` in the REPL to list connected tools. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
 
 ## Configuration
 

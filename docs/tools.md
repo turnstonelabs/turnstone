@@ -432,8 +432,11 @@ MCP-compatible service.
 
 ### Approval behavior
 
-MCP tools **always require user approval** (`needs_approval: True`). They are never
-auto-approved, since turnstone cannot guarantee that external tools are read-only.
+MCP tools **require user approval by default** (`needs_approval: True`). turnstone
+does not auto-approve MCP tools based on their schema, since it cannot guarantee
+that external tools are read-only. However, global overrides such as
+`--skip-permissions` or the UI's "always allow" setting will auto-approve all
+tools, including MCP tools.
 
 ### Sub-agent availability
 
