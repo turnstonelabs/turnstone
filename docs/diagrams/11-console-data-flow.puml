@@ -1,0 +1,124 @@
+@startuml
+!theme plain
+title Turnstone — Console Dashboard Data Collection
+
+skinparam sequenceArrowThickness 1.5
+
+participant "Browser" as Browser
+participant "Console\nHTTP Server" as Server
+participant "ClusterCollector" as CC
+collections "Redis" as Redis
+participant "Node-A\n(real server)" as NodeA
+participant "Node-B\n(sim node)" as NodeB
+
+== Thread 1: Cluster Event Subscriber (real-time) ==
+
+CC -> Redis : SUBSCRIBE turnstone:events:cluster
+activate CC #E1BEE7
+
+Redis --> CC : ClusterStateEvent\n{ws_id, state:"thinking",\nnode_id:"nodeA", tokens:500,\ncontext_ratio:0.05}
+CC -> CC : Update NodeSnapshot["nodeA"]\n.workstreams["ws123"].state = "thinking"
+CC -> CC : _fanout(event) → all SSE listeners
+
+Redis --> CC : {"type":"ws_created",\nws_id:"ws456", name:"task-1",\nnode_id:"sim-0003"}
+CC -> CC : Add workstream to\nNodeSnapshot["sim-0003"]
+CC -> CC : _fanout(event)
+
+Redis --> CC : ClusterStateEvent\n{ws_id:"ws456", state:"idle"}
+CC -> CC : Update workstream state
+
+note right of CC
+  Handles: cluster_state,
+  ws_created, ws_closed, ws_rename
+
+  Thread runs continuously.
+  All updates are thread-safe
+  via threading.Lock.
+end note
+
+deactivate CC
+
+== Thread 2: Node Discovery (every 15s) ==
+
+CC -> Redis : SCAN 0 MATCH turnstone:node:*
+activate CC #B2EBF2
+Redis --> CC : [turnstone:node:nodeA, turnstone:node:sim-0003, ...]
+
+loop for each discovered key
+    CC -> Redis : GET turnstone:node:{id}
+    Redis --> CC : JSON: {server_url, started, max_ws, sim:true/false}
+end
+
+CC -> CC : Create new NodeSnapshot\nfor newly discovered nodes
+CC -> CC : Remove NodeSnapshot\nfor disappeared nodes
+
+CC -> CC : _fanout({type: "node_joined", ...})\n_fanout({type: "node_lost", ...})
+
+deactivate CC
+
+== Thread 3: HTTP Polling (every 10s, real nodes only) ==
+
+CC -> CC : Filter nodes where\nserver_url.startswith("http")
+activate CC #C8E6C9
+
+note right of CC
+  sim:// nodes are SKIPPED.
+  Their data comes exclusively
+  from the cluster event channel.
+end note
+
+CC -> NodeA : GET /api/dashboard
+activate NodeA
+NodeA --> CC : {workstreams: [...],\naggregate: {total_tokens, ...}}
+deactivate NodeA
+
+CC -> NodeA : GET /health
+activate NodeA
+NodeA --> CC : {status:"ok", model:"...",\nworkstreams:{total, idle, ...}}
+deactivate NodeA
+
+CC -> CC : Replace NodeSnapshot["nodeA"]\n.workstreams, .health, .aggregate
+
+CC -x NodeB : (SKIPPED: sim:// URL)
+
+deactivate CC
+
+== Browser SSE Stream ==
+
+Browser -> Server : GET /api/cluster/events
+activate Server
+
+Server -> CC : register_listener(queue)
+note right : Per-client queue.Queue(maxsize=500)
+
+loop continuous
+    CC -> Server : event via listener queue\n(from any of the 3 threads)
+    Server -> Browser : data: {"type":"cluster_state",...}\n\n
+end
+
+alt timeout (5s no events)
+    Server -> Browser : : keepalive\n\n
+end
+
+Browser -> Server : connection closed
+Server -> CC : unregister_listener(queue)
+deactivate Server
+
+== Browser REST Requests ==
+
+Browser -> Server : GET /api/cluster/overview
+Server -> CC : get_overview()
+CC --> Server : {nodes: 10, workstreams: 47,\nstates: {running:5, thinking:3, ...},\naggregate: {total_tokens: 50000}}
+Server --> Browser : JSON response
+
+Browser -> Server : GET /api/cluster/nodes?sort=activity
+Server -> CC : get_nodes(sort_by="activity")
+CC --> Server : {nodes: [...], total: 10}
+Server --> Browser : JSON response
+
+Browser -> Server : GET /api/cluster/workstreams\n?state=running&node=sim-0003
+Server -> CC : get_workstreams(state="running",\nnode="sim-0003")
+CC --> Server : {workstreams: [...], total: 5,\npage: 1, per_page: 50, pages: 1}
+Server --> Browser : JSON response
+
+@enduml

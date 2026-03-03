@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+from typing import TYPE_CHECKING, Any
 
-from turnstone.sim.config import SimConfig
+if TYPE_CHECKING:
+    from turnstone.sim.config import SimConfig
 
 _WORD_POOL = [
     "the",
@@ -66,7 +68,7 @@ class SimEngine:
 
     async def simulate_llm_response(
         self, first_round: bool, turn_number: int
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict[str, Any]]]:
         """Simulate an LLM response.
 
         Returns ``(content_text, tool_calls)`` where *tool_calls* may be

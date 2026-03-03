@@ -1,7 +1,6 @@
 """Tests for turnstone.core.session — ChatSession construction."""
 
 import json
-import os
 from unittest.mock import MagicMock, patch
 
 from turnstone.core.session import ChatSession
@@ -46,10 +45,12 @@ class NullUI:
     def on_state_change(self, state):
         pass
 
+    def on_rename(self, name):
+        pass
+
 
 def _make_session(
     mock_openai_client=None,
-    persona=None,
     instructions=None,
     **kwargs,
 ):
@@ -59,7 +60,6 @@ def _make_session(
         client=client,
         model="test-model",
         ui=NullUI(),
-        persona=persona,
         instructions=instructions,
         temperature=0.5,
         max_tokens=4096,
@@ -76,15 +76,6 @@ class TestChatSessionConstruction:
         # At least one developer message
         roles = [m["role"] for m in session.system_messages]
         assert "developer" in roles
-
-    def test_persona_injected_into_chat_template_kwargs(self, tmp_db):
-        session = _make_session(persona="Helpful assistant")
-        assert "model_identity" in session._chat_template_kwargs
-        assert "Helpful assistant" in session._chat_template_kwargs["model_identity"]
-
-    def test_no_persona_no_model_identity(self, tmp_db):
-        session = _make_session(persona=None)
-        assert "model_identity" not in session._chat_template_kwargs
 
     def test_instructions_appended_to_developer_message(self, tmp_db):
         session = _make_session(instructions="Always be concise.")
@@ -268,8 +259,6 @@ class TestPlanExec:
         monkeypatch.chdir(tmp_path)
         session = _make_session()
         agent_output = "## Goal\n\nBuild it."
-        call_id, content, _ = self._run_plan(
-            session, "do stuff", agent_return=agent_output
-        )
+        call_id, content, _ = self._run_plan(session, "do stuff", agent_return=agent_output)
         assert call_id == "test-call-1"
         assert content == agent_output

@@ -23,7 +23,7 @@ services:
   # Redis — message broker, pub/sub, node registry
   # -------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     command:
       - sh
       - -c

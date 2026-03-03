@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Inbound messages (client → bridge)
@@ -36,7 +36,7 @@ class InboundMessage:
         klass = _INBOUND_REGISTRY.get(msg_type)
         if klass is None:
             raise ValueError(f"Unknown inbound message type: {msg_type!r}")
-        valid = {f for f in klass.__dataclass_fields__}
+        valid = {f.name for f in fields(klass)}
         return klass(**{k: v for k, v in data.items() if k in valid})
 
 
@@ -146,7 +146,7 @@ class OutboundEvent:
         data = json.loads(raw)
         msg_type = data.get("type", "")
         klass = _OUTBOUND_REGISTRY.get(msg_type, OutboundEvent)
-        valid = {f for f in klass.__dataclass_fields__}
+        valid = {f.name for f in fields(klass)}
         return klass(**{k: v for k, v in data.items() if k in valid})
 
 
@@ -180,7 +180,7 @@ class ToolInfoEvent(OutboundEvent):
     """Tool call info (auto-approved tools)."""
 
     type: str = "tool_info"
-    items: list = field(default_factory=list)
+    items: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -192,7 +192,7 @@ class ApprovalRequestEvent(OutboundEvent):
     """
 
     type: str = "approval_request"
-    items: list = field(default_factory=list)
+    items: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -275,7 +275,7 @@ class WorkstreamListEvent(OutboundEvent):
     """Workstream list response."""
 
     type: str = "ws_list"
-    workstreams: list = field(default_factory=list)
+    workstreams: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -291,7 +291,7 @@ class HealthResponseEvent(OutboundEvent):
     """Health status response."""
 
     type: str = "health_response"
-    data: dict = field(default_factory=dict)
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -315,7 +315,7 @@ class NodeListEvent(OutboundEvent):
     """List of active bridge nodes."""
 
     type: str = "node_list"
-    nodes: list = field(default_factory=list)
+    nodes: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -336,8 +336,17 @@ class ClusterStateEvent(OutboundEvent):
 # Type registries (built after all classes are defined)
 # ---------------------------------------------------------------------------
 
+
+def _type_default(cls: type[Any]) -> str:
+    """Return the default value of the 'type' field for a dataclass."""
+    for f in fields(cls):
+        if f.name == "type":
+            return f.default  # type: ignore[return-value]
+    return ""
+
+
 _INBOUND_REGISTRY: dict[str, type[InboundMessage]] = {
-    cls.__dataclass_fields__["type"].default: cls
+    _type_default(cls): cls
     for cls in [
         SendMessage,
         ApproveMessage,
@@ -352,7 +361,7 @@ _INBOUND_REGISTRY: dict[str, type[InboundMessage]] = {
 }
 
 _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
-    cls.__dataclass_fields__["type"].default: cls
+    _type_default(cls): cls
     for cls in [
         AckEvent,
         ContentEvent,

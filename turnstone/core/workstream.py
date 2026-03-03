@@ -12,9 +12,11 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.session import ChatSession, SessionUI
 
 
@@ -48,7 +50,7 @@ class Workstream:
     last_active: float = field(default_factory=time.monotonic, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.name:
             self.name = f"ws-{self.id[:4]}"
 
@@ -65,7 +67,7 @@ class WorkstreamManager:
 
     def __init__(
         self,
-        session_factory: Callable[[SessionUI], ChatSession],
+        session_factory: Callable[[SessionUI | None], ChatSession],
     ):
         """
         Args:
@@ -73,7 +75,7 @@ class WorkstreamManager:
                 config (client, model, temperature, …) so the manager can
                 create sessions without knowing those details.
         """
-        self._session_factory = session_factory
+        self._session_factory: Callable[[SessionUI | None], ChatSession] = session_factory
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []  # creation order
         self._active_id: str | None = None
@@ -94,9 +96,7 @@ class WorkstreamManager:
         ws.session = self._session_factory(ws.ui)
         with self._lock:
             if len(self._workstreams) >= self.MAX_WORKSTREAMS:
-                raise RuntimeError(
-                    f"Maximum of {self.MAX_WORKSTREAMS} workstreams reached"
-                )
+                raise RuntimeError(f"Maximum of {self.MAX_WORKSTREAMS} workstreams reached")
             self._workstreams[ws.id] = ws
             self._order.append(ws.id)
             if self._active_id is None:
@@ -117,10 +117,10 @@ class WorkstreamManager:
         # Unblock any waiting approval/plan events so worker thread can exit
         if ws.ui:
             if hasattr(ws.ui, "_approval_event"):
-                ws.ui._approval_result = (False, None)
+                ws.ui._approval_result = False, None  # type: ignore[attr-defined]
                 ws.ui._approval_event.set()
             if hasattr(ws.ui, "_plan_event"):
-                ws.ui._plan_result = "reject"
+                ws.ui._plan_result = "reject"  # type: ignore[attr-defined]
                 ws.ui._plan_event.set()
             if hasattr(ws.ui, "_fg_event"):
                 ws.ui._fg_event.set()
@@ -143,11 +143,7 @@ class WorkstreamManager:
     def list_all(self) -> list[Workstream]:
         """Return workstreams in creation order."""
         with self._lock:
-            return [
-                self._workstreams[wid]
-                for wid in self._order
-                if wid in self._workstreams
-            ]
+            return [self._workstreams[wid] for wid in self._order if wid in self._workstreams]
 
     def index_of(self, ws_id: str) -> int:
         """1-based index of a workstream, or 0 if not found."""
@@ -183,7 +179,7 @@ class WorkstreamManager:
 
     # -- state management ---------------------------------------------------
 
-    def set_state(self, ws_id: str, state: WorkstreamState, error_msg: str = ""):
+    def set_state(self, ws_id: str, state: WorkstreamState, error_msg: str = "") -> None:
         """Update a workstream's state.  Called by UI adapters."""
         ws = self._workstreams.get(ws_id)
         if ws:
@@ -207,8 +203,7 @@ class WorkstreamManager:
                 [
                     ws
                     for ws in snapshot
-                    if ws.state == WorkstreamState.IDLE
-                    and (now - ws.last_active) > max_age_seconds
+                    if ws.state == WorkstreamState.IDLE and (now - ws.last_active) > max_age_seconds
                 ],
                 key=lambda ws: ws.last_active,  # oldest first
             )

@@ -1,0 +1,147 @@
+@startuml
+!theme plain
+title Turnstone — Conversation Turn Lifecycle
+
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceLifeLineBackgroundColor #F5F5F5
+
+participant "User /\nHTTP Client" as User
+participant "ChatSession" as CS
+participant "SessionUI" as UI
+participant "OpenAI API\n(LLM)" as LLM
+participant "Tool Executor\n(ThreadPool)" as TP
+database "SQLite" as DB
+
+== User Input ==
+
+User -> CS : send(user_input)
+activate CS
+
+CS -> CS : messages.append({role: "user", content: input})
+CS -> DB : save_message(session_id, "user", input)
+
+== LLM Call Loop ==
+
+group loop [while tool_calls present]
+
+    CS -> UI : on_state_change("thinking")
+    CS -> UI : on_thinking_start()
+
+    CS -> LLM : client.chat.completions.create(\n  model, messages, tools,\n  stream=True, stream_options={include_usage})
+    activate LLM
+
+    note right of CS
+      Retry up to 3× on transient errors:
+      RateLimitError, APITimeoutError,
+      APIConnectionError, InternalServerError,
+      ServiceUnavailableError, APIError
+      Backoff: 1s, 2s, 4s
+    end note
+
+    == Streaming Response ==
+
+    loop for each chunk in stream
+        LLM --> CS : delta
+        note right of CS
+          on_thinking_stop() called on first
+          delta token via _stop_spinner_once()
+        end note
+        alt reasoning_content present
+            CS -> UI : on_reasoning_token(text)
+        else content present
+            CS -> UI : on_content_token(text)
+        else tool_call delta
+            CS -> CS : accumulate in tool_calls_acc
+        end
+    end
+
+    LLM --> CS : stream complete (usage stats)
+    deactivate LLM
+
+    CS -> UI : on_thinking_stop()  (no-op guard: already called by _stop_spinner_once)
+    CS -> UI : on_stream_end()
+
+    CS -> CS : _update_token_table()\ncalibrate chars_per_token ratio
+    CS -> CS : messages.append(assistant_msg)
+    CS -> DB : save_message(session_id, "assistant", content)
+    CS -> DB : save_message(session_id, "tool_call", ...) ×N
+
+    == Tool Dispatch (if tool_calls) ==
+
+    alt no tool_calls
+        CS -> UI : on_status(usage, context_window, effort)
+
+        opt prompt_tokens > context_window × auto_compact_pct
+            CS -> CS : _compact_messages(auto=True)
+            CS -> LLM : Non-streaming summarization call
+            CS -> CS : Replace messages with [summary]
+        end
+
+        opt first exchange & no title
+            CS -> CS : Background thread: _generate_title()
+        end
+
+        CS -> UI : on_state_change("idle")
+        CS --> User : return
+
+    else has tool_calls
+        CS -> UI : on_state_change("running")
+
+        == Phase 1: Prepare ==
+        CS -> CS : [_prepare_tool(tc) for tc in tool_calls]\nParse JSON args, validate,\nbuild preview + header
+
+        == Phase 2: Approve ==
+        CS -> UI : on_state_change("attention")
+        CS -> UI : approve_tools(items)
+        activate UI
+        note right of UI
+          TerminalUI: input() prompt
+          WebUI: _approval_event.wait()
+          NullUI: returns (True, None)
+        end note
+        UI --> CS : (approved: bool, feedback: str?)
+        deactivate UI
+        CS -> UI : on_state_change("running")
+
+        == Phase 3: Execute ==
+        CS -> TP : ThreadPoolExecutor(max_workers=4)\nrun_one(item) for each tool
+        activate TP
+
+        note right of TP
+          Parallel execution:
+          bash → subprocess.run()
+          read_file → open().read()
+          search → grep subprocess
+          edit_file → string replace
+          task/plan → _run_agent() sub-loop
+          math → sandboxed subprocess
+          web_fetch → httpx + LLM summarize
+          web_search → Tavily API
+          remember/recall/forget → SQLite
+        end note
+
+        note right of TP
+          on_tool_result() called
+          inside each _exec_* handler
+        end note
+
+        TP --> CS : [(call_id, output), ...]
+        deactivate TP
+
+        loop for each result
+            CS -> CS : messages.append({role: "tool", ...})
+            CS -> DB : save_message(session_id, "tool_result", ...)
+        end
+
+        opt user_feedback from approval
+            CS -> CS : messages.append({role: "user", content: feedback})
+        end
+
+        note right of CS : Loop back for next LLM call
+    end
+
+end
+
+deactivate CS
+
+@enduml

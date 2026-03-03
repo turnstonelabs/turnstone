@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 from turnstone.mq.protocol import (
     AckEvent,
@@ -22,6 +23,7 @@ from turnstone.mq.protocol import (
     HealthResponseEvent,
     InboundMessage,
     NodeListEvent,
+    OutboundEvent,
     StateChangeEvent,
     StatusEvent,
     StreamEndEvent,
@@ -31,9 +33,12 @@ from turnstone.mq.protocol import (
     WorkstreamCreatedEvent,
     WorkstreamListEvent,
 )
-from turnstone.sim.config import SimConfig
 from turnstone.sim.engine import SimEngine, ToolSimulationError
-from turnstone.sim.metrics import MetricsCollector
+
+if TYPE_CHECKING:
+    from turnstone.mq.broker import RedisBroker
+    from turnstone.sim.config import SimConfig
+    from turnstone.sim.metrics import MetricsCollector
 
 log = logging.getLogger("turnstone.sim.node")
 
@@ -212,7 +217,7 @@ class SimNode:
     def __init__(
         self,
         node_id: str,
-        broker: object,
+        broker: RedisBroker,
         config: SimConfig,
         metrics: MetricsCollector,
     ):
@@ -420,19 +425,19 @@ class SimNode:
 
     # -- event publishing helpers --------------------------------------------
 
-    def _publish_global(self, event: object) -> None:
+    def _publish_global(self, event: OutboundEvent) -> None:
         self._broker.publish_outbound(
             f"{self._prefix}:events:global",
             event.to_json(),
         )
 
-    def _publish_ws(self, ws_id: str, event: object) -> None:
+    def _publish_ws(self, ws_id: str, event: OutboundEvent) -> None:
         self._broker.publish_outbound(
             f"{self._prefix}:events:{ws_id}",
             event.to_json(),
         )
 
-    def _publish_cluster(self, event: object) -> None:
+    def _publish_cluster(self, event: OutboundEvent) -> None:
         self._broker.publish_outbound(
             f"{self._prefix}:events:cluster",
             event.to_json(),

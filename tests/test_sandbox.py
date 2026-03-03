@@ -1,6 +1,6 @@
 """Tests for turnstone.core.sandbox — validate_math_code and auto_print_wrap."""
 
-from turnstone.core.sandbox import validate_math_code, auto_print_wrap
+from turnstone.core.sandbox import auto_print_wrap, validate_math_code
 
 
 class TestValidateMathCode:

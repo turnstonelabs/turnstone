@@ -1,6 +1,6 @@
 """Tests for turnstone.core.memory — fts5_query and escape_like."""
 
-from turnstone.core.memory import fts5_query, escape_like
+from turnstone.core.memory import escape_like, fts5_query
 
 
 class TestFts5Query:

@@ -9,57 +9,53 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import concurrent.futures
-import ipaddress
 import json
 import os
 import re
-import socket
 import subprocess
 import tempfile
 import textwrap
 import threading
 import time
 import uuid
-from typing import Protocol
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
-from openai import OpenAI
-
-from turnstone.core.tools import (
-    TOOLS,
-    AGENT_TOOLS,
-    TASK_AGENT_TOOLS,
-    AGENT_AUTO_TOOLS,
-    TASK_AUTO_TOOLS,
-    PRIMARY_KEY_MAP,
-)
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.sandbox import execute_math_sandboxed
-from turnstone.core.safety import is_command_blocked, sanitize_command
-from turnstone.core.web import strip_html, check_ssrf
 from turnstone.core.memory import (
-    open_db,
+    delete_session,
+    escape_like,
+    get_session_name,
+    get_tavily_key,
+    list_sessions,
     load_memories,
-    save_message,
+    load_session_messages,
     normalize_key,
+    open_db,
+    register_session,
+    resolve_session,
+    save_message,
     search_history,
     search_history_recent,
-    get_tavily_key,
-    escape_like,
-    fts5_query,
-    register_session,
-    update_session_title,
     set_session_alias,
-    resolve_session,
-    get_session_name,
-    list_sessions,
-    load_session_messages,
-    delete_session,
+    update_session_title,
 )
-from turnstone.ui.colors import *  # noqa: F401, F403 — ANSI constants and helpers
+from turnstone.core.safety import is_command_blocked, sanitize_command
+from turnstone.core.sandbox import execute_math_sandboxed
+from turnstone.core.tools import (
+    AGENT_AUTO_TOOLS,
+    AGENT_TOOLS,
+    PRIMARY_KEY_MAP,
+    TASK_AGENT_TOOLS,
+    TASK_AUTO_TOOLS,
+    TOOLS,
+)
+from turnstone.core.web import check_ssrf, strip_html
+from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
+if TYPE_CHECKING:
+    from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -72,9 +68,9 @@ class SessionUI(Protocol):
     def on_reasoning_token(self, text: str) -> None: ...
     def on_content_token(self, text: str) -> None: ...
     def on_stream_end(self) -> None: ...
-    def approve_tools(self, items: list[dict]) -> tuple[bool, str | None]: ...
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]: ...
     def on_tool_result(self, name: str, output: str) -> None: ...
-    def on_status(self, usage: dict, context_window: int, effort: str) -> None: ...
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
     def on_error(self, message: str) -> None: ...
@@ -93,7 +89,6 @@ class ChatSession:
         client: OpenAI,
         model: str,
         ui: SessionUI,
-        persona: str | None,
         instructions: str | None,
         temperature: float,
         max_tokens: int,
@@ -108,7 +103,6 @@ class ChatSession:
         self.client = client
         self.model = model
         self.ui = ui
-        self.persona = persona
         self.instructions = instructions
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -131,7 +125,7 @@ class ChatSession:
         self._title_generated = False
         register_session(self._session_id)
         self._read_files: set[str] = set()
-        self.messages: list[dict] = []
+        self.messages: list[dict[str, Any]] = []
         self._last_usage: dict[str, int] | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
@@ -157,7 +151,7 @@ class ChatSession:
             + output[-half:]
         )
 
-    def _generate_title(self):
+    def _generate_title(self) -> None:
         """Generate a short title for this session via a background LLM call."""
         try:
             # Gather first user message and first assistant reply
@@ -225,38 +219,24 @@ class ChatSession:
         self._last_usage = None
         self._title_generated = True  # don't re-title resumed sessions
         self._msg_tokens = [
-            max(1, int(self._msg_char_count(m) / self._chars_per_token))
-            for m in self.messages
+            max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
         return True
 
-    def _init_system_messages(self):
+    def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
 
-        System message format matches training distribution:
-          Persona: X           (optional)
-          Knowledge cutoff: X  (from base model pretraining)
-          Current date: X      (from base model pretraining)
-          Reasoning: X         (low/medium/high)
-          # Valid channels: ... (dynamic based on tools/reasoning)
-          Calls to these tools... (only when tools present)
-
-        Developer message uses # Instructions header when combined
-        with tool definitions (tool defs appended by chat template).
+        Developer message contains tool patterns (or creative writing
+        instructions when creative_mode is on), plus any user-supplied
+        instructions and memory reminders.
         """
-        from datetime import date
-
-        self.system_messages = []
-        today = date.today().strftime("%Y-%m-%d")  # noqa: F841
-        has_tools = not self.creative_mode  # noqa: F841
+        self.system_messages: list[dict[str, Any]] = []
 
         # -- Chat template kwargs --
-        self._chat_template_kwargs_base = {
+        self._chat_template_kwargs_base: dict[str, Any] = {
             "reasoning_effort": self.reasoning_effort,
         }
-        self._chat_template_kwargs = dict(self._chat_template_kwargs_base)
-        if self.persona:
-            self._chat_template_kwargs["model_identity"] = f"Persona: {self.persona}"
+        self._chat_template_kwargs: dict[str, Any] = dict(self._chat_template_kwargs_base)
 
         # -- Developer message --
         if self.creative_mode:
@@ -311,17 +291,15 @@ class ChatSession:
                 f"REMINDER: You currently have {len(memories)} memories stored. "
                 "Use recall to see them."
             )
-        self.system_messages.append(
-            {"role": "developer", "content": "\n".join(dev_parts)}
-        )
+        self.system_messages.append({"role": "developer", "content": "\n".join(dev_parts)})
         # Agent prefix: system + developer only (no memories)
         self._agent_system_messages = list(self.system_messages)
 
-    def _full_messages(self) -> list[dict]:
+    def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history."""
         return self.system_messages + self.messages
 
-    def _emit_state(self, state: str):
+    def _emit_state(self, state: str) -> None:
         """Notify UI of a workstream state transition."""
         self.ui.on_state_change(state)
 
@@ -340,12 +318,12 @@ class ChatSession:
     _MAX_RETRIES = 3
     _RETRY_BASE_DELAY = 1.0  # seconds
 
-    def _create_stream_with_retry(self, msgs):
+    def _create_stream_with_retry(self, msgs: list[dict[str, Any]]) -> Any:
         """Call chat.completions.create with retry on transient errors."""
-        last_err = None
+        last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
-                return self.client.chat.completions.create(
+                return self.client.chat.completions.create(  # type: ignore[call-overload]
                     model=self.model,
                     messages=msgs,
                     **({"tools": TOOLS} if not self.creative_mode else {}),
@@ -365,9 +343,10 @@ class ChatSession:
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
                 self.ui.on_info(f"[Retrying in {delay:.0f}s: {ename}]")
                 time.sleep(delay)
-        raise last_err  # unreachable, but satisfies type checker
+        assert last_err is not None  # unreachable, but satisfies type checker
+        raise last_err
 
-    def send(self, user_input: str):
+    def send(self, user_input: str) -> None:
         """Send user input and handle the response loop (including tool calls)."""
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
@@ -394,9 +373,7 @@ class ChatSession:
                     self._assistant_pending_tokens
                     or max(
                         1,
-                        int(
-                            self._msg_char_count(assistant_msg) / self._chars_per_token
-                        ),
+                        int(self._msg_char_count(assistant_msg) / self._chars_per_token),
                     )
                 )
 
@@ -440,9 +417,7 @@ class ChatSession:
                     # Auto-title session after first exchange
                     if not self._title_generated:
                         self._title_generated = True
-                        threading.Thread(
-                            target=self._generate_title, daemon=True
-                        ).start()
+                        threading.Thread(target=self._generate_title, daemon=True).start()
                     self._emit_state("idle")
                     break
 
@@ -450,9 +425,7 @@ class ChatSession:
                 self._emit_state("running")
                 results, user_feedback = self._execute_tools(tool_calls)
                 # Map tool_call_id → tool name for logging
-                _tc_names = {
-                    c["id"]: c.get("function", {}).get("name", "") for c in tool_calls
-                }
+                _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
                     tool_msg = {
                         "role": "tool",
@@ -460,9 +433,7 @@ class ChatSession:
                         "content": output,
                     }
                     self.messages.append(tool_msg)
-                    self._msg_tokens.append(
-                        max(1, int(len(output) / self._chars_per_token))
-                    )
+                    self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
                     # Log tool result (skip memory tools to avoid noise)
                     _tname = _tc_names.get(tc_id, "")
                     if _tname not in (
@@ -480,9 +451,7 @@ class ChatSession:
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
-                    self._msg_tokens.append(
-                        max(1, int(len(user_feedback) / self._chars_per_token))
-                    )
+                    self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
         except KeyboardInterrupt:
             # Remove any partial tool results, then the originating assistant
             # message with unanswered tool_calls — keep _msg_tokens in sync
@@ -514,10 +483,7 @@ class ChatSession:
             while open_t in text:
                 start = text.find(open_t)
                 end = text.find(close_t, start)
-                if end != -1:
-                    text = text[:start] + text[end + len(close_t) :]
-                else:
-                    text = text[:start]
+                text = text[:start] + text[end + len(close_t) :] if end != -1 else text[:start]
         return text.strip()
 
     # Tags that delimit reasoning blocks in content stream.
@@ -526,7 +492,7 @@ class ChatSession:
     _THINK_CLOSE_TAGS = ("</think>", "</reasoning>")
     _MAX_TAG_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS)
 
-    def _stream_response(self, stream) -> dict:
+    def _stream_response(self, stream: Any) -> dict[str, Any]:
         """Stream response, dispatching tokens to the UI as they arrive.
 
         Handles two reasoning delivery mechanisms:
@@ -540,13 +506,13 @@ class ChatSession:
         """
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
-        tool_calls_acc: dict[int, dict] = {}
+        tool_calls_acc: dict[int, dict[str, Any]] = {}
         first_token = True
         in_think = False  # inside a <think>...</think> block
         path1_reasoning = False  # last reasoning came via reasoning_content field
         pending = ""  # buffer for partial tag detection
 
-        def _flush_text(text: str, is_reasoning: bool):
+        def _flush_text(text: str, is_reasoning: bool) -> None:
             """Dispatch text to the appropriate UI callback."""
             if not text:
                 return
@@ -558,7 +524,7 @@ class ChatSession:
                 content_parts.append(text)
                 self.ui.on_content_token(text)
 
-        def _drain_pending():
+        def _drain_pending() -> None:
             """Process the pending buffer, flushing content and detecting tags."""
             nonlocal pending, in_think
 
@@ -572,6 +538,7 @@ class ChatSession:
                             best_idx, best_tag = idx, tag
 
                     if best_idx is not None:
+                        assert best_tag is not None
                         _flush_text(pending[:best_idx], True)
                         pending = pending[best_idx + len(best_tag) :]
                         in_think = False
@@ -592,6 +559,7 @@ class ChatSession:
                             best_idx, best_tag = idx, tag
 
                     if best_idx is not None:
+                        assert best_tag is not None
                         _flush_text(pending[:best_idx], False)
                         pending = pending[best_idx + len(best_tag) :]
                         in_think = True
@@ -604,7 +572,7 @@ class ChatSession:
                         pending = pending[safe:]
                     break
 
-        def _stop_spinner_once():
+        def _stop_spinner_once() -> None:
             """Stop the spinner on first real content. Call is idempotent."""
             nonlocal first_token
             if first_token:
@@ -641,7 +609,7 @@ class ChatSession:
                 if delta.content:
                     parts.append(f"content={delta.content!r}")
                 if delta.tool_calls:
-                    parts.append(f"tool_calls=...")
+                    parts.append("tool_calls=...")
                 for k, v in extras.items():
                     if v is not None:
                         parts.append(f"{k}={v!r}")
@@ -649,9 +617,7 @@ class ChatSession:
                     self.ui.on_info(f"{GRAY}[delta: {', '.join(parts)}]{RESET}")
 
             # Path 1: reasoning field (vLLM sends as "reasoning" or "reasoning_content")
-            rc = getattr(delta, "reasoning", None) or getattr(
-                delta, "reasoning_content", None
-            )
+            rc = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
             if rc:
                 _stop_spinner_once()
                 reasoning_parts.append(rc)
@@ -706,9 +672,7 @@ class ChatSession:
             )
             # Drop partial tool calls — they'll have malformed JSON
             if tool_calls_acc:
-                self.ui.on_error(
-                    "Discarding partial tool calls from truncated response."
-                )
+                self.ui.on_error("Discarding partial tool calls from truncated response.")
                 tool_calls_acc.clear()
         elif finish_reason == "content_filter":
             self.ui.on_error("Warning: response blocked by content filter.")
@@ -717,7 +681,7 @@ class ChatSession:
         self.ui.on_stream_end()
 
         # Build assistant message dict
-        msg: dict = {"role": "assistant"}
+        msg: dict[str, Any] = {"role": "assistant"}
 
         content = "".join(content_parts)
         if content:
@@ -734,7 +698,7 @@ class ChatSession:
 
     # -- Debug ----------------------------------------------------------------
 
-    def _debug_print_request(self, msgs: list[dict]):
+    def _debug_print_request(self, msgs: list[dict[str, Any]]) -> None:
         """Print the full API request payload when debug mode is on."""
         lines = []
         lines.append(f"\n{GRAY}{'=' * 60}{RESET}")
@@ -753,9 +717,7 @@ class ChatSession:
 
             # Truncate long content for readability
             if len(content) > 300:
-                display = (
-                    content[:200] + f"...({len(content)} chars)..." + content[-50:]
-                )
+                display = content[:200] + f"...({len(content)} chars)..." + content[-50:]
             else:
                 display = content
             # Escape newlines for compact display
@@ -780,7 +742,7 @@ class ChatSession:
 
     # -- Token tracking & status ----------------------------------------------
 
-    def _msg_char_count(self, msg: dict) -> int:
+    def _msg_char_count(self, msg: dict[str, Any]) -> int:
         """Count characters in a message, including tool call arguments."""
         n = len(msg.get("content") or "")
         for tc in msg.get("tool_calls", []):
@@ -788,7 +750,7 @@ class ChatSession:
             n += len(tc.get("function", {}).get("arguments", ""))
         return n
 
-    def _update_token_table(self, assistant_msg: dict):
+    def _update_token_table(self, assistant_msg: dict[str, Any]) -> None:
         """Update per-message token estimates using API usage data."""
         if not self._last_usage:
             return
@@ -809,14 +771,13 @@ class ChatSession:
 
         # Re-estimate all message token counts with calibrated ratio
         self._msg_tokens = [
-            max(1, int(self._msg_char_count(m) / self._chars_per_token))
-            for m in self.messages
+            max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
 
         # Stash completion_tokens for the assistant message about to be appended
         self._assistant_pending_tokens = compl_tok
 
-    def _print_status_line(self):
+    def _print_status_line(self) -> None:
         """Emit status info via the UI."""
         if not self._last_usage:
             return
@@ -824,7 +785,7 @@ class ChatSession:
 
     # -- Conversation compaction ------------------------------------------------
 
-    def _format_messages_for_summary(self, messages: list[dict]) -> str:
+    def _format_messages_for_summary(self, messages: list[dict[str, Any]]) -> str:
         """Format messages into a readable string for the summarization prompt."""
         # Build tool_call_id → tool_name lookup for labeling tool results
         tc_names: dict[str, str] = {}
@@ -860,7 +821,7 @@ class ChatSession:
                 parts.append(f"{role}: {content}")
         return "\n\n".join(parts)
 
-    def _compact_messages(self, auto: bool = False):
+    def _compact_messages(self, auto: bool = False) -> None:
         """Compact conversation history by summarizing all messages.
 
         Summarizes the entire conversation via a separate model call,
@@ -949,12 +910,13 @@ class ChatSession:
 
         self.ui.on_thinking_start()
         try:
-            last_err = None
+            _last_err: Exception | None = None
+            response: Any = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
                     response = self.client.chat.completions.create(
                         model=self.model,
-                        messages=summary_msgs,
+                        messages=summary_msgs,  # type: ignore[arg-type]
                         max_completion_tokens=summary_max_tokens,
                         temperature=0.3,
                         stream=False,
@@ -968,15 +930,13 @@ class ChatSession:
                     break
                 except Exception as e:
                     ename = type(e).__name__
-                    if (
-                        ename not in self._RETRYABLE_ERRORS
-                        or attempt == self._MAX_RETRIES
-                    ):
+                    if ename not in self._RETRYABLE_ERRORS or attempt == self._MAX_RETRIES:
                         raise
-                    last_err = e
+                    _last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
                     time.sleep(delay)
+            assert response is not None
             choice = response.choices[0]
             summary = choice.message.content or ""
             # Strip any <think>/<reasoning> tags the summarizer may emit
@@ -1029,7 +989,7 @@ class ChatSession:
     # Phase 3 — execute: run approved tools (parallel if multiple)
 
     def _execute_tools(
-        self, tool_calls: list[dict]
+        self, tool_calls: list[dict[str, Any]]
     ) -> tuple[list[tuple[str, str]], str | None]:
         """Execute tool calls with batch preview and approval.
 
@@ -1052,12 +1012,13 @@ class ChatSession:
             user_feedback = None  # feedback is in the denial_msg
 
         # Phase 3: execute
-        def run_one(item: dict) -> tuple[str, str]:
+        def run_one(item: dict[str, Any]) -> tuple[str, str]:
             if item.get("error"):
                 return item["call_id"], item["error"]
             if item.get("denied"):
                 return item["call_id"], item.get("denial_msg", "Denied by user")
-            return item["execute"](item)
+            result: tuple[str, str] = item["execute"](item)
+            return result
 
         if len(items) == 1:
             results = [run_one(items[0])]
@@ -1089,7 +1050,7 @@ class ChatSession:
 
         return results, user_feedback
 
-    def _prepare_tool(self, tc: dict) -> dict:
+    def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
         func_name = tc["function"]["name"]
@@ -1120,11 +1081,7 @@ class ChatSession:
                     args = {key: val}
                     break
             # Fallback 2: bare string (no JSON wrapper at all)
-            if (
-                args is None
-                and raw_args.strip()
-                and not raw_args.strip().startswith("{")
-            ):
+            if args is None and raw_args.strip() and not raw_args.strip().startswith("{"):
                 pk = PRIMARY_KEY_MAP.get(func_name)
                 if pk:
                     args = {pk: raw_args}
@@ -1165,11 +1122,12 @@ class ChatSession:
                 "needs_approval": False,
                 "error": f"Unknown tool: {func_name}",
             }
+        assert args is not None  # guaranteed by the early return on args is None above
         return preparer(call_id, args)
 
     # -- Prepare methods (build preview, validate, no side effects) ------------
 
-    def _prepare_bash(self, call_id: str, args: dict) -> dict:
+    def _prepare_bash(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         command = sanitize_command(args.get("command", ""))
         if not command:
             return {
@@ -1204,7 +1162,7 @@ class ChatSession:
             "command": command,
         }
 
-    def _prepare_read_file(self, call_id: str, args: dict) -> dict:
+    def _prepare_read_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
         if not path:
             return {
@@ -1278,7 +1236,7 @@ class ChatSession:
             "limit": limit,
         }
 
-    def _prepare_search(self, call_id: str, args: dict) -> dict:
+    def _prepare_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         pattern = args.get("query", "")
         if not pattern:
             return {
@@ -1302,7 +1260,7 @@ class ChatSession:
             "path": path,
         }
 
-    def _prepare_write_file(self, call_id: str, args: dict) -> dict:
+    def _prepare_write_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
         content = args.get("content", "")
         if not path:
@@ -1343,7 +1301,7 @@ class ChatSession:
             "content": content,
         }
 
-    def _prepare_edit_file(self, call_id: str, args: dict) -> dict:
+    def _prepare_edit_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
@@ -1386,7 +1344,7 @@ class ChatSession:
 
         # Pre-read to validate and build diff preview
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 content = f.read()
             occurrences = find_occurrences(content, old_string)
             if len(occurrences) == 0:
@@ -1440,9 +1398,7 @@ class ChatSession:
             for line in new_preview.splitlines():
                 preview_parts.append(f"    {GREEN}+ {line}{RESET}")
         else:
-            preview_parts.append(
-                f"    {YELLOW}(deletion — {len(old_string)} chars removed){RESET}"
-            )
+            preview_parts.append(f"    {YELLOW}(deletion — {len(old_string)} chars removed){RESET}")
 
         return {
             "call_id": call_id,
@@ -1459,7 +1415,7 @@ class ChatSession:
             "near_line": near_line,
         }
 
-    def _prepare_math(self, call_id: str, args: dict) -> dict:
+    def _prepare_math(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         code = args.get("code", "")
         if isinstance(code, list):
             code = "\n".join(code)
@@ -1488,7 +1444,7 @@ class ChatSession:
             "code": code,
         }
 
-    def _prepare_man(self, call_id: str, args: dict) -> dict:
+    def _prepare_man(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a man/info page lookup."""
         page = (args.get("page") or "").strip()
         if not page:
@@ -1526,7 +1482,7 @@ class ChatSession:
             "section": section,
         }
 
-    def _prepare_web_fetch(self, call_id: str, args: dict) -> dict:
+    def _prepare_web_fetch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         url = args.get("url", "").strip()
         question = args.get("question", "").strip()
         if not url:
@@ -1581,7 +1537,7 @@ class ChatSession:
             "question": question,
         }
 
-    def _prepare_web_search(self, call_id: str, args: dict) -> dict:
+    def _prepare_web_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a web search via Tavily for approval."""
         query = (args.get("query") or "").strip()
         if not query:
@@ -1628,7 +1584,7 @@ class ChatSession:
             "topic": topic,
         }
 
-    def _prepare_task(self, call_id: str, args: dict) -> dict:
+    def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a general-purpose sub-agent task for approval."""
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
@@ -1652,7 +1608,7 @@ class ChatSession:
             "prompt": prompt,
         }
 
-    def _prepare_plan(self, call_id: str, args: dict) -> dict:
+    def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a planning agent for approval."""
         prompt = (args.get("prompt") or "").strip()
         if not prompt:
@@ -1676,7 +1632,7 @@ class ChatSession:
             "prompt": prompt,
         }
 
-    def _prepare_remember(self, call_id: str, args: dict) -> dict:
+    def _prepare_remember(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a remember (save memory) action."""
         key = normalize_key((args.get("key") or "").strip())
         value = (args.get("value") or "").strip()
@@ -1700,7 +1656,7 @@ class ChatSession:
             "value": value,
         }
 
-    def _prepare_forget(self, call_id: str, args: dict) -> dict:
+    def _prepare_forget(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a forget (delete memory) action."""
         key = normalize_key((args.get("key") or "").strip())
         if not key:
@@ -1722,7 +1678,7 @@ class ChatSession:
             "key": key,
         }
 
-    def _prepare_recall(self, call_id: str, args: dict) -> dict:
+    def _prepare_recall(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a recall action."""
         query = (args.get("query") or "").strip()
         limit = args.get("limit", 20)
@@ -1744,7 +1700,7 @@ class ChatSession:
 
     # -- Execute methods (do the work, report output via UI) -------------------
 
-    def _exec_bash(self, item: dict) -> tuple[str, str]:
+    def _exec_bash(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute a bash command via temp script."""
         call_id, command = item["call_id"], item["command"]
         try:
@@ -1782,7 +1738,7 @@ class ChatSession:
             self.ui.on_error(msg)
             return call_id, msg
 
-    def _exec_read_file(self, item: dict) -> tuple[str, str]:
+    def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Read a file and return numbered lines, optionally sliced."""
         call_id, path = item["call_id"], item["path"]
         offset = item.get("offset")  # 1-based, or None
@@ -1790,7 +1746,7 @@ class ChatSession:
         resolved = os.path.realpath(path)
 
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 all_lines = f.readlines()
         except FileNotFoundError:
             self._read_files.discard(resolved)
@@ -1823,7 +1779,7 @@ class ChatSession:
 
         return call_id, output if output else "(empty file)"
 
-    def _exec_search(self, item: dict) -> tuple[str, str]:
+    def _exec_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search file contents for a regex pattern using grep."""
         call_id = item["call_id"]
         pattern, path = item["pattern"], item["path"]
@@ -1849,14 +1805,10 @@ class ChatSession:
             if result.returncode == 1:
                 output = "(no matches)"
             elif result.returncode > 1:
-                output = (
-                    result.stderr.strip() or f"grep error (exit {result.returncode})"
-                )
+                output = result.stderr.strip() or f"grep error (exit {result.returncode})"
 
             # Count matches BEFORE truncation
-            match_count = (
-                output.count("\n") + 1 if result.returncode == 0 and output else 0
-            )
+            match_count = output.count("\n") + 1 if result.returncode == 0 and output else 0
 
             original_len = len(output)
             output = self._truncate_output(output)
@@ -1883,12 +1835,11 @@ class ChatSession:
 
     def _run_agent(
         self,
-        agent_messages: list[dict],
+        agent_messages: list[dict[str, Any]],
         label: str = "agent",
-        tools: list[dict] | None = None,
+        tools: list[dict[str, Any]] | None = None,
         auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
-        model_identity: str | None = None,
     ) -> str:
         """Run an autonomous agent loop.
 
@@ -1898,7 +1849,6 @@ class ChatSession:
             tools: Tool definitions to send to the API. Defaults to AGENT_TOOLS (read-only).
             auto_tools: Set of tool names the agent may execute. Defaults to _AGENT_AUTO_TOOLS.
             reasoning_effort: Override reasoning effort for this agent.
-            model_identity: Optional persona/identity string passed via chat_template_kwargs.
 
         Returns:
             Final content string from the agent.
@@ -1912,17 +1862,18 @@ class ChatSession:
         kwargs = dict(self._chat_template_kwargs_base)
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
-        if model_identity:
-            kwargs["model_identity"] = model_identity
 
-        def _api_call(messages, _tools=tools):
-            last_err = None
+        def _api_call(
+            messages: list[dict[str, Any]],
+            _tools: list[dict[str, Any]] | None = tools,
+        ) -> Any:
+            last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
                     return self.client.chat.completions.create(
                         model=self.model,
-                        messages=messages,
-                        tools=_tools,
+                        messages=messages,  # type: ignore[arg-type]
+                        tools=_tools,  # type: ignore[arg-type]
                         max_completion_tokens=self.max_tokens,
                         temperature=self.temperature,
                         extra_body={
@@ -1931,16 +1882,14 @@ class ChatSession:
                     )
                 except Exception as e:
                     ename = type(e).__name__
-                    if (
-                        ename not in self._RETRYABLE_ERRORS
-                        or attempt == self._MAX_RETRIES
-                    ):
+                    if ename not in self._RETRYABLE_ERRORS or attempt == self._MAX_RETRIES:
                         raise
                     last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[{label} retrying in {delay:.0f}s: {ename}]")
                     time.sleep(delay)
-            raise last_err  # unreachable
+            assert last_err is not None  # unreachable
+            raise last_err
 
         turn = 0
         while max_tool_turns < 0 or turn < max_tool_turns:
@@ -2054,7 +2003,7 @@ class ChatSession:
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return content
 
-    def _exec_task(self, item: dict) -> tuple[str, str]:
+    def _exec_task(self, item: dict[str, Any]) -> tuple[str, str]:
         """Delegate to a general-purpose autonomous sub-agent."""
         call_id, prompt = item["call_id"], item["prompt"]
         task_instruction = {
@@ -2104,7 +2053,7 @@ class ChatSession:
         "and functions in every step."
     )
 
-    def _exec_plan(self, item: dict) -> tuple[str, str]:
+    def _exec_plan(self, item: dict[str, Any]) -> tuple[str, str]:
         """Run a planning agent and write the result to .plan-<session_id>.md."""
         call_id, prompt = item["call_id"], item["prompt"]
         plan_path = f".plan-{self._session_id}.md"
@@ -2112,7 +2061,7 @@ class ChatSession:
         # If plan was called before in this session, the previous assistant
         # tool_call + tool result are already in self.messages — pass them
         # directly to the inner agent so it refines rather than restarts.
-        prior_plan_msgs: list[dict] = []
+        prior_plan_msgs: list[dict[str, Any]] = []
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -2127,6 +2076,7 @@ class ChatSession:
                                 break
 
         agent_messages = list(self._agent_system_messages)
+        agent_messages.append({"role": "developer", "content": self._PLAN_IDENTITY})
         agent_messages.extend(prior_plan_msgs)
         agent_messages.append({"role": "user", "content": prompt})
 
@@ -2135,7 +2085,6 @@ class ChatSession:
                 agent_messages,
                 label="plan",
                 reasoning_effort="high",
-                model_identity=self._PLAN_IDENTITY,
             )
         except KeyboardInterrupt:
             return call_id, "(plan interrupted by user)"
@@ -2153,7 +2102,7 @@ class ChatSession:
 
         return call_id, content
 
-    def _exec_remember(self, item: dict) -> tuple[str, str]:
+    def _exec_remember(self, item: dict[str, Any]) -> tuple[str, str]:
         """Save a persistent memory."""
         call_id, key, value = item["call_id"], item["key"], item["value"]
         try:
@@ -2183,7 +2132,7 @@ class ChatSession:
         except Exception as e:
             return call_id, f"Error: {e}"
 
-    def _exec_forget(self, item: dict) -> tuple[str, str]:
+    def _exec_forget(self, item: dict[str, Any]) -> tuple[str, str]:
         """Remove a persistent memory by key."""
         call_id, key = item["call_id"], item["key"]
         try:
@@ -2203,7 +2152,7 @@ class ChatSession:
         except Exception as e:
             return call_id, f"Error: {e}"
 
-    def _exec_recall(self, item: dict) -> tuple[str, str]:
+    def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search memories and conversation history."""
         call_id = item["call_id"]
         query, limit = item["query"], item["limit"]
@@ -2214,18 +2163,14 @@ class ChatSession:
             conn = open_db()
             try:
                 if not query:
-                    rows = conn.execute(
-                        "SELECT key, value FROM memories ORDER BY key"
-                    ).fetchall()
+                    rows = conn.execute("SELECT key, value FROM memories ORDER BY key").fetchall()
                 else:
                     terms = query.split()
                     clauses = []
                     params: list[str] = []
                     for t in terms:
                         escaped = escape_like(t)
-                        clauses.append(
-                            "(key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')"
-                        )
+                        clauses.append("(key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')")
                         params.extend([f"%{escaped}%", f"%{escaped}%"])
                     rows = conn.execute(
                         "SELECT key, value FROM memories WHERE "
@@ -2234,9 +2179,7 @@ class ChatSession:
                         params,
                     ).fetchall()
                 if rows:
-                    parts.append(
-                        "Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows)
-                    )
+                    parts.append("Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows))
                 elif not query:
                     parts.append("No memories stored.")
             finally:
@@ -2255,15 +2198,13 @@ class ChatSession:
                     if content and len(content) > 500:
                         text += "..."
                     lines.append(f"[{ts} {sid}] {label}: {text}")
-                parts.append(
-                    f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines)
-                )
+                parts.append(f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines))
 
         output = "\n\n".join(parts) if parts else f"No results for '{query}'."
         self.ui.on_tool_result("recall", output)
         return call_id, output
 
-    def _exec_write_file(self, item: dict) -> tuple[str, str]:
+    def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""
         call_id = item["call_id"]
         path, content, resolved = item["path"], item["content"], item["resolved"]
@@ -2276,7 +2217,7 @@ class ChatSession:
         except Exception as e:
             return call_id, f"Error writing {path}: {e}"
 
-    def _exec_edit_file(self, item: dict) -> tuple[str, str]:
+    def _exec_edit_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Replace an exact string in a file (re-reads to avoid TOCTOU).
 
         When near_line is set, picks the occurrence nearest that line
@@ -2290,7 +2231,7 @@ class ChatSession:
         )
         near_line = item.get("near_line")
         try:
-            with open(path, "r") as f:
+            with open(path) as f:
                 content = f.read()
             occurrences = find_occurrences(content, old_string)
             if len(occurrences) == 0:
@@ -2317,7 +2258,7 @@ class ChatSession:
         except Exception as e:
             return call_id, f"Error writing {path}: {e}"
 
-    def _exec_math(self, item: dict) -> tuple[str, str]:
+    def _exec_math(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute Python code in sandboxed subprocess."""
         call_id, code = item["call_id"], item["code"]
         output, is_error = execute_math_sandboxed(code, timeout=self.tool_timeout)
@@ -2329,7 +2270,7 @@ class ChatSession:
             return call_id, f"Error:\n{output}"
         return call_id, output if output else "(no output)"
 
-    def _exec_man(self, item: dict) -> tuple[str, str]:
+    def _exec_man(self, item: dict[str, Any]) -> tuple[str, str]:
         """Look up a man or info page."""
         call_id = item["call_id"]
         page = item["page"]
@@ -2341,6 +2282,7 @@ class ChatSession:
             cmd.append(section)
         cmd.append(page)
 
+        text = ""
         try:
             result = subprocess.run(
                 cmd,
@@ -2378,7 +2320,7 @@ class ChatSession:
 
         return call_id, text
 
-    def _exec_web_fetch(self, item: dict) -> tuple[str, str]:
+    def _exec_web_fetch(self, item: dict[str, Any]) -> tuple[str, str]:
         """Fetch a URL, then summarize/extract using an API call."""
         call_id, url = item["call_id"], item["url"]
         question = item.get("question", "Summarize the key content of this page.")
@@ -2457,15 +2399,13 @@ class ChatSession:
             )
             answer = response.choices[0].message.content or "(no answer)"
         except Exception as e:
-            answer = (
-                f"Extraction failed (page was fetched but summarization errored): {e}"
-            )
+            answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 
         self.ui.on_tool_result("web_fetch", answer)
 
         return call_id, answer
 
-    def _exec_web_search(self, item: dict) -> tuple[str, str]:
+    def _exec_web_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search the web via Tavily API."""
         call_id = item["call_id"]
         query = item["query"]
@@ -2522,23 +2462,10 @@ class ChatSession:
         if cmd in ("/exit", "/quit", "/q"):
             return True
 
-        elif cmd == "/persona":
-            if not arg:
-                if self.persona:
-                    self.ui.on_info(f"Current persona: {cyan(self.persona)}")
-                else:
-                    self.ui.on_info("No persona set. Usage: /persona <name>")
-            else:
-                self.persona = arg.strip()
-                self._init_system_messages()
-                self.ui.on_info(f"Switched persona to {cyan(self.persona)}")
-
         elif cmd == "/instructions":
             if not arg:
                 if self.instructions:
-                    self.ui.on_info(
-                        f"Current instructions: {self.instructions[:100]}..."
-                    )
+                    self.ui.on_info(f"Current instructions: {self.instructions[:100]}...")
                 else:
                     self.ui.on_info("No instructions set. Usage: /instructions <text>")
             else:
@@ -2569,7 +2496,7 @@ class ChatSession:
                 self.ui.on_info("No saved sessions.")
             else:
                 lines = ["Sessions:\n"]
-                for sid, alias, title, created, updated, count in rows:
+                for sid, alias, title, _created, updated, count in rows:
                     display_name = alias or sid
                     display_title = f"  {title}" if title else ""
                     marker = " *" if sid == self._session_id else "  "
@@ -2593,8 +2520,7 @@ class ChatSession:
                     self.ui.on_info("Already in that session.")
                 elif self.resume_session(target_id):
                     self.ui.on_info(
-                        f"Resumed session {bold(target_id)} "
-                        f"({len(self.messages)} messages loaded)"
+                        f"Resumed session {bold(target_id)} ({len(self.messages)} messages loaded)"
                     )
                     name = get_session_name(target_id)
                     if name:
@@ -2614,8 +2540,7 @@ class ChatSession:
         elif cmd == "/delete":
             if not arg:
                 self.ui.on_info(
-                    "Usage: /delete <alias_or_session_id>\n"
-                    "Use /sessions to list sessions."
+                    "Usage: /delete <alias_or_session_id>\nUse /sessions to list sessions."
                 )
             else:
                 target_id = resolve_session(arg.strip())
@@ -2672,9 +2597,7 @@ class ChatSession:
                 if value in valid:
                     self.reasoning_effort = value
                     self._init_system_messages()
-                    self.ui.on_info(
-                        f"Reasoning effort set to {cyan(self.reasoning_effort)}"
-                    )
+                    self.ui.on_info(f"Reasoning effort set to {cyan(self.reasoning_effort)}")
                 else:
                     self.ui.on_info(f"Invalid. Choose from: {', '.join(valid)}")
 
@@ -2710,7 +2633,6 @@ class ChatSession:
                 "\n".join(
                     [
                         "── Slash Commands ─────────────────────────────────────",
-                        "  /persona <name>        Set persona (system message)",
                         "  /instructions <text>   Set developer instructions",
                         "  /clear                 Clear context (session preserved in database)",
                         "  /new                   Start a new session (old session stays resumable)",
@@ -2736,8 +2658,6 @@ class ChatSession:
             )
 
         else:
-            self.ui.on_info(
-                f"Unknown command: {cmd}. Type /help for available commands."
-            )
+            self.ui.on_info(f"Unknown command: {cmd}. Type /help for available commands.")
 
         return False

@@ -1,0 +1,65 @@
+@startuml
+!theme plain
+title Turnstone — System Context
+
+' Actors/Users
+actor "CLI User" as cli_user
+actor "Browser User" as browser_user
+actor "External Client\n(Python / CI)" as ext_client
+actor "Eval Harness" as eval_user
+
+' External Systems
+cloud "LLM Provider\n(OpenAI-compatible API)" as llm
+database "Redis" as redis
+database "SQLite\n(.turnstone.db)" as sqlite
+
+' Turnstone System Boundary
+package "Turnstone Platform" {
+    component [turnstone\n(CLI)] as cli <<entry point>>
+    component [turnstone-server\n(HTTP + SSE)] as server <<entry point>>
+    component [turnstone-bridge\n(Queue ↔ HTTP)] as bridge <<service>>
+    component [turnstone-console\n(Dashboard)] as console <<service>>
+    component [turnstone-eval\n(Headless)] as eval <<entry point>>
+    component [turnstone-sim\n(Simulator)] as sim <<service>>
+}
+
+' User connections
+cli_user --> cli : stdin / stdout
+browser_user --> server : HTTP + SSE\n(port 8080)
+browser_user --> console : HTTP + SSE\n(port 8090)
+ext_client --> redis : Redis LIST\n(push commands)
+eval_user --> eval : Python API
+
+' Internal connections
+cli --> llm : OpenAI Streaming API\n(HTTPS)
+cli --> sqlite : SQLite
+
+server --> llm : OpenAI Streaming API\n(HTTPS)
+server --> sqlite : SQLite
+
+eval --> llm : OpenAI API\n(non-streaming)
+eval --> sqlite : SQLite
+
+bridge --> server : HTTP REST\n(POST /api/send, etc.)
+bridge <-- server : SSE\n(GET /api/events)
+bridge --> redis : Redis LIST + PUBSUB\n+ STRING (routing, heartbeats)
+
+console --> redis : Redis PUBSUB + STRING\n(cluster channel, heartbeats)
+console --> server : HTTP polling\n(GET /api/dashboard)
+
+sim --> redis : Redis LIST + PUBSUB\n+ STRING (heartbeats)
+
+' Notes
+note right of sim
+  Simulator replaces Server+Bridge
+  with lightweight SimNodes that
+  publish to the same Redis channels.
+end note
+
+note right of redis
+  Shared message broker:
+  - LIST: command queues
+  - STRING: heartbeats, routing
+  - PUBSUB: event broadcast
+end note
+@enduml

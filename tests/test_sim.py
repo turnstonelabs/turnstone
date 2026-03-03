@@ -4,18 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import random
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
 from turnstone.mq.protocol import (
-    ContentEvent,
-    InboundMessage,
     OutboundEvent,
     SendMessage,
     StateChangeEvent,
-    TurnCompleteEvent,
-    WorkstreamCreatedEvent,
 )
 from turnstone.sim.config import SimConfig
 from turnstone.sim.engine import SimEngine, ToolSimulationError

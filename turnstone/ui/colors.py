@@ -22,25 +22,25 @@ CYAN = "\033[36m" if _use_color else ""
 GRAY = "\033[90m" if _use_color else ""
 
 
-def red(s):
+def red(s: str) -> str:
     return f"{RED}{s}{RESET}"
 
 
-def yellow(s):
+def yellow(s: str) -> str:
     return f"{YELLOW}{s}{RESET}"
 
 
-def dim(s):
+def dim(s: str) -> str:
     return f"{DIM}{s}{RESET}"
 
 
-def bold(s):
+def bold(s: str) -> str:
     return f"{BOLD}{s}{RESET}"
 
 
-def cyan(s):
+def cyan(s: str) -> str:
     return f"{CYAN}{s}{RESET}"
 
 
-def green(s):
+def green(s: str) -> str:
     return f"{GREEN}{s}{RESET}"

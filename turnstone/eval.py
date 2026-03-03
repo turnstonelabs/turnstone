@@ -23,13 +23,15 @@ import sys
 import tempfile
 import textwrap
 import time
+from collections.abc import Iterator
 from datetime import datetime
+from typing import Any
 
-from openai import OpenAI
+from openai import OpenAI, Stream
 
-from turnstone.core.session import ChatSession
-from turnstone.core.tools import TOOLS, PRIMARY_KEY_MAP
 import turnstone.core.memory as _memory_module
+from turnstone.core.session import ChatSession
+from turnstone.core.tools import PRIMARY_KEY_MAP, TOOLS
 
 # ─── ANSI & logging helpers ───────────────────────────────────────────────────
 
@@ -45,44 +47,47 @@ BOLD = "\033[1m"
 class NullUI:
     """UI adapter that discards all output. Used by HeadlessSession."""
 
-    def on_thinking_start(self):
+    def on_thinking_start(self) -> None:
         pass
 
-    def on_thinking_stop(self):
+    def on_thinking_stop(self) -> None:
         pass
 
-    def on_reasoning_token(self, text):
+    def on_reasoning_token(self, text: str) -> None:
         pass
 
-    def on_content_token(self, text):
+    def on_content_token(self, text: str) -> None:
         pass
 
-    def on_stream_end(self):
+    def on_stream_end(self) -> None:
         pass
 
-    def approve_tools(self, items):
+    def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         return True, None
 
-    def on_tool_result(self, name, output):
+    def on_tool_result(self, name: str, output: str) -> None:
         pass
 
-    def on_status(self, usage, context_window, effort):
+    def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         pass
 
-    def on_plan_review(self, content):
+    def on_plan_review(self, content: str) -> str:
         return ""
 
-    def on_info(self, message):
+    def on_info(self, message: str) -> None:
         pass
 
-    def on_error(self, message):
+    def on_error(self, message: str) -> None:
         pass
 
-    def on_state_change(self, state):
+    def on_state_change(self, state: str) -> None:
+        pass
+
+    def on_rename(self, name: str) -> None:
         pass
 
 
-def _log(msg: str, dim: bool = False):
+def _log(msg: str, dim: bool = False) -> None:
     """Print a log line with optional dim styling."""
     if dim:
         sys.stderr.write(f"{DIM}{msg}{RESET}\n")
@@ -91,7 +96,7 @@ def _log(msg: str, dim: bool = False):
     sys.stderr.flush()
 
 
-def _fmt_args(args: dict, max_len: int = 80) -> str:
+def _fmt_args(args: dict[str, Any], max_len: int = 80) -> str:
     """Format tool args as a compact one-line summary."""
     parts = []
     for k, v in args.items():
@@ -109,7 +114,7 @@ def _fmt_args(args: dict, max_len: int = 80) -> str:
 
 
 @contextlib.contextmanager
-def _suppress_stdout():
+def _suppress_stdout() -> Iterator[None]:
     """Redirect stdout to devnull temporarily."""
     old = sys.stdout
     sys.stdout = io.StringIO()
@@ -132,15 +137,43 @@ class HeadlessSession(ChatSession):
     - send_headless() uses non-streaming API
     """
 
-    def __init__(self, client, model, system_prompt_override=None, **kwargs):
-        kwargs.setdefault("ui", NullUI())
-        super().__init__(client=client, model=model, **kwargs)
-        self.tool_call_log: list[dict] = []
+    def __init__(
+        self,
+        client: OpenAI,
+        model: str,
+        system_prompt_override: str | None = None,
+        instructions: str | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 32768,
+        tool_timeout: int = 30,
+        reasoning_effort: str = "medium",
+        context_window: int = 131072,
+        compact_max_tokens: int = 32768,
+        auto_compact_pct: float = 0.8,
+        agent_max_turns: int = -1,
+        tool_truncation: int = 0,
+    ) -> None:
+        super().__init__(
+            client=client,
+            model=model,
+            ui=NullUI(),
+            instructions=instructions,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tool_timeout=tool_timeout,
+            reasoning_effort=reasoning_effort,
+            context_window=context_window,
+            compact_max_tokens=compact_max_tokens,
+            auto_compact_pct=auto_compact_pct,
+            agent_max_turns=agent_max_turns,
+            tool_truncation=tool_truncation,
+        )
+        self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
         if system_prompt_override is not None:
             self._override_system_prompt(system_prompt_override)
 
-    def _override_system_prompt(self, content: str):
+    def _override_system_prompt(self, content: str) -> None:
         """Replace the developer message content with a custom prompt."""
         for i, msg in enumerate(self.system_messages):
             if msg["role"] == "developer":
@@ -154,7 +187,7 @@ class HeadlessSession(ChatSession):
         max_turns: int = 10,
         verbose: bool = False,
         log_prefix: str = "",
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """Run a complete conversation turn headlessly.
 
         Uses non-streaming API calls. Captures all tool calls into
@@ -176,8 +209,8 @@ class HeadlessSession(ChatSession):
 
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=msgs,
-                tools=TOOLS,
+                messages=msgs,  # type: ignore[arg-type]
+                tools=TOOLS,  # type: ignore[arg-type]
                 max_completion_tokens=self.max_tokens,
                 temperature=self.temperature,
                 stream=False,
@@ -189,8 +222,9 @@ class HeadlessSession(ChatSession):
             )
             elapsed = time.monotonic() - t0
 
+            assert not isinstance(response, Stream)
             choice = response.choices[0]
-            assistant_msg: dict = {
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": choice.message.content or None,
             }
@@ -203,8 +237,8 @@ class HeadlessSession(ChatSession):
                         "id": tc.id,
                         "type": "function",
                         "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
+                            "name": tc.function.name,  # type: ignore[union-attr]
+                            "arguments": tc.function.arguments,  # type: ignore[union-attr]
                         },
                     }
                     for tc in calls
@@ -237,15 +271,16 @@ class HeadlessSession(ChatSession):
 
             # Log tool calls
             if verbose:
-                names = [tc.function.name for tc in choice.message.tool_calls]
+                names = [tc.function.name for tc in choice.message.tool_calls]  # type: ignore[union-attr]
                 _log(f"{log_prefix}  turn {turn}: tools -> {names}")
 
             # Execute tools with stdout suppressed
             with _suppress_stdout():
                 results, _ = self._execute_tools(assistant_msg["tool_calls"])
 
-            for tc, (tc_id, output) in zip(assistant_msg["tool_calls"], results):
+            for tc, (tc_id, output) in zip(assistant_msg["tool_calls"], results, strict=False):
                 func_name = tc["function"]["name"]
+                args: dict[str, Any]
                 try:
                     args = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
@@ -281,9 +316,7 @@ class HeadlessSession(ChatSession):
                     "content": output,
                 }
                 self.messages.append(tool_msg)
-                self._msg_tokens.append(
-                    max(1, int(len(output) / self._chars_per_token))
-                )
+                self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
 
         return self.tool_call_log
 
@@ -295,14 +328,14 @@ def _run_single_test(
     client: OpenAI,
     model: str,
     system_prompt: str,
-    case: dict,
+    case: dict[str, Any],
     temperature: float,
     max_tokens: int,
     reasoning_effort: str,
     context_window: int,
     verbose: bool = False,
     log_prefix: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """Run a single test case once in an isolated temp directory.
 
     Must be called serially — uses os.chdir which is process-global.
@@ -325,9 +358,7 @@ def _run_single_test(
                 f.write(content)
 
         if verbose and setup_files:
-            _log(
-                f"{log_prefix}  setup: created {[p for p, _ in setup_files]}", dim=True
-            )
+            _log(f"{log_prefix}  setup: created {[p for p, _ in setup_files]}", dim=True)
 
         os.chdir(workdir)
 
@@ -335,7 +366,6 @@ def _run_single_test(
             client=client,
             model=model,
             system_prompt_override=system_prompt,
-            persona=None,
             instructions=None,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -346,7 +376,8 @@ def _run_single_test(
 
         max_turns = case.get("max_turns", 10)
         # Retry on transient API errors to avoid poisoning eval scores
-        _last_err = None
+        tool_log: list[dict[str, Any]] = []
+        _last_err: Exception | None = None
         for _attempt in range(3):
             try:
                 tool_log = session.send_headless(
@@ -363,7 +394,7 @@ def _run_single_test(
 
                     _time.sleep(2**_attempt)
         else:
-            raise _last_err
+            raise _last_err or RuntimeError("send_headless failed after 3 attempts")
 
         final_content = ""
         for msg in reversed(session.messages):
@@ -388,7 +419,7 @@ def _run_single_test(
 # ─── Scoring ─────────────────────────────────────────────────────────────────
 
 
-def _match_action(actual: dict, expected: dict) -> bool:
+def _match_action(actual: dict[str, Any], expected: dict[str, Any]) -> bool:
     """Check if a single actual tool call matches an expected action spec."""
     if actual["tool"] != expected["tool"]:
         return False
@@ -419,10 +450,10 @@ def _match_action(actual: dict, expected: dict) -> bool:
 
 
 def score_run(
-    tool_log: list[dict],
-    expected_actions: list[dict],
+    tool_log: list[dict[str, Any]],
+    expected_actions: list[dict[str, Any]],
     match_mode: str = "ordered_subset",
-) -> dict:
+) -> dict[str, Any]:
     """Score a single run's tool log against expected actions.
 
     Returns dict with: pass, score, matched, unmatched, extra_tools, detail.
@@ -441,7 +472,7 @@ def score_run(
 
     if match_mode == "exact":
         matched = []
-        for i, (actual, expected) in enumerate(zip(tool_log, expected_actions)):
+        for i, (actual, expected) in enumerate(zip(tool_log, expected_actions, strict=False)):
             if _match_action(actual, expected):
                 matched.append(i)
         score = len(matched) / n_expected
@@ -537,25 +568,23 @@ def _run_iteration(
     client: OpenAI,
     model: str,
     system_prompt: str,
-    cases: list[dict],
+    cases: list[dict[str, Any]],
     n_runs: int,
     temperature: float,
     max_tokens: int,
     reasoning_effort: str,
     context_window: int,
     verbose: bool = False,
-) -> dict:
+) -> dict[str, Any]:
     """Run all test cases n_runs times and score them."""
-    case_results = {}
+    case_results: dict[str, Any] = {}
 
     for ci, case in enumerate(cases):
         case_id = case["id"]
         case_n = case.get("n_runs", n_runs)
-        runs = []
+        runs: list[dict[str, Any]] = []
 
-        print(
-            f"\n  {CYAN}[{ci + 1}/{len(cases)}]{RESET} {BOLD}{case_id}{RESET} ({case_n} runs)"
-        )
+        print(f"\n  {CYAN}[{ci + 1}/{len(cases)}]{RESET} {BOLD}{case_id}{RESET} ({case_n} runs)")
         if verbose:
             _log(f"    prompt: {case['user_prompt']}", dim=True)
 
@@ -582,12 +611,8 @@ def _run_iteration(
                     match_mode=case.get("match_mode", "ordered_subset"),
                 )
 
-                score_result["tool_sequence"] = [
-                    t["tool"] for t in run_result["tool_log"]
-                ]
-                score_result["tool_args"] = [
-                    {t["tool"]: t["args"]} for t in run_result["tool_log"]
-                ]
+                score_result["tool_sequence"] = [t["tool"] for t in run_result["tool_log"]]
+                score_result["tool_args"] = [{t["tool"]: t["args"]} for t in run_result["tool_log"]]
                 score_result["elapsed"] = run_result.get("elapsed", 0)
 
                 # Detect JSON dumped into final channel (tool call not made)
@@ -619,9 +644,7 @@ def _run_iteration(
             status_label = "PASS" if passed else "FAIL"
             tools = score_result.get("tool_sequence", [])
             elapsed = score_result.get("elapsed", 0)
-            json_flag = (
-                f" {YELLOW}[JSON_DUMP]{RESET}" if score_result.get("json_dump") else ""
-            )
+            json_flag = f" {YELLOW}[JSON_DUMP]{RESET}" if score_result.get("json_dump") else ""
             print(
                 f"    Run {run_idx + 1}: "
                 f"{status_color}[{status_label}]{RESET} "
@@ -642,9 +665,7 @@ def _run_iteration(
 
     # Aggregate
     total_runs = sum(len(cr["runs"]) for cr in case_results.values())
-    total_passes = sum(
-        sum(1 for r in cr["runs"] if r["pass"]) for cr in case_results.values()
-    )
+    total_passes = sum(sum(1 for r in cr["runs"] if r["pass"]) for cr in case_results.values())
     total_json_dumps = sum(
         sum(1 for r in cr["runs"] if r.get("json_dump")) for cr in case_results.values()
     )
@@ -661,9 +682,7 @@ def _run_iteration(
                 if case_results
                 else 0
             ),
-            "per_case_pass_rates": {
-                cid: cr["pass_rate"] for cid, cr in case_results.items()
-            },
+            "per_case_pass_rates": {cid: cr["pass_rate"] for cid, cr in case_results.items()},
         },
     }
 
@@ -723,10 +742,10 @@ def _observe_and_update_optimizer(
     client: OpenAI,
     model: str,
     optimizer_system: str,
-    iterations: list[dict],
+    iterations: list[dict[str, Any]],
 ) -> str:
     """Analyze optimizer behavior and return a modified OPTIMIZER_SYSTEM."""
-    parts = []
+    parts: list[str] = []
     for i in range(1, len(iterations)):
         prev, curr = iterations[i - 1], iterations[i]
         prev_agg = prev.get("aggregate", {})
@@ -744,8 +763,8 @@ def _observe_and_update_optimizer(
 
         prev_rates = prev_agg.get("per_case_pass_rates", {})
         curr_rates = curr_agg.get("per_case_pass_rates", {})
-        improved = []
-        regressed = []
+        improved: list[str] = []
+        regressed: list[str] = []
         for case_id in set(prev_rates) | set(curr_rates):
             p = prev_rates.get(case_id, 0)
             c = curr_rates.get(case_id, 0)
@@ -764,7 +783,7 @@ def _observe_and_update_optimizer(
 
     # Summarize what the optimizer's output looked like (without showing
     # full developer messages, which cause the observer to mimic them)
-    behavior_notes = []
+    behavior_notes: list[str] = []
     for it in iterations[-3:]:
         idx = it.get("iteration", "?")
         prompt = it.get("prompt", "")
@@ -772,7 +791,7 @@ def _observe_and_update_optimizer(
         has_bullets = "- " in prompt or "* " in prompt
         has_numbers = bool(re.search(r"^\d+\.", prompt, re.MULTILINE))
         has_headers = "**" in prompt or "##" in prompt
-        notes = []
+        notes: list[str] = []
         if has_bullets or has_numbers:
             notes.append("used bullet/numbered lists")
         if has_headers:
@@ -791,7 +810,7 @@ def _observe_and_update_optimizer(
         f"```\n{optimizer_system}\n```\n\n"
         f"## What the Rewriter Produced (do NOT mimic this)\n"
         + "\n".join(behavior_notes)
-        + f"\n\n## Iteration History\n"
+        + "\n\n## Iteration History\n"
         + "\n".join(parts)
     )
 
@@ -835,14 +854,14 @@ def _propose_prompt_modification(
     client: OpenAI,
     model: str,
     current_prompt: str,
-    test_cases: list[dict],
-    iteration_result: dict,
-    history: list[dict],
+    test_cases: list[dict[str, Any]],
+    iteration_result: dict[str, Any],
+    history: list[dict[str, Any]],
     optimizer_system: str = OPTIMIZER_SYSTEM,
 ) -> str:
     """Use the model to propose a new prompt based on evaluation results."""
     # Build summary of results
-    summary_parts = []
+    summary_parts: list[str] = []
     for case_id, case_result in iteration_result["cases"].items():
         case_def = next((c for c in test_cases if c["id"] == case_id), None)
         if not case_def:
@@ -858,7 +877,7 @@ def _propose_prompt_modification(
         )
 
     # Build history summary (last 3 iterations)
-    history_parts = []
+    history_parts: list[str] = []
     for h in history[-3:]:
         agg = h.get("aggregate", {})
         history_parts.append(
@@ -926,7 +945,7 @@ def run_optimization(
     model: str | None,
     test_file: str,
     initial_prompt: str | None = None,
-    n_runs: int = 3,
+    n_runs: int | None = 3,
     max_iterations: int = 5,
     temperature: float = 0.7,
     max_tokens: int = 32768,
@@ -934,7 +953,7 @@ def run_optimization(
     output_file: str = "eval_results.json",
     context_window: int = 131072,
     verbose: bool = False,
-):
+) -> dict[str, Any]:
     """Main optimization loop."""
     client = OpenAI(
         base_url=base_url,
@@ -946,9 +965,9 @@ def run_optimization(
 
     # Load test cases
     with open(test_file) as f:
-        suite = json.load(f)
+        suite: dict[str, Any] = json.load(f)
 
-    cases = suite["cases"]
+    cases: list[dict[str, Any]] = suite["cases"]
     for i, case in enumerate(cases):
         if "id" not in case:
             raise SystemExit(f"Test case {i} missing required 'id' field")
@@ -956,8 +975,7 @@ def run_optimization(
             raise SystemExit(f"Test case '{case.get('id', i)}' missing 'user_prompt'")
     defaults = suite.get("defaults", {})
     # Precedence: CLI arg (non-None) > tests.json defaults > code default (3)
-    if n_runs is None:
-        n_runs = defaults.get("n_runs", 3)
+    resolved_n_runs: int = n_runs if n_runs is not None else int(defaults.get("n_runs", 3))
 
     # Get initial prompt
     if initial_prompt is None:
@@ -965,7 +983,7 @@ def run_optimization(
         tmp = ChatSession(
             client=client,
             model=model,
-            persona=None,
+            ui=NullUI(),
             instructions=None,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -973,9 +991,7 @@ def run_optimization(
             reasoning_effort=reasoning_effort,
             context_window=context_window,
         )
-        initial_prompt = next(
-            m["content"] for m in tmp.system_messages if m["role"] == "developer"
-        )
+        initial_prompt = next(m["content"] for m in tmp.system_messages if m["role"] == "developer")
         # Strip memory reminder — it's a runtime artifact, not part of the prompt
         initial_prompt = re.sub(
             r"\n*REMINDER: You currently have \d+ memories stored\..*$",
@@ -984,13 +1000,13 @@ def run_optimization(
         ).strip()
 
     current_prompt = initial_prompt
-    results = {
+    results: dict[str, Any] = {
         "meta": {
             "model": model,
             "base_url": base_url,
             "started": datetime.now().isoformat(),
             "test_suite": test_file,
-            "n_runs_default": n_runs,
+            "n_runs_default": resolved_n_runs,
         },
         "iterations": [],
     }
@@ -1007,7 +1023,7 @@ def run_optimization(
             model=model,
             system_prompt=current_prompt,
             cases=cases,
-            n_runs=n_runs,
+            n_runs=resolved_n_runs,
             temperature=temperature,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
@@ -1092,10 +1108,7 @@ def run_optimization(
 
             if new_prompt != current_prompt:
                 diff = _simple_diff(current_prompt, new_prompt)
-                print(
-                    f"Prompt modified "
-                    f"({len(current_prompt)} -> {len(new_prompt)} chars)"
-                )
+                print(f"Prompt modified ({len(current_prompt)} -> {len(new_prompt)} chars)")
                 if diff:
                     print(diff)
                 iter_result["prompt_diff"] = diff
@@ -1126,7 +1139,7 @@ def _detect_model(client: OpenAI) -> str:
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Prompt optimization and evaluation for turnstone",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -6,6 +6,6 @@ commands and subscribe to progress.
 """
 
 from turnstone.mq.broker import MessageBroker, RedisBroker
-from turnstone.mq.client import TurnstoneClient, TurnResult
+from turnstone.mq.client import TurnResult, TurnstoneClient
 
 __all__ = ["MessageBroker", "RedisBroker", "TurnstoneClient", "TurnResult"]

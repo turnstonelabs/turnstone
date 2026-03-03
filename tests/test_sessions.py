@@ -1,21 +1,19 @@
 """Tests for session persistence and resume functionality."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import turnstone.core.memory as memory
 from turnstone.core.memory import (
-    register_session,
-    update_session_title,
-    set_session_alias,
-    resolve_session,
+    delete_session,
     list_sessions,
     load_session_messages,
-    delete_session,
-    save_message,
     open_db,
+    register_session,
+    resolve_session,
+    save_message,
+    set_session_alias,
+    update_session_title,
 )
 from turnstone.core.session import ChatSession
-
 
 # ── Session registration ──────────────────────────────────────────────
 
@@ -154,12 +152,8 @@ class TestLoadSessionMessages:
     def test_tool_calls_with_ids(self, tmp_db):
         save_message("s1", "user", "run ls")
         save_message("s1", "assistant", "Let me check.")
-        save_message(
-            "s1", "tool_call", None, "bash", '{"command":"ls"}', tool_call_id="call_abc"
-        )
-        save_message(
-            "s1", "tool_result", "file1.txt\nfile2.txt", "bash", tool_call_id="call_abc"
-        )
+        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', tool_call_id="call_abc")
+        save_message("s1", "tool_result", "file1.txt\nfile2.txt", "bash", tool_call_id="call_abc")
         msgs = load_session_messages("s1")
         assert len(msgs) == 3  # user, assistant+tool_calls, tool
         # Assistant should have content merged with tool_calls
@@ -186,12 +180,8 @@ class TestLoadSessionMessages:
 
     def test_parallel_tool_calls(self, tmp_db):
         save_message("s1", "user", "search two things")
-        save_message(
-            "s1", "tool_call", None, "search", '{"query":"a"}', tool_call_id="call_1"
-        )
-        save_message(
-            "s1", "tool_call", None, "search", '{"query":"b"}', tool_call_id="call_2"
-        )
+        save_message("s1", "tool_call", None, "search", '{"query":"a"}', tool_call_id="call_1")
+        save_message("s1", "tool_call", None, "search", '{"query":"b"}', tool_call_id="call_2")
         save_message("s1", "tool_result", "result a", "search", tool_call_id="call_1")
         save_message("s1", "tool_result", "result b", "search", tool_call_id="call_2")
         msgs = load_session_messages("s1")
@@ -231,9 +221,7 @@ class TestDeleteSession:
 
 class TestSaveMessageToolCallId:
     def test_tool_call_id_stored(self, tmp_db):
-        save_message(
-            "s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="call_xyz"
-        )
+        save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="call_xyz")
         conn = open_db()
         try:
             row = conn.execute(
@@ -293,7 +281,6 @@ class TestResumeSession:
             client=mock_openai_client,
             model="test-model",
             ui=MagicMock(),
-            persona=None,
             instructions=None,
             temperature=0.5,
             max_tokens=1000,
@@ -314,7 +301,6 @@ class TestResumeSession:
             client=mock_openai_client,
             model="test-model",
             ui=MagicMock(),
-            persona=None,
             instructions=None,
             temperature=0.5,
             max_tokens=1000,
@@ -327,7 +313,6 @@ class TestResumeSession:
             client=mock_openai_client,
             model="test-model",
             ui=MagicMock(),
-            persona=None,
             instructions=None,
             temperature=0.5,
             max_tokens=1000,
@@ -347,7 +332,7 @@ class TestSaveMessageUpdatesSession:
         register_session("s1")
         save_message("s1", "user", "first")
         rows = list_sessions()
-        original_updated = rows[0][4]
+        _original_updated = rows[0][4]
 
         import time
 

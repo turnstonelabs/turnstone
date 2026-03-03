@@ -1,21 +1,39 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.29"]
 build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "0.2.0"
-description = "AI chat client with tool use, agent tools, and persistent memory."
+version = "0.2.1"
+description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "BUSL-1.1"
 requires-python = ">=3.11"
-dependencies = ["openai>=1.0", "httpx>=0.24"]
+authors = [{name = "Patrick Buckley", email = "buckleypm@gmail.com"}]
+keywords = ["ai", "chat", "llm", "agent", "tools", "openai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["openai>=2.24", "httpx>=0.28"]
+
+[project.urls]
+Homepage = "https://github.com/turnstonelabs/turnstone"
+Repository = "https://github.com/turnstonelabs/turnstone"
+Issues = "https://github.com/turnstonelabs/turnstone/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=7.0"]
-mq = ["redis>=5.0"]
-console = ["redis>=5.0"]
-sim = ["redis>=5.0"]
+test = ["pytest>=9.0"]
+dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
+mq = ["redis>=7.2"]
+console = ["redis>=7.2"]
+sim = ["redis>=7.2"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
@@ -39,3 +57,33 @@ include = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["live: requires a running LLM backend"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["sympy", "sympy.*", "numpy", "numpy.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false

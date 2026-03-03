@@ -55,6 +55,8 @@ schema plus turnstone-specific metadata keys:
 
 ## Execution Pipeline
 
+> See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
+
 Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools()`:
 
 ### Phase 1: Prepare

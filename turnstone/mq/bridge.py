@@ -9,6 +9,7 @@ Run as: ``turnstone-bridge --server-url http://localhost:8080``
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ import socket
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -46,12 +47,13 @@ from turnstone.mq.protocol import (
     WorkstreamRenameEvent,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
 log = logging.getLogger("turnstone.mq.bridge")
 
 # Server's default safe tools (auto-approved without user confirmation)
-DEFAULT_SAFE_TOOLS = frozenset(
-    ["read_file", "search", "man", "remember", "recall", "forget"]
-)
+DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "remember", "recall", "forget"])
 
 
 def _default_node_id() -> str:
@@ -85,7 +87,7 @@ class Bridge:
         node_id: str = "",
         heartbeat_ttl: int = 60,
         auth_token: str = "",
-    ):
+    ) -> None:
         self._server_url = server_url.rstrip("/")
         self._broker = broker or RedisBroker()
         self._approval_timeout = approval_timeout
@@ -99,9 +101,7 @@ class Bridge:
         headers: dict[str, str] = {}
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
-        self._http = httpx.Client(
-            base_url=self._server_url, timeout=30, headers=headers
-        )
+        self._http = httpx.Client(base_url=self._server_url, timeout=30, headers=headers)
 
         # Protected by _lock — accessed from main, global SSE, and per-ws SSE threads
         self._lock = threading.Lock()
@@ -160,9 +160,7 @@ class Bridge:
                 self._dispatch(msg)
             except Exception as exc:
                 log.error("Failed to process inbound message: %s", exc)
-                self._publish_global(
-                    ErrorEvent(message=f"Failed to process message: {exc}")
-                )
+                self._publish_global(ErrorEvent(message=f"Failed to process message: {exc}"))
 
     def _dispatch(self, msg: InboundMessage) -> None:
         # Messages that need routing (have ws_id or target_node)
@@ -272,9 +270,7 @@ class Bridge:
     def _handle_command(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
         command = getattr(msg, "command", "")
-        resp = self._http.post(
-            "/api/command", json={"command": command, "ws_id": ws_id}
-        )
+        resp = self._http.post("/api/command", json={"command": command, "ws_id": ws_id})
         data = resp.json()
         self._publish_ws(
             ws_id,
@@ -356,7 +352,7 @@ class Bridge:
                     )
                 )
                 return ""
-            ws_id = data["ws_id"]
+            ws_id: str = data["ws_id"]
             ws_name = data.get("name", "")
 
             self._broker.set_ws_owner(ws_id, self._node_id)
@@ -425,21 +421,15 @@ class Bridge:
                         log.debug("WS SSE reconnecting (%s): %s", ws_id, exc)
                         time.sleep(2)
 
-    def _handle_ws_event(self, ws_id: str, data: dict) -> None:
+    def _handle_ws_event(self, ws_id: str, data: dict[str, Any]) -> None:
         etype = data.get("type", "")
 
         if etype == "content":
-            self._publish_ws(
-                ws_id, ContentEvent(ws_id=ws_id, text=data.get("text", ""))
-            )
+            self._publish_ws(ws_id, ContentEvent(ws_id=ws_id, text=data.get("text", "")))
         elif etype == "reasoning":
-            self._publish_ws(
-                ws_id, ReasoningEvent(ws_id=ws_id, text=data.get("text", ""))
-            )
+            self._publish_ws(ws_id, ReasoningEvent(ws_id=ws_id, text=data.get("text", "")))
         elif etype == "tool_info":
-            self._publish_ws(
-                ws_id, ToolInfoEvent(ws_id=ws_id, items=data.get("items", []))
-            )
+            self._publish_ws(ws_id, ToolInfoEvent(ws_id=ws_id, items=data.get("items", [])))
         elif etype == "approve_request":
             self._handle_approval(ws_id, data)
         elif etype == "plan_review":
@@ -467,17 +457,13 @@ class Bridge:
                 ),
             )
         elif etype == "error":
-            self._publish_ws(
-                ws_id, ErrorEvent(ws_id=ws_id, message=data.get("message", ""))
-            )
+            self._publish_ws(ws_id, ErrorEvent(ws_id=ws_id, message=data.get("message", "")))
         elif etype == "info":
-            self._publish_ws(
-                ws_id, InfoEvent(ws_id=ws_id, message=data.get("message", ""))
-            )
+            self._publish_ws(ws_id, InfoEvent(ws_id=ws_id, message=data.get("message", "")))
         elif etype == "stream_end":
             self._publish_ws(ws_id, StreamEndEvent(ws_id=ws_id))
 
-    def _handle_approval(self, ws_id: str, data: dict) -> None:
+    def _handle_approval(self, ws_id: str, data: dict[str, Any]) -> None:
         """Handle an approval request — auto-approve or forward to client."""
         items = data.get("items", [])
 
@@ -506,9 +492,7 @@ class Bridge:
         )
 
         def _wait_approval() -> None:
-            raw_resp = self._broker.pop_response(
-                request_id, timeout=self._approval_timeout
-            )
+            raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
             if raw_resp:
                 resp_msg = InboundMessage.from_json(raw_resp)
                 approved = getattr(resp_msg, "approved", False)
@@ -524,7 +508,7 @@ class Bridge:
 
         threading.Thread(target=_wait_approval, daemon=True).start()
 
-    def _handle_plan_review(self, ws_id: str, data: dict) -> None:
+    def _handle_plan_review(self, ws_id: str, data: dict[str, Any]) -> None:
         """Handle a plan review request — auto-approve or forward to client."""
         with self._lock:
             if self._ws_auto_approve.get(ws_id):
@@ -542,20 +526,14 @@ class Bridge:
         )
 
         def _wait_plan() -> None:
-            raw_resp = self._broker.pop_response(
-                request_id, timeout=self._approval_timeout
-            )
+            raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
             if raw_resp:
                 resp_msg = InboundMessage.from_json(raw_resp)
                 feedback = getattr(resp_msg, "feedback", "")
-                self._http.post(
-                    "/api/plan", json={"feedback": feedback, "ws_id": ws_id}
-                )
+                self._http.post("/api/plan", json={"feedback": feedback, "ws_id": ws_id})
             else:
                 log.warning("Plan review timeout for ws %s — rejecting", ws_id)
-                self._http.post(
-                    "/api/plan", json={"feedback": "reject", "ws_id": ws_id}
-                )
+                self._http.post("/api/plan", json={"feedback": "reject", "ws_id": ws_id})
 
         threading.Thread(target=_wait_plan, daemon=True).start()
 
@@ -565,7 +543,7 @@ class Bridge:
         approved: bool,
         feedback: str | None = None,
     ) -> None:
-        body: dict = {"approved": approved, "ws_id": ws_id}
+        body: dict[str, Any] = {"approved": approved, "ws_id": ws_id}
         if feedback:
             body["feedback"] = feedback
         self._http.post("/api/approve", json=body)
@@ -592,7 +570,7 @@ class Bridge:
                         log.debug("Global SSE reconnecting: %s", exc)
                         time.sleep(2)
 
-    def _handle_global_event(self, data: dict) -> None:
+    def _handle_global_event(self, data: dict[str, Any]) -> None:
         etype = data.get("type", "")
         ws_id = data.get("ws_id", "")
 
@@ -617,17 +595,11 @@ class Bridge:
                 with self._lock:
                     cid = self._active_sends.pop(ws_id, None)
                 if cid:
-                    self._publish_ws(
-                        ws_id, TurnCompleteEvent(ws_id=ws_id, correlation_id=cid)
-                    )
+                    self._publish_ws(ws_id, TurnCompleteEvent(ws_id=ws_id, correlation_id=cid))
 
         elif etype == "ws_rename":
-            self._publish_global(
-                WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", ""))
-            )
-            self._publish_cluster(
-                WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", ""))
-            )
+            self._publish_global(WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", "")))
+            self._publish_cluster(WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", "")))
 
         elif etype == "ws_closed":
             self._publish_global(WorkstreamClosedEvent(ws_id=ws_id))
@@ -655,9 +627,7 @@ class Bridge:
 
     def _handle_list_nodes(self, msg: InboundMessage) -> None:
         nodes = self._broker.list_nodes()
-        self._publish_global(
-            NodeListEvent(correlation_id=msg.correlation_id, nodes=nodes)
-        )
+        self._publish_global(NodeListEvent(correlation_id=msg.correlation_id, nodes=nodes))
 
     # -- publish helpers -----------------------------------------------------
 
@@ -677,14 +647,13 @@ class Bridge:
 # ---------------------------------------------------------------------------
 
 
-def _iter_sse_data(resp: httpx.Response) -> Iterator[dict]:
+def _iter_sse_data(resp: httpx.Response) -> Iterator[dict[str, Any]]:
     """Yield parsed JSON dicts from an SSE stream."""
     for line in resp.iter_lines():
         if line.startswith("data: "):
-            try:
-                yield json.loads(line[6:])
-            except json.JSONDecodeError:
-                pass
+            with contextlib.suppress(json.JSONDecodeError):
+                data: dict[str, Any] = json.loads(line[6:])
+                yield data
         # SSE keepalive comments (lines starting with ':') are ignored
 
 

@@ -1,0 +1,130 @@
+@startuml
+!theme plain
+title Turnstone — Tool Execution Pipeline (Three Phases)
+
+start
+
+partition "Phase 1: Prepare" #E8F5E9 {
+    :Receive tool_calls list from LLM response;
+
+    while (more tool_calls?) is (yes)
+        :Extract call_id, func_name, raw_args;
+
+        if (json.loads(raw_args) succeeds?) then (yes)
+            :parsed_args = JSON dict;
+        else (no)
+            :Fallback 1: regex extraction;
+            if (regex found keys?) then (yes)
+                :parsed_args = extracted dict;
+            else (no)
+                :Fallback 2: bare string →\nPRIMARY_KEY_MAP[func_name];
+            endif
+        endif
+
+        :Dispatch to _prepare_{func_name}();
+
+        note right
+            **Dispatch table (14 tools):**
+            ┌─────────────┬──────────────────┐
+            │ Tool        │ Needs Approval?  │
+            ├─────────────┼──────────────────┤
+            │ bash        │ ✓ Yes            │
+            │ read_file   │ ✗ Auto-approve   │
+            │ write_file  │ ✓ Yes            │
+            │ edit_file   │ ✓ Yes            │
+            │ search      │ ✗ Auto-approve   │
+            │ math        │ ✓ Yes            │
+            │ man         │ ✗ Auto-approve   │
+            │ web_fetch   │ ✓ Yes            │
+            │ web_search  │ ✓ Yes            │
+            │ task        │ ✓ Yes            │
+            │ plan        │ ✓ Yes            │
+            │ remember    │ ✗ Auto-approve   │
+            │ recall      │ ✗ Auto-approve   │
+            │ forget      │ ✗ Auto-approve   │
+            └─────────────┴──────────────────┘
+        end note
+
+        :Build item dict:
+        {call_id, func_name, header,
+         preview, needs_approval,
+         approval_label, execute: Callable};
+    endwhile (no)
+}
+
+partition "Phase 2: Approve" #FFF3E0 {
+    if (any items need approval?) then (yes)
+        :_emit_state("attention");
+        :ui.approve_tools(items);
+
+        note right
+            **auto_approve check is handled
+            internally by ui.approve_tools()**
+
+            **TerminalUI**: Print headers/previews,
+            prompt [y/n/a, optional message]
+            If user chose "always":
+              Set ui.auto_approve = True
+              (auto-approve all future tools in this session)
+            **WebUI**: Enqueue approve_request,
+            block on _approval_event.wait()
+            **NullUI**: Return (True, None)
+        end note
+
+        if (user approved?) then (yes)
+            :_emit_state("running");
+        else (denied)
+            :Mark all pending items as denied;
+            :denial_msg = "Denied by user";
+            :_emit_state("running");
+        endif
+    else (all auto-approved)
+        :ui enqueues tool_info event\n(no blocking);
+    endif
+}
+
+partition "Phase 3: Execute" #E3F2FD {
+    if (single tool call?) then (yes)
+        :Execute sequentially:\nrun_one(items[0]);
+    else (multiple)
+        :Execute in parallel:\nThreadPoolExecutor(max_workers=4)\npool.map(run_one, items);
+    endif
+
+    note right
+        **run_one(item):**
+        if item.error → return error string
+        if item.denied → return denial message
+        else → item["execute"](item)
+          ├─ _exec_bash: subprocess.run(["bash", script.sh])
+          ├─ _exec_read_file: open().readlines()
+          ├─ _exec_write_file: makedirs + write
+          ├─ _exec_edit_file: find_occurrences + replace
+          ├─ _exec_search: grep subprocess
+          ├─ _exec_math: sandboxed subprocess
+          ├─ _exec_man: man/info subprocess
+          ├─ _exec_web_fetch: httpx.get + LLM summary
+          ├─ _exec_web_search: Tavily API POST
+          ├─ _exec_task: _run_agent(TASK_AGENT_TOOLS)
+          ├─ _exec_plan: _run_agent(AGENT_TOOLS, read-only)
+          ├─ _exec_remember: SQLite INSERT OR REPLACE
+          ├─ _exec_recall: SQLite FTS5/LIKE search
+          └─ _exec_forget: SQLite DELETE
+    end note
+
+    :Collect results: [(call_id, output), ...];
+
+    :_truncate_output() on each result\n(max context_window × chars_per_token × 0.5 chars\ndefault: ~context_window × 2 chars);
+
+    :ui.on_tool_result(name, output) for each;
+
+    if (plan tool was executed?) then (yes)
+        :ui.on_plan_review(output);
+        :Block for user review/feedback;
+    endif
+}
+
+:Return (results, user_feedback);
+
+stop
+
+@enduml

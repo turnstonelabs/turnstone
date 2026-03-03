@@ -38,6 +38,9 @@ function authFetch(url, opts) {
 var currentView = "overview"; // "overview" | "node" | "filtered"
 var currentNodeId = null;
 var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
+var expandedGroups = {};
+var _lastOverviewJson = "";
+var _lastNodesJson = "";
 var evtSource = null;
 var retryDelay = 1000;
 
@@ -95,6 +98,8 @@ function connectSSE() {
     retryDelay = 1000;
     statusBar.classList.remove("disconnected");
     statusBar.textContent = "";
+    var csb = document.getElementById("cluster-status-bar");
+    if (csb) csb.classList.remove("stale");
     try {
       var data = JSON.parse(e.data);
       handleClusterEvent(data);
@@ -107,6 +112,8 @@ function connectSSE() {
     evtSource = null;
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
+    var csb = document.getElementById("cluster-status-bar");
+    if (csb) csb.classList.add("stale");
     // Raw fetch (not authFetch) — need to inspect status before throwing
     fetch("/api/cluster/overview")
       .then(function (r) {
@@ -167,16 +174,15 @@ function loadOverview() {
   var overviewP = authFetch("/api/cluster/overview").then(function (r) {
     return r.json();
   });
-  var nodesP = authFetch("/api/cluster/nodes?sort=activity&limit=50").then(
+  var nodesP = authFetch("/api/cluster/nodes?sort=activity&limit=1000").then(
     function (r) {
       return r.json();
     },
   );
   Promise.all([overviewP, nodesP])
     .then(function (res) {
-      renderStateCards(res[0].states);
-      renderAggregateBar(res[0]);
-      renderNodeTable(res[1].nodes, res[1].total);
+      renderStatusBar(res[0]);
+      renderNodeGroups(res[1].nodes, res[1].total);
       document.getElementById("cluster-summary").textContent =
         res[0].nodes +
         " nodes \u00b7 " +
@@ -189,87 +195,307 @@ function loadOverview() {
     });
 }
 
-function renderStateCards(states) {
-  var container = document.getElementById("state-cards");
-  container.innerHTML = "";
+// --- Status Bar ---
+function renderStatusBar(overview) {
+  var cacheKey =
+    JSON.stringify(overview) +
+    "|" +
+    currentView +
+    "|" +
+    (currentFilter.state || "");
+  if (cacheKey === _lastOverviewJson) return;
+  _lastOverviewJson = cacheKey;
+
+  var states = overview.states || {};
+  var agg = overview.aggregate || {};
+
+  var statesContainer = document.getElementById("csb-states");
+  statesContainer.innerHTML = "";
   STATE_ORDER.forEach(function (state) {
     var count = states[state] || 0;
     var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
-    var card = document.createElement("div");
-    card.className = "state-card";
-    card.dataset.state = state;
-    card.setAttribute("role", "button");
-    card.setAttribute("tabindex", "0");
-    card.setAttribute("aria-label", sd.label + ": " + count + " workstreams");
-    card.innerHTML =
-      '<div class="state-card-count">' +
+    var pill = document.createElement("button");
+    pill.className = "csb-state";
+    if (currentView === "filtered" && currentFilter.state === state) {
+      pill.classList.add("active");
+    }
+    pill.setAttribute("aria-label", sd.label + ": " + count + " workstreams");
+    pill.innerHTML =
+      '<span class="csb-state-dot" data-state="' +
+      escapeHtml(state) +
+      '" aria-hidden="true"></span>' +
+      '<span class="csb-state-count' +
+      (count === 0 ? " zero" : "") +
+      '">' +
       formatCount(count) +
-      "</div>" +
-      '<div class="state-card-label">' +
-      sd.symbol +
-      " " +
+      "</span>" +
+      '<span class="csb-state-label">' +
       sd.label +
-      "</div>";
-    card.onclick = function () {
+      "</span>";
+    pill.onclick = function () {
       drillDownByState(state);
     };
-    card.onkeydown = function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        drillDownByState(state);
-      }
-    };
-    container.appendChild(card);
+    statesContainer.appendChild(pill);
+  });
+
+  var metricsContainer = document.getElementById("csb-metrics");
+  metricsContainer.innerHTML = "";
+  var metrics = [
+    { value: overview.nodes || 0, label: "nodes", format: formatCount },
+    { value: overview.workstreams || 0, label: "ws", format: formatCount },
+    { value: agg.total_tokens || 0, label: "tokens", format: formatTokens },
+    { value: agg.total_tool_calls || 0, label: "calls", format: formatCount },
+  ];
+  metrics.forEach(function (m) {
+    if (m.value === 0 && m.label !== "nodes" && m.label !== "ws") return;
+    var el = document.createElement("span");
+    el.className = "csb-metric";
+    var valSpan = document.createElement("span");
+    valSpan.className = "csb-metric-value";
+    valSpan.textContent = m.format(m.value);
+    var labelSpan = document.createElement("span");
+    labelSpan.className = "csb-metric-label";
+    labelSpan.textContent = m.label;
+    el.appendChild(valSpan);
+    el.appendChild(labelSpan);
+    metricsContainer.appendChild(el);
   });
 }
 
-function renderAggregateBar(overview) {
-  var agg = overview.aggregate || {};
-  var parts = [];
-  if (agg.total_tokens) parts.push(formatTokens(agg.total_tokens) + " tokens");
-  if (agg.total_tool_calls)
-    parts.push(formatCount(agg.total_tool_calls) + " tool calls");
-  document.getElementById("aggregate-bar").textContent = parts.join(" \u00b7 ");
+// --- Node Grouping ---
+function extractNodePrefix(nodeId) {
+  var stripped = nodeId.replace(/[-_][a-z0-9]*\d[a-z0-9]*$/i, "");
+  if (!stripped || stripped === nodeId) {
+    stripped = nodeId.replace(/[-_]?\d+$/, "");
+  }
+  // Clean trailing separators (e.g., FQDN-style "node.prod.01" → "node.prod")
+  stripped = stripped.replace(/[-_.]$/, "");
+  return stripped || nodeId;
 }
 
-function renderNodeTable(nodes, total) {
+function groupNodes(nodes) {
+  var groupMap = {};
+  var groupOrder = [];
+  nodes.forEach(function (node) {
+    var prefix = extractNodePrefix(node.node_id);
+    if (!groupMap[prefix]) {
+      groupMap[prefix] = {
+        prefix: prefix,
+        nodes: [],
+        ws_total: 0,
+        ws_running: 0,
+        ws_thinking: 0,
+        ws_attention: 0,
+        ws_error: 0,
+        ws_idle: 0,
+        total_tokens: 0,
+        all_reachable: true,
+      };
+      groupOrder.push(prefix);
+    }
+    var g = groupMap[prefix];
+    g.nodes.push(node);
+    g.ws_total += node.ws_total || 0;
+    g.ws_running += node.ws_running || 0;
+    g.ws_thinking += node.ws_thinking || 0;
+    g.ws_attention += node.ws_attention || 0;
+    g.ws_error += node.ws_error || 0;
+    g.ws_idle += node.ws_idle || 0;
+    g.total_tokens += node.total_tokens || 0;
+    if (!node.reachable) g.all_reachable = false;
+  });
+  groupOrder.forEach(function (prefix) {
+    groupMap[prefix].nodes.sort(function (a, b) {
+      return b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+    });
+  });
+  var groups = groupOrder.map(function (p) {
+    return groupMap[p];
+  });
+  groups.sort(function (a, b) {
+    var aAct = a.ws_running + a.ws_attention;
+    var bAct = b.ws_running + b.ws_attention;
+    if (bAct !== aAct) return bAct - aAct;
+    return a.prefix.localeCompare(b.prefix);
+  });
+  return groups;
+}
+
+function buildNodeRow(node) {
+  var row = document.createElement("div");
+  row.className = "node-row";
+  if (node.ws_attention > 0) row.classList.add("has-attention");
+  else if (node.ws_running > 0) row.classList.add("has-running");
+  else if (node.ws_thinking > 0) row.classList.add("has-thinking");
+  else if (node.ws_error > 0) row.classList.add("has-error");
+  row.setAttribute("role", "button");
+  row.setAttribute("tabindex", "0");
+  row.setAttribute(
+    "aria-label",
+    node.node_id +
+      ": " +
+      node.ws_total +
+      " workstreams, " +
+      node.ws_running +
+      " running, " +
+      node.ws_attention +
+      " attention, " +
+      formatTokens(node.total_tokens) +
+      " tokens",
+  );
+
+  var dotClass = node.reachable ? "node-dot" : "node-dot unreachable";
+  var displayTokens = node.total_tokens || node.ws_tokens || 0;
+  var maxWs = node.max_ws || 10;
+  var healthPct =
+    maxWs > 0 ? Math.min(Math.round((node.ws_total / maxWs) * 100), 100) : 0;
+  var healthFillClass =
+    healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
+  var healthFillHtml =
+    healthPct > 0
+      ? '<span class="health-bar-fill ' +
+        healthFillClass +
+        '" style="width:' +
+        healthPct +
+        '%"></span>'
+      : "";
+
+  row.innerHTML =
+    '<span class="node-cell node-cell-name"><span class="' +
+    dotClass +
+    '"></span>' +
+    escapeHtml(node.node_id) +
+    "</span>" +
+    '<span class="node-cell node-cell-num' +
+    (node.ws_total > 0 ? " has-value" : "") +
+    '">' +
+    node.ws_total +
+    "</span>" +
+    '<span class="node-cell node-cell-num' +
+    (node.ws_running > 0 ? " has-value" : "") +
+    '">' +
+    node.ws_running +
+    "</span>" +
+    '<span class="node-cell node-cell-num' +
+    (node.ws_attention > 0 ? " has-value" : "") +
+    '">' +
+    node.ws_attention +
+    "</span>" +
+    '<span class="node-cell node-cell-num">' +
+    formatTokens(displayTokens) +
+    "</span>" +
+    '<span class="node-cell node-cell-health"><span class="health-bar">' +
+    healthFillHtml +
+    "</span> " +
+    healthPct +
+    "%</span>";
+
+  row.onclick = function () {
+    drillDownToNode(node.node_id, node.server_url);
+  };
+  row.onkeydown = function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      drillDownToNode(node.node_id, node.server_url);
+    }
+  };
+  return row;
+}
+
+function toggleGroup(prefix) {
+  expandedGroups[prefix] = !expandedGroups[prefix];
+  var body = document.querySelector(
+    '.node-group-body[data-prefix="' + prefix.replace(/"/g, '\\"') + '"]',
+  );
+  if (!body) return;
+  var isExpanded = expandedGroups[prefix];
+  if (isExpanded) body.classList.remove("collapsed");
+  else body.classList.add("collapsed");
+  var groupEl = body.parentElement;
+  if (groupEl) groupEl.setAttribute("aria-expanded", String(isExpanded));
+  var chevron = groupEl ? groupEl.querySelector(".node-group-chevron") : null;
+  if (chevron) {
+    if (isExpanded) chevron.classList.add("expanded");
+    else chevron.classList.remove("expanded");
+  }
+}
+
+function renderNodeGroups(nodes, total) {
+  var json = JSON.stringify(nodes);
+  if (json === _lastNodesJson) return;
+  _lastNodesJson = json;
+
   var table = document.getElementById("node-table");
   table.innerHTML = "";
   if (!nodes.length) {
     table.innerHTML = '<div class="dashboard-empty">No nodes discovered</div>';
     return;
   }
-  nodes.forEach(function (node) {
-    var row = document.createElement("div");
-    row.className = "node-row";
-    if (node.ws_attention > 0) row.classList.add("has-attention");
-    else if (node.ws_running > 0) row.classList.add("has-running");
-    else if (node.ws_thinking > 0) row.classList.add("has-thinking");
-    else if (node.ws_error > 0) row.classList.add("has-error");
-    row.setAttribute("role", "button");
-    row.setAttribute("tabindex", "0");
-    row.setAttribute(
+
+  var topHeaders = document.createElement("div");
+  topHeaders.className = "node-colheaders";
+  topHeaders.setAttribute("aria-hidden", "true");
+  topHeaders.innerHTML =
+    '<span class="ncol ncol-node">NODE</span>' +
+    '<span class="ncol ncol-ws">WS</span>' +
+    '<span class="ncol ncol-run">RUN</span>' +
+    '<span class="ncol ncol-attn">ATTN</span>' +
+    '<span class="ncol ncol-tokens">TOKENS</span>' +
+    '<span class="ncol ncol-health">LOAD</span>';
+  table.appendChild(topHeaders);
+
+  var groups = groupNodes(nodes);
+
+  groups.forEach(function (group) {
+    // Single-node group — render as plain row
+    if (group.nodes.length === 1) {
+      var wrapper = document.createElement("div");
+      wrapper.className = "node-group node-group-single";
+      wrapper.appendChild(buildNodeRow(group.nodes[0]));
+      table.appendChild(wrapper);
+      return;
+    }
+
+    var groupEl = document.createElement("div");
+    groupEl.className = "node-group";
+    var isExpanded = !!expandedGroups[group.prefix];
+    groupEl.setAttribute("role", "listitem");
+    groupEl.setAttribute("aria-expanded", String(isExpanded));
+
+    // Group header
+    var header = document.createElement("div");
+    header.className = "node-group-header";
+    if (group.ws_attention > 0) header.classList.add("has-attention");
+    else if (group.ws_running > 0) header.classList.add("has-running");
+    else if (group.ws_thinking > 0) header.classList.add("has-thinking");
+    else if (group.ws_error > 0) header.classList.add("has-error");
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+    header.setAttribute(
       "aria-label",
-      node.node_id +
-        ": " +
-        node.ws_total +
+      group.prefix +
+        " group: " +
+        group.nodes.length +
+        " nodes, " +
+        group.ws_total +
         " workstreams, " +
-        node.ws_running +
+        group.ws_running +
         " running, " +
-        node.ws_attention +
+        group.ws_attention +
         " attention, " +
-        formatTokens(node.total_tokens) +
+        formatTokens(group.total_tokens) +
         " tokens",
     );
 
-    var dotClass = node.reachable ? "node-dot" : "node-dot unreachable";
-
-    // Use aggregate tokens, fall back to summed workstream tokens
-    var displayTokens = node.total_tokens || node.ws_tokens || 0;
-
-    // Load = workstream count / max capacity
-    var maxWs = node.max_ws || 10;
-    var healthPct = Math.round((node.ws_total / maxWs) * 100);
+    var chevronClass = "node-group-chevron" + (isExpanded ? " expanded" : "");
+    var totalMaxWs = 0;
+    group.nodes.forEach(function (n) {
+      totalMaxWs += n.max_ws || 10;
+    });
+    var healthPct =
+      totalMaxWs > 0
+        ? Math.min(Math.round((group.ws_total / totalMaxWs) * 100), 100)
+        : 0;
     var healthFillClass =
       healthPct < 50 ? "low" : healthPct < 80 ? "mid" : "high";
     var healthFillHtml =
@@ -281,57 +507,76 @@ function renderNodeTable(nodes, total) {
           '%"></span>'
         : "";
 
-    row.innerHTML =
-      '<span class="node-cell node-cell-name"><span class="' +
-      dotClass +
-      '"></span>' +
-      escapeHtml(node.node_id) +
+    header.innerHTML =
+      '<span class="node-group-name">' +
+      '<span class="' +
+      chevronClass +
+      '" aria-hidden="true">&#x25b8;</span>' +
+      escapeHtml(group.prefix) +
+      '<span class="node-group-badge">' +
+      group.nodes.length +
+      " nodes</span>" +
       "</span>" +
-      '<span class="node-cell node-cell-num' +
-      (node.ws_total > 0 ? " has-value" : "") +
+      '<span class="node-group-cell num' +
+      (group.ws_total > 0 ? " has-value" : "") +
       '">' +
-      node.ws_total +
+      group.ws_total +
       "</span>" +
-      '<span class="node-cell node-cell-num' +
-      (node.ws_running > 0 ? " has-value" : "") +
+      '<span class="node-group-cell num' +
+      (group.ws_running > 0 ? " has-value" : "") +
       '">' +
-      node.ws_running +
+      group.ws_running +
       "</span>" +
-      '<span class="node-cell node-cell-num' +
-      (node.ws_attention > 0 ? " has-value" : "") +
+      '<span class="node-group-cell num' +
+      (group.ws_attention > 0 ? " has-value" : "") +
       '">' +
-      node.ws_attention +
+      group.ws_attention +
       "</span>" +
-      '<span class="node-cell node-cell-num">' +
-      formatTokens(displayTokens) +
+      '<span class="node-group-cell num">' +
+      formatTokens(group.total_tokens) +
       "</span>" +
-      '<span class="node-cell node-cell-health">' +
-      '<span class="health-bar">' +
+      '<span class="node-group-cell node-cell-health"><span class="health-bar">' +
       healthFillHtml +
-      "</span>" +
-      " " +
+      "</span> " +
       healthPct +
-      "%" +
-      "</span>";
+      "%</span>";
 
-    row.onclick = function () {
-      drillDownToNode(node.node_id, node.server_url);
+    var prefix = group.prefix;
+    header.onclick = function () {
+      toggleGroup(prefix);
     };
-    row.onkeydown = function (e) {
+    header.onkeydown = function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        drillDownToNode(node.node_id, node.server_url);
+        toggleGroup(prefix);
       }
     };
-    table.appendChild(row);
-  });
+    groupEl.appendChild(header);
 
-  // Pagination hint
-  var pag = document.getElementById("node-pagination");
-  pag.innerHTML = "";
-  if (total > nodes.length) {
-    pag.textContent = "Showing " + nodes.length + " of " + total + " nodes";
-  }
+    // Group body
+    var body = document.createElement("div");
+    body.className = "node-group-body" + (isExpanded ? "" : " collapsed");
+    body.dataset.prefix = group.prefix;
+
+    var colHeaders = document.createElement("div");
+    colHeaders.className = "node-colheaders";
+    colHeaders.setAttribute("aria-hidden", "true");
+    colHeaders.innerHTML =
+      '<span class="ncol ncol-node">NODE</span>' +
+      '<span class="ncol ncol-ws">WS</span>' +
+      '<span class="ncol ncol-run">RUN</span>' +
+      '<span class="ncol ncol-attn">ATTN</span>' +
+      '<span class="ncol ncol-tokens">TOKENS</span>' +
+      '<span class="ncol ncol-health">LOAD</span>';
+    body.appendChild(colHeaders);
+
+    group.nodes.forEach(function (node) {
+      body.appendChild(buildNodeRow(node));
+    });
+
+    groupEl.appendChild(body);
+    table.appendChild(groupEl);
+  });
 }
 
 // --- Drill-down: Node ---
@@ -349,30 +594,38 @@ function drillDownToNode(nodeId, serverUrl) {
     link.style.display = "";
   }
   document.getElementById("main").scrollTop = 0;
+  document.getElementById("node-ws-table").innerHTML =
+    '<div class="dashboard-empty">Loading workstreams...</div>';
   loadNodeDetail(nodeId);
   document.getElementById("breadcrumb-home").focus();
   history.pushState({ view: "node", nodeId: nodeId, serverUrl: serverUrl }, "");
 }
 
 function loadNodeDetail(nodeId) {
-  authFetch("/api/cluster/node/" + encodeURIComponent(nodeId))
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      if (data.error) {
-        document.getElementById("node-ws-table").innerHTML =
-          '<div class="dashboard-empty">' + escapeHtml(data.error) + "</div>";
-        return;
-      }
-      var ws = data.workstreams || [];
-      var active = ws.filter(function (w) {
-        return w.state !== "idle";
-      }).length;
-      document.getElementById("node-ws-summary").textContent =
-        active + " active \u00b7 " + ws.length + " total";
-      renderWsTable(document.getElementById("node-ws-table"), ws);
-    });
+  var detailP = authFetch(
+    "/api/cluster/node/" + encodeURIComponent(nodeId),
+  ).then(function (r) {
+    return r.json();
+  });
+  var overviewP = authFetch("/api/cluster/overview").then(function (r) {
+    return r.json();
+  });
+  Promise.all([detailP, overviewP]).then(function (res) {
+    var data = res[0];
+    renderStatusBar(res[1]);
+    if (data.error) {
+      document.getElementById("node-ws-table").innerHTML =
+        '<div class="dashboard-empty">' + escapeHtml(data.error) + "</div>";
+      return;
+    }
+    var ws = data.workstreams || [];
+    var active = ws.filter(function (w) {
+      return w.state !== "idle";
+    }).length;
+    document.getElementById("node-ws-summary").textContent =
+      active + " active \u00b7 " + ws.length + " total";
+    renderWsTable(document.getElementById("node-ws-table"), ws);
+  });
 }
 
 // --- Drill-down: Filtered ---
@@ -417,11 +670,16 @@ function loadFilteredWorkstreams() {
     params += "&state=" + encodeURIComponent(currentFilter.state);
   if (currentFilter.node)
     params += "&node=" + encodeURIComponent(currentFilter.node);
-  authFetch("/api/cluster/workstreams?" + params)
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
+  var wsP = authFetch("/api/cluster/workstreams?" + params).then(function (r) {
+    return r.json();
+  });
+  var overviewP = authFetch("/api/cluster/overview").then(function (r) {
+    return r.json();
+  });
+  Promise.all([wsP, overviewP])
+    .then(function (res) {
+      var data = res[0];
+      renderStatusBar(res[1]);
       document.getElementById("main").scrollTop = 0;
       document.getElementById("filtered-summary").textContent =
         "Page " +

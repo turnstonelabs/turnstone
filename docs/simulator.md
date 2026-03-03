@@ -164,6 +164,8 @@ Open http://localhost:8090 to see simulated nodes, workstream states, token coun
 
 ## Architecture
 
+> See also: [Simulator Architecture diagram](diagrams/png/10-simulator-architecture.png)
+
 ```
 turnstone/sim/
 ├── __init__.py     # Public API: SimCluster, SimConfig

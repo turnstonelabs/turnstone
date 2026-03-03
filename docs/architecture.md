@@ -65,6 +65,8 @@ turnstone/
 
 ## Core Loop
 
+> See also: [Conversation Turn diagram](diagrams/png/04-conversation-turn.png)
+
 A user message flows through the system as follows:
 
 ```
@@ -109,6 +111,8 @@ A user message flows through the system as follows:
 ```
 
 ### Tool Execution Pipeline
+
+> See also: [Tool Pipeline diagram](diagrams/png/05-tool-pipeline.png)
 
 Tool execution is a three-phase process:
 
@@ -168,6 +172,8 @@ The engine emits state changes via `_emit_state()` which calls
 
 ## SessionUI Protocol
 
+> See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
+
 Defined in `turnstone.core.session.SessionUI` as a `typing.Protocol` with 13
 methods. Every frontend must implement all of them.
 
@@ -224,6 +230,8 @@ Workstreams are parallel, independent chat sessions. Each has its own
 `ChatSession`, `SessionUI`, message history, and worker thread.
 
 ### WorkstreamState
+
+> See also: [Workstream States diagram](diagrams/png/09-workstream-states.png)
 
 Defined in `turnstone.core.workstream.WorkstreamState` (5 states):
 
@@ -418,8 +426,8 @@ independently, then returns the final content as the tool result.
   to `.plan-<session_id>.md` — unique per `ChatSession` so concurrent workstreams
   don't collide. On repeat invocations the prior `plan` tool call and its result
   are forwarded from `self.messages` so the agent refines the existing plan rather
-  than starting over. Planning instructions are passed via `model_identity` in
-  `chat_template_kwargs` rather than as a developer message.
+  than starting over. Planning instructions are injected as a developer message
+  prepended to the agent's conversation.
 - **Turn limit**: controlled by `agent_max_turns` (default: `-1`, unlimited).
   When a limit is set and reached, the agent is forced to synthesize a final
   response without tools. When unlimited, the loop only exits when the model

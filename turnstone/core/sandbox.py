@@ -1,9 +1,12 @@
 """Sandboxed Python executor for the math tool."""
 
+from __future__ import annotations
+
 import ast
 import multiprocessing
 import re
 import traceback
+from typing import Any
 
 _MATH_BLOCKED_BUILTINS = {
     "open",
@@ -56,29 +59,32 @@ _MATH_BLOCKED_MODULES = {
 class _ASTValidator(ast.NodeVisitor):
     """Validates AST for dangerous constructs."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.errors: list[str] = []
 
-    def visit_Import(self, node):
+    def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
             if alias.name.split(".")[0] in _MATH_BLOCKED_MODULES:
                 self.errors.append(f"Import of '{alias.name}' is not allowed")
         self.generic_visit(node)
 
-    def visit_ImportFrom(self, node):
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         if node.module and node.module.split(".")[0] in _MATH_BLOCKED_MODULES:
             self.errors.append(f"Import from '{node.module}' is not allowed")
         self.generic_visit(node)
 
-    def visit_Call(self, node):
+    def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in _MATH_BLOCKED_BUILTINS:
             self.errors.append(f"Call to '{node.func.id}' is not allowed")
         self.generic_visit(node)
 
-    def visit_Attribute(self, node):
-        if node.attr.startswith("__") and node.attr.endswith("__"):
-            if node.attr not in {"__name__", "__doc__", "__class__"}:
-                self.errors.append(f"Access to '{node.attr}' is not allowed")
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if (
+            node.attr.startswith("__")
+            and node.attr.endswith("__")
+            and node.attr not in {"__name__", "__doc__", "__class__"}
+        ):
+            self.errors.append(f"Access to '{node.attr}' is not allowed")
         self.generic_visit(node)
 
 
@@ -101,7 +107,7 @@ def validate_math_code(code: str) -> list[str]:
     return v.errors
 
 
-def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
+def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[str, str]]) -> None:
     """Execute code in a subprocess, put (status, output) in queue."""
     import signal as _signal
     import sys as _sys
@@ -115,7 +121,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
         captured = StringIO()
         _sys.stdout = captured
 
-        def _safe_import(name, *args, **kwargs):
+        def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
             if name.split(".")[0] in _MATH_BLOCKED_MODULES:
                 raise ImportError(f"Import of '{name}' is blocked")
             return original_import(name, *args, **kwargs)
@@ -137,10 +143,18 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
         safe_builtins["__import__"] = _safe_import
 
         # Pre-import safe modules
-        import math, fractions, itertools, functools, operator
-        import collections, decimal, random, re, string
+        import collections
+        import decimal
+        import fractions
+        import functools
+        import itertools
+        import math
+        import operator
+        import random
+        import re
+        import string
 
-        ns: dict = {
+        ns: dict[str, Any] = {
             "__builtins__": safe_builtins,
             "math": math,
             "fractions": fractions,
@@ -212,7 +226,11 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
             pass
 
         try:
-            import scipy, scipy.special, scipy.optimize, scipy.integrate, scipy.linalg
+            import scipy  # type: ignore[import-untyped]
+            import scipy.integrate  # type: ignore[import-untyped]
+            import scipy.linalg  # type: ignore[import-untyped]
+            import scipy.optimize  # type: ignore[import-untyped]
+            import scipy.special  # type: ignore[import-untyped]
 
             ns["scipy"] = scipy
             ns["special"] = scipy.special
@@ -230,11 +248,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
         printed = captured.getvalue()
         result_var = ns.get("result")
         if result_var is not None:
-            out = (
-                f"{printed.rstrip()}\nresult = {result_var}"
-                if printed
-                else str(result_var)
-            )
+            out = f"{printed.rstrip()}\nresult = {result_var}" if printed else str(result_var)
         elif printed:
             out = printed.rstrip()
         else:
@@ -243,9 +257,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue):
 
     except Exception as e:
         _sys.stdout = _sys.__stdout__
-        result_queue.put(
-            ("error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
-        )
+        result_queue.put(("error", f"{type(e).__name__}: {e}\n{traceback.format_exc()}"))
 
 
 def auto_print_wrap(code: str) -> str:
@@ -280,10 +292,8 @@ def execute_math_sandboxed(code: str, timeout: float = 30.0) -> tuple[str, bool]
     if errors:
         return "Validation errors:\n" + "\n".join(f"- {e}" for e in errors), True
 
-    result_queue: multiprocessing.Queue = multiprocessing.Queue()
-    proc = multiprocessing.Process(
-        target=_math_exec_in_process, args=(code, result_queue)
-    )
+    result_queue: multiprocessing.Queue[tuple[str, str]] = multiprocessing.Queue()
+    proc = multiprocessing.Process(target=_math_exec_in_process, args=(code, result_queue))
     proc.start()
     proc.join(timeout=timeout)
 

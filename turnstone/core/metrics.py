@@ -1,8 +1,11 @@
 """Thread-safe Prometheus-compatible metrics collector for the turnstone web server."""
 
+from __future__ import annotations
+
 import threading
 import time
 from collections import defaultdict
+from typing import Any
 
 
 class MetricsCollector:
@@ -10,22 +13,22 @@ class MetricsCollector:
 
     BUCKETS = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self.start_time = time.monotonic()
         self.model: str = ""
         # counters
-        self._req_total: dict = defaultdict(int)  # (method, endpoint, status) -> int
-        self._tokens: dict = defaultdict(int)  # ("prompt"|"completion") -> int
+        self._req_total: dict[tuple[str, str, str], int] = defaultdict(int)
+        self._tokens: dict[str, int] = defaultdict(int)  # "prompt"|"completion" -> int
         self._messages: int = 0
-        self._tool_calls: dict = defaultdict(int)  # tool_name -> int
+        self._tool_calls: dict[str, int] = defaultdict(int)  # tool_name -> int
         self._errors: int = 0
         # histograms: (method, endpoint) -> {buckets: [count…], sum: float, count: int}
-        self._req_duration: dict = {}
+        self._req_duration: dict[tuple[str, str], dict[str, Any]] = {}
         # gauge
         self._context_ratio: float = 0.0
 
-    def record_request(self, method: str, endpoint: str, status: int, duration: float):
+    def record_request(self, method: str, endpoint: str, status: int, duration: float) -> None:
         with self._lock:
             self._req_total[(method, endpoint, str(status))] += 1
             key = (method, endpoint)
@@ -42,43 +45,53 @@ class MetricsCollector:
             h["sum"] += duration
             h["count"] += 1
 
-    def record_tokens(self, prompt: int, completion: int):
+    def record_tokens(self, prompt: int, completion: int) -> None:
         with self._lock:
             self._tokens["prompt"] += prompt
             self._tokens["completion"] += completion
 
-    def record_tool_call(self, tool_name: str):
+    def record_tool_call(self, tool_name: str) -> None:
         with self._lock:
             self._tool_calls[tool_name] += 1
 
-    def record_error(self):
+    def record_error(self) -> None:
         with self._lock:
             self._errors += 1
 
-    def record_message_sent(self):
+    def record_message_sent(self) -> None:
         with self._lock:
             self._messages += 1
 
-    def record_context_ratio(self, ratio: float):
+    def record_context_ratio(self, ratio: float) -> None:
         with self._lock:
             self._context_ratio = ratio
 
     def generate_text(
         self,
-        workstream_states: dict,
+        workstream_states: dict[str, int],
         total_workstreams: int,
-        workstream_metrics: list[dict] | None = None,
+        workstream_metrics: list[dict[str, Any]] | None = None,
     ) -> str:
         """Return Prometheus text exposition format (v0.0.4)."""
         lines: list[str] = []
 
-        def gauge(name, help_text, value, labels=None):
+        def gauge(
+            name: str,
+            help_text: str,
+            value: float | int,
+            labels: dict[str, str] | None = None,
+        ) -> None:
             lstr = _fmt_labels(labels)
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} gauge")
             lines.append(f"{name}{lstr} {_fmt_value(value)}")
 
-        def counter(name, help_text, value, labels=None):
+        def counter(
+            name: str,
+            help_text: str,
+            value: float | int,
+            labels: dict[str, str] | None = None,
+        ) -> None:
             lstr = _fmt_labels(labels)
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} counter")
@@ -132,8 +145,7 @@ class MetricsCollector:
         lines.append("# TYPE turnstone_http_request_duration_seconds histogram")
         for (method, endpoint), h in sorted(req_duration.items()):
             prefix = (
-                f'turnstone_http_request_duration_seconds{{method="{method}",'
-                f'endpoint="{endpoint}"'
+                f'turnstone_http_request_duration_seconds{{method="{method}",endpoint="{endpoint}"'
             )
             for i, b in enumerate(self.BUCKETS):
                 lines.append(f'{prefix},le="{b}"}} {h["buckets"][i]}')
@@ -154,9 +166,7 @@ class MetricsCollector:
         lines.append("# HELP turnstone_tokens_total Total tokens consumed")
         lines.append("# TYPE turnstone_tokens_total counter")
         for tok_type in ("prompt", "completion"):
-            lines.append(
-                f'turnstone_tokens_total{{type="{tok_type}"}} {tokens.get(tok_type, 0)}'
-            )
+            lines.append(f'turnstone_tokens_total{{type="{tok_type}"}} {tokens.get(tok_type, 0)}')
 
         # turnstone_tool_calls_total
         lines.append("# HELP turnstone_tool_calls_total Total tool executions by name")
@@ -212,8 +222,7 @@ class MetricsCollector:
             for wm in workstream_metrics:
                 lstr = _fmt_labels({"ws_id": wm["ws_id"], "name": wm["name"]})
                 lines.append(
-                    f"turnstone_workstream_completion_tokens_total{lstr}"
-                    f" {wm['completion_tokens']}"
+                    f"turnstone_workstream_completion_tokens_total{lstr} {wm['completion_tokens']}"
                 )
 
             lines.append(
@@ -232,9 +241,7 @@ class MetricsCollector:
             lines.append("# TYPE turnstone_workstream_tool_calls_total counter")
             for wm in workstream_metrics:
                 for tool, cnt in sorted(wm["tool_calls"].items()):
-                    lstr = _fmt_labels(
-                        {"ws_id": wm["ws_id"], "name": wm["name"], "tool": tool}
-                    )
+                    lstr = _fmt_labels({"ws_id": wm["ws_id"], "name": wm["name"], "tool": tool})
                     lines.append(f"turnstone_workstream_tool_calls_total{lstr} {cnt}")
 
             lines.append(
@@ -252,7 +259,7 @@ class MetricsCollector:
         return "\n".join(lines)
 
 
-def _fmt_labels(labels: dict | None) -> str:
+def _fmt_labels(labels: dict[str, str] | None) -> str:
     if not labels:
         return ""
     parts = [f'{k}="{v}"' for k, v in labels.items()]

@@ -109,9 +109,7 @@ def load_auth_config() -> AuthConfig:
         tokens[env_token] = "full"
 
     if enabled and not tokens:
-        log.warning(
-            "Auth enabled but no tokens configured — all API requests will be rejected"
-        )
+        log.warning("Auth enabled but no tokens configured — all API requests will be rejected")
 
     return AuthConfig(enabled=enabled, tokens=tokens)
 
@@ -125,10 +123,7 @@ def is_public_path(path: str) -> bool:
     """Return *True* if the path should be accessible without authentication."""
     if path in PUBLIC_PATHS:
         return True
-    for prefix in PUBLIC_PREFIXES:
-        if path.startswith(prefix):
-            return True
-    return False
+    return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
 
 
 def required_role(method: str, path: str) -> str:

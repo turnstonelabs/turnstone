@@ -1,0 +1,81 @@
+@startuml
+!theme plain
+title Turnstone — Workstream State Machine
+
+skinparam state {
+    BackgroundColor<<idle>> #E8F5E9
+    BackgroundColor<<thinking>> #E3F2FD
+    BackgroundColor<<running>> #FFF3E0
+    BackgroundColor<<attention>> #FCE4EC
+    BackgroundColor<<error>> #FFCDD2
+}
+
+state "IDLE" as idle <<idle>> : Waiting for user input.\nNo active LLM call or tool execution.
+state "THINKING" as thinking <<thinking>> : LLM streaming response.\nTokens flowing (reasoning + content).
+state "RUNNING" as running <<running>> : Tools executing.\nThreadPoolExecutor active.
+state "ATTENTION" as attention <<attention>> : Blocked on user action.\nTool approval or plan review needed.
+state "ERROR" as error <<error>> : Exception occurred.\nRecoverable on next send().
+
+[*] --> idle : Session created
+
+idle --> thinking : send() called\n_emit_state("thinking")
+
+thinking --> running : Tool calls detected\nin LLM response\n_emit_state("running")
+
+thinking --> idle : No tool calls\n(final answer)\n_emit_state("idle")
+
+thinking --> error : Exception during\nstreaming
+
+running --> attention : approve_tools() called\n_emit_state("attention")
+
+attention --> running : User approves\n(tools execute)\n_emit_state("running")
+
+attention --> running : User denies\n(denial recorded)\n_emit_state("running")
+
+running --> thinking : Tool results appended,\nnext LLM call\n_emit_state("thinking")
+
+running --> attention : Plan tool complete,\non_plan_review()\n_emit_state("attention")
+
+running --> error : Exception during\ntool execution
+
+error --> thinking : New send() call\n_emit_state("thinking")
+
+note right of thinking
+  **Emitted via:**
+  session._emit_state(state)
+    → ui.on_state_change(state)
+
+  **Propagation:**
+  • WebUI → global SSE queue (ws_state)
+  • Bridge → PUBLISH to global + cluster channels
+  • CLI → WorkstreamManager.set_state()
+end note
+
+note left of attention
+  **Blocking mechanisms:**
+  • TerminalUI: input() prompt
+  • WebUI: threading.Event.wait()
+  • Bridge: BLPOP on response queue
+  • NullUI: auto-approve (never reaches)
+end note
+
+state "SimWorkstream (simplified)" as sim_group {
+    state "sim_idle" as si <<idle>>
+    state "sim_thinking" as st <<thinking>>
+    state "sim_running" as sr <<running>>
+    state "sim_error" as se <<error>>
+
+    [*] --> si
+    si --> st : process_turn() called
+    st --> sr : Tool calls generated
+    sr --> st : More rounds
+    st --> si : No tools / max rounds
+    st --> se : Uncaught exception
+}
+
+note right of sim_group
+  SimWorkstream has no ATTENTION state —
+  tool approval is not simulated.
+end note
+
+@enduml

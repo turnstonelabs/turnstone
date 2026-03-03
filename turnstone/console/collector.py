@@ -7,6 +7,7 @@ for real-time state changes.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import queue
@@ -14,10 +15,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from turnstone.mq.broker import RedisBroker
+if TYPE_CHECKING:
+    from turnstone.mq.broker import RedisBroker
 
 log = logging.getLogger("turnstone.console.collector")
 
@@ -31,9 +34,9 @@ class NodeSnapshot:
     started: float = 0.0
     last_seen: float = 0.0  # monotonic time of last successful poll
     max_ws: int = 10  # max workstreams (capacity)
-    workstreams: dict[str, dict] = field(default_factory=dict)
-    health: dict = field(default_factory=dict)
-    aggregate: dict = field(default_factory=dict)
+    workstreams: dict[str, dict[str, Any]] = field(default_factory=dict)
+    health: dict[str, Any] = field(default_factory=dict)
+    aggregate: dict[str, Any] = field(default_factory=dict)
     reachable: bool = True
 
 
@@ -74,7 +77,7 @@ class ClusterCollector:
         self._http_client = httpx.Client(timeout=http_timeout, headers=headers)
 
         # SSE fan-out to browser clients
-        self._listeners: list[queue.Queue] = []
+        self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
@@ -165,14 +168,12 @@ class ClusterCollector:
         # Fan out to SSE listeners
         self._fanout(data)
 
-    def _fanout(self, event: dict) -> None:
+    def _fanout(self, event: dict[str, Any]) -> None:
         """Copy an event to all registered SSE listener queues."""
         with self._listeners_lock:
             for q in self._listeners:
-                try:
+                with contextlib.suppress(queue.Full):
                     q.put_nowait(event)
-                except queue.Full:
-                    pass
 
     # -- node discovery ------------------------------------------------------
 
@@ -242,10 +243,7 @@ class ClusterCollector:
         if not targets:
             return
 
-        futures = {
-            self._poll_pool.submit(self._fetch_node, nid, url): nid
-            for nid, url in targets
-        }
+        futures = {self._poll_pool.submit(self._fetch_node, nid, url): nid for nid, url in targets}
         for future in as_completed(futures):
             nid = futures[future]
             try:
@@ -257,19 +255,19 @@ class ClusterCollector:
                     if nid in self._nodes:
                         self._nodes[nid].reachable = False
 
-    def _fetch_node(self, node_id: str, server_url: str) -> tuple[dict, dict]:
+    def _fetch_node(self, node_id: str, server_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch /api/dashboard and /health from a single node."""
         base = server_url.rstrip("/")
         dash_resp = self._http_client.get(f"{base}/api/dashboard")
-        dash_data = dash_resp.json()
+        dash_data: dict[str, Any] = dash_resp.json()
         try:
             health_resp = self._http_client.get(f"{base}/health")
-            health_data = health_resp.json()
+            health_data: dict[str, Any] = health_resp.json()
         except Exception:
             health_data = {}
         return dash_data, health_data
 
-    def _apply_poll(self, node_id: str, dashboard: dict, health: dict) -> None:
+    def _apply_poll(self, node_id: str, dashboard: dict[str, Any], health: dict[str, Any]) -> None:
         """Apply polled data to the in-memory node snapshot."""
         ws_list = dashboard.get("workstreams", [])
         aggregate = dashboard.get("aggregate", {})
@@ -289,7 +287,7 @@ class ClusterCollector:
 
     # -- query methods (thread-safe) -----------------------------------------
 
-    def get_overview(self) -> dict:
+    def get_overview(self) -> dict[str, Any]:
         """Return cluster overview: state counts, totals, aggregate stats."""
         states = {"running": 0, "thinking": 0, "attention": 0, "idle": 0, "error": 0}
         total_tokens = 0
@@ -316,7 +314,7 @@ class ClusterCollector:
 
     def get_nodes(
         self, sort_by: str = "activity", limit: int = 100, offset: int = 0
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Return sorted, paginated node list with per-node counts."""
         with self._lock:
             items = []
@@ -334,9 +332,7 @@ class ClusterCollector:
                 # Use aggregate tokens if available, else sum from workstreams
                 agg_tokens = node.aggregate.get("total_tokens", 0)
                 if not agg_tokens:
-                    agg_tokens = sum(
-                        ws.get("tokens", 0) for ws in node.workstreams.values()
-                    )
+                    agg_tokens = sum(ws.get("tokens", 0) for ws in node.workstreams.values())
                 items.append(
                     {
                         "node_id": node.node_id,
@@ -376,7 +372,7 @@ class ClusterCollector:
         sort_by: str = "state",
         page: int = 1,
         per_page: int = 50,
-    ) -> tuple[list[dict], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """Return filtered, sorted, paginated workstreams + total count."""
         with self._lock:
             all_ws = []
@@ -419,7 +415,7 @@ class ClusterCollector:
         page_ws = all_ws[start : start + per_page]
         return page_ws, total
 
-    def get_node_detail(self, node_id: str) -> dict | None:
+    def get_node_detail(self, node_id: str) -> dict[str, Any] | None:
         """Return a single node's workstreams and health."""
         with self._lock:
             node = self._nodes.get(node_id)
@@ -436,12 +432,12 @@ class ClusterCollector:
 
     # -- SSE listener management ---------------------------------------------
 
-    def register_listener(self, q: queue.Queue) -> None:
+    def register_listener(self, q: queue.Queue[dict[str, Any]]) -> None:
         """Register a queue for SSE event fan-out."""
         with self._listeners_lock:
             self._listeners.append(q)
 
-    def unregister_listener(self, q: queue.Queue) -> None:
+    def unregister_listener(self, q: queue.Queue[dict[str, Any]]) -> None:
         """Unregister a queue from SSE event fan-out."""
         with self._listeners_lock:
             if q in self._listeners:

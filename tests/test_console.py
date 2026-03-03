@@ -3,10 +3,7 @@
 import json
 import queue
 import threading
-import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -14,11 +11,7 @@ import pytest
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 from turnstone.mq.protocol import (
     ClusterStateEvent,
-    WorkstreamClosedEvent,
-    WorkstreamCreatedEvent,
-    WorkstreamRenameEvent,
 )
-
 
 # ---------------------------------------------------------------------------
 # Mock broker for collector tests
@@ -128,7 +121,7 @@ class TestCollectorDiscovery:
     def test_discover_emits_node_joined_event(self):
         broker = MockBroker()
         c = _make_collector(broker)
-        events = []
+        _events = []
         q = queue.Queue()
         c.register_listener(q)
 
@@ -218,9 +211,7 @@ class TestCollectorEvents:
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
             server_url="http://a:8080",
-            workstreams={
-                "ws1": {"id": "ws1", "name": "test", "state": "idle", "node": "node-a"}
-            },
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle", "node": "node-a"}},
         )
 
         event = ClusterStateEvent(
@@ -276,9 +267,7 @@ class TestCollectorEvents:
             workstreams={"ws1": {"id": "ws1", "name": "old-name", "state": "idle"}},
         )
 
-        event_json = json.dumps(
-            {"type": "ws_rename", "ws_id": "ws1", "name": "new-name"}
-        )
+        event_json = json.dumps({"type": "ws_rename", "ws_id": "ws1", "name": "new-name"})
         c._on_cluster_event(event_json)
 
         assert c._nodes["node-a"].workstreams["ws1"]["name"] == "new-name"
@@ -440,9 +429,7 @@ class TestCollectorQueries:
         ws, _ = populated_collector.get_workstreams(sort_by="state")
         states = [w["state"] for w in ws]
         # running before attention before idle
-        assert (
-            states.index("running") < states.index("attention") < states.index("idle")
-        )
+        assert states.index("running") < states.index("attention") < states.index("idle")
 
     def test_get_workstreams_combined_filters(self, populated_collector):
         ws, total = populated_collector.get_workstreams(state="idle", node="node-a")
@@ -588,15 +575,11 @@ class TestConsoleHTTPEndpoints:
         mock_collector.get_overview.assert_called_once()
 
     def test_get_nodes(self, server, mock_collector):
-        status, data = self._get(
-            server, "/api/cluster/nodes?sort=activity&limit=10&offset=0"
-        )
+        status, data = self._get(server, "/api/cluster/nodes?sort=activity&limit=10&offset=0")
         assert status == 200
         assert len(data["nodes"]) == 1
         assert data["total"] == 1
-        mock_collector.get_nodes.assert_called_once_with(
-            sort_by="activity", limit=10, offset=0
-        )
+        mock_collector.get_nodes.assert_called_once_with(sort_by="activity", limit=10, offset=0)
 
     def test_get_workstreams(self, server, mock_collector):
         status, data = self._get(
