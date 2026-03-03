@@ -121,9 +121,11 @@ group loop [while tool_calls present]
         end note
 
         note right of TP
-          bash: on_tool_output_chunk()
+          bash: on_tool_output_chunk(call_id, line)
           called per stdout line,
-          then on_tool_result() at end.
+          then on_tool_result(call_id, name, output).
+          call_id routes chunks/results to correct
+          tool div during parallel execution.
           Other tools: on_tool_result() only.
         end note
 

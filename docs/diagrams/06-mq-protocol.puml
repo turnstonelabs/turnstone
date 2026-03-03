@@ -133,6 +133,7 @@ package "Outbound Events (Bridge → Client)" #E3F2FD {
         }
         class ToolResultEvent {
             type = "tool_result"
+            + call_id: str
             + name: str
             + output: str
         }

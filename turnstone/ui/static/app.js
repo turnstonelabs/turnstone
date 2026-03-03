@@ -1171,13 +1171,11 @@ function handleEvent(evt) {
       break;
 
     case "tool_output_chunk":
-      if (evt.call_id && evt.chunk) {
-        appendToolOutputChunk(evt.call_id, evt.chunk);
-      }
+      appendToolOutputChunk(evt.call_id || "", evt.chunk);
       break;
 
     case "tool_result":
-      appendToolOutput(evt.name, evt.output);
+      appendToolOutput(evt.call_id || "", evt.name, evt.output);
       break;
 
     case "status":
@@ -1280,6 +1278,7 @@ function replayHistory(messages) {
             var div = document.createElement("div");
             div.className = "approval-tool";
             div.dataset.funcName = tc.name;
+            div.dataset.callId = tc.id || "";
             var nameEl = document.createElement("div");
             nameEl.className = "tool-name";
             nameEl.textContent = tc.name;
@@ -1324,11 +1323,8 @@ function replayHistory(messages) {
           var out = document.createElement("div");
           out.className = "tool-output";
           out.textContent = stripped;
-          if (stripped.split("\\n").length > 10) {
-            out.classList.add("collapsed");
-            out.addEventListener("click", function () {
-              this.classList.remove("collapsed");
-            });
+          if (stripped.split("\n").length > 10) {
+            makeCollapsible(out);
           }
           var bdg = lastToolBlock.querySelector(".approval-badge");
           if (bdg) lastToolBlock.insertBefore(out, bdg);
@@ -1338,6 +1334,26 @@ function replayHistory(messages) {
     }
   }
   scrollToBottom();
+}
+
+function makeCollapsible(el) {
+  el.classList.add("collapsed");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("role", "button");
+  el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
+  var handler = function () {
+    this.classList.remove("collapsed");
+    this.removeAttribute("tabindex");
+    this.removeAttribute("role");
+    this.removeAttribute("aria-label");
+  };
+  el.addEventListener("click", handler);
+  el.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      handler.call(this);
+    }
+  });
 }
 
 // --- Inline tool/approval blocks ---
@@ -1354,6 +1370,7 @@ function buildToolDiv(item) {
   const div = document.createElement("div");
   div.className = "approval-tool";
   div.dataset.funcName = item.func_name || "";
+  div.dataset.callId = item.call_id || "";
 
   const name = document.createElement("div");
   name.className = "tool-name";
@@ -1503,20 +1520,32 @@ function appendToolOutputChunk(callId, chunk) {
   if (!stripped) return;
 
   // Find or create a streaming output element keyed by call_id
-  var el = messagesEl.querySelector(
-    '.tool-output-stream[data-call-id="' + callId + '"]',
-  );
+  var escapedId = callId ? CSS.escape(callId) : "";
+  var el = escapedId
+    ? messagesEl.querySelector(
+        '.tool-output-stream[data-call-id="' + escapedId + '"]',
+      )
+    : null;
   if (!el) {
-    // Find the last approval-block and last bash tool div inside it
-    var blocks = messagesEl.querySelectorAll(".approval-block");
-    if (!blocks.length) return;
-    var block = blocks[blocks.length - 1];
-    var tools = block.querySelectorAll('.approval-tool[data-func-name="bash"]');
-    var target = tools.length ? tools[tools.length - 1] : null;
+    // Primary: find the tool div matching this call_id
+    var target = escapedId
+      ? messagesEl.querySelector(
+          '.approval-tool[data-call-id="' + escapedId + '"]',
+        )
+      : null;
     if (!target) {
-      // Fallback to last tool div
-      var allTools = block.querySelectorAll(".approval-tool");
-      target = allTools.length ? allTools[allTools.length - 1] : null;
+      // Fallback: last bash tool in last approval-block
+      var blocks = messagesEl.querySelectorAll(".approval-block");
+      if (!blocks.length) return;
+      var block = blocks[blocks.length - 1];
+      var tools = block.querySelectorAll(
+        '.approval-tool[data-func-name="bash"]',
+      );
+      target = tools.length ? tools[tools.length - 1] : null;
+      if (!target) {
+        var allTools = block.querySelectorAll(".approval-tool");
+        target = allTools.length ? allTools[allTools.length - 1] : null;
+      }
     }
     if (!target) return;
 
@@ -1534,29 +1563,43 @@ function appendToolOutputChunk(callId, chunk) {
   scrollToBottom();
 }
 
-function appendToolOutput(name, output) {
-  // Find the last approval-block in messages
-  const blocks = messagesEl.querySelectorAll(".approval-block");
-  if (!blocks.length) return;
-  const block = blocks[blocks.length - 1];
-
-  // Find the matching tool div or use the last one
-  let target = null;
-  const tools = block.querySelectorAll(".approval-tool");
-  for (let i = tools.length - 1; i >= 0; i--) {
-    if (tools[i].dataset.funcName === name) {
-      target = tools[i];
-      break;
+function appendToolOutput(callId, name, output) {
+  var escapedId = callId ? CSS.escape(callId) : "";
+  // Primary: find tool div by call_id
+  var target = escapedId
+    ? messagesEl.querySelector(
+        '.approval-tool[data-call-id="' + escapedId + '"]',
+      )
+    : null;
+  // Fallback: last block, match by func_name
+  if (!target) {
+    const blocks = messagesEl.querySelectorAll(".approval-block");
+    if (!blocks.length) return;
+    const block = blocks[blocks.length - 1];
+    const tools = block.querySelectorAll(".approval-tool");
+    for (let i = tools.length - 1; i >= 0; i--) {
+      if (tools[i].dataset.funcName === name) {
+        target = tools[i];
+        break;
+      }
     }
+    if (!target && tools.length) target = tools[tools.length - 1];
   }
-  if (!target && tools.length) target = tools[tools.length - 1];
   if (!target) return;
 
-  // Remove the streaming output element adjacent to this tool
-  var streamEl = target.nextElementSibling;
-  if (streamEl && streamEl.classList.contains("tool-output-stream")) {
-    streamEl.remove();
+  // Remove the streaming output element for this tool
+  var streamEl = null;
+  if (escapedId) {
+    streamEl = messagesEl.querySelector(
+      '.tool-output-stream[data-call-id="' + escapedId + '"]',
+    );
+  } else {
+    var next = target.nextElementSibling;
+    if (next && next.classList.contains("tool-output-stream")) {
+      streamEl = next;
+    }
   }
+  if (streamEl) streamEl.remove();
 
   const stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
@@ -1566,28 +1609,8 @@ function appendToolOutput(name, output) {
   out.textContent = stripped;
 
   // Auto-collapse long output (keyboard-accessible)
-  const lineCount = stripped.split("\n").length;
-  if (lineCount > 10) {
-    out.classList.add("collapsed");
-    out.setAttribute("tabindex", "0");
-    out.setAttribute("role", "button");
-    out.setAttribute(
-      "aria-label",
-      "Tool output (collapsed). Activate to expand.",
-    );
-    var expandHandler = function () {
-      this.classList.remove("collapsed");
-      this.removeAttribute("tabindex");
-      this.removeAttribute("role");
-      this.removeAttribute("aria-label");
-    };
-    out.addEventListener("click", expandHandler);
-    out.addEventListener("keydown", function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        expandHandler.call(this);
-      }
-    });
+  if (stripped.split("\n").length > 10) {
+    makeCollapsible(out);
   }
 
   // Insert after the target tool div

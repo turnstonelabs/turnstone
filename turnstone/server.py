@@ -151,6 +151,7 @@ class WebUI:
         for item in items:
             serialized.append(
                 {
+                    "call_id": item.get("call_id", ""),
                     "header": item.get("header", ""),
                     "preview": item.get("preview", ""),
                     "func_name": item.get("func_name", ""),
@@ -199,14 +200,14 @@ class WebUI:
 
         return approved, feedback
 
-    def on_tool_result(self, name: str, output: str) -> None:
+    def on_tool_result(self, call_id: str, name: str, output: str) -> None:
         _metrics.record_tool_call(name)
         with self._ws_lock:
             self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
             self._ws_current_activity = ""
             self._ws_activity_state = ""
         self._broadcast_activity()
-        self._enqueue({"type": "tool_result", "name": name, "output": output})
+        self._enqueue({"type": "tool_result", "call_id": call_id, "name": name, "output": output})
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         self._enqueue({"type": "tool_output_chunk", "call_id": call_id, "chunk": chunk})
@@ -284,6 +285,7 @@ def _build_history(
         if msg.get("tool_calls"):
             entry["tool_calls"] = [
                 {
+                    "id": tc.get("id", ""),
                     "name": tc["function"]["name"],
                     "arguments": tc["function"].get("arguments", ""),
                 }

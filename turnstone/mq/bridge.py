@@ -449,6 +449,7 @@ class Bridge:
                 ws_id,
                 ToolResultEvent(
                     ws_id=ws_id,
+                    call_id=data.get("call_id", ""),
                     name=data.get("name", ""),
                     output=data.get("output", ""),
                 ),
@@ -484,7 +485,7 @@ class Bridge:
                 return
             approve_set = self._ws_approve_tools.get(ws_id, DEFAULT_SAFE_TOOLS)
 
-        tool_names = {it.get("name", "") for it in items if it.get("needs_approval")}
+        tool_names = {it.get("func_name", "") for it in items if it.get("needs_approval")}
 
         if tool_names and tool_names.issubset(approve_set):
             self._api_approve(ws_id, approved=True)
