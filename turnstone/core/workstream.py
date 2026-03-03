@@ -79,6 +79,8 @@ class WorkstreamManager:
                 capacity, ``create()`` will auto-evict the oldest IDLE
                 workstream before raising.
         """
+        if max_workstreams < 1:
+            raise ValueError(f"max_workstreams must be >= 1, got {max_workstreams}")
         self._session_factory: Callable[[SessionUI | None, str | None], ChatSession] = (
             session_factory
         )
@@ -119,16 +121,17 @@ class WorkstreamManager:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
         """
-        ws = Workstream(name=name)
-        if ui_factory:
-            ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui, model)
         evicted_ws: Workstream | None = None
         with self._lock:
             if len(self._workstreams) >= self._max_workstreams:
                 evicted_ws = self._evict_oldest_idle_locked()
                 if evicted_ws is None:
                     raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
+        ws = Workstream(name=name)
+        if ui_factory:
+            ws.ui = ui_factory(ws.id)
+        ws.session = self._session_factory(ws.ui, model)
+        with self._lock:
             self._workstreams[ws.id] = ws
             self._order.append(ws.id)
             if self._active_id is None:

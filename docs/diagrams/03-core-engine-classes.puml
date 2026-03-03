@@ -126,8 +126,6 @@ class "WorkstreamManager" as WsMgr {
     + set_state(ws_id, state)
     + close_idle(max_age_seconds)
     - _max_workstreams: int
-    --
-    MAX_WORKSTREAMS = 10
 }
 
 ' Workstream
@@ -234,7 +232,7 @@ class "RateLimiter" as RateLimiter {
     - _rate: float
     - _burst: int
     --
-    + check(client_ip: str) → (bool, float)
+    + check(client_ip: str, path: str) → (bool, float)
     --
     Per-IP token bucket.
     Returns (allowed, retry_after).
@@ -249,7 +247,8 @@ class "TokenBucket" as TokenBucket {
     - _burst: int
     - _last_refill: float
     --
-    + consume() → (bool, float)
+    + consume() → bool
+    + retry_after: float {property}
     --
     Single-IP bucket with
     refill rate and burst cap.

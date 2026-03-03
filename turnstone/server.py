@@ -28,6 +28,7 @@ from urllib.parse import ParseResult, parse_qs, urlparse
 
 from openai import OpenAI
 
+from turnstone import __version__
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
@@ -568,15 +569,16 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         _t0 = time.monotonic()
         self._response_status = 200
+        parsed_path = urlparse(self.path).path
         try:
-            if not self._check_auth("POST", self.path):
+            if not self._check_auth("POST", parsed_path):
                 return
-            if not self._check_rate_limit(self.path):
+            if not self._check_rate_limit(parsed_path):
                 return
             self._do_POST()
         finally:
             _metrics.record_request(
-                "POST", self.path, self._response_status, time.monotonic() - _t0
+                "POST", parsed_path, self._response_status, time.monotonic() - _t0
             )
 
     def _do_POST(self) -> None:  # noqa: N802
@@ -765,9 +767,10 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
     def _handle_health(self) -> None:
         """Return server health status as JSON.
 
-        Returns ``"status": "degraded"`` when the LLM backend is unreachable
-        (circuit breaker open).  HTTP status is always 200 — the server itself
-        is running; only the backend is unavailable.
+        Returns ``"status": "degraded"`` when the LLM backend is unhealthy
+        (circuit breaker not CLOSED, i.e. OPEN or HALF_OPEN).  HTTP status
+        is always 200 — the server itself is running; only the backend may
+        be unavailable.
         """
         mgr: WorkstreamManager = self.server.workstreams  # type: ignore[attr-defined]
         wss = mgr.list_all()
@@ -785,7 +788,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
         backend_ok = monitor.is_healthy if monitor else True
         data: dict[str, Any] = {
             "status": "ok" if backend_ok else "degraded",
-            "version": "0.2.1",
+            "version": __version__,
             "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
             "model": _metrics.model,
             "workstreams": {"total": len(wss), **states},

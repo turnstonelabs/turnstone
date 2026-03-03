@@ -147,7 +147,9 @@ class MetricsCollector:
         # turnstone_build_info
         lines.append("# HELP turnstone_build_info Server version and model info")
         lines.append("# TYPE turnstone_build_info gauge")
-        lines.append(f'turnstone_build_info{{version="0.2.1",model="{model}"}} 1')
+        from turnstone import __version__
+
+        lines.append(f'turnstone_build_info{{version="{__version__}",model="{model}"}} 1')
 
         # turnstone_uptime_seconds
         gauge("turnstone_uptime_seconds", "Server uptime in seconds", uptime)

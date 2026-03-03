@@ -50,6 +50,10 @@ class RateLimiter:
         rate: float = 10.0,
         burst: int = 20,
     ) -> None:
+        if enabled and rate <= 0:
+            raise ValueError(f"rate must be > 0 when enabled, got {rate}")
+        if enabled and burst < 1:
+            raise ValueError(f"burst must be >= 1 when enabled, got {burst}")
         self.enabled = enabled
         self.rate = rate
         self.burst = burst

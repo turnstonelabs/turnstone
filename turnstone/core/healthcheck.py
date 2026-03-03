@@ -115,7 +115,7 @@ class BackendHealthMonitor:
 
     @property
     def should_allow_request(self) -> bool:
-        """False only if circuit is OPEN (fast-fail).  HALF_OPEN allows one probe."""
+        """False only if circuit is OPEN (fast-fail).  HALF_OPEN allows requests through."""
         with self._lock:
             if self._state == CircuitState.OPEN:
                 # Check if cooldown has elapsed -> transition to HALF_OPEN
