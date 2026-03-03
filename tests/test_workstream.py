@@ -155,13 +155,16 @@ class TestManagerCreation:
         ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
         assert ws.name.startswith("ws-")
 
-    def test_create_max_workstreams(self):
-        mgr = WorkstreamManager(_fake_factory)
-        mgr.MAX_WORKSTREAMS = 3
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        with pytest.raises(RuntimeError, match="Maximum"):
+    def test_create_max_workstreams_all_active(self):
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
+        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws3 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        # Mark all as non-idle so eviction cannot help
+        mgr.set_state(ws1.id, WorkstreamState.THINKING)
+        mgr.set_state(ws2.id, WorkstreamState.RUNNING)
+        mgr.set_state(ws3.id, WorkstreamState.ATTENTION)
+        with pytest.raises(RuntimeError, match="All 3 workstreams are active"):
             mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
 
@@ -314,6 +317,66 @@ class TestManagerClose:
 
 
 # ---------------------------------------------------------------------------
+# WorkstreamManager — auto-eviction
+# ---------------------------------------------------------------------------
+
+
+class TestManagerEviction:
+    def test_evict_oldest_idle_on_create(self):
+        """At capacity with idle workstreams, create() succeeds by evicting the oldest idle."""
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
+        ws1 = mgr.create(name="oldest", ui_factory=lambda wid: FakeUI(wid))
+        ws2 = mgr.create(name="middle", ui_factory=lambda wid: FakeUI(wid))
+        _ws3 = mgr.create(name="newest", ui_factory=lambda wid: FakeUI(wid))
+        # All three are IDLE.  Mark ws2 as RUNNING so it won't be evicted.
+        mgr.set_state(ws2.id, WorkstreamState.RUNNING)
+        # ws1 is oldest idle, ws3 is newer idle.  Creating should evict ws1.
+        ws4 = mgr.create(name="four", ui_factory=lambda wid: FakeUI(wid))
+        assert mgr.count == 3
+        assert mgr.get(ws1.id) is None, "oldest idle should have been evicted"
+        assert mgr.get(ws4.id) is ws4
+        # Creation order should reflect the eviction
+        names = [w.name for w in mgr.list_all()]
+        assert "oldest" not in names
+        assert names == ["middle", "newest", "four"]
+
+    def test_create_fails_when_all_active(self):
+        """At capacity with ALL non-idle workstreams, create() raises RuntimeError."""
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
+        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.set_state(ws1.id, WorkstreamState.THINKING)
+        mgr.set_state(ws2.id, WorkstreamState.RUNNING)
+        with pytest.raises(RuntimeError, match="All 2 workstreams are active"):
+            mgr.create(ui_factory=lambda wid: FakeUI(wid))
+
+    def test_configurable_max(self):
+        """Constructor accepts max_workstreams param and respects it."""
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
+        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.set_state(ws1.id, WorkstreamState.RUNNING)
+        mgr.set_state(ws2.id, WorkstreamState.RUNNING)
+        with pytest.raises(RuntimeError):
+            mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        assert mgr.count == 2
+
+    def test_eviction_counter(self):
+        """eviction_count increments on each auto-eviction."""
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
+        assert mgr.eviction_count == 0
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        # Both IDLE — create should evict the oldest
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        assert mgr.eviction_count == 1
+        # Again — evict another idle one
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        assert mgr.eviction_count == 2
+        assert mgr.count == 2
+
+
+# ---------------------------------------------------------------------------
 # WorkstreamManager — state management
 # ---------------------------------------------------------------------------
 
@@ -357,15 +420,16 @@ class TestManagerState:
 
 class TestManagerThreadSafety:
     def test_concurrent_create_respects_max(self):
-        """Multiple threads creating workstreams should not exceed MAX."""
-        mgr = WorkstreamManager(_fake_factory)
-        mgr.MAX_WORKSTREAMS = 5
+        """Multiple threads creating workstreams should not exceed max."""
+        mgr = WorkstreamManager(_fake_factory, max_workstreams=5)
         errors = []
         created = []
 
         def do_create():
             try:
                 ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+                # Mark as non-idle immediately so auto-eviction cannot reclaim it
+                mgr.set_state(ws.id, WorkstreamState.RUNNING)
                 created.append(ws.id)
             except RuntimeError:
                 errors.append(True)

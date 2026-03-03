@@ -409,6 +409,25 @@ body {
   background: var(--red);
   box-shadow: 0 0 4px var(--red-glow);
 }
+.node-cell-name .node-dot.degraded {
+  background: var(--accent);
+  box-shadow: 0 0 4px var(--accent-glow-strong);
+}
+.node-degraded-badge {
+  font-size: 9px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  padding: 0 5px;
+  margin-left: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  flex-shrink: 0;
+}
 .node-cell-num {
   color: var(--fg-dim);
   font-size: 11px;
@@ -715,7 +734,7 @@ body {
   .csb-state, .node-row, .node-group-header, .dash-row { transition: none; }
   .header-btn, .node-link, .dash-cell-node,
   #login-box input, #login-box button,
-  .pagination button { transition: none; }
+  .pagination button, #toast { transition: none; }
 }
 
 /* ==========================================================================
@@ -886,3 +905,34 @@ body {
 }
 .kb-section:first-child { margin-top: 0; }
 #kb-box .kb-hint { color: var(--fg-dim); font-size: 11px; text-align: center; margin-top: 16px; font-family: var(--font-display); }
+
+/* ==========================================================================
+   Toast notification
+   ========================================================================== */
+#toast {
+  position: fixed;
+  bottom: 56px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: var(--bg-elevated);
+  color: var(--fg-bright);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px 20px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  z-index: 200;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.4);
+  white-space: nowrap;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#toast.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}

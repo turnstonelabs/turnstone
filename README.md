@@ -115,6 +115,8 @@ turnstone/
 │   ├── config.py      # Unified TOML config (~/.config/turnstone/config.toml)
 │   ├── memory.py      # SQLite persistence (memories, conversations, FTS5)
 │   ├── metrics.py     # Prometheus-compatible metrics collector
+│   ├── healthcheck.py # Backend health monitor + circuit breaker
+│   ├── ratelimit.py   # Per-IP token-bucket rate limiter
 │   ├── edit.py        # File editing (fuzzy match, indentation)
 │   ├── safety.py      # Path validation, sandbox checks
 │   ├── sandbox.py     # Command sandboxing
@@ -287,6 +289,7 @@ skip_permissions = false
 [server]
 host = "0.0.0.0"
 port = 8080
+max_workstreams = 10       # auto-evicts oldest idle when full
 
 [redis]
 host = "localhost"
@@ -302,6 +305,17 @@ host = "0.0.0.0"
 port = 8090
 url = "http://localhost:8090"  # used by CLI /cluster commands
 poll_interval = 10
+
+[health]
+backend_probe_interval = 30
+backend_probe_timeout = 5
+circuit_breaker_threshold = 5
+circuit_breaker_cooldown = 60
+
+[ratelimit]
+enabled = true
+requests_per_second = 10.0
+burst = 20
 
 [mcp]
 config_path = ""       # path to MCP JSON config file (alternative to TOML sections)
@@ -338,8 +352,23 @@ Idle workstreams are automatically cleaned up after 2 hours (configurable). In m
 - `turnstone_workstream_context_ratio{ws_id}` — per-workstream context utilization
 - `turnstone_http_request_duration_seconds` — request latency histogram
 - `turnstone_workstreams_by_state{state}` — workstream state gauges
+- `turnstone_sse_connections_active` — current open SSE connections
+- `turnstone_ratelimit_rejected_total` — requests rejected by rate limiter
+- `turnstone_backend_up` — LLM backend reachability (0/1)
+- `turnstone_circuit_state` — circuit breaker state (0=closed, 1=open, 2=half_open)
+- `turnstone_workstreams_evicted_total` — workstreams auto-evicted at capacity
 
 Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
+
+### Health & Rate Limiting
+
+**Health degradation.** A background `BackendHealthMonitor` probes the LLM backend every `backend_probe_interval` seconds. When the backend is unreachable, `/health` reports `"status": "degraded"` (HTTP 200) and the `turnstone_backend_up` gauge drops to 0.
+
+**Circuit breaker.** After `circuit_breaker_threshold` consecutive probe failures the circuit opens (CLOSED -> OPEN). While open, `ChatSession._create_stream_with_retry` skips the backend entirely and returns an error. After `circuit_breaker_cooldown` seconds the circuit enters HALF_OPEN, allowing a single probe. A successful probe closes the circuit; a failure re-opens it.
+
+**Per-IP rate limiting.** When `[ratelimit].enabled` is true, each client IP is tracked with a token-bucket limiter (`requests_per_second` / `burst`). Rate limiting is applied in `do_GET`/`do_POST` after authentication but before route dispatch. `/health` and `/metrics` are exempt. Requests that exceed the limit receive HTTP 429 with a `Retry-After` header.
+
+**Workstream eviction.** When `WorkstreamManager.create()` would exceed `max_workstreams`, the oldest IDLE workstream is automatically evicted and the `turnstone_workstreams_evicted_total` counter is incremented. Configure via `[server].max_workstreams` (default 10).
 
 ## Requirements
 
