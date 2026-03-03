@@ -690,24 +690,11 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
 # ─── Model auto-detection ─────────────────────────────────────────────────
 
 
-def detect_model(client: OpenAI) -> str:
-    """Auto-detect the model from vLLM's /v1/models endpoint."""
-    try:
-        models = client.models.list()
-        model_ids = [m.id for m in models.data]
-        if not model_ids:
-            print(red("No models found at server. Use --model to specify."))
-            sys.exit(1)
-        if len(model_ids) == 1:
-            return model_ids[0]
-        # Multiple models -- pick first, but inform user
-        print(f"Available models: {', '.join(model_ids)}")
-        print(f"Using: {bold(model_ids[0])} (override with --model)")
-        return model_ids[0]
-    except Exception as e:
-        print(red(f"Could not connect to server: {e}"))
-        print("Is vLLM running? Start it or use --base-url to point elsewhere.")
-        sys.exit(1)
+def detect_model(client: OpenAI) -> tuple[str, int | None]:
+    """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`."""
+    from turnstone.core.model_registry import detect_model as _detect
+
+    return _detect(client)
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
@@ -715,7 +702,7 @@ def detect_model(client: OpenAI) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Interactive CLI for vLLM models with tool calling.",
+        description="Interactive CLI for OpenAI-compatible models with tool calling.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -727,7 +714,7 @@ def main() -> None:
     parser.add_argument(
         "--base-url",
         default="http://localhost:8000/v1",
-        help="vLLM API base URL (default: http://localhost:8000/v1)",
+        help="OpenAI-compatible API base URL (default: http://localhost:8000/v1)",
     )
     parser.add_argument(
         "--model",
@@ -851,7 +838,16 @@ def main() -> None:
         base_url=args.base_url,
         api_key=api_key,
     )
-    model = args.model or detect_model(client)
+    if args.model:
+        model = args.model
+        detected_ctx = None
+    else:
+        model, detected_ctx = detect_model(client)
+
+    # Use detected context window when the user hasn't explicitly set one
+    context_window = args.context_window
+    if detected_ctx and context_window == 131072:  # default unchanged
+        context_window = detected_ctx
 
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry
@@ -860,7 +856,7 @@ def main() -> None:
         base_url=args.base_url,
         api_key=api_key,
         model=model,
-        context_window=args.context_window,
+        context_window=context_window,
     )
 
     # Initialize MCP client (connects to configured MCP servers, if any)

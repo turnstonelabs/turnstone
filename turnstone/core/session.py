@@ -595,7 +595,7 @@ class ChatSession:
         """Stream response, dispatching tokens to the UI as they arrive.
 
         Handles two reasoning delivery mechanisms:
-        1. vLLM's `reasoning_content` field (when --reasoning-parser is set)
+        1. The `reasoning_content` field (e.g. vLLM with --reasoning-parser)
         2. <think>...</think> tags in regular content (common default)
 
         Calls self.ui.on_thinking_stop() on the first received delta.
@@ -715,7 +715,7 @@ class ChatSession:
                 if parts:
                     self.ui.on_info(f"{GRAY}[delta: {', '.join(parts)}]{RESET}")
 
-            # Path 1: reasoning field (vLLM sends as "reasoning" or "reasoning_content")
+            # Path 1: reasoning field (sent as "reasoning" or "reasoning_content")
             rc = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
             if rc:
                 _stop_spinner_once()
