@@ -823,6 +823,8 @@ function renderDashboardTable(wsList, agg) {
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
     var ariaLabel = liveName + " \u2014 " + sd.label;
+    if (ws.model_alias || ws.model)
+      ariaLabel += ", model: " + (ws.model_alias || ws.model);
     if (ws.title) ariaLabel += ", task: " + ws.title;
     if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
     if (ws.context_ratio > 0)
@@ -855,10 +857,18 @@ function renderDashboardTable(wsList, agg) {
     nameCell.textContent = liveName;
     main.appendChild(nameCell);
 
+    // MODEL cell
+    var modelCell = document.createElement("span");
+    modelCell.className = "dash-cell-model";
+    modelCell.textContent = ws.model_alias || ws.model || "";
+    if (ws.model) modelCell.title = ws.model;
+    main.appendChild(modelCell);
+
     // NODE cell
     var nodeCell = document.createElement("span");
     nodeCell.className = "dash-cell-node";
     nodeCell.textContent = ws.node || "local";
+    if (ws.node) nodeCell.title = ws.node;
     main.appendChild(nodeCell);
 
     // TASK cell
@@ -1224,7 +1234,8 @@ function handleEvent(evt) {
       break;
 
     case "connected":
-      modelName.textContent = evt.model || "";
+      modelName.textContent = evt.model_alias || evt.model || "";
+      modelName.title = evt.model || "";
       if (evt.skip_permissions) {
         var existing = document.querySelector(".skip-permissions-warning");
         if (!existing) {

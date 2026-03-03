@@ -423,6 +423,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 {
                     "type": "connected",
                     "model": session.model,
+                    "model_alias": session.model_alias or "",
                     "skip_permissions": ui.auto_approve,
                 }
             )
@@ -667,6 +668,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 ws = mgr.create(
                     name=body.get("name", ""),
                     ui_factory=lambda wid: WebUI(ws_id=wid),
+                    model=body.get("model") or None,
                 )
                 assert isinstance(ws.ui, WebUI)
                 if skip or body.get("auto_approve", False):
@@ -776,6 +778,8 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     "activity_state": activity_state,
                     "tool_calls": tc,
                     "node": "local",
+                    "model": ws.session.model if ws.session else "",
+                    "model_alias": ws.session.model_alias if ws.session else "",
                 }
             )
         uptime_sec = round(time.monotonic() - _metrics.start_time)
@@ -1057,15 +1061,23 @@ def main() -> None:
 
     prune_sessions(retention_days=args.session_retention_days, log_fn=print)
 
-    # Create OpenAI client
+    # Create OpenAI client and detect model
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "dummy"
     client = OpenAI(
         base_url=args.base_url,
         api_key=api_key,
     )
-
-    # Detect or use provided model
     model = args.model or detect_model(client)
+
+    # Build model registry (reads [models.*] sections from config.toml)
+    from turnstone.core.model_registry import load_model_registry
+
+    registry = load_model_registry(
+        base_url=args.base_url,
+        api_key=api_key,
+        model=model,
+        context_window=args.context_window,
+    )
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
@@ -1079,23 +1091,26 @@ def main() -> None:
     WebUI._global_queue = global_queue
 
     # Session factory — captures shared config
-    def session_factory(ui: SessionUI | None) -> ChatSession:
+    def session_factory(ui: SessionUI | None, model_alias: str | None = None) -> ChatSession:
         assert ui is not None
+        r_client, r_model, r_cfg = registry.resolve(model_alias)
         return ChatSession(
-            client=client,
-            model=model,
+            client=r_client,
+            model=r_model,
             ui=ui,
             instructions=args.instructions,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             tool_timeout=args.tool_timeout,
             reasoning_effort=args.reasoning_effort,
-            context_window=args.context_window,
+            context_window=r_cfg.context_window,
             compact_max_tokens=args.compact_max_tokens,
             auto_compact_pct=args.auto_compact_pct,
             agent_max_turns=args.agent_max_turns,
             tool_truncation=args.tool_truncation,
             mcp_client=mcp_client,
+            registry=registry,
+            model_alias=model_alias or registry.default,
         )
 
     # Create workstream manager and initial workstream
@@ -1159,6 +1174,9 @@ def main() -> None:
 
     print(f"turnstone web server running on http://{args.host}:{args.port}")
     print(f"Model: {model}")
+    if registry.count > 1:
+        others = [a for a in registry.list_aliases() if a != registry.default]
+        print(f"Models: {registry.default} (default), {', '.join(others)}")
     if mcp_client:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
@@ -1171,6 +1189,7 @@ def main() -> None:
         print("\nShutting down.")
         if mcp_client:
             mcp_client.shutdown()
+        registry.shutdown()
         server.shutdown()
 
 

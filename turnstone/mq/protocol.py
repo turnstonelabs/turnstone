@@ -93,6 +93,7 @@ class CreateWorkstreamMessage(InboundMessage):
     auto_approve: bool = False
     auto_approve_tools: list[str] = field(default_factory=list)
     target_node: str = ""
+    model: str = ""
 
 
 @dataclass

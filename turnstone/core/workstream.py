@@ -67,15 +67,18 @@ class WorkstreamManager:
 
     def __init__(
         self,
-        session_factory: Callable[[SessionUI | None], ChatSession],
+        session_factory: Callable[[SessionUI | None, str | None], ChatSession],
     ):
         """
         Args:
-            session_factory: callable(ui) -> ChatSession.  Captures shared
-                config (client, model, temperature, …) so the manager can
-                create sessions without knowing those details.
+            session_factory: callable(ui, model_alias) -> ChatSession.
+                Captures shared config (registry, temperature, …) so the
+                manager can create sessions without knowing those details.
+                *model_alias* selects a model from the registry (None = default).
         """
-        self._session_factory: Callable[[SessionUI | None], ChatSession] = session_factory
+        self._session_factory: Callable[[SessionUI | None, str | None], ChatSession] = (
+            session_factory
+        )
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []  # creation order
         self._active_id: str | None = None
@@ -88,12 +91,18 @@ class WorkstreamManager:
         self,
         name: str = "",
         ui_factory: Callable[..., SessionUI] | None = None,
+        model: str | None = None,
     ) -> Workstream:
-        """Create a new workstream.  Returns the new ws."""
+        """Create a new workstream.  Returns the new ws.
+
+        Args:
+            model: Optional model alias from the registry.  ``None`` uses the
+                default model.
+        """
         ws = Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui)
+        ws.session = self._session_factory(ws.ui, model)
         with self._lock:
             if len(self._workstreams) >= self.MAX_WORKSTREAMS:
                 raise RuntimeError(f"Maximum of {self.MAX_WORKSTREAMS} workstreams reached")

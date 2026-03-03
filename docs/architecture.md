@@ -35,6 +35,7 @@ turnstone/
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
+    model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         SQLite persistence (conversations, memories, FTS5 search)
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     edit.py           File edit utilities (find_occurrences, pick_nearest)
@@ -466,6 +467,47 @@ at connection time (server names with `__` are rejected).
 **Error isolation:** Per-server connection failures are caught and logged; other
 servers still connect. Tool execution errors return error strings to the LLM
 rather than crashing the session.
+
+### Multi-Model Registry
+
+`ModelRegistry` (`turnstone/core/model_registry.py`) manages named model
+configurations so workstreams can use different LLM backends.
+
+**Config format:**
+```toml
+[models.local]
+base_url = "http://localhost:8000/v1"
+model = "qwen3-32b"
+
+[models.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+model = "gpt-4o"
+context_window = 128000
+
+[model]
+default = "local"
+fallback = ["openai"]
+agent_model = "local"
+```
+
+**Lifecycle:**
+1. `load_model_registry()` reads `[models.*]` sections from config.toml and
+   builds a `"default"` entry from CLI `--base-url`/`--model`/`--api-key` args
+2. The registry is passed to the session factory closure in both `cli.py` and
+   `server.py`; each workstream resolves its model on creation
+3. `ModelRegistry.get_client()` lazily creates `OpenAI` client instances
+   (thread-safe via `_client_lock`)
+4. `/model` command shows available models; `/model <alias>` switches the
+   active workstream's client, model, and context window
+5. `_create_stream_with_retry()` tries the primary model, then each fallback
+   alias in order if the primary is unreachable
+6. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task
+   sub-agents, allowing a cheaper model for autonomous loops
+
+**Per-workstream selection:** `POST /api/workstreams/new` accepts an optional
+`"model"` field. The bridge `CreateWorkstreamMessage` carries the same field
+through the MQ protocol.
 
 ### Tool Output Truncation
 
