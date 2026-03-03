@@ -173,10 +173,26 @@ function submitLogin() {
           if (wsIds.length) {
             currentWsId = wsIds[0];
             renderTabBar();
-            connectContentSSE(currentWsId);
           }
           connectGlobalSSE();
-          showDashboard();
+          var params = new URLSearchParams(location.search);
+          var targetWs = params.get("ws_id");
+          if (targetWs && workstreams[targetWs]) {
+            history.replaceState(
+              { turnstone: "workstream", wsId: targetWs },
+              "",
+              location.pathname,
+            );
+            switchTab(targetWs);
+          } else {
+            if (currentWsId) connectContentSSE(currentWsId);
+            history.replaceState(
+              { turnstone: "dashboard" },
+              "",
+              location.pathname,
+            );
+            showDashboard();
+          }
         });
     })
     .catch(function (err) {
@@ -1886,17 +1902,27 @@ authFetch("/api/workstreams")
     data.workstreams.forEach(function (ws) {
       workstreams[ws.id] = { name: ws.name, state: ws.state };
     });
-    // Default to first workstream
     var wsIds = Object.keys(workstreams);
     if (wsIds.length) {
       currentWsId = wsIds[0];
       renderTabBar();
-      connectContentSSE(currentWsId);
     }
     connectGlobalSSE();
-    // Seed the history stack so back-from-workstream returns here.
-    history.replaceState({ turnstone: "dashboard" }, "");
-    showDashboard();
+    // Deep linking: check for ?ws_id= query parameter
+    var params = new URLSearchParams(location.search);
+    var targetWs = params.get("ws_id");
+    if (targetWs && workstreams[targetWs]) {
+      history.replaceState(
+        { turnstone: "workstream", wsId: targetWs },
+        "",
+        location.pathname,
+      );
+      switchTab(targetWs);
+    } else {
+      if (currentWsId) connectContentSSE(currentWsId);
+      history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
+      showDashboard();
+    }
   });
 
 // Back/forward button: retrace dashboard → tab1 → tab2 navigation.
