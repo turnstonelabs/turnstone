@@ -368,23 +368,50 @@ def prune_sessions(
         conn = open_db()
         try:
             # 1. Remove sessions that have no messages at all.
-            cur = conn.execute(
-                "DELETE FROM sessions "
-                "WHERE NOT EXISTS "
-                "  (SELECT 1 FROM conversations c WHERE c.session_id = sessions.session_id)"
-            )
-            orphans = cur.rowcount
+            orphan_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT session_id FROM sessions "
+                    "WHERE NOT EXISTS "
+                    "  (SELECT 1 FROM conversations c "
+                    "   WHERE c.session_id = sessions.session_id)"
+                ).fetchall()
+            ]
+            if orphan_ids:
+                placeholders = ",".join("?" * len(orphan_ids))
+                conn.execute(
+                    f"DELETE FROM session_config WHERE session_id IN ({placeholders})",
+                    orphan_ids,
+                )
+                cur = conn.execute(
+                    f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                    orphan_ids,
+                )
+                orphans = cur.rowcount
 
             # 2. Remove old unnamed sessions.
             if retention_days > 0:
                 cutoff = (datetime.utcnow() - timedelta(days=retention_days)).strftime(
                     "%Y-%m-%dT%H:%M:%S"
                 )
-                cur = conn.execute(
-                    "DELETE FROM sessions WHERE alias IS NULL AND updated < ?",
-                    (cutoff,),
-                )
-                stale = cur.rowcount
+                stale_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT session_id FROM sessions WHERE alias IS NULL AND updated < ?",
+                        (cutoff,),
+                    ).fetchall()
+                ]
+                if stale_ids:
+                    placeholders = ",".join("?" * len(stale_ids))
+                    conn.execute(
+                        f"DELETE FROM session_config WHERE session_id IN ({placeholders})",
+                        stale_ids,
+                    )
+                    cur = conn.execute(
+                        f"DELETE FROM sessions WHERE session_id IN ({placeholders})",
+                        stale_ids,
+                    )
+                    stale = cur.rowcount
 
             conn.commit()
         finally:

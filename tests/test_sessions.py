@@ -523,3 +523,26 @@ class TestPruneSessions:
         _orphans, stale = prune_sessions(retention_days=30)
         assert stale == 0
         assert len(list_sessions()) == 1
+
+    def test_prune_removes_session_config(self, tmp_db):
+        """Pruning orphan/stale sessions should also remove their config rows."""
+        register_session("orphan_cfg")
+        save_session_config("orphan_cfg", {"temperature": "0.5"})
+
+        register_session("stale_cfg")
+        save_message("stale_cfg", "user", "old")
+        save_session_config("stale_cfg", {"temperature": "0.9"})
+        conn = open_db()
+        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'stale_cfg'")
+        conn.commit()
+        conn.close()
+
+        # Both should have config before prune
+        assert load_session_config("orphan_cfg") == {"temperature": "0.5"}
+        assert load_session_config("stale_cfg") == {"temperature": "0.9"}
+
+        prune_sessions(retention_days=30)
+
+        # Config rows should be cleaned up
+        assert load_session_config("orphan_cfg") == {}
+        assert load_session_config("stale_cfg") == {}

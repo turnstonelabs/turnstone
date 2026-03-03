@@ -251,8 +251,8 @@ class ChatSession:
                 self.reasoning_effort = config["reasoning_effort"]
             if "max_tokens" in config:
                 self.max_tokens = int(config["max_tokens"])
-            if config.get("instructions"):
-                self.instructions = config["instructions"]
+            if "instructions" in config:
+                self.instructions = config["instructions"] or None
             if "creative_mode" in config:
                 self.creative_mode = config["creative_mode"] == "True"
             self._init_system_messages()
@@ -2562,6 +2562,7 @@ class ChatSession:
             self._session_id = uuid.uuid4().hex[:12]
             self._title_generated = False
             register_session(self._session_id)
+            self._save_config()
             self.ui.on_info("New session started.")
 
         elif cmd == "/sessions":
