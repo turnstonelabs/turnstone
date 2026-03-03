@@ -666,12 +666,14 @@ class Bridge:
 
 def _iter_sse_data(resp: httpx.Response) -> Iterator[dict[str, Any]]:
     """Yield parsed JSON dicts from an SSE stream."""
-    for line in resp.iter_lines():
-        if line.startswith("data: "):
+    from httpx_sse import EventSource
+
+    source = EventSource(resp)
+    for sse in source.iter_sse():
+        if sse.data:
             with contextlib.suppress(json.JSONDecodeError):
-                data: dict[str, Any] = json.loads(line[6:])
+                data: dict[str, Any] = json.loads(sse.data)
                 yield data
-        # SSE keepalive comments (lines starting with ':') are ignored
 
 
 # ---------------------------------------------------------------------------

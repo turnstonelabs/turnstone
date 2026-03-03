@@ -785,33 +785,48 @@ stderr so it does not interfere with readline. Tool execution may use a
 ### Server
 
 ```
-ThreadedHTTPServer (ThreadingMixIn + HTTPServer, daemon_threads=True)
+Starlette ASGI app (served by uvicorn)
   |
-  +-- Thread per HTTP request
-  |     POST /api/send      -> worker thread per workstream
+  +-- Async request handlers
+  |     POST /api/send      -> starts worker thread per workstream
   |     POST /api/approve   -> unblocks WebUI._approval_event
   |     POST /api/plan      -> unblocks WebUI._plan_event
   |     POST /api/workstreams/new -> creates workstream + worker
-  |     GET  /api/events    -> SSE long-poll (per workstream)
-  |     GET  /api/events/global -> SSE long-poll (fan-out)
+  |     GET  /api/events    -> SSE via EventSourceResponse (per workstream)
+  |     GET  /api/events/global -> SSE via EventSourceResponse (fan-out)
   |
-  +-- Worker thread per workstream
-  |     Runs session.send() in a loop
-  |     Blocks on WebUI._approval_event / _plan_event
+  +-- ASGI middleware stack
+  |     MetricsMiddleware -> CORSMiddleware -> AuthMiddleware -> RateLimitMiddleware
   |
-  +-- Global SSE fan-out
-        WebUI._global_queue shared across all WebUI instances
-        Global SSE endpoint drains this queue
+  +-- Worker thread per workstream (daemon)
+  |     Runs session.send() synchronously -- ChatSession is fully blocking
+  |     Blocks on WebUI._approval_event / _plan_event (threading.Event)
+  |
+  +-- Background daemon threads
+        Global SSE fan-out: reads global_queue, copies to per-client queues
+        Idle cleanup: closes stale workstreams, cleans rate limiter buckets
 ```
 
-`ThreadingMixIn` ensures each HTTP request (including long-lived SSE
-connections) gets its own thread. This is necessary because SSE connections
-block indefinitely, and POST requests must be handled concurrently.
+Starlette handles all HTTP routing, CORS, and middleware. uvicorn runs
+the ASGI application with async request handling. SSE endpoints use
+`EventSourceResponse` from `sse-starlette` with async generators that
+bridge sync `queue.Queue` via `asyncio.get_running_loop().run_in_executor()`.
+
+`ChatSession.send()` remains synchronous, running in daemon worker threads.
+WebUI keeps `threading.Event` and `queue.Queue` primitives (unchanged from
+the sync era). The `_global_fanout_thread` and `_idle_cleanup_thread` remain
+as daemon threads since they interact with sync primitives. A lifespan
+context manager handles startup/shutdown (health monitor, MCP client,
+registry).
 
 Each workstream's `WebUI` has:
-- `_event_queue` (per-workstream SSE events)
+- `_event_queue` (per-workstream SSE events, `queue.Queue`)
 - `_approval_event` / `_plan_event` (`threading.Event` for blocking)
 - `_global_queue` (class variable, shared, for state broadcasts)
+
+The SSE handlers bridge these sync queues to async via
+`run_in_executor()`, polling `queue.Queue.get(timeout=1)` while
+`sse-starlette` handles keepalive pings automatically.
 
 ### Workstream Threading (CLI)
 
@@ -843,7 +858,8 @@ bell + status line to stderr to alert the user.
 Main thread              Global SSE thread         Per-WS SSE threads (×N)
 +------------------+     +------------------+      +-------------------+
 | Inbound loop     |     | GET /events/glob |      | GET /events?ws_id |
-| BLPOP on Redis   |     | Parse SSE data   |      | Parse SSE data    |
+| BLPOP on Redis   |     | Parse SSE via    |      | Parse SSE via     |
+|                  |     |   httpx-sse      |      |   httpx-sse       |
 | Dispatch to      |     | Forward state    |      | Forward content,  |
 |   handler        |     |   changes        |      |   tool results    |
 | POST to server   |     | Detect turn      |      | Handle approval   |
@@ -891,6 +907,12 @@ Event subscriber          Node discovery          Poll loop
        +-- Redis pub/sub         +-- Redis SCAN            +-- HTTP to each
            (SUBSCRIBE)               (every 15s)               server (every 10s)
 ```
+
+The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
+endpoint uses `EventSourceResponse` with the same listener queue pattern as
+the main server. `ClusterCollector`'s background threads (event subscriber,
+node discovery, poll loop) remain unchanged — they use sync Redis clients
+and `ThreadPoolExecutor` for parallel HTTP polling.
 
 The console is read-only — it never writes to Redis queues or sends commands to servers.
 Real-time events provide instant state transitions; periodic polling provides full data

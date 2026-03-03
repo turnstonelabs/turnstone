@@ -580,9 +580,9 @@ class TestSessionConfig:
 
 
 class TestServerHealthMetrics:
-    """Verify /health and /metrics endpoints using an in-process HTTP server.
+    """Verify /health and /metrics endpoints using a Starlette TestClient.
 
-    These tests spin up a real ThreadedHTTPServer with a mock WorkstreamManager
+    These tests create a Starlette app with a mock WorkstreamManager
     so no live LLM backend is required.  Run them independently with:
 
         pytest tests/test_server_live.py::TestServerHealthMetrics -v
@@ -592,16 +592,16 @@ class TestServerHealthMetrics:
     def setup_class(cls):
         from unittest.mock import MagicMock
 
-        import turnstone.server as srv_mod
+        from starlette.testclient import TestClient
 
-        # Reset module-level metrics so each test run starts fresh
+        import turnstone.server as srv_mod
+        from turnstone.core.auth import AuthConfig
         from turnstone.core.metrics import MetricsCollector
         from turnstone.core.workstream import WorkstreamState
 
         srv_mod._metrics = MetricsCollector()
         srv_mod._metrics.model = "test-model"
 
-        # Mock WorkstreamManager.list_all() to return one idle workstream
         mock_ui = MagicMock()
         mock_ui._ws_lock = threading.Lock()
         mock_ui._ws_prompt_tokens = 0
@@ -623,32 +623,23 @@ class TestServerHealthMetrics:
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        # Start a server on a random port (port 0 -> OS assigns free port)
-        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
-        from turnstone.core.auth import AuthConfig
-
-        cls.server.workstreams = mock_mgr
-        cls.server.skip_permissions = False
-        cls.server.global_listeners = []
-        cls.server.global_queue = queue.Queue()
-        cls.server.global_listeners_lock = threading.Lock()
-        cls.server.auth_config = AuthConfig()  # auth disabled by default
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        app = srv_mod.create_app(
+            workstreams=mock_mgr,
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(),
+        )
+        cls.client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.client.close()
 
-    def _get(self, path) -> tuple[int, str, dict]:
+    def _get(self, path) -> tuple[int, str, str]:
         """Make a GET request; return (status, content_type, body_str)."""
-        url = self.base + path
-        resp = httpx.get(url, timeout=5)
+        resp = self.client.get(path)
         ct = resp.headers.get("content-type", "")
         return resp.status_code, ct, resp.text
 
@@ -768,7 +759,7 @@ class TestServerHealthMetrics:
 class TestServerRateLimiting:
     """Verify per-IP rate limiting returns 429 with Retry-After header.
 
-    Spins up a real HTTP server with a tight rate limiter (rate=2, burst=3)
+    Creates a Starlette app with a tight rate limiter (rate=2, burst=3)
     and verifies that requests beyond the burst are rejected.
     """
 
@@ -776,7 +767,10 @@ class TestServerRateLimiting:
     def setup_class(cls):
         from unittest.mock import MagicMock
 
+        from starlette.testclient import TestClient
+
         import turnstone.server as srv_mod
+        from turnstone.core.auth import AuthConfig
         from turnstone.core.metrics import MetricsCollector
         from turnstone.core.ratelimit import RateLimiter
         from turnstone.core.workstream import WorkstreamState
@@ -805,30 +799,23 @@ class TestServerRateLimiting:
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
-        from turnstone.core.auth import AuthConfig
-
-        cls.server.workstreams = mock_mgr
-        cls.server.skip_permissions = False
-        cls.server.global_listeners = []
-        cls.server.global_queue = queue.Queue()
-        cls.server.global_listeners_lock = threading.Lock()
-        cls.server.auth_config = AuthConfig()
-        cls.server.rate_limiter = RateLimiter(enabled=True, rate=2.0, burst=3)
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        app = srv_mod.create_app(
+            workstreams=mock_mgr,
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(),
+            rate_limiter=RateLimiter(enabled=True, rate=2.0, burst=3),
+        )
+        cls.client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.client.close()
 
     def _get(self, path) -> httpx.Response:
-        return httpx.get(self.base + path, timeout=5)
+        return self.client.get(path)
 
     def test_burst_requests_succeed(self):
         """First burst requests should all succeed."""

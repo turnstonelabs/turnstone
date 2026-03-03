@@ -541,13 +541,15 @@ class TestLoadAuthConfig:
 
 
 class TestServerAuth:
-    """Spin up a real turnstone-server with auth enabled and test endpoints."""
+    """Test turnstone-server with auth enabled using Starlette TestClient."""
 
     @classmethod
     def setup_class(cls):
         import queue
         import threading
         from unittest.mock import MagicMock
+
+        from starlette.testclient import TestClient
 
         import turnstone.server as srv_mod
         from turnstone.core.metrics import MetricsCollector
@@ -556,164 +558,137 @@ class TestServerAuth:
         srv_mod._metrics = MetricsCollector()
         srv_mod._metrics.model = "test-model"
 
+        mock_session = MagicMock()
+        mock_session.session_id = "test-session-id"
+
         mock_ws = MagicMock()
+        mock_ws.id = "test-ws"
+        mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
+        mock_ws.session = mock_session
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
-        cls.server.workstreams = mock_mgr
-        cls.server.skip_permissions = False
-        cls.server.global_listeners = []
-        cls.server.global_queue = queue.Queue()
-        cls.server.global_listeners_lock = threading.Lock()
-        cls.server.auth_config = AuthConfig(
-            enabled=True,
-            tokens={"tok_full": "full", "tok_read": "read"},
+        app = srv_mod.create_app(
+            workstreams=mock_mgr,
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(
+                enabled=True,
+                tokens={"tok_full": "full", "tok_read": "read"},
+            ),
         )
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        cls.client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.client.close()
 
     def test_health_no_token_200(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/health", timeout=5)
+        resp = self.client.get("/health")
         assert resp.status_code == 200
 
     def test_metrics_no_token_passes_auth(self):
-        import httpx
-
-        try:
-            resp = httpx.get(f"{self.base}/metrics", timeout=5)
-            # Public path — should never be 401/403
-            assert resp.status_code not in (401, 403)
-        except httpx.RemoteProtocolError:
-            # Server crashes in metrics handler due to MagicMock —
-            # the important thing is auth didn't reject it (no 401/403 before crash)
-            pass
+        resp = self.client.get("/metrics")
+        # Public path — should never be 401/403
+        assert resp.status_code not in (401, 403)
 
     def test_root_no_token_200(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/", timeout=5)
+        resp = self.client.get("/")
         assert resp.status_code == 200
 
     def test_static_css_no_token_200(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/static/style.css", timeout=5)
+        resp = self.client.get("/static/style.css")
         assert resp.status_code == 200
 
     def test_api_workstreams_no_token_401(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/api/workstreams", timeout=5)
+        resp = self.client.get("/api/workstreams")
         assert resp.status_code == 401
         assert "Unauthorized" in resp.json().get("error", "")
 
     def test_api_workstreams_read_token_200(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/workstreams",
+        resp = self.client.get(
+            "/api/workstreams",
             headers={"Authorization": "Bearer tok_read"},
-            timeout=5,
         )
         assert resp.status_code == 200
 
     def test_api_workstreams_full_token_200(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/workstreams",
+        resp = self.client.get(
+            "/api/workstreams",
             headers={"Authorization": "Bearer tok_full"},
-            timeout=5,
         )
         assert resp.status_code == 200
 
     def test_api_send_read_token_403(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/send",
+        resp = self.client.post(
+            "/api/send",
             headers={"Authorization": "Bearer tok_read"},
             json={"message": "hello", "ws_id": "x"},
-            timeout=5,
         )
         assert resp.status_code == 403
         assert "Forbidden" in resp.json().get("error", "")
 
     def test_api_send_full_token_passes_auth(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/send",
+        resp = self.client.post(
+            "/api/send",
             headers={"Authorization": "Bearer tok_full"},
             json={"message": "hello", "ws_id": "nonexistent"},
-            timeout=5,
         )
         # Should get 404 (unknown workstream), not 401/403
         assert resp.status_code not in (401, 403)
 
     def test_api_send_no_token_401(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/send",
+        resp = self.client.post(
+            "/api/send",
             json={"message": "hello", "ws_id": "x"},
-            timeout=5,
         )
         assert resp.status_code == 401
 
     def test_invalid_token_401(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/workstreams",
+        resp = self.client.get(
+            "/api/workstreams",
             headers={"Authorization": "Bearer wrong_token"},
-            timeout=5,
         )
         assert resp.status_code == 401
 
     def test_options_no_auth_required(self):
-        import httpx
-
-        resp = httpx.options(f"{self.base}/api/send", timeout=5)
+        resp = self.client.options(
+            "/api/send",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
         assert resp.status_code == 200
         allowed = resp.headers.get("access-control-allow-headers", "")
-        assert "Authorization" in allowed
+        assert "authorization" in allowed.lower()
 
     def test_cors_includes_authorization(self):
-        import httpx
-
-        resp = httpx.options(f"{self.base}/api/workstreams", timeout=5)
+        resp = self.client.options(
+            "/api/workstreams",
+            headers={
+                "Origin": "http://example.com",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
         allowed = resp.headers.get("access-control-allow-headers", "")
-        assert "Authorization" in allowed
+        assert "authorization" in allowed.lower()
 
 
 class TestConsoleAuth:
-    """Spin up a console server with auth enabled and test endpoints."""
+    """Test console server with auth enabled using TestClient."""
 
     @classmethod
     def setup_class(cls):
-        import threading
         from unittest.mock import MagicMock
 
+        from starlette.testclient import TestClient
+
         from turnstone.console.collector import ClusterCollector
-        from turnstone.console.server import (
-            ConsoleHTTPHandler,
-            ThreadedHTTPServer,
-            _load_static,
-        )
+        from turnstone.console.server import _load_static, create_app
 
         _load_static()
 
@@ -725,69 +700,50 @@ class TestConsoleAuth:
             "aggregate": {"total_tokens": 100},
         }
 
-        cls.server = ThreadedHTTPServer(("127.0.0.1", 0), ConsoleHTTPHandler)
-        cls.server.collector = mock_collector
-        cls.server.auth_config = AuthConfig(
-            enabled=True,
-            tokens={"tok_full": "full", "tok_read": "read"},
+        app = create_app(
+            collector=mock_collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(
+                enabled=True,
+                tokens={"tok_full": "full", "tok_read": "read"},
+            ),
         )
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        cls.test_client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.test_client.close()
 
     def test_health_no_token_200(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/health", timeout=5)
+        resp = self.test_client.get("/health")
         assert resp.status_code == 200
 
     def test_root_no_token_200(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/", timeout=5)
+        resp = self.test_client.get("/")
         assert resp.status_code == 200
 
     def test_api_overview_no_token_401(self):
-        import httpx
-
-        resp = httpx.get(f"{self.base}/api/cluster/overview", timeout=5)
+        resp = self.test_client.get("/api/cluster/overview")
         assert resp.status_code == 401
 
     def test_api_overview_read_token_200(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/cluster/overview",
+        resp = self.test_client.get(
+            "/api/cluster/overview",
             headers={"Authorization": "Bearer tok_read"},
-            timeout=5,
         )
         assert resp.status_code == 200
 
     def test_api_overview_full_token_200(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/cluster/overview",
+        resp = self.test_client.get(
+            "/api/cluster/overview",
             headers={"Authorization": "Bearer tok_full"},
-            timeout=5,
         )
         assert resp.status_code == 200
 
     def test_invalid_token_401(self):
-        import httpx
-
-        resp = httpx.get(
-            f"{self.base}/api/cluster/overview",
+        resp = self.test_client.get(
+            "/api/cluster/overview",
             headers={"Authorization": "Bearer wrong"},
-            timeout=5,
         )
         assert resp.status_code == 401
 
@@ -806,6 +762,8 @@ class TestServerLogin:
         import threading
         from unittest.mock import MagicMock
 
+        from starlette.testclient import TestClient
+
         import turnstone.server as srv_mod
         from turnstone.core.metrics import MetricsCollector
         from turnstone.core.workstream import WorkstreamState
@@ -813,40 +771,38 @@ class TestServerLogin:
         srv_mod._metrics = MetricsCollector()
         srv_mod._metrics.model = "test-model"
 
+        mock_session = MagicMock()
+        mock_session.session_id = "test-session-id"
+
         mock_ws = MagicMock()
+        mock_ws.id = "test-ws"
+        mock_ws.name = "test"
         mock_ws.state = WorkstreamState.IDLE
+        mock_ws.session = mock_session
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
 
-        cls.server = srv_mod.ThreadedHTTPServer(("127.0.0.1", 0), srv_mod.TurnstoneHTTPHandler)
-        cls.server.workstreams = mock_mgr
-        cls.server.skip_permissions = False
-        cls.server.global_listeners = []
-        cls.server.global_queue = queue.Queue()
-        cls.server.global_listeners_lock = threading.Lock()
-        cls.server.auth_config = AuthConfig(
-            enabled=True,
-            tokens={"tok_full": "full", "tok_read": "read"},
+        app = srv_mod.create_app(
+            workstreams=mock_mgr,
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(
+                enabled=True,
+                tokens={"tok_full": "full", "tok_read": "read"},
+            ),
         )
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        cls.test_client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.test_client.close()
 
     def test_login_valid_token_sets_cookie(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/auth/login",
+        resp = self.test_client.post(
+            "/api/auth/login",
             json={"token": "tok_full"},
-            timeout=5,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -856,55 +812,41 @@ class TestServerLogin:
         assert "HttpOnly" in cookie
 
     def test_login_invalid_token_401(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/auth/login",
+        resp = self.test_client.post(
+            "/api/auth/login",
             json={"token": "wrong"},
-            timeout=5,
         )
         assert resp.status_code == 401
 
     def test_login_no_auth_required(self):
-        import httpx
-
         # /api/auth/login is public — shouldn't require auth itself
-        resp = httpx.post(
-            f"{self.base}/api/auth/login",
+        resp = self.test_client.post(
+            "/api/auth/login",
             json={"token": "tok_read"},
-            timeout=5,
         )
         assert resp.status_code == 200
 
     def test_cookie_auth_on_api(self):
-        import httpx
-
-        # Login to get cookie
-        client = httpx.Client(base_url=self.base, timeout=5)
-        login_resp = client.post("/api/auth/login", json={"token": "tok_read"})
+        # Login to get cookie (TestClient tracks cookies automatically)
+        login_resp = self.test_client.post("/api/auth/login", json={"token": "tok_read"})
         assert login_resp.status_code == 200
 
-        # Use cookie to access API
-        resp = client.get("/api/workstreams")
+        # Use cookie to access API — TestClient forwards cookies
+        resp = self.test_client.get("/api/workstreams")
         assert resp.status_code == 200
-        client.close()
 
     def test_logout_clears_cookie(self):
-        import httpx
-
-        client = httpx.Client(base_url=self.base, timeout=5)
-        client.post("/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
 
         # Logout
-        logout_resp = client.post("/api/auth/logout")
+        logout_resp = self.test_client.post("/api/auth/logout")
         assert logout_resp.status_code == 200
         cookie = logout_resp.headers.get("set-cookie", "")
         assert "Max-Age=0" in cookie
 
-        # API should now fail
-        resp = client.get("/api/workstreams")
+        # API should now fail (cookie cleared)
+        resp = self.test_client.get("/api/workstreams")
         assert resp.status_code == 401
-        client.close()
 
 
 class TestConsoleLogin:
@@ -912,15 +854,12 @@ class TestConsoleLogin:
 
     @classmethod
     def setup_class(cls):
-        import threading
         from unittest.mock import MagicMock
 
+        from starlette.testclient import TestClient
+
         from turnstone.console.collector import ClusterCollector
-        from turnstone.console.server import (
-            ConsoleHTTPHandler,
-            ThreadedHTTPServer,
-            _load_static,
-        )
+        from turnstone.console.server import _load_static, create_app
 
         _load_static()
 
@@ -932,60 +871,42 @@ class TestConsoleLogin:
             "aggregate": {"total_tokens": 100},
         }
 
-        cls.server = ThreadedHTTPServer(("127.0.0.1", 0), ConsoleHTTPHandler)
-        cls.server.collector = mock_collector
-        cls.server.auth_config = AuthConfig(
-            enabled=True,
-            tokens={"tok_full": "full", "tok_read": "read"},
+        app = create_app(
+            collector=mock_collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(
+                enabled=True,
+                tokens={"tok_full": "full", "tok_read": "read"},
+            ),
         )
-
-        port = cls.server.server_address[1]
-        cls.base = f"http://127.0.0.1:{port}"
-
-        cls._thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls._thread.start()
+        cls.test_client = TestClient(app, raise_server_exceptions=False)
 
     @classmethod
     def teardown_class(cls):
-        cls.server.shutdown()
-        cls._thread.join(timeout=5)
+        cls.test_client.close()
 
     def test_login_valid_token(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/auth/login",
+        resp = self.test_client.post(
+            "/api/auth/login",
             json={"token": "tok_read"},
-            timeout=5,
         )
         assert resp.status_code == 200
         assert "turnstone_auth" in resp.headers.get("set-cookie", "")
 
     def test_login_invalid_token(self):
-        import httpx
-
-        resp = httpx.post(
-            f"{self.base}/api/auth/login",
+        resp = self.test_client.post(
+            "/api/auth/login",
             json={"token": "wrong"},
-            timeout=5,
         )
         assert resp.status_code == 401
 
     def test_cookie_auth_on_api(self):
-        import httpx
-
-        client = httpx.Client(base_url=self.base, timeout=5)
-        client.post("/api/auth/login", json={"token": "tok_read"})
-        resp = client.get("/api/cluster/overview")
+        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
+        resp = self.test_client.get("/api/cluster/overview")
         assert resp.status_code == 200
-        client.close()
 
     def test_logout_then_api_fails(self):
-        import httpx
-
-        client = httpx.Client(base_url=self.base, timeout=5)
-        client.post("/api/auth/login", json={"token": "tok_read"})
-        client.post("/api/auth/logout")
-        resp = client.get("/api/cluster/overview")
+        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post("/api/auth/logout")
+        resp = self.test_client.get("/api/cluster/overview")
         assert resp.status_code == 401
-        client.close()

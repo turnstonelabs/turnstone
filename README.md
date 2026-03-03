@@ -128,7 +128,7 @@ turnstone/
 │   └── client.py      # TurnstoneClient — Python API for external systems
 ├── console/           # Cluster dashboard
 │   ├── collector.py   # ClusterCollector — aggregates all nodes via Redis + HTTP
-│   ├── server.py      # Dashboard HTTP server + SSE
+│   ├── server.py      # Dashboard Starlette/ASGI server + SSE
 │   └── static/        # Cluster dashboard web UI
 ├── tools/             # Tool schemas (one JSON file per tool)
 ├── ui/                # Frontend assets and terminal rendering
@@ -141,7 +141,7 @@ turnstone/
 │   ├── metrics.py     # Latency, throughput, utilization collection
 │   └── cli.py         # CLI entry point (turnstone-sim)
 ├── cli.py             # Terminal frontend (+ /cluster commands for console)
-├── server.py          # Web frontend (HTTP + SSE)
+├── server.py          # Web frontend (Starlette/ASGI + SSE)
 └── eval.py            # Evaluation and prompt optimization harness
 docs/
 ├── architecture.md    # System architecture and threading model
