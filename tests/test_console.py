@@ -178,6 +178,7 @@ class TestCollectorPolling:
         assert len(detail["workstreams"]) == 1
         assert detail["workstreams"][0]["name"] == "test"
         assert detail["workstreams"][0]["node"] == "node-a"
+        assert detail["workstreams"][0]["server_url"] == "http://a:8080"
         assert detail["health"]["status"] == "ok"
 
     def test_apply_poll_replaces_stale_workstreams(self):
@@ -247,6 +248,7 @@ class TestCollectorEvents:
 
         assert "ws-new" in c._nodes["node-a"].workstreams
         assert c._nodes["node-a"].workstreams["ws-new"]["name"] == "new-task"
+        assert c._nodes["node-a"].workstreams["ws-new"]["server_url"] == "http://a:8080"
 
     def test_ws_closed_event_removes_workstream(self):
         c = _make_collector()

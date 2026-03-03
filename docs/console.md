@@ -165,9 +165,11 @@ The web UI has three views, toggled client-side:
 
 Breadcrumb: `Cluster > db-west-04`. Shows the node's workstreams in a table matching the per-node dashboard layout (STATE, NAME, NODE, TASK, TOKENS, CTX) with activity sub-lines. Includes a link to the node's own dashboard (`http://{server_url}/`).
 
+**Deep linking:** Clicking a workstream row opens the node's server UI in a new tab with `?ws_id=<id>`, which auto-selects that workstream. A `↗` indicator appears on hover to signal the external navigation. Rows without a `server_url` are non-interactive.
+
 ### 3. Filtered Workstreams
 
-Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated workstream table. NODE column values are clickable to filter further. Pagination controls at bottom.
+Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated workstream table. NODE column values are clickable to filter further. Pagination controls at bottom. Workstream rows are deep-linkable when `server_url` is available (injected by the collector from the parent node).
 
 All three views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
 

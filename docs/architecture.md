@@ -783,7 +783,9 @@ Event subscriber          Node discovery          Poll loop
 
 The console is read-only — it never writes to Redis queues or sends commands to servers.
 Real-time events provide instant state transitions; periodic polling provides full data
-consistency (tokens, context ratios, activity strings). See [docs/console.md](console.md)
+consistency (tokens, context ratios, activity strings). Clicking a workstream row in the
+console opens the node's server UI with `?ws_id=<id>` for direct deep linking — the
+server parses this on load and auto-selects the workstream. See [docs/console.md](console.md)
 for the full API reference.
 
 ---
