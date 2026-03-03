@@ -209,6 +209,7 @@ class ToolResultEvent(OutboundEvent):
     """Tool execution result."""
 
     type: str = "tool_result"
+    call_id: str = ""
     name: str = ""
     output: str = ""
 

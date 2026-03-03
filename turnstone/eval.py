@@ -65,7 +65,7 @@ class NullUI:
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         return True, None
 
-    def on_tool_result(self, name: str, output: str) -> None:
+    def on_tool_result(self, call_id: str, name: str, output: str) -> None:
         pass
 
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
