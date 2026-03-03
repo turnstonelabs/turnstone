@@ -21,7 +21,15 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = ["openai>=2.24", "httpx>=0.28", "mcp>=1.6"]
+dependencies = [
+    "openai>=2.24",
+    "httpx>=0.28",
+    "mcp>=1.6",
+    "starlette>=0.45",
+    "uvicorn>=0.34",
+    "sse-starlette>=2.0",
+    "httpx-sse>=0.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/turnstonelabs/turnstone"
@@ -102,6 +110,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["mcp", "mcp.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sse_starlette", "sse_starlette.*", "uvicorn", "uvicorn.*", "httpx_sse", "httpx_sse.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

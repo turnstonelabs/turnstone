@@ -5,7 +5,7 @@ title Turnstone — Console Dashboard Data Collection
 skinparam sequenceArrowThickness 1.5
 
 participant "Browser" as Browser
-participant "Console\nHTTP Server" as Server
+participant "Console\nStarlette App" as Server
 participant "ClusterCollector" as CC
 collections "Redis" as Redis
 participant "Node-A\n(real server)" as NodeA
@@ -89,15 +89,15 @@ Browser -> Server : GET /api/cluster/events
 activate Server
 
 Server -> CC : register_listener(queue)
-note right : Per-client queue.Queue(maxsize=500)
+note right : Per-client queue.Queue(maxsize=500)\nSSE via EventSourceResponse + run_in_executor()
 
 loop continuous
     CC -> Server : event via listener queue\n(from any of the 3 threads)
     Server -> Browser : data: {"type":"cluster_state",...}\n\n
 end
 
-alt timeout (5s no events)
-    Server -> Browser : : keepalive\n\n
+alt keepalive (sse-starlette ping=5)
+    Server -> Browser : : ping\n\n
 end
 
 Browser -> Server : connection closed
