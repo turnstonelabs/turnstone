@@ -552,7 +552,9 @@ class TestConsoleHTTPEndpoints:
             broker=MagicMock(),
             auth_config=AuthConfig(),
         )
-        return TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
 
     def _get(self, client, path):
         resp = client.get(path)

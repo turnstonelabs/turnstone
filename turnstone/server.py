@@ -413,6 +413,20 @@ class MetricsMiddleware:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _read_json(request: Request) -> dict[str, Any]:
+    """Read JSON body from request, returning {} on invalid/missing JSON."""
+    try:
+        body: dict[str, Any] = await request.json()
+        return body
+    except (ValueError, json.JSONDecodeError):
+        return {}
+
+
+# ---------------------------------------------------------------------------
 # Helper — workstream lookup (replaces self._get_ws on the old handler)
 # ---------------------------------------------------------------------------
 
@@ -487,7 +501,7 @@ async def events_sse(request: Request) -> Response:
             while my_gen == ui._sse_generation:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(ui._event_queue.get, timeout=1)
+                        None, functools.partial(ui._event_queue.get, timeout=5)
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
@@ -515,7 +529,7 @@ async def global_events_sse(request: Request) -> Response:
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(client_queue.get, timeout=1)
+                        None, functools.partial(client_queue.get, timeout=5)
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
@@ -693,7 +707,7 @@ async def metrics_endpoint(request: Request) -> Response:
 
 async def send_message(request: Request) -> JSONResponse:
     """POST /api/send — send a user message to the workstream."""
-    body = await request.json()
+    body = await _read_json(request)
     message = body.get("message", "").strip()
     ws_id = body.get("ws_id")
     if not message:
@@ -733,7 +747,7 @@ async def send_message(request: Request) -> JSONResponse:
 
 async def approve(request: Request) -> JSONResponse:
     """POST /api/approve — approve or deny a tool call."""
-    body = await request.json()
+    body = await _read_json(request)
     approved = body.get("approved", False)
     feedback = body.get("feedback")
     always = body.get("always", False)
@@ -750,7 +764,7 @@ async def approve(request: Request) -> JSONResponse:
 
 async def plan_feedback(request: Request) -> JSONResponse:
     """POST /api/plan — respond to a plan review."""
-    body = await request.json()
+    body = await _read_json(request)
     feedback = body.get("feedback", "")
     ws_id = body.get("ws_id")
     mgr = request.app.state.workstreams
@@ -763,7 +777,7 @@ async def plan_feedback(request: Request) -> JSONResponse:
 
 async def command(request: Request) -> JSONResponse:
     """POST /api/command — execute a slash command."""
-    body = await request.json()
+    body = await _read_json(request)
     cmd = body.get("command", "").strip()
     ws_id = body.get("ws_id")
     if not cmd:
@@ -804,7 +818,7 @@ async def command(request: Request) -> JSONResponse:
 
 async def create_workstream(request: Request) -> JSONResponse:
     """POST /api/workstreams/new — create a new workstream."""
-    body = await request.json()
+    body = await _read_json(request)
     mgr: WorkstreamManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
     try:
@@ -836,7 +850,7 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 async def close_workstream(request: Request) -> JSONResponse:
     """POST /api/workstreams/close — close a workstream."""
-    body = await request.json()
+    body = await _read_json(request)
     ws_id = str(body.get("ws_id", ""))
     mgr = request.app.state.workstreams
     if mgr.close(ws_id):
@@ -848,7 +862,7 @@ async def auth_login(request: Request) -> Response:
     """POST /api/auth/login — authenticate with a token."""
     from turnstone.core.auth import make_set_cookie
 
-    body = await request.json()
+    body = await _read_json(request)
     token = body.get("token", "")
     auth_config = request.app.state.auth_config
     role = auth_config.check(token)

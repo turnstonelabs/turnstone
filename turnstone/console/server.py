@@ -183,7 +183,7 @@ async def cluster_events_sse(request: Request) -> Response:
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(client_queue.get, timeout=1)
+                        None, functools.partial(client_queue.get, timeout=5)
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
@@ -212,7 +212,10 @@ async def health(request: Request) -> JSONResponse:
 async def auth_login(request: Request) -> Response:
     from turnstone.core.auth import make_set_cookie
 
-    body = await request.json()
+    try:
+        body: dict[str, Any] = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
     token = body.get("token", "")
     auth_config = request.app.state.auth_config
     role = auth_config.check(token)

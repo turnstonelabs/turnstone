@@ -712,7 +712,7 @@ class TestConsoleAuth:
 
     @classmethod
     def teardown_class(cls):
-        pass
+        cls.test_client.close()
 
     def test_health_no_token_200(self):
         resp = self.test_client.get("/health")
@@ -883,7 +883,7 @@ class TestConsoleLogin:
 
     @classmethod
     def teardown_class(cls):
-        pass
+        cls.test_client.close()
 
     def test_login_valid_token(self):
         resp = self.test_client.post(
