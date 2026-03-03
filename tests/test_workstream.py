@@ -20,7 +20,7 @@ class FakeSession:
         self.messages = []
 
 
-def _fake_factory(ui):
+def _fake_factory(ui, model_alias=None):
     return FakeSession()
 
 

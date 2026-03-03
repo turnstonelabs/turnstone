@@ -51,6 +51,7 @@ not recognized.
 {
   "type": "connected",
   "model": "kappa_20b_131k",
+  "model_alias": "default",
   "skip_permissions": false
 }
 ```
@@ -505,10 +506,16 @@ Creates a new workstream. The server supports up to 10 concurrent workstreams.
 **Request body:**
 
 ```json
-{}
+{"name": "my-ws", "model": "openai"}
 ```
 
-No fields are required. The body can be empty or an empty JSON object.
+All fields are optional. The body can be empty or an empty JSON object.
+
+| Field          | Type   | Default | Description                                    |
+|----------------|--------|---------|------------------------------------------------|
+| `name`         | string | auto    | Workstream display name                        |
+| `model`        | string | default | Model alias from the registry (`[models.*]`)   |
+| `auto_approve` | bool   | false   | Auto-approve all tool calls for this workstream |
 
 **Response (success):**
 

@@ -111,6 +111,7 @@ turnstone/
 │   ├── tools.py       # Tool definitions (auto-loaded from JSON)
 │   ├── workstream.py  # WorkstreamManager — parallel independent sessions
 │   ├── mcp_client.py  # MCP client manager (external tool servers)
+│   ├── model_registry.py # ModelRegistry — named models, fallback routing, per-workstream selection
 │   ├── config.py      # Unified TOML config (~/.config/turnstone/config.toml)
 │   ├── memory.py      # SQLite persistence (memories, conversations, FTS5)
 │   ├── metrics.py     # Prometheus-compatible metrics collector
@@ -238,6 +239,29 @@ turnstone-server --mcp-config ~/.config/turnstone/mcp.json
 
 Use `/mcp` in the REPL to list connected tools. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
 
+### Multi-Model Support
+
+Turnstone supports multiple model backends per server instance. Define named models in `config.toml` and select per-workstream or switch mid-session with `/model <alias>`.
+
+```toml
+[models.local]
+base_url = "http://localhost:8000/v1"
+model = "qwen3-32b"
+
+[models.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+model = "gpt-4o"
+context_window = 128000
+
+[model]
+default = "local"              # which model to use by default
+fallback = ["openai"]          # try these if the primary is unreachable
+agent_model = "local"          # optional: cheaper model for plan/task sub-agents
+```
+
+Use `/model` to show available models, `/model openai` to switch. Workstreams created via the API accept an optional `model` parameter.
+
 ## Configuration
 
 All entry points read `~/.config/turnstone/config.toml`. CLI flags override config values.
@@ -252,6 +276,9 @@ tavily_key = ""
 name = ""              # empty = auto-detect
 temperature = 0.5
 reasoning_effort = "medium"
+default = "default"    # model alias for new workstreams
+fallback = []          # ordered list of fallback model aliases
+agent_model = ""       # model alias for plan/task sub-agents
 
 [tools]
 timeout = 30
