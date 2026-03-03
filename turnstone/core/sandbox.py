@@ -171,7 +171,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
         }
 
         try:
-            import sympy  # type: ignore[import-untyped]
+            import sympy
 
             ns["sympy"] = sympy
             for name in (
