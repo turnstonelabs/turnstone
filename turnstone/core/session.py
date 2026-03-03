@@ -128,6 +128,7 @@ class ChatSession:
         self.agent_max_turns = agent_max_turns
         self._chars_per_token = 4.0  # calibrated from API usage
         # Tool output truncation: 0 means auto (50% of context_window in chars)
+        self._manual_tool_truncation = tool_truncation > 0
         if tool_truncation > 0:
             self.tool_truncation = tool_truncation
         else:
@@ -162,6 +163,10 @@ class ChatSession:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def model_alias(self) -> str | None:
+        return self._model_alias
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed sessions behave identically."""
@@ -2786,7 +2791,8 @@ class ChatSession:
                 self.model = model_name
                 self._model_alias = arg
                 self.context_window = cfg.context_window
-                self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                if not self._manual_tool_truncation:
+                    self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
                 self._init_system_messages()
                 self._save_config()
                 self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")

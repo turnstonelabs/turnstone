@@ -73,7 +73,7 @@ class "ChatSession" as ChatSession {
     - _session_id: str
     - _mcp_client: MCPClientManager | None
     - _registry: ModelRegistry | None
-    - _model_alias: str | None
+    + model_alias: str | None {property}
     - _tools: list[dict]
     - _task_tools: list[dict]
     - _agent_tools: list[dict]

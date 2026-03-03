@@ -407,7 +407,7 @@ class TestSessionModelCommand:
         session = _make_session(registry=reg, model_alias="default")
         session.handle_command("/model alt")
         assert session.model == "alt-model"
-        assert session._model_alias == "alt"
+        assert session.model_alias == "alt"
         assert session.context_window == 64000
         assert "Switched to" in session.ui.infos[-1]
 

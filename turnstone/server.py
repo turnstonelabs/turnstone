@@ -423,7 +423,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                 {
                     "type": "connected",
                     "model": session.model,
-                    "model_alias": session._model_alias or "",
+                    "model_alias": session.model_alias or "",
                     "skip_permissions": ui.auto_approve,
                 }
             )
@@ -779,7 +779,7 @@ class TurnstoneHTTPHandler(BaseHTTPRequestHandler):
                     "tool_calls": tc,
                     "node": "local",
                     "model": ws.session.model if ws.session else "",
-                    "model_alias": ws.session._model_alias if ws.session else "",
+                    "model_alias": ws.session.model_alias if ws.session else "",
                 }
             )
         uptime_sec = round(time.monotonic() - _metrics.start_time)
