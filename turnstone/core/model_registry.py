@@ -1,8 +1,8 @@
 """Model registry — named model configurations with fallback routing.
 
-Manages multiple OpenAI-compatible API backends so workstreams can select
-their model at creation time or switch mid-session.  Supports a fallback
-chain for resilience when the primary model is unreachable.
+Manages multiple LLM API backends so workstreams can select their model at
+creation time or switch mid-session.  Supports a fallback chain for
+resilience when the primary model is unreachable.
 """
 
 from __future__ import annotations
@@ -12,9 +12,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import OpenAI
-
 from turnstone.core.config import load_config
+from turnstone.core.providers import LLMProvider, create_client, create_provider
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +32,7 @@ class ModelConfig:
     api_key: str = field(repr=False)
     model: str
     context_window: int = 131072
+    provider: str = "openai"
 
 
 # ---------------------------------------------------------------------------
@@ -72,23 +72,33 @@ class ModelRegistry:
         self.default = default
         self.fallback = list(fallback) if fallback else []
         self.agent_model = agent_model
-        self._clients: dict[str, OpenAI] = {}
+        self._clients: dict[str, Any] = {}
+        self._providers: dict[str, LLMProvider] = {}
         self._client_lock = threading.Lock()
 
     # -- query methods -------------------------------------------------------
 
-    def get_client(self, alias: str) -> OpenAI:
-        """Get or lazily create an OpenAI client for *alias*. Thread-safe."""
+    def get_client(self, alias: str) -> Any:
+        """Get or lazily create an API client for *alias*. Thread-safe."""
         if alias not in self._models:
             raise ValueError(f"Unknown model alias: {alias}")
         with self._client_lock:
             if alias not in self._clients:
                 cfg = self._models[alias]
-                self._clients[alias] = OpenAI(
-                    base_url=cfg.base_url,
-                    api_key=cfg.api_key,
+                self._clients[alias] = create_client(
+                    cfg.provider, base_url=cfg.base_url, api_key=cfg.api_key
                 )
             return self._clients[alias]
+
+    def get_provider(self, alias: str) -> LLMProvider:
+        """Get the ``LLMProvider`` for *alias*. Thread-safe, cached."""
+        if alias not in self._models:
+            raise ValueError(f"Unknown model alias: {alias}")
+        with self._client_lock:
+            if alias not in self._providers:
+                cfg = self._models[alias]
+                self._providers[alias] = create_provider(cfg.provider)
+            return self._providers[alias]
 
     def get_config(self, alias: str) -> ModelConfig:
         """Return the ModelConfig for *alias*."""
@@ -104,7 +114,7 @@ class ModelRegistry:
         """Return all registered model aliases."""
         return list(self._models.keys())
 
-    def resolve(self, alias: str | None = None) -> tuple[OpenAI, str, ModelConfig]:
+    def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig]:
         """Resolve *alias* to ``(client, model_name, config)``.
 
         Uses the default alias when *alias* is ``None``.
@@ -121,11 +131,13 @@ class ModelRegistry:
     # -- lifecycle -----------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Close all OpenAI client connections."""
+        """Close all cached client connections."""
         with self._client_lock:
             for client in self._clients.values():
-                client.close()
+                if hasattr(client, "close"):
+                    client.close()
             self._clients.clear()
+            self._providers.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +150,7 @@ def load_model_registry(
     api_key: str,
     model: str,
     context_window: int = 131072,
+    provider: str = "openai",
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args and ``config.toml``.
 
@@ -171,6 +184,7 @@ def load_model_registry(
             api_key=entry.get("api_key", api_key),
             model=model_name,
             context_window=entry.get("context_window", context_window),
+            provider=entry.get("provider", "openai"),
         )
 
     # Ensure a "default" entry from CLI args
@@ -180,6 +194,7 @@ def load_model_registry(
         api_key=api_key,
         model=model,
         context_window=context_window,
+        provider=provider,
     )
 
     # Determine default alias
@@ -217,11 +232,57 @@ def load_model_registry(
 # ---------------------------------------------------------------------------
 
 
-def detect_model(client: OpenAI, log_fn: Any = print) -> tuple[str, int | None]:
-    """Auto-detect the model and context window from the /v1/models endpoint.
+def _select_best_model(model_ids: list[str], provider: str) -> str:
+    """Pick the best default model from a list of available model IDs.
+
+    - **anthropic**: latest Opus model (highest generation number).
+    - **openai**: latest base GPT-N.N model (not mini/nano/pro variants).
+    - **other** (local servers): first model in the list.
+    """
+    import re
+
+    if provider == "anthropic":
+        # Prefer opus, then sonnet, then haiku — highest generation first
+        opus = [m for m in model_ids if "opus" in m]
+        if opus:
+            opus.sort(reverse=True)
+            return opus[0]
+        sonnet = [m for m in model_ids if "sonnet" in m]
+        if sonnet:
+            sonnet.sort(reverse=True)
+            return sonnet[0]
+        return model_ids[0]
+
+    if provider == "openai":
+        # Prefer base gpt-N.N (not mini/nano/pro/codex/chat variants)
+        base_pattern = re.compile(r"^gpt-(\d+(?:\.\d+)?)(?:-\d+)?$")
+        base_models: list[tuple[float, str]] = []
+        for m in model_ids:
+            match = base_pattern.match(m)
+            if match:
+                version = float(match.group(1))
+                base_models.append((version, m))
+        if base_models:
+            base_models.sort(key=lambda x: x[0], reverse=True)
+            return base_models[0][1]
+        return model_ids[0]
+
+    return model_ids[0]
+
+
+def detect_model(
+    client: Any,
+    log_fn: Any = print,
+    provider: str = "openai",
+) -> tuple[str, int | None]:
+    """Auto-detect the model and context window from the API's models endpoint.
 
     Returns ``(model_id, context_window)`` where *context_window* is
-    ``None`` when the backend does not expose ``meta.n_ctx_train``.
+    ``None`` when the backend does not expose it.
+
+    For multi-model APIs (Anthropic, OpenAI), selects a sensible default:
+    latest Opus for Anthropic, latest base GPT model for OpenAI.
+    For local single-model servers (vLLM, llama.cpp), uses the first model.
 
     Calls ``log_fn`` for informational messages (defaults to ``print``).
     Raises ``SystemExit`` on failure.
@@ -231,17 +292,27 @@ def detect_model(client: OpenAI, log_fn: Any = print) -> tuple[str, int | None]:
         if not models.data:
             log_fn("Error: No models found at server. Use --model to specify.")
             raise SystemExit(1)
-        m = models.data[0]
+
+        all_ids = [x.id for x in models.data]
+        selected_id = _select_best_model(all_ids, provider)
+        m = next(x for x in models.data if x.id == selected_id)
+
         if len(models.data) > 1:
-            log_fn(f"Available models: {', '.join(x.id for x in models.data)}")
+            log_fn(f"Available models: {', '.join(all_ids)}")
             log_fn(f"Using: {m.id} (override with --model)")
-        # Extract context window from backend metadata (llama.cpp, vLLM, etc.)
+
         ctx: int | None = None
-        meta = m.model_dump().get("meta")
-        if isinstance(meta, dict):
-            n_ctx = meta.get("n_ctx_train")
-            if isinstance(n_ctx, int) and n_ctx > 0:
-                ctx = n_ctx
+        if provider == "anthropic":
+            from turnstone.core.providers._anthropic import AnthropicProvider
+
+            ctx = AnthropicProvider().get_capabilities(m.id).context_window
+        else:
+            # OpenAI-compatible: extract from backend metadata (llama.cpp, vLLM)
+            meta = m.model_dump().get("meta")
+            if isinstance(meta, dict):
+                n_ctx = meta.get("n_ctx_train")
+                if isinstance(n_ctx, int) and n_ctx > 0:
+                    ctx = n_ctx
         return m.id, ctx
     except SystemExit:
         raise

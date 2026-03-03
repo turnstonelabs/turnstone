@@ -26,7 +26,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from openai import OpenAI
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -887,11 +886,11 @@ async def auth_logout(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
-def detect_model(client: OpenAI) -> tuple[str, int | None]:
+def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None]:
     """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`."""
     from turnstone.core.model_registry import detect_model as _detect
 
-    return _detect(client)
+    return _detect(client, provider=provider)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,8 +1096,14 @@ def main() -> None:
     parser.add_argument(
         "--reasoning-effort",
         default="medium",
-        choices=["low", "medium", "high"],
+        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
         help="Reasoning effort level (default: medium)",
+    )
+    parser.add_argument(
+        "--provider",
+        default="openai",
+        choices=["openai", "anthropic"],
+        help="LLM provider for the default model (default: openai)",
     )
     parser.add_argument(
         "--context-window",
@@ -1238,17 +1243,24 @@ def main() -> None:
 
     prune_sessions(retention_days=args.session_retention_days, log_fn=print)
 
-    # Create OpenAI client and detect model
-    api_key = args.api_key or os.environ.get("OPENAI_API_KEY") or "dummy"
-    client = OpenAI(
-        base_url=args.base_url,
-        api_key=api_key,
+    # Create client and detect model
+    provider_name = args.provider
+    api_key = (
+        args.api_key
+        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
+        or "dummy"
     )
+    base_url = args.base_url
+    if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
+        base_url = "https://api.anthropic.com"
+    from turnstone.core.providers import create_client
+
+    client = create_client(provider_name, base_url=base_url, api_key=api_key)
     if args.model:
         model = args.model
         detected_ctx = None
     else:
-        model, detected_ctx = detect_model(client)
+        model, detected_ctx = detect_model(client, provider=provider_name)
 
     # Use detected context window when the user hasn't explicitly set one
     context_window = args.context_window
@@ -1260,10 +1272,11 @@ def main() -> None:
     from turnstone.core.model_registry import load_model_registry
 
     registry = load_model_registry(
-        base_url=args.base_url,
+        base_url=base_url,
         api_key=api_key,
         model=model,
         context_window=context_window,
+        provider=provider_name,
     )
 
     # Initialize MCP client (connects to configured MCP servers, if any)

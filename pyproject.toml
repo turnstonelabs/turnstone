@@ -42,6 +42,7 @@ dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
 mq = ["redis>=7.2"]
 console = ["redis>=7.2"]
 sim = ["redis>=7.2"]
+anthropic = ["anthropic>=0.39"]
 
 
 [project.scripts]
@@ -114,6 +115,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["sse_starlette", "sse_starlette.*", "uvicorn", "uvicorn.*", "httpx_sse", "httpx_sse.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["anthropic", "anthropic.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

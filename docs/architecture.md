@@ -1,9 +1,10 @@
 # Turnstone Architecture
 
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
-memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) and
-gives the model 14 built-in tools plus external tools via MCP (Model Context
-Protocol) for reading, writing, searching, planning, and executing code.
+memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) or
+Anthropic's native Messages API via pluggable provider adapters, and gives the
+model 14 built-in tools plus external tools via MCP (Model Context Protocol) for
+reading, writing, searching, planning, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.
 The engine (`ChatSession`) drives the conversation loop -- streaming, tool
@@ -32,6 +33,11 @@ turnstone/
   eval.py             Evaluation harness (HeadlessSession, scoring, prompt optimization)
   core/
     session.py        ChatSession engine, SessionUI protocol, tool dispatch
+    providers/        LLM provider adapters (pluggable backend layer)
+      _protocol.py    LLMProvider protocol, ModelCapabilities, StreamChunk, CompletionResult
+      _openai.py      OpenAIProvider — OpenAI, vLLM, llama.cpp, any compatible API
+      _anthropic.py   AnthropicProvider — Anthropic Messages API, native streaming, thinking
+      __init__.py     create_provider() + create_client() factory functions
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
@@ -86,7 +92,7 @@ A user message flows through the system as follows:
  _emit_state("thinking")
      |
      v
- _create_stream_with_retry()  ---->  client.chat.completions.create(stream=True)
+ _create_stream_with_retry()  ---->  provider.create_streaming(client, model, messages, ...)
      |                                  up to 3 retries (4 total attempts), exponential backoff
      v
  _stream_response(stream)  -------->  dispatch tokens to UI:
@@ -476,6 +482,61 @@ at connection time (server names with `__` are rejected).
 servers still connect. Tool execution errors return error strings to the LLM
 rather than crashing the session.
 
+### Provider Adapter Layer
+
+> See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)
+
+`ChatSession` is provider-agnostic — it delegates all LLM communication to an
+`LLMProvider` protocol (`turnstone/core/providers/_protocol.py`). Internally,
+messages use an OpenAI-like format; each provider translates at the API boundary.
+
+```
+ChatSession
+    |
+    v
+LLMProvider (protocol)
+    |
+    +--- OpenAIProvider  --- OpenAI, vLLM, llama.cpp, any /v1/chat/completions API
+    +--- AnthropicProvider --- Anthropic Messages API (native streaming, thinking)
+```
+
+**Protocol methods:**
+
+| Method | Purpose |
+|--------|---------|
+| `create_streaming()` | Streaming request, yields normalized `StreamChunk` objects |
+| `create_completion()` | Non-streaming request, returns `CompletionResult` |
+| `get_capabilities()` | Per-model flags (`ModelCapabilities`) |
+| `convert_tools()` | Translate OpenAI tool schemas to provider format |
+| `retryable_error_names` | Exception class names that trigger retry |
+
+**Normalized data types:**
+
+| Type | Fields |
+|------|--------|
+| `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `usage`, `finish_reason` |
+| `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort` |
+| `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
+
+**OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
+already in OpenAI format). Model capability lookup table covers GPT-4o,
+GPT-5/5.1/5.2, and O-series models. Unknown models (local servers) get
+permissive defaults.
+
+**AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
+Anthropic content blocks, maps `system`/`developer` roles to the `system`
+parameter, groups consecutive `tool` result messages into user-role content
+blocks, and translates tool schemas from OpenAI function-calling format to
+Anthropic's `input_schema` format. Supports both manual and adaptive thinking
+modes, with effort parameter support for models like Claude Opus 4.6 and
+Sonnet 4.6. The `anthropic` SDK is imported lazily so it remains an optional
+dependency (`pip install turnstone[anthropic]`).
+
+**Factory functions** (`__init__.py`): `create_provider(name)` returns a
+singleton provider instance (thread-safe). `create_client(name, base_url,
+api_key)` creates the appropriate SDK client.
+
 ### Multi-Model Registry
 
 `ModelRegistry` (`turnstone/core/model_registry.py`) manages named model
@@ -486,6 +547,13 @@ configurations so workstreams can use different LLM backends.
 [models.local]
 base_url = "http://localhost:8000/v1"
 model = "qwen3-32b"
+# provider defaults to "openai"
+
+[models.claude]
+provider = "anthropic"
+api_key = "sk-ant-..."
+model = "claude-opus-4-6"
+context_window = 200000
 
 [models.openai]
 base_url = "https://api.openai.com/v1"
@@ -495,22 +563,28 @@ context_window = 128000
 
 [model]
 default = "local"
-fallback = ["openai"]
-agent_model = "local"
+fallback = ["claude", "openai"]
+agent_model = "claude"
 ```
+
+Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
+(default: `"openai"`). Supported values: `"openai"` and `"anthropic"`.
 
 **Lifecycle:**
 1. `load_model_registry()` reads `[models.*]` sections from config.toml and
    builds a `"default"` entry from CLI `--base-url`/`--model`/`--api-key` args
 2. The registry is passed to the session factory closure in both `cli.py` and
    `server.py`; each workstream resolves its model on creation
-3. `ModelRegistry.get_client()` lazily creates `OpenAI` client instances
-   (thread-safe via `_client_lock`)
-4. `/model` command shows available models; `/model <alias>` switches the
+3. `ModelRegistry.get_client()` lazily creates SDK client instances via
+   `create_client()` — `OpenAI` for the openai provider, `Anthropic` for
+   the anthropic provider (thread-safe via `_client_lock`)
+4. `ModelRegistry.get_provider()` lazily creates `LLMProvider` instances via
+   `create_provider()` (also cached and thread-safe)
+5. `/model` command shows available models; `/model <alias>` switches the
    active workstream's client, model, and context window
-5. `_create_stream_with_retry()` tries the primary model, then each fallback
+6. `_create_stream_with_retry()` tries the primary model, then each fallback
    alias in order if the primary is unreachable
-6. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task
+7. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task
    sub-agents, allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /api/workstreams/new` accepts an optional

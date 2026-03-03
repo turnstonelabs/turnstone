@@ -27,9 +27,10 @@ from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 
-from openai import OpenAI, Stream
+from openai import OpenAI
 
 import turnstone.core.memory as _memory_module
+from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.tools import PRIMARY_KEY_MAP, TOOLS
 
@@ -142,7 +143,7 @@ class HeadlessSession(ChatSession):
 
     def __init__(
         self,
-        client: OpenAI,
+        client: Any,
         model: str,
         system_prompt_override: str | None = None,
         instructions: str | None = None,
@@ -210,53 +211,38 @@ class HeadlessSession(ChatSession):
             t0 = time.monotonic()
             msgs = self._full_messages()
 
-            response = self.client.chat.completions.create(
+            result = self._provider.create_completion(
+                client=self.client,
                 model=self.model,
-                messages=msgs,  # type: ignore[arg-type]
-                tools=TOOLS,  # type: ignore[arg-type]
-                max_completion_tokens=self.max_tokens,
+                messages=msgs,
+                tools=TOOLS,
+                max_tokens=self.max_tokens,
                 temperature=self.temperature,
-                stream=False,
-                extra_body={
-                    "chat_template_kwargs": {
-                        "reasoning_effort": self.reasoning_effort,
-                    }
-                },
+                reasoning_effort=self.reasoning_effort,
+                extra_params=self._provider_extra_params(),
             )
             elapsed = time.monotonic() - t0
 
-            assert not isinstance(response, Stream)
-            choice = response.choices[0]
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
-                "content": choice.message.content or None,
+                "content": result.content or None,
             }
 
-            if choice.message.tool_calls:
+            if result.tool_calls:
                 # Cap parallel tool calls to prevent degenerate repetition
-                calls = choice.message.tool_calls[:10]
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,  # type: ignore[union-attr]
-                            "arguments": tc.function.arguments,  # type: ignore[union-attr]
-                        },
-                    }
-                    for tc in calls
-                ]
+                assistant_msg["tool_calls"] = result.tool_calls[:10]
 
             self.messages.append(assistant_msg)
             msg_len = len(assistant_msg.get("content") or "")
             self._msg_tokens.append(max(1, int(msg_len / self._chars_per_token)))
 
             # Log usage and content
-            usage = getattr(response, "usage", None)
             if verbose:
                 toks = ""
-                if usage:
-                    toks = f"  [{usage.prompt_tokens}p/{usage.completion_tokens}c tok]"
+                if result.usage:
+                    toks = (
+                        f"  [{result.usage.prompt_tokens}p/{result.usage.completion_tokens}c tok]"
+                    )
                 _log(
                     f"{log_prefix}  turn {turn}: response in {elapsed:.1f}s{toks}",
                     dim=True,
@@ -267,14 +253,14 @@ class HeadlessSession(ChatSession):
                         text += "..."
                     _log(f"{log_prefix}    content: {text}", dim=True)
 
-            if not choice.message.tool_calls:
+            if not result.tool_calls:
                 if verbose:
                     _log(f"{log_prefix}  turn {turn}: no tool calls, done", dim=True)
                 break
 
             # Log tool calls
             if verbose:
-                names = [tc.function.name for tc in choice.message.tool_calls]  # type: ignore[union-attr]
+                names = [tc["function"]["name"] for tc in result.tool_calls]
                 _log(f"{log_prefix}  turn {turn}: tools -> {names}")
 
             # Execute tools with stdout suppressed
@@ -328,7 +314,7 @@ class HeadlessSession(ChatSession):
 
 
 def _run_single_test(
-    client: OpenAI,
+    client: Any,
     model: str,
     system_prompt: str,
     case: dict[str, Any],
@@ -568,7 +554,7 @@ def score_run(
 
 
 def _run_iteration(
-    client: OpenAI,
+    client: Any,
     model: str,
     system_prompt: str,
     cases: list[dict[str, Any]],
@@ -742,10 +728,11 @@ Output ONLY the modified rewriter instructions.\
 
 
 def _observe_and_update_optimizer(
-    client: OpenAI,
+    client: Any,
     model: str,
     optimizer_system: str,
     iterations: list[dict[str, Any]],
+    provider: LLMProvider | None = None,
 ) -> str:
     """Analyze optimizer behavior and return a modified OPTIMIZER_SYSTEM."""
     parts: list[str] = []
@@ -817,18 +804,20 @@ def _observe_and_update_optimizer(
         + "\n".join(parts)
     )
 
-    response = client.chat.completions.create(
+    prov = provider or create_provider("openai")
+    cr = prov.create_completion(
+        client=client,
         model=model,
         messages=[
-            {"role": "developer", "content": OBSERVER_SYSTEM},
+            {"role": "system", "content": OBSERVER_SYSTEM},
             {"role": "user", "content": user_content},
         ],
-        max_completion_tokens=2048,
+        max_tokens=2048,
         temperature=0.3,
-        stream=False,
+        reasoning_effort="low",
     )
 
-    result = response.choices[0].message.content or optimizer_system
+    result = cr.content or optimizer_system
     result = re.sub(
         r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
         "",
@@ -854,13 +843,14 @@ def _observe_and_update_optimizer(
 
 
 def _propose_prompt_modification(
-    client: OpenAI,
+    client: Any,
     model: str,
     current_prompt: str,
     test_cases: list[dict[str, Any]],
     iteration_result: dict[str, Any],
     history: list[dict[str, Any]],
     optimizer_system: str = OPTIMIZER_SYSTEM,
+    provider: LLMProvider | None = None,
 ) -> str:
     """Use the model to propose a new prompt based on evaluation results."""
     # Build summary of results
@@ -899,18 +889,20 @@ def _propose_prompt_modification(
         + "\n\nPropose an improved prompt. Output ONLY the new prompt text."
     )
 
-    response = client.chat.completions.create(
+    prov = provider or create_provider("openai")
+    cr = prov.create_completion(
+        client=client,
         model=model,
         messages=[
-            {"role": "developer", "content": optimizer_system},
+            {"role": "system", "content": optimizer_system},
             {"role": "user", "content": user_content},
         ],
-        max_completion_tokens=16384,
+        max_tokens=16384,
         temperature=0.6,
-        stream=False,
+        reasoning_effort="medium",
     )
 
-    new_prompt = response.choices[0].message.content or current_prompt
+    new_prompt = cr.content or current_prompt
 
     # Strip reasoning tags if present
     new_prompt = re.sub(
@@ -962,6 +954,8 @@ def run_optimization(
         base_url=base_url,
         api_key=os.environ.get("OPENAI_API_KEY", "dummy"),
     )
+
+    eval_provider = create_provider("openai")
 
     if not model:
         from turnstone.core.model_registry import detect_model
@@ -1073,6 +1067,7 @@ def run_optimization(
                         model,
                         current_optimizer_system,
                         results["iterations"],
+                        provider=eval_provider,
                     )
                     if new_opt != current_optimizer_system:
                         opt_diff = _simple_diff(current_optimizer_system, new_opt)
@@ -1106,6 +1101,7 @@ def run_optimization(
                     iteration_result=iter_result,
                     history=results["iterations"],
                     optimizer_system=current_optimizer_system,
+                    provider=eval_provider,
                 )
             except Exception as e:
                 _log(f"  Prompt modification failed: {e}", dim=True)
