@@ -221,7 +221,7 @@ class ChatSession:
                 model=self.model,
                 messages=[
                     {
-                        "role": "developer",
+                        "role": "system",
                         "content": (
                             "# Instructions\n\n"
                             "You are a conversation title generator. "
@@ -354,7 +354,7 @@ class ChatSession:
                 f"REMINDER: You currently have {len(memories)} memories stored. "
                 "Use recall to see them."
             )
-        self.system_messages.append({"role": "developer", "content": "\n".join(dev_parts)})
+        self.system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Agent prefix: system + developer only (no memories)
         self._agent_system_messages = list(self.system_messages)
 
@@ -971,7 +971,7 @@ class ChatSession:
         formatted = self._format_messages_for_summary(selected)
         summary_msgs = [
             {
-                "role": "developer",
+                "role": "system",
                 "content": (
                     "# Conversation Compactor\n\n"
                     "Your output REPLACES the conversation history — the assistant "
@@ -2209,7 +2209,7 @@ class ChatSession:
         """Delegate to a general-purpose autonomous sub-agent."""
         call_id, prompt = item["call_id"], item["prompt"]
         task_instruction = {
-            "role": "developer",
+            "role": "system",
             "content": (
                 "# Task Agent\n\n"
                 "You are an autonomous task agent with full tool access. "
@@ -2278,7 +2278,7 @@ class ChatSession:
                                 break
 
         agent_messages = list(self._agent_system_messages)
-        agent_messages.append({"role": "developer", "content": self._PLAN_IDENTITY})
+        agent_messages.append({"role": "system", "content": self._PLAN_IDENTITY})
         agent_messages.extend(prior_plan_msgs)
         agent_messages.append({"role": "user", "content": prompt})
 

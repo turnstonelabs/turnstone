@@ -76,15 +76,15 @@ class TestChatSessionConstruction:
     def test_system_messages_created(self, tmp_db):
         session = _make_session()
         assert len(session.system_messages) >= 1
-        # At least one developer message
+        # At least one system message
         roles = [m["role"] for m in session.system_messages]
-        assert "developer" in roles
+        assert "system" in roles
 
-    def test_instructions_appended_to_developer_message(self, tmp_db):
+    def test_instructions_appended_to_system_message(self, tmp_db):
         session = _make_session(instructions="Always be concise.")
-        dev_msgs = [m for m in session.system_messages if m["role"] == "developer"]
-        assert len(dev_msgs) >= 1
-        assert "Always be concise." in dev_msgs[0]["content"]
+        sys_msgs = [m for m in session.system_messages if m["role"] == "system"]
+        assert len(sys_msgs) >= 1
+        assert "Always be concise." in sys_msgs[0]["content"]
 
     def test_full_messages_returns_system_plus_conversation(self, tmp_db):
         session = _make_session()
