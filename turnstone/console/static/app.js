@@ -753,6 +753,8 @@ function renderWsTable(container, wsList) {
     row.setAttribute("tabindex", "0");
     row.setAttribute("role", "button");
     var ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
+    if (ws.model_alias || ws.model)
+      ariaLabel += ", model: " + (ws.model_alias || ws.model);
     if (ws.node) ariaLabel += " on " + ws.node;
     if (ws.title) ariaLabel += ", task: " + ws.title;
     if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
@@ -784,6 +786,13 @@ function renderWsTable(container, wsList) {
     nameCell.className = "dash-cell-name";
     nameCell.textContent = ws.name || ws.id || "";
     main.appendChild(nameCell);
+
+    // MODEL
+    var modelCell = document.createElement("span");
+    modelCell.className = "dash-cell-model";
+    modelCell.textContent = ws.model_alias || ws.model || "";
+    if (ws.model) modelCell.title = ws.model;
+    main.appendChild(modelCell);
 
     // NODE (clickable)
     var nodeCell = document.createElement("span");

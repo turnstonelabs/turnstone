@@ -72,6 +72,8 @@ class "ChatSession" as ChatSession {
     - _msg_tokens: list[int]
     - _session_id: str
     - _mcp_client: MCPClientManager | None
+    - _registry: ModelRegistry | None
+    + model_alias: str | None {property}
     - _tools: list[dict]
     - _task_tools: list[dict]
     - _agent_tools: list[dict]
@@ -83,7 +85,8 @@ class "ChatSession" as ChatSession {
     + resume_session(session_id: str)
     - _save_config()
     - _stream_response(stream) → dict
-    - _create_stream_with_retry(msgs) → Stream
+    - _create_stream_with_retry(msgs) → Stream (+ fallback)
+    - _try_stream(client, model, msgs) → Stream
     - _execute_tools(tool_calls) → (results, feedback)
     - _prepare_tool(tc) → item dict
     - _prepare_mcp_tool(call_id, name, args) → item dict
@@ -167,6 +170,35 @@ class "MCPClientManager" as MCPMgr {
     core/mcp_client.py
 }
 
+' ModelRegistry
+class "ModelRegistry" as ModelReg {
+    - _models: dict[str, ModelConfig]
+    - _clients: dict[str, OpenAI]
+    - _client_lock: Lock
+    + default: str
+    + fallback: list[str]
+    + agent_model: str | None
+    --
+    + resolve(alias) → (client, model, config)
+    + get_client(alias) → OpenAI
+    + has_alias(alias) → bool
+    + list_aliases() → list[str]
+    + shutdown()
+    --
+    Thread-safe lazy client creation.
+    Loaded by load_model_registry()
+    from CLI args + [models.*] config.
+    --
+    core/model_registry.py
+}
+
+class "ModelConfig" as ModelCfg <<frozen>> {
+    + alias: str
+    + base_url: str
+    + model: str
+    + context_window: int
+}
+
 ' Relationships
 SessionUI <|.. TerminalUI
 TerminalUI <|-- WsTermUI
@@ -175,6 +207,7 @@ SessionUI <|.. NullUI
 
 ChatSession --> SessionUI : uses
 ChatSession --> MCPMgr : optional
+ChatSession --> ModelReg : optional
 ChatSession <|-- HeadlessSession
 
 WsMgr --> "*" Ws : manages
@@ -182,7 +215,9 @@ Ws --> "1" ChatSession : wraps
 Ws --> "1" SessionUI : wraps
 Ws --> "1" WsState : has
 
-WsMgr ..> ChatSession : creates via\nsession_factory(ui)
+WsMgr ..> ChatSession : creates via\nsession_factory(ui, model_alias)
+
+ModelReg --> "*" ModelCfg : holds
 
 note bottom of ChatSession
   Central engine: multi-turn LLM loop

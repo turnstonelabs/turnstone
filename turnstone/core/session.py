@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from openai import OpenAI
 
     from turnstone.core.mcp_client import MCPClientManager
+    from turnstone.core.model_registry import ModelRegistry
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -108,9 +109,13 @@ class ChatSession:
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
         mcp_client: MCPClientManager | None = None,
+        registry: ModelRegistry | None = None,
+        model_alias: str | None = None,
     ):
         self.client = client
         self.model = model
+        self._registry = registry
+        self._model_alias = model_alias
         self.ui = ui
         self.instructions = instructions
         self.temperature = temperature
@@ -123,6 +128,7 @@ class ChatSession:
         self.agent_max_turns = agent_max_turns
         self._chars_per_token = 4.0  # calibrated from API usage
         # Tool output truncation: 0 means auto (50% of context_window in chars)
+        self._manual_tool_truncation = tool_truncation > 0
         if tool_truncation > 0:
             self.tool_truncation = tool_truncation
         else:
@@ -157,6 +163,10 @@ class ChatSession:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def model_alias(self) -> str | None:
+        return self._model_alias
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed sessions behave identically."""
@@ -369,12 +379,36 @@ class ChatSession:
     _RETRY_BASE_DELAY = 1.0  # seconds
 
     def _create_stream_with_retry(self, msgs: list[dict[str, Any]]) -> Any:
-        """Call chat.completions.create with retry on transient errors."""
+        """Call chat.completions.create with retry on transient errors.
+
+        If all retries fail and a fallback chain is configured, tries each
+        fallback model in order before giving up.
+        """
+        try:
+            return self._try_stream(self.client, self.model, msgs)
+        except Exception as primary_err:
+            if not self._registry or not self._registry.fallback:
+                raise
+            # Try each fallback model
+            for alias in self._registry.fallback:
+                if alias == self._model_alias:
+                    continue
+                try:
+                    fb_client, fb_model, _ = self._registry.resolve(alias)
+                    self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
+                    return self._try_stream(fb_client, fb_model, msgs)
+                except Exception as fb_err:
+                    self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
+                    continue
+            raise primary_err
+
+    def _try_stream(self, client: Any, model: str, msgs: list[dict[str, Any]]) -> Any:
+        """Attempt a streaming API call with retries on transient errors."""
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
-                return self.client.chat.completions.create(  # type: ignore[call-overload]
-                    model=self.model,
+                return client.chat.completions.create(
+                    model=model,
                     messages=msgs,
                     **({"tools": self._tools} if not self.creative_mode else {}),
                     max_completion_tokens=self.max_tokens,
@@ -2010,6 +2044,12 @@ class ChatSession:
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
 
+        # Resolve agent model: use registry.agent_model if configured
+        agent_client = self.client
+        agent_model = self.model
+        if self._registry and self._registry.agent_model:
+            agent_client, agent_model, _ = self._registry.resolve(self._registry.agent_model)
+
         def _api_call(
             messages: list[dict[str, Any]],
             _tools: list[dict[str, Any]] | None = tools,
@@ -2017,8 +2057,8 @@ class ChatSession:
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    return self.client.chat.completions.create(
-                        model=self.model,
+                    return agent_client.chat.completions.create(
+                        model=agent_model,
                         messages=messages,  # type: ignore[arg-type]
                         tools=_tools,  # type: ignore[arg-type]
                         max_completion_tokens=self.max_tokens,
@@ -2733,7 +2773,34 @@ class ChatSession:
                     self.ui.on_info("\n".join(lines))
 
         elif cmd == "/model":
-            self.ui.on_info(f"Model: {cyan(self.model)}")
+            if not arg:
+                info = f"Model: {cyan(self.model)}"
+                if self._model_alias:
+                    info += f" ({self._model_alias})"
+                if self._registry and self._registry.count > 1:
+                    avail = ", ".join(self._registry.list_aliases())
+                    info += f"\nAvailable: {avail}"
+                    if self._registry.fallback:
+                        info += f"\nFallback: {', '.join(self._registry.fallback)}"
+                    if self._registry.agent_model:
+                        info += f"\nAgent model: {self._registry.agent_model}"
+                self.ui.on_info(info)
+            elif self._registry and self._registry.has_alias(arg):
+                client, model_name, cfg = self._registry.resolve(arg)
+                self.client = client
+                self.model = model_name
+                self._model_alias = arg
+                self.context_window = cfg.context_window
+                if not self._manual_tool_truncation:
+                    self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                self._init_system_messages()
+                self._save_config()
+                self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")
+            else:
+                available = ""
+                if self._registry:
+                    available = f" Available: {', '.join(self._registry.list_aliases())}"
+                self.ui.on_info(f"Unknown model alias: {arg}.{available}")
 
         elif cmd == "/raw":
             self.show_reasoning = not self.show_reasoning
@@ -2815,7 +2882,7 @@ class ChatSession:
                         "  /history [query]       Search conversation history (or show recent)",
                         "  /compact               Compact conversation (summarize old messages)",
                         "",
-                        "  /model                 Show current model",
+                        "  /model [alias]         Show/switch model (alias from config)",
                         "  /raw                   Toggle reasoning content display",
                         "  /reason [low|med|high] Set/show reasoning effort",
                         "  /creative              Toggle creative writing mode (no tools)",

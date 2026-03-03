@@ -287,11 +287,13 @@ class Bridge:
         name = getattr(msg, "name", "")
         auto_approve = getattr(msg, "auto_approve", False)
         auto_approve_tools = getattr(msg, "auto_approve_tools", [])
+        model = getattr(msg, "model", "")
         self._create_ws_on_server(
             name=name,
             auto_approve=auto_approve,
             auto_approve_tools=auto_approve_tools,
             correlation_id=msg.correlation_id,
+            model=model,
         )
 
     def _handle_close_ws(self, msg: InboundMessage) -> None:
@@ -336,12 +338,16 @@ class Bridge:
         auto_approve: bool,
         auto_approve_tools: list[str],
         correlation_id: str,
+        model: str = "",
     ) -> str:
         """Create a workstream on the server.  Returns ws_id or empty on error."""
         try:
+            payload: dict[str, Any] = {"name": name, "auto_approve": auto_approve}
+            if model:
+                payload["model"] = model
             resp = self._http.post(
                 "/api/workstreams/new",
-                json={"name": name, "auto_approve": auto_approve},
+                json=payload,
             )
             data = resp.json()
             if "error" in data:
