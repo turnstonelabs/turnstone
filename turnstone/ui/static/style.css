@@ -510,6 +510,15 @@ body {
   max-height: 300px;
   overflow-y: auto;
 }
+.tool-output-stream {
+  border-left: 2px solid var(--accent);
+  max-height: 400px;
+  animation: stream-pulse 2s ease-in-out infinite;
+}
+@keyframes stream-pulse {
+  0%, 100% { border-left-color: var(--accent); }
+  50% { border-left-color: rgba(229, 160, 66, 0.15); }
+}
 .tool-output.collapsed { max-height: 150px; position: relative; }
 .tool-output.collapsed::after {
   content: 'click to expand';
@@ -826,6 +835,7 @@ body {
   :root { --dash-grid: 50px 1fr 50px; }
   .dash-col-node, .dash-cell-node, .dash-col-task, .dash-cell-task, .dash-col-ctx, .dash-cell-ctx { display: none; }
   .dash-row-sub { padding-left: 66px; }
+  .tool-output, .tool-output-stream { max-height: 200px; }
 }
 
 /* ==========================================================================
@@ -838,6 +848,7 @@ body {
   .dash-state-dot[data-state="running"],
   .dash-state-dot[data-state="thinking"],
   .dash-state-dot[data-state="attention"] { animation: none; opacity: 1; }
+  .tool-output-stream { animation: none; border-left-color: var(--accent); }
   .thinking-indicator::after { animation: none; content: '...'; }
   .ws-tab, .ws-tab .tab-close, #new-tab-btn,
   .header-btn, .hmenu-item, .dashboard-card,

@@ -9,9 +9,11 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import textwrap
@@ -70,6 +72,7 @@ class SessionUI(Protocol):
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]: ...
     def on_tool_result(self, name: str, output: str) -> None: ...
+    def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_plan_review(self, content: str) -> str: ...
     def on_info(self, message: str) -> None: ...
@@ -1701,31 +1704,69 @@ class ChatSession:
     # -- Execute methods (do the work, report output via UI) -------------------
 
     def _exec_bash(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Execute a bash command via temp script."""
+        """Execute a bash command via temp script, streaming stdout."""
         call_id, command = item["call_id"], item["command"]
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
                 f.write(command)
                 script_path = f.name
             try:
-                result = subprocess.run(
+                proc = subprocess.Popen(
                     ["bash", script_path],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
-                    timeout=self.tool_timeout,
+                    start_new_session=True,
                 )
+                # Drain stderr in background thread to avoid pipe deadlock
+                stderr_lines: list[str] = []
+
+                def drain_stderr() -> None:
+                    assert proc.stderr is not None
+                    for line in proc.stderr:
+                        stderr_lines.append(line)
+
+                stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+                stderr_thread.start()
+
+                # Stream stdout line-by-line with process-group timeout
+                stdout_parts: list[str] = []
+                timed_out = threading.Event()
+
+                def _on_timeout() -> None:
+                    timed_out.set()
+                    with contextlib.suppress(OSError, ProcessLookupError):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+
+                timer = threading.Timer(self.tool_timeout, _on_timeout)
+                timer.start()
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        stdout_parts.append(line)
+                        with contextlib.suppress(Exception):
+                            self.ui.on_tool_output_chunk(call_id, line)
+                finally:
+                    timer.cancel()
+
+                proc.wait()
+                stderr_thread.join(timeout=5)
             finally:
                 os.unlink(script_path)
-            output = result.stdout
-            if result.stderr:
-                output += ("\n" if output else "") + result.stderr
+
+            if timed_out.is_set():
+                raise subprocess.TimeoutExpired(cmd="bash", timeout=self.tool_timeout)
+
+            output = "".join(stdout_parts)
+            if stderr_lines:
+                output += ("\n" if output else "") + "".join(stderr_lines)
             output = output.strip()
             output = self._truncate_output(output)
 
             self.ui.on_tool_result("bash", output)
 
-            if result.returncode != 0:
-                output += f"\n[exit code: {result.returncode}]"
+            if proc.returncode != 0:
+                output += f"\n[exit code: {proc.returncode}]"
 
             return call_id, output if output else "(no output)"
 

@@ -91,6 +91,10 @@ Each item's `execute` callable is invoked:
 - Single tool calls run directly on the current thread.
 - Multiple tool calls run in parallel via `ThreadPoolExecutor(max_workers=4)`.
 - Errored or denied items return their error/denial message without executing.
+- The `bash` tool streams stdout incrementally: each line calls
+  `ui.on_tool_output_chunk(call_id, line)` as it is produced, then the final
+  combined output (stdout + stderr) is delivered via `ui.on_tool_result()`.
+  Other tools deliver results atomically via `on_tool_result()` only.
 - Special post-execution gate for `plan`: the plan output is shown to the user
   for review, and the user can reject or annotate it.
 

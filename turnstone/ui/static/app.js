@@ -1170,6 +1170,12 @@ function handleEvent(evt) {
       showInlineToolBlock(evt.items, false);
       break;
 
+    case "tool_output_chunk":
+      if (evt.call_id && evt.chunk) {
+        appendToolOutputChunk(evt.call_id, evt.chunk);
+      }
+      break;
+
     case "tool_result":
       appendToolOutput(evt.name, evt.output);
       break;
@@ -1313,9 +1319,7 @@ function replayHistory(messages) {
       }
     } else if (msg.role === "tool") {
       if (lastToolBlock) {
-        var stripped = (msg.content || "")
-          .replace(/\x1b\[[0-9;]*m/g, "")
-          .trim();
+        var stripped = stripAnsi(msg.content || "").trim();
         if (stripped) {
           var out = document.createElement("div");
           out.className = "tool-output";
@@ -1339,7 +1343,11 @@ function replayHistory(messages) {
 // --- Inline tool/approval blocks ---
 
 function stripAnsi(s) {
-  return s.replace(/\x1b\[[0-9;]*m/g, "");
+  // Strip CSI sequences, OSC sequences, and two-byte escapes
+  return s.replace(
+    /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
+    "",
+  );
 }
 
 function buildToolDiv(item) {
@@ -1489,6 +1497,43 @@ function resolveInlineApproval(approved, always, feedback) {
   scrollToBottom();
 }
 
+function appendToolOutputChunk(callId, chunk) {
+  if (!chunk) return;
+  var stripped = stripAnsi(chunk);
+  if (!stripped) return;
+
+  // Find or create a streaming output element keyed by call_id
+  var el = messagesEl.querySelector(
+    '.tool-output-stream[data-call-id="' + callId + '"]',
+  );
+  if (!el) {
+    // Find the last approval-block and last bash tool div inside it
+    var blocks = messagesEl.querySelectorAll(".approval-block");
+    if (!blocks.length) return;
+    var block = blocks[blocks.length - 1];
+    var tools = block.querySelectorAll('.approval-tool[data-func-name="bash"]');
+    var target = tools.length ? tools[tools.length - 1] : null;
+    if (!target) {
+      // Fallback to last tool div
+      var allTools = block.querySelectorAll(".approval-tool");
+      target = allTools.length ? allTools[allTools.length - 1] : null;
+    }
+    if (!target) return;
+
+    el = document.createElement("pre");
+    el.className = "tool-output tool-output-stream";
+    el.dataset.callId = callId;
+    el.setAttribute("aria-label", "Streaming command output");
+    el.setAttribute("aria-live", "off");
+    el.textContent = "";
+    target.after(el);
+  }
+
+  el.textContent += stripped;
+  el.scrollTop = el.scrollHeight;
+  scrollToBottom();
+}
+
 function appendToolOutput(name, output) {
   // Find the last approval-block in messages
   const blocks = messagesEl.querySelectorAll(".approval-block");
@@ -1507,6 +1552,12 @@ function appendToolOutput(name, output) {
   if (!target && tools.length) target = tools[tools.length - 1];
   if (!target) return;
 
+  // Remove the streaming output element adjacent to this tool
+  var streamEl = target.nextElementSibling;
+  if (streamEl && streamEl.classList.contains("tool-output-stream")) {
+    streamEl.remove();
+  }
+
   const stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
 
@@ -1514,12 +1565,28 @@ function appendToolOutput(name, output) {
   out.className = "tool-output";
   out.textContent = stripped;
 
-  // Auto-collapse long output
+  // Auto-collapse long output (keyboard-accessible)
   const lineCount = stripped.split("\n").length;
   if (lineCount > 10) {
     out.classList.add("collapsed");
-    out.addEventListener("click", function () {
+    out.setAttribute("tabindex", "0");
+    out.setAttribute("role", "button");
+    out.setAttribute(
+      "aria-label",
+      "Tool output (collapsed). Activate to expand.",
+    );
+    var expandHandler = function () {
       this.classList.remove("collapsed");
+      this.removeAttribute("tabindex");
+      this.removeAttribute("role");
+      this.removeAttribute("aria-label");
+    };
+    out.addEventListener("click", expandHandler);
+    out.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        expandHandler.call(this);
+      }
     });
   }
 
@@ -1531,8 +1598,7 @@ function appendToolOutput(name, output) {
 function addInfoMessage(text) {
   const el = document.createElement("div");
   el.className = "msg msg-info";
-  // Strip ANSI codes
-  el.textContent = text.replace(/\x1b\[[0-9;]*m/g, "");
+  el.textContent = stripAnsi(text);
   messagesEl.appendChild(el);
   scrollToBottom();
 }
@@ -1541,7 +1607,7 @@ function addErrorMessage(text) {
   const el = document.createElement("div");
   el.className = "msg msg-error";
   el.setAttribute("role", "alert");
-  el.textContent = text.replace(/\x1b\[[0-9;]*m/g, "");
+  el.textContent = stripAnsi(text);
   messagesEl.appendChild(el);
   scrollToBottom();
 }

@@ -126,6 +126,11 @@ package "Outbound Events (Bridge → Client)" #E3F2FD {
             ..
             correlation_id = request_id
         }
+        class ToolOutputChunkEvent {
+            type = "tool_output_chunk"
+            + call_id: str
+            + chunk: str
+        }
         class ToolResultEvent {
             type = "tool_result"
             + name: str
