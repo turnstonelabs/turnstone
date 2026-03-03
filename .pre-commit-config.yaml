@@ -10,7 +10,7 @@ repos:
     rev: v1.14.1
     hooks:
       - id: mypy
-        additional_dependencies: [types-redis>=4.6]
+        additional_dependencies: [types-redis>=4.6, redis>=7.2]
         args: [--config-file=pyproject.toml]
         pass_filenames: false
         entry: mypy turnstone/

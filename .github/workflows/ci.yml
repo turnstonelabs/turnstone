@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test,mq]"
-      - run: pytest tests/ -m "not live" --cov --cov-report=term-missing --cov-report=xml -q
+      - run: pytest tests/ -m "not live" --cov=turnstone --cov-report=term-missing --cov-report=xml -q
       - uses: actions/upload-artifact@v4
         if: always()
         with:
