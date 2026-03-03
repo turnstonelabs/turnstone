@@ -653,7 +653,7 @@ liveness probes.
 ```json
 {
   "status": "ok",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "uptime_seconds": 3614.72,
   "model": "llama-3.1-70b-instruct",
   "workstreams": {
