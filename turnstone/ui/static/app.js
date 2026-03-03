@@ -1345,7 +1345,7 @@ function replayHistory(messages) {
 function stripAnsi(s) {
   // Strip CSI sequences, OSC sequences, and two-byte escapes
   return s.replace(
-    /\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
+    /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
     "",
   );
 }
@@ -1529,7 +1529,7 @@ function appendToolOutputChunk(callId, chunk) {
     target.after(el);
   }
 
-  el.textContent += stripped;
+  el.appendChild(document.createTextNode(stripped));
   el.scrollTop = el.scrollHeight;
   scrollToBottom();
 }

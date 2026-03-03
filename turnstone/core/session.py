@@ -1766,9 +1766,15 @@ class ChatSession:
                 timed_out = threading.Event()
 
                 def _on_timeout() -> None:
+                    if proc.poll() is not None:
+                        return  # process already exited
                     timed_out.set()
                     with contextlib.suppress(OSError, ProcessLookupError):
-                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except OSError:
+                            with contextlib.suppress(OSError, ProcessLookupError):
+                                proc.kill()
 
                 timer = threading.Timer(self.tool_timeout, _on_timeout)
                 timer.start()
@@ -1782,7 +1788,7 @@ class ChatSession:
                     timer.cancel()
 
                 proc.wait()
-                stderr_thread.join(timeout=5)
+                stderr_thread.join()
             finally:
                 os.unlink(script_path)
 
