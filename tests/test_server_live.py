@@ -65,7 +65,7 @@ class RecordingUI:
         self.events: list[tuple[str, ...]] = []
         self.content_tokens: list[str] = []
         self.reasoning_tokens: list[str] = []
-        self.tool_results: list[tuple[str, str]] = []
+        self.tool_results: list[tuple[str, str, str]] = []
         self.tool_chunks: list[tuple[str, str]] = []
         self.errors: list[str] = []
         self.infos: list[str] = []
@@ -88,8 +88,8 @@ class RecordingUI:
     def approve_tools(self, items):
         return True, None  # auto-approve everything
 
-    def on_tool_result(self, name, output):
-        self.tool_results.append((name, output))
+    def on_tool_result(self, call_id, name, output):
+        self.tool_results.append((call_id, name, output))
 
     def on_tool_output_chunk(self, call_id, chunk):
         self.tool_chunks.append((call_id, chunk))
@@ -406,9 +406,9 @@ class TestToolCalling:
         session.send("Calculate 2+2")
 
         # math tool was invoked and returned a result
-        math_results = [r for r in ui.tool_results if r[0] == "math"]
+        math_results = [r for r in ui.tool_results if r[1] == "math"]
         assert len(math_results) > 0
-        assert "4" in math_results[0][1]
+        assert "4" in math_results[0][2]
 
         # Final content contains the answer
         assert "4" in ui.full_content
@@ -430,9 +430,9 @@ class TestToolCalling:
 
         session.send("Run echo hello")
 
-        bash_results = [r for r in ui.tool_results if r[0] == "bash"]
+        bash_results = [r for r in ui.tool_results if r[1] == "bash"]
         assert len(bash_results) > 0
-        assert "hello" in bash_results[0][1]
+        assert "hello" in bash_results[0][2]
 
     def test_read_file_tool(self, tmp_db):
         """First call returns tool_call for read_file, second returns content."""
@@ -456,7 +456,7 @@ class TestToolCalling:
 
             session.send(f"Read {path}")
 
-            read_results = [r for r in ui.tool_results if r[0] == "read_file"]
+            read_results = [r for r in ui.tool_results if r[1] == "read_file"]
             assert len(read_results) > 0
 
             # Model relays the content

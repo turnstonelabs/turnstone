@@ -73,7 +73,7 @@ class SessionUI(Protocol):
     def on_content_token(self, text: str) -> None: ...
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]: ...
-    def on_tool_result(self, name: str, output: str) -> None: ...
+    def on_tool_result(self, call_id: str, name: str, output: str) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_plan_review(self, content: str) -> str: ...
@@ -1801,7 +1801,7 @@ class ChatSession:
             output = output.strip()
             output = self._truncate_output(output)
 
-            self.ui.on_tool_result("bash", output)
+            self.ui.on_tool_result(call_id, "bash", output)
 
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]"
@@ -1854,7 +1854,7 @@ class ChatSession:
         if offset is not None or limit is not None:
             end = start + len(lines) - 1
             desc += f" (lines {start}-{end} of {total_lines})"
-        self.ui.on_tool_result("read_file", desc)
+        self.ui.on_tool_result(call_id, "read_file", desc)
 
         return call_id, output if output else "(empty file)"
 
@@ -1895,7 +1895,7 @@ class ChatSession:
             desc = f"{match_count} matches" if match_count else "no matches"
             if original_len > 500:
                 desc += f" ({original_len} chars)"
-            self.ui.on_tool_result("search", desc)
+            self.ui.on_tool_result(call_id, "search", desc)
 
             return call_id, output
 
@@ -2204,7 +2204,7 @@ class ChatSession:
                     msg = f"Updated memory: {key} = {value} (was: {existing[0]})"
                 else:
                     msg = f"Saved memory: {key} = {value}"
-                self.ui.on_tool_result("remember", msg)
+                self.ui.on_tool_result(call_id, "remember", msg)
                 return call_id, msg
             finally:
                 conn.close()
@@ -2224,7 +2224,7 @@ class ChatSession:
                 else:
                     self._init_system_messages()
                     msg = f"Forgot: {key}"
-                self.ui.on_tool_result("forget", msg)
+                self.ui.on_tool_result(call_id, "forget", msg)
                 return call_id, msg
             finally:
                 conn.close()
@@ -2280,7 +2280,7 @@ class ChatSession:
                 parts.append(f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines))
 
         output = "\n\n".join(parts) if parts else f"No results for '{query}'."
-        self.ui.on_tool_result("recall", output)
+        self.ui.on_tool_result(call_id, "recall", output)
         return call_id, output
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -2292,7 +2292,9 @@ class ChatSession:
             with open(path, "w") as f:
                 f.write(content)
             self._read_files.add(resolved)
-            return call_id, f"Wrote {len(content)} chars to {path}"
+            msg = f"Wrote {len(content)} chars to {path}"
+            self.ui.on_tool_result(call_id, "write_file", msg)
+            return call_id, msg
         except Exception as e:
             return call_id, f"Error writing {path}: {e}"
 
@@ -2333,7 +2335,9 @@ class ChatSession:
                 content = content.replace(old_string, new_string, 1)
             with open(path, "w") as f:
                 f.write(content)
-            return call_id, f"Edited {path}: replaced 1 occurrence"
+            msg = f"Edited {path}: replaced 1 occurrence"
+            self.ui.on_tool_result(call_id, "edit_file", msg)
+            return call_id, msg
         except Exception as e:
             return call_id, f"Error writing {path}: {e}"
 
@@ -2343,7 +2347,7 @@ class ChatSession:
         output, is_error = execute_math_sandboxed(code, timeout=self.tool_timeout)
         output = self._truncate_output(output)
 
-        self.ui.on_tool_result("math", output)
+        self.ui.on_tool_result(call_id, "math", output)
 
         if is_error:
             return call_id, f"Error:\n{output}"
@@ -2386,7 +2390,7 @@ class ChatSession:
                     text = result.stdout
                 else:
                     msg = f"No man or info page found for '{page}'"
-                    self.ui.on_tool_result("man", msg)
+                    self.ui.on_tool_result(call_id, "man", msg)
                     return call_id, msg
         except FileNotFoundError:
             return call_id, "Error: man command not available"
@@ -2395,7 +2399,7 @@ class ChatSession:
 
         text = self._truncate_output(text)
 
-        self.ui.on_tool_result("man", f"{len(text)} chars")
+        self.ui.on_tool_result(call_id, "man", f"{len(text)} chars")
 
         return call_id, text
 
@@ -2480,7 +2484,7 @@ class ChatSession:
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 
-        self.ui.on_tool_result("web_fetch", answer)
+        self.ui.on_tool_result(call_id, "web_fetch", answer)
 
         return call_id, answer
 
@@ -2528,7 +2532,7 @@ class ChatSession:
 
         output = "\n\n".join(parts) if parts else f"No results for '{query}'."
 
-        self.ui.on_tool_result("web_search", output)
+        self.ui.on_tool_result(call_id, "web_search", output)
 
         return call_id, output
 

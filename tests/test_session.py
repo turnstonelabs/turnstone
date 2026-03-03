@@ -27,7 +27,7 @@ class NullUI:
     def approve_tools(self, items):
         return True, None
 
-    def on_tool_result(self, name, output):
+    def on_tool_result(self, call_id, name, output):
         pass
 
     def on_tool_output_chunk(self, call_id, chunk):

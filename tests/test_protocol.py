@@ -121,7 +121,7 @@ OUTBOUND_TYPES = [
     (ReasoningEvent, {"text": "thinking..."}),
     (ToolInfoEvent, {"items": [{"name": "bash", "preview": "ls"}]}),
     (ApprovalRequestEvent, {"items": [{"name": "bash", "needs_approval": True}]}),
-    (ToolResultEvent, {"name": "bash", "output": "file.txt"}),
+    (ToolResultEvent, {"call_id": "call_123", "name": "bash", "output": "file.txt"}),
     (PlanReviewEvent, {"content": "# Plan\n\nStep 1: ..."}),
     (StatusEvent, {"prompt_tokens": 100, "completion_tokens": 50, "pct": 0.42}),
     (StateChangeEvent, {"state": "thinking"}),
