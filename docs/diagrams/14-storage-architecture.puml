@@ -1,0 +1,156 @@
+@startuml
+!theme plain
+title Turnstone — Storage Architecture
+
+skinparam class {
+    BackgroundColor<<protocol>> #E8EAF6
+    BackgroundColor<<sqlite>> #C8E6C9
+    BackgroundColor<<postgres>> #B3E5FC
+    BackgroundColor<<facade>> #FFF9C4
+    BackgroundColor<<migration>> #FFE0B2
+    BackgroundColor<<schema>> #F3E5F5
+}
+
+' -- Protocol --
+interface "StorageBackend" as SB <<protocol>> {
+    +register_session(session_id, title)
+    +save_message(session_id, role, content, ...)
+    +load_session_messages(session_id) → list[dict]
+    +list_sessions(limit) → list
+    +delete_session(session_id) → bool
+    +prune_sessions(retention_days) → (int, int)
+    +resolve_session(alias_or_id) → str | None
+    +save_session_config(session_id, config)
+    +load_session_config(session_id) → dict
+    +set_session_alias(session_id, alias) → bool
+    +get_session_name(session_id) → str | None
+    +update_session_title(session_id, title)
+    +kv_get(key) → str | None
+    +kv_set(key, value) → str | None
+    +kv_delete(key) → bool
+    +kv_list() → list[(str, str)]
+    +kv_search(query) → list[(str, str)]
+    +search_history(query, limit) → list
+    +search_history_recent(limit) → list
+    +close()
+}
+
+' -- Backends --
+class "SQLiteBackend" as SQLite <<sqlite>> {
+    -_engine: sa.Engine
+    -_fts5_available: bool
+    +__init__(path: str)
+    --
+    FTS5 full-text search
+    Default pool, check_same_thread=False
+}
+
+class "PostgreSQLBackend" as PG <<postgres>> {
+    -_engine: sa.Engine
+    +__init__(url: str, pool_size: int)
+    --
+    tsvector + ILIKE search
+    Connection pooling
+}
+
+' -- Schema --
+class "_schema.py" as Schema <<schema>> {
+    +metadata: MetaData
+    +memories: Table
+    +conversations: Table
+    +sessions: Table
+    +session_config: Table
+    --
+    SQLAlchemy Core
+    Single source of truth
+}
+
+' -- Migration --
+class "_migrate.py" as Migrate <<migration>> {
+    +run_migrations(storage, backend)
+    -_bootstrap_existing_sqlite()
+    --
+    Programmatic Alembic
+    Auto-bootstrap existing DBs
+}
+
+class "migrations/" as Versions <<migration>> {
+    001_initial_schema.py
+}
+
+' -- Registry --
+class "_registry.py" as Registry {
+    -_storage: StorageBackend | None
+    +init_storage(backend, path, url) → StorageBackend
+    +get_storage() → StorageBackend
+    +reset_storage()
+    --
+    Auto-initializes SQLite
+    if not configured
+}
+
+' -- Facade --
+class "memory.py" as Facade <<facade>> {
+    +register_session()
+    +save_message()
+    +load_session_messages()
+    +save_memory() / delete_memory()
+    +search_memories()
+    +... (all 18 functions)
+    --
+    Thin delegation to
+    get_storage()
+    Silent failure behavior
+}
+
+' -- Consumers --
+class "session.py\nChatSession" as Session {
+}
+
+class "server.py\nWeb UI" as Server {
+}
+
+class "cli.py\nTerminal" as CLI {
+}
+
+' -- Relationships --
+SQLite ..|> SB
+PG ..|> SB
+
+SQLite --> Schema : uses
+PG --> Schema : uses
+
+Registry --> SB : creates
+Registry --> Migrate : calls
+
+Migrate --> Versions : applies
+Migrate --> Schema : references
+
+Facade --> Registry : get_storage()
+
+Session --> Facade : imports
+Server --> Facade : imports
+CLI --> Facade : imports
+
+' -- Config --
+note right of Registry
+  [database]
+  backend = "sqlite" | "postgresql"
+  url = "postgresql+psycopg://..."
+  path = ".turnstone.db"
+  pool_size = 5
+end note
+
+note bottom of SQLite
+  Default backend.
+  Zero-config for
+  single-node / dev.
+end note
+
+note bottom of PG
+  Production backend.
+  Multi-node / Docker
+  default.
+end note
+
+@enduml

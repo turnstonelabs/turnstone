@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "turnstone.fullname" . }}-bridge
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bridge
+spec:
+  replicas: {{ .Values.bridge.replicas }}
+  selector:
+    matchLabels:
+      {{- include "turnstone.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: bridge
+  template:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: bridge
+    spec:
+      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      containers:
+        - name: bridge
+          image: {{ include "turnstone.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - turnstone-bridge
+            - --server-url={{ printf "http://%s-server:%s" (include "turnstone.fullname" .) (.Values.server.service.port | toString) }}
+            - --redis-host={{ include "turnstone.redis.host" . }}
+            - --redis-port={{ include "turnstone.redis.port" . }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "turnstone.fullname" . }}-config
+            - secretRef:
+                name: {{ include "turnstone.llm.secretName" . }}
+                optional: true
+          {{- if and .Values.auth.enabled .Values.auth.existingSecret }}
+          env:
+            - name: TURNSTONE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: TURNSTONE_AUTH_TOKEN
+          {{- end }}
+          resources:
+            {{- toYaml .Values.bridge.resources | nindent 12 }}

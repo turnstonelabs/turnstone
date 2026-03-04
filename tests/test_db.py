@@ -1,38 +1,30 @@
 """Tests for turnstone.core.memory — database operations."""
 
+import sqlalchemy as sa
+
 from turnstone.core.memory import (
     normalize_key,
-    open_db,
     save_message,
     search_history,
     search_history_recent,
 )
+from turnstone.core.storage import get_storage
 
 
-class TestOpenDb:
+class TestSchemaCreation:
     def test_creates_tables(self, tmp_db):
-        conn = open_db()
-        try:
-            # Check memories table exists
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'"
+                sa.text("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
             ).fetchall()
             assert len(rows) == 1
-
-            # Check conversations table exists
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'"
+                sa.text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'"
+                )
             ).fetchall()
             assert len(rows) == 1
-        finally:
-            conn.close()
-
-    def test_idempotent_open(self, tmp_db):
-        # Opening twice should not raise
-        conn1 = open_db()
-        conn1.close()
-        conn2 = open_db()
-        conn2.close()
 
 
 class TestSaveAndSearchHistory:
@@ -40,7 +32,6 @@ class TestSaveAndSearchHistory:
         save_message("sess1", "user", "hello world test message")
         results = search_history("hello")
         assert len(results) >= 1
-        # Result tuple: (timestamp, session_id, role, content, tool_name)
         found = any(r[3] == "hello world test message" for r in results)
         assert found
 

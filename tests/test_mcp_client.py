@@ -243,11 +243,13 @@ class TestMCPClientManager:
 
 class TestSessionIntegration:
     @pytest.fixture()
-    def tmp_db(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TURNSTONE_DB_PATH", str(tmp_path / "test.db"))
-        from turnstone.core.memory import open_db
+    def tmp_db(self, tmp_path):
+        from turnstone.core.storage import init_storage, reset_storage
 
-        open_db()
+        reset_storage()
+        init_storage("sqlite", path=str(tmp_path / "test.db"), run_migrations=False)
+        yield
+        reset_storage()
 
     def _make_session(self, mcp_client=None, **kwargs):
         from turnstone.core.session import ChatSession

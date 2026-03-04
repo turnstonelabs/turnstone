@@ -12,3 +12,12 @@ venv/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
+deploy/
+docs/
+tests/
+sdk/
+*.md
+!README.md
+!LICENSE
+.coverage
+.swp

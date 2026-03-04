@@ -78,7 +78,14 @@ Then open `http://localhost:8090` for the cluster-wide dashboard. Create workstr
 
 ```bash
 cp .env.example .env  # edit LLM_BASE_URL, OPENAI_API_KEY, etc.
-docker compose up     # starts redis + server + bridge + console
+docker compose up     # starts redis + server + bridge + console (SQLite)
+```
+
+For production with PostgreSQL:
+
+```bash
+# Requires POSTGRES_PASSWORD and DB_BACKEND=postgresql in .env (or exported)
+docker compose --profile production up  # adds PostgreSQL, uses it as database
 ```
 
 Console dashboard at http://localhost:8090. See [docs/docker.md](docs/docker.md) for configuration, scaling, and profiles.
@@ -117,7 +124,8 @@ turnstone/
 │   ├── mcp_client.py  # MCP client manager (external tool servers)
 │   ├── model_registry.py # ModelRegistry — named models, fallback routing, per-workstream selection
 │   ├── config.py      # Unified TOML config (~/.config/turnstone/config.toml)
-│   ├── memory.py      # SQLite persistence (memories, conversations, FTS5)
+│   ├── memory.py      # Persistence facade (delegates to storage/)
+│   ├── storage/       # Pluggable storage backend (SQLite + PostgreSQL)
 │   ├── metrics.py     # Prometheus-compatible metrics collector
 │   ├── healthcheck.py # Backend health monitor + circuit breaker
 │   ├── ratelimit.py   # Per-IP token-bucket rate limiter
@@ -147,9 +155,12 @@ turnstone/
 ├── cli.py             # Terminal frontend (+ /cluster commands for console)
 ├── server.py          # Web frontend (Starlette/ASGI + SSE)
 └── eval.py            # Evaluation and prompt optimization harness
+├── api/               # OpenAPI spec generation (Pydantic v2 models)
+├── sdk/               # Client SDKs (sync + async, Python)
 docs/
 ├── architecture.md    # System architecture and threading model
 ├── api-reference.md   # Web server API and SSE event reference
+├── sdk.md             # Client SDK reference (Python + TypeScript)
 ├── console.md         # Cluster dashboard service (turnstone-console)
 ├── docker.md          # Docker Compose deployment and configuration
 ├── simulator.md       # Cluster simulator usage and scenarios
@@ -157,6 +168,9 @@ docs/
 ├── eval.md            # Evaluation harness internals
 └── diagrams/          # UML architecture diagrams (PlantUML sources + PNGs)
     └── png/           # Pre-rendered diagram images
+deploy/
+├── helm/turnstone/    # Helm chart for Kubernetes
+└── terraform/         # Terraform modules (AWS ECS/Fargate)
 ```
 
 ### Architecture Diagrams
@@ -177,6 +191,8 @@ Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
 | [Simulator](docs/diagrams/png/10-simulator-architecture.png) | SimCluster, dispatchers, scenarios |
 | [Console Data Flow](docs/diagrams/png/11-console-data-flow.png) | Dashboard data collection threads |
 | [Deployment](docs/diagrams/png/12-deployment.png) | Docker Compose service topology |
+| [SDK Architecture](docs/diagrams/png/13-sdk-architecture.png) | Python + TypeScript client libraries |
+| [Storage Architecture](docs/diagrams/png/14-storage-architecture.png) | Pluggable database backends (SQLite + PostgreSQL) |
 
 ## Multi-node routing
 
@@ -330,6 +346,12 @@ enabled = true
 requests_per_second = 10.0
 burst = 20
 
+[database]
+backend = "sqlite"     # "sqlite" (default) or "postgresql"
+path = ".turnstone.db" # SQLite file path (relative to working directory)
+# url = "postgresql+psycopg://user:pass@host:5432/turnstone"  # PostgreSQL
+# pool_size = 5        # PostgreSQL connection pool size
+
 [mcp]
 config_path = ""       # path to MCP JSON config file (alternative to TOML sections)
 
@@ -389,6 +411,7 @@ Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
 - An OpenAI-compatible API endpoint ([vLLM](https://github.com/vllm-project/vllm), [NVIDIA NIM](https://build.nvidia.com/), [llama.cpp](https://github.com/ggml-org/llama.cpp), etc.) or an Anthropic API key
 - Redis (for message queue bridge — `pip install turnstone[mq]`)
 - Anthropic provider (optional — `pip install turnstone[anthropic]`)
+- PostgreSQL (optional, for production — `pip install turnstone[postgres]`)
 
 ## License
 

@@ -115,7 +115,39 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "circuit_breaker_threshold": "circuit_breaker_threshold",
         "circuit_breaker_cooldown": "circuit_breaker_cooldown",
     },
+    "database": {
+        "backend": "db_backend",
+        "url": "db_url",
+        "path": "db_path",
+        "pool_size": "db_pool_size",
+    },
 }
+
+# -- Tavily API key (cached) --------------------------------------------------
+
+_tavily_key: str | None = None
+_tavily_key_loaded: bool = False
+
+
+def get_tavily_key() -> str | None:
+    """Load Tavily API key (cached after first call).
+
+    Precedence: config.toml [api] tavily_key -> $TAVILY_API_KEY
+    """
+    import os
+
+    global _tavily_key, _tavily_key_loaded
+    if _tavily_key_loaded:
+        return _tavily_key
+    _tavily_key_loaded = True
+    cfg_key = load_config("api").get("tavily_key", "").strip()
+    if cfg_key:
+        _tavily_key = cfg_key
+        return _tavily_key
+    env_key = os.environ.get("TAVILY_API_KEY", "").strip()
+    if env_key:
+        _tavily_key = env_key
+    return _tavily_key
 
 
 def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:
