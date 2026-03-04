@@ -68,6 +68,9 @@ function connectSSE() {
   evtSource.onerror = function () {
     evtSource.close();
     evtSource = null;
+    // Don't show reconnecting state if login overlay is visible
+    var loginOverlay = document.getElementById("login-overlay");
+    if (loginOverlay && loginOverlay.style.display !== "none") return;
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
     var csb = document.getElementById("cluster-status-bar");
@@ -126,6 +129,8 @@ function showOverview() {
   document.getElementById("view-overview").style.display = "";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "none";
+  var adminView = document.getElementById("view-admin");
+  if (adminView) adminView.style.display = "none";
   document.getElementById("breadcrumb").style.display = "none";
   document.getElementById("main").scrollTop = 0;
   loadOverview();
@@ -637,6 +642,8 @@ function drillDownToNode(nodeId, serverUrl) {
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "";
   document.getElementById("view-filtered").style.display = "none";
+  var adminView = document.getElementById("view-admin");
+  if (adminView) adminView.style.display = "none";
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
   var link = document.getElementById("node-link");
@@ -685,6 +692,8 @@ function drillDownByState(state) {
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "";
+  var adminView = document.getElementById("view-admin");
+  if (adminView) adminView.style.display = "none";
   document.getElementById("breadcrumb").style.display = "";
   var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
   document.getElementById("breadcrumb-label").textContent =
@@ -703,6 +712,8 @@ function drillDownByNode(nodeId) {
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "";
+  var adminView = document.getElementById("view-admin");
+  if (adminView) adminView.style.display = "none";
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
   document.getElementById("filtered-title").textContent =
@@ -915,6 +926,8 @@ window.addEventListener("popstate", function (e) {
     return;
   }
   if (e.state.view === "overview") showOverview();
+  else if (e.state.view === "admin" && typeof showAdmin === "function")
+    showAdmin();
   else if (e.state.view === "node" && e.state.nodeId)
     drillDownToNode(e.state.nodeId, e.state.serverUrl);
   else if (e.state.view === "filtered" && e.state.filter) {
@@ -1082,8 +1095,15 @@ document.addEventListener("keydown", function (e) {
 });
 
 // --- Init ---
+// SSE connects after auth is confirmed — either via onLoginSuccess after
+// login, or after the first successful data load (page refresh with valid cookie).
+var _sseStarted = false;
+function _ensureSSE() {
+  if (!_sseStarted) {
+    _sseStarted = true;
+    connectSSE();
+  }
+}
 history.replaceState({ view: "overview" }, "");
 initLogin();
-connectSSE();
 loadOverview();
-// Try loading — if auth required, login overlay will show

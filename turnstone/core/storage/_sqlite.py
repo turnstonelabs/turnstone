@@ -11,11 +11,13 @@ from typing import Any
 import sqlalchemy as sa
 
 from turnstone.core.storage._schema import (
+    api_tokens,
     conversations,
     memories,
     metadata,
     session_config,
     sessions,
+    users,
     workstreams,
 )
 
@@ -88,6 +90,7 @@ class SQLiteBackend:
         title: str | None = None,
         node_id: str | None = None,
         ws_id: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -98,6 +101,7 @@ class SQLiteBackend:
                     "title": title,
                     "node_id": node_id,
                     "ws_id": ws_id,
+                    "user_id": user_id,
                     "created": now,
                     "updated": now,
                 },
@@ -423,6 +427,7 @@ class SQLiteBackend:
         node_id: str | None = None,
         name: str = "",
         state: str = "idle",
+        user_id: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -431,6 +436,7 @@ class SQLiteBackend:
                 {
                     "ws_id": ws_id,
                     "node_id": node_id,
+                    "user_id": user_id,
                     "name": name,
                     "state": state,
                     "created": now,
@@ -526,6 +532,205 @@ class SQLiteBackend:
                     {"limit": capped},
                 ).fetchall()
             )
+
+    # -- User identity operations -----------------------------------------------
+
+    def create_user(
+        self, user_id: str, username: str, display_name: str, password_hash: str
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(users).prefix_with("OR IGNORE"),
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "display_name": display_name,
+                    "password_hash": password_hash,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def create_first_user(
+        self, user_id: str, username: str, display_name: str, password_hash: str
+    ) -> bool:
+        """Atomically create a user only if no users exist. Returns True if created."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.text(
+                    "INSERT INTO users (user_id, username, display_name, password_hash, created) "
+                    "SELECT :user_id, :username, :display_name, :password_hash, :created "
+                    "WHERE NOT EXISTS (SELECT 1 FROM users)"
+                ),
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "display_name": display_name,
+                    "password_hash": password_hash,
+                    "created": now,
+                },
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def get_user(self, user_id: str) -> dict[str, str] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    users.c.user_id,
+                    users.c.username,
+                    users.c.display_name,
+                    users.c.password_hash,
+                    users.c.created,
+                ).where(users.c.user_id == user_id)
+            ).fetchone()
+            if row:
+                return {
+                    "user_id": row[0],
+                    "username": row[1],
+                    "display_name": row[2],
+                    "password_hash": row[3],
+                    "created": row[4],
+                }
+            return None
+
+    def get_user_by_username(self, username: str) -> dict[str, str] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    users.c.user_id,
+                    users.c.username,
+                    users.c.display_name,
+                    users.c.password_hash,
+                    users.c.created,
+                ).where(users.c.username == username)
+            ).fetchone()
+            if row:
+                return {
+                    "user_id": row[0],
+                    "username": row[1],
+                    "display_name": row[2],
+                    "password_hash": row[3],
+                    "created": row[4],
+                }
+            return None
+
+    def list_users(self) -> list[dict[str, str]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    users.c.user_id,
+                    users.c.username,
+                    users.c.display_name,
+                    users.c.created,
+                ).order_by(users.c.created.desc())
+            ).fetchall()
+            return [
+                {"user_id": r[0], "username": r[1], "display_name": r[2], "created": r[3]}
+                for r in rows
+            ]
+
+    def delete_user(self, user_id: str) -> bool:
+        from turnstone.core.storage._schema import channel_users
+
+        with self._engine.connect() as conn:
+            conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
+            conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
+            result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    def create_api_token(
+        self,
+        token_id: str,
+        token_hash: str,
+        token_prefix: str,
+        user_id: str,
+        name: str,
+        scopes: str,
+        expires: str | None = None,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(api_tokens),
+                {
+                    "token_id": token_id,
+                    "token_hash": token_hash,
+                    "token_prefix": token_prefix,
+                    "user_id": user_id,
+                    "name": name,
+                    "scopes": scopes,
+                    "created": now,
+                    "expires": expires,
+                },
+            )
+            conn.commit()
+
+    def get_api_token_by_hash(self, token_hash: str) -> dict[str, str] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    api_tokens.c.token_id,
+                    api_tokens.c.token_prefix,
+                    api_tokens.c.user_id,
+                    api_tokens.c.name,
+                    api_tokens.c.scopes,
+                    api_tokens.c.created,
+                    api_tokens.c.expires,
+                ).where(api_tokens.c.token_hash == token_hash)
+            ).fetchone()
+            if row:
+                result: dict[str, str] = {
+                    "token_id": row[0],
+                    "token_prefix": row[1],
+                    "user_id": row[2],
+                    "name": row[3],
+                    "scopes": row[4],
+                    "created": row[5],
+                }
+                if row[6] is not None:
+                    result["expires"] = row[6]
+                return result
+            return None
+
+    def list_api_tokens(self, user_id: str) -> list[dict[str, str]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    api_tokens.c.token_id,
+                    api_tokens.c.token_prefix,
+                    api_tokens.c.user_id,
+                    api_tokens.c.name,
+                    api_tokens.c.scopes,
+                    api_tokens.c.created,
+                    api_tokens.c.expires,
+                )
+                .where(api_tokens.c.user_id == user_id)
+                .order_by(api_tokens.c.created.desc())
+            ).fetchall()
+            result = []
+            for r in rows:
+                entry: dict[str, str] = {
+                    "token_id": r[0],
+                    "token_prefix": r[1],
+                    "user_id": r[2],
+                    "name": r[3],
+                    "scopes": r[4],
+                    "created": r[5],
+                }
+                if r[6] is not None:
+                    entry["expires"] = r[6]
+                result.append(entry)
+            return result
+
+    def delete_api_token(self, token_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(api_tokens).where(api_tokens.c.token_id == token_id))
+            conn.commit()
+            return result.rowcount > 0
 
     # -- Lifecycle -------------------------------------------------------------
 

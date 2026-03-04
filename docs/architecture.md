@@ -917,6 +917,98 @@ limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
 
 ---
 
+## User Identity and Authentication
+
+Turnstone supports three authentication mechanisms, unified behind an
+`AuthResult` dataclass that carries `user_id`, `scopes`, and `token_source`:
+
+1. **Config-file tokens** — static secrets in `config.toml` `[[auth.tokens]]`
+   or the `TURNSTONE_AUTH_TOKEN` env var. Validated in-memory via
+   `hmac.compare_digest`. Map to scopes through their role (`read` or `full`).
+2. **API tokens** — database-backed, prefixed `ts_`, stored as SHA-256 hashes
+   in the `api_tokens` table. Can be exchanged for JWTs via
+   `POST /v1/api/auth/login`.
+3. **JWTs** — short-lived HMAC-SHA256 session tokens (default 24h) issued after
+   successful credential validation. Contain `sub` (user_id), `scopes`, and
+   `src` (origin) in claims.
+
+### Scope Model
+
+Three hierarchical scopes control endpoint access:
+
+| Scope | Grants | Endpoints |
+|-------|--------|-----------|
+| `read` | SSE streams, workstream listing, sessions | GET endpoints |
+| `write` | `read` + send, command, workstream create/close | POST to `/api/send`, `/api/command`, etc. |
+| `approve` | `write` + tool approval, admin operations | POST to `/api/approve`, `/api/admin/*` |
+
+### Middleware Flow
+
+`AuthMiddleware` (ASGI) intercepts every request:
+
+1. **Public path check** — `/`, `/static/*`, `/shared/*`, `/health`,
+   `/metrics`, `/openapi.json`, `/docs`, `/api/auth/*`, and `/api/auth/setup`
+   are always allowed.
+2. **Token extraction** — `Authorization: Bearer <token>` header first, then
+   `turnstone_auth` cookie as fallback.
+3. **Token type detection** — dots in the token indicate JWT; `ts_` prefix
+   indicates API token; otherwise config-file token.
+4. **Validation** — JWT signature check, API token hash lookup in storage, or
+   config-token hmac comparison.
+5. **Scope check** — `required_scope(method, path)` determines the minimum
+   scope; the request is rejected with 403 if the token lacks it.
+6. **Context propagation** — on success, `ctx_user_id` is set so structured
+   logging includes the authenticated identity on every log event.
+
+### Architecture Split
+
+- **Console** is the auth management hub — it hosts the admin endpoints for
+  creating users, issuing API tokens, and managing channel mappings. User
+  records and token hashes live in the shared storage backend. The console
+  dashboard includes an **admin panel** (Users and Tokens tabs) for managing
+  credentials through the browser.
+- **Server** is a JWT validator only — it validates tokens on each request but
+  never creates users or tokens. Both processes share the same `jwt_secret`
+  (via `TURNSTONE_JWT_SECRET` env var or `[auth].jwt_secret` config).
+- **First-time setup** — both server and console expose
+  `POST /v1/api/auth/setup`, a public endpoint that creates the initial admin
+  user when no users exist. This avoids the chicken-and-egg problem of needing
+  `approve` scope to create the first user via `/api/admin/users`.
+
+### Auth Storage Tables
+
+Three tables in `storage/_schema.py` support identity:
+
+```sql
+users
+  user_id        TEXT PRIMARY KEY
+  username       TEXT NOT NULL UNIQUE
+  display_name   TEXT NOT NULL
+  password_hash  TEXT NOT NULL       -- bcrypt
+  created        TEXT NOT NULL
+
+api_tokens
+  token_id       TEXT PRIMARY KEY
+  token_hash     TEXT NOT NULL UNIQUE  -- SHA-256 of raw token
+  token_prefix   TEXT NOT NULL         -- first 8 chars for display
+  user_id        TEXT NOT NULL
+  name           TEXT NOT NULL         -- human-readable label
+  scopes         TEXT NOT NULL         -- comma-separated
+  created        TEXT NOT NULL
+  expires        TEXT                  -- optional expiry timestamp
+
+channel_users
+  channel_type      TEXT NOT NULL      -- e.g. "slack", "discord"
+  channel_user_id   TEXT NOT NULL      -- platform-specific user ID
+  user_id           TEXT NOT NULL      -- FK to users
+  PRIMARY KEY (channel_type, channel_user_id)
+```
+
+See [docs/security.md](security.md) for full security details including token
+lifecycle, password hashing, and deployment hardening.
+
+---
+
 ## Threading Model
 
 ### CLI

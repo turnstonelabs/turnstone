@@ -306,68 +306,78 @@ class TestCheckRequest:
         )
 
     def test_disabled_allows_all(self, disabled):
-        allowed, status, msg = check_request(disabled, "POST", "/api/send", None)
+        allowed, status, msg, _result = check_request(disabled, "POST", "/api/send", None)
         assert allowed is True
         assert status == 200
 
     def test_disabled_allows_no_header(self, disabled):
-        allowed, status, msg = check_request(disabled, "GET", "/api/workstreams", None)
+        allowed, status, msg, _result = check_request(disabled, "GET", "/api/workstreams", None)
         assert allowed is True
 
     def test_public_path_no_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/health", None)
+        allowed, status, msg, _result = check_request(enabled, "GET", "/health", None)
         assert allowed is True
         assert status == 200
 
     def test_public_root_no_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/", None)
+        allowed, status, msg, _result = check_request(enabled, "GET", "/", None)
         assert allowed is True
 
     def test_public_static_no_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/static/style.css", None)
+        allowed, status, msg, _result = check_request(enabled, "GET", "/static/style.css", None)
         assert allowed is True
 
     def test_api_no_token_401(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/api/workstreams", None)
+        allowed, status, msg, _result = check_request(enabled, "GET", "/api/workstreams", None)
         assert allowed is False
         assert status == 401
         assert "Unauthorized" in msg
 
     def test_api_invalid_token_401(self, enabled):
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "GET", "/api/workstreams", "Bearer wrong_token"
         )
         assert allowed is False
         assert status == 401
 
     def test_api_read_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/api/workstreams", "Bearer tok_read")
+        allowed, status, msg, _result = check_request(
+            enabled, "GET", "/api/workstreams", "Bearer tok_read"
+        )
         assert allowed is True
         assert status == 200
 
     def test_api_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/api/workstreams", "Bearer tok_full")
+        allowed, status, msg, _result = check_request(
+            enabled, "GET", "/api/workstreams", "Bearer tok_full"
+        )
         assert allowed is True
 
     def test_write_read_token_403(self, enabled):
-        allowed, status, msg = check_request(enabled, "POST", "/api/send", "Bearer tok_read")
+        allowed, status, msg, _result = check_request(
+            enabled, "POST", "/api/send", "Bearer tok_read"
+        )
         assert allowed is False
         assert status == 403
         assert "Forbidden" in msg
 
     def test_write_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "POST", "/api/send", "Bearer tok_full")
+        allowed, status, msg, _result = check_request(
+            enabled, "POST", "/api/send", "Bearer tok_full"
+        )
         assert allowed is True
         assert status == 200
 
     def test_approve_read_token_403(self, enabled):
-        allowed, status, msg = check_request(enabled, "POST", "/api/approve", "Bearer tok_read")
+        allowed, status, msg, _result = check_request(
+            enabled, "POST", "/api/approve", "Bearer tok_read"
+        )
         assert allowed is False
         assert status == 403
 
     def test_proxy_write_read_token_403(self, enabled):
         """Read tokens cannot escalate to write ops via proxy routes."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/node/node-a/api/send", "Bearer tok_read"
         )
         assert allowed is False
@@ -375,7 +385,7 @@ class TestCheckRequest:
 
     def test_proxy_write_trailing_slash_read_token_403(self, enabled):
         """Trailing slash must not bypass write-role check on proxy routes."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/node/node-a/api/send/", "Bearer tok_read"
         )
         assert allowed is False
@@ -383,20 +393,22 @@ class TestCheckRequest:
 
     def test_direct_write_trailing_slash_read_token_403(self, enabled):
         """Trailing slash must not bypass write-role check on direct routes."""
-        allowed, status, msg = check_request(enabled, "POST", "/api/send/", "Bearer tok_read")
+        allowed, status, msg, _result = check_request(
+            enabled, "POST", "/api/send/", "Bearer tok_read"
+        )
         assert allowed is False
         assert status == 403
 
     def test_proxy_write_full_token_ok(self, enabled):
         """Full tokens pass through proxy write routes."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/node/node-a/api/send", "Bearer tok_full"
         )
         assert allowed is True
 
     def test_proxy_v1_write_read_token_403(self, enabled):
         """Read tokens cannot escalate to write ops via v1 proxy routes."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_read"
         )
         assert allowed is False
@@ -404,14 +416,14 @@ class TestCheckRequest:
 
     def test_proxy_v1_write_full_token_ok(self, enabled):
         """Full tokens pass through v1 proxy write routes."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_full"
         )
         assert allowed is True
 
     def test_proxy_v1_cluster_ws_new_read_403(self, enabled):
         """Read tokens cannot create workstreams via v1 proxy."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled,
             "POST",
             "/node/node-a/v1/api/cluster/workstreams/new",
@@ -422,25 +434,27 @@ class TestCheckRequest:
 
     def test_proxy_read_endpoint_read_token_ok(self, enabled):
         """Read tokens can access proxy read endpoints."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "GET", "/node/node-a/api/workstreams", "Bearer tok_read"
         )
         assert allowed is True
 
     def test_console_create_ws_read_token_403(self, enabled):
         """Read tokens cannot create workstreams."""
-        allowed, status, msg = check_request(
+        allowed, status, msg, _result = check_request(
             enabled, "POST", "/api/cluster/workstreams/new", "Bearer tok_read"
         )
         assert allowed is False
         assert status == 403
 
     def test_approve_full_token_ok(self, enabled):
-        allowed, status, msg = check_request(enabled, "POST", "/api/approve", "Bearer tok_full")
+        allowed, status, msg, _result = check_request(
+            enabled, "POST", "/api/approve", "Bearer tok_full"
+        )
         assert allowed is True
 
     def test_no_auth_header_string(self, enabled):
-        allowed, status, msg = check_request(enabled, "GET", "/api/dashboard", "")
+        allowed, status, msg, _result = check_request(enabled, "GET", "/api/dashboard", "")
         assert allowed is False
         assert status == 401
 
@@ -461,7 +475,7 @@ class TestCheckRequestWithCookie:
         )
 
     def test_cookie_fallback_when_no_bearer(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "GET",
             "/api/workstreams",
@@ -473,7 +487,7 @@ class TestCheckRequestWithCookie:
 
     def test_bearer_takes_precedence_over_cookie(self, enabled):
         # Bearer is full, cookie is read — Bearer should win
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "POST",
             "/api/send",
@@ -483,7 +497,7 @@ class TestCheckRequestWithCookie:
         assert allowed is True
 
     def test_invalid_cookie_401(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "GET",
             "/api/workstreams",
@@ -494,7 +508,7 @@ class TestCheckRequestWithCookie:
         assert status == 401
 
     def test_cookie_read_on_write_403(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "POST",
             "/api/send",
@@ -505,7 +519,7 @@ class TestCheckRequestWithCookie:
         assert status == 403
 
     def test_cookie_full_on_write_ok(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "POST",
             "/api/send",
@@ -515,7 +529,7 @@ class TestCheckRequestWithCookie:
         assert allowed is True
 
     def test_no_cookie_no_bearer_401(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "GET",
             "/api/workstreams",
@@ -526,7 +540,7 @@ class TestCheckRequestWithCookie:
         assert status == 401
 
     def test_login_path_public(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "POST",
             "/api/auth/login",
@@ -535,7 +549,7 @@ class TestCheckRequestWithCookie:
         assert allowed is True
 
     def test_logout_path_public(self, enabled):
-        allowed, status, _ = check_request(
+        allowed, status, _, _r = check_request(
             enabled,
             "POST",
             "/api/auth/logout",
@@ -552,11 +566,27 @@ class TestCheckRequestWithCookie:
 class TestLoadAuthConfig:
     """Tests for load_auth_config with mocked config + env vars."""
 
-    def test_default_disabled(self):
+    def test_default_enabled(self):
         with patch("turnstone.core.config.load_config", return_value={}):
             cfg = load_auth_config()
-        assert cfg.enabled is False
+        assert cfg.enabled is True
         assert cfg.tokens == {}
+
+    def test_explicit_disable(self):
+        with (
+            patch("turnstone.core.config.load_config", return_value={"enabled": False}),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            cfg = load_auth_config()
+        assert cfg.enabled is False
+
+    def test_env_disable(self):
+        with (
+            patch("turnstone.core.config.load_config", return_value={}),
+            patch.dict(os.environ, {"TURNSTONE_AUTH_ENABLED": "0"}, clear=True),
+        ):
+            cfg = load_auth_config()
+        assert cfg.enabled is False
 
     def test_config_file_tokens(self):
         mock_cfg = {

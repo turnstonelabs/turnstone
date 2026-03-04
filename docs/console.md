@@ -148,7 +148,7 @@ Single node detail with all its workstreams.
 
 ### `POST /v1/api/cluster/workstreams/new`
 
-Create a new workstream on a target node. Dispatches a `CreateWorkstreamMessage` through the Redis MQ pipeline — the bridge on the target node picks it up and creates the workstream on the server. Requires `"full"` auth role.
+Create a new workstream on a target node. Dispatches a `CreateWorkstreamMessage` through the Redis MQ pipeline — the bridge on the target node picks it up and creates the workstream on the server. Requires `write` scope.
 
 Request:
 
@@ -207,6 +207,86 @@ Keepalive comments (`: keepalive\n\n`) are sent every 5 seconds. Clients should 
 }
 ```
 
+### Admin API
+
+User and token management endpoints. All admin endpoints require `approve` scope, except for the setup endpoint which is public.
+
+#### `POST /v1/api/auth/setup`
+
+Creates the first admin user when no users exist. Public endpoint (no auth required). Returns a JWT and sets a session cookie. Returns `409` if users already exist. See [Security: First-time setup](security.md#first-time-setup) for full details.
+
+#### `POST /v1/api/admin/users`
+
+Create a new user.
+
+```json
+{
+  "username": "alice",
+  "password": "s3cret",
+  "scopes": ["read", "write"]
+}
+```
+
+#### `GET /v1/api/admin/users`
+
+List all users.
+
+```json
+{
+  "users": [
+    {"user_id": "u_abc123", "username": "alice", "scopes": ["read", "write"], "created": "2026-03-01T12:00:00Z"}
+  ]
+}
+```
+
+#### `DELETE /v1/api/admin/users/{user_id}`
+
+Delete a user and revoke all their tokens.
+
+#### `POST /v1/api/admin/users/{user_id}/tokens`
+
+Create an API token for the given user. Returns a `ts_`-prefixed token string that can be used for Bearer auth or passed to `client.login(token="ts_xxx")`.
+
+```json
+{
+  "name": "CI pipeline",
+  "scopes": ["read", "write"]
+}
+```
+
+#### `GET /v1/api/admin/users/{user_id}/tokens`
+
+List active tokens for a user (token strings are not returned, only metadata).
+
+#### `DELETE /v1/api/admin/tokens/{token_id}`
+
+Revoke a specific API token.
+
+#### `GET /v1/api/auth/status`
+
+Public endpoint for login UI state detection. Returns auth configuration, not
+current-user identity.
+
+```json
+{
+  "auth_enabled": true,
+  "has_users": true,
+  "setup_required": false
+}
+```
+
+### Auth Scopes
+
+The auth system uses three scopes instead of the earlier read/full role model:
+
+| Scope | Grants |
+|-------|--------|
+| `read` | Read-only access: dashboards, workstream lists, SSE streams, health |
+| `write` | Send messages, create/close workstreams, approve tool calls |
+| `approve` | Admin operations: manage users and API tokens |
+
+Scopes are cumulative — a user with `approve` scope can also perform `write` and `read` operations.
+
 ---
 
 ## Reverse Proxy
@@ -240,13 +320,13 @@ SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied by creating 
 
 ### Authentication
 
-The proxy forwards requests to server nodes using the console's `--auth-token`. The console's own auth middleware also checks proxy routes — `POST` requests to proxy write endpoints (`/v1/api/send`, `/v1/api/approve`, etc.) require the `"full"` auth role, preventing read-only tokens from escalating to write operations.
+The proxy forwards the user's JWT to upstream server nodes — it extracts the token from the incoming request's cookie (or `Authorization` header) and adds it as a `Bearer` header on the proxied request.  Since all services share the same `TURNSTONE_JWT_SECRET`, the user's JWT is valid on every node without re-authentication.  The console's own auth middleware also checks proxy routes — `POST` requests to proxy write endpoints (`/v1/api/send`, `/v1/api/approve`, etc.) require `write` scope, preventing read-only tokens from escalating via proxy.  The static `--auth-token` / `proxy_auth_token` is used as a fallback when no user JWT is present.
 
 ---
 
 ## Browser Dashboard
 
-The web UI has four views, toggled client-side:
+The web UI has five views, toggled client-side:
 
 ### 1. Cluster Overview (landing)
 
@@ -276,7 +356,46 @@ Triggered by the "+ new" header button. A modal dialog with:
 
 On submit, `POST /v1/api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
 
-All four views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
+All five views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
+
+### 5. Admin Panel
+
+Accessed via the "admin" button in the header (visible when authenticated
+with `approve` scope). Provides user and API token management with two tabs:
+
+**Users tab:**
+
+- Grid table listing all users (username, display name, role, creation date)
+- "Create User" button opens a modal with fields for username, display name,
+  and password (validated: username 1-64 ASCII, password min 8 characters)
+- Delete button on each row removes the user and cascades to revoke all
+  their tokens
+
+**Tokens tab:**
+
+- User selector dropdown to pick which user's tokens to manage
+- Grid table listing tokens for the selected user (name, prefix, scopes,
+  creation date)
+- Scope badges rendered as colored pills for visual clarity
+- "Create Token" button opens a modal with fields for token name and scope
+  checkboxes
+- On creation, a "Token Created" modal displays the raw `ts_`-prefixed
+  token with a copy button. The token is shown once and cannot be retrieved
+  again.
+- Revoke button on each row deletes the token
+
+**Accessibility:**
+
+- Full keyboard navigation: focus traps in modals, Escape to close, arrow
+  keys for tab switching
+- Responsive layout with column hiding at 700px breakpoint
+
+**First-time setup:**
+
+The console also exposes `POST /v1/api/auth/setup` for first-time
+bootstrap. When no users exist, the setup wizard calls this public endpoint
+to create the initial admin user and receive a JWT in one step. See
+[Security: First-time setup](security.md#first-time-setup) for details.
 
 ---
 
