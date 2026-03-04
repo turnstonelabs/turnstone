@@ -789,6 +789,12 @@
   grid-template-columns: 100px 1fr 160px 100px 100px 80px;
 }
 
+/* Channels grid: CHANNEL | EXTERNAL ID | LINKED | ACTIONS */
+#admin-channels .admin-colheaders,
+#admin-channels .admin-row {
+  grid-template-columns: 100px 1fr 100px 80px;
+}
+
 /* Scope badges */
 .scope-badge {
   display: inline-block;
@@ -806,6 +812,7 @@
 }
 .scope-write { color: var(--cyan); border-color: rgba(103, 232, 249, 0.2); }
 .scope-approve { color: var(--accent); border-color: var(--accent-dim); }
+.scope-channel { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
 
 /* Action buttons */
 .admin-btn-danger {
@@ -917,7 +924,7 @@
 .modal-submit:focus-visible { outline: 2px solid var(--fg-bright); outline-offset: 2px; }
 .modal-submit:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
 
-#create-user-overlay, #create-token-overlay, #token-created-overlay {
+#create-user-overlay, #create-token-overlay, #token-created-overlay, #create-channel-overlay, #confirm-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -957,6 +964,10 @@
     grid-template-columns: 80px 1fr 100px 80px;
   }
   .admin-col-created, .admin-col-expires { display: none; }
+  #admin-channels .admin-colheaders, #admin-channels .admin-row {
+    grid-template-columns: 80px 1fr 80px;
+  }
+  #admin-channels .admin-col-created { display: none; }
 }
 
 /* ==========================================================================

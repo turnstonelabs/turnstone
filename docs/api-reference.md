@@ -716,22 +716,25 @@ Creates a new workstream. The server supports up to 10 concurrent workstreams.
 
 All fields are optional. The body can be empty or an empty JSON object.
 
-| Field          | Type   | Default | Description                                    |
-|----------------|--------|---------|------------------------------------------------|
-| `name`         | string | auto    | Workstream display name                        |
-| `model`        | string | default | Model alias from the registry (`[models.*]`)   |
-| `auto_approve` | bool   | false   | Auto-approve all tool calls for this workstream |
+| Field            | Type   | Default | Description                                                    |
+|------------------|--------|---------|----------------------------------------------------------------|
+| `name`           | string | auto    | Workstream display name                                        |
+| `model`          | string | default | Model alias from the registry (`[models.*]`)                   |
+| `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
+| `resume_session` | string | ""      | Session ID to resume atomically during creation (empty = fresh)|
 
 **Response (success):**
 
 ```json
-{"ws_id": "ghi789", "name": "ws-3"}
+{"ws_id": "ghi789", "name": "ws-3", "resumed": false, "message_count": 0}
 ```
 
-| Field   | Type   | Description                        |
-|---------|--------|------------------------------------|
-| `ws_id` | string | Unique ID of the new workstream    |
-| `name`  | string | Auto-generated workstream name     |
+| Field           | Type   | Description                                         |
+|-----------------|--------|-----------------------------------------------------|
+| `ws_id`         | string | Unique ID of the new workstream                     |
+| `name`          | string | Auto-generated workstream name                      |
+| `resumed`       | bool   | Whether a previous session was successfully resumed |
+| `message_count` | int    | Number of messages in the resumed session (0 if fresh) |
 
 **Error (limit reached):**
 

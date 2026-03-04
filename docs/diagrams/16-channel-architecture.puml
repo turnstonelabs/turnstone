@@ -1,0 +1,211 @@
+@startuml
+!theme plain
+title Turnstone — Channel Integration Architecture
+
+skinparam class {
+    BackgroundColor<<platform>> #E1BEE7
+    BackgroundColor<<service>> #E8EAF6
+    BackgroundColor<<mq>> #FFCDD2
+    BackgroundColor<<bridge>> #C8E6C9
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+}
+
+' -- External Platforms --
+class "Discord" as Discord <<platform>> {
+    Gateway WebSocket (v10)
+    Message events
+    Interaction callbacks (buttons)
+    Thread-per-workstream
+    --
+    discord.py 2.x
+    asyncio event loop
+}
+
+class "Slack (future)" as Slack <<platform>> {
+    Socket Mode / Events API
+    Block Kit messages
+    --
+    Planned integration
+}
+
+class "Teams (future)" as Teams <<platform>> {
+    Bot Framework
+    Adaptive Cards
+    --
+    Planned integration
+}
+
+' -- Channel Service --
+class "turnstone-channel" as ChannelService <<service>> {
+    entry point: turnstone-channel
+    --
+    One process per platform
+    asyncio event loop
+    Structured logging (structlog)
+    --log-level, --log-format
+}
+
+class "DiscordBot" as Bot <<service>> {
+    +on_message(msg)
+    +on_interaction(interaction)
+    +run(token)
+    --
+    discord.py Client
+    Receives message events
+    Sends replies + embeds
+    Creates threads for workstreams
+    Renders approval buttons
+}
+
+class "ChannelRouter" as Router <<service>> {
+    +resolve_route(platform, channel_id)
+        → ws_id | None
+    +register_route(channel_id, ws_id)
+    +resolve_identity(platform, platform_user_id)
+        → user_id | None
+    --
+    Maps channels → workstreams
+    Maps platform users → turnstone users
+    Caches routes in memory
+}
+
+class "AsyncRedisBroker" as Broker <<service>> {
+    +push_inbound(msg)
+    +subscribe(ws_id) → AsyncIterator
+    +subscribe_global() → AsyncIterator
+    +push_response(correlation_id, msg)
+    --
+    redis.asyncio client
+    Pub/sub + queue operations
+}
+
+' -- Redis MQ --
+class "Redis MQ" as Redis <<mq>> {
+    turnstone:inbound (LIST)
+    turnstone:events:{ws_id} (PUBSUB)
+    turnstone:events:global (PUBSUB)
+    turnstone:resp:{corr_id} (LIST)
+    --
+    Shared message bus
+    Same queues as bridge protocol
+}
+
+' -- Bridge + Server --
+class "turnstone-bridge" as Bridge <<bridge>> {
+    BLPOP turnstone:inbound
+    Drive server via HTTP
+    Relay SSE → Redis pub/sub
+    --
+    Owns workstream lifecycle
+    Auto-approve / manual approve
+}
+
+class "turnstone-server" as Server <<server>> {
+    POST /v1/api/send
+    POST /v1/api/approve
+    POST /v1/api/workstreams/new
+    GET  /v1/api/events?ws_id=
+    --
+    LLM execution + tool use
+    SSE event stream
+}
+
+' -- Storage --
+class "channel_users" as CU <<storage>> {
+    channel_user_id (PK)
+    platform: "discord" | "slack"
+    platform_user_id
+    user_id → users
+    linked_at
+    --
+    /link command creates row
+    Resolved on each inbound message
+}
+
+class "channel_routes" as CR <<storage>> {
+    channel_type (PK)
+    channel_id (PK)
+    ws_id
+    node_id
+    created
+    --
+    Maps platform channels
+    to turnstone workstreams
+}
+
+' -- Relationships --
+Discord --> Bot : gateway\nevents
+Bot --> Router : on_message\non_interaction
+Router --> Broker : SendMessage\nApproveMessage
+Router --> CU : resolve identity
+Router --> CR : resolve / register route
+Broker --> Redis : RPUSH inbound\nRPUSH resp:{id}
+
+Redis --> Bridge : BLPOP inbound
+Bridge --> Server : HTTP API
+Server --> Bridge : SSE events
+Bridge --> Redis : PUBLISH events:{ws_id}\nPUBLISH events:global
+
+Redis --> Broker : SUBSCRIBE events:{ws_id}
+Broker --> Bot : event stream
+Bot --> Discord : reply / embed\nbutton callback
+
+Slack .[hidden]. Discord
+Teams .[hidden]. Slack
+
+ChannelService --> Bot : creates + runs
+ChannelService --> Router : creates
+ChannelService --> Broker : creates
+
+' -- Notes --
+note right of Bot
+  **Inbound Flow**
+  1. Discord message arrives via gateway
+  2. Bot.on_message() fires
+  3. ChannelRouter resolves channel → ws_id
+     (or creates new workstream)
+  4. ChannelRouter resolves platform user → user_id
+     via channel_users table
+  5. Broker.push_inbound(SendMessage)
+  6. Bridge pops from Redis, drives server
+
+  **Session Resume (evicted workstreams)**
+  1. Stale route detected (no MQ owner)
+  2. Old session looked up via get_session_id_by_ws()
+  3. CreateWorkstreamMessage sent with
+     resume_session=<old_session_id>
+  4. Server resumes atomically during creation
+  5. Bridge emits SessionResumedEvent → thread
+end note
+
+note right of Broker
+  **Outbound Flow**
+  1. Server emits SSE events
+  2. Bridge relays to Redis events:{ws_id}
+  3. Broker.subscribe(ws_id) yields events
+  4. Bot formats and sends to Discord thread
+end note
+
+note bottom of CR
+  **Approval Flow**
+  1. ApprovalRequestEvent arrives via events:{ws_id}
+  2. Bot renders Discord buttons (Approve / Deny)
+  3. User clicks button → on_interaction()
+  4. Router builds ApproveMessage
+  5. Broker.push_response(correlation_id, msg)
+  6. Bridge pops from resp:{id}, calls POST /api/approve
+end note
+
+note bottom of CU
+  **Identity Linking**
+  1. User runs /link in Discord
+  2. Bot opens modal requesting API token
+  3. User submits ts_... API token
+  4. Bot validates token against storage
+  5. On success, inserts channel_users row
+  6. Subsequent messages carry user_id
+  7. AuthResult scopes applied by server
+end note
+
+@enduml

@@ -473,6 +473,15 @@ class PostgreSQLBackend:
                 ).fetchall()
             )
 
+    # -- Session lookup by workstream ------------------------------------------
+
+    def get_session_id_by_ws(self, ws_id: str) -> str | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(sessions.c.session_id).where(sessions.c.ws_id == ws_id)
+            ).fetchone()
+            return str(row[0]) if row else None
+
     # -- User identity operations -----------------------------------------------
 
     def create_user(
@@ -673,6 +682,200 @@ class PostgreSQLBackend:
     def delete_api_token(self, token_id: str) -> bool:
         with self._engine.connect() as conn:
             result = conn.execute(sa.delete(api_tokens).where(api_tokens.c.token_id == token_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Channel user mapping ---------------------------------------------------
+
+    def create_channel_user(self, channel_type: str, channel_user_id: str, user_id: str) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        from turnstone.core.storage._schema import channel_users
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                postgresql.insert(channel_users)
+                .values(
+                    channel_type=channel_type,
+                    channel_user_id=channel_user_id,
+                    user_id=user_id,
+                    created=now,
+                )
+                .on_conflict_do_nothing()
+            )
+            conn.commit()
+
+    def get_channel_user(self, channel_type: str, channel_user_id: str) -> dict[str, str] | None:
+        from turnstone.core.storage._schema import channel_users
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    channel_users.c.channel_type,
+                    channel_users.c.channel_user_id,
+                    channel_users.c.user_id,
+                    channel_users.c.created,
+                ).where(
+                    (channel_users.c.channel_type == channel_type)
+                    & (channel_users.c.channel_user_id == channel_user_id)
+                )
+            ).fetchone()
+            if row:
+                return {
+                    "channel_type": row[0],
+                    "channel_user_id": row[1],
+                    "user_id": row[2],
+                    "created": row[3],
+                }
+            return None
+
+    def list_channel_users_by_user(self, user_id: str) -> list[dict[str, str]]:
+        from turnstone.core.storage._schema import channel_users
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    channel_users.c.channel_type,
+                    channel_users.c.channel_user_id,
+                    channel_users.c.user_id,
+                    channel_users.c.created,
+                )
+                .where(channel_users.c.user_id == user_id)
+                .order_by(channel_users.c.created.desc())
+            ).fetchall()
+            return [
+                {
+                    "channel_type": r[0],
+                    "channel_user_id": r[1],
+                    "user_id": r[2],
+                    "created": r[3],
+                }
+                for r in rows
+            ]
+
+    def delete_channel_user(self, channel_type: str, channel_user_id: str) -> bool:
+        from turnstone.core.storage._schema import channel_users
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(channel_users).where(
+                    (channel_users.c.channel_type == channel_type)
+                    & (channel_users.c.channel_user_id == channel_user_id)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Channel routing -------------------------------------------------------
+
+    def create_channel_route(
+        self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
+    ) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        from turnstone.core.storage._schema import channel_routes
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                postgresql.insert(channel_routes)
+                .values(
+                    channel_type=channel_type,
+                    channel_id=channel_id,
+                    ws_id=ws_id,
+                    node_id=node_id,
+                    created=now,
+                )
+                .on_conflict_do_nothing()
+            )
+            conn.commit()
+
+    def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
+        from turnstone.core.storage._schema import channel_routes
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    channel_routes.c.channel_type,
+                    channel_routes.c.channel_id,
+                    channel_routes.c.ws_id,
+                    channel_routes.c.node_id,
+                    channel_routes.c.created,
+                ).where(
+                    (channel_routes.c.channel_type == channel_type)
+                    & (channel_routes.c.channel_id == channel_id)
+                )
+            ).fetchone()
+            if row:
+                return {
+                    "channel_type": row[0],
+                    "channel_id": row[1],
+                    "ws_id": row[2],
+                    "node_id": row[3],
+                    "created": row[4],
+                }
+            return None
+
+    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
+        from turnstone.core.storage._schema import channel_routes
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    channel_routes.c.channel_type,
+                    channel_routes.c.channel_id,
+                    channel_routes.c.ws_id,
+                    channel_routes.c.node_id,
+                    channel_routes.c.created,
+                ).where(channel_routes.c.ws_id == ws_id)
+            ).fetchone()
+            if row:
+                return {
+                    "channel_type": row[0],
+                    "channel_id": row[1],
+                    "ws_id": row[2],
+                    "node_id": row[3],
+                    "created": row[4],
+                }
+            return None
+
+    def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
+        from turnstone.core.storage._schema import channel_routes
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    channel_routes.c.channel_type,
+                    channel_routes.c.channel_id,
+                    channel_routes.c.ws_id,
+                    channel_routes.c.node_id,
+                    channel_routes.c.created,
+                )
+                .where(channel_routes.c.channel_type == channel_type)
+                .order_by(channel_routes.c.created.desc())
+            ).fetchall()
+            return [
+                {
+                    "channel_type": r[0],
+                    "channel_id": r[1],
+                    "ws_id": r[2],
+                    "node_id": r[3],
+                    "created": r[4],
+                }
+                for r in rows
+            ]
+
+    def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
+        from turnstone.core.storage._schema import channel_routes
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(channel_routes).where(
+                    (channel_routes.c.channel_type == channel_type)
+                    & (channel_routes.c.channel_id == channel_id)
+                )
+            )
             conn.commit()
             return result.rowcount > 0
 

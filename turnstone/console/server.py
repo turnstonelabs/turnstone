@@ -986,6 +986,79 @@ async def admin_revoke_token(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Channel user mapping
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_channels(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/users/{user_id}/channels — list channel links for a user."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    channels = storage.list_channel_users_by_user(user_id)
+    return JSONResponse({"channels": channels})
+
+
+async def admin_create_channel(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/users/{user_id}/channels — link a channel account."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    try:
+        body: dict[str, Any] = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    channel_type = body.get("channel_type", "").strip().lower()
+    channel_user_id = body.get("channel_user_id", "").strip()
+
+    if not channel_type:
+        return JSONResponse({"error": "channel_type is required"}, status_code=400)
+    if not channel_user_id:
+        return JSONResponse({"error": "channel_user_id is required"}, status_code=400)
+    if len(channel_type) > 64 or len(channel_user_id) > 256:
+        return JSONResponse({"error": "Value too long"}, status_code=400)
+
+    # Verify user exists
+    if storage.get_user(user_id) is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+
+    # Check for existing mapping
+    existing = storage.get_channel_user(channel_type, channel_user_id)
+    if existing is not None:
+        return JSONResponse(
+            {"error": f"Channel user already linked to user {existing['user_id']}"},
+            status_code=409,
+        )
+
+    storage.create_channel_user(channel_type, channel_user_id, user_id)
+    result = storage.get_channel_user(channel_type, channel_user_id)
+    if result is None:
+        return JSONResponse({"error": "Failed to create channel mapping"}, status_code=500)
+    # Guard against race: another request may have claimed this channel_user_id.
+    if result.get("user_id") != user_id:
+        return JSONResponse(
+            {"error": f"Channel user already linked to user {result['user_id']}"},
+            status_code=409,
+        )
+    return JSONResponse(result)
+
+
+async def admin_delete_channel(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/channels/{channel_type}/{channel_user_id} — unlink."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    channel_type = request.path_params["channel_type"]
+    channel_user_id = request.path_params["channel_user_id"]
+    if storage.delete_channel_user(channel_type, channel_user_id):
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Channel link not found"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -1028,6 +1101,20 @@ def create_app(
                         "/api/admin/users/{user_id}/tokens", admin_create_token, methods=["POST"]
                     ),
                     Route("/api/admin/tokens/{token_id}", admin_revoke_token, methods=["DELETE"]),
+                    Route(
+                        "/api/admin/users/{user_id}/channels",
+                        admin_list_channels,
+                    ),
+                    Route(
+                        "/api/admin/users/{user_id}/channels",
+                        admin_create_channel,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/channels/{channel_type}/{channel_user_id}",
+                        admin_delete_channel,
+                        methods=["DELETE"],
+                    ),
                 ],
             ),
             Route("/health", health),
@@ -1156,10 +1243,27 @@ def main() -> None:
         password=args.redis_password,
     )
 
+    # If no explicit auth token is provided, mint a service JWT using the
+    # shared secret so the collector can poll server nodes.
+    collector_token = args.auth_token
+    if not collector_token:
+        _jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
+        if _jwt_secret:
+            from turnstone.core.auth import create_jwt
+
+            collector_token = create_jwt(
+                user_id="console-collector",
+                scopes=frozenset({"read"}),
+                source="console",
+                secret=_jwt_secret,
+                expiry_hours=168,  # 1 week — console restarts refresh
+            )
+            log.info("console.collector_jwt_minted")
+
     collector = ClusterCollector(
         broker=broker,
         poll_interval=args.poll_interval,
-        auth_token=args.auth_token,
+        auth_token=collector_token,
     )
     collector.start()
 
@@ -1182,13 +1286,28 @@ def main() -> None:
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
 
+    # If no explicit auth token is provided, mint a service JWT using the
+    # shared secret so the console can proxy requests to the server.
+    proxy_token = args.auth_token
+    if not proxy_token and jwt_secret:
+        from turnstone.core.auth import create_jwt
+
+        proxy_token = create_jwt(
+            user_id="console-proxy",
+            scopes=frozenset({"write"}),
+            source="console",
+            secret=jwt_secret,
+            expiry_hours=168,  # 1 week — console restarts refresh
+        )
+        log.info("console.jwt_minted")
+
     app = create_app(
         collector=collector,
         broker=broker,
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
-        proxy_auth_token=args.auth_token,
+        proxy_auth_token=proxy_token,
     )
 
     log.info("Console starting on http://%s:%s", args.host, args.port)

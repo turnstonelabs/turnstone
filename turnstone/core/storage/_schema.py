@@ -120,3 +120,20 @@ channel_users = sa.Table(
 )
 
 sa.Index("idx_channel_users_user_id", channel_users.c.user_id)
+
+# ---------------------------------------------------------------------------
+# Channel routing tables
+# ---------------------------------------------------------------------------
+
+channel_routes = sa.Table(
+    "channel_routes",
+    metadata,
+    sa.Column("channel_type", sa.Text, nullable=False),
+    sa.Column("channel_id", sa.Text, nullable=False),
+    sa.Column("ws_id", sa.Text, nullable=False),
+    sa.Column("node_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("channel_type", "channel_id"),
+)
+
+sa.Index("idx_channel_routes_ws", channel_routes.c.ws_id)

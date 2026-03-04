@@ -262,6 +262,16 @@ List active tokens for a user (token strings are not returned, only metadata).
 
 Revoke a specific API token.
 
+### Channel links
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/api/admin/users/{user_id}/channels` | List channel links for a user |
+| POST | `/v1/api/admin/users/{user_id}/channels` | Link a channel account (channel_type, channel_user_id) |
+| DELETE | `/v1/api/admin/channels/{channel_type}/{channel_user_id}` | Unlink a channel account |
+
+These endpoints manage the `channel_users` table mappings that connect external platform identities (e.g. Discord user IDs) to turnstone users. See [Channel Integrations](channels.md) for details on the linking flow.
+
 #### `GET /v1/api/auth/status`
 
 Public endpoint for login UI state detection. Returns auth configuration, not
@@ -361,15 +371,16 @@ All five views receive live updates via SSE — state cards update counts, node 
 ### 5. Admin Panel
 
 Accessed via the "admin" button in the header (visible when authenticated
-with `approve` scope). Provides user and API token management with two tabs:
+with `approve` scope). Provides user, API token, and channel link management
+with three tabs:
 
 **Users tab:**
 
 - Grid table listing all users (username, display name, role, creation date)
 - "Create User" button opens a modal with fields for username, display name,
   and password (validated: username 1-64 ASCII, password min 8 characters)
-- Delete button on each row removes the user and cascades to revoke all
-  their tokens
+- Delete button on each row opens a styled confirmation modal before
+  removing the user and cascading to revoke all their tokens
 
 **Tokens tab:**
 
@@ -382,7 +393,20 @@ with `approve` scope). Provides user and API token management with two tabs:
 - On creation, a "Token Created" modal displays the raw `ts_`-prefixed
   token with a copy button. The token is shown once and cannot be retrieved
   again.
-- Revoke button on each row deletes the token
+- Revoke button on each row opens a styled confirmation modal before
+  deleting the token
+
+**Channels tab:**
+
+- User selector dropdown to pick which user's channel links to manage
+- Grid table listing linked channel accounts for the selected user
+  (channel type, channel user ID, creation date)
+- "Link Channel" button opens a modal with fields for channel type
+  (e.g. `discord`) and the platform user ID
+- Unlink button on each row opens a styled confirmation modal before
+  removing the channel mapping
+- Admins can force-link users who have not self-linked via `/link` in
+  Discord
 
 **Accessibility:**
 

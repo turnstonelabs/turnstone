@@ -34,7 +34,7 @@ RUN useradd --create-home --shell /bin/bash turnstone
 
 # Install the wheel with all optional extras
 COPY --from=builder /build/wheels/*.whl /tmp/wheels/
-RUN pip install --no-cache-dir "$(ls /tmp/wheels/*.whl)[mq,console,sim,postgres]" \
+RUN pip install --no-cache-dir "$(ls /tmp/wheels/*.whl)[mq,console,sim,postgres,discord]" \
     && rm -rf /tmp/wheels
 
 # Health check script (stdlib only, no pip deps needed)
