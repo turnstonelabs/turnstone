@@ -107,15 +107,33 @@ class AuthMiddleware:
         from turnstone.core.auth import check_request
 
         auth_config = request.app.state.auth_config
+        jwt_secret = getattr(request.app.state, "jwt_secret", "")
+        storage = getattr(request.app.state, "auth_storage", None)
         method = request.method
         path = request.url.path
         auth_header = request.headers.get("Authorization")
         cookie_header = request.headers.get("Cookie")
-        allowed, status, msg = check_request(auth_config, method, path, auth_header, cookie_header)
+        allowed, status, msg, auth_result = check_request(
+            auth_config,
+            method,
+            path,
+            auth_header,
+            cookie_header,
+            jwt_secret=jwt_secret,
+            storage=storage,
+        )
         if not allowed:
             response = JSONResponse({"error": msg}, status_code=status)
             await response(scope, receive, send)
             return
+
+        if auth_result and auth_result.user_id:
+            from turnstone.core.log import ctx_user_id
+
+            ctx_user_id.set(auth_result.user_id)
+        if "state" not in scope:
+            scope["state"] = {}
+        scope["state"]["auth_result"] = auth_result
         await self.app(scope, receive, send)
 
 
@@ -165,6 +183,34 @@ _CONSOLE_PROXY_STYLE = "<style>.dashboard-overlay{top:32px!important}</style>"
 
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _proxy_auth_headers(request: Request) -> dict[str, str]:
+    """Build auth headers for proxied requests to upstream servers.
+
+    Forwards the user's JWT (from cookie or Bearer header) so that
+    upstream servers with auth enabled accept the proxied request.
+    Falls back to the static proxy_auth_token if configured.
+    """
+    # Prefer the incoming Authorization header (e.g. Bearer JWT)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header:
+        return {"Authorization": auth_header}
+
+    # Extract JWT from cookie
+    from turnstone.core.auth import AUTH_COOKIE, _extract_cookie
+
+    cookie_header = request.headers.get("Cookie", "")
+    cookie_token = _extract_cookie(cookie_header, AUTH_COOKIE)
+    if cookie_token:
+        return {"Authorization": f"Bearer {cookie_token}"}
+
+    # Fall back to static proxy_auth_token
+    static_token = getattr(request.app.state, "proxy_auth_token", "")
+    if static_token:
+        return {"Authorization": f"Bearer {static_token}"}
+
+    return {}
 
 
 def _get_server_url(request: Request, node_id: str) -> str | None:
@@ -298,20 +344,69 @@ async def health(request: Request) -> JSONResponse:
 
 
 async def auth_login(request: Request) -> Response:
-    from turnstone.core.auth import make_set_cookie
+    """Authenticate via username:password or legacy token, return JWT."""
+    from turnstone.core.auth import (
+        AuthResult,
+        _authenticate_token,
+        create_jwt,
+        make_set_cookie,
+        verify_password,
+    )
 
     try:
         body: dict[str, Any] = await request.json()
     except (ValueError, json.JSONDecodeError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-    token = body.get("token", "")
+
     auth_config = request.app.state.auth_config
-    role = auth_config.check(token)
-    if role:
-        response = JSONResponse({"status": "ok", "role": role})
-        response.headers["Set-Cookie"] = make_set_cookie(token)
-        return response
-    return JSONResponse({"error": "Invalid token"}, status_code=401)
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    result: AuthResult | None = None
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if username and password and storage is not None:
+        user = storage.get_user_by_username(username)
+        if user and verify_password(password, user["password_hash"]):
+            result = AuthResult(
+                user_id=user["user_id"],
+                scopes=frozenset({"read", "write", "approve"}),
+                token_source="password",
+            )
+    elif body.get("token"):
+        result = _authenticate_token(
+            body["token"],
+            auth_config,
+            jwt_secret=jwt_secret,
+            storage=storage,
+        )
+
+    if result is None:
+        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+
+    jwt_token = ""
+    if jwt_secret:
+        jwt_token = create_jwt(
+            user_id=result.user_id,
+            scopes=result.scopes,
+            source=result.token_source,
+            secret=jwt_secret,
+        )
+
+    role = "full" if result.has_scope("write") else "read"
+    scopes_str = ",".join(sorted(result.scopes))
+    resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
+    if jwt_token:
+        resp_body["jwt"] = jwt_token
+    if result.user_id:
+        resp_body["user_id"] = result.user_id
+
+    response = JSONResponse(resp_body)
+    cookie_value = jwt_token if jwt_token else body.get("token", "")
+    if cookie_value:
+        response.headers["Set-Cookie"] = make_set_cookie(cookie_value)
+    return response
 
 
 async def auth_logout(request: Request) -> Response:
@@ -319,6 +414,102 @@ async def auth_logout(request: Request) -> Response:
 
     response = JSONResponse({"status": "ok"})
     response.headers["Set-Cookie"] = make_clear_cookie()
+    return response
+
+
+async def auth_status(request: Request) -> JSONResponse:
+    """GET /v1/api/auth/status — public endpoint for login UI state detection."""
+    auth_config = request.app.state.auth_config
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    has_users = False
+    if storage is not None:
+        try:
+            users = storage.list_users()
+            has_users = len(users) > 0
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {
+            "auth_enabled": auth_config.enabled,
+            "has_users": has_users,
+            "setup_required": auth_config.enabled and not has_users,
+        }
+    )
+
+
+async def auth_setup(request: Request) -> JSONResponse:
+    """POST /v1/api/auth/setup — create first admin user (public, one-time only).
+
+    Only works when auth is enabled and zero users exist. Returns JWT on success.
+    """
+    import uuid
+
+    from turnstone.core.auth import create_jwt, hash_password, make_set_cookie
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+
+    try:
+        body: dict[str, Any] = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    username = body.get("username", "").strip()
+    display_name = body.get("display_name", "").strip()
+    password = body.get("password", "")
+
+    from turnstone.core.auth import is_valid_username
+
+    if not is_valid_username(username):
+        return JSONResponse(
+            {"error": "Invalid username (1-64 chars: letters, digits, . _ -)"},
+            status_code=400,
+        )
+    if not display_name:
+        return JSONResponse({"error": "display_name is required"}, status_code=400)
+    if len(password) < 8:
+        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
+
+    user_id = uuid.uuid4().hex
+    pw_hash = hash_password(password)
+
+    # Atomic: insert only if no users exist (prevents TOCTOU race)
+    try:
+        created = storage.create_first_user(user_id, username, display_name, pw_hash)
+    except Exception:
+        return JSONResponse({"error": "Storage error"}, status_code=503)
+    if not created:
+        return JSONResponse({"error": "Setup already completed"}, status_code=409)
+
+    # Issue JWT automatically
+    scopes = frozenset({"read", "write", "approve"})
+    jwt_token = ""
+    if jwt_secret:
+        jwt_token = create_jwt(
+            user_id=user_id,
+            scopes=scopes,
+            source="password",
+            secret=jwt_secret,
+        )
+
+    resp_body: dict[str, str] = {
+        "status": "ok",
+        "user_id": user_id,
+        "username": username,
+        "role": "full",
+        "scopes": ",".join(sorted(scopes)),
+    }
+    if jwt_token:
+        resp_body["jwt"] = jwt_token
+
+    response = JSONResponse(resp_body)
+    if jwt_token:
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token)
     return response
 
 
@@ -423,7 +614,7 @@ async def proxy_index(request: Request) -> Response:
     safe_node = urllib.parse.quote(node_id, safe="")
     prefix = f"/node/{safe_node}"
     try:
-        resp = await client.get(f"{server_url}/")
+        resp = await client.get(f"{server_url}/", headers=_proxy_auth_headers(request))
         if resp.status_code < 200 or resp.status_code >= 300:
             log.debug("Upstream %s returned status %s", node_id, resp.status_code)
             return JSONResponse(
@@ -460,7 +651,10 @@ async def proxy_static(request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     try:
-        resp = await client.get(f"{server_url}/static/{path}")
+        resp = await client.get(
+            f"{server_url}/static/{path}",
+            headers=_proxy_auth_headers(request),
+        )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -481,7 +675,10 @@ async def proxy_shared_static(request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     try:
-        resp = await client.get(f"{server_url}/shared/{path}")
+        resp = await client.get(
+            f"{server_url}/shared/{path}",
+            headers=_proxy_auth_headers(request),
+        )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -533,7 +730,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
     if request.url.query:
         target += f"?{request.url.query}"
     try:
-        resp = await client.get(target)
+        resp = await client.get(target, headers=_proxy_auth_headers(request))
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -555,11 +752,9 @@ async def _proxy_post(
     if request.url.query:
         target += f"?{request.url.query}"
     try:
-        resp = await client.post(
-            target,
-            content=body,
-            headers={"Content-Type": content_type},
-        )
+        post_headers = {"Content-Type": content_type}
+        post_headers.update(_proxy_auth_headers(request))
+        resp = await client.post(target, content=body, headers=post_headers)
         return Response(
             content=resp.content,
             status_code=resp.status_code,
@@ -579,12 +774,13 @@ async def _proxy_sse(
         target += f"?{request.url.query}"
 
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
+    sse_auth = _proxy_auth_headers(request)
 
     async def sse_generator() -> AsyncGenerator[dict[str, str], None]:
         from httpx_sse import aconnect_sse
 
         try:
-            async with aconnect_sse(sse_client, "GET", target) as source:
+            async with aconnect_sse(sse_client, "GET", target, headers=sse_auth) as source:
                 if source.response.status_code != 200:
                     log.debug(
                         "SSE proxy received status %s from %s",
@@ -635,6 +831,163 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
+# Admin API endpoints — user + token management
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_users(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/users — list all users."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    return JSONResponse({"users": storage.list_users()})
+
+
+async def admin_create_user(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/users — create a new user."""
+    import uuid
+
+    from turnstone.core.auth import hash_password
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    try:
+        body: dict[str, Any] = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    username = body.get("username", "").strip()
+    display_name = body.get("display_name", "").strip()
+    password = body.get("password", "")
+
+    from turnstone.core.auth import is_valid_username
+
+    if not is_valid_username(username):
+        return JSONResponse(
+            {"error": "Invalid username (1-64 chars: letters, digits, . _ -)"},
+            status_code=400,
+        )
+    if not display_name:
+        return JSONResponse({"error": "display_name is required"}, status_code=400)
+    if not password or len(password) < 8:
+        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
+
+    # Check username uniqueness
+    if storage.get_user_by_username(username) is not None:
+        return JSONResponse({"error": "Username already taken"}, status_code=409)
+
+    user_id = uuid.uuid4().hex
+    pw_hash = hash_password(password)
+    storage.create_user(user_id, username, display_name, pw_hash)
+    # Read back to get the storage-canonical created timestamp
+    user = storage.get_user(user_id)
+    return JSONResponse(
+        {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "created": user["created"],
+        }
+    )
+
+
+async def admin_delete_user(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/users/{user_id} — delete user + cascade tokens."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    if storage.delete_user(user_id):
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "User not found"}, status_code=404)
+
+
+async def admin_list_tokens(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/users/{user_id}/tokens — list tokens for a user."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+    return JSONResponse({"tokens": storage.list_api_tokens(user_id)})
+
+
+async def admin_create_token(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/users/{user_id}/tokens — create API token."""
+    import uuid
+
+    from turnstone.core.auth import generate_token, hash_token, token_prefix
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    user_id = request.path_params["user_id"]
+
+    # Verify user exists
+    if storage.get_user(user_id) is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+
+    try:
+        body: dict[str, Any] = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        body = {}
+
+    name = body.get("name", "")
+    scopes = body.get("scopes", "read,write,approve")
+    expires_days = body.get("expires_days")
+
+    # Validate scopes
+    from turnstone.core.auth import VALID_SCOPES
+
+    requested = {s.strip() for s in scopes.split(",") if s.strip()}
+    if not requested or not requested.issubset(VALID_SCOPES):
+        return JSONResponse(
+            {"error": "Invalid scopes (allowed: read, write, approve)"}, status_code=400
+        )
+
+    expires: str | None = None
+    if expires_days is not None:
+        from datetime import UTC, datetime, timedelta
+
+        expires = (datetime.now(UTC) + timedelta(days=int(expires_days))).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+
+    raw = generate_token()
+    tid = uuid.uuid4().hex
+    storage.create_api_token(
+        token_id=tid,
+        token_hash=hash_token(raw),
+        token_prefix=token_prefix(raw),
+        user_id=user_id,
+        name=name,
+        scopes=scopes,
+        expires=expires,
+    )
+    return JSONResponse(
+        {
+            "token": raw,
+            "token_id": tid,
+            "token_prefix": token_prefix(raw),
+            "scopes": scopes,
+        }
+    )
+
+
+async def admin_revoke_token(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/tokens/{token_id} — revoke an API token."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    token_id = request.path_params["token_id"]
+    if storage.delete_api_token(token_id):
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Token not found"}, status_code=404)
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
 
 
 def create_app(
@@ -642,6 +995,8 @@ def create_app(
     collector: ClusterCollector,
     broker: RedisBroker,
     auth_config: Any,
+    jwt_secret: str = "",
+    auth_storage: Any = None,
     proxy_auth_token: str = "",
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
@@ -663,6 +1018,16 @@ def create_app(
                     Route("/api/cluster/events", cluster_events_sse),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
+                    Route("/api/auth/status", auth_status),
+                    Route("/api/auth/setup", auth_setup, methods=["POST"]),
+                    Route("/api/admin/users", admin_list_users),
+                    Route("/api/admin/users", admin_create_user, methods=["POST"]),
+                    Route("/api/admin/users/{user_id}", admin_delete_user, methods=["DELETE"]),
+                    Route("/api/admin/users/{user_id}/tokens", admin_list_tokens),
+                    Route(
+                        "/api/admin/users/{user_id}/tokens", admin_create_token, methods=["POST"]
+                    ),
+                    Route("/api/admin/tokens/{token_id}", admin_revoke_token, methods=["DELETE"]),
                 ],
             ),
             Route("/health", health),
@@ -692,6 +1057,8 @@ def create_app(
     app.state.collector = collector
     app.state.broker = broker
     app.state.auth_config = auth_config
+    app.state.jwt_secret = jwt_secret
+    app.state.auth_storage = auth_storage
     app.state.proxy_auth_token = proxy_auth_token
     return app
 
@@ -798,20 +1165,35 @@ def main() -> None:
 
     _load_static()
 
-    from turnstone.core.auth import load_auth_config
+    from turnstone.core.auth import load_auth_config, load_jwt_secret
 
     auth_config = load_auth_config()
+    jwt_secret = load_jwt_secret() if auth_config.enabled else ""
+
+    # Initialize storage for user/token management (optional — requires DB config)
+    auth_storage = None
+    try:
+        from turnstone.core.storage import init_storage
+
+        db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
+        db_url = os.environ.get("TURNSTONE_DB_URL", "")
+        db_path = os.environ.get("TURNSTONE_DB_PATH", "")
+        auth_storage = init_storage(db_backend, path=db_path, url=db_url)
+    except Exception:
+        log.info("Console storage not available — admin API disabled, JWT-only auth")
 
     app = create_app(
         collector=collector,
         broker=broker,
         auth_config=auth_config,
+        jwt_secret=jwt_secret,
+        auth_storage=auth_storage,
         proxy_auth_token=args.auth_token,
     )
 
     log.info("Console starting on http://%s:%s", args.host, args.port)
     if auth_config.enabled:
-        log.info("Auth: enabled (%d token(s) configured)", len(auth_config.tokens))
+        log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
     print("Press Ctrl+C to stop.")
 
     import uvicorn

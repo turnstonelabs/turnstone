@@ -2,6 +2,8 @@ import { BaseClient, type ClientOptions } from "./base.js";
 import type { ClusterEvent } from "./events.js";
 import type {
   AuthLoginResponse,
+  AuthSetupResponse,
+  AuthStatusResponse,
   ClusterNodesResponse,
   ClusterOverviewResponse,
   ClusterWorkstreamsResponse,
@@ -70,9 +72,33 @@ export class TurnstoneConsole extends BaseClient {
 
   // -- Auth -----------------------------------------------------------------
 
-  async login(token: string): Promise<AuthLoginResponse> {
-    return this.request("POST", "/v1/api/auth/login", {
-      json: { token },
+  async login(opts: {
+    token?: string;
+    username?: string;
+    password?: string;
+  }): Promise<AuthLoginResponse> {
+    const body =
+      opts.username && opts.password
+        ? { username: opts.username, password: opts.password }
+        : { token: opts.token ?? "" };
+    return this.request("POST", "/v1/api/auth/login", { json: body });
+  }
+
+  async authStatus(): Promise<AuthStatusResponse> {
+    return this.request("GET", "/v1/api/auth/status");
+  }
+
+  async setup(opts: {
+    username: string;
+    displayName: string;
+    password: string;
+  }): Promise<AuthSetupResponse> {
+    return this.request("POST", "/v1/api/auth/setup", {
+      json: {
+        username: opts.username,
+        display_name: opts.displayName,
+        password: opts.password,
+      },
     });
   }
 

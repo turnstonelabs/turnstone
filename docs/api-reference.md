@@ -56,6 +56,170 @@ console.log(result.content);
 
 ---
 
+## Authentication
+
+When auth is enabled (`[auth].enabled = true` or `TURNSTONE_AUTH_ENABLED=1`), all API endpoints except public paths require a valid token.
+
+### Sending Credentials
+
+Include a token in one of two ways:
+
+- **Bearer header**: `Authorization: Bearer <token>`
+- **Cookie**: `turnstone_auth=<token>` (set automatically by the login endpoint)
+
+The server accepts three token types:
+
+| Type | Format | Example |
+|------|--------|---------|
+| JWT | Base64 segments separated by dots | `eyJhbG...` |
+| API token | `ts_` prefix + 64 hex chars | `ts_a1b2c3d4...` |
+| Config token | Arbitrary string from `config.toml` | `my-secret-token` |
+
+JWTs are the recommended credential for browser sessions. API tokens are suitable for programmatic access and CI/CD. Config tokens are a simple option for single-node deployments.
+
+### `POST /v1/api/auth/login`
+
+Authenticate with credentials and receive a JWT. Accepts two credential formats:
+
+**Username + password:**
+
+```json
+{"username": "alice", "password": "hunter2"}
+```
+
+**API token:**
+
+```json
+{"token": "ts_a1b2c3d4e5f6..."}
+```
+
+**Response (success):** `200`
+
+```json
+{
+  "status": "ok",
+  "role": "full",
+  "scopes": "approve,read,write",
+  "jwt": "eyJhbGciOiJIUzI1NiIs...",
+  "user_id": "u_abc123"
+}
+```
+
+The response also sets a `turnstone_auth` HttpOnly cookie containing the JWT.
+
+**Response (failure):** `401`
+
+```json
+{"error": "Invalid credentials"}
+```
+
+---
+
+### `POST /v1/api/auth/logout`
+
+Clears the `turnstone_auth` cookie. No request body required.
+
+**Response:** `200`
+
+```json
+{"status": "ok"}
+```
+
+The response includes a `Set-Cookie` header that expires the auth cookie.
+
+---
+
+### `GET /v1/api/auth/status`
+
+Returns the current authentication state. Works with or without a valid token.
+
+**Response (authenticated):** `200`
+
+```json
+{
+  "authenticated": true,
+  "user_id": "u_abc123",
+  "scopes": ["approve", "read", "write"],
+  "source": "jwt"
+}
+```
+
+**Response (not authenticated):** `200`
+
+```json
+{
+  "authenticated": false,
+  "user_id": null,
+  "scopes": [],
+  "source": null
+}
+```
+
+**Response (auth disabled):** `200`
+
+```json
+{
+  "authenticated": false,
+  "auth_enabled": false
+}
+```
+
+---
+
+### `POST /v1/api/auth/setup`
+
+Creates the first admin user when no users exist in the database. This is a
+public endpoint (no authentication required) that only succeeds when auth is
+enabled and the user database is empty. Both the server and console expose
+this endpoint.
+
+**Request body:**
+
+```json
+{
+  "username": "admin",
+  "display_name": "Admin",
+  "password": "strongpass"
+}
+```
+
+| Field          | Type   | Required | Validation                  |
+|----------------|--------|----------|-----------------------------|
+| `username`     | string | yes      | 1-64 ASCII characters       |
+| `display_name` | string | yes      | Non-empty                   |
+| `password`     | string | yes      | Minimum 8 characters        |
+
+**Response (success):** `200`
+
+```json
+{
+  "status": "ok",
+  "user_id": "u_abc123",
+  "username": "admin",
+  "role": "full",
+  "scopes": "approve,read,write",
+  "jwt": "eyJhbGciOiJIUzI1NiIs..."
+}
+```
+
+The response also sets a `turnstone_auth` HttpOnly cookie containing the JWT.
+
+**Response (already set up):** `409`
+
+```json
+{"error": "Setup already completed"}
+```
+
+Returned when one or more users already exist in the database.
+
+**Response (auth disabled):** `400`
+
+```json
+{"error": "Auth is not enabled"}
+```
+
+---
+
 ## Endpoints
 
 ### `GET /`

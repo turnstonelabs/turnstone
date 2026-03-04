@@ -17,6 +17,24 @@ export interface AuthLoginRequest {
 export interface AuthLoginResponse {
   status: string;
   role: string;
+  scopes?: string;
+  jwt?: string;
+  user_id?: string;
+}
+
+export interface AuthStatusResponse {
+  auth_enabled: boolean;
+  has_users: boolean;
+  setup_required: boolean;
+}
+
+export interface AuthSetupResponse {
+  status: string;
+  user_id: string;
+  username: string;
+  role: string;
+  scopes: string;
+  jwt?: string;
 }
 
 // ---------------------------------------------------------------------------

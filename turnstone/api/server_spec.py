@@ -11,6 +11,9 @@ if TYPE_CHECKING:
 from turnstone.api.schemas import (
     AuthLoginRequest,
     AuthLoginResponse,
+    AuthSetupRequest,
+    AuthSetupResponse,
+    AuthStatusResponse,
     ErrorResponse,
     StatusResponse,
 )
@@ -138,6 +141,22 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         tags=["Auth"],
     ),
     EndpointSpec(
+        "/v1/api/auth/setup",
+        "POST",
+        "Create first admin user",
+        request_model=AuthSetupRequest,
+        response_model=AuthSetupResponse,
+        error_codes=[400, 409, 503],
+        tags=["Auth"],
+    ),
+    EndpointSpec(
+        "/v1/api/auth/status",
+        "GET",
+        "Return auth state",
+        response_model=AuthStatusResponse,
+        tags=["Auth"],
+    ),
+    EndpointSpec(
         "/v1/api/auth/logout",
         "POST",
         "Clear auth cookie",
@@ -159,6 +178,9 @@ _ALL_MODELS: list[type[BaseModel]] = [
     StatusResponse,
     AuthLoginRequest,
     AuthLoginResponse,
+    AuthSetupRequest,
+    AuthSetupResponse,
+    AuthStatusResponse,
     SendRequest,
     SendResponse,
     ApproveRequest,

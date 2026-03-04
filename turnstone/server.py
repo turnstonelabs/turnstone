@@ -355,15 +355,34 @@ class AuthMiddleware:
         from turnstone.core.auth import check_request
 
         auth_config = request.app.state.auth_config
+        jwt_secret = getattr(request.app.state, "jwt_secret", "")
+        storage = getattr(request.app.state, "auth_storage", None)
         method = request.method
         path = request.url.path
         auth_header = request.headers.get("Authorization")
         cookie_header = request.headers.get("Cookie")
-        allowed, status, msg = check_request(auth_config, method, path, auth_header, cookie_header)
+        allowed, status, msg, auth_result = check_request(
+            auth_config,
+            method,
+            path,
+            auth_header,
+            cookie_header,
+            jwt_secret=jwt_secret,
+            storage=storage,
+        )
         if not allowed:
             response = JSONResponse({"error": msg}, status_code=status)
             await response(scope, receive, send)
             return
+
+        # Set user_id in log context and stash auth result for handlers
+        if auth_result and auth_result.user_id:
+            from turnstone.core.log import ctx_user_id
+
+            ctx_user_id.set(auth_result.user_id)
+        if "state" not in scope:
+            scope["state"] = {}
+        scope["state"]["auth_result"] = auth_result
         await self.app(scope, receive, send)
 
 
@@ -914,18 +933,70 @@ async def close_workstream(request: Request) -> JSONResponse:
 
 
 async def auth_login(request: Request) -> Response:
-    """POST /v1/api/auth/login — authenticate with a token."""
-    from turnstone.core.auth import make_set_cookie
+    """POST /v1/api/auth/login — authenticate and return JWT.
+
+    Accepts either:
+    - ``{"username": "...", "password": "..."}`` — credential-based login
+    - ``{"token": "..."}`` — legacy token-based login
+    """
+    from turnstone.core.auth import (
+        AuthResult,
+        _authenticate_token,
+        create_jwt,
+        make_set_cookie,
+        verify_password,
+    )
 
     body = await _read_json(request)
-    token = body.get("token", "")
     auth_config = request.app.state.auth_config
-    role = auth_config.check(token)
-    if role:
-        response = JSONResponse({"status": "ok", "role": role})
-        response.headers["Set-Cookie"] = make_set_cookie(token)
-        return response
-    return JSONResponse({"error": "Invalid token"}, status_code=401)
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    result: AuthResult | None = None
+    username = body.get("username", "")
+    password = body.get("password", "")
+
+    if username and password and storage is not None:
+        user = storage.get_user_by_username(username)
+        if user and verify_password(password, user["password_hash"]):
+            result = AuthResult(
+                user_id=user["user_id"],
+                scopes=frozenset({"read", "write", "approve"}),
+                token_source="password",
+            )
+    elif body.get("token"):
+        result = _authenticate_token(
+            body["token"],
+            auth_config,
+            jwt_secret=jwt_secret,
+            storage=storage,
+        )
+
+    if result is None:
+        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
+
+    jwt_token = ""
+    if jwt_secret:
+        jwt_token = create_jwt(
+            user_id=result.user_id,
+            scopes=result.scopes,
+            source=result.token_source,
+            secret=jwt_secret,
+        )
+
+    role = "full" if result.has_scope("write") else "read"
+    scopes_str = ",".join(sorted(result.scopes))
+    resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
+    if jwt_token:
+        resp_body["jwt"] = jwt_token
+    if result.user_id:
+        resp_body["user_id"] = result.user_id
+
+    response = JSONResponse(resp_body)
+    cookie_value = jwt_token if jwt_token else body.get("token", "")
+    if cookie_value:
+        response.headers["Set-Cookie"] = make_set_cookie(cookie_value)
+    return response
 
 
 async def auth_logout(request: Request) -> Response:
@@ -934,6 +1005,94 @@ async def auth_logout(request: Request) -> Response:
 
     response = JSONResponse({"status": "ok"})
     response.headers["Set-Cookie"] = make_clear_cookie()
+    return response
+
+
+async def auth_status(request: Request) -> JSONResponse:
+    """GET /v1/api/auth/status — public endpoint for login UI state detection."""
+    auth_config = request.app.state.auth_config
+    storage = getattr(request.app.state, "auth_storage", None)
+
+    has_users = False
+    if storage is not None:
+        try:
+            users = storage.list_users()
+            has_users = len(users) > 0
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {
+            "auth_enabled": auth_config.enabled,
+            "has_users": has_users,
+            "setup_required": auth_config.enabled and not has_users,
+        }
+    )
+
+
+async def auth_setup(request: Request) -> JSONResponse:
+    """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
+    import uuid
+
+    from turnstone.core.auth import create_jwt, hash_password, make_set_cookie
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+
+    body = await _read_json(request)
+    username = body.get("username", "").strip()
+    display_name = body.get("display_name", "").strip()
+    password = body.get("password", "")
+
+    from turnstone.core.auth import is_valid_username
+
+    if not is_valid_username(username):
+        return JSONResponse(
+            {"error": "Invalid username (1-64 chars: letters, digits, . _ -)"},
+            status_code=400,
+        )
+    if not display_name:
+        return JSONResponse({"error": "display_name is required"}, status_code=400)
+    if len(password) < 8:
+        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
+
+    user_id = uuid.uuid4().hex
+    pw_hash = hash_password(password)
+
+    # Atomic: insert only if no users exist (prevents TOCTOU race)
+    try:
+        created = storage.create_first_user(user_id, username, display_name, pw_hash)
+    except Exception:
+        return JSONResponse({"error": "Storage error"}, status_code=503)
+    if not created:
+        return JSONResponse({"error": "Setup already completed"}, status_code=409)
+
+    scopes = frozenset({"read", "write", "approve"})
+    jwt_token = ""
+    if jwt_secret:
+        jwt_token = create_jwt(
+            user_id=user_id,
+            scopes=scopes,
+            source="password",
+            secret=jwt_secret,
+        )
+
+    resp_body: dict[str, str] = {
+        "status": "ok",
+        "user_id": user_id,
+        "username": username,
+        "role": "full",
+        "scopes": ",".join(sorted(scopes)),
+    }
+    if jwt_token:
+        resp_body["jwt"] = jwt_token
+
+    response = JSONResponse(resp_body)
+    if jwt_token:
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token)
     return response
 
 
@@ -1045,6 +1204,8 @@ def create_app(
     global_listeners_lock: threading.Lock,
     skip_permissions: bool,
     auth_config: Any,
+    jwt_secret: str = "",
+    auth_storage: Any = None,
     health_monitor: Any = None,
     rate_limiter: Any = None,
     mcp_client: Any = None,
@@ -1076,6 +1237,8 @@ def create_app(
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
+                    Route("/api/auth/status", auth_status),
+                    Route("/api/auth/setup", auth_setup, methods=["POST"]),
                 ],
             ),
             Route("/health", health),
@@ -1105,6 +1268,8 @@ def create_app(
     app.state.global_listeners_lock = global_listeners_lock
     app.state.skip_permissions = skip_permissions
     app.state.auth_config = auth_config
+    app.state.jwt_secret = jwt_secret
+    app.state.auth_storage = auth_storage
     app.state.health_monitor = health_monitor
     app.state.rate_limiter = rate_limiter
     app.state.mcp_client = mcp_client
@@ -1500,11 +1665,13 @@ def main() -> None:
     _metrics.model = model
 
     # Auth config
-    from turnstone.core.auth import load_auth_config
+    from turnstone.core.auth import load_auth_config, load_jwt_secret
+    from turnstone.core.storage import get_storage
 
     auth_config = load_auth_config()
+    jwt_secret = load_jwt_secret() if auth_config.enabled else ""
     if auth_config.enabled:
-        log.info("Auth: enabled (%d token(s) configured)", len(auth_config.tokens))
+        log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
 
     # Build the ASGI app
     app = create_app(
@@ -1514,6 +1681,8 @@ def main() -> None:
         global_listeners_lock=global_listeners_lock,
         skip_permissions=args.skip_permissions,
         auth_config=auth_config,
+        jwt_secret=jwt_secret,
+        auth_storage=get_storage(),
         health_monitor=health_monitor,
         rate_limiter=rate_limiter,
         mcp_client=mcp_client,

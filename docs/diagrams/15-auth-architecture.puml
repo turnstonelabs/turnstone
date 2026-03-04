@@ -1,0 +1,179 @@
+@startuml
+!theme plain
+title Turnstone — Authentication Architecture
+
+skinparam class {
+    BackgroundColor<<core>> #E8EAF6
+    BackgroundColor<<jwt>> #C8E6C9
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<endpoint>> #FFE0B2
+    BackgroundColor<<scope>> #F3E5F5
+}
+
+' -- Core Auth --
+class "AuthConfig" as AC <<core>> {
+    +enabled: bool
+    +tokens: dict[str, str]
+    +check(token) → role | None
+    --
+    Static config-file tokens
+    hmac.compare_digest
+}
+
+class "AuthResult" as AR <<core>> {
+    +user_id: str
+    +scopes: frozenset[str]
+    +token_source: str
+    +has_scope(scope) → bool
+}
+
+class "check_request()" as CR <<core>> {
+    auth_config, method, path,
+    auth_header, cookie_header,
+    jwt_secret, storage
+    → (allowed, status, msg, AuthResult)
+    --
+    1. Auth disabled → allow
+    2. Public path → allow
+    3. Extract Bearer / cookie
+    4. Detect token type
+    5. Validate → AuthResult
+    6. Check scope vs path
+}
+
+' -- Token Types --
+class "JWT (HS256)" as JWT <<jwt>> {
+    sub: user_id
+    scopes: "read,write,approve"
+    src: "password" | "database"
+    iat, exp (24h default)
+    --
+    Detected by: contains "."
+    Validated locally
+    No DB call
+}
+
+class "API Token" as AT <<jwt>> {
+    Format: ts_ + 64 hex
+    Stored: SHA-256 hash
+    --
+    Detected by: starts with "ts_"
+    Lookup by hash in DB
+    Expiry check
+}
+
+class "Config Token" as CT <<core>> {
+    Raw value in memory
+    Role: "read" | "full"
+    --
+    Detected by: fallback
+    hmac.compare_digest
+    No DB needed
+}
+
+' -- Scopes --
+class "Scope Hierarchy" as SH <<scope>> {
+    read: {read}
+    write: {read, write}
+    approve: {read, write, approve}
+    --
+    GET → read
+    POST write paths → write
+    POST /api/approve → approve
+    /api/admin/* → approve
+}
+
+' -- Storage --
+class "users" as UT <<storage>> {
+    user_id (PK)
+    username (unique)
+    display_name
+    password_hash (bcrypt)
+    created
+}
+
+class "api_tokens" as TT <<storage>> {
+    token_id (PK)
+    token_hash (SHA-256, unique)
+    token_prefix
+    user_id → users
+    name, scopes
+    created, expires
+}
+
+' -- Endpoints --
+class "POST /api/auth/login" as Login <<endpoint>> {
+    {username, password}
+    OR {token: "ts_xxx"}
+    → {jwt, role, scopes, user_id}
+    --
+    Sets HttpOnly cookie
+}
+
+class "GET /api/auth/status" as Status <<endpoint>> {
+    → {auth_enabled, has_users,
+       setup_required}
+    --
+    Public (no auth)
+    Drives UI setup wizard
+}
+
+class "POST /api/auth/setup" as Setup <<endpoint>> {
+    {username, display_name, password}
+    → {jwt, user_id, scopes}
+    --
+    Public (no auth)
+    Only when zero users exist
+    Returns 409 if already set up
+}
+
+class "Admin API (Console)" as Admin <<endpoint>> {
+    POST/GET/DELETE users
+    POST/GET tokens
+    DELETE tokens/{id}
+    --
+    Requires approve scope
+}
+
+' -- Relationships --
+CR --> AC : config tokens
+CR --> JWT : validate
+CR --> AT : hash lookup
+CR --> CT : hmac check
+CR --> AR : returns
+CR --> SH : checks
+
+Login --> JWT : issues
+Login --> UT : verify password
+Login --> TT : verify API token
+
+Setup --> UT : create first user
+Setup --> JWT : issues
+
+AT --> TT : lookup by hash
+Admin --> UT : CRUD
+Admin --> TT : CRUD
+
+AR --> SH : scopes from
+
+JWT ..> AR : produces
+AT ..> AR : produces
+CT ..> AR : produces
+
+note right of CR
+  **Middleware Flow**
+  AuthMiddleware on every request:
+  1. Extract token from header/cookie
+  2. Detect type (JWT / ts_ / config)
+  3. Validate → AuthResult
+  4. Set ctx_user_id for logging
+  5. Store auth_result in scope state
+end note
+
+note bottom of SH
+  **Console** owns admin endpoints
+  **Server** validates JWT + config only
+  Both share JWT signing secret
+end note
+
+@enduml

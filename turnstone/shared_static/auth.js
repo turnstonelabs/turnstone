@@ -1,10 +1,17 @@
 /* Shared auth system — turnstone design system
    Configure: window.TURNSTONE_AUTH_TITLE (default "turnstone")
-   Hooks: window.onLoginSuccess() and window.onLogout() */
+   Hooks: window.onLoginSuccess() and window.onLogout()
+
+   Flows:
+   1. Check /v1/api/auth/status — detect if setup is needed
+   2. If setup_required → show first-time setup wizard (create admin user)
+   3. If auth_enabled + has_users → show login (username:password)
+   4. Legacy: token-based login still supported via toggle */
 
 var _AUTH_TITLE = window.TURNSTONE_AUTH_TITLE || "turnstone";
 var _loginTrapHandler = null;
 var _loginBusy = false;
+var _authMode = "login"; // "login", "setup", "token"
 
 async function authFetch(url, opts) {
   var maxRetries = 2;
@@ -22,6 +29,10 @@ async function authFetch(url, opts) {
       });
       continue;
     }
+    // Successful auth — ensure logout button and SSE connection
+    var _lb = document.getElementById("logout-btn");
+    if (_lb) _lb.style.display = "";
+    if (typeof _ensureSSE === "function") _ensureSSE();
     return r;
   }
 }
@@ -33,30 +44,131 @@ function initLogin() {
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.setAttribute("aria-labelledby", "login-title");
-  overlay.innerHTML =
+  overlay.innerHTML = _buildLoginHTML();
+  document.body.appendChild(overlay);
+  _bindLoginEvents();
+}
+
+function _buildLoginHTML() {
+  return (
     '<div id="login-box">' +
     '<h2 id="login-title">' +
     escapeHtml(_AUTH_TITLE) +
     "</h2>" +
+    '<div id="login-subtitle" class="login-subtitle"></div>' +
     '<div id="login-error" role="alert" aria-live="assertive"></div>' +
-    '<label for="login-token" class="sr-only">Auth token</label>' +
+    // --- Setup mode fields ---
+    '<div id="setup-fields" style="display:none">' +
+    '<label for="setup-username" class="login-label">Username</label>' +
+    '<input id="setup-username" type="text" placeholder="admin" autocomplete="username" spellcheck="false">' +
+    '<label for="setup-displayname" class="login-label">Display name</label>' +
+    '<input id="setup-displayname" type="text" placeholder="Administrator" autocomplete="name">' +
+    '<label for="setup-password" class="login-label">Password</label>' +
+    '<input id="setup-password" type="password" placeholder="Choose a strong password" autocomplete="new-password">' +
+    '<label for="setup-confirm" class="login-label">Confirm password</label>' +
+    '<input id="setup-confirm" type="password" placeholder="Confirm password" autocomplete="new-password">' +
+    "</div>" +
+    // --- Login mode fields ---
+    '<div id="login-fields">' +
+    '<label for="login-username" class="login-label">Username</label>' +
+    '<input id="login-username" type="text" placeholder="Username" autocomplete="username" spellcheck="false">' +
+    '<label for="login-password" class="login-label">Password</label>' +
+    '<input id="login-password" type="password" placeholder="Password" autocomplete="current-password">' +
+    "</div>" +
+    // --- Token mode fields ---
+    '<div id="token-fields" style="display:none">' +
+    '<label for="login-token" class="login-label">Auth token</label>' +
     '<input id="login-token" type="password" placeholder="Enter auth token" autocomplete="off">' +
+    "</div>" +
     '<button id="login-submit">Sign in</button>' +
-    "</div>";
-  document.body.appendChild(overlay);
-  document.getElementById("login-submit").onclick = submitLogin;
-  document
-    .getElementById("login-token")
-    .addEventListener("keydown", function (e) {
-      if (e.key === "Enter") submitLogin();
-      if (e.key === "Escape") {
-        var errEl = document.getElementById("login-error");
-        if (errEl && errEl.style.display !== "none") {
-          errEl.style.display = "none";
-          errEl.textContent = "";
-        }
-      }
+    // --- Mode toggle ---
+    '<div id="login-toggle" class="login-toggle">' +
+    '<button id="toggle-token" class="login-link" type="button">Use token instead</button>' +
+    "</div>" +
+    "</div>"
+  );
+}
+
+function _bindLoginEvents() {
+  document.getElementById("login-submit").onclick = _handleSubmit;
+
+  // Enter key on all inputs
+  var inputs = document.querySelectorAll("#login-box input");
+  for (var i = 0; i < inputs.length; i++) {
+    inputs[i].addEventListener("keydown", function (e) {
+      if (e.key === "Enter") _handleSubmit();
+      if (e.key === "Escape") _clearError();
     });
+  }
+
+  // Mode toggle
+  document.getElementById("toggle-token").onclick = function () {
+    if (_authMode === "login") {
+      _switchMode("token");
+    } else if (_authMode === "token") {
+      _switchMode("login");
+    }
+  };
+}
+
+function _switchMode(mode) {
+  _authMode = mode;
+  var setupFields = document.getElementById("setup-fields");
+  var loginFields = document.getElementById("login-fields");
+  var tokenFields = document.getElementById("token-fields");
+  var toggleDiv = document.getElementById("login-toggle");
+  var toggleBtn = document.getElementById("toggle-token");
+  var subtitle = document.getElementById("login-subtitle");
+  var btn = document.getElementById("login-submit");
+
+  setupFields.style.display = "none";
+  loginFields.style.display = "none";
+  tokenFields.style.display = "none";
+  _clearError();
+
+  if (mode === "setup") {
+    setupFields.style.display = "";
+    toggleDiv.style.display = "none";
+    subtitle.textContent = "Create the first admin account";
+    btn.textContent = "Create account";
+    setTimeout(function () {
+      document.getElementById("setup-username").focus();
+    }, 50);
+  } else if (mode === "login") {
+    loginFields.style.display = "";
+    toggleDiv.style.display = "";
+    toggleBtn.textContent = "Use token instead";
+    subtitle.textContent = "";
+    btn.textContent = "Sign in";
+    setTimeout(function () {
+      document.getElementById("login-username").focus();
+    }, 50);
+  } else if (mode === "token") {
+    tokenFields.style.display = "";
+    toggleDiv.style.display = "";
+    toggleBtn.textContent = "Use password instead";
+    subtitle.textContent = "";
+    btn.textContent = "Sign in";
+    setTimeout(function () {
+      document.getElementById("login-token").focus();
+    }, 50);
+  }
+}
+
+function _clearError() {
+  var errEl = document.getElementById("login-error");
+  if (errEl && errEl.style.display !== "none") {
+    errEl.style.display = "none";
+    errEl.textContent = "";
+  }
+}
+
+function _showError(msg) {
+  var errEl = document.getElementById("login-error");
+  if (errEl) {
+    errEl.textContent = msg;
+    errEl.style.display = "block";
+  }
 }
 
 function showLogin() {
@@ -66,26 +178,42 @@ function showLogin() {
   document.body.style.overflow = "hidden";
   var logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "none";
-  var errEl = document.getElementById("login-error");
-  if (errEl) {
-    errEl.style.display = "none";
-    errEl.textContent = "";
-  }
-  setTimeout(function () {
-    var inp = document.getElementById("login-token");
-    if (inp) {
-      inp.value = "";
-      inp.focus();
-    }
-  }, 50);
+  _clearError();
+
+  // Check auth status to determine mode
+  fetch("/v1/api/auth/status")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      if (data.setup_required) {
+        _switchMode("setup");
+      } else {
+        _switchMode("login");
+      }
+    })
+    .catch(function () {
+      // Fallback to login mode
+      _switchMode("login");
+    });
+
+  // Keyboard trap
   if (_loginTrapHandler)
     document.removeEventListener("keydown", _loginTrapHandler);
   _loginTrapHandler = function (e) {
     if (e.key === "Tab") {
       var box = document.getElementById("login-box");
-      var focusable = box.querySelectorAll("input, button");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
+      var focusable = box.querySelectorAll(
+        'input:not([style*="display: none"]):not([style*="display:none"]), button:not([style*="display: none"]):not([style*="display:none"])',
+      );
+      // Filter to visible elements
+      var visible = [];
+      for (var i = 0; i < focusable.length; i++) {
+        if (focusable[i].offsetParent !== null) visible.push(focusable[i]);
+      }
+      if (visible.length === 0) return;
+      var first = visible[0];
+      var last = visible[visible.length - 1];
       if (e.shiftKey) {
         if (document.activeElement === first) {
           e.preventDefault();
@@ -112,26 +240,59 @@ function hideLogin() {
   }
 }
 
-function submitLogin() {
+function _handleSubmit() {
   if (_loginBusy) return;
-  var token = (document.getElementById("login-token").value || "").trim();
-  if (!token) {
-    var errEl = document.getElementById("login-error");
-    if (errEl) {
-      errEl.textContent = "Token is required";
-      errEl.style.display = "block";
-    }
-    document.getElementById("login-token").focus();
+  if (_authMode === "setup") return _submitSetup();
+  if (_authMode === "token") return _submitToken();
+  return _submitLogin();
+}
+
+function _submitLogin() {
+  var username = (document.getElementById("login-username").value || "").trim();
+  var password = document.getElementById("login-password").value || "";
+
+  if (!username) {
+    _showError("Username is required");
+    return;
+  }
+  if (!password) {
+    _showError("Password is required");
     return;
   }
 
-  _loginBusy = true;
-  var btn = document.getElementById("login-submit");
-  var inp = document.getElementById("login-token");
-  btn.disabled = true;
-  btn.textContent = "Signing in\u2026";
-  inp.disabled = true;
+  _setBusy(true);
+  fetch("/v1/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: username, password: password }),
+  })
+    .then(function (r) {
+      if (r.status === 401 || r.status === 403) throw new Error("invalid");
+      if (!r.ok) throw new Error("server");
+      return r.json();
+    })
+    .then(function () {
+      _setBusy(false);
+      _onSuccess();
+    })
+    .catch(function (err) {
+      _setBusy(false);
+      _showError(
+        err.message === "invalid"
+          ? "Invalid username or password"
+          : "Connection failed \u2014 try again",
+      );
+    });
+}
 
+function _submitToken() {
+  var token = (document.getElementById("login-token").value || "").trim();
+  if (!token) {
+    _showError("Token is required");
+    return;
+  }
+
+  _setBusy(true);
   fetch("/v1/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -143,29 +304,98 @@ function submitLogin() {
       return r.json();
     })
     .then(function () {
-      _loginBusy = false;
-      btn.disabled = false;
-      btn.textContent = "Sign in";
-      inp.disabled = false;
-      hideLogin();
-      var logoutBtn = document.getElementById("logout-btn");
-      if (logoutBtn) logoutBtn.style.display = "";
-      if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+      _setBusy(false);
+      _onSuccess();
     })
     .catch(function (err) {
-      _loginBusy = false;
-      btn.disabled = false;
-      btn.textContent = "Sign in";
-      inp.disabled = false;
-      var errEl = document.getElementById("login-error");
-      if (errEl) {
-        errEl.textContent =
-          err.message === "invalid"
-            ? "Invalid token"
-            : "Connection failed \u2014 try again";
-        errEl.style.display = "block";
-      }
+      _setBusy(false);
+      _showError(
+        err.message === "invalid"
+          ? "Invalid token"
+          : "Connection failed \u2014 try again",
+      );
     });
+}
+
+function _submitSetup() {
+  var username = (document.getElementById("setup-username").value || "").trim();
+  var displayName = (
+    document.getElementById("setup-displayname").value || ""
+  ).trim();
+  var password = document.getElementById("setup-password").value || "";
+  var confirm = document.getElementById("setup-confirm").value || "";
+
+  if (!username) {
+    _showError("Username is required");
+    return;
+  }
+  if (!displayName) {
+    _showError("Display name is required");
+    return;
+  }
+  if (!password) {
+    _showError("Password is required");
+    return;
+  }
+  if (password.length < 8) {
+    _showError("Password must be at least 8 characters");
+    return;
+  }
+  if (password !== confirm) {
+    _showError("Passwords do not match");
+    return;
+  }
+
+  _setBusy(true, "Creating account\u2026");
+
+  // Use the public setup endpoint (creates user + returns JWT in one step)
+  fetch("/v1/api/auth/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: username,
+      display_name: displayName,
+      password: password,
+    }),
+  })
+    .then(function (r) {
+      if (r.status === 409) throw new Error("Setup already completed");
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed to create account");
+        });
+      return r.json();
+    })
+    .then(function () {
+      _setBusy(false);
+      _onSuccess();
+    })
+    .catch(function (err) {
+      _setBusy(false);
+      _showError(err.message || "Setup failed \u2014 try again");
+    });
+}
+
+function _setBusy(busy, label) {
+  _loginBusy = busy;
+  var btn = document.getElementById("login-submit");
+  var inputs = document.querySelectorAll("#login-box input");
+  btn.disabled = busy;
+  if (busy) {
+    btn.textContent = label || "Signing in\u2026";
+  } else {
+    btn.textContent = _authMode === "setup" ? "Create account" : "Sign in";
+  }
+  for (var i = 0; i < inputs.length; i++) {
+    inputs[i].disabled = busy;
+  }
+}
+
+function _onSuccess() {
+  hideLogin();
+  var logoutBtn = document.getElementById("logout-btn");
+  if (logoutBtn) logoutBtn.style.display = "";
+  if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
 }
 
 function logout() {

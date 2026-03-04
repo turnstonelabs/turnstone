@@ -16,7 +16,12 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.schemas import AuthLoginResponse, StatusResponse
+from turnstone.api.schemas import (
+    AuthLoginResponse,
+    AuthSetupResponse,
+    AuthStatusResponse,
+    StatusResponse,
+)
 from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
@@ -213,12 +218,45 @@ class AsyncTurnstoneServer(_BaseClient):
 
     # -- auth ----------------------------------------------------------------
 
-    async def login(self, token: str) -> AuthLoginResponse:
+    async def login(
+        self,
+        token: str = "",
+        *,
+        username: str = "",
+        password: str = "",
+    ) -> AuthLoginResponse:
+        """Authenticate via API token or username:password."""
+        if username and password:
+            body: dict[str, str] = {"username": username, "password": password}
+        else:
+            body = {"token": token}
         return await self._request(
             "POST",
             "/v1/api/auth/login",
-            json_body={"token": token},
+            json_body=body,
             response_model=AuthLoginResponse,
+        )
+
+    async def auth_status(self) -> AuthStatusResponse:
+        """Get auth status (public -- no auth required)."""
+        return await self._request("GET", "/v1/api/auth/status", response_model=AuthStatusResponse)
+
+    async def setup(
+        self,
+        username: str,
+        display_name: str,
+        password: str,
+    ) -> AuthSetupResponse:
+        """First-time setup: create initial admin user (public, one-time only)."""
+        return await self._request(
+            "POST",
+            "/v1/api/auth/setup",
+            json_body={
+                "username": username,
+                "display_name": display_name,
+                "password": password,
+            },
+            response_model=AuthSetupResponse,
         )
 
     async def logout(self) -> StatusResponse:
@@ -326,8 +364,16 @@ class TurnstoneServer:
 
     # -- auth ----------------------------------------------------------------
 
-    def login(self, token: str) -> AuthLoginResponse:
-        return self._runner.run(self._async.login(token))
+    def login(
+        self, token: str = "", *, username: str = "", password: str = ""
+    ) -> AuthLoginResponse:
+        return self._runner.run(self._async.login(token, username=username, password=password))
+
+    def auth_status(self) -> AuthStatusResponse:
+        return self._runner.run(self._async.auth_status())
+
+    def setup(self, username: str, display_name: str, password: str) -> AuthSetupResponse:
+        return self._runner.run(self._async.setup(username, display_name, password))
 
     def logout(self) -> StatusResponse:
         return self._runner.run(self._async.logout())

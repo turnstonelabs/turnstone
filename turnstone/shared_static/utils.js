@@ -3,7 +3,7 @@
 function escapeHtml(text) {
   var el = document.createElement("span");
   el.textContent = text;
-  return el.innerHTML;
+  return el.innerHTML.replace(/'/g, "&#39;").replace(/"/g, "&quot;");
 }
 
 function formatTokens(n) {
