@@ -976,31 +976,46 @@ re-routes to that node's queue (1 extra hop). Bridges publish heartbeats to
 ### Cluster Console
 
 ```
-Event subscriber          Node discovery          Poll loop
-+------------------+     +------------------+    +-------------------+
-| SUBSCRIBE on     |     | SCAN node:* keys |    | For each node:    |
-| events:cluster   |     | every 15 seconds |    |   GET /api/dash   |
-| Apply state      |     | Add/remove nodes |    |   GET /health     |
-| changes to       |     | Emit join/lost   |    | ThreadPoolExecutor|
-| in-memory model  |     | events           |    | (50 workers)      |
-+------------------+     +------------------+    +-------------------+
-       |                         |                         |
-       +-- Redis pub/sub         +-- Redis SCAN            +-- HTTP to each
-           (SUBSCRIBE)               (every 15s)               server (every 10s)
+Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
++------------------+                 +----------------------------+
+| Event subscriber |                 | POST /api/cluster/         |
+| SUBSCRIBE on     |                 |   workstreams/new          |
+| events:cluster   |                 |   → LPUSH to Redis         |
++------------------+                 |     inbound:{node_id}      |
+| Node discovery   |                 +----------------------------+
+| SCAN node:* keys |                 | GET /node/{node_id}/       |
+| every 15 seconds |                 |   → httpx.AsyncClient      |
++------------------+                 |     proxy to server_url    |
+| Poll loop        |                 | GET /node/{id}/api/events  |
+| GET /api/dash    |                 |   → SSE stream proxy       |
+| GET /health      |                 | POST /node/{id}/api/send   |
+| ThreadPoolExec   |                 |   → forwarded to server    |
++------------------+                 +----------------------------+
 ```
 
 The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
 endpoint uses `EventSourceResponse` with the same listener queue pattern as
 the main server. `ClusterCollector`'s background threads (event subscriber,
-node discovery, poll loop) remain unchanged — they use sync Redis clients
-and `ThreadPoolExecutor` for parallel HTTP polling.
+node discovery, poll loop) use sync Redis clients and `ThreadPoolExecutor`
+for parallel HTTP polling.
 
-The console is read-only — it never writes to Redis queues or sends commands to servers.
-Real-time events provide instant state transitions; periodic polling provides full data
-consistency (tokens, context ratios, activity strings). Clicking a workstream row in the
-console opens the node's server UI with `?ws_id=<id>` for direct deep linking — the
-server parses this on load and auto-selects the workstream. See [docs/console.md](console.md)
-for the full API reference.
+The console has two write-path capabilities:
+
+1. **Workstream creation** — pushes `CreateWorkstreamMessage` to Redis inbound
+   queues targeting specific nodes. The bridge on each node picks up the message
+   and creates the workstream on the local server. Auto-selects the node with
+   the most available capacity if no target is specified.
+
+2. **Reverse proxy** — serves each node's server UI through the console port at
+   `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
+   A JS shim is injected into the server's `app.js` to override `fetch()` and
+   `EventSource()`, routing root-relative URLs through the proxy prefix. This
+   eliminates the need for direct network access to individual server nodes.
+
+Clicking a workstream row in the console opens the proxied server UI at
+`/node/{node_id}/?ws_id=<id>` — the server's JS parses this on load and
+auto-selects the workstream. See [docs/console.md](console.md) for the full
+API reference.
 
 ---
 

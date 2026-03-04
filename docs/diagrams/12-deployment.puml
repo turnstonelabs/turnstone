@@ -87,8 +87,8 @@ bridge --> server : HTTP REST\n(POST /api/send, etc.)
 bridge <-- server : SSE\n(GET /api/events)
 bridge --> redis : Redis protocol\n(queues + pubsub)
 
-console --> redis : Redis PUBSUB\n(cluster channel)
-console --> server : HTTP polling\n(GET /api/dashboard)
+console --> redis : Redis PUBSUB + LIST\n(cluster events,\nws creation commands)
+console --> server : HTTP polling + proxy\n(GET /api/dashboard,\nproxy /node/{id}/*)
 
 sim --> redis : Redis protocol\n(queues + pubsub + keys)
 
