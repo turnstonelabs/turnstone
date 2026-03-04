@@ -305,6 +305,36 @@ function renderStatusBar(overview) {
     el.appendChild(labelSpan);
     metricsContainer.appendChild(el);
   });
+  if (
+    overview.version_drift &&
+    overview.versions &&
+    overview.versions.length > 1
+  ) {
+    var driftEl = document.createElement("span");
+    driftEl.className = "csb-metric csb-version-drift";
+    driftEl.title = "Versions detected: " + overview.versions.join(", ");
+    var warnSpan = document.createElement("span");
+    warnSpan.className = "csb-metric-value drift-warn";
+    warnSpan.textContent = "DRIFT";
+    var verLabel = document.createElement("span");
+    verLabel.className = "csb-metric-label";
+    verLabel.textContent = overview.versions.join(" / ");
+    driftEl.appendChild(warnSpan);
+    driftEl.appendChild(verLabel);
+    metricsContainer.appendChild(driftEl);
+  } else if (overview.versions && overview.versions.length === 1) {
+    var verEl = document.createElement("span");
+    verEl.className = "csb-metric";
+    var valSpan = document.createElement("span");
+    valSpan.className = "csb-metric-value";
+    valSpan.textContent = overview.versions[0];
+    var verLbl = document.createElement("span");
+    verLbl.className = "csb-metric-label";
+    verLbl.textContent = "ver";
+    verEl.appendChild(valSpan);
+    verEl.appendChild(verLbl);
+    metricsContainer.appendChild(verEl);
+  }
 }
 
 // --- Node Grouping ---
@@ -336,6 +366,7 @@ function groupNodes(nodes) {
         total_tokens: 0,
         all_reachable: true,
         any_degraded: false,
+        versions: new Set(),
       };
       groupOrder.push(prefix);
     }
@@ -350,6 +381,8 @@ function groupNodes(nodes) {
     g.total_tokens += node.total_tokens || 0;
     if (!node.reachable) g.all_reachable = false;
     if (node.health && node.health.status === "degraded") g.any_degraded = true;
+    var nodeVer = node.version || "";
+    if (nodeVer) g.versions.add(nodeVer);
   });
   groupOrder.forEach(function (prefix) {
     groupMap[prefix].nodes.sort(function (a, b) {
@@ -388,7 +421,8 @@ function buildNodeRow(node) {
       node.ws_attention +
       " attention, " +
       formatTokens(node.total_tokens) +
-      " tokens",
+      " tokens" +
+      (node.version ? ", version " + node.version : ""),
   );
 
   var isDegraded = node.health && node.health.status === "degraded";
@@ -455,6 +489,9 @@ function buildNodeRow(node) {
     '<span class="node-cell node-cell-num">' +
     formatTokens(displayTokens) +
     "</span>" +
+    '<span class="node-cell node-cell-version">' +
+    escapeHtml(node.version || "") +
+    "</span>" +
     '<span class="node-cell node-cell-health"><span class="health-bar">' +
     healthFillHtml +
     "</span> " +
@@ -512,6 +549,7 @@ function renderNodeGroups(nodes, total) {
     '<span class="ncol ncol-run">RUN</span>' +
     '<span class="ncol ncol-attn">ATTN</span>' +
     '<span class="ncol ncol-tokens">TOKENS</span>' +
+    '<span class="ncol ncol-version">VER</span>' +
     '<span class="ncol ncol-health">LOAD</span>';
   table.appendChild(topHeaders);
 
@@ -555,7 +593,8 @@ function renderNodeGroups(nodes, total) {
         group.ws_attention +
         " attention, " +
         formatTokens(group.total_tokens) +
-        " tokens",
+        " tokens" +
+        (group.versions.size > 1 ? ", version drift detected" : ""),
     );
 
     var chevronClass = "node-group-chevron" + (isExpanded ? " expanded" : "");
@@ -580,6 +619,17 @@ function renderNodeGroups(nodes, total) {
 
     var groupDegradedBadge = group.any_degraded
       ? '<span class="node-degraded-badge">degraded</span>'
+      : "";
+    var groupVersionText = "";
+    var groupVersionDrift = false;
+    if (group.versions.size === 1) {
+      groupVersionText = Array.from(group.versions)[0];
+    } else if (group.versions.size > 1) {
+      groupVersionText = "mixed";
+      groupVersionDrift = true;
+    }
+    var versionDriftBadge = groupVersionDrift
+      ? '<span class="node-version-drift-badge">drift</span>'
       : "";
 
     header.innerHTML =
@@ -610,6 +660,12 @@ function renderNodeGroups(nodes, total) {
       "</span>" +
       '<span class="node-group-cell num">' +
       formatTokens(group.total_tokens) +
+      "</span>" +
+      '<span class="node-group-cell node-cell-version' +
+      (groupVersionDrift ? " drift" : "") +
+      '">' +
+      escapeHtml(groupVersionText) +
+      versionDriftBadge +
       "</span>" +
       '<span class="node-group-cell node-cell-health"><span class="health-bar">' +
       healthFillHtml +
@@ -643,6 +699,7 @@ function renderNodeGroups(nodes, total) {
       '<span class="ncol ncol-run">RUN</span>' +
       '<span class="ncol ncol-attn">ATTN</span>' +
       '<span class="ncol ncol-tokens">TOKENS</span>' +
+      '<span class="ncol ncol-version">VER</span>' +
       '<span class="ncol ncol-health">LOAD</span>';
     body.appendChild(colHeaders);
 

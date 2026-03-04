@@ -85,9 +85,13 @@ Cluster-wide state counts and aggregate metrics.
   "nodes": 847,
   "workstreams": 4219,
   "states": {"running": 1847, "thinking": 312, "attention": 89, "idle": 1940, "error": 31},
-  "aggregate": {"total_tokens": 12400000, "total_tool_calls": 34200}
+  "aggregate": {"total_tokens": 12400000, "total_tool_calls": 34200},
+  "version_drift": true,
+  "versions": ["0.3.0", "0.3.1"]
 }
 ```
+
+`version_drift` is `true` when nodes report different versions. `versions` lists all unique version strings sorted alphabetically.
 
 ### `GET /api/cluster/nodes?sort=activity&limit=100&offset=0`
 
@@ -103,7 +107,8 @@ Paginated node list. Sort options: `activity` (default, by running+attention cou
       "total_tokens": 48200,
       "started": 1709294400.0,
       "reachable": true,
-      "health": {}
+      "health": {"status": "ok", "version": "0.3.0"},
+      "version": "0.3.0"
     }
   ],
   "total": 847
@@ -192,7 +197,14 @@ Keepalive comments (`: keepalive\n\n`) are sent every 5 seconds. Clients should 
 ### `GET /health`
 
 ```json
-{"status": "ok", "service": "turnstone-console", "nodes": 847, "workstreams": 4219}
+{
+  "status": "ok",
+  "service": "turnstone-console",
+  "nodes": 847,
+  "workstreams": 4219,
+  "version_drift": false,
+  "versions": ["0.3.0"]
+}
 ```
 
 ---
@@ -239,7 +251,8 @@ The web UI has four views, toggled client-side:
 
 - **State cards** — 5 clickable cards (running, thinking, attention, idle, error) with count and colored top border. Clicking filters to that state.
 - **Aggregate bar** — total tokens and tool calls across the cluster.
-- **Node table** — columns: NODE, WS, RUN, ATTN, TOKENS, HEALTH. Sorted by activity. Clickable rows drill down to node detail.
+- **Node table** — columns: NODE, WS, RUN, ATTN, TOKENS, VER, LOAD. Sorted by activity. Clickable rows drill down to node detail. Version column shows per-node version; hidden on mobile.
+- **Version drift indicator** — when nodes report different versions, the status bar shows a yellow "DRIFT" warning with a tooltip listing all versions. Node groups show "mixed" with a yellow badge when their members disagree.
 - **"+ new" button** — opens the workstream creation modal (see below).
 
 ### 2. Node Drill-down

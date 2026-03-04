@@ -75,7 +75,7 @@ deactivate NodeA
 
 CC -> NodeA : GET /health
 activate NodeA
-NodeA --> CC : {status:"ok", model:"...",\nworkstreams:{total, idle, ...}}
+NodeA --> CC : {status:"ok", version:"0.3.0",\nmodel:"...", workstreams:{...}}
 deactivate NodeA
 
 CC -> CC : Replace NodeSnapshot["nodeA"]\n.workstreams, .health, .aggregate
@@ -109,7 +109,7 @@ deactivate Server
 
 Browser -> Server : GET /api/cluster/overview
 Server -> CC : get_overview()
-CC --> Server : {nodes: 10, workstreams: 47,\nstates: {running:5, thinking:3, ...},\naggregate: {total_tokens: 50000}}
+CC --> Server : {nodes: 10, workstreams: 47,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.3.0"]}
 Server --> Browser : JSON response
 
 Browser -> Server : GET /api/cluster/nodes?sort=activity

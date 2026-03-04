@@ -1017,6 +1017,11 @@ The console has two write-path capabilities:
    `EventSource()`, routing root-relative URLs through the proxy prefix. This
    eliminates the need for direct network access to individual server nodes.
 
+The console also performs **version drift detection** — flagging when nodes
+report different versions via the `/health` endpoint. The overview API includes
+`version_drift` and `versions` fields; the dashboard shows a yellow warning
+indicator when versions diverge.
+
 Clicking a workstream row in the console opens the proxied server UI at
 `/node/{node_id}/?ws_id=<id>` — the server's JS parses this on load and
 auto-selects the workstream. See [docs/console.md](console.md) for the full

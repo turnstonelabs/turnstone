@@ -296,6 +296,7 @@ class ClusterCollector:
         total_tokens = 0
         total_tool_calls = 0
         total_ws = 0
+        versions: set[str] = set()
         with self._lock:
             for node in self._nodes.values():
                 for ws in node.workstreams.values():
@@ -304,6 +305,9 @@ class ClusterCollector:
                     total_ws += 1
                 total_tokens += node.aggregate.get("total_tokens", 0)
                 total_tool_calls += node.aggregate.get("total_tool_calls", 0)
+                ver = node.health.get("version", "")
+                if ver:
+                    versions.add(ver)
             node_count = len(self._nodes)
         return {
             "nodes": node_count,
@@ -313,6 +317,23 @@ class ClusterCollector:
                 "total_tokens": total_tokens,
                 "total_tool_calls": total_tool_calls,
             },
+            "version_drift": len(versions) > 1,
+            "versions": sorted(versions),
+        }
+
+    def get_version_info(self) -> dict[str, Any]:
+        """Return per-node version map and drift flag."""
+        with self._lock:
+            versions = {
+                n.node_id: n.health.get("version", "")
+                for n in self._nodes.values()
+                if n.health.get("version")
+            }
+            unique = set(versions.values())
+        return {
+            "versions": versions,
+            "unique_versions": sorted(unique),
+            "drift": len(unique) > 1,
         }
 
     def get_nodes(
@@ -353,6 +374,7 @@ class ClusterCollector:
                         "last_seen": node.last_seen,
                         "reachable": node.reachable,
                         "health": node.health,
+                        "version": node.health.get("version", ""),
                     }
                 )
             total = len(items)
