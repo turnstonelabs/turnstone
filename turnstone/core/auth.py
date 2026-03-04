@@ -134,11 +134,12 @@ def required_role(method: str, path: str) -> str:
     Handles console proxy routes (``/node/{id}/api/...``) by extracting the
     proxied path and checking it against ``WRITE_PATHS``.
     """
-    if method == "POST" and path in WRITE_PATHS:
+    normalized = path.rstrip("/") if path != "/" else path
+    if method == "POST" and normalized in WRITE_PATHS:
         return "full"
     # Console proxy routes: /node/{node_id}/api/{tail}
-    if method == "POST" and path.startswith("/node/"):
-        parts = path.split("/", 4)  # ['', 'node', '{id}', 'api', '{tail}']
+    if method == "POST" and normalized.startswith("/node/"):
+        parts = normalized.split("/", 4)  # ['', 'node', '{id}', 'api', '{tail}']
         if len(parts) >= 5 and parts[3] == "api":
             proxied_path = "/api/" + parts[4]
             if proxied_path in WRITE_PATHS:

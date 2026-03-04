@@ -19,7 +19,9 @@ import logging
 import math
 import os
 import queue
+import re
 import textwrap
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -155,8 +157,13 @@ _CONSOLE_BANNER_TEMPLATE = (
 )
 
 
+_VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
 def _get_server_url(request: Request, node_id: str) -> str | None:
     """Resolve node_id to its server_url via the collector."""
+    if not node_id or not _VALID_NODE_ID.match(node_id) or len(node_id) > 256:
+        return None
     collector: ClusterCollector = request.app.state.collector
     detail = collector.get_node_detail(node_id)
     if detail and detail.get("server_url"):
@@ -327,9 +334,20 @@ async def create_workstream(request: Request) -> JSONResponse:
     broker: RedisBroker = request.app.state.broker
     collector: ClusterCollector = request.app.state.collector
 
-    node_id = str(body.get("node_id", ""))
-    name = str(body.get("name", ""))[:256]
-    model = str(body.get("model", ""))[:128]
+    raw_node_id = body.get("node_id", "")
+    raw_name = body.get("name", "")
+    raw_model = body.get("model", "")
+    if not isinstance(raw_node_id, str):
+        raw_node_id = "" if raw_node_id is None else None
+    if not isinstance(raw_name, str):
+        raw_name = "" if raw_name is None else None
+    if not isinstance(raw_model, str):
+        raw_model = "" if raw_model is None else None
+    if raw_node_id is None or raw_name is None or raw_model is None:
+        return JSONResponse({"error": "node_id, name, and model must be strings"}, status_code=400)
+    node_id = raw_node_id
+    name = raw_name[:256]
+    model = raw_model[:128]
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
@@ -386,9 +404,16 @@ async def proxy_index(request: Request) -> Response:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
     client: httpx.AsyncClient = request.app.state.proxy_client
-    prefix = f"/node/{node_id}"
+    safe_node = urllib.parse.quote(node_id, safe="")
+    prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/")
+        if resp.status_code < 200 or resp.status_code >= 300:
+            log.debug("Upstream %s returned status %s", node_id, resp.status_code)
+            return JSONResponse(
+                {"error": "Upstream server error", "status_code": resp.status_code},
+                status_code=resp.status_code,
+            )
         page = resp.text
         # Rewrite static asset paths
         page = page.replace('href="/static/', f'href="{prefix}/static/')
@@ -411,14 +436,15 @@ async def proxy_static(request: Request) -> Response:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
     client: httpx.AsyncClient = request.app.state.proxy_client
-    prefix = f"/node/{node_id}"
+    safe_node = urllib.parse.quote(node_id, safe="")
+    prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/static/{path}")
         content_type = resp.headers.get("content-type", "application/octet-stream")
         body = resp.content
         # Inject proxy shim into app.js
         if path == "app.js":
-            shim = _JS_PROXY_SHIM.replace("PREFIX_PLACEHOLDER", prefix)
+            shim = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
             body = shim.encode("utf-8") + body
             content_type = "application/javascript; charset=utf-8"
         return Response(content=body, status_code=resp.status_code, media_type=content_type)
@@ -478,9 +504,12 @@ async def _proxy_post(request: Request, server_url: str, path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
+    target = f"{server_url}/api/{path}"
+    if request.url.query:
+        target += f"?{request.url.query}"
     try:
         resp = await client.post(
-            f"{server_url}/api/{path}",
+            target,
             content=body,
             headers={"Content-Type": content_type},
         )
@@ -509,6 +538,17 @@ async def _proxy_sse(request: Request, server_url: str, path: str) -> Response:
         async with httpx.AsyncClient(timeout=None, headers=headers) as sse_client:
             try:
                 async with sse_client.stream("GET", target) as resp:
+                    if resp.status_code != 200:
+                        log.debug(
+                            "SSE proxy received status %s from %s",
+                            resp.status_code,
+                            target,
+                        )
+                        yield {
+                            "event": "error",
+                            "data": f"Upstream returned status {resp.status_code}",
+                        }
+                        return
                     buf = ""
                     async for chunk in resp.aiter_text():
                         if await request.is_disconnected():

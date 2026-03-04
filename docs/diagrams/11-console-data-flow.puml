@@ -132,7 +132,7 @@ CC --> Server : node validated
 
 Server -> Server : Build CreateWorkstreamMessage\n{target_node:"nodeA", name:"new-task"}
 
-Server -> Redis : LPUSH turnstone:inbound:nodeA\n(directed queue)
+Server -> Redis : RPUSH turnstone:inbound:nodeA\n(directed queue)
 Server --> Browser : {status:"ok", correlation_id:"abc",\ntarget_node:"nodeA"}
 deactivate Server
 

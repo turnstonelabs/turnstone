@@ -33,7 +33,7 @@ Data flows in two directions:
 | Redis pub/sub | `SUBSCRIBE turnstone:events:cluster` | Read | State changes, creates, closes, renames |
 | Node HTTP API | `GET {server_url}/api/dashboard` | Read | Full workstream list with tokens, context, activity |
 | Node HTTP API | `GET {server_url}/health` | Read | Node health status |
-| Redis inbound queue | `LPUSH turnstone:inbound:{node_id}` | Write | Workstream creation commands |
+| Redis inbound queue | `RPUSH turnstone:inbound:{node_id}` | Write | Workstream creation commands |
 | Node HTTP API | `GET/POST {server_url}/*` | Proxy | Server UI, API requests, SSE streams |
 
 ### Redis Key: Cluster Event Channel
