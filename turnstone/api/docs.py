@@ -25,17 +25,23 @@ def make_openapi_handler(spec: dict[str, Any]) -> Callable[..., Awaitable[Respon
 
 def make_docs_handler(
     openapi_path: str = "/openapi.json",
+    swagger_ui_base_url: str = "https://unpkg.com/swagger-ui-dist@5.18.2",
 ) -> Callable[..., Awaitable[HTMLResponse]]:
-    """Create a /docs handler that serves SwaggerUI loaded from CDN."""
+    """Create a /docs handler that serves SwaggerUI.
+
+    *swagger_ui_base_url* can point at locally-served assets (e.g.
+    ``/static/swagger-ui-dist``) for air-gapped deployments.
+    """
+    base = swagger_ui_base_url.rstrip("/")
     html = (
         '<!DOCTYPE html><html lang="en"><head>'
         "<title>turnstone API</title>"
         '<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui.css">'
+        f'<link rel="stylesheet" href="{base}/swagger-ui.css">'
         "</head><body>"
         '<div id="swagger-ui"><p style="padding:2rem;font-family:sans-serif;color:#666">'
         "Loading API documentation&hellip;</p></div>"
-        '<script src="https://unpkg.com/swagger-ui-dist@5.18.2/swagger-ui-bundle.js"></script>'
+        f'<script src="{base}/swagger-ui-bundle.js"></script>'
         "<script>SwaggerUIBundle({url:" + json.dumps(openapi_path) + ","
         'dom_id:"#swagger-ui",deepLinking:true})</script>'
         "</body></html>"

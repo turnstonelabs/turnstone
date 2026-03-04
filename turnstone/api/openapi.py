@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -77,8 +78,18 @@ def build_openapi(
             op["tags"] = ep.tags
         if ep.description:
             op["description"] = ep.description
+        # Auto-detect path parameters from {param} segments
+        params: list[dict[str, Any]] = []
+        for match in re.finditer(r"\{(\w+)\}", ep.path):
+            params.append(
+                {
+                    "name": match.group(1),
+                    "in": "path",
+                    "required": True,
+                    "schema": {"type": "string"},
+                }
+            )
         if ep.query_params:
-            params: list[dict[str, Any]] = []
             for qp in ep.query_params:
                 p: dict[str, Any] = {
                     "name": qp.name,
@@ -93,6 +104,7 @@ def build_openapi(
                 if qp.enum:
                     p["schema"]["enum"] = qp.enum
                 params.append(p)
+        if params:
             op["parameters"] = params
         if ep.request_model:
             op["requestBody"] = {

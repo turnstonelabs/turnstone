@@ -491,7 +491,8 @@ async def proxy_api(request: Request) -> Response:
 
     # Detect if this came through the /v1/ proxy route
     api_prefix = "api"
-    if "/v1/api/" in str(request.url.path):
+    safe_node = urllib.parse.quote(node_id, safe="")
+    if request.url.path.startswith(f"/node/{safe_node}/v1/api/"):
         api_prefix = "v1/api"
 
     # SSE detection: GET requests to events endpoints
