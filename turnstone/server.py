@@ -435,6 +435,35 @@ class MetricsMiddleware:
             )
 
 
+class LogContextMiddleware:
+    """Set structlog context variables (request_id, ws_id) per request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        import structlog
+
+        from turnstone.core.log import ctx_request_id, ctx_ws_id
+
+        rid = uuid.uuid4().hex[:8]
+        tok_rid = ctx_request_id.set(rid)
+        # Extract ws_id from query params if present
+        request = Request(scope)
+        ws_id = request.query_params.get("ws_id", "")
+        tok_ws = ctx_ws_id.set(ws_id) if ws_id else None
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            ctx_request_id.reset(tok_rid)
+            if tok_ws is not None:
+                ctx_ws_id.reset(tok_ws)
+            structlog.contextvars.clear_contextvars()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -1057,6 +1086,7 @@ def create_app(
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
         ],
         middleware=[
+            Middleware(LogContextMiddleware),
             Middleware(MetricsMiddleware),
             Middleware(
                 CORSMiddleware,
@@ -1276,6 +1306,18 @@ def main() -> None:
         default=60.0,
         help="Circuit breaker cooldown in seconds (default: 60)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-format",
+        default="auto",
+        choices=["auto", "json", "text"],
+        help="Log output format (default: auto — JSON when stderr is not a TTY)",
+    )
     from turnstone.core.config import apply_config
 
     apply_config(
@@ -1283,6 +1325,14 @@ def main() -> None:
         ["api", "model", "session", "tools", "server", "mcp", "ratelimit", "health", "database"],
     )
     args = parser.parse_args()
+
+    from turnstone.core.log import configure_logging
+
+    configure_logging(
+        level=args.log_level,
+        json_output={"json": True, "text": False}.get(args.log_format),
+        service="server",
+    )
 
     # Initialize storage backend
     from turnstone.core.storage import init_storage
@@ -1325,7 +1375,7 @@ def main() -> None:
     context_window = args.context_window
     if detected_ctx and context_window == 131072:  # default unchanged
         context_window = detected_ctx
-        print(f"Context window: {context_window:,} (detected from backend)")
+        log.info("Context window: %s (detected from backend)", f"{context_window:,}")
 
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry
@@ -1385,6 +1435,10 @@ def main() -> None:
 
     _node_id = os.environ.get("TURNSTONE_NODE_ID") or _default_node_id()
 
+    from turnstone.core.log import ctx_node_id
+
+    ctx_node_id.set(_node_id)
+
     # Session factory — captures shared config
     def session_factory(
         ui: SessionUI | None,
@@ -1435,12 +1489,12 @@ def main() -> None:
 
         target_id = resolve_session(args.resume)
         if not target_id:
-            print(f"Session not found: {args.resume}")
+            log.error("Session not found: %s", args.resume)
             sys.exit(1)
         if not ws.session.resume_session(target_id):
-            print(f"Session '{args.resume}' has no messages.")
+            log.error("Session '%s' has no messages.", args.resume)
             sys.exit(1)
-        print(f"Resumed session {target_id} ({len(ws.session.messages)} messages)")
+        log.info("Resumed session %s (%d messages)", target_id, len(ws.session.messages))
 
     # Record detected model in metrics
     _metrics.model = model
@@ -1450,7 +1504,7 @@ def main() -> None:
 
     auth_config = load_auth_config()
     if auth_config.enabled:
-        print(f"Auth: enabled ({len(auth_config.tokens)} token(s) configured)")
+        log.info("Auth: enabled (%d token(s) configured)", len(auth_config.tokens))
 
     # Build the ASGI app
     app = create_app(
@@ -1468,18 +1522,19 @@ def main() -> None:
         node_id=_node_id,
     )
 
-    print(f"turnstone web server running on http://{args.host}:{args.port}")
-    print(f"Model: {model}")
+    log.info("Server starting on http://%s:%s", args.host, args.port)
+    log.info("Model: %s", model)
     if registry.count > 1:
         others = [a for a in registry.list_aliases() if a != registry.default]
-        print(f"Models: {registry.default} (default), {', '.join(others)}")
+        log.info("Models: %s (default), %s", registry.default, ", ".join(others))
     if mcp_client:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
-            print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
-    print(
-        f"Health monitor: probe every {args.health_probe_interval}s, "
-        f"circuit breaker threshold={args.circuit_breaker_threshold}"
+            log.info("MCP tools: %d from %d server(s)", len(mcp_tools), mcp_client.server_count)
+    log.info(
+        "Health monitor: probe every %ss, circuit breaker threshold=%s",
+        args.health_probe_interval,
+        args.circuit_breaker_threshold,
     )
     if rate_limiter.enabled:
         proxy_info = (
@@ -1487,8 +1542,14 @@ def main() -> None:
             if args.ratelimit_trusted_proxies
             else ""
         )
-        print(f"Rate limiter: {args.ratelimit_rps} req/s, burst={args.ratelimit_burst}{proxy_info}")
-    print(f"Max workstreams: {args.max_workstreams}")
+        log.info(
+            "Rate limiter: %s req/s, burst=%s%s",
+            args.ratelimit_rps,
+            args.ratelimit_burst,
+            proxy_info,
+        )
+    log.info("Max workstreams: %s", args.max_workstreams)
+    log.info("Node ID: %s", _node_id)
     print("Press Ctrl+C to stop.")
 
     import uvicorn

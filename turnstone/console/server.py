@@ -758,6 +758,12 @@ def main() -> None:
         help="Log level (default: INFO)",
     )
     parser.add_argument(
+        "--log-format",
+        default="auto",
+        choices=["auto", "json", "text"],
+        help="Log output format (default: auto — JSON when stderr is not a TTY)",
+    )
+    parser.add_argument(
         "--auth-token",
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
         help="Bearer token for polling turnstone-server nodes (default: $TURNSTONE_AUTH_TOKEN)",
@@ -768,9 +774,12 @@ def main() -> None:
     apply_config(parser, ["console", "redis", "auth"])
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    from turnstone.core.log import configure_logging
+
+    configure_logging(
+        level=args.log_level,
+        json_output={"json": True, "text": False}.get(args.log_format),
+        service="console",
     )
 
     broker = RedisBroker(
@@ -800,9 +809,9 @@ def main() -> None:
         proxy_auth_token=args.auth_token,
     )
 
-    print(f"turnstone console running on http://{args.host}:{args.port}")
+    log.info("Console starting on http://%s:%s", args.host, args.port)
     if auth_config.enabled:
-        print(f"Auth: enabled ({len(auth_config.tokens)} token(s) configured)")
+        log.info("Auth: enabled (%d token(s) configured)", len(auth_config.tokens))
     print("Press Ctrl+C to stop.")
 
     import uvicorn

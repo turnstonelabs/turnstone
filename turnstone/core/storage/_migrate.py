@@ -78,7 +78,9 @@ if __name__ == "__main__":
     url = os.environ.get("TURNSTONE_DB_URL", "")
     path = os.environ.get("TURNSTONE_DB_PATH", "")
 
-    logging.basicConfig(level=logging.INFO)
+    from turnstone.core.log import configure_logging
+
+    configure_logging(level="INFO", service="migrate")
     init_storage(backend, path=path, url=url, run_migrations=True)
     log.info("Migrations complete")
     get_storage().close()
