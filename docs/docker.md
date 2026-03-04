@@ -57,7 +57,7 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 |----------|---------|-------------|
 | `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | OpenAI-compatible API URL |
 | `OPENAI_API_KEY` | `dummy` | API key (`dummy` for local servers) |
-| `TAVILY_API_KEY` | — | Web search API key (optional) |
+| `TAVILY_API_KEY` | — | Web search API key (only needed for local/vLLM models; Anthropic and OpenAI search models use native search) |
 
 ### Redis
 

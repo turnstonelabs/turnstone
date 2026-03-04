@@ -213,7 +213,7 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 | `math` | Sandboxed Python evaluation | |
 | `man` | Read man pages | yes |
 | `web_fetch` | Fetch URL content | |
-| `web_search` | Search via Tavily API | |
+| `web_search` | Web search (provider-native or Tavily) | |
 | `remember` | Save persistent facts | yes |
 | `recall` | Search memories and history | yes |
 | `forget` | Remove a memory | yes |
@@ -264,8 +264,8 @@ context_window = 200000
 [models.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-..."
-model = "gpt-4o"
-context_window = 128000
+model = "gpt-5"
+context_window = 400000
 
 [model]
 default = "local"              # which model to use by default
@@ -285,7 +285,7 @@ All entry points read `~/.config/turnstone/config.toml`. CLI flags override conf
 [api]
 base_url = "http://localhost:8000/v1"
 api_key = ""
-tavily_key = ""
+tavily_key = ""        # only needed for local/vLLM models without native search
 
 [model]
 name = ""              # empty = auto-detect

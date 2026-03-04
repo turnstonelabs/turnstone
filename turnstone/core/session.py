@@ -770,6 +770,11 @@ class ChatSession:
                     if tcd.arguments_delta:
                         tc["function"]["arguments"] += tcd.arguments_delta
 
+            # Informational messages (e.g. server-side web search status)
+            if chunk.info_delta:
+                _stop_spinner_once()
+                self.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
+
         # Flush any remaining buffered text
         if pending:
             _flush_text(pending, in_think)
