@@ -217,19 +217,20 @@ The console reverse-proxies each node's server UI at `/node/{node_id}/`. This al
 
 | Route | Behavior |
 |-------|----------|
-| `GET /node/{node_id}/` | Fetches the server's `index.html`, rewrites static asset paths, injects a console-return banner and a JS proxy shim |
-| `GET /node/{node_id}/static/{path}` | Proxies static files; injects a JS shim into `app.js` |
+| `GET /node/{node_id}/` | Fetches the server's `index.html`, rewrites static and shared asset paths, injects a console-return banner and an inline JS proxy shim |
+| `GET /node/{node_id}/static/{path}` | Proxies page-specific static files |
+| `GET /node/{node_id}/shared/{path}` | Proxies shared static files (`base.css`, `auth.js`, etc.) |
 | `GET /node/{node_id}/api/{path}` | Proxies GET API requests; detects SSE endpoints and streams them |
 | `POST /node/{node_id}/api/{path}` | Proxies POST API requests with body forwarding |
 | `GET /node/{node_id}/{path}` | Proxies non-API endpoints (health, metrics) |
 
 ### URL Rewriting
 
-The server UI uses root-relative URLs (`/api/send`, `/static/app.js`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
+The server UI uses root-relative URLs (`/api/send`, `/static/app.js`, `/shared/base.css`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
 
-1. **HTML rewriting** — when serving `index.html`, replaces `href="/static/"` and `src="/static/"` with the proxy prefix (`/node/{node_id}/static/`).
+1. **HTML rewriting** — when serving `index.html`, replaces `href=` and `src=` references to both `/static/` and `/shared/` with the proxy prefix (`/node/{node_id}/static/` and `/node/{node_id}/shared/` respectively).
 
-2. **JS shim injection** — when serving `app.js`, prepends an IIFE that overrides `window.fetch()` and `window.EventSource()` to prepend the proxy prefix to any root-relative URL. This intercepts all API calls and SSE connections transparently.
+2. **Inline JS shim** — injects an inline `<script>` block into the proxied HTML (after the console-return banner, before any external scripts) that overrides `window.fetch()` and `window.EventSource()` to prepend the proxy prefix to any root-relative URL. Running the shim inline ensures it executes before any external scripts load, so all API calls and SSE connections are intercepted transparently.
 
 3. **Console-return banner** — injects a thin inline-styled `<div>` after `<body>` with a "← Console" link and the node ID, providing navigation back to the dashboard.
 

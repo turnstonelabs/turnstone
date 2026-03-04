@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/shared/base.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -80,6 +81,26 @@
 </div>
 
 <div id="toast" role="status" aria-live="polite"></div>
+<script>
+window.TURNSTONE_AUTH_TITLE = "turnstone console";
+window.TURNSTONE_TOAST_TIMEOUT = 4000;
+window.TURNSTONE_KB_SHORTCUTS = [
+  { title: "Navigation", keys: [
+    { desc: "Activate card / row", badge: '<span class="kb-key">Enter</span>' },
+    { desc: "Activate card / row", badge: '<span class="kb-key">Space</span>' },
+    { desc: "Navigate rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' }
+  ]},
+  { title: "General", keys: [
+    { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
+    { desc: "Close overlay", badge: '<span class="kb-key">Esc</span>' }
+  ]}
+];
+</script>
+<script src="/shared/utils.js"></script>
+<script src="/shared/toast.js"></script>
+<script src="/shared/theme.js"></script>
+<script src="/shared/auth.js"></script>
+<script src="/shared/kb.js"></script>
 
 <div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
   <div id="new-ws-box">

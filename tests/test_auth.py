@@ -42,6 +42,12 @@ class TestIsPublicPath:
     def test_static_subdir(self):
         assert is_public_path("/static/fonts/mono.woff2") is True
 
+    def test_shared_css_public(self):
+        assert is_public_path("/shared/base.css") is True
+
+    def test_shared_js_public(self):
+        assert is_public_path("/shared/utils.js") is True
+
     def test_api_workstreams_not_public(self):
         assert is_public_path("/api/workstreams") is False
 
@@ -720,6 +726,10 @@ class TestServerAuth:
         )
         allowed = resp.headers.get("access-control-allow-headers", "")
         assert "authorization" in allowed.lower()
+
+    def test_shared_css_no_token_200(self):
+        resp = self.client.get("/shared/base.css")
+        assert resp.status_code == 200
 
 
 class TestConsoleAuth:

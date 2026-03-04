@@ -1125,3 +1125,157 @@ class TestConsoleVersionEndpoints:
         assert status == 200
         assert data["version_drift"] is True
         assert "0.3.0" in data["versions"]
+
+
+# ---------------------------------------------------------------------------
+# Shared static serving
+# ---------------------------------------------------------------------------
+
+
+class TestSharedStatic:
+    """Tests for /shared/ static file serving."""
+
+    @pytest.fixture()
+    def client(self):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import AuthConfig
+
+        _load_static()
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_overview.return_value = {
+            "nodes": 0,
+            "workstreams": 0,
+            "states": {},
+            "aggregate": {},
+        }
+        app = create_app(
+            collector=collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
+
+    def test_shared_base_css(self, client):
+        resp = client.get("/shared/base.css")
+        assert resp.status_code == 200
+        assert "text/css" in resp.headers.get("content-type", "")
+
+    def test_shared_utils_js(self, client):
+        resp = client.get("/shared/utils.js")
+        assert resp.status_code == 200
+        assert "javascript" in resp.headers.get("content-type", "")
+
+    def test_shared_auth_js(self, client):
+        resp = client.get("/shared/auth.js")
+        assert resp.status_code == 200
+        assert "javascript" in resp.headers.get("content-type", "")
+
+    def test_shared_toast_js(self, client):
+        resp = client.get("/shared/toast.js")
+        assert resp.status_code == 200
+
+    def test_shared_theme_js(self, client):
+        resp = client.get("/shared/theme.js")
+        assert resp.status_code == 200
+
+    def test_shared_kb_js(self, client):
+        resp = client.get("/shared/kb.js")
+        assert resp.status_code == 200
+
+    def test_shared_nonexistent_returns_404(self, client):
+        resp = client.get("/shared/nonexistent.js")
+        assert resp.status_code == 404
+
+    def test_index_imports_shared_base_css(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert '/shared/base.css"' in resp.text
+
+    def test_index_imports_shared_scripts(self, client):
+        resp = client.get("/")
+        body = resp.text
+        assert "/shared/utils.js" in body
+        assert "/shared/toast.js" in body
+        assert "/shared/theme.js" in body
+        assert "/shared/auth.js" in body
+        assert "/shared/kb.js" in body
+
+    def test_shared_scripts_load_before_app_js(self, client):
+        """Shared scripts must appear before page-specific app.js."""
+        body = client.get("/").text
+        shared_pos = body.find("/shared/utils.js")
+        app_pos = body.find("/static/app.js")
+        assert shared_pos < app_pos
+
+
+class TestProxySharedStatic:
+    """Tests for proxy rewriting of /shared/ paths."""
+
+    def test_html_rewriting_includes_shared_paths(self):
+        """Verify proxy_index rewrites /shared/ paths like /static/ paths."""
+        sample_html = (
+            '<link rel="stylesheet" href="/shared/base.css">\n'
+            '<link rel="stylesheet" href="/static/style.css">\n'
+            '<script src="/shared/utils.js"></script>\n'
+            '<script src="/static/app.js"></script>'
+        )
+        prefix = "/node/test-node"
+        rewritten = sample_html.replace('href="/static/', f'href="{prefix}/static/')
+        rewritten = rewritten.replace('src="/static/', f'src="{prefix}/static/')
+        rewritten = rewritten.replace('href="/shared/', f'href="{prefix}/shared/')
+        rewritten = rewritten.replace('src="/shared/', f'src="{prefix}/shared/')
+        assert "/node/test-node/shared/base.css" in rewritten
+        assert "/node/test-node/shared/utils.js" in rewritten
+        assert "/node/test-node/static/style.css" in rewritten
+        assert "/node/test-node/static/app.js" in rewritten
+        assert 'href="/shared/' not in rewritten
+        assert 'src="/shared/' not in rewritten
+
+    def test_proxy_shim_injected_in_html(self):
+        """Verify shim is injected as inline script in proxied HTML."""
+        import json
+
+        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE, _JS_PROXY_SHIM
+
+        sample_html = "<html><body><div>content</div></body></html>"
+        prefix = "/node/test-node"
+        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", "test-node")
+        shim = (
+            "<script>"
+            + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+            + "</script>"
+        )
+        result = sample_html.replace("<body>", "<body>" + banner + shim, 1)
+        assert "<script>" in result
+        assert "/node/test-node" in result
+        assert "window.fetch" in result
+        assert "window.EventSource" in result
+
+    def test_proxy_shared_static_unknown_node_returns_404(self):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import AuthConfig
+
+        _load_static()
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_overview.return_value = {
+            "nodes": 0,
+            "workstreams": 0,
+            "states": {},
+            "aggregate": {},
+        }
+        collector.get_node_detail.return_value = None
+        app = create_app(
+            collector=collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/node/unknown/shared/base.css")
+        assert resp.status_code == 404
+        client.close()

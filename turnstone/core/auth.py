@@ -29,7 +29,7 @@ AUTH_COOKIE = "turnstone_auth"
 PUBLIC_PATHS: frozenset[str] = frozenset(
     {"/", "/health", "/metrics", "/api/auth/login", "/api/auth/logout"}
 )
-PUBLIC_PREFIXES: tuple[str, ...] = ("/static/",)
+PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {

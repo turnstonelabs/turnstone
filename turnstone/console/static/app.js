@@ -1,48 +1,27 @@
-// --- Theme ---
-function toggleTheme() {
-  var next = document.documentElement.dataset.theme === "light" ? "" : "light";
-  document.documentElement.dataset.theme = next;
-  localStorage.setItem("turnstone-theme", next || "dark");
+// --- Shared hooks ---
+window.onLoginSuccess = function () {
+  connectSSE();
+  if (currentView === "overview") loadOverview();
+  else if (currentView === "node") drillDownToNode(currentNodeId);
+  else if (currentView === "filtered") loadFilteredWorkstreams();
+};
+window.onLogout = function () {
+  if (evtSource) {
+    evtSource.close();
+    evtSource = null;
+  }
+};
+window.onThemeChange = function (next) {
   var btn = document.getElementById("theme-toggle");
   if (btn) btn.textContent = next === "light" ? "\u2600" : "\u263E";
-}
-(function initTheme() {
-  var stored = localStorage.getItem("turnstone-theme");
-  if (stored === "light") {
-    document.documentElement.dataset.theme = "light";
-  } else if (
-    !stored &&
-    window.matchMedia &&
-    window.matchMedia("(prefers-color-scheme: light)").matches
-  ) {
-    document.documentElement.dataset.theme = "light";
-  }
+};
+// Set initial theme button text
+(function () {
   var btn = document.getElementById("theme-toggle");
   if (btn)
     btn.textContent =
       document.documentElement.dataset.theme === "light" ? "\u2600" : "\u263E";
 })();
-
-/* Auth-aware fetch — shows login overlay on 401, retries on 429 */
-async function authFetch(url, opts) {
-  var maxRetries = 2;
-  for (var attempt = 0; attempt <= maxRetries; attempt++) {
-    var r = await fetch(url, opts);
-    if (r.status === 401) {
-      showLogin();
-      throw new Error("auth");
-    }
-    if (r.status === 429 && attempt < maxRetries) {
-      var retryAfter = parseInt(r.headers.get("Retry-After") || "1", 10);
-      showToast("Rate limited \u2014 retrying in " + retryAfter + "s");
-      await new Promise(function (resolve) {
-        setTimeout(resolve, retryAfter * 1000);
-      });
-      continue;
-    }
-    return r;
-  }
-}
 
 // --- State ---
 var currentView = "overview"; // "overview" | "node" | "filtered"
@@ -64,68 +43,6 @@ var STATE_DISPLAY = {
   error: { symbol: "\u2716", label: "err" },
 };
 var STATE_ORDER = ["running", "thinking", "attention", "error", "idle"];
-
-// --- Helpers ---
-function escapeHtml(s) {
-  var el = document.createElement("span");
-  el.textContent = s;
-  return el.innerHTML;
-}
-function formatTokens(n) {
-  if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-  return String(n || 0);
-}
-function ctxClass(ratio) {
-  if (ratio <= 0) return "ctx-idle";
-  var pct = ratio * 100;
-  if (pct < 30) return "ctx-low";
-  if (pct < 50) return "ctx-mid";
-  if (pct < 80) return "ctx-high";
-  return "ctx-danger";
-}
-function formatUptime(seconds) {
-  if (!seconds) return "";
-  if (seconds < 60) return seconds + "s";
-  var min = Math.floor(seconds / 60);
-  if (min < 60) return min + "m";
-  var hr = Math.floor(min / 60);
-  return hr + "h " + (min % 60) + "m";
-}
-function formatCount(n) {
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-  return String(n);
-}
-
-// --- Toast ---
-var _toastQueue = [];
-var _toastTimer = null;
-var _toastShowing = false;
-function showToast(message) {
-  var el = document.getElementById("toast");
-  if (!el) return;
-  if (_toastShowing) {
-    _toastQueue.push(message);
-    return;
-  }
-  _displayToast(el, message);
-}
-function _displayToast(el, message) {
-  el.textContent = message;
-  el.classList.add("visible");
-  _toastShowing = true;
-  if (_toastTimer) clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(function () {
-    el.classList.remove("visible");
-    _toastShowing = false;
-    _toastTimer = null;
-    if (_toastQueue.length) {
-      setTimeout(function () {
-        _displayToast(el, _toastQueue.shift());
-      }, 300);
-    }
-  }, 4000);
-}
 
 // --- SSE Connection ---
 function connectSSE() {
@@ -990,163 +907,6 @@ function renderWsTable(container, wsList) {
   });
 }
 
-// --- Login Overlay ---
-var _loginTrapHandler = null;
-var _loginBusy = false;
-
-function initLogin() {
-  var overlay = document.createElement("div");
-  overlay.id = "login-overlay";
-  overlay.style.display = "none";
-  overlay.setAttribute("role", "dialog");
-  overlay.setAttribute("aria-modal", "true");
-  overlay.setAttribute("aria-labelledby", "login-title");
-  overlay.innerHTML =
-    '<div id="login-box">' +
-    '<h2 id="login-title">turnstone console</h2>' +
-    '<div id="login-error" role="alert" aria-live="assertive"></div>' +
-    '<label for="login-token" class="sr-only">Auth token</label>' +
-    '<input id="login-token" type="password" placeholder="Enter auth token" autocomplete="off">' +
-    '<button id="login-submit">Sign in</button>' +
-    "</div>";
-  document.body.appendChild(overlay);
-  document.getElementById("login-submit").onclick = submitLogin;
-  document
-    .getElementById("login-token")
-    .addEventListener("keydown", function (e) {
-      if (e.key === "Enter") submitLogin();
-      if (e.key === "Escape") {
-        var errEl = document.getElementById("login-error");
-        if (errEl && errEl.style.display !== "none") {
-          errEl.style.display = "none";
-          errEl.textContent = "";
-        }
-      }
-    });
-}
-
-function showLogin() {
-  var overlay = document.getElementById("login-overlay");
-  if (!overlay) return;
-  overlay.style.display = "flex";
-  document.body.style.overflow = "hidden";
-  var logoutBtn = document.getElementById("logout-btn");
-  if (logoutBtn) logoutBtn.style.display = "none";
-  var errEl = document.getElementById("login-error");
-  if (errEl) {
-    errEl.style.display = "none";
-    errEl.textContent = "";
-  }
-  setTimeout(function () {
-    var inp = document.getElementById("login-token");
-    if (inp) {
-      inp.value = "";
-      inp.focus();
-    }
-  }, 50);
-  // Focus trap
-  if (_loginTrapHandler)
-    document.removeEventListener("keydown", _loginTrapHandler);
-  _loginTrapHandler = function (e) {
-    if (e.key === "Tab") {
-      var box = document.getElementById("login-box");
-      var focusable = box.querySelectorAll("input, button");
-      var first = focusable[0];
-      var last = focusable[focusable.length - 1];
-      if (e.shiftKey) {
-        if (document.activeElement === first) {
-          e.preventDefault();
-          last.focus();
-        }
-      } else {
-        if (document.activeElement === last) {
-          e.preventDefault();
-          first.focus();
-        }
-      }
-    }
-  };
-  document.addEventListener("keydown", _loginTrapHandler);
-}
-
-function hideLogin() {
-  var overlay = document.getElementById("login-overlay");
-  if (overlay) overlay.style.display = "none";
-  document.body.style.overflow = "";
-  if (_loginTrapHandler) {
-    document.removeEventListener("keydown", _loginTrapHandler);
-    _loginTrapHandler = null;
-  }
-}
-
-function submitLogin() {
-  if (_loginBusy) return;
-  var token = (document.getElementById("login-token").value || "").trim();
-  if (!token) {
-    var errEl = document.getElementById("login-error");
-    if (errEl) {
-      errEl.textContent = "Token is required";
-      errEl.style.display = "block";
-    }
-    document.getElementById("login-token").focus();
-    return;
-  }
-
-  _loginBusy = true;
-  var btn = document.getElementById("login-submit");
-  var inp = document.getElementById("login-token");
-  btn.disabled = true;
-  btn.textContent = "Signing in\u2026";
-  inp.disabled = true;
-
-  fetch("/api/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token: token }),
-  })
-    .then(function (r) {
-      if (r.status === 401 || r.status === 403) throw new Error("invalid");
-      if (!r.ok) throw new Error("server");
-      return r.json();
-    })
-    .then(function () {
-      _loginBusy = false;
-      btn.disabled = false;
-      btn.textContent = "Sign in";
-      inp.disabled = false;
-      hideLogin();
-      document.getElementById("logout-btn").style.display = "";
-      connectSSE();
-      if (currentView === "overview") loadOverview();
-      else if (currentView === "node") drillDownToNode(currentNodeId);
-      else if (currentView === "filtered") loadFilteredWorkstreams();
-    })
-    .catch(function (err) {
-      _loginBusy = false;
-      btn.disabled = false;
-      btn.textContent = "Sign in";
-      inp.disabled = false;
-      var errEl = document.getElementById("login-error");
-      if (errEl) {
-        errEl.textContent =
-          err.message === "invalid"
-            ? "Invalid token"
-            : "Connection failed \u2014 try again";
-        errEl.style.display = "block";
-      }
-    });
-}
-
-function logout() {
-  fetch("/api/auth/logout", { method: "POST" }).then(function () {
-    if (evtSource) {
-      evtSource.close();
-      evtSource = null;
-    }
-    showLogin();
-  });
-}
-
 // --- Navigation ---
 window.addEventListener("popstate", function (e) {
   var overlay = document.getElementById("login-overlay");
@@ -1162,54 +922,6 @@ window.addEventListener("popstate", function (e) {
     currentFilter = e.state.filter;
     if (currentFilter.state) drillDownByState(currentFilter.state);
     else if (currentFilter.node) drillDownByNode(currentFilter.node);
-  }
-});
-
-// --- Keyboard shortcuts help ---
-function showKbHelp() {
-  var existing = document.getElementById("kb-overlay");
-  if (existing) {
-    existing.remove();
-  }
-  var overlay = document.createElement("div");
-  overlay.id = "kb-overlay";
-  overlay.innerHTML =
-    '<div id="kb-box" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">' +
-    "<h2>Keyboard shortcuts</h2>" +
-    '<div class="kb-section">Navigation</div>' +
-    '<div class="kb-row"><span class="kb-desc">Activate card / row</span><span class="kb-key">Enter</span></div>' +
-    '<div class="kb-row"><span class="kb-desc">Activate card / row</span><span class="kb-key">Space</span></div>' +
-    '<div class="kb-row"><span class="kb-desc">Navigate rows</span><span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span></div>' +
-    '<div class="kb-section">General</div>' +
-    '<div class="kb-row"><span class="kb-desc">Show this help</span><span class="kb-key">?</span></div>' +
-    '<div class="kb-row"><span class="kb-desc">Close overlay</span><span class="kb-key">Esc</span></div>' +
-    '<div class="kb-hint">Press <span class="kb-key">Esc</span> to close</div>' +
-    "</div>";
-  overlay.onclick = function (e) {
-    if (e.target === overlay) hideKbHelp();
-  };
-  document.body.appendChild(overlay);
-  document.getElementById("kb-box").focus();
-}
-function hideKbHelp() {
-  var el = document.getElementById("kb-overlay");
-  if (el) el.remove();
-}
-document.addEventListener("keydown", function (e) {
-  // Don't trigger when typing in inputs or when login overlay is open
-  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-  var login = document.getElementById("login-overlay");
-  if (login && login.style.display !== "none") return;
-  if (e.key === "?" && !e.ctrlKey && !e.metaKey) {
-    e.preventDefault();
-    showKbHelp();
-  }
-  if (e.key === "Escape") {
-    var kb = document.getElementById("kb-overlay");
-    if (kb) {
-      e.preventDefault();
-      hideKbHelp();
-    }
   }
 });
 
