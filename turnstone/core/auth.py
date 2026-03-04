@@ -448,9 +448,14 @@ def _authenticate_token(
     storage: Any = None,
 ) -> AuthResult | None:
     """Identify token type and authenticate it."""
-    # 1. JWT (contains dots)
+    # 1. JWT (contains dots) — attempt validation, fall through on failure
     if "." in token and jwt_secret:
-        return validate_jwt(token, jwt_secret)
+        try:
+            jwt_result = validate_jwt(token, jwt_secret)
+        except Exception:
+            jwt_result = None
+        if jwt_result is not None:
+            return jwt_result
 
     # 2. API token (starts with ts_) — look up in storage
     if token.startswith(TOKEN_PREFIX) and storage is not None:

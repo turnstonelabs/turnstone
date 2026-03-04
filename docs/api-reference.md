@@ -98,10 +98,10 @@ Authenticate with credentials and receive a JWT. Accepts two credential formats:
 ```json
 {
   "status": "ok",
-  "token": "eyJhbGciOiJIUzI1NiIs...",
-  "user_id": "u_abc123",
-  "display_name": "Alice",
-  "scopes": ["approve", "read", "write"]
+  "role": "full",
+  "scopes": "approve,read,write",
+  "jwt": "eyJhbGciOiJIUzI1NiIs...",
+  "user_id": "u_abc123"
 }
 ```
 

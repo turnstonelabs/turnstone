@@ -49,6 +49,7 @@ class AuthLoginResponse(BaseModel):
     """POST /v1/api/auth/login success response."""
 
     status: str = Field(default="ok")
+    user_id: str = Field(default="", description="Authenticated user ID")
     role: str = Field(description="Legacy role", examples=["full", "read"])
     scopes: str = Field(
         default="", description="Comma-separated scopes", examples=["read,write,approve"]

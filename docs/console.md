@@ -264,14 +264,14 @@ Revoke a specific API token.
 
 #### `GET /v1/api/auth/status`
 
-Returns the current user's identity and scopes. Does not require admin scope.
+Public endpoint for login UI state detection. Returns auth configuration, not
+current-user identity.
 
 ```json
 {
-  "authenticated": true,
-  "user_id": "u_abc123",
-  "username": "alice",
-  "scopes": ["read", "write"]
+  "auth_enabled": true,
+  "has_users": true,
+  "setup_required": false
 }
 ```
 

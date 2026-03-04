@@ -17,7 +17,7 @@ from turnstone.sdk import TurnstoneServer
 
 # Synchronous client — login with username/password
 with TurnstoneServer("http://localhost:8080") as client:
-    client.login("alice", "s3cret")
+    client.login(username="alice", password="s3cret")
 
     # Create a workstream
     ws = client.create_workstream(name="Analysis")
@@ -52,7 +52,7 @@ from turnstone.sdk import AsyncTurnstoneServer
 
 async def main():
     async with AsyncTurnstoneServer("http://localhost:8080") as client:
-        await client.login("alice", "s3cret")
+        await client.login(username="alice", password="s3cret")
         ws = await client.create_workstream(name="demo")
         async for event in client.stream_events(ws.ws_id):
             if event.type == "content":
@@ -79,7 +79,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
 | **Sessions** | `list_sessions()` | `ListSessionsResponse` |
-| **Auth** | `login(username, password)` | `AuthLoginResponse` |
+| **Auth** | `login(username=..., password=...)` | `AuthLoginResponse` |
 | | `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
 | | `auth_status()` | `AuthStatusResponse` |
@@ -97,7 +97,7 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `node_detail(node_id)` | `NodeDetailResponse` |
 | | `create_workstream(*, node_id, name, model, initial_message)` | `ConsoleCreateWsResponse` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |
-| **Auth** | `login(username, password)` / `login(token="ts_xxx")` | `AuthLoginResponse` |
+| **Auth** | `login(username=..., password=...)` / `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
 | **Health** | `health()` | `ConsoleHealthResponse` |
 
@@ -183,7 +183,7 @@ import { TurnstoneServer } from "@turnstone/sdk";
 const client = new TurnstoneServer({ baseUrl: "http://localhost:8080" });
 
 // Login with username/password or API token
-await client.login("alice", "s3cret");
+await client.login({ username: "alice", password: "s3cret" });
 // or: await client.login({ token: "ts_abc123..." });
 
 // Create workstream and send message
@@ -205,7 +205,7 @@ for await (const event of client.streamEvents(ws.ws_id)) {
 import { TurnstoneConsole } from "@turnstone/sdk";
 
 const client = new TurnstoneConsole({ baseUrl: "http://localhost:8090" });
-await client.login("alice", "s3cret");
+await client.login({ username: "alice", password: "s3cret" });
 
 const overview = await client.overview();
 console.log(`Nodes: ${overview.nodes}, Workstreams: ${overview.workstreams}`);
@@ -289,7 +289,7 @@ In both cases the server returns the JWT in the response body and as a `Set-Cook
 
 ```python
 # Username + password
-client.login("alice", "s3cret")
+client.login(username="alice", password="s3cret")
 
 # API token (created via admin API or turnstone-admin CLI)
 client.login(token="ts_abc123...")

@@ -100,10 +100,10 @@ The database stores workstream history, user accounts, and API tokens. When usin
 > **First-time setup:** After deploying with auth enabled, create an initial admin user by running `turnstone-admin create-user` inside the container:
 >
 > ```bash
-> docker compose exec server turnstone-admin create-user --username admin --scopes read,write,approve
+> docker compose exec server turnstone-admin create-user --username admin --name "Admin"
 > ```
 >
-> This prints a one-time password. Use it to log in via the UI or SDK, then create additional users through the admin API.
+> You will be prompted to set a password. Use it to log in via the UI or SDK, then create additional users through the admin API. Pass `--token --scopes read,write,approve` to also generate an initial API token.
 
 ### Simulator
 

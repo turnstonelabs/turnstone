@@ -20,8 +20,7 @@ value = "tok_legacy"
 role = "full"     # full → {read, write, approve}
 ```
 
-Role mappings: `"read"` → `{read}`, `"write"` → `{read, write}`,
-`"full"` → `{read, write, approve}`.
+Role mappings: `"read"` → `{read}`, `"full"` → `{read, write, approve}`.
 
 Config tokens are sent directly as `Authorization: Bearer tok_legacy`
 on every request. No JWT exchange is needed.

@@ -880,12 +880,14 @@ async def admin_create_user(request: Request) -> JSONResponse:
     user_id = uuid.uuid4().hex
     pw_hash = hash_password(password)
     storage.create_user(user_id, username, display_name, pw_hash)
-    # Return user info (no password_hash)
+    # Read back to get the storage-canonical created timestamp
+    user = storage.get_user(user_id)
     return JSONResponse(
         {
-            "user_id": user_id,
-            "username": username,
-            "display_name": display_name,
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "created": user["created"],
         }
     )
 
