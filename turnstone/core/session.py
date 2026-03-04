@@ -408,6 +408,8 @@ class ChatSession:
         except BaseException as primary_err:
             if self._health_monitor:
                 self._health_monitor.record_failure()
+            if isinstance(primary_err, (KeyboardInterrupt, SystemExit)):
+                raise
             if not self._registry or not self._registry.fallback:
                 raise
             # Try each fallback model.  Fallbacks may use different backends;
@@ -498,7 +500,7 @@ class ChatSession:
                     import json as _json
 
                     provider_data = _json.dumps(assistant_msg["_provider_content"])
-                if content:
+                if content or provider_data is not None:
                     save_message(
                         self._session_id, "assistant", content, provider_data=provider_data
                     )

@@ -84,13 +84,16 @@ def resolve_client_ip(
     before checking against trusted proxies for dual-stack compatibility.
     """
     if not trusted_proxies or not forwarded_for:
-        return direct_ip
+        try:
+            return str(_normalize_ip(ipaddress.ip_address(direct_ip)))
+        except ValueError:
+            return direct_ip
     try:
         addr = _normalize_ip(ipaddress.ip_address(direct_ip))
     except ValueError:
         return direct_ip
     if not any(addr in net for net in trusted_proxies):
-        return direct_ip
+        return str(addr)
     parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
     for ip_str in reversed(parts):
         try:
@@ -98,8 +101,8 @@ def resolve_client_ip(
         except ValueError:
             continue
         if not any(ip in net for net in trusted_proxies):
-            return ip_str
-    return direct_ip
+            return str(ip)
+    return str(addr)
 
 
 class RateLimiter:

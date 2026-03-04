@@ -130,7 +130,7 @@ class BackendHealthMonitor:
             if self._state == CircuitState.OPEN:
                 if (time.monotonic() - self._last_state_change) >= self._cooldown:
                     self._state = CircuitState.HALF_OPEN
-                    self._half_open_permit = True
+                    self._half_open_permit = False  # consumed by this caller
                     self._last_state_change = time.monotonic()
                     log.info("Circuit breaker HALF_OPEN: cooldown elapsed, one probe permitted")
                     self._update_metrics()
