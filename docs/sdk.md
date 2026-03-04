@@ -81,7 +81,7 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `nodes(*, sort, limit, offset)` | `ClusterNodesResponse` |
 | | `workstreams(*, state, node, search, sort, page, per_page)` | `ClusterWorkstreamsResponse` |
 | | `node_detail(node_id)` | `NodeDetailResponse` |
-| | `create_workstream(*, node_id, name, model)` | `ConsoleCreateWsResponse` |
+| | `create_workstream(*, node_id, name, model, initial_message)` | `ConsoleCreateWsResponse` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |
 | **Auth** | `login(token)` / `logout()` | `AuthLoginResponse` / `StatusResponse` |
 | **Health** | `health()` | `ConsoleHealthResponse` |

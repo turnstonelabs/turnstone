@@ -150,14 +150,22 @@ _CONSOLE_BANNER_TEMPLATE = (
     '<div style="background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);'
     "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
     'display:flex;align-items:center;gap:12px;position:relative;z-index:9999">'
-    '<a href="/" style="color:#e5a042;text-decoration:none;font-weight:600;'
+    '<span style="color:#e5a042;font-weight:700;font-size:13px;'
+    "font-family:'Outfit',sans-serif;letter-spacing:0.02em\">"
+    "turnstone</span>"
+    '<span style="color:#3b4463">\u2502</span>'
+    '<a href="/" style="color:#8a93ad;text-decoration:none;font-weight:500;'
     'padding:2px 0" '
-    "onmouseover=\"this.style.textDecoration='underline'\" "
-    "onmouseout=\"this.style.textDecoration='none'\">"
+    "onmouseover=\"this.style.color='#e5a042'\" "
+    "onmouseout=\"this.style.color='#8a93ad'\">"
     "&larr; Console</a>"
+    '<span style="color:#3b4463">\u2502</span>'
     '<span style="color:#8a93ad;font-size:11px">NODE_ID_PLACEHOLDER</span>'
     "</div>"
 )
+
+# Injected <style> offsets fixed-position overlays below the console banner.
+_CONSOLE_PROXY_STYLE = "<style>.dashboard-overlay{top:32px!important}</style>"
 
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -342,23 +350,29 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_node_id = body.get("node_id", "")
     raw_name = body.get("name", "")
     raw_model = body.get("model", "")
+    raw_initial_message = body.get("initial_message", "")
     if not isinstance(raw_node_id, str):
         raw_node_id = "" if raw_node_id is None else None
     if not isinstance(raw_name, str):
         raw_name = "" if raw_name is None else None
     if not isinstance(raw_model, str):
         raw_model = "" if raw_model is None else None
-    if raw_node_id is None or raw_name is None or raw_model is None:
-        return JSONResponse({"error": "node_id, name, and model must be strings"}, status_code=400)
+    if not isinstance(raw_initial_message, str):
+        raw_initial_message = "" if raw_initial_message is None else None
+    if raw_node_id is None or raw_name is None or raw_model is None or raw_initial_message is None:
+        return JSONResponse(
+            {"error": "node_id, name, model, and initial_message must be strings"}, status_code=400
+        )
     node_id = raw_node_id
     name = raw_name[:256]
     model = raw_model[:128]
+    initial_message = raw_initial_message[:4096]
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
     # General pool — push to shared queue, any bridge picks it up
     if node_id == "pool":
-        msg = CreateWorkstreamMessage(name=name, model=model)
+        msg = CreateWorkstreamMessage(name=name, model=model, initial_message=initial_message)
         broker.push_inbound(msg.to_json())
         log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
         return JSONResponse(
@@ -384,6 +398,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         name=name,
         model=model,
         target_node=node_id,
+        initial_message=initial_message,
     )
     broker.push_inbound(msg.to_json(), node_id=node_id)
 
@@ -432,7 +447,7 @@ async def proxy_index(request: Request) -> Response:
             + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
             + "</script>"
         )
-        page = page.replace("<body>", "<body>" + banner + shim, 1)
+        page = page.replace("<body>", "<body>" + banner + _CONSOLE_PROXY_STYLE + shim, 1)
         return HTMLResponse(page)
     except httpx.HTTPError as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
@@ -567,45 +582,30 @@ async def _proxy_sse(
     if request.url.query:
         target += f"?{request.url.query}"
 
-    proxy_token: str = request.app.state.proxy_auth_token
+    sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
 
     async def sse_generator() -> AsyncGenerator[dict[str, str], None]:
-        headers: dict[str, str] = {}
-        if proxy_token:
-            headers["Authorization"] = f"Bearer {proxy_token}"
-        async with httpx.AsyncClient(timeout=None, headers=headers) as sse_client:
-            try:
-                async with sse_client.stream("GET", target) as resp:
-                    if resp.status_code != 200:
-                        log.debug(
-                            "SSE proxy received status %s from %s",
-                            resp.status_code,
-                            target,
-                        )
-                        yield {
-                            "event": "error",
-                            "data": f"Upstream returned status {resp.status_code}",
-                        }
+        from httpx_sse import aconnect_sse
+
+        try:
+            async with aconnect_sse(sse_client, "GET", target) as source:
+                if source.response.status_code != 200:
+                    log.debug(
+                        "SSE proxy received status %s from %s",
+                        source.response.status_code,
+                        target,
+                    )
+                    yield {
+                        "event": "error",
+                        "data": f"Upstream returned status {source.response.status_code}",
+                    }
+                    return
+                async for sse in source.aiter_sse():
+                    if await request.is_disconnected():
                         return
-                    buf = ""
-                    async for chunk in resp.aiter_text():
-                        if await request.is_disconnected():
-                            return
-                        buf += chunk
-                        while "\n\n" in buf:
-                            event_text, buf = buf.split("\n\n", 1)
-                            data_lines = []
-                            for line in event_text.split("\n"):
-                                if line.startswith("data:"):
-                                    # SSE spec: strip exactly one leading space
-                                    value = line[5:]
-                                    if value.startswith(" "):
-                                        value = value[1:]
-                                    data_lines.append(value)
-                            if data_lines:
-                                yield {"data": "\n".join(data_lines)}
-            except httpx.HTTPError:
-                log.debug("SSE proxy stream ended for %s", target)
+                    yield {"event": sse.event, "data": sse.data}
+        except httpx.HTTPError:
+            log.debug("SSE proxy stream ended for %s", target)
 
     return EventSourceResponse(sse_generator(), ping=5)
 
@@ -623,8 +623,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     app.state.proxy_client = httpx.AsyncClient(timeout=30, headers=headers)
+    # Separate client for SSE streams — longer read timeout, shared connection pool
+    app.state.proxy_sse_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
+        headers=headers,
+    )
     yield
     # Shutdown
+    await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
     app.state.broker.close()

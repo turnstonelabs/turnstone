@@ -1760,12 +1760,13 @@ authFetch("/v1/api/workstreams")
         "",
         location.pathname,
       );
-      _historyNavigation = true;
-      try {
-        switchTab(targetWs);
-      } finally {
-        _historyNavigation = false;
-      }
+      // Force switch even if targetWs is already currentWsId — on init
+      // the SSE connection hasn't been established yet.
+      currentWsId = targetWs;
+      messagesEl.innerHTML = "";
+      showEmptyState();
+      renderTabBar();
+      connectContentSSE(targetWs);
     } else {
       if (currentWsId) connectContentSSE(currentWsId);
       history.replaceState({ turnstone: "dashboard" }, "", location.pathname);

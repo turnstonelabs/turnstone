@@ -109,6 +109,9 @@ class ConsoleCreateWsRequest(BaseModel):
     )
     name: str = Field(default="", description="Workstream name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from node registry")
+    initial_message: str = Field(
+        default="", description="Optional first message sent after creation"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):

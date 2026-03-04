@@ -83,7 +83,7 @@ class Bridge:
         self,
         server_url: str = "http://localhost:8080",
         broker: RedisBroker | None = None,
-        approval_timeout: float = 300,
+        approval_timeout: float = 3600,
         prefix: str = "turnstone",
         node_id: str = "",
         heartbeat_ttl: int = 60,
@@ -288,13 +288,24 @@ class Bridge:
         auto_approve = getattr(msg, "auto_approve", False)
         auto_approve_tools = getattr(msg, "auto_approve_tools", [])
         model = getattr(msg, "model", "")
-        self._create_ws_on_server(
+        initial_message = getattr(msg, "initial_message", "")
+        ws_id = self._create_ws_on_server(
             name=name,
             auto_approve=auto_approve,
             auto_approve_tools=auto_approve_tools,
             correlation_id=msg.correlation_id,
             model=model,
         )
+        if ws_id and initial_message:
+            try:
+                resp = self._http.post(
+                    "/v1/api/send", json={"message": initial_message, "ws_id": ws_id}
+                )
+                data = resp.json()
+                if data.get("error"):
+                    log.warning("Initial message failed for ws %s: %s", ws_id, data["error"])
+            except Exception as exc:
+                log.warning("Initial message send failed for ws %s: %s", ws_id, exc)
 
     def _handle_close_ws(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
@@ -709,7 +720,7 @@ def main() -> None:
     parser.add_argument(
         "--approval-timeout",
         type=float,
-        default=300,
+        default=3600,
         help="Seconds to wait for approval responses (default: %(default)s)",
     )
     parser.add_argument(
