@@ -819,7 +819,8 @@ HALF_OPEN ──(probe fails)──────────>  OPEN
 
 - `record_success()` / `record_failure()` update `_consecutive_failures` and
   transition the `_state` (`CircuitState` enum: `CLOSED`, `OPEN`, `HALF_OPEN`).
-- `should_allow_request()` returns `False` when the circuit is `OPEN`, causing
+- `acquire_request_permit()` returns `False` when the circuit is `OPEN` or when
+  in `HALF_OPEN` and the single probe permit has already been consumed. Causes
   `ChatSession._create_stream_with_retry` to skip the backend and surface an
   error immediately.
 - The `/health` endpoint reads the monitor's state: `"status": "ok"` when the
@@ -832,8 +833,12 @@ limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
 `requests_per_second` (refill rate) and `burst` (bucket capacity) from
 `[ratelimit]` config.
 
-- Applied in `do_GET` / `do_POST` after authentication but before route dispatch.
+- Applied via `RateLimitMiddleware` after authentication but before route dispatch.
 - `/health` and `/metrics` are exempt (monitoring must always be reachable).
+- **X-Forwarded-For support**: when `trusted_proxies` is configured (comma-separated
+  CIDRs), the middleware parses the `X-Forwarded-For` header using the
+  rightmost-untrusted approach. IPv4-mapped IPv6 addresses are normalized.
+  The direct client IP must be in the trusted set before XFF is considered.
 - On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
   `{"error": "Rate limit exceeded", "retry_after": N}`.
 - The `turnstone_ratelimit_rejected_total` counter is incremented on each

@@ -397,7 +397,7 @@ class ChatSession:
         before attempting a call — fast-fails when the backend is unreachable.
         """
         # Circuit breaker check — fast-fail if backend is known to be down
-        if self._health_monitor and not self._health_monitor.should_allow_request:
+        if self._health_monitor and not self._health_monitor.acquire_request_permit():
             raise ConnectionError("Backend unreachable (circuit breaker open)")
 
         try:
@@ -405,7 +405,7 @@ class ChatSession:
             if self._health_monitor:
                 self._health_monitor.record_success()
             return result
-        except Exception as primary_err:
+        except BaseException as primary_err:
             if self._health_monitor:
                 self._health_monitor.record_failure()
             if not self._registry or not self._registry.fallback:
@@ -493,8 +493,15 @@ class ChatSession:
                 # Log assistant message to conversation history
                 content = assistant_msg.get("content", "")
                 tc = assistant_msg.get("tool_calls")
+                provider_data = None
+                if assistant_msg.get("_provider_content"):
+                    import json as _json
+
+                    provider_data = _json.dumps(assistant_msg["_provider_content"])
                 if content:
-                    save_message(self._session_id, "assistant", content)
+                    save_message(
+                        self._session_id, "assistant", content, provider_data=provider_data
+                    )
                 if tc:
                     for call in tc:
                         fn = call.get("function", {})
@@ -620,6 +627,7 @@ class ChatSession:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_calls_acc: dict[int, dict[str, Any]] = {}
+        provider_blocks: list[dict[str, Any]] = []
         first_token = True
         in_think = False  # inside a <think>...</think> block
         path1_reasoning = False  # last reasoning came via reasoning_delta field
@@ -775,6 +783,10 @@ class ChatSession:
                 _stop_spinner_once()
                 self.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
 
+            # Raw provider content blocks (for multi-turn preservation)
+            if chunk.provider_blocks:
+                provider_blocks = chunk.provider_blocks
+
         # Flush any remaining buffered text
         if pending:
             _flush_text(pending, in_think)
@@ -806,6 +818,11 @@ class ChatSession:
 
         if tool_calls_acc:
             msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+
+        # Store raw provider content blocks for multi-turn preservation
+        # (e.g. Anthropic web_search_tool_result with encrypted_content)
+        if provider_blocks:
+            msg["_provider_content"] = provider_blocks
 
         return msg
 
