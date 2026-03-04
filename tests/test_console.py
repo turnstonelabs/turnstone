@@ -654,6 +654,87 @@ class TestConsoleHTTPEndpoints:
 
 
 # ---------------------------------------------------------------------------
+# Version tracking / drift detection
+# ---------------------------------------------------------------------------
+
+
+class TestCollectorVersionInfo:
+    """Version extraction and drift detection."""
+
+    def test_get_overview_no_drift(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a", health={"status": "ok", "version": "0.3.0"}
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b", health={"status": "ok", "version": "0.3.0"}
+        )
+        overview = c.get_overview()
+        assert overview["version_drift"] is False
+        assert overview["versions"] == ["0.3.0"]
+
+    def test_get_overview_drift_detected(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a", health={"status": "ok", "version": "0.3.0"}
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b", health={"status": "ok", "version": "0.3.1"}
+        )
+        overview = c.get_overview()
+        assert overview["version_drift"] is True
+        assert sorted(overview["versions"]) == ["0.3.0", "0.3.1"]
+
+    def test_get_overview_no_version_in_health(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", health={"status": "ok"})
+        overview = c.get_overview()
+        assert overview["version_drift"] is False
+        assert overview["versions"] == []
+
+    def test_get_overview_single_node_no_drift(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", health={"version": "0.3.0"})
+        overview = c.get_overview()
+        assert overview["version_drift"] is False
+        assert overview["versions"] == ["0.3.0"]
+
+    def test_get_nodes_includes_version(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            health={"status": "ok", "version": "0.3.0"},
+        )
+        nodes, _ = c.get_nodes()
+        assert nodes[0]["version"] == "0.3.0"
+
+    def test_get_nodes_version_empty_when_missing(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080", health={})
+        nodes, _ = c.get_nodes()
+        assert nodes[0]["version"] == ""
+
+    def test_get_version_info(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", health={"version": "0.3.0"})
+        c._nodes["node-b"] = NodeSnapshot(node_id="node-b", health={"version": "0.3.1"})
+        info = c.get_version_info()
+        assert info["drift"] is True
+        assert info["versions"]["node-a"] == "0.3.0"
+        assert info["versions"]["node-b"] == "0.3.1"
+        assert sorted(info["unique_versions"]) == ["0.3.0", "0.3.1"]
+
+    def test_get_version_info_no_drift(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", health={"version": "0.3.0"})
+        c._nodes["node-b"] = NodeSnapshot(node_id="node-b", health={"version": "0.3.0"})
+        info = c.get_version_info()
+        assert info["drift"] is False
+        assert info["unique_versions"] == ["0.3.0"]
+
+
+# ---------------------------------------------------------------------------
 # Workstream creation tests
 # ---------------------------------------------------------------------------
 
@@ -988,3 +1069,59 @@ class TestPickBestNode:
             1,
         )
         assert _pick_best_node(collector) == ""
+
+
+# ---------------------------------------------------------------------------
+# Version tracking endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class TestConsoleVersionEndpoints:
+    """HTTP endpoint tests for version drift fields."""
+
+    @pytest.fixture()
+    def mock_collector(self):
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_overview.return_value = {
+            "nodes": 2,
+            "workstreams": 5,
+            "states": {"running": 1, "thinking": 0, "attention": 0, "idle": 4, "error": 0},
+            "aggregate": {"total_tokens": 10000, "total_tool_calls": 50},
+            "version_drift": True,
+            "versions": ["0.3.0", "0.3.1"],
+        }
+        return collector
+
+    @pytest.fixture()
+    def client(self, mock_collector):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import AuthConfig
+
+        _load_static()
+        app = create_app(
+            collector=mock_collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
+
+    def _get(self, client, path):
+        resp = client.get(path)
+        return resp.status_code, resp.json()
+
+    def test_overview_includes_version_drift(self, client, mock_collector):
+        status, data = self._get(client, "/api/cluster/overview")
+        assert status == 200
+        assert data["version_drift"] is True
+        assert "0.3.0" in data["versions"]
+        assert "0.3.1" in data["versions"]
+
+    def test_health_includes_version_drift(self, client, mock_collector):
+        status, data = self._get(client, "/health")
+        assert status == 200
+        assert data["version_drift"] is True
+        assert "0.3.0" in data["versions"]
