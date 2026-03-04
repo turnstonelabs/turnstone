@@ -819,7 +819,8 @@ HALF_OPEN ──(probe fails)──────────>  OPEN
 
 - `record_success()` / `record_failure()` update `_consecutive_failures` and
   transition the `_state` (`CircuitState` enum: `CLOSED`, `OPEN`, `HALF_OPEN`).
-- `should_allow_request()` returns `False` when the circuit is `OPEN`, causing
+- `acquire_request_permit()` returns `False` when the circuit is `OPEN` or when
+  in `HALF_OPEN` and the single probe permit has already been consumed. Causes
   `ChatSession._create_stream_with_retry` to skip the backend and surface an
   error immediately.
 - The `/health` endpoint reads the monitor's state: `"status": "ok"` when the
@@ -832,8 +833,12 @@ limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
 `requests_per_second` (refill rate) and `burst` (bucket capacity) from
 `[ratelimit]` config.
 
-- Applied in `do_GET` / `do_POST` after authentication but before route dispatch.
+- Applied via `RateLimitMiddleware` after authentication but before route dispatch.
 - `/health` and `/metrics` are exempt (monitoring must always be reachable).
+- **X-Forwarded-For support**: when `trusted_proxies` is configured (comma-separated
+  CIDRs), the middleware parses the `X-Forwarded-For` header using the
+  rightmost-untrusted approach. IPv4-mapped IPv6 addresses are normalized.
+  The direct client IP must be in the trusted set before XFF is considered.
 - On limit exceeded: HTTP 429 with `Retry-After` header and JSON body
   `{"error": "Rate limit exceeded", "retry_after": N}`.
 - The `turnstone_ratelimit_rejected_total` counter is incremented on each
@@ -976,33 +981,51 @@ re-routes to that node's queue (1 extra hop). Bridges publish heartbeats to
 ### Cluster Console
 
 ```
-Event subscriber          Node discovery          Poll loop
-+------------------+     +------------------+    +-------------------+
-| SUBSCRIBE on     |     | SCAN node:* keys |    | For each node:    |
-| events:cluster   |     | every 15 seconds |    |   GET /api/dash   |
-| Apply state      |     | Add/remove nodes |    |   GET /health     |
-| changes to       |     | Emit join/lost   |    | ThreadPoolExecutor|
-| in-memory model  |     | events           |    | (50 workers)      |
-+------------------+     +------------------+    +-------------------+
-       |                         |                         |
-       +-- Redis pub/sub         +-- Redis SCAN            +-- HTTP to each
-           (SUBSCRIBE)               (every 15s)               server (every 10s)
+Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
++------------------+                 +----------------------------+
+| Event subscriber |                 | POST /api/cluster/         |
+| SUBSCRIBE on     |                 |   workstreams/new          |
+| events:cluster   |                 |   → LPUSH to Redis         |
++------------------+                 |     inbound:{node_id}      |
+| Node discovery   |                 +----------------------------+
+| SCAN node:* keys |                 | GET /node/{node_id}/       |
+| every 15 seconds |                 |   → httpx.AsyncClient      |
++------------------+                 |     proxy to server_url    |
+| Poll loop        |                 | GET /node/{id}/api/events  |
+| GET /api/dash    |                 |   → SSE stream proxy       |
+| GET /health      |                 | POST /node/{id}/api/send   |
+| ThreadPoolExec   |                 |   → forwarded to server    |
++------------------+                 +----------------------------+
 ```
 
 The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
 endpoint uses `EventSourceResponse` with the same listener queue pattern as
 the main server. `ClusterCollector`'s background threads (event subscriber,
-node discovery, poll loop) remain unchanged — they use sync Redis clients
-and `ThreadPoolExecutor` for parallel HTTP polling.
+node discovery, poll loop) use sync Redis clients and `ThreadPoolExecutor`
+for parallel HTTP polling.
 
-The console supports workstream creation (dispatched via MQ), a reverse proxy
-for serving node UIs through the console port, and version drift detection
-(flagging when nodes report different versions). Real-time events provide instant
-state transitions; periodic polling provides full data consistency (tokens,
-context ratios, activity strings, version). Clicking a workstream row in the
-console opens the node's server UI via the built-in reverse proxy with
-`?ws_id=<id>` for direct deep linking. See [docs/console.md](console.md)
-for the full API reference.
+The console has two write-path capabilities:
+
+1. **Workstream creation** — pushes `CreateWorkstreamMessage` to Redis inbound
+   queues targeting specific nodes. The bridge on each node picks up the message
+   and creates the workstream on the local server. Auto-selects the node with
+   the most available capacity if no target is specified.
+
+2. **Reverse proxy** — serves each node's server UI through the console port at
+   `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
+   A JS shim is injected into the server's `app.js` to override `fetch()` and
+   `EventSource()`, routing root-relative URLs through the proxy prefix. This
+   eliminates the need for direct network access to individual server nodes.
+
+The console also performs **version drift detection** — flagging when nodes
+report different versions via the `/health` endpoint. The overview API includes
+`version_drift` and `versions` fields; the dashboard shows a yellow warning
+indicator when versions diverge.
+
+Clicking a workstream row in the console opens the proxied server UI at
+`/node/{node_id}/?ws_id=<id>` — the server's JS parses this on load and
+auto-selects the workstream. See [docs/console.md](console.md) for the full
+API reference.
 
 ---
 

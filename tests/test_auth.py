@@ -309,6 +309,50 @@ class TestCheckRequest:
         assert allowed is False
         assert status == 403
 
+    def test_proxy_write_read_token_403(self, enabled):
+        """Read tokens cannot escalate to write ops via proxy routes."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/node/node-a/api/send", "Bearer tok_read"
+        )
+        assert allowed is False
+        assert status == 403
+
+    def test_proxy_write_trailing_slash_read_token_403(self, enabled):
+        """Trailing slash must not bypass write-role check on proxy routes."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/node/node-a/api/send/", "Bearer tok_read"
+        )
+        assert allowed is False
+        assert status == 403
+
+    def test_direct_write_trailing_slash_read_token_403(self, enabled):
+        """Trailing slash must not bypass write-role check on direct routes."""
+        allowed, status, msg = check_request(enabled, "POST", "/api/send/", "Bearer tok_read")
+        assert allowed is False
+        assert status == 403
+
+    def test_proxy_write_full_token_ok(self, enabled):
+        """Full tokens pass through proxy write routes."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/node/node-a/api/send", "Bearer tok_full"
+        )
+        assert allowed is True
+
+    def test_proxy_read_endpoint_read_token_ok(self, enabled):
+        """Read tokens can access proxy read endpoints."""
+        allowed, status, msg = check_request(
+            enabled, "GET", "/node/node-a/api/workstreams", "Bearer tok_read"
+        )
+        assert allowed is True
+
+    def test_console_create_ws_read_token_403(self, enabled):
+        """Read tokens cannot create workstreams."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/api/cluster/workstreams/new", "Bearer tok_read"
+        )
+        assert allowed is False
+        assert status == 403
+
     def test_approve_full_token_ok(self, enabled):
         allowed, status, msg = check_request(enabled, "POST", "/api/approve", "Bearer tok_full")
         assert allowed is True

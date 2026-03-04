@@ -44,6 +44,7 @@ class StreamChunk:
     finish_reason: str | None = None
     is_first: bool = False
     info_delta: str = ""
+    provider_blocks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -54,6 +55,7 @@ class CompletionResult:
     tool_calls: list[dict[str, Any]] | None = None
     finish_reason: str = "stop"
     usage: UsageInfo | None = None
+    provider_blocks: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

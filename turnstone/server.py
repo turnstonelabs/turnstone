@@ -37,6 +37,7 @@ from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
 from turnstone.core.metrics import metrics as _metrics
+from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.workstream import Workstream, WorkstreamManager
@@ -367,7 +368,13 @@ class RateLimitMiddleware:
         if limiter is None:
             await self.app(scope, receive, send)
             return
-        client_ip = request.client.host if request.client else "unknown"
+        if not request.client:
+            # No peer address — cannot enforce per-IP limit; pass through
+            await self.app(scope, receive, send)
+            return
+        client_ip = request.client.host
+        xff = request.headers.get("X-Forwarded-For", "")
+        client_ip = resolve_client_ip(client_ip, xff, limiter.trusted_proxies)
         path = request.url.path
         allowed, retry_after = limiter.check(client_ip, path)
         if not allowed:
@@ -1207,6 +1214,11 @@ def main() -> None:
         help="Rate limit: burst size (default: 20)",
     )
     parser.add_argument(
+        "--ratelimit-trusted-proxies",
+        default="",
+        help="Trusted proxy CIDRs for X-Forwarded-For parsing (comma-separated, e.g. '10.0.0.0/8,172.16.0.0/12')",
+    )
+    parser.add_argument(
         "--health-probe-interval",
         type=float,
         default=30.0,
@@ -1303,6 +1315,7 @@ def main() -> None:
         enabled=args.ratelimit_enabled,
         rate=args.ratelimit_rps,
         burst=args.ratelimit_burst,
+        trusted_proxies=args.ratelimit_trusted_proxies,
     )
 
     # Set up global event queue for state-change broadcasts
@@ -1398,7 +1411,12 @@ def main() -> None:
         f"circuit breaker threshold={args.circuit_breaker_threshold}"
     )
     if rate_limiter.enabled:
-        print(f"Rate limiter: {args.ratelimit_rps} req/s, burst={args.ratelimit_burst}")
+        proxy_info = (
+            f", trusted proxies: {args.ratelimit_trusted_proxies}"
+            if args.ratelimit_trusted_proxies
+            else ""
+        )
+        print(f"Rate limiter: {args.ratelimit_rps} req/s, burst={args.ratelimit_burst}{proxy_info}")
     print(f"Max workstreams: {args.max_workstreams}")
     print("Press Ctrl+C to stop.")
 

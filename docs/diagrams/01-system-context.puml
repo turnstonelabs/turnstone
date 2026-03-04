@@ -47,8 +47,8 @@ bridge --> server : HTTP REST\n(POST /api/send, etc.)
 bridge <-- server : SSE\n(GET /api/events)
 bridge --> redis : Redis LIST + PUBSUB\n+ STRING (routing, heartbeats)
 
-console --> redis : Redis PUBSUB + STRING\n(cluster channel, heartbeats)
-console --> server : HTTP polling\n(GET /api/dashboard)
+console --> redis : Redis PUBSUB + STRING + LIST\n(cluster events, heartbeats,\nworkstream creation commands)
+console --> server : HTTP polling + reverse proxy\n(GET /api/dashboard,\nproxy /node/{id}/* traffic)
 
 sim --> redis : Redis LIST + PUBSUB\n+ STRING (heartbeats)
 

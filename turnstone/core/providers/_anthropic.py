@@ -253,6 +253,14 @@ class AnthropicProvider:
                 continue
 
             if role == "assistant":
+                # If raw provider content was preserved, pass it through verbatim
+                # so encrypted_content/encrypted_index from web search are retained
+                provider_content = msg.get("_provider_content")
+                if provider_content:
+                    converted.append({"role": "assistant", "content": provider_content})
+                    i += 1
+                    continue
+
                 content_blocks: list[dict[str, Any]] = []
                 text = msg.get("content")
                 if text:
@@ -390,6 +398,8 @@ class AnthropicProvider:
         next_tool_index = 0
         # Track server-side tool blocks (web search) — accumulate query input
         server_tool_blocks: dict[int, dict[str, str]] = {}
+        # Capture raw content blocks for multi-turn preservation
+        raw_blocks: dict[int, dict[str, Any]] = {}
 
         for event in stream:
             sc = StreamChunk()
@@ -397,6 +407,7 @@ class AnthropicProvider:
 
             if event_type == "content_block_start":
                 block = event.content_block
+                raw_blocks[event.index] = _block_to_dict(block)
                 if block.type == "tool_use":
                     idx = next_tool_index
                     tool_block_to_index[event.index] = idx
@@ -429,8 +440,18 @@ class AnthropicProvider:
                 delta = event.delta
                 if delta.type == "text_delta":
                     sc.content_delta = delta.text
+                    # Accumulate text into raw block for preservation
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["text"] = (
+                            raw_blocks[event.index].get("text", "") + delta.text
+                        )
                 elif delta.type == "thinking_delta":
                     sc.reasoning_delta = delta.thinking
+                    # Accumulate thinking text into raw block for round-trip
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["thinking"] = (
+                            raw_blocks[event.index].get("thinking", "") + delta.thinking
+                        )
                 elif delta.type == "input_json_delta":
                     if event.index in server_tool_blocks:
                         # Accumulate server tool input (search query)
@@ -443,8 +464,21 @@ class AnthropicProvider:
                                 arguments_delta=delta.partial_json,
                             )
                         )
+                    # Accumulate input JSON into raw block for tool_use/server_tool_use
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["_input_json"] = (
+                            raw_blocks[event.index].get("_input_json", "") + delta.partial_json
+                        )
 
             elif event_type == "content_block_stop":
+                # Finalize accumulated input JSON into parsed input
+                if event.index in raw_blocks and "_input_json" in raw_blocks[event.index]:
+                    rb = raw_blocks[event.index]
+                    try:
+                        rb["input"] = json.loads(rb.pop("_input_json"))
+                    except (json.JSONDecodeError, TypeError):
+                        rb.pop("_input_json", None)
+
                 # When a server tool block completes, emit search query info
                 if event.index in server_tool_blocks:
                     info = server_tool_blocks.pop(event.index)
@@ -468,6 +502,9 @@ class AnthropicProvider:
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
+                    # Emit all raw content blocks for multi-turn preservation
+                    if raw_blocks:
+                        sc.provider_blocks = [raw_blocks[i] for i in sorted(raw_blocks)]
 
             elif event_type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
@@ -522,7 +559,9 @@ class AnthropicProvider:
         # which are handled server-side and don't require client execution.
         content_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
+        provider_blocks: list[dict[str, Any]] = []
         for block in response.content:
+            provider_blocks.append(_block_to_dict(block))
             if block.type == "text":
                 content_parts.append(block.text)
             elif block.type == "tool_use":
@@ -536,7 +575,7 @@ class AnthropicProvider:
                         },
                     }
                 )
-            # server_tool_use, web_search_tool_result — skip (server-handled)
+            # server_tool_use, web_search_tool_result — captured in provider_blocks
 
         finish_reason = _normalize_finish_reason(response.stop_reason or "end_turn")
 
@@ -554,6 +593,7 @@ class AnthropicProvider:
             tool_calls=tool_calls if tool_calls else None,
             finish_reason=finish_reason,
             usage=usage,
+            provider_blocks=provider_blocks,
         )
 
     # -- retryable errors ----------------------------------------------------
@@ -584,3 +624,38 @@ def _normalize_finish_reason(reason: str) -> str:
         # Server-side tool (web search) paused a long turn; treat as stop
         return "stop"
     return reason
+
+
+def _block_to_dict(block: Any) -> dict[str, Any]:
+    """Convert an Anthropic SDK content block to a plain dict.
+
+    Preserves all fields including ``encrypted_content`` and ``encrypted_index``
+    on ``web_search_tool_result`` blocks, which must be passed back verbatim
+    on subsequent turns for citation resolution.
+    """
+    if hasattr(block, "model_dump"):
+        return block.model_dump(exclude_none=True)  # type: ignore[no-any-return]
+    # Fallback: extract known attributes
+    d: dict[str, Any] = {"type": getattr(block, "type", "")}
+    for attr in (
+        "id",
+        "name",
+        "input",
+        "text",
+        "thinking",
+        "signature",
+        "content",
+        "encrypted_content",
+        "encrypted_index",
+    ):
+        val = getattr(block, attr, None)
+        if val is not None:
+            if hasattr(val, "model_dump"):
+                d[attr] = val.model_dump()
+            elif isinstance(val, list):
+                d[attr] = [
+                    item.model_dump() if hasattr(item, "model_dump") else item for item in val
+                ]
+            else:
+                d[attr] = val
+    return d
