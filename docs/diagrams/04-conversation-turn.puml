@@ -8,7 +8,7 @@ skinparam sequenceLifeLineBackgroundColor #F5F5F5
 participant "User /\nHTTP Client" as User
 participant "ChatSession" as CS
 participant "SessionUI" as UI
-participant "OpenAI API\n(LLM)" as LLM
+participant "LLMProvider\n(OpenAI / Anthropic)" as LLM
 participant "Tool Executor\n(ThreadPool)" as TP
 database "SQLite" as DB
 
@@ -27,7 +27,7 @@ group loop [while tool_calls present]
     CS -> UI : on_state_change("thinking")
     CS -> UI : on_thinking_start()
 
-    CS -> LLM : client.chat.completions.create(\n  model, messages, tools,\n  stream=True, stream_options={include_usage})
+    CS -> LLM : provider.create_streaming(\n  client, model, messages, tools, ...)\n  (normalized StreamChunk iterator)
     activate LLM
 
     note right of CS

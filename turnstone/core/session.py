@@ -45,6 +45,7 @@ from turnstone.core.memory import (
     set_session_alias,
     update_session_title,
 )
+from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.tools import (
@@ -60,11 +61,12 @@ from turnstone.core.web import check_ssrf, strip_html
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
 if TYPE_CHECKING:
-    from openai import OpenAI
+    from collections.abc import Iterator
 
     from turnstone.core.healthcheck import BackendHealthMonitor
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelRegistry
+    from turnstone.core.providers import CompletionResult, LLMProvider, StreamChunk
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -96,7 +98,7 @@ class SessionUI(Protocol):
 class ChatSession:
     def __init__(
         self,
-        client: OpenAI,
+        client: Any,
         model: str,
         ui: SessionUI,
         instructions: str | None,
@@ -119,6 +121,12 @@ class ChatSession:
         self._registry = registry
         self._model_alias = model_alias
         self._health_monitor = health_monitor
+        # Resolve provider for the current model
+        self._provider: LLMProvider = (
+            registry.get_provider(model_alias)
+            if registry and model_alias
+            else create_provider("openai")
+        )
         self.ui = ui
         self.instructions = instructions
         self.temperature = temperature
@@ -217,7 +225,8 @@ class ChatSession:
             if asst_msg:
                 snippet += f"\nAssistant: {asst_msg}"
             snippet += "\n\nTitle:"
-            response = self.client.chat.completions.create(
+            result = self._provider.create_completion(
+                client=self.client,
                 model=self.model,
                 messages=[
                     {
@@ -233,16 +242,12 @@ class ChatSession:
                     },
                     {"role": "user", "content": snippet},
                 ],
-                max_completion_tokens=200,
+                max_tokens=200,
                 temperature=0.3,
-                extra_body={
-                    "chat_template_kwargs": {
-                        **self._chat_template_kwargs_base,
-                        "reasoning_effort": "low",
-                    }
-                },
+                reasoning_effort="low",
+                extra_params=self._provider_extra_params(reasoning_effort="low"),
             )
-            raw = (response.choices[0].message.content or "").strip()
+            raw = (result.content or "").strip()
             # Take first line, strip quotes
             title = raw.split("\n")[0].strip().strip('"').strip("'")
             if title:
@@ -366,23 +371,26 @@ class ChatSession:
         """Notify UI of a workstream state transition."""
         self.ui.on_state_change(state)
 
-    # Transient error types that warrant automatic retry (checked by class name
-    # so we don't need to import backend-specific exception hierarchies).
-    _RETRYABLE_ERRORS = frozenset(
-        {
-            "RateLimitError",
-            "APITimeoutError",
-            "APIConnectionError",
-            "InternalServerError",
-            "ServiceUnavailableError",
-            "APIError",
-        }
-    )
+    def _provider_extra_params(
+        self,
+        reasoning_effort: str | None = None,
+        provider: LLMProvider | None = None,
+    ) -> dict[str, Any] | None:
+        """Build provider-specific extra parameters."""
+        prov = provider or self._provider
+        if prov.provider_name == "openai":
+            kwargs = dict(self._chat_template_kwargs_base)
+            if reasoning_effort:
+                kwargs["reasoning_effort"] = reasoning_effort
+            return {"chat_template_kwargs": kwargs}
+        return None
+
+    # Retryable error names are now provided by LLMProvider.retryable_error_names.
     _MAX_RETRIES = 3
     _RETRY_BASE_DELAY = 1.0  # seconds
 
-    def _create_stream_with_retry(self, msgs: list[dict[str, Any]]) -> Any:
-        """Call chat.completions.create with retry on transient errors.
+    def _create_stream_with_retry(self, msgs: list[dict[str, Any]]) -> Iterator[StreamChunk]:
+        """Create a streaming request with retry on transient errors.
 
         If all retries fail and a fallback chain is configured, tries each
         fallback model in order before giving up.  Checks the circuit breaker
@@ -410,33 +418,39 @@ class ChatSession:
                     continue
                 try:
                     fb_client, fb_model, _ = self._registry.resolve(alias)
+                    fb_provider = self._registry.get_provider(alias)
                     self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
-                    return self._try_stream(fb_client, fb_model, msgs)
+                    return self._try_stream(fb_client, fb_model, msgs, provider=fb_provider)
                 except Exception as fb_err:
                     self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
                     continue
             raise primary_err
 
-    def _try_stream(self, client: Any, model: str, msgs: list[dict[str, Any]]) -> Any:
+    def _try_stream(
+        self,
+        client: Any,
+        model: str,
+        msgs: list[dict[str, Any]],
+        provider: LLMProvider | None = None,
+    ) -> Iterator[StreamChunk]:
         """Attempt a streaming API call with retries on transient errors."""
+        prov = provider or self._provider
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             try:
-                return client.chat.completions.create(
+                return prov.create_streaming(
+                    client=client,
                     model=model,
                     messages=msgs,
-                    **({"tools": self._tools} if not self.creative_mode else {}),
-                    max_completion_tokens=self.max_tokens,
+                    tools=self._tools if not self.creative_mode else None,
+                    max_tokens=self.max_tokens,
                     temperature=self.temperature,
-                    stream=True,
-                    stream_options={"include_usage": True},
-                    extra_body={
-                        "chat_template_kwargs": self._chat_template_kwargs,
-                    },
+                    reasoning_effort=self.reasoning_effort,
+                    extra_params=self._provider_extra_params(provider=prov),
                 )
             except Exception as e:
                 ename = type(e).__name__
-                if ename not in self._RETRYABLE_ERRORS or attempt == self._MAX_RETRIES:
+                if ename not in prov.retryable_error_names or attempt == self._MAX_RETRIES:
                     raise
                 last_err = e
                 delay = self._RETRY_BASE_DELAY * (2**attempt)
@@ -591,11 +605,11 @@ class ChatSession:
     _THINK_CLOSE_TAGS = ("</think>", "</reasoning>")
     _MAX_TAG_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS)
 
-    def _stream_response(self, stream: Any) -> dict[str, Any]:
+    def _stream_response(self, stream: Iterator[StreamChunk]) -> dict[str, Any]:
         """Stream response, dispatching tokens to the UI as they arrive.
 
         Handles two reasoning delivery mechanisms:
-        1. The `reasoning_content` field (e.g. vLLM with --reasoning-parser)
+        1. The `reasoning_delta` field (e.g. vLLM with --reasoning-parser)
         2. <think>...</think> tags in regular content (common default)
 
         Calls self.ui.on_thinking_stop() on the first received delta.
@@ -608,7 +622,7 @@ class ChatSession:
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         first_token = True
         in_think = False  # inside a <think>...</think> block
-        path1_reasoning = False  # last reasoning came via reasoning_content field
+        path1_reasoning = False  # last reasoning came via reasoning_delta field
         pending = ""  # buffer for partial tag detection
 
         def _flush_text(text: str, is_reasoning: bool) -> None:
@@ -681,69 +695,67 @@ class ChatSession:
         finish_reason = None
         for chunk in stream:
             # Track finish_reason (e.g. "stop", "length", "tool_calls")
-            if chunk.choices and chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
 
-            # Capture usage from final chunk (stream_options.include_usage)
-            if hasattr(chunk, "usage") and chunk.usage is not None:
-                u = chunk.usage
-                pt = getattr(u, "prompt_tokens", None)
-                ct = getattr(u, "completion_tokens", None)
-                tt = getattr(u, "total_tokens", None)
-                if pt is not None and ct is not None:
+            # Accumulate usage (Anthropic sends prompt tokens in message_start
+            # and completion tokens in message_delta as separate events)
+            if chunk.usage:
+                if self._last_usage is None:
                     self._last_usage = {
-                        "prompt_tokens": pt,
-                        "completion_tokens": ct,
-                        "total_tokens": tt or (pt + ct),
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
                     }
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
+                else:
+                    self._last_usage["prompt_tokens"] = max(
+                        self._last_usage["prompt_tokens"], chunk.usage.prompt_tokens
+                    )
+                    self._last_usage["completion_tokens"] = max(
+                        self._last_usage["completion_tokens"], chunk.usage.completion_tokens
+                    )
+                    self._last_usage["total_tokens"] = (
+                        self._last_usage["prompt_tokens"] + self._last_usage["completion_tokens"]
+                    )
 
             if self.debug:
-                extras = dict(delta.model_extra) if delta.model_extra else {}
                 parts = []
-                if delta.role:
-                    parts.append(f"role={delta.role}")
-                if delta.content:
-                    parts.append(f"content={delta.content!r}")
-                if delta.tool_calls:
+                if chunk.content_delta:
+                    parts.append(f"content={chunk.content_delta!r}")
+                if chunk.reasoning_delta:
+                    parts.append(f"reasoning={chunk.reasoning_delta!r}")
+                if chunk.tool_call_deltas:
                     parts.append("tool_calls=...")
-                for k, v in extras.items():
-                    if v is not None:
-                        parts.append(f"{k}={v!r}")
                 if parts:
                     self.ui.on_info(f"{GRAY}[delta: {', '.join(parts)}]{RESET}")
 
-            # Path 1: reasoning field (sent as "reasoning" or "reasoning_content")
-            rc = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
-            if rc:
+            # Path 1: reasoning field (provider-normalized reasoning_delta)
+            if chunk.reasoning_delta:
                 _stop_spinner_once()
-                reasoning_parts.append(rc)
+                reasoning_parts.append(chunk.reasoning_delta)
                 in_think = True
                 path1_reasoning = True
                 if self.show_reasoning:
-                    self.ui.on_reasoning_token(rc)
-                continue
+                    self.ui.on_reasoning_token(chunk.reasoning_delta)
 
             # Path 2: regular content (may contain <think> tags)
-            if delta.content:
+            if chunk.content_delta:
                 _stop_spinner_once()
                 # Close reasoning if transitioning from Path 1 reasoning
                 if path1_reasoning:
                     path1_reasoning = False
                     in_think = False
-                pending += delta.content
+                pending += chunk.content_delta
                 _drain_pending()
 
             # Handle tool call deltas
-            if delta.tool_calls:
+            if chunk.tool_call_deltas:
                 _stop_spinner_once()
                 # Close reasoning if transitioning from reasoning
                 if in_think:
                     in_think = False
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
+                for tcd in chunk.tool_call_deltas:
+                    idx = tcd.index
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {
                             "id": "",
@@ -751,13 +763,12 @@ class ChatSession:
                             "function": {"name": "", "arguments": ""},
                         }
                     tc = tool_calls_acc[idx]
-                    if tc_delta.id:
-                        tc["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tc["function"]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tc["function"]["arguments"] += tc_delta.function.arguments
+                    if tcd.id:
+                        tc["id"] = tcd.id
+                    if tcd.name:
+                        tc["function"]["name"] = tcd.name
+                    if tcd.arguments_delta:
+                        tc["function"]["arguments"] += tcd.arguments_delta
 
         # Flush any remaining buffered text
         if pending:
@@ -1010,37 +1021,35 @@ class ChatSession:
         self.ui.on_thinking_start()
         try:
             _last_err: Exception | None = None
-            response: Any = None
+            result: CompletionResult | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    response = self.client.chat.completions.create(
+                    result = self._provider.create_completion(
+                        client=self.client,
                         model=self.model,
-                        messages=summary_msgs,  # type: ignore[arg-type]
-                        max_completion_tokens=summary_max_tokens,
+                        messages=summary_msgs,
+                        max_tokens=summary_max_tokens,
                         temperature=0.3,
-                        stream=False,
-                        extra_body={
-                            "chat_template_kwargs": {
-                                **self._chat_template_kwargs_base,
-                                "reasoning_effort": "low",
-                            }
-                        },
+                        reasoning_effort="low",
+                        extra_params=self._provider_extra_params(reasoning_effort="low"),
                     )
                     break
                 except Exception as e:
                     ename = type(e).__name__
-                    if ename not in self._RETRYABLE_ERRORS or attempt == self._MAX_RETRIES:
+                    if (
+                        ename not in self._provider.retryable_error_names
+                        or attempt == self._MAX_RETRIES
+                    ):
                         raise
                     _last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
                     time.sleep(delay)
-            assert response is not None
-            choice = response.choices[0]
-            summary = choice.message.content or ""
+            assert result is not None
+            summary = result.content or ""
             # Strip any <think>/<reasoning> tags the summarizer may emit
             summary = self._strip_reasoning(summary)
-            if choice.finish_reason == "length":
+            if result.finish_reason == "length":
                 self.ui.on_info("[Warning: compaction summary was truncated]")
         except Exception as e:
             self.ui.on_error(f"Compaction failed: {e}")
@@ -2055,36 +2064,45 @@ class ChatSession:
             auto_tools = self._AGENT_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
 
-        kwargs = dict(self._chat_template_kwargs_base)
-        if reasoning_effort:
-            kwargs["reasoning_effort"] = reasoning_effort
-
-        # Resolve agent model: use registry.agent_model if configured
+        # Resolve agent model and provider: use registry.agent_model if configured
         agent_client = self.client
         agent_model = self.model
+        agent_provider = self._provider
         if self._registry and self._registry.agent_model:
             agent_client, agent_model, _ = self._registry.resolve(self._registry.agent_model)
+            agent_provider = self._registry.get_provider(self._registry.agent_model)
+
+        # Build extra params for agent calls
+        agent_extra: dict[str, Any] | None = None
+        if agent_provider.provider_name == "openai":
+            agent_kwargs = dict(self._chat_template_kwargs_base)
+            if reasoning_effort:
+                agent_kwargs["reasoning_effort"] = reasoning_effort
+            agent_extra = {"chat_template_kwargs": agent_kwargs}
 
         def _api_call(
             messages: list[dict[str, Any]],
             _tools: list[dict[str, Any]] | None = tools,
-        ) -> Any:
+        ) -> CompletionResult:
             last_err: Exception | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    return agent_client.chat.completions.create(
+                    return agent_provider.create_completion(
+                        client=agent_client,
                         model=agent_model,
-                        messages=messages,  # type: ignore[arg-type]
-                        tools=_tools,  # type: ignore[arg-type]
-                        max_completion_tokens=self.max_tokens,
+                        messages=messages,
+                        tools=_tools,
+                        max_tokens=self.max_tokens,
                         temperature=self.temperature,
-                        extra_body={
-                            "chat_template_kwargs": kwargs,
-                        },
+                        reasoning_effort=reasoning_effort or self.reasoning_effort,
+                        extra_params=agent_extra,
                     )
                 except Exception as e:
                     ename = type(e).__name__
-                    if ename not in self._RETRYABLE_ERRORS or attempt == self._MAX_RETRIES:
+                    if (
+                        ename not in agent_provider.retryable_error_names
+                        or attempt == self._MAX_RETRIES
+                    ):
                         raise
                     last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
@@ -2095,47 +2113,35 @@ class ChatSession:
 
         turn = 0
         while max_tool_turns < 0 or turn < max_tool_turns:
-            response = _api_call(agent_messages)
-            choice = response.choices[0]
-            assistant_msg = choice.message
+            result = _api_call(agent_messages)
 
             # Handle truncation or content filter — stop agent early
-            if choice.finish_reason == "length":
+            if result.finish_reason == "length":
                 self.ui.on_info(f"[{label}] response truncated, stopping early")
-                return assistant_msg.content or "(truncated)"
-            if choice.finish_reason == "content_filter":
+                return result.content or "(truncated)"
+            if result.finish_reason == "content_filter":
                 self.ui.on_info(f"[{label}] blocked by content filter")
                 return "(content filter)"
 
             # Build message dict for agent history
-            msg_dict = {
+            msg_dict: dict[str, Any] = {
                 "role": "assistant",
-                "content": assistant_msg.content or "",
+                "content": result.content or "",
             }
-            if assistant_msg.tool_calls:
-                msg_dict["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in assistant_msg.tool_calls
-                ]
+            if result.tool_calls:
+                msg_dict["tool_calls"] = result.tool_calls
             agent_messages.append(msg_dict)
 
-            if not assistant_msg.tool_calls:
-                content = assistant_msg.content or "(no output)"
+            if not result.tool_calls:
+                content = result.content or "(no output)"
                 self.ui.on_info(f"[{label} done] {len(content)} chars")
                 return content
 
             # Execute tools sequentially (not parallel) to avoid
             # concurrent _read_files mutation from worker threads.
             tool_names = {t["function"]["name"] for t in tools}
-            for tc in assistant_msg.tool_calls:
-                tool_name = tc.function.name
+            for tc_dict in result.tool_calls:
+                tool_name = tc_dict["function"]["name"]
 
                 # Guard 1: block recursive agent calls.
                 if tool_name in ("task", "plan"):
@@ -2148,14 +2154,6 @@ class ChatSession:
                         f"Available: {', '.join(sorted(tool_names))}"
                     )
                 else:
-                    tc_dict = {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
                     prepared = self._prepare_tool(tc_dict)
 
                     lbl = prepared.get("header", tool_name)
@@ -2182,7 +2180,7 @@ class ChatSession:
                 agent_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc.id,
+                        "tool_call_id": tc_dict["id"],
                         "content": output,
                     }
                 )
@@ -2200,8 +2198,8 @@ class ChatSession:
                 ),
             }
         )
-        response = _api_call(agent_messages, _tools=[])
-        content = response.choices[0].message.content or "(no output)"
+        result = _api_call(agent_messages, _tools=[])
+        content = result.content or "(no output)"
         self.ui.on_info(f"[{label} done] {len(content)} chars")
         return content
 
@@ -2578,7 +2576,8 @@ class ChatSession:
 
         # Phase 3: summarization API call
         try:
-            response = self.client.chat.completions.create(
+            result = self._provider.create_completion(
+                client=self.client,
                 model=self.model,
                 messages=[
                     {
@@ -2600,10 +2599,11 @@ class ChatSession:
                         ),
                     },
                 ],
-                max_completion_tokens=2000,
+                max_tokens=2000,
                 temperature=0.2,
+                extra_params=self._provider_extra_params(),
             )
-            answer = response.choices[0].message.content or "(no answer)"
+            answer = result.content or "(no answer)"
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 
@@ -2805,6 +2805,7 @@ class ChatSession:
                 self.client = client
                 self.model = model_name
                 self._model_alias = arg
+                self._provider = self._registry.get_provider(arg)
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)

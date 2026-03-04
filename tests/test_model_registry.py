@@ -457,7 +457,7 @@ class TestSessionFallback:
         # _try_stream: first call (primary) raises, second call (fallback) succeeds
         call_count = 0
 
-        def fake_try_stream(client: Any, model: str, msgs: Any) -> str:
+        def fake_try_stream(client: Any, model: str, msgs: Any, **kwargs: Any) -> str:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -473,7 +473,7 @@ class TestSessionFallback:
     def test_no_fallback_without_registry(self) -> None:
         session = _make_session()
 
-        def fake_try_stream(client: Any, model: str, msgs: Any) -> str:
+        def fake_try_stream(client: Any, model: str, msgs: Any, **kwargs: Any) -> str:
             raise ConnectionError("Down")
 
         session._try_stream = fake_try_stream  # type: ignore[assignment]

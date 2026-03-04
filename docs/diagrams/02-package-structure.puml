@@ -24,6 +24,7 @@ package "Entry Points" <<Rectangle>> {
 ' Core engine
 package "turnstone/core/" <<Rectangle>> {
     component [session.py\nChatSession, SessionUI] as session <<core>>
+    component [providers/\nLLMProvider, OpenAI, Anthropic] as providers <<core>>
     component [workstream.py\nWorkstreamManager] as workstream <<core>>
     component [tools.py\nTool loader] as tools <<core>>
     component [memory.py\nSQLite + FTS5] as memory <<core>>
@@ -105,6 +106,7 @@ eval --> tools
 chat --> session
 
 ' Core internal deps
+session --> providers
 session --> tools
 session --> memory
 session --> safety
@@ -114,6 +116,7 @@ session --> web
 session --> healthcheck
 session --> mcp : optional
 session --> registry : optional
+registry --> providers
 healthcheck --> metrics
 mcp --> config
 registry --> config

@@ -9,7 +9,10 @@ actor "External Client\n(Python / CI)" as ext_client
 actor "Eval Harness" as eval_user
 
 ' External Systems
-cloud "LLM Provider\n(OpenAI-compatible API)" as llm
+cloud "LLM Providers" as llm {
+    component [OpenAI-compatible API\n(OpenAI, vLLM, llama.cpp)] as llm_openai
+    component [Anthropic Messages API] as llm_anthropic
+}
 database "Redis" as redis
 database "SQLite\n(.turnstone.db)" as sqlite
 
@@ -31,13 +34,13 @@ ext_client --> redis : Redis LIST\n(push commands)
 eval_user --> eval : Python API
 
 ' Internal connections
-cli --> llm : OpenAI Streaming API\n(HTTPS)
+cli --> llm : LLM Provider API\n(via provider adapters)
 cli --> sqlite : SQLite
 
-server --> llm : OpenAI Streaming API\n(HTTPS)
+server --> llm : LLM Provider API\n(via provider adapters)
 server --> sqlite : SQLite
 
-eval --> llm : OpenAI API\n(non-streaming)
+eval --> llm : LLM Provider API\n(non-streaming)
 eval --> sqlite : SQLite
 
 bridge --> server : HTTP REST\n(POST /api/send, etc.)

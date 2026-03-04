@@ -65,9 +65,50 @@ class "NullUI" as NullUI {
     eval.py
 }
 
+' LLMProvider Protocol
+interface "LLMProvider" as LLMProvider <<Protocol>> {
+    + provider_name: str {property}
+    + get_capabilities(model) → ModelCapabilities
+    + create_streaming(client, model, messages, ...) → Iterator[StreamChunk]
+    + create_completion(client, model, messages, ...) → CompletionResult
+    + convert_tools(tools) → list[dict]
+    + retryable_error_names: frozenset[str] {property}
+    --
+    core/providers/_protocol.py
+}
+
+class "OpenAIProvider" as OpenAIProv {
+    Model capability lookup table
+    (GPT-4o, GPT-5.x, O-series)
+    Passthrough: messages already
+    in OpenAI format
+    --
+    core/providers/_openai.py
+}
+
+class "AnthropicProvider" as AnthropicProv {
+    Converts OpenAI messages to
+    Anthropic content blocks.
+    Adaptive + manual thinking.
+    Lazy anthropic SDK import.
+    --
+    core/providers/_anthropic.py
+}
+
+' ModelCapabilities
+class "ModelCapabilities" as ModelCaps <<frozen>> {
+    + context_window: int
+    + max_output_tokens: int
+    + supports_temperature: bool
+    + token_param: str
+    + thinking_mode: str
+    + supports_effort: bool
+}
+
 ' ChatSession
 class "ChatSession" as ChatSession {
-    - client: OpenAI
+    - client: Any
+    - provider: LLMProvider
     - model: str
     - ui: SessionUI
     - messages: list[dict]
@@ -174,20 +215,22 @@ class "MCPClientManager" as MCPMgr {
 ' ModelRegistry
 class "ModelRegistry" as ModelReg {
     - _models: dict[str, ModelConfig]
-    - _clients: dict[str, OpenAI]
+    - _clients: dict[str, Any]
+    - _providers: dict[str, LLMProvider]
     - _client_lock: Lock
     + default: str
     + fallback: list[str]
     + agent_model: str | None
     --
     + resolve(alias) → (client, model, config)
-    + get_client(alias) → OpenAI
+    + get_client(alias) → Any
+    + get_provider(alias) → LLMProvider
     + has_alias(alias) → bool
     + list_aliases() → list[str]
     + shutdown()
     --
-    Thread-safe lazy client creation.
-    Loaded by load_model_registry()
+    Thread-safe lazy client + provider
+    creation. Loaded by load_model_registry()
     from CLI args + [models.*] config.
     --
     core/model_registry.py
@@ -195,6 +238,7 @@ class "ModelRegistry" as ModelReg {
 
 class "ModelConfig" as ModelCfg <<frozen>> {
     + alias: str
+    + provider: str
     + base_url: str
     + model: str
     + context_window: int
@@ -262,7 +306,11 @@ TerminalUI <|-- WsTermUI
 SessionUI <|.. WebUI
 SessionUI <|.. NullUI
 
+LLMProvider <|.. OpenAIProv
+LLMProvider <|.. AnthropicProv
+
 ChatSession --> SessionUI : uses
+ChatSession --> LLMProvider : delegates LLM calls
 ChatSession --> MCPMgr : optional
 ChatSession --> ModelReg : optional
 ChatSession <|-- HeadlessSession
@@ -275,6 +323,8 @@ Ws --> "1" WsState : has
 WsMgr ..> ChatSession : creates via\nsession_factory(ui, model_alias)
 
 ModelReg --> "*" ModelCfg : holds
+ModelReg --> "*" LLMProvider : caches
+LLMProvider --> ModelCaps : returns
 
 ChatSession --> HealthMon : checks circuit
 HealthMon --> "1" CircuitState : has
@@ -284,6 +334,8 @@ note bottom of ChatSession
   Central engine: multi-turn LLM loop
   with tool dispatch, agent sub-sessions,
   context compaction, and memory persistence.
+  Provider-agnostic — delegates all LLM
+  communication to LLMProvider adapters.
 
   core/session.py (~2700 lines)
 end note
