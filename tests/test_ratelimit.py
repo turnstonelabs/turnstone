@@ -132,3 +132,112 @@ class TestRateLimiter:
             # 10.0.0.2 last_refill=1060, age=0 < 3600 => kept
             assert removed == 0
             assert len(limiter._buckets) == 2
+
+
+# ---------------------------------------------------------------------------
+# resolve_client_ip / parse_trusted_proxies
+# ---------------------------------------------------------------------------
+
+
+class TestResolveClientIp:
+    """X-Forwarded-For parsing with trusted proxy validation."""
+
+    def test_no_trusted_proxies_returns_direct(self):
+        from turnstone.core.ratelimit import resolve_client_ip
+
+        result = resolve_client_ip("192.168.1.1", "10.0.0.1", frozenset())
+        assert result == "192.168.1.1"
+
+    def test_no_xff_returns_direct(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("127.0.0.0/8")
+        result = resolve_client_ip("127.0.0.1", "", trusted)
+        assert result == "127.0.0.1"
+
+    def test_trusted_proxy_extracts_xff(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("127.0.0.1/32")
+        result = resolve_client_ip("127.0.0.1", "1.2.3.4", trusted)
+        assert result == "1.2.3.4"
+
+    def test_untrusted_direct_ignores_xff(self):
+        """If the direct client is not a trusted proxy, XFF is ignored (anti-spoof)."""
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("10.0.0.0/8")
+        result = resolve_client_ip("203.0.113.5", "1.2.3.4", trusted)
+        assert result == "203.0.113.5"
+
+    def test_chained_proxies(self):
+        """XFF: 'client, proxy1, proxy2' with proxy1+proxy2 trusted → returns client."""
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("10.0.0.0/8")
+        result = resolve_client_ip("10.0.0.3", "1.2.3.4, 10.0.0.1, 10.0.0.2", trusted)
+        assert result == "1.2.3.4"
+
+    def test_all_trusted_returns_direct(self):
+        """If all XFF entries are trusted proxies, fall back to direct IP."""
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("10.0.0.0/8")
+        result = resolve_client_ip("10.0.0.3", "10.0.0.1, 10.0.0.2", trusted)
+        assert result == "10.0.0.3"
+
+    def test_invalid_direct_ip_returns_direct(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("10.0.0.0/8")
+        result = resolve_client_ip("not-an-ip", "1.2.3.4", trusted)
+        assert result == "not-an-ip"
+
+    def test_invalid_xff_entry_skipped(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("10.0.0.0/8")
+        result = resolve_client_ip("10.0.0.1", "garbage, 1.2.3.4", trusted)
+        assert result == "1.2.3.4"
+
+    def test_ipv6_trusted_proxy(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies, resolve_client_ip
+
+        trusted = parse_trusted_proxies("::1/128")
+        result = resolve_client_ip("::1", "2001:db8::1", trusted)
+        assert result == "2001:db8::1"
+
+
+class TestParseTrustedProxies:
+    def test_empty_string(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies
+
+        assert parse_trusted_proxies("") == frozenset()
+
+    def test_single_cidr(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies
+
+        result = parse_trusted_proxies("10.0.0.0/8")
+        assert len(result) == 1
+
+    def test_multiple_cidrs(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies
+
+        result = parse_trusted_proxies("10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16")
+        assert len(result) == 3
+
+    def test_single_ip_becomes_host_network(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies
+
+        result = parse_trusted_proxies("127.0.0.1")
+        assert len(result) == 1
+
+    def test_invalid_entry_skipped(self):
+        from turnstone.core.ratelimit import parse_trusted_proxies
+
+        result = parse_trusted_proxies("10.0.0.0/8, not-valid, 172.16.0.0/12")
+        assert len(result) == 2
+
+    def test_constructor_parses_trusted_proxies(self):
+        limiter = RateLimiter(enabled=True, rate=10.0, burst=5, trusted_proxies="10.0.0.0/8")
+        assert len(limiter.trusted_proxies) == 1

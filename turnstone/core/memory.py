@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -65,6 +67,12 @@ def open_db() -> sqlite3.Connection:
         except sqlite3.OperationalError:
             conn.execute("ALTER TABLE conversations ADD COLUMN tool_call_id TEXT")
             conn.commit()
+        # Migration: add provider_data column for raw provider content blocks
+        try:
+            conn.execute("SELECT provider_data FROM conversations LIMIT 0")
+        except sqlite3.OperationalError:
+            conn.execute("ALTER TABLE conversations ADD COLUMN provider_data TEXT")
+            conn.commit()
         # Sessions table — maps session_id to human-friendly alias/title
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions "
@@ -122,6 +130,7 @@ def save_message(
     tool_name: str | None = None,
     tool_args: str | None = None,
     tool_call_id: str | None = None,
+    provider_data: str | None = None,
 ) -> None:
     """Log a message to the conversations table."""
     global _fts5_available
@@ -130,9 +139,9 @@ def save_message(
         try:
             conn.execute(
                 "INSERT INTO conversations (session_id, timestamp, role, content, "
-                "tool_name, tool_args, tool_call_id) "
-                "VALUES (?, datetime('now'), ?, ?, ?, ?, ?)",
-                (session_id, role, content, tool_name, tool_args, tool_call_id),
+                "tool_name, tool_args, tool_call_id, provider_data) "
+                "VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?)",
+                (session_id, role, content, tool_name, tool_args, tool_call_id, provider_data),
             )
             if _fts5_available and content:
                 try:
@@ -468,7 +477,7 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
         conn = open_db()
         try:
             rows = conn.execute(
-                "SELECT role, content, tool_name, tool_args, tool_call_id "
+                "SELECT role, content, tool_name, tool_args, tool_call_id, provider_data "
                 "FROM conversations WHERE session_id = ? ORDER BY id",
                 (session_id,),
             ).fetchall()
@@ -480,14 +489,18 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     i = 0
     while i < len(rows):
-        role, content, tool_name, tool_args, tc_id = rows[i]
+        role, content, tool_name, tool_args, tc_id, provider_data = rows[i]
 
         if role == "user":
             messages.append({"role": "user", "content": content or ""})
             i += 1
 
         elif role == "assistant":
-            messages.append({"role": "assistant", "content": content})
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            if provider_data:
+                with contextlib.suppress(json.JSONDecodeError, TypeError):
+                    msg["_provider_content"] = json.loads(provider_data)
+            messages.append(msg)
             i += 1
 
         elif role == "tool_call":
@@ -508,7 +521,7 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
                 assistant_msg["tool_calls"] = []
 
             while i < len(rows) and rows[i][0] == "tool_call":
-                _, _, tn, ta, stored_tc_id = rows[i]
+                _, _, tn, ta, stored_tc_id, _ = rows[i]
                 call_id = stored_tc_id or f"call_{session_id}_{i}"
                 assistant_msg["tool_calls"].append(
                     {
@@ -523,7 +536,7 @@ def load_session_messages(session_id: str) -> list[dict[str, Any]]:
             # Consume matching tool_result rows
             result_idx = 0
             while i < len(rows) and rows[i][0] == "tool_result":
-                _, result_content, _, _, result_tc_id = rows[i]
+                _, result_content, _, _, result_tc_id, _ = rows[i]
                 if result_tc_id:
                     tc_id_to_use = result_tc_id
                 elif result_idx < len(assistant_msg["tool_calls"]):
