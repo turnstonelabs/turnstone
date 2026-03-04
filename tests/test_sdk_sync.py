@@ -56,7 +56,7 @@ def test_sync_runner_iter_empty():
 
         async def _empty():
             return
-            yield  # noqa: RET504 — make it an async generator
+            yield  # pragma: no cover  # makes this an async generator
 
         items = list(runner.run_iter(_empty()))
         assert items == []

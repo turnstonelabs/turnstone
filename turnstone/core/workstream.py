@@ -126,11 +126,20 @@ class WorkstreamManager:
                 default model.
         """
         # Fast-fail capacity check (avoids expensive session creation when full).
+        first_evicted: Workstream | None = None
         with self._lock:
             if len(self._workstreams) >= self._max_workstreams:
-                evicted = self._evict_oldest_idle_locked()
-                if evicted is None:
+                first_evicted = self._evict_oldest_idle_locked()
+                if first_evicted is None:
                     raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
+
+        # Cleanup first-phase eviction outside the lock (may trigger callbacks).
+        if first_evicted is not None:
+            self._cleanup_ui(first_evicted)
+            self._last_evicted = first_evicted
+            from turnstone.core.metrics import metrics as _m1
+
+            _m1.record_eviction()
 
         # Create workstream and session outside the lock (session creation is
         # expensive — involves LLM client setup and DB writes).
@@ -141,11 +150,11 @@ class WorkstreamManager:
 
         # Authoritative insert under lock with re-check (another thread may
         # have filled capacity while we were unlocked).
-        evicted_ws: Workstream | None = None
+        second_evicted: Workstream | None = None
         with self._lock:
             if len(self._workstreams) >= self._max_workstreams:
-                evicted_ws = self._evict_oldest_idle_locked()
-                if evicted_ws is None:
+                second_evicted = self._evict_oldest_idle_locked()
+                if second_evicted is None:
                     raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
             self._workstreams[ws.id] = ws
             self._order.append(ws.id)
@@ -157,14 +166,13 @@ class WorkstreamManager:
 
         register_workstream(ws.id, node_id=self._node_id, name=ws.name)
 
-        # UI cleanup for the evicted workstream must happen outside the lock
-        # because it may trigger callbacks.
-        self._last_evicted = evicted_ws
-        if evicted_ws is not None:
-            self._cleanup_ui(evicted_ws)
-            from turnstone.core.metrics import metrics
+        # Cleanup second-phase eviction outside the lock.
+        if second_evicted is not None:
+            self._cleanup_ui(second_evicted)
+            self._last_evicted = second_evicted
+            from turnstone.core.metrics import metrics as _m2
 
-            metrics.record_eviction()
+            _m2.record_eviction()
         return ws
 
     # -- eviction helpers ---------------------------------------------------
@@ -218,6 +226,9 @@ class WorkstreamManager:
                 self._active_id = self._order[0]
         # Unblock any waiting approval/plan events so worker thread can exit
         self._cleanup_ui(ws)
+        from turnstone.core.memory import update_workstream_state
+
+        update_workstream_state(ws_id, "closed")
         return True
 
     # -- lookup -------------------------------------------------------------

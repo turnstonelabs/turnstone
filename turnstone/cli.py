@@ -891,7 +891,9 @@ def main() -> None:
     mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
 
     # Session factory — captures shared config for creating workstream sessions
-    def session_factory(ui: SessionUI | None, model_alias: str | None = None) -> ChatSession:
+    def session_factory(
+        ui: SessionUI | None, model_alias: str | None = None, ws_id: str | None = None
+    ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         return ChatSession(
