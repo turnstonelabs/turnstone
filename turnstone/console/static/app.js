@@ -312,7 +312,7 @@ function renderStatusBar(overview) {
   ) {
     var driftEl = document.createElement("span");
     driftEl.className = "csb-metric csb-version-drift";
-    driftEl.title = "Nodes running: " + overview.versions.join(", ");
+    driftEl.title = "Versions detected: " + overview.versions.join(", ");
     var warnSpan = document.createElement("span");
     warnSpan.className = "csb-metric-value drift-warn";
     warnSpan.textContent = "DRIFT";
