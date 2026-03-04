@@ -1675,6 +1675,36 @@ class TestOpenAIWebSearch:
         assert "Sources:" in result.content
         assert "[Test](https://test.com)" in result.content
 
+    def test_streaming_emits_citations_as_info_delta(self) -> None:
+        """Streaming with search model should emit citations as final info_delta."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Result", url="https://example.com")
+
+        # Content chunk, then a chunk with annotation, then finish
+        content_chunk = _openai_stream_chunk(content="Search result text.")
+        content_chunk.choices[0].delta.annotations = None
+
+        ann_chunk = _openai_stream_chunk(content=None)
+        ann_chunk.choices[0].delta.annotations = [ann]
+
+        finish_chunk = _openai_stream_chunk(finish_reason="stop")
+        finish_chunk.choices[0].delta.annotations = None
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([content_chunk, ann_chunk, finish_chunk])
+        chunks = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
+        )
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Sources:" in info_chunks[0].info_delta
+        assert "[Result](https://example.com)" in info_chunks[0].info_delta
+
 
 class TestTavilyFallback:
     """Tests for Tavily fallback when providers don't support native search."""

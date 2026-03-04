@@ -208,6 +208,7 @@ class OpenAIProvider:
     def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
         """Convert OpenAI stream chunks to normalized StreamChunks."""
         first = True
+        annotations: list[Any] = []
         for chunk in stream:
             sc = StreamChunk()
 
@@ -257,6 +258,11 @@ class OpenAIProvider:
                             tcd.arguments_delta = tc_delta.function.arguments
                     sc.tool_call_deltas.append(tcd)
 
+            # Accumulate url_citation annotations from search models
+            delta_anns = getattr(delta, "annotations", None)
+            if delta_anns:
+                annotations.extend(delta_anns)
+
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
             if has_content and first:
                 sc.is_first = True
@@ -264,6 +270,12 @@ class OpenAIProvider:
 
             if has_content or sc.finish_reason or sc.usage:
                 yield sc
+
+        # Emit accumulated citations as a final info chunk
+        if annotations:
+            citation_text = self._format_citations("", annotations).strip()
+            if citation_text:
+                yield StreamChunk(info_delta=citation_text)
 
     # -- non-streaming -------------------------------------------------------
 
