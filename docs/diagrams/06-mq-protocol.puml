@@ -58,6 +58,7 @@ package "Inbound Messages (Client → Bridge)" #FFF3E0 {
         + auto_approve: bool = False
         + auto_approve_tools: list[str] = []
         + target_node: str = ""
+        + initial_message: str = ""
     }
 
     class CloseWorkstreamMessage {

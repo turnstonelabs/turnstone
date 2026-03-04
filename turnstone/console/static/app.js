@@ -972,6 +972,7 @@ function showNewWsModal() {
     });
   document.getElementById("new-ws-name").value = "";
   document.getElementById("new-ws-model").value = "";
+  document.getElementById("new-ws-task").value = "";
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
@@ -1023,6 +1024,7 @@ function submitNewWs() {
   var nodeId = document.getElementById("new-ws-node").value;
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
+  var task = document.getElementById("new-ws-task").value.trim();
   var errEl = document.getElementById("new-ws-error");
   var btn = document.getElementById("new-ws-submit");
 
@@ -1034,6 +1036,7 @@ function submitNewWs() {
   if (nodeId) body.node_id = nodeId;
   if (name) body.name = name;
   if (model) body.model = model;
+  if (task) body.initial_message = task;
 
   authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",

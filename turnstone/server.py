@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import functools
 import json
+import logging
 import os
 import queue
 import sys
@@ -42,7 +43,7 @@ from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
-from turnstone.core.workstream import Workstream, WorkstreamManager
+from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, MutableMapping
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"
@@ -75,6 +78,7 @@ class WebUI:
     # Shared global event queue for state-change broadcasts across all
     # workstreams.  Set by main() before any WebUI instances are created.
     _global_queue: queue.Queue[dict[str, Any]] | None = None
+    _workstream_mgr: WorkstreamManager | None = None
 
     def __init__(self, ws_id: str = "") -> None:
         self.ws_id = ws_id
@@ -264,6 +268,14 @@ class WebUI:
         self._enqueue({"type": "error", "message": message})
 
     def on_state_change(self, state: str) -> None:
+        # Update the Workstream object so dashboard/polling sees the new state
+        if WebUI._workstream_mgr is not None:
+            try:
+                ws_state = WorkstreamState(state)
+            except ValueError:
+                log.debug("Ignoring unknown state %r for ws %s", state, self.ws_id)
+            else:
+                WebUI._workstream_mgr.set_state(self.ws_id, ws_state)
         self._broadcast_state(state)
 
     def on_rename(self, name: str) -> None:
@@ -1378,6 +1390,7 @@ def main() -> None:
 
     # Create workstream manager and initial workstream
     manager = WorkstreamManager(session_factory, max_workstreams=args.max_workstreams)
+    WebUI._workstream_mgr = manager
     ws = manager.create(
         name="default",
         ui_factory=lambda wid: WebUI(ws_id=wid),

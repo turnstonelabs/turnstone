@@ -114,6 +114,8 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
     <label for="new-ws-model">Model <span class="label-hint">optional</span></label>
     <input id="new-ws-model" type="text" placeholder="Default model" autocomplete="off">
+    <label for="new-ws-task">Task <span class="label-hint">optional &mdash; sent as first message</span></label>
+    <textarea id="new-ws-task" rows="3" placeholder="What should this workstream work on?"></textarea>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>

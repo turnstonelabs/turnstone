@@ -144,7 +144,7 @@ services:
       - --redis-host=redis
       - --redis-port=6379
       - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
-      - --approval-timeout=${APPROVAL_TIMEOUT:-300}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}

@@ -57,7 +57,7 @@ def _make_collector(broker=None, poll_interval=999, discovery_interval=999):
 
 
 def _dashboard_response(workstreams=None, aggregate=None):
-    """Build a /api/dashboard-style response dict."""
+    """Build a /v1/api/dashboard-style response dict."""
     return {
         "workstreams": workstreams or [],
         "aggregate": aggregate
@@ -148,7 +148,7 @@ class TestCollectorDiscovery:
 
 
 class TestCollectorPolling:
-    """Polling /api/dashboard from nodes."""
+    """Polling /v1/api/dashboard from nodes."""
 
     def test_apply_poll_populates_workstreams(self):
         c = _make_collector()
@@ -815,6 +815,26 @@ class TestConsoleWorkstreamCreation:
         msg_json = broker.push_inbound.call_args[0][0]
         msg = json.loads(msg_json)
         assert msg["model"] == "gpt-5"
+
+    def test_create_with_initial_message_directed(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "initial_message": "Do the thing"},
+        )
+        assert resp.status_code == 200
+        msg = json.loads(broker.push_inbound.call_args[0][0])
+        assert msg["initial_message"] == "Do the thing"
+
+    def test_create_with_initial_message_pool(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "pool", "initial_message": "Pool task"},
+        )
+        assert resp.status_code == 200
+        msg = json.loads(broker.push_inbound.call_args[0][0])
+        assert msg["initial_message"] == "Pool task"
 
     def test_create_auto_selects_best_node(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
