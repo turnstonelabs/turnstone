@@ -52,6 +52,8 @@ group loop [while tool_calls present]
             CS -> UI : on_content_token(text)
         else tool_call delta
             CS -> CS : accumulate in tool_calls_acc
+        else info_delta present
+            CS -> UI : on_info(text)\n(e.g. server-side web search status)
         end
     end
 
@@ -116,7 +118,7 @@ group loop [while tool_calls present]
           task/plan → _run_agent() sub-loop
           math → sandboxed subprocess
           web_fetch → httpx + LLM summarize
-          web_search → Tavily API
+          web_search → provider-native or Tavily fallback
           remember/recall/forget → SQLite
         end note
 

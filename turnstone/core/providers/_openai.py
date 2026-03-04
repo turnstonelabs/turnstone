@@ -23,15 +23,6 @@ from turnstone.core.providers._protocol import (
 # -- model capabilities -------------------------------------------------------
 
 _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
-    # GPT-4o family
-    "gpt-4o": ModelCapabilities(
-        context_window=128000,
-        max_output_tokens=16384,
-    ),
-    "gpt-4o-mini": ModelCapabilities(
-        context_window=128000,
-        max_output_tokens=16384,
-    ),
     # GPT-5 base — NO temperature support
     "gpt-5": ModelCapabilities(
         context_window=400000,
@@ -102,6 +93,14 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
     ),
+    # Search models — always search on every request, no reasoning_effort
+    "gpt-5-search-api": ModelCapabilities(
+        context_window=400000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        supports_web_search=True,
+        reasoning_effort_values=(),
+    ),
 }
 
 # Default for unknown models (local servers: vLLM, llama.cpp, etc.)
@@ -148,6 +147,32 @@ class OpenAIProvider:
         if caps.reasoning_effort_values and reasoning_effort and reasoning_effort != "none":
             kwargs["reasoning_effort"] = reasoning_effort
 
+    # -- web search ----------------------------------------------------------
+
+    def _apply_web_search(
+        self,
+        kwargs: dict[str, Any],
+        caps: ModelCapabilities,
+        tools: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]] | None:
+        """Inject ``web_search_options`` for search models.
+
+        For models with ``supports_web_search``, the web search function tool
+        is removed (the model searches automatically) and ``web_search_options``
+        is added to the request kwargs.
+
+        Returns the (possibly filtered) tools list.
+        """
+        if not caps.supports_web_search:
+            return tools
+        # Remove web_search function tool — model has built-in search
+        if tools:
+            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+            if not tools:
+                tools = None
+        kwargs["web_search_options"] = {}
+        return tools
+
     # -- streaming -----------------------------------------------------------
 
     def create_streaming(
@@ -171,6 +196,7 @@ class OpenAIProvider:
             "stream_options": {"include_usage": True},
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
+        tools = self._apply_web_search(kwargs, caps, tools)
         if tools:
             kwargs["tools"] = tools
         if extra_params:
@@ -261,6 +287,7 @@ class OpenAIProvider:
             "stream": False,
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
+        tools = self._apply_web_search(kwargs, caps, tools)
         if tools:
             kwargs["tools"] = tools
         if extra_params:
@@ -284,6 +311,12 @@ class OpenAIProvider:
                 for tc in msg.tool_calls
             ]
 
+        # Extract url_citation annotations from web search models
+        content = msg.content or ""
+        annotations = getattr(msg, "annotations", None)
+        if annotations:
+            content = self._format_citations(content, annotations)
+
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
@@ -295,11 +328,30 @@ class OpenAIProvider:
             )
 
         return CompletionResult(
-            content=msg.content or "",
+            content=content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
         )
+
+    @staticmethod
+    def _format_citations(content: str, annotations: list[Any]) -> str:
+        """Append url_citation sources as footnotes at the end of the content."""
+        seen_urls: set[str] = set()
+        sources: list[str] = []
+        for ann in annotations:
+            ann_type = getattr(ann, "type", None)
+            if ann_type == "url_citation":
+                citation = getattr(ann, "url_citation", None)
+                if citation:
+                    title = getattr(citation, "title", "")
+                    url = getattr(citation, "url", "")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        sources.append(f"[{title}]({url})" if title else url)
+        if sources:
+            content += "\n\nSources:\n" + "\n".join(f"- {s}" for s in sources)
+        return content
 
     # -- tool conversion -----------------------------------------------------
 

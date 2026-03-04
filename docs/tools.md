@@ -302,8 +302,11 @@ Search the web using a text query.
 | `max_results` | integer | no       | Max results to return (default 5, max 20). |
 | `topic`       | string  | no       | Search topic: `general`, `news`, or `finance` (default `general`). |
 
-- **What it does**: Searches the web via the Tavily API and returns ranked results with titles, URLs, and content snippets.
-- **Auto-approve**: No -- requires user confirmation (makes network requests).
+- **What it does**: Searches the web and returns ranked results with titles, URLs, and content snippets. Uses provider-native search when available:
+  - **Anthropic**: Replaced at the API boundary with Anthropic's `web_search_20250305` server-side tool. Claude decides when to search; the API executes it and returns results with citations inline. No Tavily key needed.
+  - **OpenAI search models** (`gpt-5-search-api`): Replaced with `web_search_options` parameter. The model always searches and returns `url_citation` annotations.
+  - **Local/vLLM models**: Falls back to the Tavily API. Requires `tavily_key` in `config.toml` or `$TAVILY_API_KEY`.
+- **Auto-approve**: Yes (auto-approved for all tool dispatch paths).
 - **Agent availability**: `agent` and `task_agent`.
 
 ---

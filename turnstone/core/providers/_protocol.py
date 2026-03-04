@@ -43,6 +43,7 @@ class StreamChunk:
     usage: UsageInfo | None = None
     finish_reason: str | None = None
     is_first: bool = False
+    info_delta: str = ""
 
 
 @dataclass
@@ -72,6 +73,7 @@ class ModelCapabilities:
     effort_levels: tuple[str, ...] = ()
     reasoning_effort_values: tuple[str, ...] = ()
     default_reasoning_effort: str = "medium"
+    supports_web_search: bool = False
 
 
 def _lookup_capabilities(

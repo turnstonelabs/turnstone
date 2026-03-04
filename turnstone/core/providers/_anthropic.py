@@ -61,6 +61,9 @@ def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+# Tool version for Anthropic's server-side web search (update when new version ships)
+_WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
+
 # -- model capabilities -------------------------------------------------------
 
 _ANTHROPIC_DEFAULT = ModelCapabilities(
@@ -68,6 +71,7 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
     max_output_tokens=64000,
     token_param="max_tokens",
     thinking_mode="manual",
+    supports_web_search=True,
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
@@ -78,6 +82,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="adaptive",
         supports_effort=True,
         effort_levels=("low", "medium", "high", "max"),
+        supports_web_search=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
         context_window=200000,
@@ -86,18 +91,21 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="adaptive",
         supports_effort=True,
         effort_levels=("low", "medium", "high"),
+        supports_web_search=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
         context_window=200000,
         max_output_tokens=64000,
         token_param="max_tokens",
         thinking_mode="manual",
+        supports_web_search=True,
     ),
     "claude-sonnet-4-5": ModelCapabilities(
         context_window=200000,
         max_output_tokens=64000,
         token_param="max_tokens",
         thinking_mode="manual",
+        supports_web_search=True,
     ),
     "claude-opus-4-5": ModelCapabilities(
         context_window=200000,
@@ -106,18 +114,21 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_effort=True,
         effort_levels=("low", "medium", "high"),
+        supports_web_search=True,
     ),
     "claude-opus-4": ModelCapabilities(
         context_window=200000,
         max_output_tokens=32000,
         token_param="max_tokens",
         thinking_mode="manual",
+        supports_web_search=True,
     ),
     "claude-sonnet-4": ModelCapabilities(
         context_window=200000,
         max_output_tokens=64000,
         token_param="max_tokens",
         thinking_mode="manual",
+        supports_web_search=True,
     ),
 }
 
@@ -146,6 +157,30 @@ class AnthropicProvider:
 
     def get_capabilities(self, model: str) -> ModelCapabilities:
         return _lookup_capabilities(model, _ANTHROPIC_CAPABILITIES, _ANTHROPIC_DEFAULT)
+
+    # -- web search tool injection -------------------------------------------
+
+    def _inject_web_search(
+        self,
+        tools: list[dict[str, Any]],
+        caps: ModelCapabilities,
+    ) -> list[dict[str, Any]]:
+        """Replace ``web_search`` function tool with native server-side tool.
+
+        If the tools list contains a ``web_search`` function tool and the model
+        supports native web search, replace it with Anthropic's
+        ``web_search_20250305`` server-side tool.  The server executes the search
+        autonomously — no client-side tool execution loop needed.
+        """
+        if not caps.supports_web_search:
+            return tools
+        has_web_search = any(t.get("name") == "web_search" for t in tools)
+        if not has_web_search:
+            return tools
+        # Remove the function-based web_search and add the native tool
+        filtered = [t for t in tools if t.get("name") != "web_search"]
+        filtered.append({"type": _WEB_SEARCH_TOOL_TYPE, "name": "web_search"})
+        return filtered
 
     # -- shared param logic --------------------------------------------------
 
@@ -180,7 +215,9 @@ class AnthropicProvider:
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
-            kwargs["tools"] = self.convert_tools(tools)
+            anthropic_tools = self.convert_tools(tools)
+            anthropic_tools = self._inject_web_search(anthropic_tools, caps)
+            kwargs["tools"] = anthropic_tools
         kwargs.update(thinking_params)
 
         # Effort param for models that support it (Opus 4.6, Sonnet 4.6, Opus 4.5)
@@ -351,6 +388,8 @@ class AnthropicProvider:
         # Map content block index → tool call index for our accumulator
         tool_block_to_index: dict[int, int] = {}
         next_tool_index = 0
+        # Track server-side tool blocks (web search) — accumulate query input
+        server_tool_blocks: dict[int, dict[str, str]] = {}
 
         for event in stream:
             sc = StreamChunk()
@@ -365,6 +404,26 @@ class AnthropicProvider:
                     sc.tool_call_deltas.append(
                         ToolCallDelta(index=idx, id=block.id, name=block.name)
                     )
+                elif block.type == "server_tool_use":
+                    # Server-side tool (web search) — track for query accumulation
+                    server_tool_blocks[event.index] = {
+                        "name": getattr(block, "name", ""),
+                        "input_json": "",
+                    }
+                elif block.type == "web_search_tool_result":
+                    # Search results arrived — count results for info display
+                    content = getattr(block, "content", None)
+                    if isinstance(content, list):
+                        n = sum(
+                            1 for r in content if getattr(r, "type", None) == "web_search_result"
+                        )
+                        sc.info_delta = f"[Found {n} result{'s' if n != 1 else ''}]"
+                    elif (
+                        content is not None
+                        and getattr(content, "type", None) == "web_search_tool_result_error"
+                    ):
+                        code = getattr(content, "error_code", "unknown")
+                        sc.info_delta = f"[Web search error: {code}]"
 
             elif event_type == "content_block_delta":
                 delta = event.delta
@@ -373,13 +432,29 @@ class AnthropicProvider:
                 elif delta.type == "thinking_delta":
                     sc.reasoning_delta = delta.thinking
                 elif delta.type == "input_json_delta":
-                    tool_idx = tool_block_to_index.get(event.index, event.index)
-                    sc.tool_call_deltas.append(
-                        ToolCallDelta(
-                            index=tool_idx,
-                            arguments_delta=delta.partial_json,
+                    if event.index in server_tool_blocks:
+                        # Accumulate server tool input (search query)
+                        server_tool_blocks[event.index]["input_json"] += delta.partial_json
+                    else:
+                        tool_idx = tool_block_to_index.get(event.index, event.index)
+                        sc.tool_call_deltas.append(
+                            ToolCallDelta(
+                                index=tool_idx,
+                                arguments_delta=delta.partial_json,
+                            )
                         )
-                    )
+
+            elif event_type == "content_block_stop":
+                # When a server tool block completes, emit search query info
+                if event.index in server_tool_blocks:
+                    info = server_tool_blocks.pop(event.index)
+                    query = ""
+                    try:
+                        parsed = json.loads(info["input_json"])
+                        query = parsed.get("query", "")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    sc.info_delta = f"[Searching: {query}]" if query else "[Searching...]"
 
             elif event_type == "message_delta":
                 if hasattr(event, "usage") and event.usage:
@@ -408,7 +483,7 @@ class AnthropicProvider:
                 sc.is_first = True
                 first = False
 
-            if has_content or sc.finish_reason or sc.usage:
+            if has_content or sc.finish_reason or sc.usage or sc.info_delta:
                 yield sc
 
     # -- non-streaming -------------------------------------------------------
@@ -442,7 +517,9 @@ class AnthropicProvider:
 
         response = client.messages.create(**kwargs)
 
-        # Extract content and tool_calls from content blocks
+        # Extract content and tool_calls from content blocks.
+        # Skip server-side blocks (server_tool_use, web_search_tool_result)
+        # which are handled server-side and don't require client execution.
         content_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         for block in response.content:
@@ -459,6 +536,7 @@ class AnthropicProvider:
                         },
                     }
                 )
+            # server_tool_use, web_search_tool_result — skip (server-handled)
 
         finish_reason = _normalize_finish_reason(response.stop_reason or "end_turn")
 
@@ -502,4 +580,7 @@ def _normalize_finish_reason(reason: str) -> str:
         return "tool_calls"
     if reason == "max_tokens":
         return "length"
+    if reason == "pause_turn":
+        # Server-side tool (web search) paused a long turn; treat as stop
+        return "stop"
     return reason
