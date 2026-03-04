@@ -8,10 +8,12 @@ from typing import TYPE_CHECKING, Any
 from starlette.responses import HTMLResponse, Response
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from starlette.requests import Request
 
 
-def make_openapi_handler(spec: dict[str, Any]):
+def make_openapi_handler(spec: dict[str, Any]) -> Callable[..., Awaitable[Response]]:
     """Create a /openapi.json handler that serves a pre-built spec."""
     cached = json.dumps(spec, indent=2)
 
@@ -21,7 +23,9 @@ def make_openapi_handler(spec: dict[str, Any]):
     return openapi_json
 
 
-def make_docs_handler(openapi_path: str = "/openapi.json"):
+def make_docs_handler(
+    openapi_path: str = "/openapi.json",
+) -> Callable[..., Awaitable[HTMLResponse]]:
     """Create a /docs handler that serves SwaggerUI loaded from CDN."""
     html = (
         '<!DOCTYPE html><html lang="en"><head>'

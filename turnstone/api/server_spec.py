@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 from turnstone.api.schemas import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -151,7 +154,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     ),
 ]
 
-_ALL_MODELS = [
+_ALL_MODELS: list[type[BaseModel]] = [
     ErrorResponse,
     StatusResponse,
     AuthLoginRequest,
