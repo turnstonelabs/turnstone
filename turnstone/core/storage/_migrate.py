@@ -25,7 +25,7 @@ def run_migrations(storage: Any, backend: str) -> None:
     # Build Alembic config programmatically (no alembic.ini needed)
     cfg = Config()
     cfg.set_main_option("script_location", _MIGRATIONS_DIR)
-    cfg.set_main_option("sqlalchemy.url", str(engine.url))
+    cfg.set_main_option("sqlalchemy.url", engine.url.render_as_string(hide_password=False))
 
     # Check if this is an existing database without alembic_version
     if backend == "sqlite":
