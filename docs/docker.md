@@ -84,8 +84,26 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TURNSTONE_AUTH_ENABLED` | — | Set to `1` to require Bearer token auth |
-| `TURNSTONE_AUTH_TOKEN` | — | Shared auth token for server/bridge/console |
+| `TURNSTONE_AUTH_ENABLED` | — | Set to `1` to require authentication |
+| `TURNSTONE_AUTH_TOKEN` | — | Config-file token for server/bridge/console (backward compat, works alongside JWT) |
+| `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required when using user identity / JWT auth) |
+
+### Database
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURNSTONE_DB_BACKEND` | `sqlite` | Storage backend: `sqlite` or `postgresql` |
+| `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql://user:pass@db:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
+
+The database stores workstream history, user accounts, and API tokens. When using JWT auth, a database backend is required for user storage.
+
+> **First-time setup:** After deploying with auth enabled, create an initial admin user by running `turnstone-admin create-user` inside the container:
+>
+> ```bash
+> docker compose exec server turnstone-admin create-user --username admin --scopes read,write,approve
+> ```
+>
+> This prints a one-time password. Use it to log in via the UI or SDK, then create additional users through the admin API.
 
 ### Simulator
 

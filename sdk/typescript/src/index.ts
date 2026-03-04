@@ -90,6 +90,8 @@ export type {
   HealthResponse,
   AuthLoginRequest,
   AuthLoginResponse,
+  AuthStatusResponse,
+  AuthSetupResponse,
   StatusResponse,
   ErrorResponse,
   ClusterOverviewResponse,

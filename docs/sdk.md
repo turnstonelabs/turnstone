@@ -15,8 +15,10 @@ The Python SDK is included in the `turnstone` package — no extra install requi
 ```python
 from turnstone.sdk import TurnstoneServer
 
-# Synchronous client
-with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+# Synchronous client — login with username/password
+with TurnstoneServer("http://localhost:8080") as client:
+    client.login("alice", "s3cret")
+
     # Create a workstream
     ws = client.create_workstream(name="Analysis")
 
@@ -33,6 +35,15 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
     client.close_workstream(ws.ws_id)
 ```
 
+Alternatively, authenticate with an API token:
+
+```python
+with TurnstoneServer("http://localhost:8080") as client:
+    client.login(token="ts_abc123...")
+    ws = client.create_workstream(name="CI run")
+    result = client.send_and_wait("Run the test suite.", ws.ws_id)
+```
+
 ### Async Client
 
 ```python
@@ -40,7 +51,8 @@ import asyncio
 from turnstone.sdk import AsyncTurnstoneServer
 
 async def main():
-    async with AsyncTurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+    async with AsyncTurnstoneServer("http://localhost:8080") as client:
+        await client.login("alice", "s3cret")
         ws = await client.create_workstream(name="demo")
         async for event in client.stream_events(ws.ws_id):
             if event.type == "content":
@@ -67,8 +79,10 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
 | **Sessions** | `list_sessions()` | `ListSessionsResponse` |
-| **Auth** | `login(token)` | `AuthLoginResponse` |
+| **Auth** | `login(username, password)` | `AuthLoginResponse` |
+| | `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
+| | `auth_status()` | `AuthStatusResponse` |
 | **Health** | `health()` | `HealthResponse` |
 
 ### Console Client API
@@ -83,7 +97,8 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `node_detail(node_id)` | `NodeDetailResponse` |
 | | `create_workstream(*, node_id, name, model, initial_message)` | `ConsoleCreateWsResponse` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |
-| **Auth** | `login(token)` / `logout()` | `AuthLoginResponse` / `StatusResponse` |
+| **Auth** | `login(username, password)` / `login(token="ts_xxx")` | `AuthLoginResponse` |
+| | `logout()` | `StatusResponse` |
 | **Health** | `health()` | `ConsoleHealthResponse` |
 
 ### Event Types
@@ -165,10 +180,11 @@ Located at `sdk/typescript/`. Zero runtime dependencies for browsers; uses nativ
 ```typescript
 import { TurnstoneServer } from "@turnstone/sdk";
 
-const client = new TurnstoneServer({
-  baseUrl: "http://localhost:8080",
-  token: "tok_xxx",
-});
+const client = new TurnstoneServer({ baseUrl: "http://localhost:8080" });
+
+// Login with username/password or API token
+await client.login("alice", "s3cret");
+// or: await client.login({ token: "ts_abc123..." });
 
 // Create workstream and send message
 const ws = await client.createWorkstream({ name: "demo" });
@@ -188,16 +204,14 @@ for await (const event of client.streamEvents(ws.ws_id)) {
 ```typescript
 import { TurnstoneConsole } from "@turnstone/sdk";
 
-const console = new TurnstoneConsole({
-  baseUrl: "http://localhost:8081",
-  token: "tok_xxx",
-});
+const client = new TurnstoneConsole({ baseUrl: "http://localhost:8090" });
+await client.login("alice", "s3cret");
 
-const overview = await console.overview();
+const overview = await client.overview();
 console.log(`Nodes: ${overview.nodes}, Workstreams: ${overview.workstreams}`);
 
 // Stream cluster events
-for await (const event of console.clusterEvents()) {
+for await (const event of client.clusterEvents()) {
   console.log(event.type, event);
 }
 ```
@@ -256,3 +270,38 @@ sdk/typescript/              TypeScript SDK (npm package)
 The Python SDK reuses Pydantic models from `turnstone/api/` directly — no schema duplication. The TypeScript SDK has hand-written interfaces matching those models.
 
 Both SDKs follow the same design: typed methods for REST endpoints, async iterators for SSE streams, and a high-level `send_and_wait` method for simple request-response patterns.
+
+---
+
+## Authentication
+
+When auth is enabled on the server, the SDK handles JWT-based authentication automatically.
+
+### Login Flow
+
+There are two ways to authenticate:
+
+1. **Username + password** — calls `POST /v1/api/auth/login` with credentials. The server validates against the user database and returns a JWT.
+
+2. **API token** — calls `POST /v1/api/auth/login` with a `ts_`-prefixed token string. The server looks up the token, resolves the associated user, and returns a JWT.
+
+In both cases the server returns the JWT in the response body and as a `Set-Cookie` header. The SDK extracts the JWT and includes it as a `Bearer` token in the `Authorization` header on all subsequent requests.
+
+```python
+# Username + password
+client.login("alice", "s3cret")
+
+# API token (created via admin API or turnstone-admin CLI)
+client.login(token="ts_abc123...")
+```
+
+### Token Lifecycle
+
+- JWTs have a configurable expiry (default: 24 hours).
+- `client.auth_status()` returns the current user identity and scopes without refreshing the token.
+- `client.logout()` clears the stored JWT from the client.
+- If a request returns 401, the SDK raises `TurnstoneAPIError` — the caller is responsible for re-authenticating.
+
+### Backward Compatibility
+
+The config-file token (`TURNSTONE_AUTH_TOKEN`) still works as a simple Bearer token for environments that do not use the user/JWT system. When the server receives a non-JWT Bearer token, it falls back to the legacy token check.

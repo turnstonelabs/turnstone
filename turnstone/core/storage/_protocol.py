@@ -21,6 +21,7 @@ class StorageBackend(Protocol):
         title: str | None = None,
         node_id: str | None = None,
         ws_id: str | None = None,
+        user_id: str | None = None,
     ) -> None:
         """Create a sessions row for a new session (no-op if already exists)."""
         ...
@@ -114,6 +115,7 @@ class StorageBackend(Protocol):
         node_id: str | None = None,
         name: str = "",
         state: str = "idle",
+        user_id: str | None = None,
     ) -> None:
         """Create a workstreams row (no-op if already exists)."""
         ...
@@ -142,6 +144,61 @@ class StorageBackend(Protocol):
 
     def search_history_recent(self, limit: int = 20) -> list[Any]:
         """Return most recent conversation messages."""
+        ...
+
+    # -- User identity operations -----------------------------------------------
+
+    def create_user(
+        self, user_id: str, username: str, display_name: str, password_hash: str
+    ) -> None:
+        """Create a user row. No-op if user_id already exists."""
+        ...
+
+    def create_first_user(
+        self, user_id: str, username: str, display_name: str, password_hash: str
+    ) -> bool:
+        """Atomically create a user only if no users exist. Returns True if created."""
+        ...
+
+    def get_user(self, user_id: str) -> dict[str, str] | None:
+        """Return user dict {user_id, username, display_name, password_hash, created} or None."""
+        ...
+
+    def get_user_by_username(self, username: str) -> dict[str, str] | None:
+        """Lookup user by username. Returns same dict as get_user or None."""
+        ...
+
+    def list_users(self) -> list[dict[str, str]]:
+        """Return all users ordered by created DESC."""
+        ...
+
+    def delete_user(self, user_id: str) -> bool:
+        """Delete user and cascade-delete all their tokens. Returns True if existed."""
+        ...
+
+    def create_api_token(
+        self,
+        token_id: str,
+        token_hash: str,
+        token_prefix: str,
+        user_id: str,
+        name: str,
+        scopes: str,
+        expires: str | None = None,
+    ) -> None:
+        """Store a hashed API token."""
+        ...
+
+    def get_api_token_by_hash(self, token_hash: str) -> dict[str, str] | None:
+        """Lookup token by SHA-256 hash. Returns dict with all columns or None."""
+        ...
+
+    def list_api_tokens(self, user_id: str) -> list[dict[str, str]]:
+        """List tokens for a user (no hash in results, prefix only)."""
+        ...
+
+    def delete_api_token(self, token_id: str) -> bool:
+        """Revoke/delete a token by ID. Returns True if existed."""
         ...
 
     # -- Lifecycle -------------------------------------------------------------

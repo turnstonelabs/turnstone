@@ -545,6 +545,8 @@ function connectContentSSE(wsId) {
   contentEvtSource.onerror = function () {
     contentEvtSource.close();
     contentEvtSource = null;
+    var loginOverlay = document.getElementById("login-overlay");
+    if (loginOverlay && loginOverlay.style.display !== "none") return;
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
     // Raw fetch (not authFetch) — need to inspect status before throwing
