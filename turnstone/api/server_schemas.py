@@ -39,11 +39,18 @@ class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")
+    resume_session: str = Field(
+        default="",
+        description="Session ID to resume atomically during creation (empty = fresh start)",
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):
     ws_id: str = Field(description="Unique ID of the new workstream")
     name: str = Field(description="Assigned workstream name")
+    resumed: bool = Field(default=False, description="Whether a previous session was resumed")
+    session_id: str = Field(default="", description="Resolved session ID (set when resumed)")
+    message_count: int = Field(default=0, description="Number of messages in the resumed session")
 
 
 class CloseWorkstreamRequest(BaseModel):

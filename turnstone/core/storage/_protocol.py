@@ -201,6 +201,54 @@ class StorageBackend(Protocol):
         """Revoke/delete a token by ID. Returns True if existed."""
         ...
 
+    # -- Channel user mapping ---------------------------------------------------
+
+    def create_channel_user(self, channel_type: str, channel_user_id: str, user_id: str) -> None:
+        """Map an external channel user to a turnstone user_id. No-op if exists."""
+        ...
+
+    def get_channel_user(self, channel_type: str, channel_user_id: str) -> dict[str, str] | None:
+        """Lookup turnstone user for a channel user. Returns dict or None."""
+        ...
+
+    def list_channel_users_by_user(self, user_id: str) -> list[dict[str, str]]:
+        """List all channel mappings for a turnstone user."""
+        ...
+
+    def delete_channel_user(self, channel_type: str, channel_user_id: str) -> bool:
+        """Remove a channel user mapping. Returns True if existed."""
+        ...
+
+    # -- Session lookup by workstream ------------------------------------------
+
+    def get_session_id_by_ws(self, ws_id: str) -> str | None:
+        """Find the session_id associated with a workstream. Returns None if not found."""
+        ...
+
+    # -- Channel routing -------------------------------------------------------
+
+    def create_channel_route(
+        self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
+    ) -> None:
+        """Map a channel/thread to a workstream. No-op if exists."""
+        ...
+
+    def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
+        """Lookup workstream for a channel/thread."""
+        ...
+
+    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
+        """Reverse lookup: find channel/thread for a workstream."""
+        ...
+
+    def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
+        """List all routes for a channel type, ordered by created DESC."""
+        ...
+
+    def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
+        """Remove a channel route. Returns True if existed."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

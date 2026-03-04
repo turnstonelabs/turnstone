@@ -50,6 +50,7 @@ console = ["redis>=7.2"]
 sim = ["redis>=7.2"]
 anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
+discord = ["discord.py>=2.4", "redis>=7.2"]
 
 
 [project.scripts]
@@ -60,6 +61,7 @@ turnstone-bridge = "turnstone.mq.bridge:main"
 turnstone-console = "turnstone.console.server:main"
 turnstone-sim = "turnstone.sim.cli:main"
 turnstone-admin = "turnstone.admin:main"
+turnstone-channel = "turnstone.channels.cli:main"
 
 [tool.hatch.build.targets.wheel]
 include = [
@@ -143,6 +145,16 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["anthropic", "anthropic.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["discord", "discord.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["turnstone.channels.discord.*"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
 module = "tests.*"

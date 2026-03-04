@@ -3,10 +3,15 @@
 var _adminTab = "users";
 var _adminUsers = [];
 var _adminTokenUserId = "";
+var _adminChannelUserId = "";
 var _lastCreatedToken = "";
 var _cuTrapHandler = null;
 var _ctTrapHandler = null;
 var _tcTrapHandler = null;
+var _ccTrapHandler = null;
+var _cfTrapHandler = null;
+var _confirmCallbackFn = null;
+var _confirmTriggerEl = null;
 
 // ---------------------------------------------------------------------------
 // View switching (called from app.js showOverview/drillDown pattern)
@@ -39,9 +44,12 @@ function switchAdminTab(tab) {
     tab === "users" ? "" : "none";
   document.getElementById("admin-tokens").style.display =
     tab === "tokens" ? "" : "none";
+  document.getElementById("admin-channels").style.display =
+    tab === "channels" ? "" : "none";
 
   if (tab === "users") loadAdminUsers();
   if (tab === "tokens") _populateTokenUserSelect();
+  if (tab === "channels") _populateChannelUserSelect();
 }
 
 // ---------------------------------------------------------------------------
@@ -109,18 +117,26 @@ function _renderUsers(users) {
 }
 
 function confirmDeleteUser(userId, username) {
-  if (!confirm("Delete user '" + username + "' and all their tokens?")) return;
-  authFetch("/v1/api/admin/users/" + encodeURIComponent(userId), {
-    method: "DELETE",
-  })
-    .then(function (r) {
-      if (!r.ok) throw new Error("Delete failed");
-      showToast("User '" + username + "' deleted");
-      loadAdminUsers();
-    })
-    .catch(function () {
-      showToast("Failed to delete user");
-    });
+  showConfirmModal(
+    "Delete User",
+    "Delete user \u2018" +
+      username +
+      "\u2019 and all their tokens and channel links? This cannot be undone.",
+    "Delete",
+    function () {
+      authFetch("/v1/api/admin/users/" + encodeURIComponent(userId), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Delete failed");
+          showToast("User '" + username + "' deleted");
+          loadAdminUsers();
+        })
+        .catch(function () {
+          showToast("Failed to delete user");
+        });
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -224,17 +240,213 @@ function _renderScopeBadges(scopes) {
 }
 
 function confirmRevokeToken(tokenId) {
-  if (!confirm("Revoke this token? This cannot be undone.")) return;
-  authFetch("/v1/api/admin/tokens/" + encodeURIComponent(tokenId), {
-    method: "DELETE",
-  })
+  showConfirmModal(
+    "Revoke Token",
+    "Revoke this API token? Existing JWTs issued from it will remain valid until they expire (max 24h). This cannot be undone.",
+    "Revoke",
+    function () {
+      authFetch("/v1/api/admin/tokens/" + encodeURIComponent(tokenId), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Revoke failed");
+          showToast("Token revoked");
+          loadAdminTokens();
+        })
+        .catch(function () {
+          showToast("Failed to revoke token");
+        });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Channels
+// ---------------------------------------------------------------------------
+
+function _populateChannelUserSelect() {
+  var sel = document.getElementById("admin-channel-user");
+  var current = sel.value;
+  sel.innerHTML = '<option value="">Select user...</option>';
+  for (var i = 0; i < _adminUsers.length; i++) {
+    var u = _adminUsers[i];
+    var opt = document.createElement("option");
+    opt.value = u.user_id;
+    opt.textContent = u.username + " (" + u.display_name + ")";
+    sel.appendChild(opt);
+  }
+  if (current) sel.value = current;
+}
+
+function loadAdminChannels() {
+  var userId = document.getElementById("admin-channel-user").value;
+  _adminChannelUserId = userId;
+  if (!userId) {
+    document.getElementById("admin-channels-table").innerHTML =
+      '<div class="dashboard-empty">Select a user to view channel links</div>';
+    return;
+  }
+  document.getElementById("admin-channels-table").innerHTML =
+    '<div class="dashboard-empty">Loading channel links...</div>';
+  authFetch("/v1/api/admin/users/" + encodeURIComponent(userId) + "/channels")
     .then(function (r) {
-      if (!r.ok) throw new Error("Revoke failed");
-      showToast("Token revoked");
-      loadAdminTokens();
+      if (!r.ok) throw new Error("Failed to load channels");
+      return r.json();
+    })
+    .then(function (data) {
+      _renderChannels(data.channels || []);
     })
     .catch(function () {
-      showToast("Failed to revoke token");
+      document.getElementById("admin-channels-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load channel links</div>';
+    });
+}
+
+function _renderChannels(channels) {
+  var container = document.getElementById("admin-channels-table");
+  if (!channels.length) {
+    container.innerHTML =
+      '<div class="dashboard-empty">No channel links for this user</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < channels.length; i++) {
+    var c = channels[i];
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-chtype"><span class="scope-badge scope-channel">' +
+      escapeHtml(c.channel_type) +
+      "</span></span>" +
+      '<span class="admin-col admin-col-chuid"><code>' +
+      escapeHtml(c.channel_user_id) +
+      "</code></span>" +
+      '<span class="admin-col admin-col-created">' +
+      escapeHtml(c.created || "").slice(0, 10) +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      '<button class="admin-btn-danger" data-unlink-type="' +
+      escapeHtml(c.channel_type) +
+      '" data-unlink-uid="' +
+      escapeHtml(c.channel_user_id) +
+      '" title="Unlink channel account">unlink</button>' +
+      "</span>" +
+      "</div>";
+  }
+  container.innerHTML = html;
+  var btns = container.querySelectorAll("[data-unlink-type]");
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].addEventListener("click", function () {
+      confirmUnlinkChannel(
+        this.getAttribute("data-unlink-type"),
+        this.getAttribute("data-unlink-uid"),
+      );
+    });
+  }
+}
+
+function confirmUnlinkChannel(channelType, channelUserId) {
+  showConfirmModal(
+    "Unlink Channel",
+    "Unlink " +
+      channelType +
+      " account \u2018" +
+      channelUserId +
+      "\u2019? The user will need to re-link via /link to interact with the bot.",
+    "Unlink",
+    function () {
+      authFetch(
+        "/v1/api/admin/channels/" +
+          encodeURIComponent(channelType) +
+          "/" +
+          encodeURIComponent(channelUserId),
+        { method: "DELETE" },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error("Unlink failed");
+          showToast("Channel account unlinked");
+          loadAdminChannels();
+        })
+        .catch(function () {
+          showToast("Failed to unlink channel account");
+        });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Create Channel Link Modal
+// ---------------------------------------------------------------------------
+
+function showCreateChannelModal() {
+  if (!_adminChannelUserId) {
+    showToast("Select a user first");
+    return;
+  }
+  var overlay = document.getElementById("create-channel-overlay");
+  overlay.style.display = "flex";
+  document.getElementById("create-channel-error").style.display = "none";
+  document.getElementById("cc-type").value = "discord";
+  document.getElementById("cc-uid").value = "";
+  document.getElementById("cc-submit").disabled = false;
+  document.getElementById("cc-submit").textContent = "Link";
+  _ccTrapHandler = _installTrap("create-channel-overlay", "create-channel-box");
+  setTimeout(function () {
+    document.getElementById("cc-uid").focus();
+  }, 50);
+}
+
+function hideCreateChannelModal() {
+  document.getElementById("create-channel-overlay").style.display = "none";
+  _ccTrapHandler = _removeTrap(_ccTrapHandler);
+  var trigger = document.querySelector("#admin-channels .admin-action-btn");
+  if (trigger) trigger.focus();
+}
+
+function submitCreateChannel() {
+  var channelType = document.getElementById("cc-type").value;
+  var channelUserId = (document.getElementById("cc-uid").value || "").trim();
+  var errEl = document.getElementById("create-channel-error");
+
+  if (!channelUserId)
+    return _showModalError(errEl, "External user ID is required");
+
+  var btn = document.getElementById("cc-submit");
+  btn.disabled = true;
+  btn.textContent = "Linking\u2026";
+
+  authFetch(
+    "/v1/api/admin/users/" +
+      encodeURIComponent(_adminChannelUserId) +
+      "/channels",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        channel_type: channelType,
+        channel_user_id: channelUserId,
+      }),
+    },
+  )
+    .then(function (r) {
+      if (r.status === 409)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Already linked");
+        });
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreateChannelModal();
+      showToast("Channel account linked");
+      loadAdminChannels();
+    })
+    .catch(function (err) {
+      btn.disabled = false;
+      btn.textContent = "Link";
+      _showModalError(errEl, err.message || "Failed to link channel account");
     });
 }
 
@@ -261,6 +473,8 @@ function showCreateUserModal() {
 function hideCreateUserModal() {
   document.getElementById("create-user-overlay").style.display = "none";
   _cuTrapHandler = _removeTrap(_cuTrapHandler);
+  var trigger = document.querySelector("#admin-users .admin-action-btn");
+  if (trigger) trigger.focus();
 }
 
 function submitCreateUser() {
@@ -339,6 +553,8 @@ function showCreateTokenModal() {
 function hideCreateTokenModal() {
   document.getElementById("create-token-overlay").style.display = "none";
   _ctTrapHandler = _removeTrap(_ctTrapHandler);
+  var trigger = document.querySelector("#admin-tokens .admin-action-btn");
+  if (trigger) trigger.focus();
 }
 
 function submitCreateToken() {
@@ -396,6 +612,8 @@ function hideTokenCreatedModal() {
   document.getElementById("token-created-overlay").style.display = "none";
   _tcTrapHandler = _removeTrap(_tcTrapHandler);
   _lastCreatedToken = "";
+  var trigger = document.querySelector("#admin-tokens .admin-action-btn");
+  if (trigger) trigger.focus();
 }
 
 function copyCreatedToken() {
@@ -458,6 +676,9 @@ function _installTrap(overlayId, boxId, trapRef) {
         if (overlayId === "create-user-overlay") hideCreateUserModal();
         else if (overlayId === "create-token-overlay") hideCreateTokenModal();
         else if (overlayId === "token-created-overlay") hideTokenCreatedModal();
+        else if (overlayId === "create-channel-overlay")
+          hideCreateChannelModal();
+        else if (overlayId === "confirm-overlay") hideConfirmModal();
       }
     };
   }
@@ -494,6 +715,18 @@ document.addEventListener("keydown", function (e) {
     hideTokenCreatedModal();
     return;
   }
+  var cc = document.getElementById("create-channel-overlay");
+  if (cc && cc.style.display !== "none") {
+    e.preventDefault();
+    hideCreateChannelModal();
+    return;
+  }
+  var cf = document.getElementById("confirm-overlay");
+  if (cf && cf.style.display !== "none") {
+    e.preventDefault();
+    hideConfirmModal();
+    return;
+  }
 });
 
 // Tab arrow key navigation
@@ -502,7 +735,7 @@ document.addEventListener("keydown", function (e) {
   if (!tablist) return;
   tablist.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var tabOrder = ["users", "tokens"];
+    var tabOrder = ["users", "tokens", "channels"];
     var idx = tabOrder.indexOf(_adminTab);
     if (e.key === "ArrowRight") idx = (idx + 1) % tabOrder.length;
     else idx = (idx - 1 + tabOrder.length) % tabOrder.length;
@@ -513,6 +746,49 @@ document.addEventListener("keydown", function (e) {
     if (btn) btn.focus();
   });
 })();
+
+// ---------------------------------------------------------------------------
+// Confirm Modal (reusable styled replacement for confirm())
+// ---------------------------------------------------------------------------
+
+function showConfirmModal(title, message, actionLabel, callback) {
+  _confirmCallbackFn = callback;
+  _confirmTriggerEl = document.activeElement;
+  document.getElementById("confirm-title").textContent = title;
+  document.getElementById("confirm-message").textContent = message;
+  var btn = document.getElementById("confirm-submit");
+  btn.textContent = actionLabel;
+  btn.disabled = false;
+  var overlay = document.getElementById("confirm-overlay");
+  overlay.style.display = "flex";
+  _cfTrapHandler = _installTrap("confirm-overlay", "confirm-box");
+  setTimeout(function () {
+    btn.focus();
+  }, 50);
+}
+
+function hideConfirmModal() {
+  document.getElementById("confirm-overlay").style.display = "none";
+  _cfTrapHandler = _removeTrap(_cfTrapHandler);
+  if (
+    _confirmTriggerEl &&
+    _confirmTriggerEl.focus &&
+    _confirmTriggerEl.isConnected
+  ) {
+    _confirmTriggerEl.focus();
+  }
+  _confirmCallbackFn = null;
+  _confirmTriggerEl = null;
+}
+
+function _confirmCallback() {
+  var fn = _confirmCallbackFn;
+  _confirmCallbackFn = null;
+  var btn = document.getElementById("confirm-submit");
+  if (btn) btn.disabled = true;
+  if (fn) fn();
+  hideConfirmModal();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers

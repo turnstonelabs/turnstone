@@ -862,9 +862,10 @@ function dashboardResumeSession(sessionId) {
   authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: "{}",
+    body: JSON.stringify({ resume_session: sessionId }),
   })
     .then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
     })
     .then(function (data) {
@@ -872,16 +873,10 @@ function dashboardResumeSession(sessionId) {
       workstreams[data.ws_id] = { name: data.name, state: "idle" };
       switchTab(data.ws_id);
       hideDashboard();
-      authFetch("/v1/api/command", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          ws_id: data.ws_id,
-          command: "/resume " + sessionId,
-        }),
-      }).catch(function (err) {
-        addErrorMessage("Failed to resume: " + err.message);
-      });
+      // Resume handled atomically by server — history arrives via SSE.
+    })
+    .catch(function (err) {
+      showToast("Failed to resume session", "error");
     });
 }
 function dashboardNewChat() {

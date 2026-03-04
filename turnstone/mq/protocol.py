@@ -95,6 +95,7 @@ class CreateWorkstreamMessage(InboundMessage):
     target_node: str = ""
     model: str = ""
     initial_message: str = ""
+    resume_session: str = ""
 
 
 @dataclass
@@ -273,6 +274,10 @@ class WorkstreamCreatedEvent(OutboundEvent):
 
     type: str = "ws_created"
     name: str = ""
+    node_id: str = ""
+    resumed: bool = False
+    session_id: str = ""
+    message_count: int = 0
 
 
 @dataclass
@@ -328,6 +333,16 @@ class NodeListEvent(OutboundEvent):
 
     type: str = "node_list"
     nodes: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class SessionResumedEvent(OutboundEvent):
+    """Confirmation that a session was resumed during workstream creation."""
+
+    type: str = "session_resumed"
+    session_id: str = ""
+    message_count: int = 0
+    name: str = ""
 
 
 @dataclass
@@ -395,6 +410,7 @@ _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
         ErrorEvent,
         InfoEvent,
         NodeListEvent,
+        SessionResumedEvent,
         ClusterStateEvent,
     ]
 }

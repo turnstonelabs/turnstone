@@ -8,4 +8,19 @@ commands and subscribe to progress.
 from turnstone.mq.broker import MessageBroker, RedisBroker
 from turnstone.mq.client import TurnResult, TurnstoneClient
 
-__all__ = ["MessageBroker", "RedisBroker", "TurnstoneClient", "TurnResult"]
+__all__ = [
+    "AsyncRedisBroker",
+    "MessageBroker",
+    "RedisBroker",
+    "TurnstoneClient",
+    "TurnResult",
+]
+
+
+def __getattr__(name: str) -> object:
+    if name == "AsyncRedisBroker":
+        from turnstone.mq.async_broker import AsyncRedisBroker
+
+        return AsyncRedisBroker
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)

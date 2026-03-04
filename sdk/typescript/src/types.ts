@@ -71,11 +71,15 @@ export interface CreateWorkstreamRequest {
   name?: string;
   model?: string;
   auto_approve?: boolean;
+  resume_session?: string;
 }
 
 export interface CreateWorkstreamResponse {
   ws_id: string;
   name: string;
+  resumed?: boolean;
+  session_id?: string;
+  message_count?: number;
 }
 
 export interface CloseWorkstreamRequest {
