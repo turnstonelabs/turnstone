@@ -57,7 +57,7 @@ def _make_collector(broker=None, poll_interval=999, discovery_interval=999):
 
 
 def _dashboard_response(workstreams=None, aggregate=None):
-    """Build a /api/dashboard-style response dict."""
+    """Build a /v1/api/dashboard-style response dict."""
     return {
         "workstreams": workstreams or [],
         "aggregate": aggregate
@@ -148,7 +148,7 @@ class TestCollectorDiscovery:
 
 
 class TestCollectorPolling:
-    """Polling /api/dashboard from nodes."""
+    """Polling /v1/api/dashboard from nodes."""
 
     def test_apply_poll_populates_workstreams(self):
         c = _make_collector()

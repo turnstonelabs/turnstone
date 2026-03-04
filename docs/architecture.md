@@ -1031,7 +1031,7 @@ the workstream's `auto_approve_tools` set. If all requested tools are in the set
 bridge auto-approves via `POST /v1/api/approve`. Otherwise, it publishes an
 `ApprovalRequestEvent` to the outbound channel with a `request_id`, then blocks on
 `BLPOP` of a Redis response queue (`turnstone:resp:{request_id}`) until the client pushes
-a response or the approval timeout (default 300s) expires.
+a response or the approval timeout (default 3600s / 1 hour) expires.
 
 **Completion detection:** The bridge tracks which `correlation_id` maps to which
 `ws_id` for active sends. When the global SSE reports `ws_state → idle` for a tracked

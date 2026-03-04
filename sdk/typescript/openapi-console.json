@@ -796,6 +796,12 @@
             "description": "Model alias from node registry",
             "title": "Model",
             "type": "string"
+          },
+          "initial_message": {
+            "default": "",
+            "description": "Optional first message sent after creation",
+            "title": "Initial Message",
+            "type": "string"
           }
         },
         "title": "ConsoleCreateWsRequest",

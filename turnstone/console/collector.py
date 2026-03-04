@@ -1,6 +1,6 @@
 """Cluster state collector — aggregates data from all turnstone nodes.
 
-Discovers nodes via Redis heartbeat keys, polls each node's /api/dashboard
+Discovers nodes via Redis heartbeat keys, polls each node's /v1/api/dashboard
 endpoint for workstream data, and subscribes to the cluster event channel
 for real-time state changes.
 """
@@ -46,7 +46,7 @@ class ClusterCollector:
     Three daemon threads:
     1. Event subscriber — real-time state changes from {prefix}:events:cluster
     2. Node discovery — scans heartbeat keys every ``discovery_interval`` seconds
-    3. Poll loop — fetches /api/dashboard from each node every ``poll_interval`` seconds
+    3. Poll loop — fetches /v1/api/dashboard from each node every ``poll_interval`` seconds
     """
 
     def __init__(
@@ -225,7 +225,7 @@ class ClusterCollector:
     # -- polling -------------------------------------------------------------
 
     def _poll_loop(self) -> None:
-        """Periodically fetch /api/dashboard from each node."""
+        """Periodically fetch /v1/api/dashboard from each node."""
         while self._running:
             try:
                 self._poll_all_nodes()
@@ -258,9 +258,9 @@ class ClusterCollector:
                         self._nodes[nid].reachable = False
 
     def _fetch_node(self, node_id: str, server_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Fetch /api/dashboard and /health from a single node."""
+        """Fetch /v1/api/dashboard and /health from a single node."""
         base = server_url.rstrip("/")
-        dash_resp = self._http_client.get(f"{base}/api/dashboard")
+        dash_resp = self._http_client.get(f"{base}/v1/api/dashboard")
         dash_data: dict[str, Any] = dash_resp.json()
         try:
             health_resp = self._http_client.get(f"{base}/health")

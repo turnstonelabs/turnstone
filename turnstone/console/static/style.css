@@ -584,7 +584,8 @@
   opacity: 0.6;
 }
 #new-ws-box select,
-#new-ws-box input[type="text"] {
+#new-ws-box input[type="text"],
+#new-ws-box textarea {
   width: 100%;
   padding: 9px 12px;
   background: var(--bg);
@@ -595,8 +596,11 @@
   font-size: 13px;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
+#new-ws-box textarea { resize: vertical; min-height: 40px; }
+#new-ws-box textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
 #new-ws-box select:focus,
-#new-ws-box input:focus {
+#new-ws-box input:focus,
+#new-ws-box textarea:focus {
   border-color: var(--accent);
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-dim);

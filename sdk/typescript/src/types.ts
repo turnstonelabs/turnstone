@@ -229,6 +229,7 @@ export interface ConsoleCreateWsRequest {
   node_id?: string;
   name?: string;
   model?: string;
+  initial_message?: string;
 }
 
 export interface ConsoleCreateWsResponse {
