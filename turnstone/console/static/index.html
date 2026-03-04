@@ -14,6 +14,7 @@
   <h1>turnstone <span class="header-dim">console</span></h1>
   <span id="cluster-summary" aria-live="polite"></span>
   <span id="status-bar" role="status" aria-live="polite"></span>
+  <button id="new-ws-btn" class="header-btn header-btn-accent" onclick="showNewWsModal()" title="Create workstream">+ new</button>
   <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
 </div>
@@ -49,7 +50,7 @@
       <span class="dash-col dash-col-ctx">CTX</span>
     </div>
     <div id="node-ws-table" class="dash-table" role="group" aria-label="Workstreams" aria-live="polite"></div>
-    <a id="node-link" class="node-link" target="_blank" rel="noopener">Open node dashboard</a>
+    <a id="node-link" class="node-link" target="_blank" rel="noopener">Open node UI</a>
   </div>
 
   <!-- FILTERED WORKSTREAMS -->
@@ -79,6 +80,26 @@
 </div>
 
 <div id="toast" role="status" aria-live="polite"></div>
+
+<div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
+  <div id="new-ws-box">
+    <h2 id="new-ws-title">New Workstream</h2>
+    <div id="new-ws-error" role="alert" aria-live="assertive"></div>
+    <label for="new-ws-node">Node</label>
+    <select id="new-ws-node">
+      <option value="">Auto (best available)</option>
+    </select>
+    <label for="new-ws-name">Name <span class="label-hint">optional</span></label>
+    <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
+    <label for="new-ws-model">Model <span class="label-hint">optional</span></label>
+    <input id="new-ws-model" type="text" placeholder="Default model" autocomplete="off">
+    <div id="new-ws-buttons">
+      <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
+      <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/app.js"></script>
 </body>
 </html>

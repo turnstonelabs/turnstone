@@ -666,13 +666,9 @@ function drillDownToNode(nodeId, serverUrl) {
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
   var link = document.getElementById("node-link");
-  if (serverUrl) {
-    link.href = serverUrl;
-    link.style.display = "";
-  } else {
-    link.removeAttribute("href");
-    link.style.display = "none";
-  }
+  // Use proxy path so users don't need direct server access
+  link.href = "/node/" + encodeURIComponent(nodeId) + "/";
+  link.style.display = "";
   document.getElementById("main").scrollTop = 0;
   document.getElementById("node-ws-table").innerHTML =
     '<div class="dashboard-empty">Loading workstreams...</div>';
@@ -906,15 +902,20 @@ function renderWsTable(container, wsList) {
     sub.textContent = ws.activity || "";
     row.appendChild(sub);
 
-    // Deep link: click opens server UI at this workstream
-    var wsServerUrl = ws.server_url || currentServerUrl;
-    if (wsServerUrl) {
+    // Deep link: click opens proxied server UI at this workstream
+    var wsNodeId = ws.node;
+    if (wsNodeId) {
       row.classList.add("has-link");
-      (function (url, wsId) {
+      (function (nodeId, wsId) {
         row.onclick = function () {
-          var target = new URL(url);
-          target.searchParams.set("ws_id", wsId);
-          window.open(target.href, "_blank", "noopener");
+          window.open(
+            "/node/" +
+              encodeURIComponent(nodeId) +
+              "/?ws_id=" +
+              encodeURIComponent(wsId),
+            "_blank",
+            "noopener",
+          );
         };
         row.onkeydown = function (e) {
           if (e.key === "Enter" || e.key === " ") {
@@ -922,7 +923,7 @@ function renderWsTable(container, wsList) {
             row.onclick();
           }
         };
-      })(wsServerUrl, ws.id);
+      })(wsNodeId, ws.id);
     } else {
       row.removeAttribute("role");
       row.removeAttribute("tabindex");
@@ -1152,6 +1153,160 @@ document.addEventListener("keydown", function (e) {
       e.preventDefault();
       hideKbHelp();
     }
+  }
+});
+
+// --- New Workstream Modal ---
+var _newWsTrapHandler = null;
+
+function showNewWsModal() {
+  // Don't open if login overlay is active
+  var login = document.getElementById("login-overlay");
+  if (login && login.style.display !== "none") return;
+
+  var overlay = document.getElementById("new-ws-overlay");
+  overlay.style.display = "flex";
+  document.body.style.overflow = "hidden";
+
+  // Backdrop click to dismiss
+  overlay.onclick = function (e) {
+    if (e.target === overlay) hideNewWsModal();
+  };
+
+  var select = document.getElementById("new-ws-node");
+  select.innerHTML =
+    '<option value="">Auto (best node by capacity)</option>' +
+    '<option value="pool">General pool (next available)</option>';
+  authFetch("/api/cluster/nodes?sort=activity&limit=100")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.nodes || []).forEach(function (n) {
+        if (!n.reachable) return;
+        var opt = document.createElement("option");
+        opt.value = n.node_id;
+        opt.textContent =
+          n.node_id +
+          " (" +
+          (n.ws_total || 0) +
+          "/" +
+          (n.max_ws || 10) +
+          " ws)";
+        select.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — auto is always available */
+    });
+  document.getElementById("new-ws-name").value = "";
+  document.getElementById("new-ws-model").value = "";
+  var errEl = document.getElementById("new-ws-error");
+  errEl.style.display = "none";
+  errEl.textContent = "";
+  var btn = document.getElementById("new-ws-submit");
+  btn.disabled = false;
+  btn.textContent = "Create";
+
+  // Focus trap (same pattern as login overlay)
+  if (_newWsTrapHandler)
+    document.removeEventListener("keydown", _newWsTrapHandler);
+  _newWsTrapHandler = function (e) {
+    if (e.key === "Tab") {
+      var box = document.getElementById("new-ws-box");
+      var focusable = box.querySelectorAll("select, input, button");
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault();
+          last.focus();
+        }
+      } else {
+        if (document.activeElement === last) {
+          e.preventDefault();
+          first.focus();
+        }
+      }
+    }
+  };
+  document.addEventListener("keydown", _newWsTrapHandler);
+
+  setTimeout(function () {
+    document.getElementById("new-ws-name").focus();
+  }, 50);
+}
+
+function hideNewWsModal() {
+  document.getElementById("new-ws-overlay").style.display = "none";
+  document.body.style.overflow = "";
+  if (_newWsTrapHandler) {
+    document.removeEventListener("keydown", _newWsTrapHandler);
+    _newWsTrapHandler = null;
+  }
+  var triggerBtn = document.getElementById("new-ws-btn");
+  if (triggerBtn) triggerBtn.focus();
+}
+
+function submitNewWs() {
+  var nodeId = document.getElementById("new-ws-node").value;
+  var name = document.getElementById("new-ws-name").value.trim();
+  var model = document.getElementById("new-ws-model").value.trim();
+  var errEl = document.getElementById("new-ws-error");
+  var btn = document.getElementById("new-ws-submit");
+
+  btn.disabled = true;
+  btn.textContent = "Creating\u2026";
+  errEl.style.display = "none";
+
+  var body = {};
+  if (nodeId) body.node_id = nodeId;
+  if (name) body.name = name;
+  if (model) body.model = model;
+
+  authFetch("/api/cluster/workstreams/new", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      btn.disabled = false;
+      btn.textContent = "Create";
+      if (data.error) {
+        errEl.textContent = data.error;
+        errEl.style.display = "block";
+        return;
+      }
+      hideNewWsModal();
+      var label =
+        data.target_node === "pool"
+          ? "general pool"
+          : data.target_node || "auto";
+      showToast("Workstream created on " + label);
+    })
+    .catch(function () {
+      btn.disabled = false;
+      btn.textContent = "Create";
+      errEl.textContent = "Request failed";
+      errEl.style.display = "block";
+    });
+}
+
+// Escape closes the new-ws modal; Enter submits
+document.addEventListener("keydown", function (e) {
+  var overlay = document.getElementById("new-ws-overlay");
+  if (!overlay || overlay.style.display === "none") return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    hideNewWsModal();
+  }
+  if (e.key === "Enter" && e.target.tagName !== "SELECT") {
+    e.preventDefault();
+    var btn = document.getElementById("new-ws-submit");
+    if (btn && !btn.disabled) submitNewWs();
   }
 });
 

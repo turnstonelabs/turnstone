@@ -640,3 +640,351 @@ class TestConsoleHTTPEndpoints:
     def test_404(self, client):
         resp = client.get("/nonexistent")
         assert resp.status_code == 404
+
+    def test_index_has_new_ws_button(self, client):
+        status, body, ct = self._get_raw(client, "/")
+        assert status == 200
+        assert 'id="new-ws-btn"' in body
+        assert "showNewWsModal" in body
+
+    def test_index_has_new_ws_modal(self, client):
+        status, body, ct = self._get_raw(client, "/")
+        assert 'id="new-ws-overlay"' in body
+        assert 'id="new-ws-node"' in body
+
+
+# ---------------------------------------------------------------------------
+# Workstream creation tests
+# ---------------------------------------------------------------------------
+
+
+class TestConsoleWorkstreamCreation:
+    """Tests for POST /api/cluster/workstreams/new."""
+
+    @pytest.fixture()
+    def mock_collector(self):
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_overview.return_value = {
+            "nodes": 2,
+            "workstreams": 5,
+            "states": {"running": 1, "idle": 4, "thinking": 0, "attention": 0, "error": 0},
+            "aggregate": {"total_tokens": 0, "total_tool_calls": 0},
+        }
+        collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "health": {},
+            "workstreams": [],
+            "aggregate": {},
+            "reachable": True,
+        }
+        collector.get_nodes.return_value = (
+            [
+                {"node_id": "node-a", "reachable": True, "max_ws": 10, "ws_total": 8},
+                {"node_id": "node-b", "reachable": True, "max_ws": 10, "ws_total": 3},
+            ],
+            2,
+        )
+        return collector
+
+    @pytest.fixture()
+    def client_and_broker(self, mock_collector):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import AuthConfig
+
+        _load_static()
+        mock_broker = MagicMock()
+        app = create_app(
+            collector=mock_collector,
+            broker=mock_broker,
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client, mock_broker
+        client.close()
+
+    def test_create_with_explicit_node(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "name": "test-ws"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["target_node"] == "node-a"
+        assert "correlation_id" in data
+        broker.push_inbound.assert_called_once()
+        # Verify the pushed message
+        msg_json = broker.push_inbound.call_args[0][0]
+        msg = json.loads(msg_json)
+        assert msg["type"] == "create_workstream"
+        assert msg["target_node"] == "node-a"
+        assert msg["name"] == "test-ws"
+
+    def test_create_with_model(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "model": "gpt-5"},
+        )
+        assert resp.status_code == 200
+        msg_json = broker.push_inbound.call_args[0][0]
+        msg = json.loads(msg_json)
+        assert msg["model"] == "gpt-5"
+
+    def test_create_auto_selects_best_node(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"name": "auto-test"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # node-b has more headroom (10-3=7 vs 10-8=2)
+        assert data["target_node"] == "node-b"
+
+    def test_create_no_reachable_nodes(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        mock_collector.get_nodes.return_value = ([], 0)
+        resp = client.post("/api/cluster/workstreams/new", json={})
+        assert resp.status_code == 503
+        assert "No reachable nodes" in resp.json()["error"]
+
+    def test_create_unknown_node(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        mock_collector.get_node_detail.return_value = None
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "nonexistent"},
+        )
+        assert resp.status_code == 404
+
+    def test_create_invalid_json(self, client_and_broker):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            content=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+
+    def test_create_pushes_to_directed_queue(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "node-a"},
+        )
+        assert resp.status_code == 200
+        # Verify push_inbound called with node_id kwarg
+        call_kwargs = broker.push_inbound.call_args
+        assert call_kwargs[1]["node_id"] == "node-a"
+
+    def test_create_pool_pushes_to_shared_queue(self, client_and_broker, mock_collector):
+        client, broker = client_and_broker
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "pool", "name": "pool-task"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["target_node"] == "pool"
+        broker.push_inbound.assert_called_once()
+        # Shared queue: no node_id kwarg (or empty)
+        call_args = broker.push_inbound.call_args
+        assert call_args[1].get("node_id", "") == ""
+        # Message should have no target_node
+        msg = json.loads(call_args[0][0])
+        assert msg["type"] == "create_workstream"
+        assert msg["target_node"] == ""
+        assert msg["name"] == "pool-task"
+
+    def test_create_pool_skips_node_validation(self, client_and_broker, mock_collector):
+        """Pool mode doesn't need a valid node_id — it goes to the shared queue."""
+        client, broker = client_and_broker
+        mock_collector.get_node_detail.return_value = None  # would 404 for directed
+        resp = client.post(
+            "/api/cluster/workstreams/new",
+            json={"node_id": "pool"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["target_node"] == "pool"
+
+
+# ---------------------------------------------------------------------------
+# Proxy tests
+# ---------------------------------------------------------------------------
+
+
+class TestConsoleProxy:
+    """Tests for /node/{node_id}/ reverse proxy."""
+
+    @pytest.fixture()
+    def mock_collector(self):
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_overview.return_value = {
+            "nodes": 1,
+            "workstreams": 2,
+            "states": {"running": 0, "idle": 2, "thinking": 0, "attention": 0, "error": 0},
+            "aggregate": {"total_tokens": 0, "total_tool_calls": 0},
+        }
+        collector.get_node_detail.return_value = {
+            "node_id": "node-a",
+            "server_url": "http://a:8080",
+            "health": {},
+            "workstreams": [],
+            "aggregate": {},
+            "reachable": True,
+        }
+        return collector
+
+    @pytest.fixture()
+    def client(self, mock_collector):
+        from starlette.testclient import TestClient
+
+        from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import AuthConfig
+
+        _load_static()
+        app = create_app(
+            collector=mock_collector,
+            broker=MagicMock(),
+            auth_config=AuthConfig(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client
+        client.close()
+
+    def test_proxy_unknown_node_returns_404(self, client, mock_collector):
+        mock_collector.get_node_detail.return_value = None
+        resp = client.get("/node/unknown/")
+        assert resp.status_code == 404
+
+    def test_proxy_static_unknown_node_returns_404(self, client, mock_collector):
+        mock_collector.get_node_detail.return_value = None
+        resp = client.get("/node/unknown/static/app.js")
+        assert resp.status_code == 404
+
+    def test_proxy_api_unknown_node_returns_404(self, client, mock_collector):
+        mock_collector.get_node_detail.return_value = None
+        resp = client.get("/node/unknown/api/workstreams")
+        assert resp.status_code == 404
+
+    def test_proxy_api_post_unknown_node_returns_404(self, client, mock_collector):
+        mock_collector.get_node_detail.return_value = None
+        resp = client.post(
+            "/node/unknown/api/send",
+            json={"message": "hello", "ws_id": "ws1"},
+        )
+        assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Proxy URL rewriting unit tests (no HTTP needed)
+# ---------------------------------------------------------------------------
+
+
+class TestProxyRewriting:
+    """Test the JS shim and HTML rewriting logic."""
+
+    def test_js_shim_contains_prefix_placeholder(self):
+        from turnstone.console.server import _JS_PROXY_SHIM
+
+        assert "PREFIX_PLACEHOLDER" in _JS_PROXY_SHIM
+        replaced = _JS_PROXY_SHIM.replace("PREFIX_PLACEHOLDER", "/node/my-node")
+        assert "/node/my-node" in replaced
+        assert "PREFIX_PLACEHOLDER" not in replaced
+
+    def test_js_shim_overrides_fetch_and_eventsource(self):
+        from turnstone.console.server import _JS_PROXY_SHIM
+
+        assert "window.fetch" in _JS_PROXY_SHIM
+        assert "window.EventSource" in _JS_PROXY_SHIM
+
+    def test_console_banner_contains_placeholder(self):
+        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE
+
+        assert "NODE_ID_PLACEHOLDER" in _CONSOLE_BANNER_TEMPLATE
+        assert "Console" in _CONSOLE_BANNER_TEMPLATE
+
+    def test_html_rewriting_changes_static_paths(self):
+        """Simulate the proxy_index rewriting logic."""
+        sample_html = (
+            '<link rel="stylesheet" href="/static/style.css">\n'
+            '<script src="/static/app.js"></script>'
+        )
+        prefix = "/node/test-node"
+        rewritten = sample_html.replace('href="/static/', f'href="{prefix}/static/')
+        rewritten = rewritten.replace('src="/static/', f'src="{prefix}/static/')
+        assert "/node/test-node/static/style.css" in rewritten
+        assert "/node/test-node/static/app.js" in rewritten
+        # Originals should be gone
+        assert 'href="/static/' not in rewritten
+        assert 'src="/static/' not in rewritten
+
+    def test_banner_injection_after_body(self):
+        """Simulate the banner injection logic."""
+        from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE
+
+        sample_html = "<html><body><div>content</div></body></html>"
+        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", "node-a")
+        result = sample_html.replace("<body>", "<body>" + banner, 1)
+        assert "node-a" in result
+        assert "Console" in result
+        assert result.startswith("<html><body><div")
+
+
+# ---------------------------------------------------------------------------
+# _pick_best_node unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestPickBestNode:
+    """Test the _pick_best_node helper."""
+
+    def test_picks_node_with_most_headroom(self):
+        from turnstone.console.server import _pick_best_node
+
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_nodes.return_value = (
+            [
+                {"node_id": "busy", "reachable": True, "max_ws": 10, "ws_total": 9},
+                {"node_id": "free", "reachable": True, "max_ws": 10, "ws_total": 2},
+                {"node_id": "mid", "reachable": True, "max_ws": 10, "ws_total": 5},
+            ],
+            3,
+        )
+        assert _pick_best_node(collector) == "free"
+
+    def test_skips_unreachable_nodes(self):
+        from turnstone.console.server import _pick_best_node
+
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_nodes.return_value = (
+            [
+                {"node_id": "down", "reachable": False, "max_ws": 10, "ws_total": 0},
+                {"node_id": "up", "reachable": True, "max_ws": 10, "ws_total": 5},
+            ],
+            2,
+        )
+        assert _pick_best_node(collector) == "up"
+
+    def test_returns_empty_when_no_nodes(self):
+        from turnstone.console.server import _pick_best_node
+
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_nodes.return_value = ([], 0)
+        assert _pick_best_node(collector) == ""
+
+    def test_returns_empty_when_all_unreachable(self):
+        from turnstone.console.server import _pick_best_node
+
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_nodes.return_value = (
+            [{"node_id": "down", "reachable": False, "max_ws": 10, "ws_total": 0}],
+            1,
+        )
+        assert _pick_best_node(collector) == ""

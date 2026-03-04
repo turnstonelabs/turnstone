@@ -16,7 +16,7 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
 - **Queue-driven agents** — trigger workstreams via message queue, stream progress, approve or auto-approve tool use
 - **Multi-node clusters** — generic work load-balances across nodes, directed work routes to a specific server
-- **Cluster dashboard** — real-time view of all nodes, workstreams, and resource utilization
+- **Cluster dashboard** — real-time view of all nodes and workstreams, workstream creation with node targeting, reverse proxy for server UIs (only the console port needs network access)
 - **Cluster simulator** — test the stack at scale (up to 1000 nodes) without an LLM backend
 
 ```
@@ -72,7 +72,7 @@ pip install turnstone[console]
 turnstone-console --redis-host localhost --port 8090
 ```
 
-Then open `http://localhost:8090` for the cluster-wide dashboard.
+Then open `http://localhost:8090` for the cluster-wide dashboard. Create workstreams from the console and interact with any node's server UI through the built-in reverse proxy — no direct server port access required.
 
 ### Docker
 
