@@ -7,16 +7,12 @@ WorkstreamCreatedEvent resumed fields, and server endpoint handling.
 from __future__ import annotations
 
 import json
-from dataclasses import fields
-
-import pytest
 
 from turnstone.mq.protocol import (
     CreateWorkstreamMessage,
     SessionResumedEvent,
     WorkstreamCreatedEvent,
 )
-
 
 # ---------------------------------------------------------------------------
 # Protocol tests

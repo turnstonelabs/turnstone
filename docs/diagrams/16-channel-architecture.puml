@@ -124,12 +124,10 @@ class "channel_users" as CU <<storage>> {
 }
 
 class "channel_routes" as CR <<storage>> {
-    route_id (PK)
-    platform
-    channel_id
-    guild_id (nullable)
+    channel_type (PK)
+    channel_id (PK)
     ws_id
-    thread_id (nullable)
+    node_id
     created
     --
     Maps platform channels
@@ -201,11 +199,13 @@ end note
 
 note bottom of CU
   **Identity Linking**
-  /link <username> <password>
-  → verifies credentials via console API
-  → inserts channel_users row
-  → subsequent messages carry user_id
-  → AuthResult scopes applied by server
+  1. User runs /link in Discord
+  2. Bot opens modal requesting API token
+  3. User submits ts_... API token
+  4. Bot validates token against storage
+  5. On success, inserts channel_users row
+  6. Subsequent messages carry user_id
+  7. AuthResult scopes applied by server
 end note
 
 @enduml

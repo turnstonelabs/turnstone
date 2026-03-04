@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -120,10 +121,8 @@ class TestSubscribe:
         assert isinstance(broker._listener_task, asyncio.Task)
         # Clean up.
         broker._listener_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await broker._listener_task
-        except asyncio.CancelledError:
-            pass
 
 
 class TestUnsubscribe:

@@ -151,5 +151,11 @@ module = ["discord", "discord.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = ["turnstone.channels.discord.*"]
+disallow_subclassing_any = false
+disallow_untyped_decorators = false
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false

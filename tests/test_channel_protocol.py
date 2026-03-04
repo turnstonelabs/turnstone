@@ -10,7 +10,6 @@ from turnstone.channels._formatter import (
 )
 from turnstone.channels._protocol import ChannelEvent
 
-
 # ---------------------------------------------------------------------------
 # ChannelEvent
 # ---------------------------------------------------------------------------

@@ -324,7 +324,12 @@ class TurnstoneBot:
         if not allowed or not event.items:
             return False
         for item in event.items:
-            name = item.get("function", {}).get("name", "")
+            # Support both server SSE format (func_name) and OpenAI format (function.name).
+            name = (
+                item.get("func_name")
+                or item.get("approval_label")
+                or item.get("function", {}).get("name", "")
+            )
             if name not in allowed:
                 return False
         return True

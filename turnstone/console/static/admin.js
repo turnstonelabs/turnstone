@@ -120,7 +120,7 @@ function confirmDeleteUser(userId, username) {
   showConfirmModal(
     "Delete User",
     "Delete user \u2018" +
-      escapeHtml(username) +
+      username +
       "\u2019 and all their tokens and channel links? This cannot be undone.",
     "Delete",
     function () {
@@ -348,9 +348,9 @@ function confirmUnlinkChannel(channelType, channelUserId) {
   showConfirmModal(
     "Unlink Channel",
     "Unlink " +
-      escapeHtml(channelType) +
+      channelType +
       " account \u2018" +
-      escapeHtml(channelUserId) +
+      channelUserId +
       "\u2019? The user will need to re-link via /link to interact with the bot.",
     "Unlink",
     function () {

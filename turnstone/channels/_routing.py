@@ -135,12 +135,11 @@ class ChannelRouter:
         completes.
         """
         key = f"{channel_type}:{channel_id}"
-        if key not in self._create_locks:
-            self._create_locks[key] = asyncio.Lock()
+        lock = self._create_locks.setdefault(key, asyncio.Lock())
 
         old_ws_id: str | None = None
 
-        async with self._create_locks[key]:
+        async with lock:
             # 1. Check for existing route.
             old_ws_id = ""
             route = await asyncio.to_thread(

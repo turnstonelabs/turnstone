@@ -688,12 +688,14 @@ class PostgreSQLBackend:
     # -- Channel user mapping ---------------------------------------------------
 
     def create_channel_user(self, channel_type: str, channel_user_id: str, user_id: str) -> None:
+        from sqlalchemy.dialects import postgresql
+
         from turnstone.core.storage._schema import channel_users
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                sa.dialects.postgresql.insert(channel_users)
+                postgresql.insert(channel_users)
                 .values(
                     channel_type=channel_type,
                     channel_user_id=channel_user_id,
@@ -770,12 +772,14 @@ class PostgreSQLBackend:
     def create_channel_route(
         self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
     ) -> None:
+        from sqlalchemy.dialects import postgresql
+
         from turnstone.core.storage._schema import channel_routes
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                sa.dialects.postgresql.insert(channel_routes)
+                postgresql.insert(channel_routes)
                 .values(
                     channel_type=channel_type,
                     channel_id=channel_id,

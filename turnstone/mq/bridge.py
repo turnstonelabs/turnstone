@@ -452,13 +452,15 @@ class Bridge:
 
             self._start_ws_sse(ws_id)
 
+            resolved_session_id = data.get("session_id", "") if resumed else ""
+
             self._publish_global(
                 WorkstreamCreatedEvent(
                     ws_id=ws_id,
                     name=ws_name,
                     correlation_id=correlation_id,
                     resumed=resumed,
-                    session_id=resume_session if resumed else "",
+                    session_id=resolved_session_id,
                     message_count=data.get("message_count", 0),
                 )
             )
@@ -478,7 +480,7 @@ class Bridge:
                     SessionResumedEvent(
                         ws_id=ws_id,
                         correlation_id=correlation_id,
-                        session_id=resume_session,
+                        session_id=resolved_session_id,
                         message_count=data.get("message_count", 0),
                         name=ws_name,
                     ),

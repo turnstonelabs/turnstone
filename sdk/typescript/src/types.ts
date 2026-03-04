@@ -78,6 +78,7 @@ export interface CreateWorkstreamResponse {
   ws_id: string;
   name: string;
   resumed?: boolean;
+  session_id?: string;
   message_count?: number;
 }
 

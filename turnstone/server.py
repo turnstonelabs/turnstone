@@ -920,6 +920,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         # Atomic session resume during creation.
         resumed = False
         message_count = 0
+        session_id = ""
         resume_session_id = body.get("resume_session", "")
         if resume_session_id and ws.session is not None:
             from turnstone.core.memory import get_session_name, resolve_session
@@ -927,6 +928,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             target_id = resolve_session(resume_session_id)
             if target_id and ws.session.resume_session(target_id):
                 resumed = True
+                session_id = target_id
                 message_count = len(ws.session.messages)
                 ws.name = get_session_name(target_id) or ws.name
                 ui = ws.ui
@@ -941,6 +943,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "ws_id": ws.id,
                 "name": ws.name,
                 "resumed": resumed,
+                "session_id": session_id,
                 "message_count": message_count,
             }
         )

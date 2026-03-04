@@ -1035,7 +1035,15 @@ async def admin_create_channel(request: Request) -> JSONResponse:
 
     storage.create_channel_user(channel_type, channel_user_id, user_id)
     result = storage.get_channel_user(channel_type, channel_user_id)
-    return JSONResponse(result or {})
+    if result is None:
+        return JSONResponse({"error": "Failed to create channel mapping"}, status_code=500)
+    # Guard against race: another request may have claimed this channel_user_id.
+    if result.get("user_id") != user_id:
+        return JSONResponse(
+            {"error": f"Channel user already linked to user {result['user_id']}"},
+            status_code=409,
+        )
+    return JSONResponse(result)
 
 
 async def admin_delete_channel(request: Request) -> JSONResponse:

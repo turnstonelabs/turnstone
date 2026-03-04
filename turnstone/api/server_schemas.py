@@ -49,6 +49,7 @@ class CreateWorkstreamResponse(BaseModel):
     ws_id: str = Field(description="Unique ID of the new workstream")
     name: str = Field(description="Assigned workstream name")
     resumed: bool = Field(default=False, description="Whether a previous session was resumed")
+    session_id: str = Field(default="", description="Resolved session ID (set when resumed)")
     message_count: int = Field(default=0, description="Number of messages in the resumed session")
 
 
