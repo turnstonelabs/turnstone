@@ -50,11 +50,26 @@ turnstone/
     safety.py         Command safety validation (blocked patterns, sanitization)
     sandbox.py        Math code sandboxing (AST validation, subprocess execution)
     web.py            Web utilities (HTML stripping, SSRF prevention)
+  api/
+    schemas.py        Shared Pydantic v2 models (auth, errors, WorkstreamState)
+    server_schemas.py Server endpoint request/response models
+    console_schemas.py Console endpoint request/response models
+    openapi.py        OpenAPI 3.1 spec builder
+    server_spec.py    Server endpoint catalog → build_server_spec()
+    console_spec.py   Console endpoint catalog → build_console_spec()
+    docs.py           /openapi.json + /docs (Swagger UI) handler factories
+  sdk/
+    server.py         AsyncTurnstoneServer + TurnstoneServer (HTTP client)
+    console.py        AsyncTurnstoneConsole + TurnstoneConsole (HTTP client)
+    events.py         27 SSE event dataclasses with type registry
+    _base.py          Shared httpx async client, auth, error handling
+    _sync.py          Background event loop for sync wrappers
+    _types.py         TurnResult + TurnstoneAPIError
   mq/
     protocol.py       Inbound/outbound message dataclasses (JSON serialization)
     broker.py         Abstract MessageBroker protocol + RedisBroker
     bridge.py         Bridge service (queue ↔ turnstone-server HTTP API)
-    client.py         TurnstoneClient library + TurnResult for external systems
+    client.py         TurnstoneClient library + TurnResult for MQ-based access
   console/
     collector.py      ClusterCollector — aggregates state from all nodes via Redis + HTTP
     server.py         Cluster dashboard HTTP server + SSE + CLI entry point
@@ -1053,3 +1068,41 @@ preserves:
 
 After compaction, `_read_files` is cleared to force re-reads before edits,
 since file contents are no longer in the message history.
+
+---
+
+## Client SDK
+
+> See also: [SDK Architecture diagram](diagrams/png/13-sdk-architecture.png) | [SDK Documentation](sdk.md)
+
+The `turnstone/sdk/` package provides typed HTTP clients for programmatic access
+to both the server and console APIs. It wraps REST endpoints with methods that
+return Pydantic models, and SSE endpoints with async/sync iterators that yield
+typed event dataclasses.
+
+**Two client pairs** (sync + async):
+
+- `TurnstoneServer` / `AsyncTurnstoneServer` — server API (workstreams, chat, streaming, sessions)
+- `TurnstoneConsole` / `AsyncTurnstoneConsole` — console API (cluster overview, nodes, workstreams)
+
+**Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx
+setup, auth headers, `_request()` (REST) and `_stream_sse()` (SSE). Sync
+clients delegate through `_SyncRunner` which maintains a persistent background
+event loop on a daemon thread.
+
+**Event types**: 27 standalone dataclasses in `events.py` with a type-registry
+pattern matching `OutboundEvent.from_json()` from `mq/protocol.py`. Events are
+decoupled from the MQ package so SDK consumers don't need the `redis` dependency.
+
+**TypeScript SDK**: `sdk/typescript/` — separate npm package with the same API
+surface. Zero browser dependencies, SSE via `fetch` + `ReadableStream` parsing.
+
+```python
+# Python quick start
+from turnstone.sdk import TurnstoneServer
+
+with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+    ws = client.create_workstream(name="demo")
+    result = client.send_and_wait("Hello!", ws.ws_id)
+    print(result.content)
+```
