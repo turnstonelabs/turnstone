@@ -189,18 +189,21 @@ class AsyncTurnstoneServer(_BaseClient):
         consume_task = asyncio.create_task(_consume())
         await asyncio.sleep(0)  # yield to let SSE connection establish
 
-        send_resp = await self.send(message, ws_id)
-        if send_resp.status == "busy":
-            consume_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await consume_task
-            result.errors.append("Workstream is busy")
-            return result
-
         try:
+            send_resp = await self.send(message, ws_id)
+            if send_resp.status == "busy":
+                result.errors.append("Workstream is busy")
+                return result
+
             await asyncio.wait_for(consume_task, timeout=timeout)
         except TimeoutError:
             result.timed_out = True
+        finally:
+            # Always clean up the SSE consumer to prevent connection leaks
+            if not consume_task.done():
+                consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consume_task
         return result
 
     # -- sessions ------------------------------------------------------------

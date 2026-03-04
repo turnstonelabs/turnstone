@@ -73,6 +73,7 @@ export class BaseClient {
   protected async *streamSSE<T = Record<string, unknown>>(
     path: string,
     params?: Record<string, string | number>,
+    signal?: AbortSignal,
   ): AsyncIterableIterator<T> {
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
@@ -93,7 +94,7 @@ export class BaseClient {
       if (qs) url += `?${qs}`;
     }
 
-    const resp = await this.fetchFn(url, { method: "GET", headers });
+    const resp = await this.fetchFn(url, { method: "GET", headers, signal });
     if (!resp.ok) {
       throw new TurnstoneAPIError(
         resp.status,

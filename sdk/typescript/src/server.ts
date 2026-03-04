@@ -119,18 +119,26 @@ export class TurnstoneServer extends BaseClient {
       },
     };
 
-    const sendResp = await this.send(message, wsId);
-    if (sendResp.status === "busy") {
-      result.errors.push("Workstream is busy");
-      return result;
-    }
-
-    const timeout = opts?.timeout ?? 600_000;
+    // Open SSE stream BEFORE sending to avoid missing early events
+    const timeoutMs = opts?.timeout ?? 600_000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      for await (const event of this.streamEvents(wsId)) {
+      // Start consuming the per-workstream SSE stream first
+      const events = this.streamSSE<ServerEvent>(
+        "/v1/api/events",
+        { ws_id: wsId },
+        controller.signal,
+      );
+
+      const sendResp = await this.send(message, wsId);
+      if (sendResp.status === "busy") {
+        result.errors.push("Workstream is busy");
+        return result;
+      }
+
+      for await (const event of events) {
         opts?.onEvent?.(event);
 
         switch (event.type) {
@@ -162,6 +170,7 @@ export class TurnstoneServer extends BaseClient {
       }
     } finally {
       clearTimeout(timer);
+      controller.abort();
     }
 
     return result;

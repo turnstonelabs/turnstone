@@ -26,6 +26,12 @@ class _BaseClient:
         timeout: float = 30.0,
         httpx_client: httpx.AsyncClient | None = None,
     ) -> None:
+        """Initialise the client.
+
+        When *httpx_client* is provided it is used directly and *base_url*,
+        *token*, and *timeout* are ignored — configure headers and base URL
+        on the injected client instead.
+        """
         headers: dict[str, str] = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import httpx
 
+from turnstone.sdk._sync import _SyncRunner
 from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer, TurnstoneServer
-from turnstone.sdk._sync import _SyncRunner
 
 
 def _json_response(data: dict, status: int = 200) -> httpx.Response:

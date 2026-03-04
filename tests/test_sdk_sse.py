@@ -1,4 +1,4 @@
-"""Tests for turnstone.sdk._sse — SSE stream parsing."""
+"""Tests for _BaseClient._stream_sse — SSE stream parsing."""
 
 from __future__ import annotations
 

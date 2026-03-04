@@ -263,6 +263,7 @@ export interface TurnResult {
 }
 
 export interface SendAndWaitOptions {
+  /** Timeout in milliseconds (default: 600000 = 10 minutes). */
   timeout?: number;
   onEvent?: (event: import("./events.js").ServerEvent) => void;
 }

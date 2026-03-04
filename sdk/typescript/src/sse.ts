@@ -8,13 +8,8 @@
 /**
  * Parse an SSE stream and yield JSON-parsed data payloads.
  *
- * Handles the standard SSE format:
- * ```
- * data: {"type": "content", "text": "hello"}
- *
- * data: {"type": "stream_end"}
- *
- * ```
+ * Handles the standard SSE format including multi-line `data:` fields
+ * (joined with `\n` per the SSE spec) and CRLF line endings.
  */
 export async function* parseSSEStream<T = Record<string, unknown>>(
   response: Response,
@@ -33,6 +28,9 @@ export async function* parseSSEStream<T = Record<string, unknown>>(
 
       buffer += decoder.decode(value, { stream: true });
 
+      // Normalize CRLF to LF
+      buffer = buffer.replace(/\r\n/g, "\n");
+
       // Process complete SSE frames (separated by double newlines)
       const frames = buffer.split("\n\n");
       // Keep the last (possibly incomplete) frame in the buffer
@@ -41,17 +39,19 @@ export async function* parseSSEStream<T = Record<string, unknown>>(
       for (const frame of frames) {
         if (!frame.trim()) continue;
 
-        // Extract data lines from the frame
-        let data = "";
+        // Extract data lines from the frame, joining with \n per SSE spec
+        const dataLines: string[] = [];
         for (const line of frame.split("\n")) {
           if (line.startsWith("data: ")) {
-            data += line.slice(6);
+            dataLines.push(line.slice(6));
           } else if (line.startsWith("data:")) {
-            data += line.slice(5);
+            dataLines.push(line.slice(5));
           }
         }
 
-        if (!data || !data.trim()) continue;
+        if (dataLines.length === 0) continue;
+        const data = dataLines.join("\n");
+        if (!data.trim()) continue;
 
         try {
           yield JSON.parse(data) as T;
