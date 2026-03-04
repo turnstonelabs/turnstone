@@ -26,6 +26,34 @@ All API endpoints use the `/v1/` prefix. Non-API endpoints (`/`, `/health`, `/me
 - **OpenAPI spec**: `GET /openapi.json` — machine-readable OpenAPI 3.1 schema
 - **Swagger UI**: `GET /docs` — interactive API explorer (loads from CDN)
 
+### Client SDKs
+
+Typed client libraries for programmatic access to both the server and console APIs.
+
+**Python** (included in the `turnstone` package):
+
+```python
+from turnstone.sdk import TurnstoneServer
+
+with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+    ws = client.create_workstream(name="demo")
+    result = client.send_and_wait("Hello!", ws.ws_id)
+    print(result.content)
+```
+
+Async variant: `AsyncTurnstoneServer` / `AsyncTurnstoneConsole`.
+
+**TypeScript** (`sdk/typescript/`):
+
+```typescript
+import { TurnstoneServer } from "@turnstone/sdk";
+
+const client = new TurnstoneServer({ baseUrl: "http://localhost:8080", token: "tok_xxx" });
+const ws = await client.createWorkstream({ name: "demo" });
+const result = await client.sendAndWait("Hello!", ws.ws_id);
+console.log(result.content);
+```
+
 ---
 
 ## Endpoints

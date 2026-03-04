@@ -1,0 +1,38 @@
+{
+  "name": "@turnstone/sdk",
+  "version": "0.3.0",
+  "description": "TypeScript client SDK for the turnstone AI orchestration platform",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "generate-types": "python scripts/generate-types.py"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "keywords": [
+    "turnstone",
+    "ai",
+    "llm",
+    "agent",
+    "sdk",
+    "client"
+  ],
+  "license": "BUSL-1.1",
+  "devDependencies": {
+    "typescript": "^5.4",
+    "vitest": "^2.0"
+  }
+}
