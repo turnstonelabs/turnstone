@@ -1,6 +1,6 @@
 @startuml
 !theme plain
-title Turnstone — Console Dashboard Data Collection
+title Turnstone — Console Dashboard Data Flow
 
 skinparam sequenceArrowThickness 1.5
 
@@ -8,6 +8,7 @@ participant "Browser" as Browser
 participant "Console\nStarlette App" as Server
 participant "ClusterCollector" as CC
 collections "Redis" as Redis
+participant "Node-A Bridge" as BridgeA
 participant "Node-A\n(real server)" as NodeA
 participant "Node-B\n(sim node)" as NodeB
 
@@ -120,5 +121,101 @@ Browser -> Server : GET /api/cluster/workstreams\n?state=running&node=sim-0003
 Server -> CC : get_workstreams(state="running",\nnode="sim-0003")
 CC --> Server : {workstreams: [...], total: 5,\npage: 1, per_page: 50, pages: 1}
 Server --> Browser : JSON response
+
+== Workstream Creation (via MQ) ==
+
+Browser -> Server : POST /api/cluster/workstreams/new\n{node_id:"nodeA", name:"new-task"}
+activate Server #FFECB3
+
+Server -> CC : _pick_best_node() or\nget_node_detail(node_id)
+CC --> Server : node validated
+
+Server -> Server : Build CreateWorkstreamMessage\n{target_node:"nodeA", name:"new-task"}
+
+Server -> Redis : RPUSH turnstone:inbound:nodeA\n(directed queue)
+Server --> Browser : {status:"ok", correlation_id:"abc",\ntarget_node:"nodeA"}
+deactivate Server
+
+note right of Redis
+  Bridge on Node-A picks up the
+  message from its directed queue,
+  POSTs to /api/workstreams/new,
+  registers ownership, publishes
+  ws_created to cluster channel.
+end note
+
+Redis --> BridgeA : BLPOP turnstone:inbound:nodeA
+activate BridgeA
+BridgeA -> NodeA : POST /api/workstreams/new\n{name:"new-task"}
+NodeA --> BridgeA : {ws_id:"ws789", name:"new-task"}
+BridgeA -> Redis : SET turnstone:ws:ws789 = nodeA
+BridgeA -> Redis : PUBLISH turnstone:events:cluster\n{type:"ws_created", ws_id:"ws789",\nnode_id:"nodeA", name:"new-task"}
+deactivate BridgeA
+
+Redis --> CC : ws_created event
+CC -> CC : Add workstream to\nNodeSnapshot["nodeA"]
+CC -> CC : _fanout(event)
+Server -> Browser : SSE: data: {"type":"ws_created",...}
+
+== Reverse Proxy (server UI through console port) ==
+
+Browser -> Server : GET /node/nodeA/
+activate Server #FFF9C4
+
+Server -> CC : get_node_detail("nodeA")\n→ server_url = "http://10.0.1.1:8080"
+
+Server -> NodeA : GET http://10.0.1.1:8080/\n(via httpx.AsyncClient)
+activate NodeA
+NodeA --> Server : index.html
+deactivate NodeA
+
+Server -> Server : Rewrite static paths:\nhref="/static/" → "/node/nodeA/static/"\nInject console-return banner\nafter <body>
+
+Server --> Browser : Rewritten HTML
+deactivate Server
+
+Browser -> Server : GET /node/nodeA/static/app.js
+activate Server #FFF9C4
+
+Server -> NodeA : GET http://10.0.1.1:8080/static/app.js
+activate NodeA
+NodeA --> Server : app.js
+deactivate NodeA
+
+Server -> Server : Prepend JS proxy shim:\nOverride fetch() and EventSource()\nto prepend "/node/nodeA" prefix
+
+Server --> Browser : Shimmed app.js
+deactivate Server
+
+note right of Browser
+  All fetch("/api/send") calls in the
+  server UI now become fetch("/node/nodeA/api/send"),
+  routed through the console proxy.
+end note
+
+Browser -> Server : GET /node/nodeA/api/events?ws_id=ws789
+activate Server #FFF9C4
+
+Server -> NodeA : GET http://10.0.1.1:8080/api/events?ws_id=ws789\n(SSE stream via httpx.AsyncClient timeout=None)
+activate NodeA
+
+loop SSE streaming
+    NodeA --> Server : data: {"type":"content","text":"..."}\n\n
+    Server --> Browser : data: {"type":"content","text":"..."}\n\n
+end
+
+deactivate NodeA
+deactivate Server
+
+Browser -> Server : POST /node/nodeA/api/send\n{message:"hello", ws_id:"ws789"}
+activate Server #FFF9C4
+
+Server -> NodeA : POST http://10.0.1.1:8080/api/send\n(body forwarded)
+activate NodeA
+NodeA --> Server : {status:"ok"}
+deactivate NodeA
+
+Server --> Browser : {status:"ok"}
+deactivate Server
 
 @enduml
