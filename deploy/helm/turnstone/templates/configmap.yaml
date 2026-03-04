@@ -5,8 +5,11 @@ metadata:
   labels:
     {{- include "turnstone.labels" . | nindent 4 }}
 data:
-  DB_BACKEND: {{ .Values.database.backend | quote }}
-  TURNSTONE_DB_URL: {{ printf "postgresql+psycopg://%s:$(POSTGRES_PASSWORD)@%s:%s/%s" (include "turnstone.postgresql.username" .) (include "turnstone.postgresql.host" .) (include "turnstone.postgresql.port" .) (include "turnstone.postgresql.database" .) | quote }}
+  TURNSTONE_DB_BACKEND: {{ .Values.database.backend | quote }}
+  TURNSTONE_DB_HOST: {{ include "turnstone.postgresql.host" . | quote }}
+  TURNSTONE_DB_PORT: {{ include "turnstone.postgresql.port" . | quote }}
+  TURNSTONE_DB_NAME: {{ include "turnstone.postgresql.database" . | quote }}
+  TURNSTONE_DB_USER: {{ include "turnstone.postgresql.username" . | quote }}
   TURNSTONE_SERVER_HOST: "0.0.0.0"
   TURNSTONE_SERVER_PORT: {{ .Values.server.service.port | quote }}
   TURNSTONE_CONSOLE_HOST: "0.0.0.0"

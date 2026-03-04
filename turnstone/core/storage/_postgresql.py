@@ -23,14 +23,17 @@ log = logging.getLogger(__name__)
 class PostgreSQLBackend:
     """PostgreSQL implementation of the StorageBackend protocol."""
 
-    def __init__(self, url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
+    def __init__(
+        self, url: str, pool_size: int = 5, max_overflow: int = 10, *, create_tables: bool = True
+    ) -> None:
         self._engine = sa.create_engine(
             url,
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_pre_ping=True,
         )
-        metadata.create_all(self._engine)
+        if create_tables:
+            metadata.create_all(self._engine)
 
     # -- Core session operations -----------------------------------------------
 

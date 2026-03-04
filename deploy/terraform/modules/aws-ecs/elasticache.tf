@@ -22,7 +22,7 @@ resource "aws_elasticache_replication_group" "this" {
   security_group_ids = [aws_security_group.redis.id]
 
   at_rest_encryption_enabled = true
-  transit_encryption_enabled = false
+  transit_encryption_enabled = true
 
   automatic_failover_enabled = false
 

@@ -17,11 +17,33 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   tags              = local.common_tags
 }
 
+resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+  count             = var.certificate_arn != "" ? 1 : 0
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS traffic to server"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  tags              = local.common_tags
+}
+
 resource "aws_vpc_security_group_ingress_rule" "alb_console" {
   security_group_id = aws_security_group.alb.id
   description       = "HTTP traffic to console"
   from_port         = 8090
   to_port           = 8090
+  ip_protocol       = "tcp"
+  cidr_ipv4         = "0.0.0.0/0"
+  tags              = local.common_tags
+}
+
+resource "aws_vpc_security_group_ingress_rule" "alb_console_https" {
+  count             = var.certificate_arn != "" ? 1 : 0
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS traffic to console"
+  from_port         = 8443
+  to_port           = 8443
   ip_protocol       = "tcp"
   cidr_ipv4         = "0.0.0.0/0"
   tags              = local.common_tags

@@ -117,6 +117,12 @@ variable "auth_token" {
   default     = ""
 }
 
+variable "certificate_arn" {
+  description = "ACM certificate ARN for HTTPS listeners. Leave empty for HTTP-only (not recommended for production)."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Additional tags to apply to all resources."
   type        = map(string)

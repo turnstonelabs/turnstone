@@ -42,7 +42,7 @@ class "SQLiteBackend" as SQLite <<sqlite>> {
     +__init__(path: str)
     --
     FTS5 full-text search
-    StaticPool (single-threaded)
+    Default pool, check_same_thread=False
 }
 
 class "PostgreSQLBackend" as PG <<postgres>> {
@@ -76,7 +76,6 @@ class "_migrate.py" as Migrate <<migration>> {
 
 class "migrations/" as Versions <<migration>> {
     001_initial_schema.py
-    002_postgresql_fts.py
 }
 
 ' -- Registry --

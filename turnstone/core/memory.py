@@ -151,12 +151,18 @@ def update_session_title(session_id: str, title: str) -> None:
 
 def save_memory(key: str, value: str) -> str | None:
     """Save a memory. Returns the previous value if it existed."""
-    return get_storage().kv_set(key, value)
+    try:
+        return get_storage().kv_set(key, value)
+    except Exception:
+        return None
 
 
 def delete_memory(key: str) -> bool:
     """Delete a memory by key. Returns True if the key existed."""
-    return get_storage().kv_delete(key)
+    try:
+        return get_storage().kv_delete(key)
+    except Exception:
+        return False
 
 
 def load_memories() -> list[tuple[str, str]]:

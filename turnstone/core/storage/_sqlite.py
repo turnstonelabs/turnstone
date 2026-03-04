@@ -39,7 +39,7 @@ def _fts5_query(query: str) -> str:
 class SQLiteBackend:
     """SQLite implementation of the StorageBackend protocol."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, create_tables: bool = True) -> None:
         self._path = path
         self._engine = sa.create_engine(
             f"sqlite:///{path}",
@@ -47,7 +47,8 @@ class SQLiteBackend:
             connect_args={"check_same_thread": False},
         )
         self._fts5_available = False
-        self._init_schema()
+        if create_tables:
+            self._init_schema()
 
     def _init_schema(self) -> None:
         """Create tables and FTS5 index."""

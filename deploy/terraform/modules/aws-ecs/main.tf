@@ -25,8 +25,8 @@ locals {
   # Shared environment variables injected into every container.
   common_env = [
     { name = "TURNSTONE_ENV", value = var.environment },
+    { name = "TURNSTONE_DB_BACKEND", value = "postgresql" },
     { name = "TURNSTONE_LLM_BASE_URL", value = var.llm_base_url },
-    { name = "TURNSTONE_DB_URL", value = "postgresql+psycopg://${aws_db_instance.this.username}:${random_password.db.result}@${aws_db_instance.this.endpoint}/turnstone" },
     { name = "TURNSTONE_REDIS_URL", value = "redis://${aws_elasticache_replication_group.this.primary_endpoint_address}:6379/0" },
   ]
 
@@ -36,10 +36,14 @@ locals {
       name      = "OPENAI_API_KEY"
       valueFrom = aws_secretsmanager_secret_version.openai_api_key.arn
     },
+    {
+      name      = "TURNSTONE_DB_URL"
+      valueFrom = aws_secretsmanager_secret_version.db_url.arn
+    },
   ]
 
   auth_env = var.auth_token != "" ? [
-    { name = "TURNSTONE_AUTH_TOKEN", value = "true" },
+    { name = "TURNSTONE_AUTH_ENABLED", value = "true" },
   ] : []
 
   auth_secrets = var.auth_token != "" ? [
@@ -82,6 +86,16 @@ resource "aws_secretsmanager_secret" "db_password" {
 resource "aws_secretsmanager_secret_version" "db_password" {
   secret_id     = aws_secretsmanager_secret.db_password.id
   secret_string = random_password.db.result
+}
+
+resource "aws_secretsmanager_secret" "db_url" {
+  name = "${var.name_prefix}-${var.environment}-db-url"
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "db_url" {
+  secret_id     = aws_secretsmanager_secret.db_url.id
+  secret_string = "postgresql+psycopg://${aws_db_instance.this.username}:${random_password.db.result}@${aws_db_instance.this.endpoint}/turnstone"
 }
 
 # ---------- ECS Cluster ----------
@@ -170,7 +184,7 @@ resource "aws_ecs_service" "server" {
     container_port   = 8080
   }
 
-  depends_on = [aws_lb_listener.server]
+  depends_on = [aws_lb_target_group.server]
 }
 
 # ---------- Bridge Task Definition + Service ----------
@@ -290,7 +304,7 @@ resource "aws_ecs_service" "console" {
     container_port   = 8090
   }
 
-  depends_on = [aws_lb_listener.console]
+  depends_on = [aws_lb_target_group.console]
 }
 
 # ---------- Data Sources ----------

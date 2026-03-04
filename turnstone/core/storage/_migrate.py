@@ -34,7 +34,10 @@ def run_migrations(storage: Any, backend: str) -> None:
     try:
         command.upgrade(cfg, "head")
     except Exception as exc:
-        log.warning("Migration failed (non-fatal): %s", exc)
+        if backend == "sqlite":
+            log.warning("Migration failed (non-fatal for SQLite): %s", exc)
+        else:
+            raise
 
 
 def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:

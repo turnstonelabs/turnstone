@@ -33,11 +33,16 @@ def init_storage(
     """
     global _storage
 
+    # When Alembic migrations will run, skip create_all() to avoid
+    # bypassing migration-managed DDL.  Tests pass run_migrations=False
+    # and rely on create_all() instead.
+    create_tables = not run_migrations
+
     if backend == "sqlite":
         from turnstone.core.storage._sqlite import SQLiteBackend
 
         db_path = path or os.path.join(os.getcwd(), ".turnstone.db")
-        _storage = SQLiteBackend(db_path)
+        _storage = SQLiteBackend(db_path, create_tables=create_tables)
         log.info("Storage initialized: SQLite at %s", db_path)
 
     elif backend == "postgresql":
@@ -46,7 +51,7 @@ def init_storage(
         if not url:
             msg = "PostgreSQL backend requires a connection URL (db_url)"
             raise ValueError(msg)
-        _storage = PostgreSQLBackend(url, pool_size=pool_size)
+        _storage = PostgreSQLBackend(url, pool_size=pool_size, create_tables=create_tables)
         log.info("Storage initialized: PostgreSQL")
 
     else:

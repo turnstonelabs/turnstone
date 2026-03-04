@@ -84,6 +84,7 @@ docker compose up     # starts redis + server + bridge + console (SQLite)
 For production with PostgreSQL:
 
 ```bash
+# Requires POSTGRES_PASSWORD and DB_BACKEND=postgresql in .env (or exported)
 docker compose --profile production up  # adds PostgreSQL, uses it as database
 ```
 
