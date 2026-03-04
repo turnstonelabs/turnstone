@@ -6,8 +6,14 @@ Thread-safe. Zero external dependencies.
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import threading
 import time
+
+log = logging.getLogger(__name__)
+
+_NetworkType = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
 class TokenBucket:
@@ -38,6 +44,67 @@ class TokenBucket:
         return (1.0 - self.tokens) / self.rate
 
 
+def parse_trusted_proxies(raw: str) -> frozenset[_NetworkType]:
+    """Parse a comma-separated list of IPs/CIDRs into a frozen set of networks."""
+    if not raw or not raw.strip():
+        return frozenset()
+    nets: list[_NetworkType] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError:
+            log.warning("Ignoring invalid trusted_proxies entry: %r", entry)
+    return frozenset(nets)
+
+
+def _normalize_ip(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Collapse ``::ffff:x.x.x.x`` to its IPv4 form for dual-stack compatibility."""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def resolve_client_ip(
+    direct_ip: str,
+    forwarded_for: str,
+    trusted_proxies: frozenset[_NetworkType],
+) -> str:
+    """Extract real client IP from X-Forwarded-For, only trusting known proxies.
+
+    Uses the rightmost-untrusted approach: walks the XFF header right-to-left
+    and returns the first IP not in the trusted set.  If the direct client IP
+    is not a trusted proxy, XFF is ignored entirely (prevents spoofing).
+
+    IPv4-mapped IPv6 addresses (``::ffff:x.x.x.x``) are normalized to IPv4
+    before checking against trusted proxies for dual-stack compatibility.
+    """
+    if not trusted_proxies or not forwarded_for:
+        try:
+            return str(_normalize_ip(ipaddress.ip_address(direct_ip)))
+        except ValueError:
+            return direct_ip
+    try:
+        addr = _normalize_ip(ipaddress.ip_address(direct_ip))
+    except ValueError:
+        return direct_ip
+    if not any(addr in net for net in trusted_proxies):
+        return str(addr)
+    parts = [p.strip() for p in forwarded_for.split(",") if p.strip()]
+    for ip_str in reversed(parts):
+        try:
+            ip = _normalize_ip(ipaddress.ip_address(ip_str))
+        except ValueError:
+            continue
+        if not any(ip in net for net in trusted_proxies):
+            return str(ip)
+    return str(addr)
+
+
 class RateLimiter:
     """Per-IP rate limiter using token buckets."""
 
@@ -49,6 +116,7 @@ class RateLimiter:
         enabled: bool = False,
         rate: float = 10.0,
         burst: int = 20,
+        trusted_proxies: str = "",
     ) -> None:
         if enabled and rate <= 0:
             raise ValueError(f"rate must be > 0 when enabled, got {rate}")
@@ -57,6 +125,7 @@ class RateLimiter:
         self.enabled = enabled
         self.rate = rate
         self.burst = burst
+        self.trusted_proxies: frozenset[_NetworkType] = parse_trusted_proxies(trusted_proxies)
         self._buckets: dict[str, TokenBucket] = {}
         self._lock = threading.Lock()
 

@@ -91,7 +91,7 @@ class TestBackendHealthMonitor:
         mon = _make_monitor(mock_client, failure_threshold=1, cooldown=9999.0)
         mon.record_failure()
         assert mon.circuit_state == CircuitState.OPEN
-        assert mon.should_allow_request is False
+        assert mon.acquire_request_permit() is False
 
     @patch("turnstone.core.healthcheck.time")
     def test_half_open_after_cooldown(
@@ -109,7 +109,7 @@ class TestBackendHealthMonitor:
 
         # Advance past cooldown
         mock_time.monotonic.return_value = t + 61.0
-        assert mon.should_allow_request is True
+        assert mon.acquire_request_permit() is True
         assert mon.circuit_state == CircuitState.HALF_OPEN  # type: ignore[comparison-overlap]
 
     def test_success_resets(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
@@ -126,18 +126,59 @@ class TestBackendHealthMonitor:
 
     def test_should_allow_when_closed(self, mock_client: MagicMock) -> None:
         mon = _make_monitor(mock_client)
-        assert mon.should_allow_request is True
+        assert mon.acquire_request_permit() is True
 
-    def test_should_allow_half_open(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        """HALF_OPEN state allows requests (one probe attempt)."""
+    def test_half_open_allows_only_one_request(
+        self, mock_client: MagicMock, mock_metrics: MagicMock
+    ) -> None:
+        """HALF_OPEN permits exactly one probe; subsequent callers are blocked."""
         mon = _make_monitor(mock_client, failure_threshold=1)
         mon.record_failure()
         assert mon.circuit_state == CircuitState.OPEN
 
-        # Force into HALF_OPEN
+        # Force into HALF_OPEN with permit
         with mon._lock:
             mon._state = CircuitState.HALF_OPEN
-        assert mon.should_allow_request is True
+            mon._half_open_permit = True
+
+        # First caller gets through
+        assert mon.acquire_request_permit() is True
+        # Second caller is blocked
+        assert mon.acquire_request_permit() is False
+        # Third caller is also blocked
+        assert mon.acquire_request_permit() is False
+
+    def test_half_open_success_reopens_to_all(
+        self, mock_client: MagicMock, mock_metrics: MagicMock
+    ) -> None:
+        """After probe succeeds in HALF_OPEN, circuit closes and all requests pass."""
+        mon = _make_monitor(mock_client, failure_threshold=1)
+        mon.record_failure()
+        with mon._lock:
+            mon._state = CircuitState.HALF_OPEN
+            mon._half_open_permit = False  # permit already consumed
+
+        # Probe succeeds
+        mon.record_success()
+        assert mon.circuit_state == CircuitState.CLOSED  # type: ignore[comparison-overlap]
+        # All callers pass now
+        assert mon.acquire_request_permit() is True
+        assert mon.acquire_request_permit() is True
+
+    def test_half_open_failure_blocks_all(
+        self, mock_client: MagicMock, mock_metrics: MagicMock
+    ) -> None:
+        """After probe fails in HALF_OPEN, circuit reopens and all requests blocked."""
+        mon = _make_monitor(mock_client, failure_threshold=1, cooldown=9999.0)
+        mon.record_failure()
+        with mon._lock:
+            mon._state = CircuitState.HALF_OPEN
+            mon._half_open_permit = False
+
+        # Probe fails
+        mon.record_failure()
+        assert mon.circuit_state == CircuitState.OPEN
+        assert mon.acquire_request_permit() is False
 
     def test_half_open_failure_reopens(
         self, mock_client: MagicMock, mock_metrics: MagicMock

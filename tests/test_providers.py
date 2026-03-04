@@ -1726,3 +1726,173 @@ class TestTavilyFallback:
         result = provider._apply_web_search(kwargs, caps, tools)
         assert result is tools
         assert "web_search_options" not in kwargs
+
+
+# ===========================================================================
+# Anthropic provider_blocks / _provider_content round-trip tests
+# ===========================================================================
+
+
+class TestAnthropicProviderBlocks:
+    """Tests for multi-turn web search content preservation."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_convert_messages_uses_provider_content(self) -> None:
+        """Assistant message with _provider_content passes through verbatim."""
+        provider_content = [
+            {"type": "text", "text": "Here is what I found."},
+            {
+                "type": "server_tool_use",
+                "id": "stu_123",
+                "name": "web_search",
+                "input": {"query": "turnstone bird"},
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "stu_123",
+                "content": [{"type": "web_search_result", "url": "https://example.com"}],
+                "encrypted_content": "abc123encrypted",
+                "encrypted_index": "idx456encrypted",
+            },
+        ]
+        messages = [
+            {"role": "user", "content": "Search for turnstone bird"},
+            {
+                "role": "assistant",
+                "content": "Here is what I found.",
+                "_provider_content": provider_content,
+            },
+            {"role": "user", "content": "Tell me more"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # The assistant message should use provider_content verbatim
+        assistant_msg = converted[1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["content"] is provider_content
+        assert assistant_msg["content"][2]["encrypted_content"] == "abc123encrypted"
+
+    def test_convert_messages_without_provider_content_unchanged(self) -> None:
+        """Assistant message without _provider_content uses normal reconstruction."""
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assistant_msg = converted[1]
+        assert assistant_msg["role"] == "assistant"
+        assert assistant_msg["content"] == [{"type": "text", "text": "Hi there"}]
+
+    def test_block_to_dict_with_model_dump(self) -> None:
+        """_block_to_dict uses model_dump(exclude_none=True) when available."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeBlock:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                d = {"type": "text", "text": "hello", "extra": True, "nullable": None}
+                if kwargs.get("exclude_none"):
+                    return {k: v for k, v in d.items() if v is not None}
+                return d
+
+        result = _block_to_dict(FakeBlock())
+        assert result == {"type": "text", "text": "hello", "extra": True}
+        assert "nullable" not in result
+
+    def test_block_to_dict_fallback(self) -> None:
+        """_block_to_dict extracts known attributes as fallback."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeBlock:
+            type = "web_search_tool_result"
+            content = [{"type": "web_search_result"}]
+            encrypted_content = "enc123"
+            encrypted_index = "idx456"
+
+        result = _block_to_dict(FakeBlock())
+        assert result["type"] == "web_search_tool_result"
+        assert result["encrypted_content"] == "enc123"
+        assert result["encrypted_index"] == "idx456"
+
+    def test_streaming_captures_provider_blocks(self) -> None:
+        """Streaming events produce provider_blocks on the final chunk."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+
+        # Build mock stream events
+        events = []
+
+        # Text block
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = ""
+        text_block.model_dump.return_value = {"type": "text", "text": ""}
+        events.append(MagicMock(type="content_block_start", index=0, content_block=text_block))
+
+        events.append(
+            MagicMock(
+                type="content_block_delta",
+                index=0,
+                delta=MagicMock(type="text_delta", text="Hello"),
+            )
+        )
+        events.append(MagicMock(type="content_block_stop", index=0))
+
+        # Server tool use block
+        stu_block = MagicMock()
+        stu_block.type = "server_tool_use"
+        stu_block.name = "web_search"
+        stu_block.model_dump.return_value = {
+            "type": "server_tool_use",
+            "id": "stu_1",
+            "name": "web_search",
+            "input": {},
+        }
+        events.append(MagicMock(type="content_block_start", index=1, content_block=stu_block))
+        events.append(
+            MagicMock(
+                type="content_block_delta",
+                index=1,
+                delta=MagicMock(type="input_json_delta", partial_json='{"query":"test"}'),
+            )
+        )
+        events.append(MagicMock(type="content_block_stop", index=1))
+
+        # Web search tool result block
+        wsr_block = MagicMock()
+        wsr_block.type = "web_search_tool_result"
+        wsr_block.model_dump.return_value = {
+            "type": "web_search_tool_result",
+            "tool_use_id": "stu_1",
+            "content": [{"type": "web_search_result", "url": "https://example.com"}],
+            "encrypted_content": "enc_data",
+            "encrypted_index": "idx_data",
+        }
+        # Make content iterable for count
+        fake_result = MagicMock()
+        fake_result.type = "web_search_result"
+        wsr_block.content = [fake_result]
+        events.append(MagicMock(type="content_block_start", index=2, content_block=wsr_block))
+        events.append(MagicMock(type="content_block_stop", index=2))
+
+        # Message delta with stop
+        msg_delta = MagicMock(type="message_delta")
+        msg_delta.delta = MagicMock(stop_reason="end_turn")
+        msg_delta.usage = MagicMock(input_tokens=100, output_tokens=50)
+        events.append(msg_delta)
+
+        chunks = list(provider._iter_anthropic_stream(iter(events)))
+
+        # Find the final chunk with provider_blocks
+        final_chunks = [c for c in chunks if c.provider_blocks]
+        assert len(final_chunks) == 1
+        blocks = final_chunks[0].provider_blocks
+        assert len(blocks) == 3
+        assert blocks[0]["type"] == "text"
+        assert blocks[1]["type"] == "server_tool_use"
+        assert blocks[1]["input"] == {"query": "test"}  # parsed from accumulated JSON
+        assert blocks[2]["type"] == "web_search_tool_result"
+        assert blocks[2]["encrypted_content"] == "enc_data"

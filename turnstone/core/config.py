@@ -107,6 +107,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "enabled": "ratelimit_enabled",
         "requests_per_second": "ratelimit_rps",
         "burst": "ratelimit_burst",
+        "trusted_proxies": "ratelimit_trusted_proxies",
     },
     "health": {
         "backend_probe_interval": "health_probe_interval",

@@ -47,6 +47,8 @@ class BackendHealthMonitor:
         self._state = CircuitState.CLOSED
         self._consecutive_failures = 0
         self._last_state_change = time.monotonic()
+        # Set True on OPEN→HALF_OPEN; consumed by first acquire_request_permit() call
+        self._half_open_permit = False
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -73,8 +75,11 @@ class BackendHealthMonitor:
         with self._lock:
             self._consecutive_failures = 0
             if self._state != CircuitState.CLOSED:
+                prev = self._state
                 self._state = CircuitState.CLOSED
+                self._half_open_permit = False
                 self._last_state_change = time.monotonic()
+                log.info("Circuit breaker CLOSED (was %s): backend recovered", prev.value)
                 self._update_metrics()
 
     def record_failure(self) -> None:
@@ -84,6 +89,7 @@ class BackendHealthMonitor:
             if self._state == CircuitState.HALF_OPEN:
                 # Probe failed in HALF_OPEN — re-open immediately
                 self._state = CircuitState.OPEN
+                self._half_open_permit = False
                 self._last_state_change = time.monotonic()
                 log.warning("Circuit breaker OPEN: probe failed in HALF_OPEN")
                 self._update_metrics()
@@ -113,20 +119,30 @@ class BackendHealthMonitor:
         with self._lock:
             return self._state
 
-    @property
-    def should_allow_request(self) -> bool:
-        """False only if circuit is OPEN (fast-fail).  HALF_OPEN allows requests through."""
+    def acquire_request_permit(self) -> bool:
+        """Consume one request permit if available.
+
+        Returns True when the caller may proceed.  In HALF_OPEN, only one probe
+        request is allowed — subsequent callers are blocked until the probe
+        completes (via ``record_success`` or ``record_failure``).
+        """
         with self._lock:
             if self._state == CircuitState.OPEN:
-                # Check if cooldown has elapsed -> transition to HALF_OPEN
                 if (time.monotonic() - self._last_state_change) >= self._cooldown:
                     self._state = CircuitState.HALF_OPEN
+                    self._half_open_permit = False  # consumed by this caller
                     self._last_state_change = time.monotonic()
-                    log.info("Circuit breaker HALF_OPEN: cooldown elapsed")
+                    log.info("Circuit breaker HALF_OPEN: cooldown elapsed, one probe permitted")
                     self._update_metrics()
+                    return True  # this caller is the probe
+                return False
+            if self._state == CircuitState.HALF_OPEN:
+                # Only one probe request allowed; subsequent callers block
+                if self._half_open_permit:
+                    self._half_open_permit = False
                     return True
                 return False
-            return True
+            return True  # CLOSED
 
     # ------------------------------------------------------------------
     # Background probe
