@@ -585,36 +585,25 @@ async def _proxy_sse(
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
 
     async def sse_generator() -> AsyncGenerator[dict[str, str], None]:
+        from httpx_sse import aconnect_sse
+
         try:
-            async with sse_client.stream("GET", target) as resp:
-                if resp.status_code != 200:
+            async with aconnect_sse(sse_client, "GET", target) as source:
+                if source.response.status_code != 200:
                     log.debug(
                         "SSE proxy received status %s from %s",
-                        resp.status_code,
+                        source.response.status_code,
                         target,
                     )
                     yield {
                         "event": "error",
-                        "data": f"Upstream returned status {resp.status_code}",
+                        "data": f"Upstream returned status {source.response.status_code}",
                     }
                     return
-                buf = ""
-                async for chunk in resp.aiter_text():
+                async for sse in source.aiter_sse():
                     if await request.is_disconnected():
                         return
-                    buf += chunk.replace("\r", "")
-                    while "\n\n" in buf:
-                        event_text, buf = buf.split("\n\n", 1)
-                        data_lines = []
-                        for line in event_text.split("\n"):
-                            if line.startswith("data:"):
-                                # SSE spec: strip exactly one leading space
-                                value = line[5:]
-                                if value.startswith(" "):
-                                    value = value[1:]
-                                data_lines.append(value)
-                        if data_lines:
-                            yield {"data": "\n".join(data_lines)}
+                    yield {"event": sse.event, "data": sse.data}
         except httpx.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 
