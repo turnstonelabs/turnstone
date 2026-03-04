@@ -411,7 +411,7 @@ from each schema and builds:
 - `edit_file` -- string replacement in an existing file (requires prior `read_file`)
 - `math` -- execute Python in sandboxed subprocess (via `turnstone.core.sandbox`)
 - `web_fetch` -- fetch a URL (with SSRF protection via `turnstone.core.web`)
-- `web_search` -- search the web via Tavily API
+- `web_search` -- search the web (provider-native for Anthropic/OpenAI, Tavily fallback for local models)
 
 **Agent (delegated sub-sessions)**:
 - `task` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
@@ -514,15 +514,18 @@ LLMProvider (protocol)
 
 | Type | Fields |
 |------|--------|
-| `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `usage`, `finish_reason` |
+| `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage` |
-| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
-already in OpenAI format). Model capability lookup table covers GPT-4o,
-GPT-5/5.1/5.2, and O-series models. Unknown models (local servers) get
-permissive defaults.
+already in OpenAI format). Model capability lookup table covers
+GPT-5/5.1/5.2, O-series, and search models (`gpt-5-search-api`).
+For search models, injects `web_search_options` and removes the `web_search`
+function tool (the model always searches). Citations from `url_citation`
+annotations are formatted as footnotes. Unknown models (local servers) get
+permissive defaults and use Tavily for web search.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`
@@ -530,7 +533,11 @@ parameter, groups consecutive `tool` result messages into user-role content
 blocks, and translates tool schemas from OpenAI function-calling format to
 Anthropic's `input_schema` format. Supports both manual and adaptive thinking
 modes, with effort parameter support for models like Claude Opus 4.6 and
-Sonnet 4.6. The `anthropic` SDK is imported lazily so it remains an optional
+Sonnet 4.6. Replaces the `web_search` function tool with Anthropic's native
+`web_search_20250305` server-side tool — Claude decides when to search, the
+API executes it, and results stream back as `server_tool_use` /
+`web_search_tool_result` content blocks (emitted as `info_delta` for UI
+display). The `anthropic` SDK is imported lazily so it remains an optional
 dependency (`pip install turnstone[anthropic]`).
 
 **Factory functions** (`__init__.py`): `create_provider(name)` returns a
@@ -558,8 +565,8 @@ context_window = 200000
 [models.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "sk-..."
-model = "gpt-4o"
-context_window = 128000
+model = "gpt-5"
+context_window = 400000
 
 [model]
 default = "local"

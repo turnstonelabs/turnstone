@@ -105,7 +105,7 @@ partition "Phase 3: Execute" #E3F2FD {
           ├─ _exec_math: sandboxed subprocess
           ├─ _exec_man: man/info subprocess
           ├─ _exec_web_fetch: httpx.get + LLM summary
-          ├─ _exec_web_search: Tavily API POST
+          ├─ _exec_web_search: Tavily API POST (fallback for local models)
           ├─ _exec_task: _run_agent(TASK_AGENT_TOOLS)
           ├─ _exec_plan: _run_agent(AGENT_TOOLS, read-only)
           ├─ _exec_remember: SQLite INSERT OR REPLACE

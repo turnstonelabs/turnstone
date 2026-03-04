@@ -110,6 +110,9 @@ def _anthropic_event(
         stop_delta.stop_reason = kwargs.get("stop_reason")
         event.delta = stop_delta
 
+    elif event_type == "content_block_stop":
+        event.index = kwargs.get("index", 0)
+
     elif event_type == "message_start":
         msg = MagicMock()
         if "usage_input_tokens" in kwargs:
@@ -1038,6 +1041,16 @@ class TestDataclasses:
         assert cr.finish_reason == "stop"
         assert cr.usage is None
 
+    def test_stream_chunk_info_delta_default(self) -> None:
+        sc = StreamChunk()
+        assert sc.info_delta == ""
+
+    def test_model_capabilities_web_search_default(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_web_search is False
+
 
 # ===========================================================================
 # TestParameterGating — model capability parameter gating
@@ -1111,3 +1124,605 @@ class TestAnthropicReasoningNone:
         result = self.provider._reasoning_params("low", None, max_tokens=4096)
         assert "thinking" in result
         assert result["thinking"]["budget_tokens"] == 1024
+
+
+# ===========================================================================
+# TestWebSearch — provider-native web search
+# ===========================================================================
+
+
+class TestAnthropicWebSearch:
+    """Tests for Anthropic native web search tool injection and streaming."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_web_search_capability_flag(self) -> None:
+        """All Anthropic models should support native web search."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        assert caps.supports_web_search is True
+        caps = self.provider.get_capabilities("claude-sonnet-4")
+        assert caps.supports_web_search is True
+        # Unknown models use default which also has web search
+        caps = self.provider.get_capabilities("claude-unknown-99")
+        assert caps.supports_web_search is True
+
+    def test_inject_web_search_replaces_function_tool(self) -> None:
+        """web_search function tool should be replaced with native server-side tool."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        tools = [
+            {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}},
+            {"name": "web_search", "description": "Search web", "input_schema": {"type": "object"}},
+        ]
+        result = self.provider._inject_web_search(tools, caps)
+        names = [t.get("name") for t in result]
+        assert "bash" in names
+        assert "web_search" in names
+        # The web_search entry should be the native tool, not the function tool
+        ws_tool = next(t for t in result if t.get("name") == "web_search")
+        from turnstone.core.providers._anthropic import _WEB_SEARCH_TOOL_TYPE
+
+        assert ws_tool["type"] == _WEB_SEARCH_TOOL_TYPE
+        assert "input_schema" not in ws_tool
+
+    def test_inject_web_search_no_op_without_tool(self) -> None:
+        """If no web_search tool in list, no injection happens."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        tools = [
+            {"name": "bash", "description": "Run bash", "input_schema": {"type": "object"}},
+        ]
+        result = self.provider._inject_web_search(tools, caps)
+        assert result is tools  # Unchanged
+
+    def test_streaming_server_tool_use_emits_search_info(self) -> None:
+        """server_tool_use block should emit info_delta with search query."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_123",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "python web frameworks"}',
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "python web frameworks" in info_chunks[0].info_delta
+        assert "Searching" in info_chunks[0].info_delta
+
+    def test_streaming_web_search_result_emits_count(self) -> None:
+        """web_search_tool_result block should emit result count info."""
+        # Build mock search results
+        result1 = MagicMock()
+        result1.type = "web_search_result"
+        result2 = MagicMock()
+        result2.type = "web_search_result"
+
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=1,
+            ),
+        ]
+        # Set up the content attribute with search results
+        events[0].content_block.content = [result1, result2]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Found 2 results" in info_chunks[0].info_delta
+
+    def test_streaming_web_search_error_emits_info(self) -> None:
+        """web_search_tool_result with error should emit error info."""
+        error_content = MagicMock()
+        error_content.type = "web_search_tool_result_error"
+        error_content.error_code = "too_many_requests"
+
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=1,
+            ),
+        ]
+        events[0].content_block.content = error_content
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "too_many_requests" in info_chunks[0].info_delta
+
+    def test_streaming_server_tool_use_not_emitted_as_tool_call(self) -> None:
+        """server_tool_use should NOT produce tool_call_deltas (it's server-side)."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_123",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test"}',
+                index=0,
+            ),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        tool_chunks = [c for c in chunks if c.tool_call_deltas]
+        assert len(tool_chunks) == 0
+
+    def test_streaming_mixed_text_and_search(self) -> None:
+        """Full sequence: text + server search + results + more text."""
+        events = [
+            # Initial text
+            _anthropic_event(
+                "content_block_start",
+                block_type="text",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="Let me search.",
+                index=0,
+            ),
+            # Server tool use
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=1,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test query"}',
+                index=1,
+            ),
+            _anthropic_event("content_block_stop", index=1),
+            # Response text
+            _anthropic_event(
+                "content_block_start",
+                block_type="text",
+                index=3,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="Based on the results...",
+                index=3,
+            ),
+            # Finish
+            _anthropic_event("message_delta", stop_reason="end_turn"),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        text_chunks = [c for c in chunks if c.content_delta]
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(text_chunks) == 2
+        assert text_chunks[0].content_delta == "Let me search."
+        assert text_chunks[1].content_delta == "Based on the results..."
+        assert len(info_chunks) == 1
+        assert "test query" in info_chunks[0].info_delta
+
+    def test_pause_turn_normalized_to_stop(self) -> None:
+        """pause_turn stop reason should normalize to 'stop'."""
+        from turnstone.core.providers._anthropic import _normalize_finish_reason
+
+        assert _normalize_finish_reason("pause_turn") == "stop"
+
+    def test_completion_skips_server_blocks(self) -> None:
+        """create_completion should skip server_tool_use and web_search_tool_result."""
+        # Build mock response with mixed block types
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Here are the results."
+
+        server_tu_block = MagicMock()
+        server_tu_block.type = "server_tool_use"
+
+        search_result_block = MagicMock()
+        search_result_block.type = "web_search_tool_result"
+
+        response = MagicMock()
+        response.content = [server_tu_block, search_result_block, text_block]
+        response.stop_reason = "end_turn"
+        response.usage.input_tokens = 100
+        response.usage.output_tokens = 50
+
+        client = MagicMock()
+        client.messages.create.return_value = response
+
+        with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
+            result = self.provider.create_completion(
+                client=client,
+                model="claude-opus-4-6",
+                messages=[{"role": "user", "content": "search test"}],
+            )
+        assert result.content == "Here are the results."
+        assert result.tool_calls is None
+
+    def test_streaming_multiple_searches(self) -> None:
+        """Multiple server_tool_use blocks in one response should each emit info."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "first search"}',
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_2",
+                block_name="web_search",
+                index=2,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "second search"}',
+                index=2,
+            ),
+            _anthropic_event("content_block_stop", index=2),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 2
+        assert "first search" in info_chunks[0].info_delta
+        assert "second search" in info_chunks[1].info_delta
+
+    def test_streaming_interleaved_tool_use_and_server_tool_use(self) -> None:
+        """Regular tool_use and server_tool_use at different indices."""
+        events = [
+            # Regular tool call at index 0
+            _anthropic_event(
+                "content_block_start",
+                block_type="tool_use",
+                block_id="toolu_1",
+                block_name="bash",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"command": "ls"}',
+                index=0,
+            ),
+            # Server tool at index 1
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=1,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json='{"query": "test"}',
+                index=1,
+            ),
+            _anthropic_event("content_block_stop", index=1),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        tool_chunks = [c for c in chunks if c.tool_call_deltas]
+        info_chunks = [c for c in chunks if c.info_delta]
+        # Regular tool_use should produce tool_call_deltas
+        assert len(tool_chunks) == 2  # start + delta
+        assert tool_chunks[0].tool_call_deltas[0].name == "bash"
+        # Server tool_use should produce info_delta only
+        assert len(info_chunks) == 1
+        assert "test" in info_chunks[0].info_delta
+
+    def test_streaming_malformed_server_tool_json(self) -> None:
+        """Malformed JSON in server tool input should emit fallback info."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="server_tool_use",
+                block_id="srvtoolu_1",
+                block_name="web_search",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="input_json_delta",
+                partial_json="{bad json",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert info_chunks[0].info_delta == "[Searching...]"
+
+    def test_web_search_result_empty_list(self) -> None:
+        """Empty search results list should report 0 results."""
+        events = [
+            _anthropic_event(
+                "content_block_start",
+                block_type="web_search_tool_result",
+                index=0,
+            ),
+        ]
+        events[0].content_block.content = []
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Found 0 results" in info_chunks[0].info_delta
+
+    def test_content_block_stop_for_text_block_no_spurious_info(self) -> None:
+        """content_block_stop for a text block should not emit info_delta."""
+        events = [
+            _anthropic_event("content_block_start", block_type="text", index=0),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="text_delta",
+                text="hello",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+        ]
+        chunks = list(self.provider._iter_anthropic_stream(events))
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 0
+
+
+class TestOpenAIWebSearch:
+    """Tests for OpenAI native web search with search models."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_search_model_capability(self) -> None:
+        """Search models should have supports_web_search=True."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        assert caps.supports_web_search is True
+
+    def test_non_search_model_no_web_search(self) -> None:
+        """Regular models should not have supports_web_search."""
+        caps = self.provider.get_capabilities("gpt-5")
+        assert caps.supports_web_search is False
+        caps = self.provider.get_capabilities("gpt-5.2")
+        assert caps.supports_web_search is False
+
+    def test_apply_web_search_injects_options(self) -> None:
+        """For search models, web_search_options should be added to kwargs."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {"model": "gpt-5-search-api"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "bash", "description": "Run bash"}},
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        # web_search_options should be in kwargs
+        assert "web_search_options" in kwargs
+        # web_search tool should be removed
+        assert result is not None
+        names = [t["function"]["name"] for t in result]
+        assert "web_search" not in names
+        assert "bash" in names
+
+    def test_apply_web_search_no_op_for_regular_models(self) -> None:
+        """For non-search models, no web_search_options, tools unchanged."""
+        caps = self.provider.get_capabilities("gpt-5")
+        kwargs: dict[str, Any] = {"model": "gpt-5"}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert "web_search_options" not in kwargs
+        assert result is tools  # Unchanged
+
+    def test_apply_web_search_returns_none_when_only_web_search(self) -> None:
+        """If web_search was the only tool, return None after removing it."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        tools: list[dict[str, Any]] = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = self.provider._apply_web_search(kwargs, caps, tools)
+        assert result is None
+
+    def test_format_citations_appends_sources(self) -> None:
+        """url_citation annotations should be formatted as footnote sources."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        citation = MagicMock()
+        citation.title = "Example Page"
+        citation.url = "https://example.com"
+        ann.url_citation = citation
+
+        content = "Some search result text."
+        result = OpenAIProvider._format_citations(content, [ann])
+        assert "Sources:" in result
+        assert "[Example Page](https://example.com)" in result
+
+    def test_format_citations_deduplicates(self) -> None:
+        """Duplicate URLs should not appear twice in sources."""
+        ann1 = MagicMock()
+        ann1.type = "url_citation"
+        ann1.url_citation = MagicMock(title="Page", url="https://example.com")
+
+        ann2 = MagicMock()
+        ann2.type = "url_citation"
+        ann2.url_citation = MagicMock(title="Page Again", url="https://example.com")
+
+        content = "Text."
+        result = OpenAIProvider._format_citations(content, [ann1, ann2])
+        assert result.count("example.com") == 1
+
+    def test_format_citations_skips_non_url_citation(self) -> None:
+        """Non-url_citation annotations should be ignored."""
+        ann = MagicMock()
+        ann.type = "something_else"
+
+        content = "Text."
+        result = OpenAIProvider._format_citations(content, [ann])
+        assert "Sources:" not in result
+
+    def test_format_citations_empty_title(self) -> None:
+        """Citation with empty title should show plain URL."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="", url="https://example.com")
+
+        result = OpenAIProvider._format_citations("Text.", [ann])
+        assert "https://example.com" in result
+        # Should not have markdown link format when title is empty
+        assert "[](https://example.com)" not in result
+
+    def test_format_citations_none_citation(self) -> None:
+        """Citation with None url_citation should be skipped."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = None
+
+        result = OpenAIProvider._format_citations("Text.", [ann])
+        assert "Sources:" not in result
+
+    def test_apply_web_search_with_no_tools(self) -> None:
+        """Search model with tools=None should still inject web_search_options."""
+        caps = self.provider.get_capabilities("gpt-5-search-api")
+        kwargs: dict[str, Any] = {}
+        result = self.provider._apply_web_search(kwargs, caps, None)
+        assert "web_search_options" in kwargs
+        assert result is None
+
+    def test_streaming_creates_with_web_search_options(self) -> None:
+        """Streaming with a search model should pass web_search_options."""
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(
+            [
+                _openai_stream_chunk(content="Result text"),
+            ]
+        )
+        list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search something"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {"name": "web_search", "description": "Search"},
+                    },
+                ],
+            )
+        )
+        call_kwargs = client.chat.completions.create.call_args[1]
+        assert "web_search_options" in call_kwargs
+        # web_search tool should not be in the tools
+        assert "tools" not in call_kwargs or not any(
+            t.get("function", {}).get("name") == "web_search" for t in call_kwargs.get("tools", [])
+        )
+
+    def test_completion_with_annotations(self) -> None:
+        """Non-streaming completion with search model should format citations."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Test", url="https://test.com")
+
+        msg = MagicMock()
+        msg.content = "Found information."
+        msg.annotations = [ann]
+        msg.tool_calls = None
+
+        choice = MagicMock()
+        choice.message = msg
+        choice.finish_reason = "stop"
+
+        response = MagicMock()
+        response.choices = [choice]
+        response.usage.prompt_tokens = 50
+        response.usage.completion_tokens = 20
+        response.usage.total_tokens = 70
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        result = self.provider.create_completion(
+            client=client,
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "search test"}],
+        )
+        assert "Found information." in result.content
+        assert "Sources:" in result.content
+        assert "[Test](https://test.com)" in result.content
+
+    def test_streaming_emits_citations_as_info_delta(self) -> None:
+        """Streaming with search model should emit citations as final info_delta."""
+        ann = MagicMock()
+        ann.type = "url_citation"
+        ann.url_citation = MagicMock(title="Result", url="https://example.com")
+
+        # Content chunk, then a chunk with annotation, then finish
+        content_chunk = _openai_stream_chunk(content="Search result text.")
+        content_chunk.choices[0].delta.annotations = None
+
+        ann_chunk = _openai_stream_chunk(content=None)
+        ann_chunk.choices[0].delta.annotations = [ann]
+
+        finish_chunk = _openai_stream_chunk(finish_reason="stop")
+        finish_chunk.choices[0].delta.annotations = None
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter([content_chunk, ann_chunk, finish_chunk])
+        chunks = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5-search-api",
+                messages=[{"role": "user", "content": "search test"}],
+            )
+        )
+        info_chunks = [c for c in chunks if c.info_delta]
+        assert len(info_chunks) == 1
+        assert "Sources:" in info_chunks[0].info_delta
+        assert "[Result](https://example.com)" in info_chunks[0].info_delta
+
+
+class TestTavilyFallback:
+    """Tests for Tavily fallback when providers don't support native search."""
+
+    def test_local_model_no_web_search(self) -> None:
+        """Local/vLLM models should not have supports_web_search."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("my-local-model")
+        assert caps.supports_web_search is False
+
+    def test_web_search_tool_preserved_for_local_models(self) -> None:
+        """For local models, web_search function tool stays in the tools list."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("llama-3-70b")
+        kwargs: dict[str, Any] = {}
+        tools = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+        ]
+        result = provider._apply_web_search(kwargs, caps, tools)
+        assert result is tools
+        assert "web_search_options" not in kwargs

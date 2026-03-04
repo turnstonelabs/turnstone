@@ -79,9 +79,11 @@ interface "LLMProvider" as LLMProvider <<Protocol>> {
 
 class "OpenAIProvider" as OpenAIProv {
     Model capability lookup table
-    (GPT-4o, GPT-5.x, O-series)
+    (GPT-5.x, O-series, search)
     Passthrough: messages already
-    in OpenAI format
+    in OpenAI format.
+    Search models: web_search_options
+    + url_citation annotations.
     --
     core/providers/_openai.py
 }
@@ -90,6 +92,8 @@ class "AnthropicProvider" as AnthropicProv {
     Converts OpenAI messages to
     Anthropic content blocks.
     Adaptive + manual thinking.
+    Native web search via
+    web_search_20250305 server tool.
     Lazy anthropic SDK import.
     --
     core/providers/_anthropic.py
@@ -103,6 +107,7 @@ class "ModelCapabilities" as ModelCaps <<frozen>> {
     + token_param: str
     + thinking_mode: str
     + supports_effort: bool
+    + supports_web_search: bool
 }
 
 ' ChatSession
