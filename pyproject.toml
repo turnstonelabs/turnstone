@@ -30,6 +30,8 @@ dependencies = [
     "sse-starlette>=2.0",
     "httpx-sse>=0.4",
     "pydantic>=2.0",
+    "sqlalchemy>=2.0",
+    "alembic>=1.14",
 ]
 
 [project.urls]
@@ -44,6 +46,7 @@ mq = ["redis>=7.2"]
 console = ["redis>=7.2"]
 sim = ["redis>=7.2"]
 anthropic = ["anthropic>=0.39"]
+postgres = ["psycopg[binary]>=3.2"]
 
 
 [project.scripts]
@@ -119,6 +122,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["sse_starlette", "sse_starlette.*", "uvicorn", "uvicorn.*", "httpx_sse", "httpx_sse.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["sqlalchemy", "sqlalchemy.*", "alembic", "alembic.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

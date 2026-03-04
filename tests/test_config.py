@@ -153,27 +153,23 @@ def test_apply_config_model_section(tmp_path, monkeypatch):
 def test_tavily_key_from_config(tmp_path, monkeypatch):
     """get_tavily_key() reads from config.toml [api] tavily_key."""
     _reset_cache()
-    import turnstone.core.memory as mem
-
-    mem._tavily_key = None
-    mem._tavily_key_loaded = False
+    config_mod._tavily_key = None
+    config_mod._tavily_key_loaded = False
 
     cfg = tmp_path / "config.toml"
     cfg.write_text('[api]\ntavily_key = "tvly-from-config"\n')
     monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg)
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
-    key = mem.get_tavily_key()
+    key = config_mod.get_tavily_key()
     assert key == "tvly-from-config"
 
 
 def test_tavily_key_fallback_to_env(tmp_path, monkeypatch):
     """get_tavily_key() falls back to $TAVILY_API_KEY env var."""
     _reset_cache()
-    import turnstone.core.memory as mem
-
-    mem._tavily_key = None
-    mem._tavily_key_loaded = False
+    config_mod._tavily_key = None
+    config_mod._tavily_key_loaded = False
 
     # Config exists but no tavily_key in it
     cfg = tmp_path / "config.toml"
@@ -181,5 +177,5 @@ def test_tavily_key_fallback_to_env(tmp_path, monkeypatch):
     monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg)
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-from-env")
 
-    key = mem.get_tavily_key()
+    key = config_mod.get_tavily_key()
     assert key == "tvly-from-env"

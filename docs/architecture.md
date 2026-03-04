@@ -42,7 +42,8 @@ turnstone/
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
-    memory.py         SQLite persistence (conversations, memories, FTS5 search)
+    memory.py         Persistence facade (delegates to storage backend)
+    storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker
     ratelimit.py      Per-IP token-bucket rate limiter (RateLimiter, TokenBucket)
@@ -637,11 +638,37 @@ This truncation message is visible to the model, so it knows output was cut.
 
 ## Persistence
 
-### Database
+### Storage Architecture
 
-SQLite via `turnstone.core.memory`. Database file: `.turnstone.db` in the
-current working directory (overridable via `memory.db_override` for eval
-isolation).
+Persistence is managed by the `turnstone.core.storage` package — a pluggable
+backend behind a `StorageBackend` protocol. The `memory.py` facade provides
+backward-compatible module-level functions that delegate to the active backend.
+
+```
+session.py / server.py / cli.py
+        ↓
+    memory.py  (facade — silent-failure wrappers)
+        ↓
+    storage._registry  (singleton factory)
+        ↓
+  ┌─────────────┐    ┌──────────────────┐
+  │ SQLiteBackend │    │ PostgreSQLBackend │
+  │ (FTS5 search) │    │ (tsvector/ILIKE)  │
+  └─────────────┘    └──────────────────┘
+        ↓                     ↓
+    storage._schema  (SQLAlchemy Core tables — single source of truth)
+        ↓
+    storage._migrate  (programmatic Alembic)
+```
+
+**SQLite** is the default (zero-config, single file at `.turnstone.db`).
+**PostgreSQL** is the production backend (connection pooling, `tsvector`
+full-text search). Select via `[database]` in `config.toml`, CLI flags, or
+environment variables (`TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`).
+
+Schema migrations are managed by Alembic and run automatically on startup.
+Existing SQLite databases created before the migration system are auto-stamped
+at the baseline revision.
 
 ### Tables
 
@@ -668,34 +695,53 @@ conversations
   tool_name     TEXT
   tool_args     TEXT
   tool_call_id  TEXT                 -- links tool_call ↔ tool_result for resume
+  provider_data TEXT                 -- raw provider content (e.g. Anthropic encrypted)
 
-conversations_fts                    -- FTS5 virtual table
+session_config
+  session_id  TEXT NOT NULL          -- composite PK with key
+  key         TEXT NOT NULL
+  value       TEXT
+
+conversations_fts                    -- SQLite FTS5 virtual table (optional)
   content     (content=conversations, content_rowid=id)
 ```
 
-The `tool_call_id` column was added via schema migration (`ALTER TABLE`) for
-backwards compatibility with existing databases.
+Table definitions live in `storage/_schema.py` (SQLAlchemy Core `Table` objects)
+and are the single source of truth for both backends and Alembic migrations.
 
-### Key Functions
+### StorageBackend Protocol
 
-| Function | Purpose |
-|----------|---------|
-| `open_db()` | Open/create database, run migrations, initialize tables |
-| `load_memories()` | Return all `(key, value)` pairs sorted by key |
-| `save_message(session_id, role, content, ...)` | Log a message to conversations (accepts `tool_call_id`) |
-| `search_history(query, limit)` | Full-text search via FTS5 (falls back to LIKE) |
-| `search_history_recent(limit)` | Return most recent messages |
+| Method | Purpose |
+|--------|---------|
 | `register_session(session_id, title)` | Create a sessions row (no-op if exists) |
-| `update_session_title(session_id, title)` | Set/update LLM-generated title |
+| `save_message(session_id, role, content, ...)` | Log a message to conversations |
+| `load_session_messages(session_id)` | Reconstruct OpenAI message format from DB rows |
+| `list_sessions(limit)` | List sessions with >=1 message, ordered by updated DESC |
+| `delete_session(session_id)` | Delete session and all its messages |
+| `prune_sessions(retention_days)` | Remove empty sessions and old unnamed sessions |
+| `resolve_session(alias_or_id)` | Resolve alias, exact id, or id prefix to full session_id |
+| `save_session_config(session_id, config)` | Persist session configuration key/value pairs |
+| `load_session_config(session_id)` | Retrieve session configuration |
 | `set_session_alias(session_id, alias)` | Set user-friendly alias (returns False if taken) |
 | `get_session_name(session_id)` | Return alias if set, else title, else None |
-| `resolve_session(alias_or_id)` | Resolve alias, exact id, or id prefix to full session_id |
-| `list_sessions(limit)` | List sessions with ≥1 message, ordered by updated DESC |
-| `load_session_messages(session_id)` | Reconstruct OpenAI message format from DB rows |
-| `delete_session(session_id)` | Delete session and all its messages |
-| `prune_sessions(retention_days, log_fn)` | Remove empty sessions and old unnamed sessions; called at startup |
-| `normalize_key(key)` | Normalize memory keys (`lower`, replace `-`/` ` with `_`) |
-| `fts5_query(query)` | Convert plain text to safe FTS5 query (quoted terms) |
+| `update_session_title(session_id, title)` | Set/update LLM-generated title |
+| `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Generic key-value store (backs memories table) |
+| `kv_list()` / `kv_search(query)` | List or search key-value pairs |
+| `search_history(query, limit)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |
+| `search_history_recent(limit)` | Return most recent messages |
+| `close()` | Release resources (connection pool, engine) |
+
+### Database Configuration
+
+```toml
+[database]
+backend = "sqlite"                  # "sqlite" | "postgresql"
+path = ".turnstone.db"              # SQLite file path
+url = ""                            # PostgreSQL connection URL
+pool_size = 5                       # PostgreSQL connection pool size
+```
+
+Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB_PATH`.
 
 ### Session Persistence and Resume
 

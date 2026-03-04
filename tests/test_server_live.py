@@ -30,8 +30,8 @@ import httpx
 import pytest
 from openai import OpenAI
 
-import turnstone.core.memory as _memory_module
 from turnstone.core.session import ChatSession
+from turnstone.core.storage import init_storage, reset_storage
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -126,12 +126,10 @@ def tmp_db():
     """Temp DB to avoid polluting real conversation history."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         path = f.name
-    old = _memory_module.db_override
-    _memory_module.db_override = path
-    _memory_module.db_initialized.discard(path)
+    reset_storage()
+    init_storage("sqlite", path=path, run_migrations=False)
     yield path
-    _memory_module.db_override = old
-    _memory_module.db_initialized.discard(path)
+    reset_storage()
     os.unlink(path)
 
 

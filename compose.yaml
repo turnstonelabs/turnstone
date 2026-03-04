@@ -2,10 +2,11 @@
 # Turnstone Docker Compose Stack
 #
 # Usage:
-#   Full stack:       docker compose up
-#   With simulator:   docker compose --profile sim up
-#   Sim only:         docker compose --profile sim up redis console sim
-#   Scale bridges:    docker compose up --scale bridge=3
+#   Default (SQLite):     docker compose up
+#   Production (PG):      DB_BACKEND=postgresql docker compose --profile production up
+#                         (or set DB_BACKEND=postgresql in .env)
+#   With simulator:       docker compose --profile sim up
+#   Scale bridges:        docker compose up --scale bridge=3
 # =============================================================================
 
 name: turnstone
@@ -17,8 +18,37 @@ networks:
 volumes:
   redis-data:
   turnstone-data:
+  postgres-data:
 
 services:
+  # -------------------------------------------------------------------
+  # PostgreSQL — production database (profile: production)
+  # -------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    profiles:
+      - production
+    environment:
+      POSTGRES_DB: turnstone
+      POSTGRES_USER: ${POSTGRES_USER:-turnstone}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required for production profile}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - turnstone-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-turnstone}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+    restart: unless-stopped
+
   # -------------------------------------------------------------------
   # Redis — message broker, pub/sub, node registry
   # -------------------------------------------------------------------
@@ -66,6 +96,7 @@ services:
         --port 8080
         --base-url "$${LLM_BASE_URL}"
         --api-key "$${OPENAI_API_KEY}"
+        $${MODEL:+--model $$MODEL}
         $${SKIP_PERMISSIONS:+--skip-permissions}
     ports:
       - "${SERVER_PORT:-8080}:8080"
@@ -78,6 +109,9 @@ services:
       - SKIP_PERMISSIONS=${SKIP_PERMISSIONS:-}
       - TURNSTONE_AUTH_ENABLED=${TURNSTONE_AUTH_ENABLED:-}
       - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
+      - MODEL=${MODEL:-}
+      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -85,6 +119,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+        required: false
     healthcheck:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
       interval: 10s

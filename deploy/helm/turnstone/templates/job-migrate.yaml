@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "turnstone.fullname" . }}-migrate
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-1"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: {{ include "turnstone.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - python
+            - -m
+            - turnstone.core.storage._migrate
+          envFrom:
+            - configMapRef:
+                name: {{ include "turnstone.fullname" . }}-config
+            - secretRef:
+                name: {{ include "turnstone.llm.secretName" . }}
+                optional: true
+          env:
+            - name: TURNSTONE_DB_URL
+              value: "postgresql+psycopg://$(TURNSTONE_DB_USER):$(POSTGRES_PASSWORD)@$(TURNSTONE_DB_HOST):$(TURNSTONE_DB_PORT)/$(TURNSTONE_DB_NAME)"

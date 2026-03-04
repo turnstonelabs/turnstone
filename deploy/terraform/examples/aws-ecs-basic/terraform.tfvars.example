@@ -1,0 +1,22 @@
+# --- Required ---
+
+# VPC and subnet IDs from your existing AWS infrastructure.
+# The VPC must have DNS support and DNS hostnames enabled.
+vpc_id             = "vpc-0123456789abcdef0"
+private_subnet_ids = ["subnet-aaa111", "subnet-bbb222"]
+public_subnet_ids  = ["subnet-ccc333", "subnet-ddd444"]
+
+# LLM provider configuration.
+# For OpenAI: https://api.openai.com/v1
+# For a self-hosted vLLM instance: http://your-vllm-host:8000/v1
+llm_base_url   = "https://api.openai.com/v1"
+openai_api_key = "sk-..."
+
+# --- Optional ---
+
+# aws_region       = "us-east-1"
+# image_repository = "ghcr.io/turnstonelabs/turnstone"
+# image_tag        = "0.3.0"
+# environment      = "production"
+# name_prefix      = "turnstone"
+# auth_token       = "my-secret-token"
