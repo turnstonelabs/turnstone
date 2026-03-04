@@ -394,12 +394,14 @@ Each session object:
 
 | Field           | Type        | Description                                |
 |-----------------|-------------|--------------------------------------------|
-| `session_id`    | string      | Unique 12-char hex session identifier      |
+| `session_id`    | string      | Unique 32-char hex UUID session identifier |
 | `alias`         | string/null | User-assigned short name                   |
 | `title`         | string/null | LLM-generated title                        |
 | `created`       | string      | ISO timestamp of session creation          |
 | `updated`       | string      | ISO timestamp of last message              |
 | `message_count` | int         | Number of messages in the session          |
+| `node_id`       | string/null | Server node that created the session       |
+| `ws_id`         | string/null | Workstream the session belongs to          |
 
 ---
 
@@ -692,7 +694,8 @@ liveness probes.
 ```json
 {
   "status": "ok",
-  "version": "0.3.0",
+  "version": "0.3.5",
+  "node_id": "worker-01_a3f2",
   "uptime_seconds": 3614.72,
   "model": "llama-3.1-70b-instruct",
   "workstreams": {
@@ -714,6 +717,7 @@ liveness probes.
 |-------|------|-------------|
 | `status` | string | `"ok"` or `"degraded"` (degraded when backend unreachable) |
 | `version` | string | turnstone server version |
+| `node_id` | string | Server-generated node identity (`{hostname}_{4hex}`) |
 | `uptime_seconds` | number | Seconds since the server process started |
 | `model` | string | Model name detected or configured at startup |
 | `workstreams.total` | integer | Total active workstreams |

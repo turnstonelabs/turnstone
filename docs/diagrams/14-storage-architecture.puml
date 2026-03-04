@@ -13,7 +13,7 @@ skinparam class {
 
 ' -- Protocol --
 interface "StorageBackend" as SB <<protocol>> {
-    +register_session(session_id, title)
+    +register_session(session_id, title, node_id, ws_id)
     +save_message(session_id, role, content, ...)
     +load_session_messages(session_id) → list[dict]
     +list_sessions(limit) → list
@@ -25,6 +25,11 @@ interface "StorageBackend" as SB <<protocol>> {
     +set_session_alias(session_id, alias) → bool
     +get_session_name(session_id) → str | None
     +update_session_title(session_id, title)
+    +register_workstream(ws_id, node_id, name, state)
+    +update_workstream_state(ws_id, state)
+    +update_workstream_name(ws_id, name)
+    +delete_workstream(ws_id) → bool
+    +list_workstreams(node_id, limit) → list
     +kv_get(key) → str | None
     +kv_set(key, value) → str | None
     +kv_delete(key) → bool
@@ -58,7 +63,8 @@ class "_schema.py" as Schema <<schema>> {
     +metadata: MetaData
     +memories: Table
     +conversations: Table
-    +sessions: Table
+    +sessions: Table (node_id, ws_id)
+    +workstreams: Table (node_id, state)
     +session_config: Table
     --
     SQLAlchemy Core
@@ -94,9 +100,11 @@ class "memory.py" as Facade <<facade>> {
     +register_session()
     +save_message()
     +load_session_messages()
+    +register_workstream()
+    +update_workstream_state()
     +save_memory() / delete_memory()
     +search_memories()
-    +... (all 18 functions)
+    +... (all 22 functions)
     --
     Thin delegation to
     get_storage()

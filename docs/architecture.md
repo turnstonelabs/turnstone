@@ -713,7 +713,7 @@ and are the single source of truth for both backends and Alembic migrations.
 
 | Method | Purpose |
 |--------|---------|
-| `register_session(session_id, title)` | Create a sessions row (no-op if exists) |
+| `register_session(session_id, title, node_id, ws_id)` | Create a sessions row (no-op if exists) |
 | `save_message(session_id, role, content, ...)` | Log a message to conversations |
 | `load_session_messages(session_id)` | Reconstruct OpenAI message format from DB rows |
 | `list_sessions(limit)` | List sessions with >=1 message, ordered by updated DESC |
@@ -725,6 +725,11 @@ and are the single source of truth for both backends and Alembic migrations.
 | `set_session_alias(session_id, alias)` | Set user-friendly alias (returns False if taken) |
 | `get_session_name(session_id)` | Return alias if set, else title, else None |
 | `update_session_title(session_id, title)` | Set/update LLM-generated title |
+| `register_workstream(ws_id, node_id, name, state)` | Create a workstreams row (no-op if exists) |
+| `update_workstream_state(ws_id, state)` | Update workstream state and bump timestamp |
+| `update_workstream_name(ws_id, name)` | Update workstream display name |
+| `delete_workstream(ws_id)` | Delete a workstream row |
+| `list_workstreams(node_id, limit)` | List workstreams, optionally by node |
 | `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Generic key-value store (backs memories table) |
 | `kv_list()` / `kv_search(query)` | List or search key-value pairs |
 | `search_history(query, limit)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |
@@ -745,9 +750,11 @@ Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB
 
 ### Session Persistence and Resume
 
-Each `ChatSession` generates a 12-char hex `_session_id` on creation and
-registers it in the `sessions` table. Messages are saved to `conversations`
-as they happen via `save_message()`.
+Each `ChatSession` generates a full 32-char hex UUID `_session_id` on creation
+and registers it in the `sessions` table with the server's `node_id` and the
+owning `ws_id`. Messages are saved to `conversations` as they happen via
+`save_message()`. Workstreams are persisted to the `workstreams` table on
+creation, with state changes tracked via `update_workstream_state()`.
 
 **Auto-titling:** After the first complete exchange (user message + assistant
 response), a background thread calls the LLM with a title-generation prompt
@@ -1037,7 +1044,10 @@ a response or the approval timeout (default 3600s / 1 hour) expires.
 `ws_id` for active sends. When the global SSE reports `ws_state → idle` for a tracked
 workstream, the bridge emits a synthetic `TurnCompleteEvent` with the correlation ID.
 
-**Multi-node routing:** Each bridge has a `node_id` (defaults to hostname) and BLPOPs
+**Multi-node routing:** Each bridge retrieves its `node_id` from the server's
+`/health` endpoint on startup (with exponential backoff retry). The server
+generates the `node_id` (`{hostname}_{4hex}`) and is the sole authority for
+node identity. The bridge BLPOPs
 from both `turnstone:inbound:{node_id}` (directed, priority) and `turnstone:inbound` (shared).
 Messages with `target_node` set are pushed to the target's per-node queue. Messages
 for existing workstreams are auto-routed via `turnstone:ws:{ws_id}` ownership keys in Redis.
