@@ -995,11 +995,13 @@ the main server. `ClusterCollector`'s background threads (event subscriber,
 node discovery, poll loop) remain unchanged — they use sync Redis clients
 and `ThreadPoolExecutor` for parallel HTTP polling.
 
-The console is read-only — it never writes to Redis queues or sends commands to servers.
-Real-time events provide instant state transitions; periodic polling provides full data
-consistency (tokens, context ratios, activity strings). Clicking a workstream row in the
-console opens the node's server UI with `?ws_id=<id>` for direct deep linking — the
-server parses this on load and auto-selects the workstream. See [docs/console.md](console.md)
+The console supports workstream creation (dispatched via MQ), a reverse proxy
+for serving node UIs through the console port, and version drift detection
+(flagging when nodes report different versions). Real-time events provide instant
+state transitions; periodic polling provides full data consistency (tokens,
+context ratios, activity strings, version). Clicking a workstream row in the
+console opens the node's server UI via the built-in reverse proxy with
+`?ws_id=<id>` for direct deep linking. See [docs/console.md](console.md)
 for the full API reference.
 
 ---

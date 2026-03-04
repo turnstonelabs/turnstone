@@ -343,7 +343,7 @@ body {
    ========================================================================== */
 .node-colheaders {
   display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 140px;
+  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
   padding: 6px 16px;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border-strong);
@@ -365,7 +365,7 @@ body {
    ========================================================================== */
 .node-row {
   display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 140px;
+  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
   padding: 9px 16px;
   cursor: pointer;
   transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
@@ -428,6 +428,38 @@ body {
   line-height: 1.6;
   flex-shrink: 0;
 }
+.node-cell-version {
+  font-size: 11px;
+  color: var(--fg-dim);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.node-cell-version.drift { color: var(--yellow); }
+.ncol-version { text-align: right; }
+.node-version-drift-badge {
+  font-size: 9px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--yellow);
+  background: var(--yellow-glow);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  padding: 0 5px;
+  margin-left: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+.csb-version-drift .drift-warn {
+  color: var(--yellow);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
 .node-cell-num {
   color: var(--fg-dim);
   font-size: 11px;
@@ -464,7 +496,7 @@ body {
 
 .node-group-header {
   display: grid;
-  grid-template-columns: 1fr 50px 50px 50px 70px 140px;
+  grid-template-columns: 1fr 50px 50px 50px 70px 60px 140px;
   padding: 10px 16px;
   cursor: pointer;
   transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
@@ -746,6 +778,7 @@ body {
   .node-colheaders, .node-row { grid-template-columns: 1fr 40px 40px 40px 60px; }
   .node-group-header { grid-template-columns: 1fr 40px 40px 40px 60px; }
   .node-group-header .node-group-cell:last-child { display: none; }
+  .ncol-version, .node-cell-version { display: none; }
   .ncol-health, .node-cell-health { display: none; }
   #main { padding: 16px; padding-bottom: 60px; }
 }

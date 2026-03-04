@@ -205,6 +205,8 @@ async def health(request: Request) -> JSONResponse:
             "service": "turnstone-console",
             "nodes": overview["nodes"],
             "workstreams": overview["workstreams"],
+            "version_drift": overview.get("version_drift", False),
+            "versions": overview.get("versions", []),
         }
     )
 
