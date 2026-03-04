@@ -565,7 +565,7 @@ class TestConsoleHTTPEndpoints:
         return resp.status_code, resp.text, resp.headers.get("content-type")
 
     def test_get_overview(self, client, mock_collector):
-        status, data = self._get(client, "/api/cluster/overview")
+        status, data = self._get(client, "/v1/api/cluster/overview")
         assert status == 200
         assert data["nodes"] == 3
         assert data["workstreams"] == 15
@@ -573,7 +573,7 @@ class TestConsoleHTTPEndpoints:
         mock_collector.get_overview.assert_called_once()
 
     def test_get_nodes(self, client, mock_collector):
-        status, data = self._get(client, "/api/cluster/nodes?sort=activity&limit=10&offset=0")
+        status, data = self._get(client, "/v1/api/cluster/nodes?sort=activity&limit=10&offset=0")
         assert status == 200
         assert len(data["nodes"]) == 1
         assert data["total"] == 1
@@ -581,7 +581,7 @@ class TestConsoleHTTPEndpoints:
 
     def test_get_workstreams(self, client, mock_collector):
         status, data = self._get(
-            client, "/api/cluster/workstreams?state=running&page=1&per_page=25"
+            client, "/v1/api/cluster/workstreams?state=running&page=1&per_page=25"
         )
         assert status == 200
         assert len(data["workstreams"]) == 1
@@ -598,19 +598,19 @@ class TestConsoleHTTPEndpoints:
         )
 
     def test_get_workstreams_per_page_capped(self, client, mock_collector):
-        self._get(client, "/api/cluster/workstreams?per_page=999")
+        self._get(client, "/v1/api/cluster/workstreams?per_page=999")
         call_kwargs = mock_collector.get_workstreams.call_args
         assert call_kwargs.kwargs["per_page"] == 200
 
     def test_get_node_detail(self, client, mock_collector):
-        status, data = self._get(client, "/api/cluster/node/node-a")
+        status, data = self._get(client, "/v1/api/cluster/node/node-a")
         assert status == 200
         assert data["node_id"] == "node-a"
         mock_collector.get_node_detail.assert_called_once_with("node-a")
 
     def test_get_node_detail_not_found(self, client, mock_collector):
         mock_collector.get_node_detail.return_value = None
-        status, data = self._get(client, "/api/cluster/node/nonexistent")
+        status, data = self._get(client, "/v1/api/cluster/node/nonexistent")
         assert status == 404
         assert "error" in data
 
@@ -740,7 +740,7 @@ class TestCollectorVersionInfo:
 
 
 class TestConsoleWorkstreamCreation:
-    """Tests for POST /api/cluster/workstreams/new."""
+    """Tests for POST /v1/api/cluster/workstreams/new."""
 
     @pytest.fixture()
     def mock_collector(self):
@@ -789,7 +789,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_with_explicit_node(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "name": "test-ws"},
         )
         assert resp.status_code == 200
@@ -808,7 +808,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_with_model(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "model": "gpt-5"},
         )
         assert resp.status_code == 200
@@ -819,7 +819,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_auto_selects_best_node(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"name": "auto-test"},
         )
         assert resp.status_code == 200
@@ -830,7 +830,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_no_reachable_nodes(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         mock_collector.get_nodes.return_value = ([], 0)
-        resp = client.post("/api/cluster/workstreams/new", json={})
+        resp = client.post("/v1/api/cluster/workstreams/new", json={})
         assert resp.status_code == 503
         assert "No reachable nodes" in resp.json()["error"]
 
@@ -838,7 +838,7 @@ class TestConsoleWorkstreamCreation:
         client, broker = client_and_broker
         mock_collector.get_node_detail.return_value = None
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "nonexistent"},
         )
         assert resp.status_code == 404
@@ -846,7 +846,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_invalid_json(self, client_and_broker):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             content=b"not json",
             headers={"Content-Type": "application/json"},
         )
@@ -855,7 +855,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_pushes_to_directed_queue(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a"},
         )
         assert resp.status_code == 200
@@ -866,7 +866,7 @@ class TestConsoleWorkstreamCreation:
     def test_create_pool_pushes_to_shared_queue(self, client_and_broker, mock_collector):
         client, broker = client_and_broker
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "pool", "name": "pool-task"},
         )
         assert resp.status_code == 200
@@ -888,7 +888,7 @@ class TestConsoleWorkstreamCreation:
         client, broker = client_and_broker
         mock_collector.get_node_detail.return_value = None  # would 404 for directed
         resp = client.post(
-            "/api/cluster/workstreams/new",
+            "/v1/api/cluster/workstreams/new",
             json={"node_id": "pool"},
         )
         assert resp.status_code == 200
@@ -1114,7 +1114,7 @@ class TestConsoleVersionEndpoints:
         return resp.status_code, resp.json()
 
     def test_overview_includes_version_drift(self, client, mock_collector):
-        status, data = self._get(client, "/api/cluster/overview")
+        status, data = self._get(client, "/v1/api/cluster/overview")
         assert status == 200
         assert data["version_drift"] is True
         assert "0.3.0" in data["versions"]

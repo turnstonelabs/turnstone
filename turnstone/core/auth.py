@@ -3,12 +3,14 @@
 Opt-in via the ``[auth]`` section in ``config.toml``.  When auth is disabled
 (the default), all requests pass through unchecked.  When enabled, API
 requests must include a valid ``Authorization: Bearer <token>`` header or
-a ``turnstone_auth`` cookie (set via the ``/api/auth/login`` endpoint).
+a ``turnstone_auth`` cookie (set via the ``/v1/api/auth/login`` endpoint).
 Each token has a role: ``"read"`` or ``"full"``.
 
-Public paths (``/``, ``/static/*``, ``/health``, ``/metrics``,
-``/api/auth/login``, ``/api/auth/logout``) are always accessible
-without authentication.
+Public paths (``/``, ``/static/*``, ``/shared/*``, ``/health``, ``/metrics``,
+``/openapi.json``, ``/docs``, ``/api/auth/login``, ``/api/auth/logout``) are
+always accessible without authentication.  Paths under ``/v1/`` are
+normalised by stripping the version prefix before classification so that
+``/v1/api/send`` maps to ``/api/send`` in the path lists.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ log = logging.getLogger(__name__)
 AUTH_COOKIE = "turnstone_auth"
 
 PUBLIC_PATHS: frozenset[str] = frozenset(
-    {"/", "/health", "/metrics", "/api/auth/login", "/api/auth/logout"}
+    {"/", "/health", "/metrics", "/openapi.json", "/docs", "/api/auth/login", "/api/auth/logout"}
 )
 PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
 
@@ -42,6 +44,13 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/cluster/workstreams/new",
     }
 )
+
+
+def _strip_version_prefix(path: str) -> str:
+    """Strip ``/v1`` prefix for path classification -- keeps path lists unversioned."""
+    if path.startswith("/v1/"):
+        return path[3:]
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +131,10 @@ def load_auth_config() -> AuthConfig:
 
 def is_public_path(path: str) -> bool:
     """Return *True* if the path should be accessible without authentication."""
-    if path in PUBLIC_PATHS:
+    normalized = _strip_version_prefix(path)
+    if normalized in PUBLIC_PATHS:
         return True
-    return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+    return any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES)
 
 
 def required_role(method: str, path: str) -> str:
@@ -134,16 +144,25 @@ def required_role(method: str, path: str) -> str:
     Handles console proxy routes (``/node/{id}/api/...``) by extracting the
     proxied path and checking it against ``WRITE_PATHS``.
     """
-    normalized = path.rstrip("/") if path != "/" else path
+    normalized = _strip_version_prefix(path)
+    normalized = normalized.rstrip("/") if normalized != "/" else normalized
     if method == "POST" and normalized in WRITE_PATHS:
         return "full"
-    # Console proxy routes: /node/{node_id}/api/{tail}
+    # Console proxy routes: /node/{node_id}/api/{tail} or /node/{node_id}/v1/api/{tail}
     if method == "POST" and normalized.startswith("/node/"):
-        parts = normalized.split("/", 4)  # ['', 'node', '{id}', 'api', '{tail}']
-        if len(parts) >= 5 and parts[3] == "api":
-            proxied_path = "/api/" + parts[4]
-            if proxied_path in WRITE_PATHS:
-                return "full"
+        parts = normalized.split("/", 4)  # ['', 'node', '{id}', 'api'|'v1', ...]
+        if len(parts) >= 5:
+            if parts[3] == "api":
+                proxied_path = "/api/" + parts[4]
+                if proxied_path in WRITE_PATHS:
+                    return "full"
+            elif parts[3] == "v1":
+                # /node/{id}/v1/api/{tail} — re-split the remainder
+                remainder = parts[4]  # "api/send" etc.
+                if remainder.startswith("api/"):
+                    proxied_path = "/api/" + remainder[4:]
+                    if proxied_path in WRITE_PATHS:
+                        return "full"
     return "read"
 
 

@@ -827,16 +827,16 @@ class TestServerRateLimiting:
         """After exhausting burst on a non-exempt endpoint, get 429."""
         # Exhaust burst on a non-exempt endpoint
         for _ in range(5):
-            self._get("/api/workstreams")
+            self._get("/v1/api/workstreams")
         # At least one should be 429
-        statuses = [self._get("/api/workstreams").status_code for _ in range(3)]
+        statuses = [self._get("/v1/api/workstreams").status_code for _ in range(3)]
         assert 429 in statuses
 
     def test_429_includes_retry_after(self):
         """429 response includes Retry-After header."""
         # Burn through burst
         for _ in range(10):
-            resp = self._get("/api/workstreams")
+            resp = self._get("/v1/api/workstreams")
             if resp.status_code == 429:
                 assert "retry-after" in resp.headers
                 data = resp.json()
@@ -848,7 +848,7 @@ class TestServerRateLimiting:
         """Health endpoint is always accessible regardless of rate limit."""
         # Burn through bucket on non-exempt path
         for _ in range(10):
-            self._get("/api/workstreams")
+            self._get("/v1/api/workstreams")
         # Health should still work
         resp = self._get("/health")
         assert resp.status_code == 200
@@ -856,6 +856,6 @@ class TestServerRateLimiting:
     def test_metrics_exempt_from_ratelimit(self):
         """Metrics endpoint is always accessible regardless of rate limit."""
         for _ in range(10):
-            self._get("/api/workstreams")
+            self._get("/v1/api/workstreams")
         resp = self._get("/metrics")
         assert resp.status_code == 200

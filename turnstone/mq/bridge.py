@@ -139,7 +139,7 @@ class Bridge:
     def _recover_workstreams(self) -> None:
         """Discover active workstreams on startup and register ownership."""
         try:
-            resp = self._http.get("/api/workstreams")
+            resp = self._http.get("/v1/api/workstreams")
             data = resp.json()
             for ws in data.get("workstreams", []):
                 ws_id = ws["id"]
@@ -245,7 +245,7 @@ class Bridge:
         with self._lock:
             self._active_sends[ws_id] = msg.correlation_id
 
-        resp = self._http.post("/api/send", json={"message": message, "ws_id": ws_id})
+        resp = self._http.post("/v1/api/send", json={"message": message, "ws_id": ws_id})
         data = resp.json()
 
         self._publish_ws(
@@ -271,7 +271,7 @@ class Bridge:
     def _handle_command(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
         command = getattr(msg, "command", "")
-        resp = self._http.post("/api/command", json={"command": command, "ws_id": ws_id})
+        resp = self._http.post("/v1/api/command", json={"command": command, "ws_id": ws_id})
         data = resp.json()
         self._publish_ws(
             ws_id,
@@ -298,7 +298,7 @@ class Bridge:
 
     def _handle_close_ws(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
-        resp = self._http.post("/api/workstreams/close", json={"ws_id": ws_id})
+        resp = self._http.post("/v1/api/workstreams/close", json={"ws_id": ws_id})
         data = resp.json()
         self._publish_ws(
             ws_id,
@@ -311,7 +311,7 @@ class Bridge:
         )
 
     def _handle_list_ws(self, msg: InboundMessage) -> None:
-        resp = self._http.get("/api/workstreams")
+        resp = self._http.get("/v1/api/workstreams")
         data = resp.json()
         self._publish_global(
             WorkstreamListEvent(
@@ -346,7 +346,7 @@ class Bridge:
             if model:
                 payload["model"] = model
             resp = self._http.post(
-                "/api/workstreams/new",
+                "/v1/api/workstreams/new",
                 json=payload,
             )
             data = resp.json()
@@ -418,7 +418,7 @@ class Bridge:
         ) as sse_client:
             while self._running:
                 try:
-                    with sse_client.stream("GET", f"/api/events?ws_id={ws_id}") as resp:
+                    with sse_client.stream("GET", f"/v1/api/events?ws_id={ws_id}") as resp:
                         for data in _iter_sse_data(resp):
                             if not self._running:
                                 break
@@ -529,7 +529,7 @@ class Bridge:
         """Handle a plan review request — auto-approve or forward to client."""
         with self._lock:
             if self._ws_auto_approve.get(ws_id):
-                self._http.post("/api/plan", json={"feedback": "", "ws_id": ws_id})
+                self._http.post("/v1/api/plan", json={"feedback": "", "ws_id": ws_id})
                 return
 
         request_id = uuid.uuid4().hex[:12]
@@ -547,10 +547,10 @@ class Bridge:
             if raw_resp:
                 resp_msg = InboundMessage.from_json(raw_resp)
                 feedback = getattr(resp_msg, "feedback", "")
-                self._http.post("/api/plan", json={"feedback": feedback, "ws_id": ws_id})
+                self._http.post("/v1/api/plan", json={"feedback": feedback, "ws_id": ws_id})
             else:
                 log.warning("Plan review timeout for ws %s — rejecting", ws_id)
-                self._http.post("/api/plan", json={"feedback": "reject", "ws_id": ws_id})
+                self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
 
         threading.Thread(target=_wait_plan, daemon=True).start()
 
@@ -563,7 +563,7 @@ class Bridge:
         body: dict[str, Any] = {"approved": approved, "ws_id": ws_id}
         if feedback:
             body["feedback"] = feedback
-        self._http.post("/api/approve", json=body)
+        self._http.post("/v1/api/approve", json=body)
 
     # -- global SSE ----------------------------------------------------------
 
@@ -577,7 +577,7 @@ class Bridge:
         ) as sse_client:
             while self._running:
                 try:
-                    with sse_client.stream("GET", "/api/events/global") as resp:
+                    with sse_client.stream("GET", "/v1/api/events/global") as resp:
                         for data in _iter_sse_data(resp):
                             if not self._running:
                                 break

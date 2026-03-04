@@ -528,7 +528,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
 
     try:
         if sub == "status":
-            resp = httpx.get(f"{console_url}/api/cluster/overview", timeout=5, headers=headers)
+            resp = httpx.get(f"{console_url}/v1/api/cluster/overview", timeout=5, headers=headers)
             data = resp.json()
             states = data.get("states", {})
             agg = data.get("aggregate", {})
@@ -561,7 +561,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
         elif sub == "nodes":
             limit = 20
             resp = httpx.get(
-                f"{console_url}/api/cluster/nodes?sort=activity&limit={limit}",
+                f"{console_url}/v1/api/cluster/nodes?sort=activity&limit={limit}",
                 timeout=5,
                 headers=headers,
             )
@@ -602,7 +602,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
                 else:
                     params += f"&state={arg}"
             resp = httpx.get(
-                f"{console_url}/api/cluster/workstreams?{params}",
+                f"{console_url}/v1/api/cluster/workstreams?{params}",
                 timeout=5,
                 headers=headers,
             )
@@ -646,7 +646,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
                 return
             node_id = parts[2]
             resp = httpx.get(
-                f"{console_url}/api/cluster/node/{node_id}", timeout=5, headers=headers
+                f"{console_url}/v1/api/cluster/node/{node_id}", timeout=5, headers=headers
             )
             data = resp.json()
             if "error" in data:
