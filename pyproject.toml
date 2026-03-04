@@ -66,6 +66,7 @@ include = [
   "turnstone/console/static/*.js",
   "turnstone/shared_static/*.css",
   "turnstone/shared_static/*.js",
+  "turnstone/sdk/py.typed",
 ]
 
 [tool.pytest.ini_options]

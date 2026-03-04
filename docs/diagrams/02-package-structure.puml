@@ -11,6 +11,8 @@ skinparam component {
     BackgroundColor<<console>> #B2EBF2
     BackgroundColor<<ui>> #F0F4C3
     BackgroundColor<<artifact>> #ECEFF1
+    BackgroundColor<<sdk>> #FFCDD2
+    BackgroundColor<<api>> #D1C4E9
 }
 
 ' Entry points
@@ -71,6 +73,23 @@ package "turnstone/ui/" <<Rectangle>> {
     component [colors.py\nANSI colors] as colors <<ui>>
     component [markdown.py\nMD rendering] as markdown <<ui>>
     component [spinner.py\nTerminal spinner] as spinner <<ui>>
+}
+
+' API schemas
+package "turnstone/api/" <<Rectangle>> {
+    component [schemas.py\nShared Pydantic models] as apischemas <<api>>
+    component [server_spec.py\nServer OpenAPI spec] as serverspec <<api>>
+    component [console_spec.py\nConsole OpenAPI spec] as consolespec <<api>>
+    component [openapi.py\nSpec builder] as openapi <<api>>
+    component [docs.py\nSwagger UI handler] as apidocs <<api>>
+}
+
+' SDK
+package "turnstone/sdk/" <<Rectangle>> {
+    component [server.py\nTurnstoneServer (sync+async)] as sdkserver <<sdk>>
+    component [console.py\nTurnstoneConsole (sync+async)] as sdkconsole <<sdk>>
+    component [events.py\n27 SSE event types] as sdkevents <<sdk>>
+    component [_base.py\nhttpx client base] as sdkbase <<sdk>>
 }
 
 ' Tool schemas
@@ -151,5 +170,23 @@ consoleserver --> collector
 consoleserver --> config
 consoleserver --> auth
 collector --> broker
+
+' API dependencies
+serverspec --> openapi
+consolespec --> openapi
+serverspec --> apischemas
+consolespec --> apischemas
+server --> apidocs
+server --> serverspec
+consoleserver --> apidocs
+consoleserver --> consolespec
+
+' SDK dependencies
+sdkserver --> sdkbase
+sdkconsole --> sdkbase
+sdkserver --> sdkevents
+sdkconsole --> sdkevents
+sdkserver --> apischemas : returns models
+sdkconsole --> apischemas : returns models
 
 @enduml

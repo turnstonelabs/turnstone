@@ -1,0 +1,869 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "turnstone Console API",
+    "version": "0.3.0",
+    "description": "Cluster-wide visibility and control across all turnstone nodes."
+  },
+  "paths": {
+    "/v1/api/cluster/overview": {
+      "get": {
+        "summary": "Cluster state summary",
+        "operationId": "v1_api_cluster_overview_get",
+        "tags": [
+          "Cluster"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterOverviewResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/nodes": {
+      "get": {
+        "summary": "Paginated node list",
+        "operationId": "v1_api_cluster_nodes_get",
+        "tags": [
+          "Cluster"
+        ],
+        "parameters": [
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "activity",
+              "enum": [
+                "activity",
+                "tokens",
+                "name"
+              ]
+            },
+            "description": "Sort field"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100
+            },
+            "description": "Page size"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Pagination offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterNodesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/workstreams": {
+      "get": {
+        "summary": "Filtered workstream list",
+        "operationId": "v1_api_cluster_workstreams_get",
+        "tags": [
+          "Cluster"
+        ],
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "running",
+                "thinking",
+                "attention",
+                "idle",
+                "error"
+              ]
+            },
+            "description": "Filter by state"
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by node_id"
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search in name/title/node"
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "state",
+              "enum": [
+                "state",
+                "tokens",
+                "name"
+              ]
+            },
+            "description": "Sort field"
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 1
+            },
+            "description": "Page number"
+          },
+          {
+            "name": "per_page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 50
+            },
+            "description": "Items per page (max 200)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterWorkstreamsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/node/{node_id}": {
+      "get": {
+        "summary": "Single node detail",
+        "operationId": "v1_api_cluster_node_{node_id}_get",
+        "tags": [
+          "Cluster"
+        ],
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeDetailResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/workstreams/new": {
+      "post": {
+        "summary": "Create workstream via MQ dispatch",
+        "operationId": "v1_api_cluster_workstreams_new_post",
+        "tags": [
+          "Cluster"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsoleCreateWsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleCreateWsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/events": {
+      "get": {
+        "summary": "Cluster SSE event stream",
+        "operationId": "v1_api_cluster_events_get",
+        "tags": [
+          "Streaming"
+        ],
+        "description": "Server-Sent Events stream for real-time cluster updates. Returns text/event-stream with node_joined, node_lost, cluster_state, ws_created, ws_closed, ws_rename events.",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/auth/login": {
+      "post": {
+        "summary": "Authenticate with a token",
+        "operationId": "v1_api_auth_login_post",
+        "tags": [
+          "Auth"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthLoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthLoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/logout": {
+      "post": {
+        "summary": "Clear auth cookie",
+        "operationId": "v1_api_auth_logout_post",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Console health check",
+        "operationId": "health_get",
+        "tags": [
+          "Observability"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsoleHealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "description": "Standard error response body.",
+        "properties": {
+          "error": {
+            "description": "Error message",
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "StatusResponse": {
+        "description": "Generic success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "StatusResponse",
+        "type": "object"
+      },
+      "AuthLoginRequest": {
+        "description": "POST /v1/api/auth/login request body.",
+        "properties": {
+          "token": {
+            "description": "Bearer token to authenticate",
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "AuthLoginRequest",
+        "type": "object"
+      },
+      "AuthLoginResponse": {
+        "description": "POST /v1/api/auth/login success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "role": {
+            "description": "Assigned role",
+            "examples": [
+              "full",
+              "read"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "AuthLoginResponse",
+        "type": "object"
+      },
+      "ClusterOverviewResponse": {
+        "properties": {
+          "nodes": {
+            "default": 0,
+            "title": "Nodes",
+            "type": "integer"
+          },
+          "workstreams": {
+            "default": 0,
+            "title": "Workstreams",
+            "type": "integer"
+          },
+          "states": {
+            "$ref": "#/components/schemas/StateCounts",
+            "default": {
+              "running": 0,
+              "thinking": 0,
+              "attention": 0,
+              "idle": 0,
+              "error": 0
+            }
+          },
+          "aggregate": {
+            "$ref": "#/components/schemas/ClusterAggregate",
+            "default": {
+              "total_tokens": 0,
+              "total_tool_calls": 0
+            }
+          },
+          "version_drift": {
+            "default": false,
+            "title": "Version Drift",
+            "type": "boolean"
+          },
+          "versions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "title": "ClusterOverviewResponse",
+        "type": "object"
+      },
+      "ClusterAggregate": {
+        "properties": {
+          "total_tokens": {
+            "default": 0,
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "total_tool_calls": {
+            "default": 0,
+            "title": "Total Tool Calls",
+            "type": "integer"
+          }
+        },
+        "title": "ClusterAggregate",
+        "type": "object"
+      },
+      "StateCounts": {
+        "properties": {
+          "running": {
+            "default": 0,
+            "title": "Running",
+            "type": "integer"
+          },
+          "thinking": {
+            "default": 0,
+            "title": "Thinking",
+            "type": "integer"
+          },
+          "attention": {
+            "default": 0,
+            "title": "Attention",
+            "type": "integer"
+          },
+          "idle": {
+            "default": 0,
+            "title": "Idle",
+            "type": "integer"
+          },
+          "error": {
+            "default": 0,
+            "title": "Error",
+            "type": "integer"
+          }
+        },
+        "title": "StateCounts",
+        "type": "object"
+      },
+      "ClusterNodesResponse": {
+        "properties": {
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterNodeInfo"
+            },
+            "title": "Nodes",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "title": "ClusterNodesResponse",
+        "type": "object"
+      },
+      "ClusterNodeInfo": {
+        "properties": {
+          "node_id": {
+            "title": "Node Id",
+            "type": "string"
+          },
+          "server_url": {
+            "default": "",
+            "title": "Server Url",
+            "type": "string"
+          },
+          "ws_total": {
+            "default": 0,
+            "title": "Ws Total",
+            "type": "integer"
+          },
+          "ws_running": {
+            "default": 0,
+            "title": "Ws Running",
+            "type": "integer"
+          },
+          "ws_thinking": {
+            "default": 0,
+            "title": "Ws Thinking",
+            "type": "integer"
+          },
+          "ws_attention": {
+            "default": 0,
+            "title": "Ws Attention",
+            "type": "integer"
+          },
+          "ws_idle": {
+            "default": 0,
+            "title": "Ws Idle",
+            "type": "integer"
+          },
+          "ws_error": {
+            "default": 0,
+            "title": "Ws Error",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "default": 0,
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "started": {
+            "default": 0.0,
+            "title": "Started",
+            "type": "number"
+          },
+          "reachable": {
+            "default": true,
+            "title": "Reachable",
+            "type": "boolean"
+          },
+          "health": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Health",
+            "type": "object"
+          },
+          "version": {
+            "default": "",
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "title": "ClusterNodeInfo",
+        "type": "object"
+      },
+      "ClusterWorkstreamsResponse": {
+        "properties": {
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterWorkstreamInfo"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "page": {
+            "default": 1,
+            "title": "Page",
+            "type": "integer"
+          },
+          "per_page": {
+            "default": 50,
+            "title": "Per Page",
+            "type": "integer"
+          },
+          "pages": {
+            "default": 1,
+            "title": "Pages",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "workstreams"
+        ],
+        "title": "ClusterWorkstreamsResponse",
+        "type": "object"
+      },
+      "ClusterWorkstreamInfo": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "default": "",
+            "title": "State",
+            "type": "string"
+          },
+          "node": {
+            "default": "",
+            "title": "Node",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "tokens": {
+            "default": 0,
+            "title": "Tokens",
+            "type": "integer"
+          },
+          "context_ratio": {
+            "default": 0.0,
+            "title": "Context Ratio",
+            "type": "number"
+          },
+          "activity": {
+            "default": "",
+            "title": "Activity",
+            "type": "string"
+          },
+          "activity_state": {
+            "default": "",
+            "title": "Activity State",
+            "type": "string"
+          },
+          "tool_calls": {
+            "default": 0,
+            "title": "Tool Calls",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "ClusterWorkstreamInfo",
+        "type": "object"
+      },
+      "NodeDetailResponse": {
+        "properties": {
+          "node_id": {
+            "title": "Node Id",
+            "type": "string"
+          },
+          "server_url": {
+            "default": "",
+            "title": "Server Url",
+            "type": "string"
+          },
+          "health": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Health",
+            "type": "object"
+          },
+          "workstreams": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ClusterWorkstreamInfo"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          },
+          "aggregate": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Aggregate",
+            "type": "object"
+          },
+          "reachable": {
+            "default": true,
+            "title": "Reachable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id"
+        ],
+        "title": "NodeDetailResponse",
+        "type": "object"
+      },
+      "ConsoleCreateWsRequest": {
+        "properties": {
+          "node_id": {
+            "default": "",
+            "description": "Target node: specific ID, 'auto', 'pool', or empty for auto",
+            "title": "Node Id",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "description": "Workstream name (auto-generated if empty)",
+            "title": "Name",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "description": "Model alias from node registry",
+            "title": "Model",
+            "type": "string"
+          }
+        },
+        "title": "ConsoleCreateWsRequest",
+        "type": "object"
+      },
+      "ConsoleCreateWsResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "correlation_id": {
+            "default": "",
+            "title": "Correlation Id",
+            "type": "string"
+          },
+          "target_node": {
+            "default": "",
+            "title": "Target Node",
+            "type": "string"
+          }
+        },
+        "title": "ConsoleCreateWsResponse",
+        "type": "object"
+      },
+      "ConsoleHealthResponse": {
+        "properties": {
+          "status": {
+            "default": "ok",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "service": {
+            "default": "turnstone-console",
+            "title": "Service",
+            "type": "string"
+          },
+          "nodes": {
+            "default": 0,
+            "title": "Nodes",
+            "type": "integer"
+          },
+          "workstreams": {
+            "default": 0,
+            "title": "Workstreams",
+            "type": "integer"
+          },
+          "version_drift": {
+            "default": false,
+            "title": "Version Drift",
+            "type": "boolean"
+          },
+          "versions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "title": "ConsoleHealthResponse",
+        "type": "object"
+      }
+    }
+  }
+}

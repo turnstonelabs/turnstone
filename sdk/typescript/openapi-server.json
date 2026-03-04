@@ -1,0 +1,1093 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "turnstone Server API",
+    "version": "0.3.0",
+    "description": "Single-node workstream management, chat interaction, and real-time streaming."
+  },
+  "paths": {
+    "/v1/api/workstreams": {
+      "get": {
+        "summary": "List active workstreams",
+        "operationId": "v1_api_workstreams_get",
+        "tags": [
+          "Workstreams"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListWorkstreamsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/dashboard": {
+      "get": {
+        "summary": "Dashboard with workstream details and aggregates",
+        "operationId": "v1_api_dashboard_get",
+        "tags": [
+          "Workstreams"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/new": {
+      "post": {
+        "summary": "Create a new workstream",
+        "operationId": "v1_api_workstreams_new_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateWorkstreamRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateWorkstreamResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/close": {
+      "post": {
+        "summary": "Close a workstream",
+        "operationId": "v1_api_workstreams_close_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloseWorkstreamRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/send": {
+      "post": {
+        "summary": "Send a user message",
+        "operationId": "v1_api_send_post",
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SendResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/approve": {
+      "post": {
+        "summary": "Approve or deny a tool call",
+        "operationId": "v1_api_approve_post",
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApproveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/plan": {
+      "post": {
+        "summary": "Respond to a plan review",
+        "operationId": "v1_api_plan_post",
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanFeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/command": {
+      "post": {
+        "summary": "Execute a slash command",
+        "operationId": "v1_api_command_post",
+        "tags": [
+          "Chat"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/events": {
+      "get": {
+        "summary": "Per-workstream SSE event stream",
+        "operationId": "v1_api_events_get",
+        "tags": [
+          "Streaming"
+        ],
+        "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Workstream identifier"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/events/global": {
+      "get": {
+        "summary": "Global SSE event stream",
+        "operationId": "v1_api_events_global_get",
+        "tags": [
+          "Streaming"
+        ],
+        "description": "Global Server-Sent Events stream for state-change broadcasts across all workstreams. Returns text/event-stream.",
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/sessions": {
+      "get": {
+        "summary": "List saved sessions",
+        "operationId": "v1_api_sessions_get",
+        "tags": [
+          "Sessions"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/login": {
+      "post": {
+        "summary": "Authenticate with a token",
+        "operationId": "v1_api_auth_login_post",
+        "tags": [
+          "Auth"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthLoginRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthLoginResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/logout": {
+      "post": {
+        "summary": "Clear auth cookie",
+        "operationId": "v1_api_auth_logout_post",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Server health check",
+        "operationId": "health_get",
+        "tags": [
+          "Observability"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ErrorResponse": {
+        "description": "Standard error response body.",
+        "properties": {
+          "error": {
+            "description": "Error message",
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "StatusResponse": {
+        "description": "Generic success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "StatusResponse",
+        "type": "object"
+      },
+      "AuthLoginRequest": {
+        "description": "POST /v1/api/auth/login request body.",
+        "properties": {
+          "token": {
+            "description": "Bearer token to authenticate",
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "AuthLoginRequest",
+        "type": "object"
+      },
+      "AuthLoginResponse": {
+        "description": "POST /v1/api/auth/login success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "role": {
+            "description": "Assigned role",
+            "examples": [
+              "full",
+              "read"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "AuthLoginResponse",
+        "type": "object"
+      },
+      "SendRequest": {
+        "properties": {
+          "message": {
+            "description": "User message text",
+            "title": "Message",
+            "type": "string"
+          },
+          "ws_id": {
+            "description": "Target workstream ID",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message",
+          "ws_id"
+        ],
+        "title": "SendRequest",
+        "type": "object"
+      },
+      "SendResponse": {
+        "properties": {
+          "status": {
+            "description": "'ok' or 'busy'",
+            "examples": [
+              "ok",
+              "busy"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SendResponse",
+        "type": "object"
+      },
+      "ApproveRequest": {
+        "properties": {
+          "approved": {
+            "description": "True to approve, false to deny",
+            "title": "Approved",
+            "type": "boolean"
+          },
+          "feedback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional denial reason",
+            "title": "Feedback"
+          },
+          "always": {
+            "default": false,
+            "description": "Enable auto-approve for this tool",
+            "title": "Always",
+            "type": "boolean"
+          },
+          "ws_id": {
+            "description": "Target workstream ID",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approved",
+          "ws_id"
+        ],
+        "title": "ApproveRequest",
+        "type": "object"
+      },
+      "PlanFeedbackRequest": {
+        "properties": {
+          "feedback": {
+            "description": "Feedback text; empty string means approval",
+            "title": "Feedback",
+            "type": "string"
+          },
+          "ws_id": {
+            "description": "Target workstream ID",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "feedback",
+          "ws_id"
+        ],
+        "title": "PlanFeedbackRequest",
+        "type": "object"
+      },
+      "CommandRequest": {
+        "properties": {
+          "command": {
+            "description": "Slash command (e.g. /clear, /new, /resume)",
+            "title": "Command",
+            "type": "string"
+          },
+          "ws_id": {
+            "description": "Target workstream ID",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "ws_id"
+        ],
+        "title": "CommandRequest",
+        "type": "object"
+      },
+      "CreateWorkstreamRequest": {
+        "properties": {
+          "name": {
+            "default": "",
+            "description": "Workstream display name (auto-generated if empty)",
+            "title": "Name",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "description": "Model alias from registry",
+            "title": "Model",
+            "type": "string"
+          },
+          "auto_approve": {
+            "default": false,
+            "description": "Auto-approve all tool calls",
+            "title": "Auto Approve",
+            "type": "boolean"
+          }
+        },
+        "title": "CreateWorkstreamRequest",
+        "type": "object"
+      },
+      "CreateWorkstreamResponse": {
+        "properties": {
+          "ws_id": {
+            "description": "Unique ID of the new workstream",
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "description": "Assigned workstream name",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name"
+        ],
+        "title": "CreateWorkstreamResponse",
+        "type": "object"
+      },
+      "CloseWorkstreamRequest": {
+        "properties": {
+          "ws_id": {
+            "description": "Workstream ID to close",
+            "title": "Ws Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "CloseWorkstreamRequest",
+        "type": "object"
+      },
+      "ListWorkstreamsResponse": {
+        "properties": {
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/WorkstreamInfo"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          }
+        },
+        "required": [
+          "workstreams"
+        ],
+        "title": "ListWorkstreamsResponse",
+        "type": "object"
+      },
+      "WorkstreamInfo": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
+        "title": "WorkstreamInfo",
+        "type": "object"
+      },
+      "DashboardResponse": {
+        "properties": {
+          "workstreams": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardWorkstream"
+            },
+            "title": "Workstreams",
+            "type": "array"
+          },
+          "aggregate": {
+            "$ref": "#/components/schemas/DashboardAggregate"
+          }
+        },
+        "required": [
+          "workstreams",
+          "aggregate"
+        ],
+        "title": "DashboardResponse",
+        "type": "object"
+      },
+      "DashboardAggregate": {
+        "properties": {
+          "total_tokens": {
+            "default": 0,
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "total_tool_calls": {
+            "default": 0,
+            "title": "Total Tool Calls",
+            "type": "integer"
+          },
+          "active_count": {
+            "default": 0,
+            "title": "Active Count",
+            "type": "integer"
+          },
+          "total_count": {
+            "default": 0,
+            "title": "Total Count",
+            "type": "integer"
+          },
+          "uptime_seconds": {
+            "default": 0,
+            "title": "Uptime Seconds",
+            "type": "integer"
+          },
+          "node": {
+            "default": "local",
+            "title": "Node",
+            "type": "string"
+          }
+        },
+        "title": "DashboardAggregate",
+        "type": "object"
+      },
+      "DashboardWorkstream": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "tokens": {
+            "default": 0,
+            "title": "Tokens",
+            "type": "integer"
+          },
+          "context_ratio": {
+            "default": 0.0,
+            "title": "Context Ratio",
+            "type": "number"
+          },
+          "activity": {
+            "default": "",
+            "title": "Activity",
+            "type": "string"
+          },
+          "activity_state": {
+            "default": "",
+            "title": "Activity State",
+            "type": "string"
+          },
+          "tool_calls": {
+            "default": 0,
+            "title": "Tool Calls",
+            "type": "integer"
+          },
+          "node": {
+            "default": "",
+            "title": "Node",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "model_alias": {
+            "default": "",
+            "title": "Model Alias",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
+        "title": "DashboardWorkstream",
+        "type": "object"
+      },
+      "ListSessionsResponse": {
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/SessionInfo"
+            },
+            "title": "Sessions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "title": "ListSessionsResponse",
+        "type": "object"
+      },
+      "SessionInfo": {
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "alias": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Alias"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Title"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          },
+          "message_count": {
+            "title": "Message Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "session_id",
+          "created",
+          "updated",
+          "message_count"
+        ],
+        "title": "SessionInfo",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "examples": [
+              "ok",
+              "degraded"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "title": "Version",
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "default": 0.0,
+            "title": "Uptime Seconds",
+            "type": "number"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "workstreams": {
+            "$ref": "#/components/schemas/WorkstreamCounts",
+            "default": {
+              "total": 0,
+              "idle": 0,
+              "thinking": 0,
+              "running": 0,
+              "attention": 0,
+              "error": 0
+            }
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BackendStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "BackendStatus": {
+        "properties": {
+          "status": {
+            "examples": [
+              "up",
+              "down"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "circuit_state": {
+            "examples": [
+              "closed",
+              "open",
+              "half_open"
+            ],
+            "title": "Circuit State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "circuit_state"
+        ],
+        "title": "BackendStatus",
+        "type": "object"
+      },
+      "WorkstreamCounts": {
+        "properties": {
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "idle": {
+            "default": 0,
+            "title": "Idle",
+            "type": "integer"
+          },
+          "thinking": {
+            "default": 0,
+            "title": "Thinking",
+            "type": "integer"
+          },
+          "running": {
+            "default": 0,
+            "title": "Running",
+            "type": "integer"
+          },
+          "attention": {
+            "default": 0,
+            "title": "Attention",
+            "type": "integer"
+          },
+          "error": {
+            "default": 0,
+            "title": "Error",
+            "type": "integer"
+          }
+        },
+        "title": "WorkstreamCounts",
+        "type": "object"
+      }
+    }
+  }
+}

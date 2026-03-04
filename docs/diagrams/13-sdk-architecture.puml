@@ -1,0 +1,155 @@
+@startuml
+!theme plain
+title Turnstone — Client SDK Architecture
+
+skinparam class {
+    BackgroundColor<<async>> #C8E6C9
+    BackgroundColor<<sync>> #B8D4E3
+    BackgroundColor<<event>> #FFE0B2
+    BackgroundColor<<type>> #F0F4C3
+    BackgroundColor<<ts>> #E1BEE7
+}
+
+skinparam packageBorderColor #888888
+skinparam ArrowColor #555555
+
+' Python SDK
+package "turnstone/sdk/ (Python)" {
+    abstract class _BaseClient <<async>> {
+        - _client: httpx.AsyncClient
+        - _owns_client: bool
+        + _request(method, path, ...) → T
+        + _stream_sse(path, ...) → AsyncIterator
+        + aclose()
+    }
+
+    class AsyncTurnstoneServer <<async>> {
+        + list_workstreams()
+        + dashboard()
+        + create_workstream()
+        + close_workstream()
+        + send(message, ws_id)
+        + approve()
+        + plan_feedback()
+        + command()
+        + stream_events(ws_id)
+        + stream_global_events()
+        + send_and_wait()
+        + list_sessions()
+        + login() / logout()
+        + health()
+    }
+
+    class AsyncTurnstoneConsole <<async>> {
+        + overview()
+        + nodes()
+        + workstreams()
+        + node_detail()
+        + create_workstream()
+        + stream_cluster_events()
+        + login() / logout()
+        + health()
+    }
+
+    class TurnstoneServer <<sync>> {
+        - _async: AsyncTurnstoneServer
+        - _runner: _SyncRunner
+        .. delegates all methods ..
+        + __enter__ / __exit__
+    }
+
+    class TurnstoneConsole <<sync>> {
+        - _async: AsyncTurnstoneConsole
+        - _runner: _SyncRunner
+        .. delegates all methods ..
+        + __enter__ / __exit__
+    }
+
+    class _SyncRunner <<sync>> {
+        - _loop: EventLoop
+        - _thread: Thread
+        + run(coro) → T
+        + run_iter(async_gen) → Iterator
+        + close()
+    }
+
+    class TurnResult <<type>> {
+        + ws_id: str
+        + content_parts: list[str]
+        + reasoning_parts: list[str]
+        + tool_results: list
+        + errors: list[str]
+        + timed_out: bool
+        --
+        + content: str
+        + reasoning: str
+        + ok: bool
+    }
+
+    class ServerEvent <<event>> {
+        + type: str
+        + ws_id: str
+        + from_dict() → ServerEvent
+    }
+
+    class ClusterEvent <<event>> {
+        + type: str
+        + from_dict() → ClusterEvent
+    }
+
+    _BaseClient <|-- AsyncTurnstoneServer
+    _BaseClient <|-- AsyncTurnstoneConsole
+    TurnstoneServer --> AsyncTurnstoneServer : wraps
+    TurnstoneServer --> _SyncRunner : uses
+    TurnstoneConsole --> AsyncTurnstoneConsole : wraps
+    TurnstoneConsole --> _SyncRunner : uses
+    AsyncTurnstoneServer ..> TurnResult : returns
+    AsyncTurnstoneServer ..> ServerEvent : yields
+    AsyncTurnstoneConsole ..> ClusterEvent : yields
+}
+
+' TypeScript SDK
+package "sdk/typescript/ (TypeScript)" {
+    class "BaseClient" as TSBase <<ts>> {
+        # baseUrl: string
+        # token: string
+        # fetchFn: fetch
+        # request<T>()
+        # streamSSE<T>()
+    }
+
+    class "TurnstoneServer" as TSServer <<ts>> {
+        + listWorkstreams()
+        + send()
+        + streamEvents()
+        + sendAndWait()
+        ...
+    }
+
+    class "TurnstoneConsole" as TSConsole <<ts>> {
+        + overview()
+        + nodes()
+        + clusterEvents()
+        ...
+    }
+
+    TSBase <|-- TSServer
+    TSBase <|-- TSConsole
+}
+
+' External connections
+class "turnstone-server :8080" as Server <<artifact>>
+class "turnstone-console :8081" as Console <<artifact>>
+
+AsyncTurnstoneServer --> Server : httpx REST + SSE
+AsyncTurnstoneConsole --> Console : httpx REST + SSE
+TSServer --> Server : fetch REST + SSE
+TSConsole --> Console : fetch REST + SSE
+
+note right of AsyncTurnstoneServer
+  Returns Pydantic models from
+  turnstone.api.server_schemas
+  (no type duplication)
+end note
+
+@enduml
