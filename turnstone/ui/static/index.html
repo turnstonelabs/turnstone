@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/shared/base.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -89,6 +90,38 @@
 </div>
 
 <div id="toast" role="status" aria-live="polite"></div>
+<script>
+window.TURNSTONE_AUTH_TITLE = "turnstone";
+window.TURNSTONE_KB_SHORTCUTS = [
+  { title: "Workstreams", keys: [
+    { desc: "Toggle dashboard", badge: '<span class="kb-key">Ctrl+D</span>' },
+    { desc: "New workstream", badge: '<span class="kb-key">Ctrl+T</span>' },
+    { desc: "Close workstream", badge: '<span class="kb-key">Ctrl+W</span>' },
+    { desc: "Switch to tab 1\u20139", badge: '<span class="kb-key">Ctrl+1</span>\u2026<span class="kb-key">9</span>' }
+  ]},
+  { title: "Tool approval", keys: [
+    { desc: "Approve", badge: '<span class="kb-key">y</span> / <span class="kb-key">Enter</span>' },
+    { desc: "Deny", badge: '<span class="kb-key">n</span> / <span class="kb-key">Esc</span>' },
+    { desc: "Always approve", badge: '<span class="kb-key">a</span>' }
+  ]},
+  { title: "Chat", keys: [
+    { desc: "Send message", badge: '<span class="kb-key">Enter</span>' },
+    { desc: "New line", badge: '<span class="kb-key">Shift+Enter</span>' }
+  ]},
+  { title: "Navigation", keys: [
+    { desc: "Navigate table rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' },
+    { desc: "Close dashboard / menu", badge: '<span class="kb-key">Esc</span>' }
+  ]},
+  { title: "General", keys: [
+    { desc: "Show this help", badge: '<span class="kb-key">?</span>' }
+  ]}
+];
+</script>
+<script src="/shared/utils.js"></script>
+<script src="/shared/toast.js"></script>
+<script src="/shared/theme.js"></script>
+<script src="/shared/auth.js"></script>
+<script src="/shared/kb.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

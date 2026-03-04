@@ -51,6 +51,7 @@ log = logging.getLogger("turnstone.console.server")
 # ---------------------------------------------------------------------------
 
 _STATIC_DIR = Path(__file__).parent / "static"
+_SHARED_DIR = Path(__file__).parent.parent / "shared_static"
 _HTML = ""
 _CSS = ""
 _JS = ""
@@ -420,9 +421,16 @@ async def proxy_index(request: Request) -> Response:
         # Rewrite static asset paths
         page = page.replace('href="/static/', f'href="{prefix}/static/')
         page = page.replace('src="/static/', f'src="{prefix}/static/')
-        # Inject console-return banner after <body>
+        page = page.replace('href="/shared/', f'href="{prefix}/shared/')
+        page = page.replace('src="/shared/', f'src="{prefix}/shared/')
+        # Inject console-return banner + proxy shim after <body>
         banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", html.escape(node_id))
-        page = page.replace("<body>", "<body>" + banner, 1)
+        shim = (
+            "<script>"
+            + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+            + "</script>"
+        )
+        page = page.replace("<body>", "<body>" + banner + shim, 1)
         return HTMLResponse(page)
     except httpx.HTTPError as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
@@ -438,20 +446,36 @@ async def proxy_static(request: Request) -> Response:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
     client: httpx.AsyncClient = request.app.state.proxy_client
-    safe_node = urllib.parse.quote(node_id, safe="")
-    prefix = f"/node/{safe_node}"
     try:
         resp = await client.get(f"{server_url}/static/{path}")
-        content_type = resp.headers.get("content-type", "application/octet-stream")
-        body = resp.content
-        # Inject proxy shim into app.js
-        if path == "app.js":
-            shim = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
-            body = shim.encode("utf-8") + body
-            content_type = "application/javascript; charset=utf-8"
-        return Response(content=body, status_code=resp.status_code, media_type=content_type)
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+        )
     except httpx.HTTPError as exc:
         log.debug("Proxy static error for %s/%s: %s", node_id, path, exc)
+        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+
+
+async def proxy_shared_static(request: Request) -> Response:
+    """GET /node/{node_id}/shared/{path} — proxy shared static files."""
+    node_id = request.path_params["node_id"]
+    path = request.path_params["path"]
+    server_url = _get_server_url(request, node_id)
+    if not server_url:
+        return JSONResponse({"error": "Node not found"}, status_code=404)
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    try:
+        resp = await client.get(f"{server_url}/shared/{path}")
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+        )
+    except httpx.HTTPError as exc:
+        log.debug("Proxy shared static error for %s/%s: %s", node_id, path, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
@@ -620,9 +644,11 @@ def create_app(
             Route("/api/auth/login", auth_login, methods=["POST"]),
             Route("/api/auth/logout", auth_logout, methods=["POST"]),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
+            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
             # Proxy routes — serve server UI through console port
             Route("/node/{node_id}/", proxy_index),
             Route("/node/{node_id}/static/{path:path}", proxy_static),
+            Route("/node/{node_id}/shared/{path:path}", proxy_shared_static),
             Route("/node/{node_id}/api/{path:path}", proxy_api, methods=["GET", "POST"]),
             Route("/node/{node_id}/{path:path}", proxy_non_api),
         ],

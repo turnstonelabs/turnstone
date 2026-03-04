@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
+_SHARED_DIR = Path(__file__).parent / "shared_static"
 _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 _CSS = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
 _JS = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -1022,6 +1023,7 @@ def create_app(
             Route("/api/auth/login", auth_login, methods=["POST"]),
             Route("/api/auth/logout", auth_logout, methods=["POST"]),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
+            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
         ],
         middleware=[
             Middleware(MetricsMiddleware),

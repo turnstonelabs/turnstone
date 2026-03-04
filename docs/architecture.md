@@ -58,18 +58,21 @@ turnstone/
   console/
     collector.py      ClusterCollector — aggregates state from all nodes via Redis + HTTP
     server.py         Cluster dashboard HTTP server + SSE + CLI entry point
-    static/           Cluster dashboard web UI (HTML, CSS, JS)
+    static/           Cluster dashboard web UI (page-specific HTML, CSS, JS)
+  shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
     spinner.py        Braille character spinner (daemon thread)
     static/
       index.html      Single-page app shell (links to CSS and JS)
-      style.css       All UI styles (dark/light themes, dashboard, approval blocks)
-      app.js          All client-side JavaScript (SSE, workstreams, dashboard, markdown)
+      style.css       Page-specific UI styles (dashboard layout, approval blocks)
+      app.js          Page-specific client-side JavaScript (SSE, workstreams, markdown)
   tools/
     *.json            14 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
+
+Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
 
 ---
 
