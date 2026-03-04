@@ -34,6 +34,7 @@ from turnstone.mq.protocol import (
     OutboundEvent,
     PlanReviewEvent,
     ReasoningEvent,
+    SessionResumedEvent,
     StateChangeEvent,
     StatusEvent,
     StreamEndEvent,
@@ -97,6 +98,8 @@ class Bridge:
         self._ws_auto_approve: dict[str, bool] = {}
         self._ws_approve_tools: dict[str, set[str]] = {}
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
+        self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
+        self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
         self._running = True
 
     # -- thread context helper ------------------------------------------------
@@ -266,7 +269,7 @@ class Bridge:
 
         # Auto-create workstream if needed
         if not ws_id:
-            ws_id = self._create_ws_on_server(
+            ws_id, _resumed = self._create_ws_on_server(
                 name=name,
                 auto_approve=auto_approve,
                 auto_approve_tools=auto_approve_tools,
@@ -285,8 +288,17 @@ class Bridge:
         with self._lock:
             self._active_sends[ws_id] = msg.correlation_id
 
-        resp = self._http.post("/v1/api/send", json={"message": message, "ws_id": ws_id})
-        data = resp.json()
+        try:
+            resp = self._http.post("/v1/api/send", json={"message": message, "ws_id": ws_id})
+            data = resp.json()
+        except Exception:
+            with self._lock:
+                self._active_sends.pop(ws_id, None)
+            raise
+
+        if data.get("status") != "ok":
+            with self._lock:
+                self._active_sends.pop(ws_id, None)
 
         self._publish_ws(
             ws_id,
@@ -329,14 +341,23 @@ class Bridge:
         auto_approve_tools = getattr(msg, "auto_approve_tools", [])
         model = getattr(msg, "model", "")
         initial_message = getattr(msg, "initial_message", "")
-        ws_id = self._create_ws_on_server(
+        resume_session = getattr(msg, "resume_session", "")
+        ws_id, resumed = self._create_ws_on_server(
             name=name,
             auto_approve=auto_approve,
             auto_approve_tools=auto_approve_tools,
             correlation_id=msg.correlation_id,
             model=model,
+            resume_session=resume_session,
         )
-        if ws_id and initial_message:
+        # Send initial_message only when no session was actually resumed.
+        # Use the server's `resumed` response (not just the intent) so that
+        # a pruned/missing session falls back to sending the initial message.
+        if ws_id and initial_message and not resumed:
+            # Track the send so the global SSE handler emits TurnCompleteEvent
+            # when the workstream returns to idle.
+            with self._lock:
+                self._active_sends[ws_id] = msg.correlation_id
             try:
                 resp = self._http.post(
                     "/v1/api/send", json={"message": initial_message, "ws_id": ws_id}
@@ -344,8 +365,12 @@ class Bridge:
                 data = resp.json()
                 if data.get("error"):
                     log.warning("Initial message failed for ws %s: %s", ws_id, data["error"])
+                    with self._lock:
+                        self._active_sends.pop(ws_id, None)
             except Exception as exc:
                 log.warning("Initial message send failed for ws %s: %s", ws_id, exc)
+                with self._lock:
+                    self._active_sends.pop(ws_id, None)
 
     def _handle_close_ws(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
@@ -390,12 +415,15 @@ class Bridge:
         auto_approve_tools: list[str],
         correlation_id: str,
         model: str = "",
-    ) -> str:
-        """Create a workstream on the server.  Returns ws_id or empty on error."""
+        resume_session: str = "",
+    ) -> tuple[str, bool]:
+        """Create a workstream on the server.  Returns (ws_id, resumed)."""
         try:
             payload: dict[str, Any] = {"name": name, "auto_approve": auto_approve}
             if model:
                 payload["model"] = model
+            if resume_session:
+                payload["resume_session"] = resume_session
             resp = self._http.post(
                 "/v1/api/workstreams/new",
                 json=payload,
@@ -409,9 +437,10 @@ class Bridge:
                         detail=data["error"],
                     )
                 )
-                return ""
+                return "", False
             ws_id: str = data["ws_id"]
             ws_name = data.get("name", "")
+            resumed = data.get("resumed", False)
 
             self._broker.set_ws_owner(ws_id, self._node_id)
 
@@ -428,6 +457,9 @@ class Bridge:
                     ws_id=ws_id,
                     name=ws_name,
                     correlation_id=correlation_id,
+                    resumed=resumed,
+                    session_id=resume_session if resumed else "",
+                    message_count=data.get("message_count", 0),
                 )
             )
             self._publish_cluster(
@@ -435,9 +467,24 @@ class Bridge:
                     ws_id=ws_id,
                     name=ws_name,
                     correlation_id=correlation_id,
+                    node_id=self._node_id,
                 )
             )
-            return ws_id
+
+            # Emit per-workstream resume confirmation.
+            if resumed:
+                self._publish_ws(
+                    ws_id,
+                    SessionResumedEvent(
+                        ws_id=ws_id,
+                        correlation_id=correlation_id,
+                        session_id=resume_session,
+                        message_count=data.get("message_count", 0),
+                        name=ws_name,
+                    ),
+                )
+
+            return ws_id, resumed
         except Exception as exc:
             self._publish_global(
                 AckEvent(
@@ -446,7 +493,7 @@ class Bridge:
                     detail=str(exc),
                 )
             )
-            return ""
+            return "", False
 
     # -- SSE consumption -----------------------------------------------------
 
@@ -535,12 +582,14 @@ class Bridge:
         """Handle an approval request — auto-approve or forward to client."""
         items = data.get("items", [])
 
-        # Check if all tools can be auto-approved
+        # Read flags under lock, then release before any HTTP calls.
         with self._lock:
-            if self._ws_auto_approve.get(ws_id):
-                self._api_approve(ws_id, approved=True)
-                return
+            auto = self._ws_auto_approve.get(ws_id, False)
             approve_set = self._ws_approve_tools.get(ws_id, DEFAULT_SAFE_TOOLS)
+
+        if auto:
+            self._api_approve(ws_id, approved=True)
+            return
 
         tool_names = {it.get("func_name", "") for it in items if it.get("needs_approval")}
 
@@ -548,8 +597,16 @@ class Bridge:
             self._api_approve(ws_id, approved=True)
             return
 
+        # Skip if an approval is already pending for this workstream (SSE
+        # reconnects re-inject the pending approval, causing duplicates).
+        with self._lock:
+            if ws_id in self._pending_approvals:
+                log.debug("Skipping duplicate approval for ws %s", ws_id)
+                return
+            request_id = uuid.uuid4().hex[:12]
+            self._pending_approvals[ws_id] = request_id
+
         # Forward to client — spawn a thread so we don't block SSE consumption
-        request_id = uuid.uuid4().hex[:12]
         self._publish_ws(
             ws_id,
             ApprovalRequestEvent(
@@ -560,30 +617,42 @@ class Bridge:
         )
 
         def _wait_approval() -> None:
-            raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
-            if raw_resp:
-                resp_msg = InboundMessage.from_json(raw_resp)
-                approved = getattr(resp_msg, "approved", False)
-                feedback = getattr(resp_msg, "feedback", None)
-                always = getattr(resp_msg, "always", False)
-                self._api_approve(ws_id, approved=approved, feedback=feedback)
-                if always:
-                    with self._lock:
-                        self._ws_auto_approve[ws_id] = True
-            else:
-                log.warning("Approval timeout for ws %s — denying", ws_id)
-                self._api_approve(ws_id, approved=False, feedback="Approval timed out")
+            try:
+                raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
+                if raw_resp:
+                    resp_msg = InboundMessage.from_json(raw_resp)
+                    approved = getattr(resp_msg, "approved", False)
+                    feedback = getattr(resp_msg, "feedback", None)
+                    always = getattr(resp_msg, "always", False)
+                    self._api_approve(ws_id, approved=approved, feedback=feedback)
+                    if always:
+                        with self._lock:
+                            self._ws_auto_approve[ws_id] = True
+                else:
+                    log.warning("Approval timeout for ws %s — denying", ws_id)
+                    self._api_approve(ws_id, approved=False, feedback="Approval timed out")
+            finally:
+                with self._lock:
+                    self._pending_approvals.pop(ws_id, None)
 
         threading.Thread(target=self._run_in_context(_wait_approval), daemon=True).start()
 
     def _handle_plan_review(self, ws_id: str, data: dict[str, Any]) -> None:
         """Handle a plan review request — auto-approve or forward to client."""
         with self._lock:
-            if self._ws_auto_approve.get(ws_id):
-                self._http.post("/v1/api/plan", json={"feedback": "", "ws_id": ws_id})
+            auto = self._ws_auto_approve.get(ws_id, False)
+            # Skip if a plan review is already pending (SSE reconnect guard).
+            if not auto and ws_id in self._pending_plan_reviews:
+                log.debug("Skipping duplicate plan review for ws %s", ws_id)
                 return
+            if not auto:
+                request_id = uuid.uuid4().hex[:12]
+                self._pending_plan_reviews[ws_id] = request_id
 
-        request_id = uuid.uuid4().hex[:12]
+        if auto:
+            self._http.post("/v1/api/plan", json={"feedback": "", "ws_id": ws_id})
+            return
+
         self._publish_ws(
             ws_id,
             PlanReviewEvent(
@@ -594,14 +663,18 @@ class Bridge:
         )
 
         def _wait_plan() -> None:
-            raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
-            if raw_resp:
-                resp_msg = InboundMessage.from_json(raw_resp)
-                feedback = getattr(resp_msg, "feedback", "")
-                self._http.post("/v1/api/plan", json={"feedback": feedback, "ws_id": ws_id})
-            else:
-                log.warning("Plan review timeout for ws %s — rejecting", ws_id)
-                self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
+            try:
+                raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
+                if raw_resp:
+                    resp_msg = InboundMessage.from_json(raw_resp)
+                    feedback = getattr(resp_msg, "feedback", "")
+                    self._http.post("/v1/api/plan", json={"feedback": feedback, "ws_id": ws_id})
+                else:
+                    log.warning("Plan review timeout for ws %s — rejecting", ws_id)
+                    self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
+            finally:
+                with self._lock:
+                    self._pending_plan_reviews.pop(ws_id, None)
 
         threading.Thread(target=self._run_in_context(_wait_plan), daemon=True).start()
 
@@ -810,13 +883,30 @@ def main() -> None:
         db=args.redis_db,
         password=args.redis_password,
     )
+    # If no explicit auth token is provided, mint a service JWT using the
+    # shared secret so the bridge can authenticate to the server.
+    auth_token = args.auth_token
+    if not auth_token:
+        jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
+        if jwt_secret:
+            from turnstone.core.auth import create_jwt
+
+            auth_token = create_jwt(
+                user_id="bridge",
+                scopes=frozenset({"approve"}),
+                source="bridge",
+                secret=jwt_secret,
+                expiry_hours=168,  # 1 week — bridge restarts refresh
+            )
+            log.info("bridge.jwt_minted")
+
     bridge = Bridge(
         server_url=args.server_url,
         broker=broker,
         approval_timeout=args.approval_timeout,
         node_id=args.node_id,
         heartbeat_ttl=args.heartbeat_ttl,
-        auth_token=args.auth_token,
+        auth_token=auth_token,
     )
     bridge.run()
 

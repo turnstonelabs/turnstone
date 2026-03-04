@@ -76,6 +76,7 @@ class AsyncTurnstoneServer(_BaseClient):
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
+        resume_session: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -84,6 +85,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["model"] = model
         if auto_approve:
             body["auto_approve"] = True
+        if resume_session:
+            body["resume_session"] = resume_session
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -304,9 +307,12 @@ class TurnstoneServer:
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
+        resume_session: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
-            self._async.create_workstream(name=name, model=model, auto_approve=auto_approve)
+            self._async.create_workstream(
+                name=name, model=model, auto_approve=auto_approve, resume_session=resume_session
+            )
         )
 
     def close_workstream(self, ws_id: str) -> StatusResponse:

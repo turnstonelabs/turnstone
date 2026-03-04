@@ -1,0 +1,204 @@
+"""Tests for turnstone.channels._protocol and turnstone.channels._formatter."""
+
+from __future__ import annotations
+
+from turnstone.channels._formatter import (
+    chunk_message,
+    format_approval_request,
+    format_plan_review,
+    truncate,
+)
+from turnstone.channels._protocol import ChannelEvent
+
+
+# ---------------------------------------------------------------------------
+# ChannelEvent
+# ---------------------------------------------------------------------------
+
+
+class TestChannelEvent:
+    def test_construction(self) -> None:
+        evt = ChannelEvent(
+            channel_type="discord",
+            channel_id="ch-1",
+            channel_user_id="u-42",
+            message="hello",
+            parent_channel_id="parent",
+            metadata={"key": "val"},
+        )
+        assert evt.channel_type == "discord"
+        assert evt.channel_id == "ch-1"
+        assert evt.channel_user_id == "u-42"
+        assert evt.message == "hello"
+        assert evt.parent_channel_id == "parent"
+        assert evt.metadata == {"key": "val"}
+
+    def test_defaults(self) -> None:
+        evt = ChannelEvent(
+            channel_type="slack",
+            channel_id="ch-2",
+            channel_user_id="u-7",
+            message="hi",
+        )
+        assert evt.parent_channel_id == ""
+        assert evt.metadata == {}
+
+    def test_metadata_independence(self) -> None:
+        """Default metadata dicts are independent across instances."""
+        a = ChannelEvent(channel_type="x", channel_id="1", channel_user_id="u", message="m")
+        b = ChannelEvent(channel_type="x", channel_id="2", channel_user_id="u", message="m")
+        a.metadata["key"] = "val"
+        assert "key" not in b.metadata
+
+
+# ---------------------------------------------------------------------------
+# chunk_message
+# ---------------------------------------------------------------------------
+
+
+class TestChunkMessage:
+    def test_empty_string(self) -> None:
+        assert chunk_message("") == [""]
+
+    def test_under_limit(self) -> None:
+        assert chunk_message("short text", max_length=100) == ["short text"]
+
+    def test_exactly_at_limit(self) -> None:
+        text = "a" * 50
+        assert chunk_message(text, max_length=50) == [text]
+
+    def test_splits_at_newline(self) -> None:
+        text = "line one\nline two\nline three"
+        chunks = chunk_message(text, max_length=18)
+        assert len(chunks) >= 2
+        # The split should happen at a newline boundary within the text.
+        # Reassembled chunks (with newline separators) should cover all content.
+        rejoined = "\n".join(chunks)
+        assert "line one" in rejoined
+        assert "line three" in rejoined
+
+    def test_splits_at_word_boundary(self) -> None:
+        text = "word1 word2 word3 word4"
+        chunks = chunk_message(text, max_length=12)
+        assert len(chunks) >= 2
+        # No chunk should start with a space (lstrip handles newlines).
+        for chunk in chunks:
+            assert not chunk.startswith("\n")
+
+    def test_hard_splits(self) -> None:
+        text = "a" * 30
+        chunks = chunk_message(text, max_length=10)
+        assert len(chunks) == 3
+        assert "".join(chunks) == text
+
+    def test_code_block_spanning_boundary(self) -> None:
+        text = "before\n```\ncode line 1\ncode line 2\ncode line 3\n```\nafter"
+        chunks = chunk_message(text, max_length=30)
+        assert len(chunks) >= 2
+        # If a chunk opens a code block without closing it, the chunker
+        # should close it and reopen in the next chunk.
+        for chunk in chunks:
+            fence_count = chunk.count("```")
+            assert fence_count % 2 == 0, f"Unmatched code fence in chunk: {chunk!r}"
+
+    def test_multiple_code_blocks(self) -> None:
+        text = "```\nblock1\n```\ntext\n```\nblock2\n```"
+        chunks = chunk_message(text, max_length=20)
+        for chunk in chunks:
+            fence_count = chunk.count("```")
+            assert fence_count % 2 == 0, f"Unmatched code fence in chunk: {chunk!r}"
+
+    def test_custom_max_length(self) -> None:
+        text = "hello world"
+        chunks = chunk_message(text, max_length=5)
+        assert len(chunks) >= 2
+        assert chunks[0] == "hello"
+
+    def test_very_long_single_line(self) -> None:
+        text = "x" * 5000
+        chunks = chunk_message(text, max_length=2000)
+        assert len(chunks) == 3
+        total = "".join(chunks)
+        assert total == text
+
+
+# ---------------------------------------------------------------------------
+# format_approval_request
+# ---------------------------------------------------------------------------
+
+
+class TestFormatApprovalRequest:
+    def test_single_tool(self) -> None:
+        items = [{"function": {"name": "read_file", "arguments": "/etc/hosts"}}]
+        result = format_approval_request(items)
+        assert "Tool approval required" in result
+        assert "`read_file`" in result
+
+    def test_multiple_tools(self) -> None:
+        items = [
+            {"function": {"name": "tool_a", "arguments": "arg1"}},
+            {"function": {"name": "tool_b", "arguments": "arg2"}},
+        ]
+        result = format_approval_request(items)
+        assert "`tool_a`" in result
+        assert "`tool_b`" in result
+
+    def test_long_arguments_truncated(self) -> None:
+        long_args = "x" * 500
+        items = [{"function": {"name": "fn", "arguments": long_args}}]
+        result = format_approval_request(items)
+        # The result should be shorter than the original args.
+        assert len(result) < 500
+
+    def test_server_sse_format(self) -> None:
+        """Items from the server SSE use func_name/preview, not function.name."""
+        items = [
+            {
+                "call_id": "c1",
+                "func_name": "bash",
+                "preview": "ls -la",
+                "header": "Execute: ls -la",
+                "needs_approval": True,
+            }
+        ]
+        result = format_approval_request(items)
+        assert "`bash`" in result
+        assert "Execute: ls -la" in result
+
+    def test_server_sse_format_no_header(self) -> None:
+        items = [{"func_name": "read_file", "preview": "/etc/hosts"}]
+        result = format_approval_request(items)
+        assert "`read_file`" in result
+        assert "/etc/hosts" in result
+
+
+# ---------------------------------------------------------------------------
+# format_plan_review
+# ---------------------------------------------------------------------------
+
+
+class TestFormatPlanReview:
+    def test_format(self) -> None:
+        result = format_plan_review("Step 1: do stuff")
+        assert result.startswith("**Plan review requested:**")
+        assert "Step 1: do stuff" in result
+
+
+# ---------------------------------------------------------------------------
+# truncate
+# ---------------------------------------------------------------------------
+
+
+class TestTruncate:
+    def test_short_text_unchanged(self) -> None:
+        assert truncate("hello", max_length=200) == "hello"
+
+    def test_long_text_truncated(self) -> None:
+        text = "a" * 300
+        result = truncate(text, max_length=200)
+        assert len(result) == 200
+        assert result.endswith("\u2026")
+
+    def test_exactly_at_limit(self) -> None:
+        text = "b" * 200
+        assert truncate(text, max_length=200) == text

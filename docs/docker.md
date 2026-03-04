@@ -27,6 +27,7 @@ Console dashboard: http://localhost:8090
 | `server` | 8080 | default | Web UI + chat workstreams + LLM |
 | `bridge` | — | default | Redis-to-HTTP bridge (multi-node routing) |
 | `console` | 8090 | default | Cluster dashboard |
+| `channel` | — | production | Channel gateway (Discord, Slack, etc.) |
 | `sim` | — | sim | Multi-node cluster simulator |
 
 ## Profiles
@@ -35,6 +36,12 @@ Console dashboard: http://localhost:8090
 
 ```bash
 docker compose up
+```
+
+**Production** — adds PostgreSQL and the channel gateway. Requires `POSTGRES_PASSWORD` and (for Discord) `TURNSTONE_DISCORD_TOKEN`:
+
+```bash
+docker compose --profile production up
 ```
 
 **Sim** — adds the simulator. Can run alongside the full stack or standalone with just Redis and the console:
@@ -105,6 +112,15 @@ The database stores workstream history, user accounts, and API tokens. When usin
 >
 > You will be prompted to set a password. Use it to log in via the UI or SDK, then create additional users through the admin API. Pass `--token --scopes read,write,approve` to also generate an initial API token.
 
+### Channel Gateway
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord adapter) |
+| `TURNSTONE_DISCORD_GUILD` | `0` | Restrict to a single Discord guild (0 = all guilds) |
+
+The channel service runs in the `production` profile. When `TURNSTONE_DISCORD_TOKEN` is set, the Discord adapter connects to the Discord Gateway and routes messages through Redis MQ to the bridge and server. See [Channel Integrations](channels.md) for full setup instructions including Discord application creation and user account linking.
+
 ### Simulator
 
 | Variable | Default | Description |
@@ -146,7 +162,7 @@ docker compose build
 docker compose build --no-cache
 ```
 
-All five entry points are installed in a single image: `turnstone-server`, `turnstone-bridge`, `turnstone-console`, `turnstone-sim`, `turnstone-eval`.
+All entry points are installed in a single image: `turnstone-server`, `turnstone-bridge`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`, `turnstone-sim`, `turnstone-eval`.
 
 ## Cleanup
 

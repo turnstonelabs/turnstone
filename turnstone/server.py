@@ -917,7 +917,33 @@ async def create_workstream(request: Request) -> JSONResponse:
                         "reason": "evicted",
                     }
                 )
-        return JSONResponse({"ws_id": ws.id, "name": ws.name})
+        # Atomic session resume during creation.
+        resumed = False
+        message_count = 0
+        resume_session_id = body.get("resume_session", "")
+        if resume_session_id and ws.session is not None:
+            from turnstone.core.memory import get_session_name, resolve_session
+
+            target_id = resolve_session(resume_session_id)
+            if target_id and ws.session.resume_session(target_id):
+                resumed = True
+                message_count = len(ws.session.messages)
+                ws.name = get_session_name(target_id) or ws.name
+                ui = ws.ui
+                if isinstance(ui, WebUI):
+                    ui._enqueue({"type": "clear_ui"})
+                    history = _build_history(ws.session)
+                    if history:
+                        ui._enqueue({"type": "history", "messages": history})
+
+        return JSONResponse(
+            {
+                "ws_id": ws.id,
+                "name": ws.name,
+                "resumed": resumed,
+                "message_count": message_count,
+            }
+        )
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

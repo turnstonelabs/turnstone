@@ -197,6 +197,41 @@ services:
     restart: unless-stopped
 
   # -------------------------------------------------------------------
+  # turnstone-channel — Channel gateway (Discord, Slack, etc.)
+  # Requires TURNSTONE_DISCORD_TOKEN to enable Discord adapter
+  # -------------------------------------------------------------------
+  channel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - production
+    command:
+      - sh
+      - -c
+      - >-
+        turnstone-channel
+        --redis-host=redis
+        --redis-port=6379
+        $${TURNSTONE_DISCORD_GUILD:+--discord-guild $$TURNSTONE_DISCORD_GUILD}
+    environment:
+      - TURNSTONE_DISCORD_TOKEN=${TURNSTONE_DISCORD_TOKEN:-}
+      - TURNSTONE_DISCORD_GUILD=${TURNSTONE_DISCORD_GUILD:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:-}
+      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-}
+    networks:
+      - turnstone-net
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+        required: false
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------
   # turnstone-sim — Multi-node cluster simulator (no LLM needed)
   # Start with: docker compose --profile sim up
   # -------------------------------------------------------------------

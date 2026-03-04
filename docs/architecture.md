@@ -21,6 +21,8 @@ plugs in.
 | `turnstone-bridge` | `turnstone.mq.bridge` | Bridge | Message queue ↔ HTTP API bridge |
 | `turnstone-console` | `turnstone.console.server` | ClusterCollector | Cluster dashboard (aggregates all nodes) |
 | `turnstone-eval` | `turnstone.eval` | `NullUI` | Headless evaluation and prompt optimization |
+| `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) via Redis MQ |
+| `turnstone-admin` | `turnstone.core.admin_cli` | — | Offline user and API token management |
 
 ---
 
@@ -75,6 +77,12 @@ turnstone/
     collector.py      ClusterCollector — aggregates state from all nodes via Redis + HTTP
     server.py         Cluster dashboard HTTP server + SSE + CLI entry point
     static/           Cluster dashboard web UI (page-specific HTML, CSS, JS)
+  channels/
+    cli.py            Unified channel gateway entry point (turnstone-channel)
+    _protocol.py      ChannelAdapter protocol, ChannelEvent dataclass
+    _routing.py       ChannelRouter — channel/thread ↔ workstream mapping via MQ
+    _config.py        Base ChannelConfig dataclass
+    discord/          Discord adapter (bot, cog, views, streaming, config)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
@@ -1254,3 +1262,28 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
     result = client.send_and_wait("Hello!", ws.ws_id)
     print(result.content)
 ```
+
+---
+
+## Channel Integrations
+
+> See also: [Channel Integrations guide](channels.md)
+
+The `turnstone-channel` gateway bridges external messaging platforms
+(Discord, Slack, Teams) to the turnstone cluster via Redis MQ. Each
+platform adapter implements the `ChannelAdapter` protocol and translates
+between platform-native events and turnstone MQ messages.
+
+The `ChannelRouter` manages bidirectional routing: it maps platform
+channel/thread IDs to turnstone workstream IDs, handles workstream
+creation and stale-route recovery, and resolves platform users to
+turnstone identities via the `channel_users` table. When an evicted
+workstream is reactivated, the router uses atomic session resume via the
+`resume_session` field on `CreateWorkstreamMessage` — the server resumes
+the old session during workstream creation in a single HTTP request,
+eliminating ordering fragility. The bridge emits a `SessionResumedEvent`
+to confirm success.
+
+Discord ships as the first adapter. See [channels.md](channels.md) for
+setup instructions, configuration reference, and the adapter development
+guide.

@@ -77,12 +77,13 @@
   <!-- ADMIN PANEL -->
   <div id="view-admin" style="display:none">
     <div class="admin-tabs" role="tablist">
-      <button class="admin-tab active" data-tab="users" role="tab" aria-selected="true" aria-controls="admin-users" tabindex="0" onclick="switchAdminTab('users')">Users</button>
-      <button class="admin-tab" data-tab="tokens" role="tab" aria-selected="false" aria-controls="admin-tokens" tabindex="-1" onclick="switchAdminTab('tokens')">Tokens</button>
+      <button id="tab-users" class="admin-tab active" data-tab="users" role="tab" aria-selected="true" aria-controls="admin-users" tabindex="0" onclick="switchAdminTab('users')">Users</button>
+      <button id="tab-tokens" class="admin-tab" data-tab="tokens" role="tab" aria-selected="false" aria-controls="admin-tokens" tabindex="-1" onclick="switchAdminTab('tokens')">Tokens</button>
+      <button id="tab-channels" class="admin-tab" data-tab="channels" role="tab" aria-selected="false" aria-controls="admin-channels" tabindex="-1" onclick="switchAdminTab('channels')">Channels</button>
     </div>
 
     <!-- Users Tab -->
-    <div id="admin-users" class="admin-panel" role="tabpanel">
+    <div id="admin-users" class="admin-panel" role="tabpanel" aria-labelledby="tab-users">
       <div class="admin-toolbar">
         <span class="section-header" style="margin:0">USERS</span>
         <button class="admin-action-btn" onclick="showCreateUserModal()">+ Create user</button>
@@ -99,7 +100,7 @@
     </div>
 
     <!-- Tokens Tab -->
-    <div id="admin-tokens" class="admin-panel" role="tabpanel" style="display:none">
+    <div id="admin-tokens" class="admin-panel" role="tabpanel" aria-labelledby="tab-tokens" style="display:none">
       <div class="admin-toolbar">
         <span class="section-header" style="margin:0">TOKENS</span>
         <label for="admin-token-user" class="sr-only">Filter tokens by user</label>
@@ -118,6 +119,27 @@
       </div>
       <div id="admin-tokens-table" role="list" aria-label="Tokens" aria-live="polite">
         <div class="dashboard-empty">Select a user to view tokens</div>
+      </div>
+    </div>
+
+    <!-- Channels Tab -->
+    <div id="admin-channels" class="admin-panel" role="tabpanel" aria-labelledby="tab-channels" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">CHANNEL LINKS</span>
+        <label for="admin-channel-user" class="sr-only">Filter channels by user</label>
+        <select id="admin-channel-user" onchange="loadAdminChannels()">
+          <option value="">Select user...</option>
+        </select>
+        <button class="admin-action-btn" onclick="showCreateChannelModal()">+ Link channel</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-chtype">CHANNEL</span>
+        <span class="admin-col admin-col-chuid">EXTERNAL ID</span>
+        <span class="admin-col admin-col-created">LINKED</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-channels-table" role="list" aria-label="Channel links" aria-live="polite">
+        <div class="dashboard-empty">Select a user to view channel links</div>
       </div>
     </div>
   </div>
@@ -228,6 +250,36 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div class="modal-buttons">
       <button class="modal-submit" onclick="copyCreatedToken()">Copy to clipboard</button>
       <button class="modal-cancel" onclick="hideTokenCreatedModal()">Done</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm Action Modal (reusable) -->
+<div id="confirm-overlay" style="display:none" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+  <div id="confirm-box" class="admin-modal">
+    <h2 id="confirm-title">Confirm</h2>
+    <p id="confirm-message" style="color:var(--fg-dim);margin:12px 0 20px;line-height:1.5"></p>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideConfirmModal()">Cancel</button>
+      <button id="confirm-submit" class="modal-submit" style="background:var(--red);border-color:var(--red)" onclick="_confirmCallback()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Channel Link Modal -->
+<div id="create-channel-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-channel-title">
+  <div id="create-channel-box" class="admin-modal">
+    <h2 id="create-channel-title">Link Channel Account</h2>
+    <div id="create-channel-error" role="alert" aria-live="assertive"></div>
+    <label for="cc-type">Channel type</label>
+    <select id="cc-type">
+      <option value="discord">Discord</option>
+    </select>
+    <label for="cc-uid">External user ID <span class="label-hint">the user's ID on the platform</span></label>
+    <input id="cc-uid" type="text" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false">
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateChannelModal()">Cancel</button>
+      <button id="cc-submit" class="modal-submit" onclick="submitCreateChannel()">Link</button>
     </div>
   </div>
 </div>
