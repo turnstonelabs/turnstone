@@ -29,9 +29,9 @@ from typing import Any
 
 from openai import OpenAI
 
-import turnstone.core.memory as _memory_module
 from turnstone.core.providers import LLMProvider, create_provider
 from turnstone.core.session import ChatSession
+from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.tools import PRIMARY_KEY_MAP, TOOLS
 
 # ─── ANSI & logging helpers ───────────────────────────────────────────────────
@@ -334,7 +334,8 @@ def _run_single_test(
     workdir = tempfile.mkdtemp(prefix="turnstone_eval_")
     original_cwd = os.getcwd()
     eval_db = os.path.join(workdir, ".turnstone_eval.db")
-    _memory_module.db_override = eval_db
+    reset_storage()
+    init_storage("sqlite", path=eval_db, run_migrations=False)
     t0 = time.monotonic()
 
     try:
@@ -399,8 +400,7 @@ def _run_single_test(
             "elapsed": round(elapsed, 1),
         }
     finally:
-        _memory_module.db_override = None
-        _memory_module.db_initialized.discard(eval_db)
+        reset_storage()
         os.chdir(original_cwd)
         shutil.rmtree(workdir, ignore_errors=True)
 

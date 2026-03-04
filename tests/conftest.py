@@ -4,15 +4,15 @@ import pytest
 
 
 @pytest.fixture
-def tmp_db(tmp_path, monkeypatch):
-    """Provide a temporary SQLite database."""
-    import turnstone.core.memory as memory
+def tmp_db(tmp_path):
+    """Provide a temporary SQLite storage backend."""
+    from turnstone.core.storage import init_storage, reset_storage
 
     db_path = str(tmp_path / "test.db")
-    monkeypatch.setattr(memory, "db_override", db_path)
-    memory.db_initialized.discard(db_path)
+    reset_storage()
+    init_storage("sqlite", path=db_path, run_migrations=False)
     yield db_path
-    memory.db_initialized.discard(db_path)
+    reset_storage()
 
 
 @pytest.fixture

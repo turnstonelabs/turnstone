@@ -825,8 +825,18 @@ def main() -> None:
     )
     from turnstone.core.config import apply_config
 
-    apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp"])
+    apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp", "database"])
     args = parser.parse_args()
+
+    # Initialize storage backend
+    from turnstone.core.storage import init_storage
+
+    db_backend = getattr(args, "db_backend", None) or os.environ.get(
+        "TURNSTONE_DB_BACKEND", "sqlite"
+    )
+    db_url = getattr(args, "db_url", None) or os.environ.get("TURNSTONE_DB_URL", "")
+    db_path = getattr(args, "db_path", None) or os.environ.get("TURNSTONE_DB_PATH", "")
+    init_storage(db_backend, path=db_path, url=db_url)
 
     # Prune stale / empty sessions on startup
     from turnstone.core.memory import prune_sessions

@@ -29,7 +29,8 @@ package "turnstone/core/" <<Rectangle>> {
     component [providers/\nLLMProvider, OpenAI, Anthropic] as providers <<core>>
     component [workstream.py\nWorkstreamManager] as workstream <<core>>
     component [tools.py\nTool loader] as tools <<core>>
-    component [memory.py\nSQLite + FTS5] as memory <<core>>
+    component [memory.py\nPersistence facade] as memory <<core>>
+    component [storage/\nStorageBackend protocol\nSQLite + PostgreSQL] as storage <<core>>
     component [metrics.py\nPrometheus metrics] as metrics <<core>>
     component [config.py\nTOML config] as config <<core>>
     component [safety.py\nPath validation] as safety <<core>>
@@ -128,6 +129,7 @@ chat --> session
 session --> providers
 session --> tools
 session --> memory
+memory --> storage
 session --> safety
 session --> sandbox
 session --> edit

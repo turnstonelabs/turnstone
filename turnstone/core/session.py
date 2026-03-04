@@ -24,24 +24,25 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.memory import (
+    delete_memory,
     delete_session,
-    escape_like,
     get_session_name,
-    get_tavily_key,
     list_sessions,
     load_memories,
     load_session_config,
     load_session_messages,
     normalize_key,
-    open_db,
     register_session,
     resolve_session,
+    save_memory,
     save_message,
     save_session_config,
     search_history,
     search_history_recent,
+    search_memories,
     set_session_alias,
     update_session_title,
 )
@@ -2330,29 +2331,14 @@ class ChatSession:
         """Save a persistent memory."""
         call_id, key, value = item["call_id"], item["key"], item["value"]
         try:
-            conn = open_db()
-            try:
-                existing = conn.execute(
-                    "SELECT value FROM memories WHERE key = ?", (key,)
-                ).fetchone()
-                conn.execute(
-                    "INSERT OR REPLACE INTO memories (key, value, created, updated) "
-                    "VALUES (?, ?, COALESCE("
-                    "  (SELECT created FROM memories WHERE key = ?), "
-                    "  datetime('now')"
-                    "), datetime('now'))",
-                    (key, value, key),
-                )
-                conn.commit()
-                self._init_system_messages()
-                if existing:
-                    msg = f"Updated memory: {key} = {value} (was: {existing[0]})"
-                else:
-                    msg = f"Saved memory: {key} = {value}"
-                self.ui.on_tool_result(call_id, "remember", msg)
-                return call_id, msg
-            finally:
-                conn.close()
+            old_value = save_memory(key, value)
+            self._init_system_messages()
+            if old_value is not None:
+                msg = f"Updated memory: {key} = {value} (was: {old_value})"
+            else:
+                msg = f"Saved memory: {key} = {value}"
+            self.ui.on_tool_result(call_id, "remember", msg)
+            return call_id, msg
         except Exception as e:
             return call_id, f"Error: {e}"
 
@@ -2360,19 +2346,14 @@ class ChatSession:
         """Remove a persistent memory by key."""
         call_id, key = item["call_id"], item["key"]
         try:
-            conn = open_db()
-            try:
-                cursor = conn.execute("DELETE FROM memories WHERE key = ?", (key,))
-                conn.commit()
-                if cursor.rowcount == 0:
-                    msg = f"Error: memory '{key}' not found"
-                else:
-                    self._init_system_messages()
-                    msg = f"Forgot: {key}"
-                self.ui.on_tool_result(call_id, "forget", msg)
-                return call_id, msg
-            finally:
-                conn.close()
+            deleted = delete_memory(key)
+            if not deleted:
+                msg = f"Error: memory '{key}' not found"
+            else:
+                self._init_system_messages()
+                msg = f"Forgot: {key}"
+            self.ui.on_tool_result(call_id, "forget", msg)
+            return call_id, msg
         except Exception as e:
             return call_id, f"Error: {e}"
 
@@ -2384,30 +2365,11 @@ class ChatSession:
 
         # Memories: list all (no query) or search (with query)
         try:
-            conn = open_db()
-            try:
-                if not query:
-                    rows = conn.execute("SELECT key, value FROM memories ORDER BY key").fetchall()
-                else:
-                    terms = query.split()
-                    clauses = []
-                    params: list[str] = []
-                    for t in terms:
-                        escaped = escape_like(t)
-                        clauses.append("(key LIKE ? ESCAPE '\\' OR value LIKE ? ESCAPE '\\')")
-                        params.extend([f"%{escaped}%", f"%{escaped}%"])
-                    rows = conn.execute(
-                        "SELECT key, value FROM memories WHERE "
-                        + " AND ".join(clauses)
-                        + " ORDER BY key",
-                        params,
-                    ).fetchall()
-                if rows:
-                    parts.append("Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows))
-                elif not query:
-                    parts.append("No memories stored.")
-            finally:
-                conn.close()
+            rows = search_memories(query) if query else load_memories()
+            if rows:
+                parts.append("Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows))
+            elif not query:
+                parts.append("No memories stored.")
         except Exception:
             pass
 

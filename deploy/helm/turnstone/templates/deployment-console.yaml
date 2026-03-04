@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "turnstone.fullname" . }}-console
+  labels:
+    {{- include "turnstone.labels" . | nindent 4 }}
+    app.kubernetes.io/component: console
+spec:
+  replicas: {{ .Values.console.replicas }}
+  selector:
+    matchLabels:
+      {{- include "turnstone.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: console
+  template:
+    metadata:
+      labels:
+        {{- include "turnstone.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: console
+    spec:
+      serviceAccountName: {{ include "turnstone.serviceAccountName" . }}
+      containers:
+        - name: console
+          image: {{ include "turnstone.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - turnstone-console
+            - --host=0.0.0.0
+            - --port={{ .Values.console.service.port }}
+            - --redis-host={{ include "turnstone.redis.host" . }}
+            - --redis-port={{ include "turnstone.redis.port" . }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.service.port }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "turnstone.fullname" . }}-config
+            - secretRef:
+                name: {{ include "turnstone.llm.secretName" . }}
+                optional: true
+          {{- if and .Values.auth.enabled .Values.auth.existingSecret }}
+          env:
+            - name: TURNSTONE_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: TURNSTONE_AUTH_TOKEN
+          {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.console.resources | nindent 12 }}

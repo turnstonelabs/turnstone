@@ -2,12 +2,13 @@
 
 from unittest.mock import MagicMock
 
+import sqlalchemy as sa
+
 from turnstone.core.memory import (
     delete_session,
     list_sessions,
     load_session_config,
     load_session_messages,
-    open_db,
     prune_sessions,
     register_session,
     resolve_session,
@@ -17,6 +18,7 @@ from turnstone.core.memory import (
     update_session_title,
 )
 from turnstone.core.session import ChatSession
+from turnstone.core.storage import get_storage
 
 # ── Session registration ──────────────────────────────────────────────
 
@@ -225,25 +227,21 @@ class TestDeleteSession:
 class TestSaveMessageToolCallId:
     def test_tool_call_id_stored(self, tmp_db):
         save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="call_xyz")
-        conn = open_db()
-        try:
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
             row = conn.execute(
-                "SELECT tool_call_id FROM conversations WHERE session_id = 's1'"
+                sa.text("SELECT tool_call_id FROM conversations WHERE session_id = 's1'")
             ).fetchone()
             assert row[0] == "call_xyz"
-        finally:
-            conn.close()
 
     def test_tool_call_id_none_by_default(self, tmp_db):
         save_message("s1", "user", "hello")
-        conn = open_db()
-        try:
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
             row = conn.execute(
-                "SELECT tool_call_id FROM conversations WHERE session_id = 's1'"
+                sa.text("SELECT tool_call_id FROM conversations WHERE session_id = 's1'")
             ).fetchone()
             assert row[0] is None
-        finally:
-            conn.close()
 
 
 # ── Sessions table creation ───────────────────────────────────────────
@@ -251,22 +249,18 @@ class TestSaveMessageToolCallId:
 
 class TestSessionsTable:
     def test_sessions_table_exists(self, tmp_db):
-        conn = open_db()
-        try:
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
             rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+                sa.text("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
             ).fetchall()
             assert len(rows) == 1
-        finally:
-            conn.close()
 
     def test_tool_call_id_column_exists(self, tmp_db):
-        conn = open_db()
-        try:
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
             # Should not raise
-            conn.execute("SELECT tool_call_id FROM conversations LIMIT 0")
-        finally:
-            conn.close()
+            conn.execute(sa.text("SELECT tool_call_id FROM conversations LIMIT 0"))
 
 
 # ── ChatSession.resume_session ────────────────────────────────────────
@@ -495,10 +489,12 @@ class TestPruneSessions:
         register_session("old1")
         save_message("old1", "user", "ancient message")
         # Force the updated timestamp to the past so it looks stale
-        conn = open_db()
-        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old1'")
-        conn.commit()
-        conn.close()
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
+            conn.execute(
+                sa.text("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old1'")
+            )
+            conn.commit()
         _orphans, stale = prune_sessions(retention_days=30)
         assert stale == 1
 
@@ -508,10 +504,12 @@ class TestPruneSessions:
         set_session_alias("old2", "important")
         save_message("old2", "user", "old but named")
         # Force old timestamp
-        conn = open_db()
-        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old2'")
-        conn.commit()
-        conn.close()
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
+            conn.execute(
+                sa.text("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old2'")
+            )
+            conn.commit()
         _orphans, stale = prune_sessions(retention_days=30)
         assert stale == 0
         assert len(list_sessions()) == 1
@@ -532,10 +530,12 @@ class TestPruneSessions:
         register_session("stale_cfg")
         save_message("stale_cfg", "user", "old")
         save_session_config("stale_cfg", {"temperature": "0.9"})
-        conn = open_db()
-        conn.execute("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'stale_cfg'")
-        conn.commit()
-        conn.close()
+        engine = get_storage()._engine  # noqa: SLF001
+        with engine.connect() as conn:
+            conn.execute(
+                sa.text("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'stale_cfg'")
+            )
+            conn.commit()
 
         # Both should have config before prune
         assert load_session_config("orphan_cfg") == {"temperature": "0.5"}
