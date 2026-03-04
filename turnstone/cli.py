@@ -828,6 +828,10 @@ def main() -> None:
     apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp", "database"])
     args = parser.parse_args()
 
+    from turnstone.core.log import configure_logging
+
+    configure_logging(level="WARNING", service="cli")
+
     # Initialize storage backend
     from turnstone.core.storage import init_storage
 

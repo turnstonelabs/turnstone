@@ -93,6 +93,12 @@ def main() -> None:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument(
+        "--log-format",
+        default="auto",
+        choices=["auto", "json", "text"],
+        help="Log output format (default: auto — JSON when stderr is not a TTY)",
+    )
 
     args = parser.parse_args()
 
@@ -116,9 +122,12 @@ def main() -> None:
         metrics_file=args.metrics_file,
     )
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    from turnstone.core.log import configure_logging
+
+    configure_logging(
+        level=args.log_level,
+        json_output={"json": True, "text": False}.get(args.log_format),
+        service="sim",
     )
 
     try:

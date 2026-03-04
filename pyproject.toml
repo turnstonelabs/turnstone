@@ -32,6 +32,7 @@ dependencies = [
     "pydantic>=2.0",
     "sqlalchemy>=2.0",
     "alembic>=1.14",
+    "structlog>=24.1",
 ]
 
 [project.urls]
@@ -126,6 +127,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["sqlalchemy", "sqlalchemy.*", "alembic", "alembic.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["structlog", "structlog.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

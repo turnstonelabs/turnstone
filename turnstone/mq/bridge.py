@@ -99,6 +99,20 @@ class Bridge:
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
         self._running = True
 
+    # -- thread context helper ------------------------------------------------
+
+    def _run_in_context(self, fn: Callable[..., Any], *args: Any) -> Callable[[], None]:
+        """Return a callable that sets ``ctx_node_id`` before invoking *fn*."""
+        node_id = self._node_id
+
+        def _wrapper() -> None:
+            from turnstone.core.log import ctx_node_id
+
+            ctx_node_id.set(node_id)
+            fn(*args)
+
+        return _wrapper
+
     # -- public entry point --------------------------------------------------
 
     def _fetch_node_id(self) -> str:
@@ -137,13 +151,18 @@ class Bridge:
         """Block until shutdown (KeyboardInterrupt)."""
         if not self._node_id:
             self._node_id = self._fetch_node_id()
+        from turnstone.core.log import ctx_node_id
+
+        ctx_node_id.set(self._node_id)
         log.info("Bridge starting — node=%s server=%s", self._node_id, self._server_url)
         self._recover_workstreams()
 
-        heartbeat_t = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        heartbeat_t = threading.Thread(
+            target=self._run_in_context(self._heartbeat_loop), daemon=True
+        )
         heartbeat_t.start()
 
-        global_t = threading.Thread(target=self._global_sse_loop, daemon=True)
+        global_t = threading.Thread(target=self._run_in_context(self._global_sse_loop), daemon=True)
         global_t.start()
 
         try:
@@ -435,7 +454,7 @@ class Bridge:
         with self._lock:
             if ws_id in self._ws_threads and self._ws_threads[ws_id].is_alive():
                 return
-            t = threading.Thread(target=self._ws_sse_loop, args=(ws_id,), daemon=True)
+            t = threading.Thread(target=self._run_in_context(self._ws_sse_loop, ws_id), daemon=True)
             self._ws_threads[ws_id] = t
             t.start()
 
@@ -555,7 +574,7 @@ class Bridge:
                 log.warning("Approval timeout for ws %s — denying", ws_id)
                 self._api_approve(ws_id, approved=False, feedback="Approval timed out")
 
-        threading.Thread(target=_wait_approval, daemon=True).start()
+        threading.Thread(target=self._run_in_context(_wait_approval), daemon=True).start()
 
     def _handle_plan_review(self, ws_id: str, data: dict[str, Any]) -> None:
         """Handle a plan review request — auto-approve or forward to client."""
@@ -584,7 +603,7 @@ class Bridge:
                 log.warning("Plan review timeout for ws %s — rejecting", ws_id)
                 self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
 
-        threading.Thread(target=_wait_plan, daemon=True).start()
+        threading.Thread(target=self._run_in_context(_wait_plan), daemon=True).start()
 
     def _api_approve(
         self,
@@ -762,6 +781,12 @@ def main() -> None:
         help="Log level (default: %(default)s)",
     )
     parser.add_argument(
+        "--log-format",
+        default="auto",
+        choices=["auto", "json", "text"],
+        help="Log output format (default: auto — JSON when stderr is not a TTY)",
+    )
+    parser.add_argument(
         "--auth-token",
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
         help="Bearer token for authenticating to turnstone-server (default: $TURNSTONE_AUTH_TOKEN)",
@@ -771,9 +796,12 @@ def main() -> None:
     apply_config(parser, ["bridge", "redis", "auth"])
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    from turnstone.core.log import configure_logging
+
+    configure_logging(
+        level=args.log_level,
+        json_output={"json": True, "text": False}.get(args.log_format),
+        service="bridge",
     )
 
     broker = RedisBroker(
