@@ -100,7 +100,7 @@ turnstone-sim --nodes 100 --scenario steady --duration 60 --mps 10
 
 See [docs/simulator.md](docs/simulator.md) for scenarios, CLI reference, and metrics.
 
-All frontends connect to any OpenAI-compatible API (vLLM, NVIDIA NIM/NGC, llama.cpp, OpenAI, etc.) and auto-detect the model.
+All frontends connect to any OpenAI-compatible API (vLLM, NVIDIA NIM/NGC, llama.cpp, OpenAI, etc.) or Anthropic's native Messages API, and auto-detect the model.
 
 ## Architecture
 
@@ -108,6 +108,10 @@ All frontends connect to any OpenAI-compatible API (vLLM, NVIDIA NIM/NGC, llama.
 turnstone/
 ├── core/              # UI-agnostic engine
 │   ├── session.py     # ChatSession — multi-turn loop, tool dispatch, agents
+│   ├── providers/     # LLM provider adapters (OpenAI, Anthropic)
+│   │   ├── _protocol.py   # LLMProvider protocol, ModelCapabilities, StreamChunk
+│   │   ├── _openai.py     # OpenAI-compatible (OpenAI, vLLM, llama.cpp)
+│   │   └── _anthropic.py  # Anthropic Messages API (native streaming, thinking)
 │   ├── tools.py       # Tool definitions (auto-loaded from JSON)
 │   ├── workstream.py  # WorkstreamManager — parallel independent sessions
 │   ├── mcp_client.py  # MCP client manager (external tool servers)
@@ -163,8 +167,8 @@ Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
 |---------|-------------|
 | [System Context](docs/diagrams/png/01-system-context.png) | Top-level components and external dependencies |
 | [Package Structure](docs/diagrams/png/02-package-structure.png) | Python modules and dependency graph |
-| [Core Engine Classes](docs/diagrams/png/03-core-engine-classes.png) | SessionUI protocol, ChatSession, WorkstreamManager |
-| [Conversation Turn](docs/diagrams/png/04-conversation-turn.png) | Full message lifecycle through the engine |
+| [Core Engine Classes](docs/diagrams/png/03-core-engine-classes.png) | SessionUI protocol, ChatSession, LLMProvider, WorkstreamManager |
+| [Conversation Turn](docs/diagrams/png/04-conversation-turn.png) | Full message lifecycle through the engine (provider-agnostic) |
 | [Tool Pipeline](docs/diagrams/png/05-tool-pipeline.png) | Three-phase prepare/approve/execute |
 | [MQ Protocol](docs/diagrams/png/06-mq-protocol.png) | 9 inbound + 19 outbound message types |
 | [Message Routing](docs/diagrams/png/07-message-routing.png) | Multi-node routing scenarios |
@@ -241,14 +245,21 @@ turnstone-server --mcp-config ~/.config/turnstone/mcp.json
 
 Use `/mcp` in the REPL to list connected tools. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
 
-### Multi-Model Support
+### Multi-Model and Multi-Provider Support
 
-Turnstone supports multiple model backends per server instance. Define named models in `config.toml` and select per-workstream or switch mid-session with `/model <alias>`.
+Turnstone supports multiple model backends per server instance, including different LLM providers. `ChatSession` delegates all API communication to pluggable `LLMProvider` adapters — the internal message format stays OpenAI-like, and each provider translates at the API boundary. Define named models in `config.toml` and select per-workstream or switch mid-session with `/model <alias>`.
 
 ```toml
 [models.local]
 base_url = "http://localhost:8000/v1"
 model = "qwen3-32b"
+# provider defaults to "openai" (works with vLLM, llama.cpp, etc.)
+
+[models.claude]
+provider = "anthropic"
+api_key = "sk-ant-..."
+model = "claude-opus-4-6"
+context_window = 200000
 
 [models.openai]
 base_url = "https://api.openai.com/v1"
@@ -258,11 +269,13 @@ context_window = 128000
 
 [model]
 default = "local"              # which model to use by default
-fallback = ["openai"]          # try these if the primary is unreachable
-agent_model = "local"          # optional: cheaper model for plan/task sub-agents
+fallback = ["claude", "openai"]  # try these if the primary is unreachable
+agent_model = "claude"         # optional: separate model for plan/task sub-agents
 ```
 
-Use `/model` to show available models, `/model openai` to switch. Workstreams created via the API accept an optional `model` parameter.
+Supported providers: `"openai"` (default -- OpenAI, vLLM, llama.cpp, any OpenAI-compatible API) and `"anthropic"` (Anthropic Messages API, requires `pip install turnstone[anthropic]`).
+
+Use `/model` to show available models, `/model claude` to switch. Workstreams created via the API accept an optional `model` parameter.
 
 ## Configuration
 
@@ -373,8 +386,9 @@ Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
 ## Requirements
 
 - Python 3.11+
-- An OpenAI-compatible API endpoint ([vLLM](https://github.com/vllm-project/vllm), [NVIDIA NIM](https://build.nvidia.com/), [llama.cpp](https://github.com/ggml-org/llama.cpp), etc.)
+- An OpenAI-compatible API endpoint ([vLLM](https://github.com/vllm-project/vllm), [NVIDIA NIM](https://build.nvidia.com/), [llama.cpp](https://github.com/ggml-org/llama.cpp), etc.) or an Anthropic API key
 - Redis (for message queue bridge — `pip install turnstone[mq]`)
+- Anthropic provider (optional — `pip install turnstone[anthropic]`)
 
 ## License
 
