@@ -15,7 +15,13 @@ class StorageBackend(Protocol):
 
     # -- Core session operations -----------------------------------------------
 
-    def register_session(self, session_id: str, title: str | None = None) -> None:
+    def register_session(
+        self,
+        session_id: str,
+        title: str | None = None,
+        node_id: str | None = None,
+        ws_id: str | None = None,
+    ) -> None:
         """Create a sessions row for a new session (no-op if already exists)."""
         ...
 
@@ -98,6 +104,34 @@ class StorageBackend(Protocol):
 
     def kv_search(self, query: str) -> list[tuple[str, str]]:
         """Search key-value pairs by query. Returns matching (key, value) pairs."""
+        ...
+
+    # -- Workstream operations -------------------------------------------------
+
+    def register_workstream(
+        self,
+        ws_id: str,
+        node_id: str | None = None,
+        name: str = "",
+        state: str = "idle",
+    ) -> None:
+        """Create a workstreams row (no-op if already exists)."""
+        ...
+
+    def update_workstream_state(self, ws_id: str, state: str) -> None:
+        """Update a workstream's state and bump updated timestamp."""
+        ...
+
+    def update_workstream_name(self, ws_id: str, name: str) -> None:
+        """Update a workstream's display name."""
+        ...
+
+    def delete_workstream(self, ws_id: str) -> bool:
+        """Delete a workstream. Returns True on success."""
+        ...
+
+    def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
+        """List workstreams, optionally filtered by node_id."""
         ...
 
     # -- Conversation search ---------------------------------------------------

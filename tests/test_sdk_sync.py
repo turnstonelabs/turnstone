@@ -49,6 +49,21 @@ def test_sync_runner_iter():
         runner.close()
 
 
+def test_sync_runner_iter_empty():
+    """_SyncRunner.run_iter handles empty async generator via sentinel."""
+    runner = _SyncRunner()
+    try:
+
+        async def _empty():
+            return
+            yield  # pragma: no cover  # makes this an async generator
+
+        items = list(runner.run_iter(_empty()))
+        assert items == []
+    finally:
+        runner.close()
+
+
 # ---------------------------------------------------------------------------
 # TurnstoneServer (sync)
 # ---------------------------------------------------------------------------

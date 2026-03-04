@@ -249,6 +249,61 @@ class TestSearch:
         assert len(results) == 1
 
 
+# -- Workstream operations -----------------------------------------------------
+
+
+class TestWorkstreams:
+    def test_register_and_list(self, backend):
+        backend.register_workstream("ws1", node_id="node-a", name="first")
+        backend.register_workstream("ws2", node_id="node-a", name="second")
+        rows = backend.list_workstreams()
+        assert len(rows) == 2
+        ws_ids = {r[0] for r in rows}
+        assert ws_ids == {"ws1", "ws2"}
+
+    def test_register_idempotent(self, backend):
+        backend.register_workstream("ws1", name="first")
+        backend.register_workstream("ws1", name="overwrite")
+        rows = backend.list_workstreams()
+        assert len(rows) == 1
+        assert rows[0][2] == "first"  # name preserved from first insert
+
+    def test_update_state(self, backend):
+        backend.register_workstream("ws1")
+        backend.update_workstream_state("ws1", "running")
+        rows = backend.list_workstreams()
+        assert rows[0][3] == "running"
+
+    def test_update_name(self, backend):
+        backend.register_workstream("ws1", name="old")
+        backend.update_workstream_name("ws1", "new")
+        rows = backend.list_workstreams()
+        assert rows[0][2] == "new"
+
+    def test_delete(self, backend):
+        backend.register_workstream("ws1")
+        assert backend.delete_workstream("ws1") is True
+        assert backend.list_workstreams() == []
+        assert backend.delete_workstream("ws1") is False
+
+    def test_list_by_node(self, backend):
+        backend.register_workstream("ws1", node_id="node-a")
+        backend.register_workstream("ws2", node_id="node-b")
+        rows = backend.list_workstreams(node_id="node-a")
+        assert len(rows) == 1
+        assert rows[0][0] == "ws1"
+
+    def test_session_with_ws_id(self, backend):
+        backend.register_workstream("ws1", node_id="node-a")
+        backend.register_session("s1", node_id="node-a", ws_id="ws1")
+        backend.save_message("s1", "user", "hello")
+        rows = backend.list_sessions()
+        assert len(rows) == 1
+        # Columns: sid, alias, title, created, updated, count, node_id, ws_id
+        assert rows[0][6] == "node-a"
+        assert rows[0][7] == "ws1"
+
+
 # -- Lifecycle -----------------------------------------------------------------
 
 

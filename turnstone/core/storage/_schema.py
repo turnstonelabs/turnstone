@@ -38,6 +38,8 @@ sessions = sa.Table(
     sa.Column("session_id", sa.Text, primary_key=True),
     sa.Column("alias", sa.Text, unique=True),
     sa.Column("title", sa.Text),
+    sa.Column("node_id", sa.Text),
+    sa.Column("ws_id", sa.Text),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -45,6 +47,22 @@ sessions = sa.Table(
 # Additional indexes on sessions (name-based to avoid duplication with SA's auto-index)
 sa.Index("idx_sessions_alias", sessions.c.alias)
 sa.Index("idx_sessions_updated", sessions.c.updated)
+sa.Index("idx_sessions_node_id", sessions.c.node_id)
+sa.Index("idx_sessions_ws_id", sessions.c.ws_id)
+
+workstreams = sa.Table(
+    "workstreams",
+    metadata,
+    sa.Column("ws_id", sa.Text, primary_key=True),
+    sa.Column("node_id", sa.Text),
+    sa.Column("name", sa.Text, nullable=False, server_default=""),
+    sa.Column("state", sa.Text, nullable=False, server_default="idle"),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_workstreams_node_id", workstreams.c.node_id)
+sa.Index("idx_workstreams_state", workstreams.c.state)
 
 session_config = sa.Table(
     "session_config",

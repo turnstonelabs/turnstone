@@ -40,7 +40,7 @@ class WorkstreamState(enum.Enum):
 
 @dataclass
 class Workstream:
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     name: str = ""
     state: WorkstreamState = WorkstreamState.IDLE
     session: ChatSession | None = None
@@ -65,25 +65,29 @@ class WorkstreamManager:
 
     def __init__(
         self,
-        session_factory: Callable[[SessionUI | None, str | None], ChatSession],
+        session_factory: Callable[[SessionUI | None, str | None, str | None], ChatSession],
         *,
         max_workstreams: int = 10,
+        node_id: str | None = None,
     ):
         """
         Args:
-            session_factory: callable(ui, model_alias) -> ChatSession.
+            session_factory: callable(ui, model_alias, ws_id) -> ChatSession.
                 Captures shared config (registry, temperature, …) so the
                 manager can create sessions without knowing those details.
                 *model_alias* selects a model from the registry (None = default).
+                *ws_id* links the session to its workstream in storage.
             max_workstreams: Maximum number of concurrent workstreams.  When at
                 capacity, ``create()`` will auto-evict the oldest IDLE
                 workstream before raising.
+            node_id: Server node identity (persisted with workstreams).
         """
         if max_workstreams < 1:
             raise ValueError(f"max_workstreams must be >= 1, got {max_workstreams}")
-        self._session_factory: Callable[[SessionUI | None, str | None], ChatSession] = (
+        self._session_factory: Callable[[SessionUI | None, str | None, str | None], ChatSession] = (
             session_factory
         )
+        self._node_id = node_id
         self._max_workstreams: int = max_workstreams
         self._workstreams: dict[str, Workstream] = {}
         self._order: list[str] = []  # creation order
@@ -121,29 +125,54 @@ class WorkstreamManager:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
         """
-        evicted_ws: Workstream | None = None
+        # Fast-fail capacity check (avoids expensive session creation when full).
+        first_evicted: Workstream | None = None
         with self._lock:
             if len(self._workstreams) >= self._max_workstreams:
-                evicted_ws = self._evict_oldest_idle_locked()
-                if evicted_ws is None:
+                first_evicted = self._evict_oldest_idle_locked()
+                if first_evicted is None:
                     raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
+
+        # Cleanup first-phase eviction outside the lock (may trigger callbacks).
+        if first_evicted is not None:
+            self._cleanup_ui(first_evicted)
+            self._last_evicted = first_evicted
+            from turnstone.core.metrics import metrics as _m1
+
+            _m1.record_eviction()
+
+        # Create workstream and session outside the lock (session creation is
+        # expensive — involves LLM client setup and DB writes).
         ws = Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui, model)
+        ws.session = self._session_factory(ws.ui, model, ws.id)
+
+        # Authoritative insert under lock with re-check (another thread may
+        # have filled capacity while we were unlocked).
+        second_evicted: Workstream | None = None
         with self._lock:
+            if len(self._workstreams) >= self._max_workstreams:
+                second_evicted = self._evict_oldest_idle_locked()
+                if second_evicted is None:
+                    raise RuntimeError(f"All {self._max_workstreams} workstreams are active")
             self._workstreams[ws.id] = ws
             self._order.append(ws.id)
             if self._active_id is None:
                 self._active_id = ws.id
-        # UI cleanup for the evicted workstream must happen outside the lock
-        # because it may trigger callbacks.
-        self._last_evicted = evicted_ws
-        if evicted_ws is not None:
-            self._cleanup_ui(evicted_ws)
-            from turnstone.core.metrics import metrics
 
-            metrics.record_eviction()
+        # Persist to storage only after successful insertion
+        from turnstone.core.memory import register_workstream
+
+        register_workstream(ws.id, node_id=self._node_id, name=ws.name)
+
+        # Cleanup second-phase eviction outside the lock.
+        if second_evicted is not None:
+            self._cleanup_ui(second_evicted)
+            self._last_evicted = second_evicted
+            from turnstone.core.metrics import metrics as _m2
+
+            _m2.record_eviction()
         return ws
 
     # -- eviction helpers ---------------------------------------------------
@@ -197,6 +226,9 @@ class WorkstreamManager:
                 self._active_id = self._order[0]
         # Unblock any waiting approval/plan events so worker thread can exit
         self._cleanup_ui(ws)
+        from turnstone.core.memory import update_workstream_state
+
+        update_workstream_state(ws_id, "closed")
         return True
 
     # -- lookup -------------------------------------------------------------
@@ -260,6 +292,9 @@ class WorkstreamManager:
                 ws.state = state
                 ws.last_active = time.monotonic()
                 ws.error_message = error_msg
+                from turnstone.core.memory import update_workstream_state
+
+                update_workstream_state(ws_id, state.value)
             if self._on_state_change:
                 self._on_state_change(ws_id, state)
 
