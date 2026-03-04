@@ -14,6 +14,7 @@ from turnstone.core.storage._schema import (
     metadata,
     session_config,
     sessions,
+    workstreams,
 )
 from turnstone.core.storage._sqlite import _reconstruct_messages
 
@@ -37,7 +38,13 @@ class PostgreSQLBackend:
 
     # -- Core session operations -----------------------------------------------
 
-    def register_session(self, session_id: str, title: str | None = None) -> None:
+    def register_session(
+        self,
+        session_id: str,
+        title: str | None = None,
+        node_id: str | None = None,
+        ws_id: str | None = None,
+    ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             # Use dialect-neutral upsert pattern
@@ -47,7 +54,14 @@ class PostgreSQLBackend:
             if not existing:
                 conn.execute(
                     sa.insert(sessions),
-                    {"session_id": session_id, "title": title, "created": now, "updated": now},
+                    {
+                        "session_id": session_id,
+                        "title": title,
+                        "node_id": node_id,
+                        "ws_id": ws_id,
+                        "created": now,
+                        "updated": now,
+                    },
                 )
             conn.commit()
 
@@ -106,7 +120,8 @@ class PostgreSQLBackend:
                     sa.text(
                         "SELECT s.session_id, s.alias, s.title, s.created, s.updated, "
                         "(SELECT COUNT(*) FROM conversations c "
-                        " WHERE c.session_id = s.session_id) "
+                        " WHERE c.session_id = s.session_id), "
+                        "s.node_id, s.ws_id "
                         "FROM sessions s "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.session_id = s.session_id) "
@@ -330,6 +345,78 @@ class PostgreSQLBackend:
                 params,
             ).fetchall()
             return [(str(r[0]), str(r[1])) for r in rows]
+
+    # -- Workstream operations -------------------------------------------------
+
+    def register_workstream(
+        self,
+        ws_id: str,
+        node_id: str | None = None,
+        name: str = "",
+        state: str = "idle",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            existing = conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    sa.insert(workstreams),
+                    {
+                        "ws_id": ws_id,
+                        "node_id": node_id,
+                        "name": name,
+                        "state": state,
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            conn.commit()
+
+    def update_workstream_state(self, ws_id: str, state: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id == ws_id)
+                .values(state=state, updated=now)
+            )
+            conn.commit()
+
+    def update_workstream_name(self, ws_id: str, name: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id == ws_id)
+                .values(name=name, updated=now)
+            )
+            conn.commit()
+
+    def delete_workstream(self, ws_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
+        with self._engine.connect() as conn:
+            q = (
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.node_id,
+                    workstreams.c.name,
+                    workstreams.c.state,
+                    workstreams.c.created,
+                    workstreams.c.updated,
+                )
+                .order_by(workstreams.c.updated.desc())
+                .limit(limit)
+            )
+            if node_id is not None:
+                q = q.where(workstreams.c.node_id == node_id)
+            return list(conn.execute(q).fetchall())
 
     # -- Conversation search ---------------------------------------------------
 

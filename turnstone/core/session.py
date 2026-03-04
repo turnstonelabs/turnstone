@@ -116,6 +116,8 @@ class ChatSession:
         registry: ModelRegistry | None = None,
         model_alias: str | None = None,
         health_monitor: BackendHealthMonitor | None = None,
+        node_id: str | None = None,
+        ws_id: str | None = None,
     ):
         self.client = client
         self.model = model
@@ -148,9 +150,11 @@ class ChatSession:
         self.show_reasoning = True
         self.debug = False
         self.auto_approve = False
-        self._session_id = uuid.uuid4().hex[:12]
+        self._node_id = node_id
+        self._ws_id = ws_id
+        self._session_id = uuid.uuid4().hex
         self._title_generated = False
-        register_session(self._session_id)
+        register_session(self._session_id, node_id=self._node_id, ws_id=self._ws_id)
         self._read_files: set[str] = set()
         self.messages: list[dict[str, Any]] = []
         self._last_usage: dict[str, int] | None = None
@@ -2678,9 +2682,9 @@ class ChatSession:
             self._read_files.clear()
             self._last_usage = None
             self._msg_tokens = []
-            self._session_id = uuid.uuid4().hex[:12]
+            self._session_id = uuid.uuid4().hex
             self._title_generated = False
-            register_session(self._session_id)
+            register_session(self._session_id, node_id=self._node_id, ws_id=self._ws_id)
             self._save_config()
             self.ui.on_info("New session started.")
 
@@ -2690,7 +2694,7 @@ class ChatSession:
                 self.ui.on_info("No saved sessions.")
             else:
                 lines = ["Sessions:\n"]
-                for sid, alias, title, _created, updated, count in rows:
+                for sid, alias, title, _created, updated, count, *_extra in rows:
                     display_name = alias or sid
                     display_title = f"  {title}" if title else ""
                     marker = " *" if sid == self._session_id else "  "

@@ -13,7 +13,6 @@ import contextlib
 import json
 import logging
 import os
-import socket
 import threading
 import time
 import uuid
@@ -57,18 +56,6 @@ log = logging.getLogger("turnstone.mq.bridge")
 DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "remember", "recall", "forget"])
 
 
-def _default_node_id() -> str:
-    """Generate a default node_id: ``{hostname}_{4hex}``, or a UUID on failure."""
-    suffix = uuid.uuid4().hex[:4]
-    try:
-        host = socket.gethostname()
-        if host and host != "localhost":
-            return f"{host}_{suffix}"
-    except OSError:
-        pass
-    return uuid.uuid4().hex[:12]
-
-
 class Bridge:
     """Connects a message broker to turnstone-server's HTTP API.
 
@@ -93,7 +80,7 @@ class Bridge:
         self._broker = broker or RedisBroker()
         self._approval_timeout = approval_timeout
         self._prefix = prefix
-        self._node_id = node_id or _default_node_id()
+        self._node_id = node_id  # resolved in run() from server /health
         self._heartbeat_ttl = heartbeat_ttl
         self._started_at = time.time()
         self._auth_token = auth_token
@@ -114,8 +101,42 @@ class Bridge:
 
     # -- public entry point --------------------------------------------------
 
+    def _fetch_node_id(self) -> str:
+        """Retrieve node_id from server /health with exponential backoff.
+
+        Raises ``SystemExit`` if the server is unreachable after 5 attempts.
+        """
+        delays = [1, 2, 4, 8, 16]
+        for attempt, delay in enumerate(delays, 1):
+            try:
+                resp = self._http.get("/health")
+                if 400 <= resp.status_code < 500:
+                    log.critical("Server returned %d — check auth_token/config", resp.status_code)
+                    raise SystemExit(1)
+                resp.raise_for_status()
+                data = resp.json()
+                nid = data.get("node_id", "")
+                if nid:
+                    return str(nid)
+                log.warning("Server /health missing node_id (attempt %d/%d)", attempt, len(delays))
+            except Exception as exc:
+                log.warning(
+                    "Failed to fetch node_id from server (attempt %d/%d): %s",
+                    attempt,
+                    len(delays),
+                    exc,
+                )
+            if attempt < len(delays):
+                time.sleep(delay)
+        log.critical(
+            "Could not retrieve node_id from server after %d attempts — exiting", len(delays)
+        )
+        raise SystemExit(1)
+
     def run(self) -> None:
         """Block until shutdown (KeyboardInterrupt)."""
+        if not self._node_id:
+            self._node_id = self._fetch_node_id()
         log.info("Bridge starting — node=%s server=%s", self._node_id, self._server_url)
         self._recover_workstreams()
 

@@ -45,11 +45,28 @@ def upgrade() -> None:
         sa.Column("session_id", sa.Text, primary_key=True),
         sa.Column("alias", sa.Text, unique=True),
         sa.Column("title", sa.Text),
+        sa.Column("node_id", sa.Text),
+        sa.Column("ws_id", sa.Text),
         sa.Column("created", sa.Text, nullable=False),
         sa.Column("updated", sa.Text, nullable=False),
     )
     op.create_index("idx_sessions_alias", "sessions", ["alias"])
     op.create_index("idx_sessions_updated", "sessions", ["updated"])
+    op.create_index("idx_sessions_node_id", "sessions", ["node_id"])
+    op.create_index("idx_sessions_ws_id", "sessions", ["ws_id"])
+
+    # workstreams — persistent workstream lifecycle tracking
+    op.create_table(
+        "workstreams",
+        sa.Column("ws_id", sa.Text, primary_key=True),
+        sa.Column("node_id", sa.Text),
+        sa.Column("name", sa.Text, nullable=False, server_default=""),
+        sa.Column("state", sa.Text, nullable=False, server_default="idle"),
+        sa.Column("created", sa.Text, nullable=False),
+        sa.Column("updated", sa.Text, nullable=False),
+    )
+    op.create_index("idx_workstreams_node_id", "workstreams", ["node_id"])
+    op.create_index("idx_workstreams_state", "workstreams", ["state"])
 
     # session_config — per-session LLM parameters
     op.create_table(
@@ -63,6 +80,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("session_config")
+    op.drop_table("workstreams")
     op.drop_table("sessions")
     op.drop_table("conversations")
     op.drop_table("memories")

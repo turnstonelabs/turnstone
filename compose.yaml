@@ -112,6 +112,7 @@ services:
       - MODEL=${MODEL:-}
       - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
       - TURNSTONE_DB_URL=${DATABASE_URL:-}
+      - TURNSTONE_NODE_ID=${TURNSTONE_NODE_ID:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

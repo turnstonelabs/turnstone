@@ -150,10 +150,6 @@ _CONSOLE_BANNER_TEMPLATE = (
     '<div style="background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);'
     "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
     'display:flex;align-items:center;gap:12px;position:relative;z-index:9999">'
-    '<span style="color:#e5a042;font-weight:700;font-size:13px;'
-    "font-family:'Outfit',sans-serif;letter-spacing:0.02em\">"
-    "turnstone</span>"
-    '<span style="color:#3b4463">\u2502</span>'
     '<a href="/" style="color:#8a93ad;text-decoration:none;font-weight:500;'
     'padding:2px 0" '
     "onmouseover=\"this.style.color='#e5a042'\" "

@@ -884,14 +884,11 @@ function renderWsTable(container, wsList) {
       row.classList.add("has-link");
       (function (nodeId, wsId) {
         row.onclick = function () {
-          window.open(
+          window.location.href =
             "/node/" +
-              encodeURIComponent(nodeId) +
-              "/?ws_id=" +
-              encodeURIComponent(wsId),
-            "_blank",
-            "noopener",
-          );
+            encodeURIComponent(nodeId) +
+            "/?ws_id=" +
+            encodeURIComponent(wsId);
         };
         row.onkeydown = function (e) {
           if (e.key === "Enter" || e.key === " ") {

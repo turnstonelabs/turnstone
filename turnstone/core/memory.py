@@ -24,10 +24,15 @@ def normalize_key(key: str) -> str:
 # -- Core session operations ---------------------------------------------------
 
 
-def register_session(session_id: str, title: str | None = None) -> None:
+def register_session(
+    session_id: str,
+    title: str | None = None,
+    node_id: str | None = None,
+    ws_id: str | None = None,
+) -> None:
     """Create a sessions row for a new session (no-op if already exists)."""
     with contextlib.suppress(Exception):
-        get_storage().register_session(session_id, title)
+        get_storage().register_session(session_id, title, node_id=node_id, ws_id=ws_id)
 
 
 def save_message(
@@ -144,6 +149,37 @@ def update_session_title(session_id: str, title: str) -> None:
     """Set or update the auto-generated title for a session."""
     with contextlib.suppress(Exception):
         get_storage().update_session_title(session_id, title)
+
+
+# -- Workstream operations -----------------------------------------------------
+
+
+def register_workstream(
+    ws_id: str, node_id: str | None = None, name: str = "", state: str = "idle"
+) -> None:
+    """Persist a new workstream (no-op if already exists)."""
+    with contextlib.suppress(Exception):
+        get_storage().register_workstream(ws_id, node_id, name, state)
+
+
+def update_workstream_state(ws_id: str, state: str) -> None:
+    """Update a workstream's state."""
+    with contextlib.suppress(Exception):
+        get_storage().update_workstream_state(ws_id, state)
+
+
+def update_workstream_name(ws_id: str, name: str) -> None:
+    """Update a workstream's display name."""
+    with contextlib.suppress(Exception):
+        get_storage().update_workstream_name(ws_id, name)
+
+
+def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
+    """List workstreams, optionally filtered by node_id."""
+    try:
+        return get_storage().list_workstreams(node_id, limit)
+    except Exception:
+        return []
 
 
 # -- Key-value store (memories) ------------------------------------------------

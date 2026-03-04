@@ -19,10 +19,12 @@ import json
 import logging
 import os
 import queue
+import socket
 import sys
 import textwrap
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -653,8 +655,10 @@ async def list_sessions_endpoint(request: Request) -> JSONResponse:
             "created": created,
             "updated": updated,
             "message_count": count,
+            "node_id": node_id,
+            "ws_id": ws_id,
         }
-        for sid, alias, title, created, updated, count in rows
+        for sid, alias, title, created, updated, count, node_id, ws_id in rows
     ]
     return JSONResponse({"sessions": sessions})
 
@@ -678,6 +682,7 @@ async def health(request: Request) -> JSONResponse:
     data: dict[str, Any] = {
         "status": "ok" if backend_ok else "degraded",
         "version": __version__,
+        "node_id": getattr(request.app.state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
         "workstreams": {"total": len(wss), **states},
@@ -1016,6 +1021,7 @@ def create_app(
     mcp_client: Any = None,
     registry: Any = None,
     idle_timeout: int = 0,
+    node_id: str = "",
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1074,6 +1080,7 @@ def create_app(
     app.state.mcp_client = mcp_client
     app.state.registry = registry
     app.state.idle_timeout = idle_timeout
+    app.state.node_id = node_id
     return app
 
 
@@ -1364,8 +1371,26 @@ def main() -> None:
     global_listeners_lock = threading.Lock()
     WebUI._global_queue = global_queue
 
+    # Server-owned node identity
+    def _default_node_id() -> str:
+        """Generate a node_id: ``{hostname}_{4hex}``, or a UUID on failure."""
+        suffix = uuid.uuid4().hex[:4]
+        try:
+            host = socket.gethostname()
+            if host and host != "localhost":
+                return f"{host}_{suffix}"
+        except OSError:
+            pass
+        return uuid.uuid4().hex[:12]
+
+    _node_id = os.environ.get("TURNSTONE_NODE_ID") or _default_node_id()
+
     # Session factory — captures shared config
-    def session_factory(ui: SessionUI | None, model_alias: str | None = None) -> ChatSession:
+    def session_factory(
+        ui: SessionUI | None,
+        model_alias: str | None = None,
+        ws_id: str | None = None,
+    ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         return ChatSession(
@@ -1386,10 +1411,14 @@ def main() -> None:
             registry=registry,
             model_alias=model_alias or registry.default,
             health_monitor=health_monitor,
+            node_id=_node_id,
+            ws_id=ws_id,
         )
 
     # Create workstream manager and initial workstream
-    manager = WorkstreamManager(session_factory, max_workstreams=args.max_workstreams)
+    manager = WorkstreamManager(
+        session_factory, max_workstreams=args.max_workstreams, node_id=_node_id
+    )
     WebUI._workstream_mgr = manager
     ws = manager.create(
         name="default",
@@ -1436,6 +1465,7 @@ def main() -> None:
         mcp_client=mcp_client,
         registry=registry,
         idle_timeout=args.workstream_idle_timeout,
+        node_id=_node_id,
     )
 
     print(f"turnstone web server running on http://{args.host}:{args.port}")
