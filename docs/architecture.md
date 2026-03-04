@@ -336,11 +336,11 @@ non-idle background workstreams above the input prompt.
 - **Tab bar**: Each workstream renders as a tab with a colored state indicator
   (CSS `@keyframes pulse` animation per state).
 - **Per-tab SSE**: `connectContentSSE(wsId)` opens
-  `/api/events?ws_id=<id>` for the active tab's event stream.
-- **Global SSE**: `connectGlobalSSE()` opens `/api/events/global` which
+  `/v1/api/events?ws_id=<id>` for the active tab's event stream.
+- **Global SSE**: `connectGlobalSSE()` opens `/v1/api/events/global` which
   receives `ws_state` broadcasts from all workstreams, used to update tab
   indicators without switching.
-- **New tab / close**: POST `/api/workstreams/new`, POST `/api/workstreams/close`.
+- **New tab / close**: POST `/v1/api/workstreams/new`, POST `/v1/api/workstreams/close`.
 
 ### Thread Safety
 
@@ -597,7 +597,7 @@ Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 7. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task
    sub-agents, allowing a cheaper model for autonomous loops
 
-**Per-workstream selection:** `POST /api/workstreams/new` accepts an optional
+**Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
 `"model"` field. The bridge `CreateWorkstreamMessage` carries the same field
 through the MQ protocol.
 
@@ -876,13 +876,13 @@ stderr so it does not interfere with readline. Tool execution may use a
 ```
 Starlette ASGI app (served by uvicorn)
   |
-  +-- Async request handlers
-  |     POST /api/send      -> starts worker thread per workstream
-  |     POST /api/approve   -> unblocks WebUI._approval_event
-  |     POST /api/plan      -> unblocks WebUI._plan_event
-  |     POST /api/workstreams/new -> creates workstream + worker
-  |     GET  /api/events    -> SSE via EventSourceResponse (per workstream)
-  |     GET  /api/events/global -> SSE via EventSourceResponse (fan-out)
+  +-- Async request handlers (all under /v1/ prefix)
+  |     POST /v1/api/send      -> starts worker thread per workstream
+  |     POST /v1/api/approve   -> unblocks WebUI._approval_event
+  |     POST /v1/api/plan      -> unblocks WebUI._plan_event
+  |     POST /v1/api/workstreams/new -> creates workstream + worker
+  |     GET  /v1/api/events    -> SSE via EventSourceResponse (per workstream)
+  |     GET  /v1/api/events/global -> SSE via EventSourceResponse (fan-out)
   |
   +-- ASGI middleware stack
   |     MetricsMiddleware -> CORSMiddleware -> AuthMiddleware -> RateLimitMiddleware
@@ -897,9 +897,12 @@ Starlette ASGI app (served by uvicorn)
 ```
 
 Starlette handles all HTTP routing, CORS, and middleware. uvicorn runs
-the ASGI application with async request handling. SSE endpoints use
-`EventSourceResponse` from `sse-starlette` with async generators that
-bridge sync `queue.Queue` via `asyncio.get_running_loop().run_in_executor()`.
+the ASGI application with async request handling. All API endpoints live
+under the `/v1/` prefix via a Starlette `Mount`. An OpenAPI 3.1 spec is
+generated from Pydantic v2 models and served at `/openapi.json`; Swagger
+UI is available at `/docs`. SSE endpoints use `EventSourceResponse` from
+`sse-starlette` with async generators that bridge sync `queue.Queue` via
+`asyncio.get_running_loop().run_in_executor()`.
 
 `ChatSession.send()` remains synchronous, running in daemon worker threads.
 WebUI keeps `threading.Event` and `queue.Queue` primitives (unchanged from
@@ -964,7 +967,7 @@ Main thread              Global SSE thread         Per-WS SSE threads (×N)
 
 **Approval flow:** When a per-WS SSE thread receives an `approve_request`, it checks
 the workstream's `auto_approve_tools` set. If all requested tools are in the set, the
-bridge auto-approves via `POST /api/approve`. Otherwise, it publishes an
+bridge auto-approves via `POST /v1/api/approve`. Otherwise, it publishes an
 `ApprovalRequestEvent` to the outbound channel with a `request_id`, then blocks on
 `BLPOP` of a Redis response queue (`turnstone:resp:{request_id}`) until the client pushes
 a response or the approval timeout (default 300s) expires.
@@ -986,7 +989,7 @@ re-routes to that node's queue (1 extra hop). Bridges publish heartbeats to
 ```
 Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
 +------------------+                 +----------------------------+
-| Event subscriber |                 | POST /api/cluster/         |
+| Event subscriber |                 | POST /v1/api/cluster/      |
 | SUBSCRIBE on     |                 |   workstreams/new          |
 | events:cluster   |                 |   → LPUSH to Redis         |
 +------------------+                 |     inbound:{node_id}      |
@@ -994,9 +997,9 @@ Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
 | SCAN node:* keys |                 | GET /node/{node_id}/       |
 | every 15 seconds |                 |   → httpx.AsyncClient      |
 +------------------+                 |     proxy to server_url    |
-| Poll loop        |                 | GET /node/{id}/api/events  |
-| GET /api/dash    |                 |   → SSE stream proxy       |
-| GET /health      |                 | POST /node/{id}/api/send   |
+| Poll loop        |                 | GET /node/{id}/v1/api/events |
+| GET /v1/api/dash |                 |   → SSE stream proxy       |
+| GET /health      |                 | POST /node/{id}/v1/api/send  |
 | ThreadPoolExec   |                 |   → forwarded to server    |
 +------------------+                 +----------------------------+
 ```

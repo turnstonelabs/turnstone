@@ -43,12 +43,12 @@ server --> sqlite : SQLite
 eval --> llm : LLM Provider API\n(non-streaming)
 eval --> sqlite : SQLite
 
-bridge --> server : HTTP REST\n(POST /api/send, etc.)
-bridge <-- server : SSE\n(GET /api/events)
+bridge --> server : HTTP REST\n(POST /v1/api/send, etc.)
+bridge <-- server : SSE\n(GET /v1/api/events)
 bridge --> redis : Redis LIST + PUBSUB\n+ STRING (routing, heartbeats)
 
 console --> redis : Redis PUBSUB + STRING + LIST\n(cluster events, heartbeats,\nworkstream creation commands)
-console --> server : HTTP polling + reverse proxy\n(GET /api/dashboard,\nproxy /node/{id}/* traffic)
+console --> server : HTTP polling + reverse proxy\n(GET /v1/api/dashboard,\nproxy /node/{id}/* traffic)
 
 sim --> redis : Redis LIST + PUBSUB\n+ STRING (heartbeats)
 

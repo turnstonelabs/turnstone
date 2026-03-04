@@ -17,6 +17,17 @@ an independent `ChatSession` and event queue.
 
 ---
 
+## API Versioning
+
+All API endpoints use the `/v1/` prefix. Non-API endpoints (`/`, `/health`, `/metrics`, `/openapi.json`, `/docs`, `/static/*`, `/shared/*`) are unversioned.
+
+### Interactive Documentation
+
+- **OpenAPI spec**: `GET /openapi.json` — machine-readable OpenAPI 3.1 schema
+- **Swagger UI**: `GET /docs` — interactive API explorer (loads from CDN)
+
+---
+
 ## Endpoints
 
 ### `GET /`
@@ -29,7 +40,7 @@ below.
 
 ---
 
-### `GET /api/events?ws_id=<id>`
+### `GET /v1/api/events?ws_id=<id>`
 
 Opens a Server-Sent Events stream scoped to a single workstream. The connection
 remains open indefinitely; the server pushes events as they occur.
@@ -146,7 +157,7 @@ action required).
 ```
 
 **`approve_request`** -- one or more tool calls that require user approval. The
-client must respond via `POST /api/approve`.
+client must respond via `POST /v1/api/approve`.
 
 ```json
 {
@@ -213,7 +224,7 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 | `effort`            | string | Reasoning effort level (`low`/`medium`/`high`) |
 
 **`plan_review`** -- the model is proposing a plan and wants feedback. The
-client must respond via `POST /api/plan`.
+client must respond via `POST /v1/api/plan`.
 
 ```json
 {"type": "plan_review", "content": "Step 1: ...\nStep 2: ..."}
@@ -267,7 +278,7 @@ connection begins streaming.
 
 ---
 
-### `GET /api/events/global`
+### `GET /v1/api/events/global`
 
 Opens a Server-Sent Events stream that broadcasts state-change events across
 all workstreams. This is used by the tab bar to display per-workstream activity
@@ -299,11 +310,11 @@ Possible `state` values:
 and copies each event to every client queue. If a client queue is full, the
 event is silently dropped for that client.
 
-**Keepalive:** Same as `/api/events` -- an SSE comment every 5 seconds.
+**Keepalive:** Same as `/v1/api/events` -- an SSE comment every 5 seconds.
 
 ---
 
-### `GET /api/workstreams`
+### `GET /v1/api/workstreams`
 
 Returns a list of all active workstreams.
 
@@ -325,11 +336,11 @@ Each workstream object:
 | `id`         | string      | Unique workstream routing identifier                   |
 | `name`       | string      | Display name (alias if set, otherwise `ws-xxxx`)       |
 | `state`      | string      | Current state (see state values above)                 |
-| `session_id` | string/null | Session ID of the workstream's `ChatSession`, used for deduplication against `/api/sessions` |
+| `session_id` | string/null | Session ID of the workstream's `ChatSession`, used for deduplication against `/v1/api/sessions` |
 
 ---
 
-### `GET /api/sessions`
+### `GET /v1/api/sessions`
 
 Returns a list of saved sessions from the database, ordered by most recently
 updated.
@@ -364,7 +375,7 @@ Each session object:
 
 ---
 
-### `POST /api/send`
+### `POST /v1/api/send`
 
 Sends a user message to a workstream. Spawns a daemon worker thread that calls
 `session.send()` and streams results back via the SSE channel.
@@ -402,7 +413,7 @@ from a previous request. Also pushes a `busy_error` event to the SSE stream.
 
 ---
 
-### `POST /api/approve`
+### `POST /v1/api/approve`
 
 Responds to a tool approval request. The SSE stream must have previously sent
 an `approve_request` event for the given workstream.
@@ -434,7 +445,7 @@ automatically approved without prompting.
 
 ---
 
-### `POST /api/plan`
+### `POST /v1/api/plan`
 
 Responds to a plan review dialog. The SSE stream must have previously sent a
 `plan_review` event for the given workstream.
@@ -464,7 +475,7 @@ revision instructions).
 
 ---
 
-### `POST /api/command`
+### `POST /v1/api/command`
 
 Executes a slash command in the given workstream.
 
@@ -499,7 +510,7 @@ containing the resumed session's messages.
 
 ---
 
-### `POST /api/workstreams/new`
+### `POST /v1/api/workstreams/new`
 
 Creates a new workstream. The server supports up to 10 concurrent workstreams.
 
@@ -538,7 +549,7 @@ Status code: `400`
 
 ---
 
-### `POST /api/workstreams/close`
+### `POST /v1/api/workstreams/close`
 
 Closes and removes a workstream. The last remaining workstream cannot be
 closed.
@@ -592,8 +603,8 @@ Status code: `200` with an empty body.
 | Malformed or unparseable JSON body | Treated as an empty dict `{}`; missing fields use defaults |
 | Unknown `ws_id`                    | `404` with `{"error": "Unknown workstream"}`               |
 | Unknown path (GET or POST)         | `404` with plain-text body `Not found`                     |
-| Empty `message` on `/api/send`     | `400` with `{"error": "Empty message"}`                    |
-| Empty `command` on `/api/command`  | `400` with `{"error": "Empty command"}`                    |
+| Empty `message` on `/v1/api/send`     | `400` with `{"error": "Empty message"}`                    |
+| Empty `command` on `/v1/api/command`  | `400` with `{"error": "Empty command"}`                    |
 | Rate limit exceeded                | `429` with `Retry-After` header (see below)                |
 
 ### `429 Too Many Requests`
@@ -635,7 +646,7 @@ reconnection:
 On reconnect, the server replays the full conversation history via the
 `history` event, so the client can rebuild its UI state without data loss. The
 same reconnection strategy applies to both the per-workstream SSE stream
-(`/api/events`) and the global state stream (`/api/events/global`).
+(`/v1/api/events`) and the global state stream (`/v1/api/events/global`).
 
 ---
 
@@ -743,7 +754,7 @@ turnstone_workstreams_active_total 1
 # TYPE turnstone_http_requests_total counter
 turnstone_http_requests_total{method="GET",endpoint="/health",status_code="200"} 42
 turnstone_http_requests_total{method="GET",endpoint="/metrics",status_code="200"} 7
-turnstone_http_requests_total{method="POST",endpoint="/api/send",status_code="200"} 18
+turnstone_http_requests_total{method="POST",endpoint="/v1/api/send",status_code="200"} 18
 # HELP turnstone_tokens_total Total tokens consumed
 # TYPE turnstone_tokens_total counter
 turnstone_tokens_total{type="prompt"} 84320
