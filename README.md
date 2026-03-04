@@ -412,6 +412,7 @@ Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
 - Redis (for message queue bridge — `pip install turnstone[mq]`)
 - Anthropic provider (optional — `pip install turnstone[anthropic]`)
 - PostgreSQL (optional, for production — `pip install turnstone[postgres]`)
+- [Git LFS](https://git-lfs.com/) (for cloning — diagram PNGs are stored in LFS)
 
 ## License
 
