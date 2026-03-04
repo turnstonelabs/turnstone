@@ -1037,3 +1037,77 @@ class TestDataclasses:
         assert cr.tool_calls is None
         assert cr.finish_reason == "stop"
         assert cr.usage is None
+
+
+# ===========================================================================
+# TestParameterGating — model capability parameter gating
+# ===========================================================================
+
+
+class TestOpenAIParameterGating:
+    """Verify _apply_model_params gates temperature and reasoning_effort correctly."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_unknown_model_no_reasoning_effort(self) -> None:
+        """Unknown/local models should NOT receive top-level reasoning_effort."""
+        caps = self.provider.get_capabilities("my-local-model")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        assert "reasoning_effort" not in kwargs
+        assert kwargs["temperature"] == 0.7
+
+    def test_gpt5_no_temperature_has_reasoning_effort(self) -> None:
+        """GPT-5 base: no temperature, reasoning_effort sent."""
+        caps = self.provider.get_capabilities("gpt-5")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_gpt51_temperature_when_effort_none(self) -> None:
+        """GPT-5.1: temperature only when reasoning_effort='none'."""
+        caps = self.provider.get_capabilities("gpt-5.1")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert "reasoning_effort" not in kwargs  # "none" is skipped
+
+    def test_gpt51_no_temperature_when_reasoning_active(self) -> None:
+        """GPT-5.1: no temperature when reasoning is active."""
+        caps = self.provider.get_capabilities("gpt-5.1")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_o_series_no_temperature_no_reasoning_effort(self) -> None:
+        """O-series: no temperature, no reasoning_effort."""
+        caps = self.provider.get_capabilities("o3")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        assert "temperature" not in kwargs
+        assert "reasoning_effort" not in kwargs
+
+
+class TestAnthropicReasoningNone:
+    """Verify 'none' effort disables thinking for manual-thinking models."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_none_effort_disables_thinking(self) -> None:
+        result = self.provider._reasoning_params("none", None, max_tokens=4096)
+        assert result == {}
+
+    def test_empty_effort_disables_thinking(self) -> None:
+        result = self.provider._reasoning_params("", None, max_tokens=4096)
+        assert result == {}
+
+    def test_low_effort_enables_thinking(self) -> None:
+        result = self.provider._reasoning_params("low", None, max_tokens=4096)
+        assert "thinking" in result
+        assert result["thinking"]["budget_tokens"] == 1024

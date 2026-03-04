@@ -300,6 +300,8 @@ class AnthropicProvider:
         actual response.  Anthropic requires ``temperature=1`` when
         thinking is enabled — callers must enforce this.
         """
+        if not reasoning_effort or reasoning_effort in ("none", ""):
+            return {}
         budget_map = {"low": 1024, "medium": 4096, "high": 16384}
         budget = budget_map.get(reasoning_effort, 4096)
         if extra_params and "thinking_budget_tokens" in extra_params:

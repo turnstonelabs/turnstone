@@ -70,7 +70,7 @@ class ModelCapabilities:
     thinking_mode: str = "none"  # "none" | "manual" | "adaptive"
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
-    reasoning_effort_values: tuple[str, ...] = ("low", "medium", "high")
+    reasoning_effort_values: tuple[str, ...] = ()
     default_reasoning_effort: str = "medium"
 
 

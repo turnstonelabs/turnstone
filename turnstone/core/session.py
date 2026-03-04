@@ -45,7 +45,7 @@ from turnstone.core.memory import (
     set_session_alias,
     update_session_title,
 )
-from turnstone.core.providers._openai import OpenAIProvider
+from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.tools import (
@@ -123,7 +123,9 @@ class ChatSession:
         self._health_monitor = health_monitor
         # Resolve provider for the current model
         self._provider: LLMProvider = (
-            registry.get_provider(model_alias) if registry and model_alias else OpenAIProvider()
+            registry.get_provider(model_alias)
+            if registry and model_alias
+            else create_provider("openai")
         )
         self.ui = ui
         self.instructions = instructions
