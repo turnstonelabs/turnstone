@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import functools
 import json
+import logging
 import os
 import queue
 import sys
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup from turnstone/ui/static/
 # ---------------------------------------------------------------------------
+
+log = logging.getLogger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"
@@ -269,9 +272,10 @@ class WebUI:
         if WebUI._workstream_mgr is not None:
             try:
                 ws_state = WorkstreamState(state)
+            except ValueError:
+                log.debug("Ignoring unknown state %r for ws %s", state, self.ws_id)
+            else:
                 WebUI._workstream_mgr.set_state(self.ws_id, ws_state)
-            except (ValueError, KeyError):
-                pass
         self._broadcast_state(state)
 
     def on_rename(self, name: str) -> None:

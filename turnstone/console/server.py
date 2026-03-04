@@ -602,7 +602,7 @@ async def _proxy_sse(
                 async for chunk in resp.aiter_text():
                     if await request.is_disconnected():
                         return
-                    buf += chunk.replace("\r\n", "\n")
+                    buf += chunk.replace("\r", "")
                     while "\n\n" in buf:
                         event_text, buf = buf.split("\n\n", 1)
                         data_lines = []

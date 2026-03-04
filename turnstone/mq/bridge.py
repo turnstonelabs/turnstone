@@ -297,7 +297,15 @@ class Bridge:
             model=model,
         )
         if ws_id and initial_message:
-            self._http.post("/v1/api/send", json={"message": initial_message, "ws_id": ws_id})
+            try:
+                resp = self._http.post(
+                    "/v1/api/send", json={"message": initial_message, "ws_id": ws_id}
+                )
+                data = resp.json()
+                if data.get("error"):
+                    log.warning("Initial message failed for ws %s: %s", ws_id, data["error"])
+            except Exception as exc:
+                log.warning("Initial message send failed for ws %s: %s", ws_id, exc)
 
     def _handle_close_ws(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")
