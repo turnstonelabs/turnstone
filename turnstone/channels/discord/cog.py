@@ -42,7 +42,7 @@ class MessageCog:
         # We build the cog dynamically so discord.py's import is fully deferred.
         cog_self = self
 
-        class _Cog(_commands.Cog, name="Turnstone"):
+        class _Cog(_commands.Cog, name="Turnstone"):  # type: ignore[call-arg]
             """Turnstone Discord integration."""
 
             @_commands.Cog.listener()
@@ -75,7 +75,7 @@ class MessageCog:
         self._cog = _Cog()
 
         # -- Modal for /link (avoids token appearing in slash command audit logs) --
-        class _LinkTokenModal(discord.ui.Modal, title="Link Account"):
+        class _LinkTokenModal(discord.ui.Modal, title="Link Account"):  # type: ignore[call-arg]
             token: discord.ui.TextInput[_LinkTokenModal] = discord.ui.TextInput(
                 label="API Token",
                 style=discord.TextStyle.short,

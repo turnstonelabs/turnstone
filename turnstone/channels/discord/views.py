@@ -179,7 +179,7 @@ class PlanReviewView:
         self.bot = bot
         view_self = self
 
-        class _FeedbackModal(discord.ui.Modal, title="Request Changes"):
+        class _FeedbackModal(discord.ui.Modal, title="Request Changes"):  # type: ignore[call-arg]
             feedback: discord.ui.TextInput[_FeedbackModal] = discord.ui.TextInput(
                 label="Feedback",
                 style=discord.TextStyle.paragraph,
