@@ -68,7 +68,7 @@ note right of CC
   from the cluster event channel.
 end note
 
-CC -> NodeA : GET /api/dashboard
+CC -> NodeA : GET /v1/api/dashboard
 activate NodeA
 NodeA --> CC : {workstreams: [...],\naggregate: {total_tokens, ...}}
 deactivate NodeA
@@ -86,7 +86,7 @@ deactivate CC
 
 == Browser SSE Stream ==
 
-Browser -> Server : GET /api/cluster/events
+Browser -> Server : GET /v1/api/cluster/events
 activate Server
 
 Server -> CC : register_listener(queue)
@@ -107,24 +107,24 @@ deactivate Server
 
 == Browser REST Requests ==
 
-Browser -> Server : GET /api/cluster/overview
+Browser -> Server : GET /v1/api/cluster/overview
 Server -> CC : get_overview()
 CC --> Server : {nodes: 10, workstreams: 47,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.3.0"]}
 Server --> Browser : JSON response
 
-Browser -> Server : GET /api/cluster/nodes?sort=activity
+Browser -> Server : GET /v1/api/cluster/nodes?sort=activity
 Server -> CC : get_nodes(sort_by="activity")
 CC --> Server : {nodes: [...], total: 10}
 Server --> Browser : JSON response
 
-Browser -> Server : GET /api/cluster/workstreams\n?state=running&node=sim-0003
+Browser -> Server : GET /v1/api/cluster/workstreams\n?state=running&node=sim-0003
 Server -> CC : get_workstreams(state="running",\nnode="sim-0003")
 CC --> Server : {workstreams: [...], total: 5,\npage: 1, per_page: 50, pages: 1}
 Server --> Browser : JSON response
 
 == Workstream Creation (via MQ) ==
 
-Browser -> Server : POST /api/cluster/workstreams/new\n{node_id:"nodeA", name:"new-task"}
+Browser -> Server : POST /v1/api/cluster/workstreams/new\n{node_id:"nodeA", name:"new-task"}
 activate Server #FFECB3
 
 Server -> CC : _pick_best_node() or\nget_node_detail(node_id)
@@ -139,14 +139,14 @@ deactivate Server
 note right of Redis
   Bridge on Node-A picks up the
   message from its directed queue,
-  POSTs to /api/workstreams/new,
+  POSTs to /v1/api/workstreams/new,
   registers ownership, publishes
   ws_created to cluster channel.
 end note
 
 Redis --> BridgeA : BLPOP turnstone:inbound:nodeA
 activate BridgeA
-BridgeA -> NodeA : POST /api/workstreams/new\n{name:"new-task"}
+BridgeA -> NodeA : POST /v1/api/workstreams/new\n{name:"new-task"}
 NodeA --> BridgeA : {ws_id:"ws789", name:"new-task"}
 BridgeA -> Redis : SET turnstone:ws:ws789 = nodeA
 BridgeA -> Redis : PUBLISH turnstone:events:cluster\n{type:"ws_created", ws_id:"ws789",\nnode_id:"nodeA", name:"new-task"}
@@ -188,15 +188,15 @@ Server --> Browser : Shimmed app.js
 deactivate Server
 
 note right of Browser
-  All fetch("/api/send") calls in the
-  server UI now become fetch("/node/nodeA/api/send"),
+  All fetch("/v1/api/send") calls in the
+  server UI now become fetch("/node/nodeA/v1/api/send"),
   routed through the console proxy.
 end note
 
-Browser -> Server : GET /node/nodeA/api/events?ws_id=ws789
+Browser -> Server : GET /node/nodeA/v1/api/events?ws_id=ws789
 activate Server #FFF9C4
 
-Server -> NodeA : GET http://10.0.1.1:8080/api/events?ws_id=ws789\n(SSE stream via httpx.AsyncClient timeout=None)
+Server -> NodeA : GET http://10.0.1.1:8080/v1/api/events?ws_id=ws789\n(SSE stream via httpx.AsyncClient timeout=None)
 activate NodeA
 
 loop SSE streaming
@@ -207,10 +207,10 @@ end
 deactivate NodeA
 deactivate Server
 
-Browser -> Server : POST /node/nodeA/api/send\n{message:"hello", ws_id:"ws789"}
+Browser -> Server : POST /node/nodeA/v1/api/send\n{message:"hello", ws_id:"ws789"}
 activate Server #FFF9C4
 
-Server -> NodeA : POST http://10.0.1.1:8080/api/send\n(body forwarded)
+Server -> NodeA : POST http://10.0.1.1:8080/v1/api/send\n(body forwarded)
 activate NodeA
 NodeA --> Server : {status:"ok"}
 deactivate NodeA

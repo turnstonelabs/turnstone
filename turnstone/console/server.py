@@ -36,6 +36,8 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from turnstone.api.console_spec import build_console_spec
+from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.mq.broker import RedisBroker
 
@@ -121,9 +123,9 @@ class AuthMiddleware:
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-# JS shim prepended to the server's app.js when proxied through the console.
-# Overrides fetch() and EventSource() so root-relative URLs (/api/send etc.)
-# route through the console proxy at /node/{node_id}/api/... instead.
+# JS shim injected into proxied HTML when served through the console.
+# Overrides fetch() and EventSource() so root-relative URLs (/v1/api/send etc.)
+# route through the console proxy at /node/{node_id}/v1/api/... instead.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx="PREFIX_PLACEHOLDER";
@@ -322,7 +324,7 @@ async def auth_logout(request: Request) -> Response:
 
 
 async def create_workstream(request: Request) -> JSONResponse:
-    """POST /api/cluster/workstreams/new — create a workstream via MQ.
+    """POST /v1/api/cluster/workstreams/new — create a workstream via MQ.
 
     Three targeting modes:
     - ``node_id`` set to a specific node ID → directed to that node's queue
@@ -487,14 +489,20 @@ async def proxy_api(request: Request) -> Response:
     if not server_url:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
+    # Detect if this came through the /v1/ proxy route
+    api_prefix = "api"
+    safe_node = urllib.parse.quote(node_id, safe="")
+    if request.url.path.startswith(f"/node/{safe_node}/v1/api/"):
+        api_prefix = "v1/api"
+
     # SSE detection: GET requests to events endpoints
     if request.method == "GET" and path in ("events", "events/global"):
-        return await _proxy_sse(request, server_url, path)
+        return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
 
     if request.method == "POST":
-        return await _proxy_post(request, server_url, path)
+        return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
-    return await _proxy_get(request, server_url, f"api/{path}")
+    return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
 
 
 async def proxy_non_api(request: Request) -> Response:
@@ -525,12 +533,14 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
-async def _proxy_post(request: Request, server_url: str, path: str) -> Response:
+async def _proxy_post(
+    request: Request, server_url: str, path: str, *, api_prefix: str = "api"
+) -> Response:
     """Forward a POST request to the target server."""
     client: httpx.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
-    target = f"{server_url}/api/{path}"
+    target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
     try:
@@ -545,13 +555,15 @@ async def _proxy_post(request: Request, server_url: str, path: str) -> Response:
             media_type=resp.headers.get("content-type", "application/json"),
         )
     except httpx.HTTPError as exc:
-        log.debug("Proxy POST error for api/%s: %s", path, exc)
+        log.debug("Proxy POST error for %s/%s: %s", api_prefix, path, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
-async def _proxy_sse(request: Request, server_url: str, path: str) -> Response:
+async def _proxy_sse(
+    request: Request, server_url: str, path: str, *, api_prefix: str = "api"
+) -> Response:
     """Proxy an SSE stream from the target server to the browser."""
-    target = f"{server_url}/api/{path}"
+    target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
 
@@ -631,24 +643,36 @@ def create_app(
     proxy_auth_token: str = "",
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
+    _spec = build_console_spec()
+    _openapi_handler = make_openapi_handler(_spec)
+    _docs_handler = make_docs_handler()
+
     app = Starlette(
         routes=[
             Route("/", index),
-            Route("/api/cluster/overview", cluster_overview),
-            Route("/api/cluster/nodes", cluster_nodes),
-            Route("/api/cluster/workstreams", cluster_workstreams),
-            Route("/api/cluster/workstreams/new", create_workstream, methods=["POST"]),
-            Route("/api/cluster/node/{node_id}", cluster_node_detail),
-            Route("/api/cluster/events", cluster_events_sse),
+            Mount(
+                "/v1",
+                routes=[
+                    Route("/api/cluster/overview", cluster_overview),
+                    Route("/api/cluster/nodes", cluster_nodes),
+                    Route("/api/cluster/workstreams", cluster_workstreams),
+                    Route("/api/cluster/workstreams/new", create_workstream, methods=["POST"]),
+                    Route("/api/cluster/node/{node_id}", cluster_node_detail),
+                    Route("/api/cluster/events", cluster_events_sse),
+                    Route("/api/auth/login", auth_login, methods=["POST"]),
+                    Route("/api/auth/logout", auth_logout, methods=["POST"]),
+                ],
+            ),
             Route("/health", health),
-            Route("/api/auth/login", auth_login, methods=["POST"]),
-            Route("/api/auth/logout", auth_logout, methods=["POST"]),
+            Route("/openapi.json", _openapi_handler),
+            Route("/docs", _docs_handler),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
             # Proxy routes — serve server UI through console port
             Route("/node/{node_id}/", proxy_index),
             Route("/node/{node_id}/static/{path:path}", proxy_static),
             Route("/node/{node_id}/shared/{path:path}", proxy_shared_static),
+            Route("/node/{node_id}/v1/api/{path:path}", proxy_api, methods=["GET", "POST"]),
             Route("/node/{node_id}/api/{path:path}", proxy_api, methods=["GET", "POST"]),
             Route("/node/{node_id}/{path:path}", proxy_non_api),
         ],

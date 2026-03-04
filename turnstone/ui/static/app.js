@@ -69,7 +69,7 @@ setInterval(pollHealth, 30000);
 
 // --- Shared hooks ---
 window.onLoginSuccess = function () {
-  authFetch("/api/workstreams")
+  authFetch("/v1/api/workstreams")
     .then(function (r) {
       return r.json();
     })
@@ -488,7 +488,7 @@ function switchTab(wsId) {
 }
 
 function newWorkstream() {
-  authFetch("/api/workstreams/new", {
+  authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
@@ -505,7 +505,7 @@ function newWorkstream() {
 }
 
 function closeWorkstream(wsId) {
-  authFetch("/api/workstreams/close", {
+  authFetch("/v1/api/workstreams/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ws_id: wsId }),
@@ -534,7 +534,7 @@ function connectContentSSE(wsId) {
     contentEvtSource = null;
   }
   contentEvtSource = new EventSource(
-    "/api/events?ws_id=" + encodeURIComponent(wsId),
+    "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
   );
   contentEvtSource.onmessage = function (e) {
     contentRetryDelay = 1000;
@@ -548,7 +548,7 @@ function connectContentSSE(wsId) {
     statusBar.textContent = "Reconnecting\u2026";
     statusBar.classList.add("disconnected");
     // Raw fetch (not authFetch) — need to inspect status before throwing
-    fetch("/api/workstreams")
+    fetch("/v1/api/workstreams")
       .then(function (r) {
         if (r.status === 401) {
           showLogin();
@@ -614,10 +614,10 @@ function loadDashboard() {
   tableEl.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
   document.getElementById("dashboard-session-cards").innerHTML =
     '<div class="dashboard-empty">Loading\u2026</div>';
-  var dashP = authFetch("/api/dashboard").then(function (r) {
+  var dashP = authFetch("/v1/api/dashboard").then(function (r) {
     return r.json();
   });
-  var sessP = authFetch("/api/sessions").then(function (r) {
+  var sessP = authFetch("/v1/api/sessions").then(function (r) {
     return r.json();
   });
   Promise.all([dashP, sessP])
@@ -857,7 +857,7 @@ function dashboardSwitchWorkstream(wsId) {
   } else loadDashboard();
 }
 function dashboardResumeSession(sessionId) {
-  authFetch("/api/workstreams/new", {
+  authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
@@ -870,7 +870,7 @@ function dashboardResumeSession(sessionId) {
       workstreams[data.ws_id] = { name: data.name, state: "idle" };
       switchTab(data.ws_id);
       hideDashboard();
-      authFetch("/api/command", {
+      authFetch("/v1/api/command", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -893,7 +893,7 @@ function dashboardSendMessage() {
   input.disabled = true;
   var btn = document.querySelector(".dashboard-new-btn");
   btn.disabled = true;
-  authFetch("/api/workstreams/new", {
+  authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: "{}",
@@ -915,7 +915,7 @@ function dashboardSendMessage() {
       busy = true;
       sendBtn.disabled = true;
       addUserMessage(text);
-      authFetch("/api/send", {
+      authFetch("/v1/api/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, ws_id: data.ws_id }),
@@ -936,7 +936,7 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
   }
-  globalEvtSource = new EventSource("/api/events/global");
+  globalEvtSource = new EventSource("/v1/api/events/global");
   globalEvtSource.onmessage = function (e) {
     globalRetryDelay = 1000;
     var data = JSON.parse(e.data);
@@ -987,7 +987,7 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
     // Raw fetch (not authFetch) — need to inspect status before throwing
-    fetch("/api/workstreams")
+    fetch("/v1/api/workstreams")
       .then(function (r) {
         if (r.status === 401) {
           showLogin();
@@ -1392,7 +1392,7 @@ function resolveInlineApproval(approved, always, feedback) {
   inputEl.focus();
 
   // POST to server with ws_id
-  authFetch("/api/approve", {
+  authFetch("/v1/api/approve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1569,7 +1569,7 @@ function resolvePlan(defaultFeedback) {
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
   document.getElementById("plan-overlay").classList.remove("active");
   inputEl.focus();
-  authFetch("/api/plan", {
+  authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ feedback: feedback, ws_id: currentWsId }),
@@ -1585,7 +1585,7 @@ function sendMessage() {
 
   if (text.startsWith("/")) {
     // Slash command
-    authFetch("/api/command", {
+    authFetch("/v1/api/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ command: text, ws_id: currentWsId }),
@@ -1602,7 +1602,7 @@ function sendMessage() {
   inputEl.value = "";
   autoResize();
 
-  authFetch("/api/send", {
+  authFetch("/v1/api/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message: text, ws_id: currentWsId }),
@@ -1737,7 +1737,7 @@ document.addEventListener("keydown", function (e) {
 // --- Init: fetch workstream list, then connect ---
 initLogin();
 pollHealth();
-authFetch("/api/workstreams")
+authFetch("/v1/api/workstreams")
   .then(function (r) {
     return r.json();
   })

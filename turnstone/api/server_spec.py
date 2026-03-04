@@ -1,0 +1,184 @@
+"""Server endpoint catalog for OpenAPI spec generation."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
+from turnstone.api.schemas import (
+    AuthLoginRequest,
+    AuthLoginResponse,
+    ErrorResponse,
+    StatusResponse,
+)
+from turnstone.api.server_schemas import (
+    ApproveRequest,
+    CloseWorkstreamRequest,
+    CommandRequest,
+    CreateWorkstreamRequest,
+    CreateWorkstreamResponse,
+    DashboardResponse,
+    HealthResponse,
+    ListSessionsResponse,
+    ListWorkstreamsResponse,
+    PlanFeedbackRequest,
+    SendRequest,
+    SendResponse,
+)
+
+SERVER_ENDPOINTS: list[EndpointSpec] = [
+    # --- Workstream management ---
+    EndpointSpec(
+        "/v1/api/workstreams",
+        "GET",
+        "List active workstreams",
+        response_model=ListWorkstreamsResponse,
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/dashboard",
+        "GET",
+        "Dashboard with workstream details and aggregates",
+        response_model=DashboardResponse,
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/new",
+        "POST",
+        "Create a new workstream",
+        request_model=CreateWorkstreamRequest,
+        response_model=CreateWorkstreamResponse,
+        error_codes=[400],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/close",
+        "POST",
+        "Close a workstream",
+        request_model=CloseWorkstreamRequest,
+        response_model=StatusResponse,
+        error_codes=[400],
+        tags=["Workstreams"],
+    ),
+    # --- Chat ---
+    EndpointSpec(
+        "/v1/api/send",
+        "POST",
+        "Send a user message",
+        request_model=SendRequest,
+        response_model=SendResponse,
+        error_codes=[400, 404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/approve",
+        "POST",
+        "Approve or deny a tool call",
+        request_model=ApproveRequest,
+        response_model=StatusResponse,
+        error_codes=[404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/plan",
+        "POST",
+        "Respond to a plan review",
+        request_model=PlanFeedbackRequest,
+        response_model=StatusResponse,
+        error_codes=[404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/command",
+        "POST",
+        "Execute a slash command",
+        request_model=CommandRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 404],
+        tags=["Chat"],
+    ),
+    # --- Streaming ---
+    EndpointSpec(
+        "/v1/api/events",
+        "GET",
+        "Per-workstream SSE event stream",
+        description="Opens a Server-Sent Events stream scoped to a single workstream. "
+        "Returns text/event-stream. See API reference for event types.",
+        query_params=[QueryParam("ws_id", "Workstream identifier", required=True)],
+        error_codes=[404],
+        tags=["Streaming"],
+    ),
+    EndpointSpec(
+        "/v1/api/events/global",
+        "GET",
+        "Global SSE event stream",
+        description="Global Server-Sent Events stream for state-change broadcasts "
+        "across all workstreams. Returns text/event-stream.",
+        tags=["Streaming"],
+    ),
+    # --- Sessions ---
+    EndpointSpec(
+        "/v1/api/sessions",
+        "GET",
+        "List saved sessions",
+        response_model=ListSessionsResponse,
+        tags=["Sessions"],
+    ),
+    # --- Auth ---
+    EndpointSpec(
+        "/v1/api/auth/login",
+        "POST",
+        "Authenticate with a token",
+        request_model=AuthLoginRequest,
+        response_model=AuthLoginResponse,
+        error_codes=[401],
+        tags=["Auth"],
+    ),
+    EndpointSpec(
+        "/v1/api/auth/logout",
+        "POST",
+        "Clear auth cookie",
+        response_model=StatusResponse,
+        tags=["Auth"],
+    ),
+    # --- Observability ---
+    EndpointSpec(
+        "/health",
+        "GET",
+        "Server health check",
+        response_model=HealthResponse,
+        tags=["Observability"],
+    ),
+]
+
+_ALL_MODELS: list[type[BaseModel]] = [
+    ErrorResponse,
+    StatusResponse,
+    AuthLoginRequest,
+    AuthLoginResponse,
+    SendRequest,
+    SendResponse,
+    ApproveRequest,
+    PlanFeedbackRequest,
+    CommandRequest,
+    CreateWorkstreamRequest,
+    CreateWorkstreamResponse,
+    CloseWorkstreamRequest,
+    ListWorkstreamsResponse,
+    DashboardResponse,
+    ListSessionsResponse,
+    HealthResponse,
+]
+
+
+def build_server_spec() -> dict[str, Any]:
+    """Build the OpenAPI spec for the turnstone server."""
+    return build_openapi(
+        title="turnstone Server API",
+        description="Single-node workstream management, chat interaction, and real-time streaming.",
+        endpoints=SERVER_ENDPOINTS,
+        models=_ALL_MODELS,
+    )

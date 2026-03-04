@@ -21,7 +21,7 @@ turnstone-console ──────┤
 
 Data flows in two directions:
 
-- **Inbound (monitoring):** Bridges publish state changes to `{prefix}:events:cluster` on Redis pub/sub. The console subscribes for real-time updates and periodically polls each node's `GET /api/dashboard` for full workstream snapshots.
+- **Inbound (monitoring):** Bridges publish state changes to `{prefix}:events:cluster` on Redis pub/sub. The console subscribes for real-time updates and periodically polls each node's `GET /v1/api/dashboard` for full workstream snapshots.
 - **Outbound (control):** The console pushes `CreateWorkstreamMessage` to Redis inbound queues targeting specific nodes. Bridges pick up these messages and create workstreams on their local servers.
 - **Proxy (pass-through):** The console reverse-proxies each node's server UI at `/node/{node_id}/`, forwarding HTTP and SSE traffic so the browser never contacts server nodes directly.
 
@@ -31,7 +31,7 @@ Data flows in two directions:
 |--------|--------|-----------|------|
 | Redis heartbeats | `SCAN turnstone:node:*` | Read | Node discovery (node_id, server_url, started) |
 | Redis pub/sub | `SUBSCRIBE turnstone:events:cluster` | Read | State changes, creates, closes, renames |
-| Node HTTP API | `GET {server_url}/api/dashboard` | Read | Full workstream list with tokens, context, activity |
+| Node HTTP API | `GET {server_url}/v1/api/dashboard` | Read | Full workstream list with tokens, context, activity |
 | Node HTTP API | `GET {server_url}/health` | Read | Node health status |
 | Redis inbound queue | `RPUSH turnstone:inbound:{node_id}` | Write | Workstream creation commands |
 | Node HTTP API | `GET/POST {server_url}/*` | Proxy | Server UI, API requests, SSE streams |
@@ -59,7 +59,7 @@ The collector (`turnstone/console/collector.py`) maintains an in-memory snapshot
 
 2. **Node discovery** — scans heartbeat keys every 15 seconds via `broker.list_nodes()`. Adds newly discovered nodes, removes expired ones, emits `node_joined` / `node_lost` events to SSE listeners.
 
-3. **Poll loop** — fetches `GET /api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
+3. **Poll loop** — fetches `GET /v1/api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
 
 ### Thread Safety
 
@@ -76,7 +76,7 @@ All reads and writes to the node/workstream map are protected by a single `threa
 
 ## HTTP API
 
-### `GET /api/cluster/overview`
+### `GET /v1/api/cluster/overview`
 
 Cluster-wide state counts and aggregate metrics.
 
@@ -93,7 +93,7 @@ Cluster-wide state counts and aggregate metrics.
 
 `version_drift` is `true` when nodes report different versions. `versions` lists all unique version strings sorted alphabetically.
 
-### `GET /api/cluster/nodes?sort=activity&limit=100&offset=0`
+### `GET /v1/api/cluster/nodes?sort=activity&limit=100&offset=0`
 
 Paginated node list. Sort options: `activity` (default, by running+attention count), `tokens`, `name`.
 
@@ -115,7 +115,7 @@ Paginated node list. Sort options: `activity` (default, by running+attention cou
 }
 ```
 
-### `GET /api/cluster/workstreams?state=running&node=db-west-04&search=perf&page=1&per_page=50`
+### `GET /v1/api/cluster/workstreams?state=running&node=db-west-04&search=perf&page=1&per_page=50`
 
 Filtered, paginated workstream list. All query parameters are optional. `per_page` is capped at 200.
 
@@ -132,7 +132,7 @@ Filtered, paginated workstream list. All query parameters are optional. `per_pag
 }
 ```
 
-### `GET /api/cluster/node/{node_id}`
+### `GET /v1/api/cluster/node/{node_id}`
 
 Single node detail with all its workstreams.
 
@@ -146,7 +146,7 @@ Single node detail with all its workstreams.
 }
 ```
 
-### `POST /api/cluster/workstreams/new`
+### `POST /v1/api/cluster/workstreams/new`
 
 Create a new workstream on a target node. Dispatches a `CreateWorkstreamMessage` through the Redis MQ pipeline — the bridge on the target node picks it up and creates the workstream on the server. Requires `"full"` auth role.
 
@@ -180,7 +180,7 @@ Response:
 
 Creation is asynchronous — the response confirms the MQ message was dispatched. A `ws_created` event on the cluster SSE stream confirms the workstream was actually created.
 
-### `GET /api/cluster/events`
+### `GET /v1/api/cluster/events`
 
 Server-Sent Events stream for real-time cluster updates.
 
@@ -220,13 +220,13 @@ The console reverse-proxies each node's server UI at `/node/{node_id}/`. This al
 | `GET /node/{node_id}/` | Fetches the server's `index.html`, rewrites static and shared asset paths, injects a console-return banner and an inline JS proxy shim |
 | `GET /node/{node_id}/static/{path}` | Proxies page-specific static files |
 | `GET /node/{node_id}/shared/{path}` | Proxies shared static files (`base.css`, `auth.js`, etc.) |
-| `GET /node/{node_id}/api/{path}` | Proxies GET API requests; detects SSE endpoints and streams them |
-| `POST /node/{node_id}/api/{path}` | Proxies POST API requests with body forwarding |
+| `GET /node/{node_id}/v1/api/{path}` | Proxies GET API requests; detects SSE endpoints and streams them |
+| `POST /node/{node_id}/v1/api/{path}` | Proxies POST API requests with body forwarding |
 | `GET /node/{node_id}/{path}` | Proxies non-API endpoints (health, metrics) |
 
 ### URL Rewriting
 
-The server UI uses root-relative URLs (`/api/send`, `/static/app.js`, `/shared/base.css`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
+The server UI uses root-relative URLs (`/v1/api/send`, `/static/app.js`, `/shared/base.css`, etc.). Since `<base>` tags cannot rewrite root-relative URLs, the console uses a JS shim approach:
 
 1. **HTML rewriting** — when serving `index.html`, replaces `href=` and `src=` references to both `/static/` and `/shared/` with the proxy prefix (`/node/{node_id}/static/` and `/node/{node_id}/shared/` respectively).
 
@@ -236,11 +236,11 @@ The server UI uses root-relative URLs (`/api/send`, `/static/app.js`, `/shared/b
 
 ### SSE Proxy
 
-SSE streams (`/api/events`, `/api/events/global`) are proxied by creating a per-connection `httpx.AsyncClient(timeout=None)`, streaming the upstream response via `aiter_text()`, parsing SSE framing (`\n\n` delimiters), and re-emitting events through `EventSourceResponse`. Each proxied SSE stream requires its own httpx client since the shared client's 30-second timeout would kill long-lived connections.
+SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied by creating a per-connection `httpx.AsyncClient(timeout=None)`, streaming the upstream response via `aiter_text()`, parsing SSE framing (`\n\n` delimiters), and re-emitting events through `EventSourceResponse`. Each proxied SSE stream requires its own httpx client since the shared client's 30-second timeout would kill long-lived connections.
 
 ### Authentication
 
-The proxy forwards requests to server nodes using the console's `--auth-token`. The console's own auth middleware also checks proxy routes — `POST` requests to proxy write endpoints (`/api/send`, `/api/approve`, etc.) require the `"full"` auth role, preventing read-only tokens from escalating to write operations.
+The proxy forwards requests to server nodes using the console's `--auth-token`. The console's own auth middleware also checks proxy routes — `POST` requests to proxy write endpoints (`/v1/api/send`, `/v1/api/approve`, etc.) require the `"full"` auth role, preventing read-only tokens from escalating to write operations.
 
 ---
 
@@ -274,7 +274,7 @@ Triggered by the "+ new" header button. A modal dialog with:
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional text input for a model alias from the target node's registry.
 
-On submit, `POST /api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
+On submit, `POST /v1/api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
 
 All four views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
 

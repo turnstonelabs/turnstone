@@ -50,7 +50,7 @@ function connectSSE() {
     evtSource.close();
     evtSource = null;
   }
-  evtSource = new EventSource("/api/cluster/events");
+  evtSource = new EventSource("/v1/api/cluster/events");
   var statusBar = document.getElementById("status-bar");
   evtSource.onmessage = function (e) {
     retryDelay = 1000;
@@ -73,7 +73,7 @@ function connectSSE() {
     var csb = document.getElementById("cluster-status-bar");
     if (csb) csb.classList.add("stale");
     // Raw fetch (not authFetch) — need to inspect status before throwing
-    fetch("/api/cluster/overview")
+    fetch("/v1/api/cluster/overview")
       .then(function (r) {
         if (r.status === 401) {
           showLogin();
@@ -133,10 +133,10 @@ function showOverview() {
 }
 
 function loadOverview() {
-  var overviewP = authFetch("/api/cluster/overview").then(function (r) {
+  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
     return r.json();
   });
-  var nodesP = authFetch("/api/cluster/nodes?sort=activity&limit=1000").then(
+  var nodesP = authFetch("/v1/api/cluster/nodes?sort=activity&limit=1000").then(
     function (r) {
       return r.json();
     },
@@ -653,11 +653,11 @@ function drillDownToNode(nodeId, serverUrl) {
 
 function loadNodeDetail(nodeId) {
   var detailP = authFetch(
-    "/api/cluster/node/" + encodeURIComponent(nodeId),
+    "/v1/api/cluster/node/" + encodeURIComponent(nodeId),
   ).then(function (r) {
     return r.json();
   });
-  var overviewP = authFetch("/api/cluster/overview").then(function (r) {
+  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
     return r.json();
   });
   Promise.all([detailP, overviewP]).then(function (res) {
@@ -720,10 +720,12 @@ function loadFilteredWorkstreams() {
     params += "&state=" + encodeURIComponent(currentFilter.state);
   if (currentFilter.node)
     params += "&node=" + encodeURIComponent(currentFilter.node);
-  var wsP = authFetch("/api/cluster/workstreams?" + params).then(function (r) {
-    return r.json();
-  });
-  var overviewP = authFetch("/api/cluster/overview").then(function (r) {
+  var wsP = authFetch("/v1/api/cluster/workstreams?" + params).then(
+    function (r) {
+      return r.json();
+    },
+  );
+  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
     return r.json();
   });
   Promise.all([wsP, overviewP])
@@ -946,7 +948,7 @@ function showNewWsModal() {
   select.innerHTML =
     '<option value="">Auto (best node by capacity)</option>' +
     '<option value="pool">General pool (next available)</option>';
-  authFetch("/api/cluster/nodes?sort=activity&limit=100")
+  authFetch("/v1/api/cluster/nodes?sort=activity&limit=100")
     .then(function (r) {
       return r.json();
     })
@@ -1033,7 +1035,7 @@ function submitNewWs() {
   if (name) body.name = name;
   if (model) body.model = model;
 
-  authFetch("/api/cluster/workstreams/new", {
+  authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

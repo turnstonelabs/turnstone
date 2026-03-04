@@ -108,7 +108,7 @@ def resolve_client_ip(
 class RateLimiter:
     """Per-IP rate limiter using token buckets."""
 
-    EXEMPT_PATHS: frozenset[str] = frozenset({"/health", "/metrics"})
+    EXEMPT_PATHS: frozenset[str] = frozenset({"/health", "/metrics", "/openapi.json", "/docs"})
     MAX_BUCKETS: int = 100_000
 
     def __init__(

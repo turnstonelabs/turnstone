@@ -83,12 +83,12 @@ mqclient --> redis : Redis protocol\nport 6379
 server --> redis : Redis protocol\n(6379)
 server --> llm_api : OpenAI API\n(HTTPS/HTTP)
 
-bridge --> server : HTTP REST\n(POST /api/send, etc.)
-bridge <-- server : SSE\n(GET /api/events)
+bridge --> server : HTTP REST\n(POST /v1/api/send, etc.)
+bridge <-- server : SSE\n(GET /v1/api/events)
 bridge --> redis : Redis protocol\n(queues + pubsub)
 
 console --> redis : Redis PUBSUB + LIST\n(cluster events,\nws creation commands)
-console --> server : HTTP polling + proxy\n(GET /api/dashboard,\nproxy /node/{id}/*)
+console --> server : HTTP polling + proxy\n(GET /v1/api/dashboard,\nproxy /node/{id}/*)
 
 sim --> redis : Redis protocol\n(queues + pubsub + keys)
 

@@ -60,6 +60,27 @@ class TestIsPublicPath:
     def test_api_events_not_public(self):
         assert is_public_path("/api/events") is False
 
+    def test_v1_api_login_public(self):
+        assert is_public_path("/v1/api/auth/login") is True
+
+    def test_v1_api_logout_public(self):
+        assert is_public_path("/v1/api/auth/logout") is True
+
+    def test_v1_api_workstreams_not_public(self):
+        assert is_public_path("/v1/api/workstreams") is False
+
+    def test_v1_api_send_not_public(self):
+        assert is_public_path("/v1/api/send") is False
+
+    def test_openapi_json_public(self):
+        assert is_public_path("/openapi.json") is True
+
+    def test_docs_public(self):
+        assert is_public_path("/docs") is True
+
+    def test_shared_static_public(self):
+        assert is_public_path("/shared/base.css") is True
+
 
 # ---------------------------------------------------------------------------
 # TestRequiredRole
@@ -100,6 +121,35 @@ class TestRequiredRole:
 
     def test_post_unknown_path_needs_read(self):
         assert required_role("POST", "/api/unknown") == "read"
+
+    def test_v1_post_send_needs_full(self):
+        assert required_role("POST", "/v1/api/send") == "full"
+
+    def test_v1_post_approve_needs_full(self):
+        assert required_role("POST", "/v1/api/approve") == "full"
+
+    def test_v1_get_workstreams_needs_read(self):
+        assert required_role("GET", "/v1/api/workstreams") == "read"
+
+    def test_v1_post_cluster_ws_new_needs_full(self):
+        assert required_role("POST", "/v1/api/cluster/workstreams/new") == "full"
+
+    def test_v1_all_write_paths_need_full(self):
+        for path in WRITE_PATHS:
+            v1_path = "/v1" + path
+            assert required_role("POST", v1_path) == "full", f"{v1_path} should need full"
+
+    def test_proxy_v1_send_needs_full(self):
+        assert required_role("POST", "/node/node-a/v1/api/send") == "full"
+
+    def test_proxy_v1_approve_needs_full(self):
+        assert required_role("POST", "/node/node-a/v1/api/approve") == "full"
+
+    def test_proxy_v1_cluster_ws_new_needs_full(self):
+        assert required_role("POST", "/node/node-a/v1/api/cluster/workstreams/new") == "full"
+
+    def test_proxy_v1_read_endpoint_needs_read(self):
+        assert required_role("GET", "/node/node-a/v1/api/workstreams") == "read"
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +393,32 @@ class TestCheckRequest:
             enabled, "POST", "/node/node-a/api/send", "Bearer tok_full"
         )
         assert allowed is True
+
+    def test_proxy_v1_write_read_token_403(self, enabled):
+        """Read tokens cannot escalate to write ops via v1 proxy routes."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_read"
+        )
+        assert allowed is False
+        assert status == 403
+
+    def test_proxy_v1_write_full_token_ok(self, enabled):
+        """Full tokens pass through v1 proxy write routes."""
+        allowed, status, msg = check_request(
+            enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_full"
+        )
+        assert allowed is True
+
+    def test_proxy_v1_cluster_ws_new_read_403(self, enabled):
+        """Read tokens cannot create workstreams via v1 proxy."""
+        allowed, status, msg = check_request(
+            enabled,
+            "POST",
+            "/node/node-a/v1/api/cluster/workstreams/new",
+            "Bearer tok_read",
+        )
+        assert allowed is False
+        assert status == 403
 
     def test_proxy_read_endpoint_read_token_ok(self, enabled):
         """Read tokens can access proxy read endpoints."""
@@ -654,27 +730,27 @@ class TestServerAuth:
         assert resp.status_code == 200
 
     def test_api_workstreams_no_token_401(self):
-        resp = self.client.get("/api/workstreams")
+        resp = self.client.get("/v1/api/workstreams")
         assert resp.status_code == 401
         assert "Unauthorized" in resp.json().get("error", "")
 
     def test_api_workstreams_read_token_200(self):
         resp = self.client.get(
-            "/api/workstreams",
+            "/v1/api/workstreams",
             headers={"Authorization": "Bearer tok_read"},
         )
         assert resp.status_code == 200
 
     def test_api_workstreams_full_token_200(self):
         resp = self.client.get(
-            "/api/workstreams",
+            "/v1/api/workstreams",
             headers={"Authorization": "Bearer tok_full"},
         )
         assert resp.status_code == 200
 
     def test_api_send_read_token_403(self):
         resp = self.client.post(
-            "/api/send",
+            "/v1/api/send",
             headers={"Authorization": "Bearer tok_read"},
             json={"message": "hello", "ws_id": "x"},
         )
@@ -683,7 +759,7 @@ class TestServerAuth:
 
     def test_api_send_full_token_passes_auth(self):
         resp = self.client.post(
-            "/api/send",
+            "/v1/api/send",
             headers={"Authorization": "Bearer tok_full"},
             json={"message": "hello", "ws_id": "nonexistent"},
         )
@@ -692,21 +768,21 @@ class TestServerAuth:
 
     def test_api_send_no_token_401(self):
         resp = self.client.post(
-            "/api/send",
+            "/v1/api/send",
             json={"message": "hello", "ws_id": "x"},
         )
         assert resp.status_code == 401
 
     def test_invalid_token_401(self):
         resp = self.client.get(
-            "/api/workstreams",
+            "/v1/api/workstreams",
             headers={"Authorization": "Bearer wrong_token"},
         )
         assert resp.status_code == 401
 
     def test_options_no_auth_required(self):
         resp = self.client.options(
-            "/api/send",
+            "/v1/api/send",
             headers={
                 "Origin": "http://example.com",
                 "Access-Control-Request-Method": "POST",
@@ -718,7 +794,7 @@ class TestServerAuth:
 
     def test_cors_includes_authorization(self):
         resp = self.client.options(
-            "/api/workstreams",
+            "/v1/api/workstreams",
             headers={
                 "Origin": "http://example.com",
                 "Access-Control-Request-Method": "GET",
@@ -777,26 +853,26 @@ class TestConsoleAuth:
         assert resp.status_code == 200
 
     def test_api_overview_no_token_401(self):
-        resp = self.test_client.get("/api/cluster/overview")
+        resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401
 
     def test_api_overview_read_token_200(self):
         resp = self.test_client.get(
-            "/api/cluster/overview",
+            "/v1/api/cluster/overview",
             headers={"Authorization": "Bearer tok_read"},
         )
         assert resp.status_code == 200
 
     def test_api_overview_full_token_200(self):
         resp = self.test_client.get(
-            "/api/cluster/overview",
+            "/v1/api/cluster/overview",
             headers={"Authorization": "Bearer tok_full"},
         )
         assert resp.status_code == 200
 
     def test_invalid_token_401(self):
         resp = self.test_client.get(
-            "/api/cluster/overview",
+            "/v1/api/cluster/overview",
             headers={"Authorization": "Bearer wrong"},
         )
         assert resp.status_code == 401
@@ -855,7 +931,7 @@ class TestServerLogin:
 
     def test_login_valid_token_sets_cookie(self):
         resp = self.test_client.post(
-            "/api/auth/login",
+            "/v1/api/auth/login",
             json={"token": "tok_full"},
         )
         assert resp.status_code == 200
@@ -867,39 +943,39 @@ class TestServerLogin:
 
     def test_login_invalid_token_401(self):
         resp = self.test_client.post(
-            "/api/auth/login",
+            "/v1/api/auth/login",
             json={"token": "wrong"},
         )
         assert resp.status_code == 401
 
     def test_login_no_auth_required(self):
-        # /api/auth/login is public — shouldn't require auth itself
+        # /v1/api/auth/login is public — shouldn't require auth itself
         resp = self.test_client.post(
-            "/api/auth/login",
+            "/v1/api/auth/login",
             json={"token": "tok_read"},
         )
         assert resp.status_code == 200
 
     def test_cookie_auth_on_api(self):
         # Login to get cookie (TestClient tracks cookies automatically)
-        login_resp = self.test_client.post("/api/auth/login", json={"token": "tok_read"})
+        login_resp = self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
         assert login_resp.status_code == 200
 
         # Use cookie to access API — TestClient forwards cookies
-        resp = self.test_client.get("/api/workstreams")
+        resp = self.test_client.get("/v1/api/workstreams")
         assert resp.status_code == 200
 
     def test_logout_clears_cookie(self):
-        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
 
         # Logout
-        logout_resp = self.test_client.post("/api/auth/logout")
+        logout_resp = self.test_client.post("/v1/api/auth/logout")
         assert logout_resp.status_code == 200
         cookie = logout_resp.headers.get("set-cookie", "")
         assert "Max-Age=0" in cookie
 
         # API should now fail (cookie cleared)
-        resp = self.test_client.get("/api/workstreams")
+        resp = self.test_client.get("/v1/api/workstreams")
         assert resp.status_code == 401
 
 
@@ -941,7 +1017,7 @@ class TestConsoleLogin:
 
     def test_login_valid_token(self):
         resp = self.test_client.post(
-            "/api/auth/login",
+            "/v1/api/auth/login",
             json={"token": "tok_read"},
         )
         assert resp.status_code == 200
@@ -949,18 +1025,18 @@ class TestConsoleLogin:
 
     def test_login_invalid_token(self):
         resp = self.test_client.post(
-            "/api/auth/login",
+            "/v1/api/auth/login",
             json={"token": "wrong"},
         )
         assert resp.status_code == 401
 
     def test_cookie_auth_on_api(self):
-        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
-        resp = self.test_client.get("/api/cluster/overview")
+        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 200
 
     def test_logout_then_api_fails(self):
-        self.test_client.post("/api/auth/login", json={"token": "tok_read"})
-        self.test_client.post("/api/auth/logout")
-        resp = self.test_client.get("/api/cluster/overview")
+        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post("/v1/api/auth/logout")
+        resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401

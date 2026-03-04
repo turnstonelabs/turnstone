@@ -132,7 +132,7 @@ function submitLogin() {
   btn.textContent = "Signing in\u2026";
   inp.disabled = true;
 
-  fetch("/api/auth/login", {
+  fetch("/v1/api/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ token: token }),
@@ -169,7 +169,7 @@ function submitLogin() {
 }
 
 function logout() {
-  fetch("/api/auth/logout", { method: "POST" }).then(function () {
+  fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();
   });

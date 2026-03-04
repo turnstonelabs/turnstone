@@ -36,6 +36,8 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
+from turnstone.api.docs import make_docs_handler, make_openapi_handler
+from turnstone.api.server_spec import build_server_spec
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
@@ -462,7 +464,7 @@ async def index(request: Request) -> HTMLResponse:
 
 
 async def events_sse(request: Request) -> Response:
-    """GET /api/events — per-workstream SSE event stream."""
+    """GET /v1/api/events — per-workstream SSE event stream."""
     mgr = request.app.state.workstreams
     ws_id = request.query_params.get("ws_id")
     ws, ui = _get_ws(mgr, ws_id)
@@ -522,7 +524,7 @@ async def events_sse(request: Request) -> Response:
 
 
 async def global_events_sse(request: Request) -> Response:
-    """GET /api/events/global — global SSE event stream."""
+    """GET /v1/api/events/global — global SSE event stream."""
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
     listeners = request.app.state.global_listeners
     listeners_lock = request.app.state.global_listeners_lock
@@ -553,7 +555,7 @@ async def global_events_sse(request: Request) -> Response:
 
 
 async def list_workstreams(request: Request) -> JSONResponse:
-    """GET /api/workstreams — list all workstreams."""
+    """GET /v1/api/workstreams — list all workstreams."""
     mgr: WorkstreamManager = request.app.state.workstreams
     result = []
     for ws in mgr.list_all():
@@ -569,7 +571,7 @@ async def list_workstreams(request: Request) -> JSONResponse:
 
 
 async def dashboard(request: Request) -> JSONResponse:
-    """GET /api/dashboard — enriched workstream data + aggregate stats."""
+    """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
     from turnstone.core.memory import get_session_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
@@ -627,7 +629,7 @@ async def dashboard(request: Request) -> JSONResponse:
 
 
 async def list_sessions_endpoint(request: Request) -> JSONResponse:
-    """GET /api/sessions — list saved sessions."""
+    """GET /v1/api/sessions — list saved sessions."""
     from turnstone.core.memory import list_sessions
 
     rows = list_sessions(limit=50)
@@ -713,7 +715,7 @@ async def metrics_endpoint(request: Request) -> Response:
 
 
 async def send_message(request: Request) -> JSONResponse:
-    """POST /api/send — send a user message to the workstream."""
+    """POST /v1/api/send — send a user message to the workstream."""
     body = await _read_json(request)
     message = body.get("message", "").strip()
     ws_id = body.get("ws_id")
@@ -753,7 +755,7 @@ async def send_message(request: Request) -> JSONResponse:
 
 
 async def approve(request: Request) -> JSONResponse:
-    """POST /api/approve — approve or deny a tool call."""
+    """POST /v1/api/approve — approve or deny a tool call."""
     body = await _read_json(request)
     approved = body.get("approved", False)
     feedback = body.get("feedback")
@@ -770,7 +772,7 @@ async def approve(request: Request) -> JSONResponse:
 
 
 async def plan_feedback(request: Request) -> JSONResponse:
-    """POST /api/plan — respond to a plan review."""
+    """POST /v1/api/plan — respond to a plan review."""
     body = await _read_json(request)
     feedback = body.get("feedback", "")
     ws_id = body.get("ws_id")
@@ -783,7 +785,7 @@ async def plan_feedback(request: Request) -> JSONResponse:
 
 
 async def command(request: Request) -> JSONResponse:
-    """POST /api/command — execute a slash command."""
+    """POST /v1/api/command — execute a slash command."""
     body = await _read_json(request)
     cmd = body.get("command", "").strip()
     ws_id = body.get("ws_id")
@@ -824,7 +826,7 @@ async def command(request: Request) -> JSONResponse:
 
 
 async def create_workstream(request: Request) -> JSONResponse:
-    """POST /api/workstreams/new — create a new workstream."""
+    """POST /v1/api/workstreams/new — create a new workstream."""
     body = await _read_json(request)
     mgr: WorkstreamManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
@@ -856,7 +858,7 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 
 async def close_workstream(request: Request) -> JSONResponse:
-    """POST /api/workstreams/close — close a workstream."""
+    """POST /v1/api/workstreams/close — close a workstream."""
     body = await _read_json(request)
     ws_id = str(body.get("ws_id", ""))
     mgr = request.app.state.workstreams
@@ -866,7 +868,7 @@ async def close_workstream(request: Request) -> JSONResponse:
 
 
 async def auth_login(request: Request) -> Response:
-    """POST /api/auth/login — authenticate with a token."""
+    """POST /v1/api/auth/login — authenticate with a token."""
     from turnstone.core.auth import make_set_cookie
 
     body = await _read_json(request)
@@ -881,7 +883,7 @@ async def auth_login(request: Request) -> Response:
 
 
 async def auth_logout(request: Request) -> Response:
-    """POST /api/auth/logout — clear auth cookie."""
+    """POST /v1/api/auth/logout — clear auth cookie."""
     from turnstone.core.auth import make_clear_cookie
 
     response = JSONResponse({"status": "ok"})
@@ -1004,24 +1006,35 @@ def create_app(
     idle_timeout: int = 0,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
+    _spec = build_server_spec()
+    _openapi_handler = make_openapi_handler(_spec)
+    _docs_handler = make_docs_handler()
+
     app = Starlette(
         routes=[
             Route("/", index),
-            Route("/api/events", events_sse),
-            Route("/api/events/global", global_events_sse),
-            Route("/api/workstreams", list_workstreams),
-            Route("/api/dashboard", dashboard),
-            Route("/api/sessions", list_sessions_endpoint),
+            Mount(
+                "/v1",
+                routes=[
+                    Route("/api/events", events_sse),
+                    Route("/api/events/global", global_events_sse),
+                    Route("/api/workstreams", list_workstreams),
+                    Route("/api/dashboard", dashboard),
+                    Route("/api/sessions", list_sessions_endpoint),
+                    Route("/api/send", send_message, methods=["POST"]),
+                    Route("/api/approve", approve, methods=["POST"]),
+                    Route("/api/plan", plan_feedback, methods=["POST"]),
+                    Route("/api/command", command, methods=["POST"]),
+                    Route("/api/workstreams/new", create_workstream, methods=["POST"]),
+                    Route("/api/workstreams/close", close_workstream, methods=["POST"]),
+                    Route("/api/auth/login", auth_login, methods=["POST"]),
+                    Route("/api/auth/logout", auth_logout, methods=["POST"]),
+                ],
+            ),
             Route("/health", health),
             Route("/metrics", metrics_endpoint),
-            Route("/api/send", send_message, methods=["POST"]),
-            Route("/api/approve", approve, methods=["POST"]),
-            Route("/api/plan", plan_feedback, methods=["POST"]),
-            Route("/api/command", command, methods=["POST"]),
-            Route("/api/workstreams/new", create_workstream, methods=["POST"]),
-            Route("/api/workstreams/close", close_workstream, methods=["POST"]),
-            Route("/api/auth/login", auth_login, methods=["POST"]),
-            Route("/api/auth/logout", auth_logout, methods=["POST"]),
+            Route("/openapi.json", _openapi_handler),
+            Route("/docs", _docs_handler),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
         ],
