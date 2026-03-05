@@ -1,7 +1,9 @@
 """Tests for turnstone.core.auth — bearer token authentication and cookies."""
 
 import os
-from unittest.mock import patch
+import queue
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -268,11 +270,23 @@ class TestMakeSetCookie:
 
     def test_max_age_default(self):
         val = make_set_cookie("tok_abc")
-        assert "Max-Age=2592000" in val  # 30 days
+        assert "Max-Age=86400" in val  # 24 hours (matches JWT expiry)
 
     def test_max_age_custom(self):
         val = make_set_cookie("tok_abc", max_age=3600)
         assert "Max-Age=3600" in val
+
+    def test_secure_default(self):
+        val = make_set_cookie("tok_abc")
+        assert "; Secure" in val
+
+    def test_secure_false(self):
+        val = make_set_cookie("tok_abc", secure=False)
+        assert "; Secure" not in val
+
+    def test_secure_true(self):
+        val = make_set_cookie("tok_abc", secure=True)
+        assert "; Secure" in val
 
 
 class TestMakeClearCookie:
@@ -735,6 +749,7 @@ class TestServerAuth:
                 enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
+            cors_origins=["*"],
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
 
@@ -1070,3 +1085,277 @@ class TestConsoleLogin:
         self.test_client.post("/v1/api/auth/logout")
         resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Security hardening tests
+# ---------------------------------------------------------------------------
+
+
+class TestLoginRateLimiter:
+    def test_allows_under_limit(self):
+        from turnstone.core.auth import LoginRateLimiter
+
+        limiter = LoginRateLimiter(max_attempts=3, window_seconds=60)
+        for _ in range(3):
+            ok, _ = limiter.check("ip:1.2.3.4")
+            assert ok
+            limiter.record("ip:1.2.3.4")
+        # 4th should be blocked (3 recorded)
+        ok, retry = limiter.check("ip:1.2.3.4")
+        assert not ok
+        assert retry > 0
+
+    def test_different_keys_independent(self):
+        from turnstone.core.auth import LoginRateLimiter
+
+        limiter = LoginRateLimiter(max_attempts=2, window_seconds=60)
+        limiter.record("ip:a")
+        limiter.record("ip:a")
+        ok_a, _ = limiter.check("ip:a")
+        ok_b, _ = limiter.check("ip:b")
+        assert not ok_a
+        assert ok_b
+
+    def test_cleanup(self):
+        from turnstone.core.auth import LoginRateLimiter
+
+        limiter = LoginRateLimiter(max_attempts=1, window_seconds=60)
+        limiter.record("ip:old")
+        removed = limiter.cleanup(max_age=0.0)
+        assert removed == 1
+        ok, _ = limiter.check("ip:old")
+        assert ok
+
+    def test_max_keys_protection(self):
+        from turnstone.core.auth import LoginRateLimiter
+
+        limiter = LoginRateLimiter(max_attempts=5, window_seconds=60)
+        limiter.MAX_KEYS = 2
+        limiter.record("a")
+        limiter.record("b")
+        limiter.record("c")  # should be silently dropped (at capacity)
+        assert "c" not in limiter._attempts
+
+
+class TestJWTAudienceIssuer:
+    SECRET = "test-secret-that-is-at-least-32-chars"
+
+    def test_create_jwt_includes_iss(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_ISSUER, create_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert payload["iss"] == JWT_ISSUER
+
+    def test_create_jwt_with_audience(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+        token = create_jwt(
+            "user1", frozenset({"read"}), "test", self.SECRET, audience=JWT_AUD_SERVER
+        )
+        payload = pyjwt.decode(token, self.SECRET, algorithms=["HS256"], audience=JWT_AUD_SERVER)
+        assert payload["aud"] == JWT_AUD_SERVER
+
+    def test_validate_jwt_wrong_audience_rejected(self):
+        from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, create_jwt, validate_jwt
+
+        token = create_jwt(
+            "user1", frozenset({"read"}), "test", self.SECRET, audience=JWT_AUD_SERVER
+        )
+        result = validate_jwt(token, self.SECRET, audience=JWT_AUD_CONSOLE)
+        assert result is None
+
+    def test_validate_jwt_correct_audience_accepted(self):
+        from turnstone.core.auth import JWT_AUD_SERVER, create_jwt, validate_jwt
+
+        token = create_jwt(
+            "user1", frozenset({"read"}), "test", self.SECRET, audience=JWT_AUD_SERVER
+        )
+        result = validate_jwt(token, self.SECRET, audience=JWT_AUD_SERVER)
+        assert result is not None
+        assert result.user_id == "user1"
+
+    def test_validate_jwt_no_audience_backward_compat(self):
+        from turnstone.core.auth import create_jwt, validate_jwt
+
+        # Token without aud claim should be accepted when audience="" (backward compat)
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
+        result = validate_jwt(token, self.SECRET, audience="")
+        assert result is not None
+
+
+class TestServiceTokenManager:
+    SECRET = "test-secret-that-is-at-least-32-chars"
+
+    def test_auto_mints_on_first_access(self):
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+        )
+        token = mgr.token
+        assert token  # non-empty
+        assert isinstance(token, str)
+
+    def test_bearer_header_format(self):
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+        )
+        header = mgr.bearer_header
+        assert "Authorization" in header
+        assert header["Authorization"].startswith("Bearer ")
+
+    def test_token_stable_within_window(self):
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+            expiry_hours=1,
+        )
+        t1 = mgr.token
+        t2 = mgr.token
+        assert t1 == t2
+
+    def test_token_rotates_near_expiry(self):
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+            expiry_hours=1,
+        )
+        _ = mgr.token  # initial mint
+        # Simulate expiry by backdating _expires_at
+        mgr._expires_at = 0.0
+        t2 = mgr.token
+        # Token was re-minted (even if payload matches within same second,
+        # the internal state was refreshed)
+        assert t2  # non-empty, valid token
+        assert mgr._expires_at > 0.0  # was refreshed
+
+    def test_audience_included(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+            audience=JWT_AUD_SERVER,
+        )
+        payload = pyjwt.decode(
+            mgr.token, self.SECRET, algorithms=["HS256"], audience=JWT_AUD_SERVER
+        )
+        assert payload["aud"] == JWT_AUD_SERVER
+
+
+class TestIsSecureRequest:
+    def test_https_scheme(self):
+        from turnstone.core.auth import is_secure_request
+
+        assert is_secure_request({}, scheme="https") is True
+
+    def test_http_scheme(self):
+        from turnstone.core.auth import is_secure_request
+
+        assert is_secure_request({}, scheme="http") is False
+
+    def test_x_forwarded_proto_https(self):
+        from turnstone.core.auth import is_secure_request
+
+        assert is_secure_request({"x-forwarded-proto": "https"}, scheme="http") is True
+
+    def test_x_forwarded_proto_http(self):
+        from turnstone.core.auth import is_secure_request
+
+        assert is_secure_request({"x-forwarded-proto": "http"}, scheme="http") is False
+
+
+class TestSecretStrength:
+    def test_short_secret_warns(self, caplog):
+        import logging
+
+        from turnstone.core.auth import _MIN_SECRET_LENGTH
+
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.auth"):
+            import turnstone.core.auth as auth_mod
+
+            old = os.environ.get("TURNSTONE_JWT_SECRET", "")
+            os.environ["TURNSTONE_JWT_SECRET"] = "short"
+            try:
+                secret = auth_mod.load_jwt_secret()
+                assert secret == "short"
+                assert any(str(_MIN_SECRET_LENGTH) in r.message for r in caplog.records)
+            finally:
+                if old:
+                    os.environ["TURNSTONE_JWT_SECRET"] = old
+                else:
+                    os.environ.pop("TURNSTONE_JWT_SECRET", None)
+
+
+class TestCorsConfigurable:
+    """Verify CORS middleware is only added when origins are configured."""
+
+    def test_no_cors_origins_no_cors_headers(self):
+        """Without cors_origins, no Access-Control headers."""
+        from starlette.testclient import TestClient
+
+        import turnstone.server as srv_mod
+
+        app = srv_mod.create_app(
+            workstreams=MagicMock(),
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(enabled=False),
+        )
+        client = TestClient(app)
+        resp = client.get("/health", headers={"Origin": "http://evil.com"})
+        assert "Access-Control-Allow-Origin" not in resp.headers
+        client.close()
+
+    def test_cors_origins_set(self):
+        """With cors_origins, CORS headers are present."""
+        from starlette.testclient import TestClient
+
+        import turnstone.server as srv_mod
+
+        app = srv_mod.create_app(
+            workstreams=MagicMock(),
+            global_queue=queue.Queue(),
+            global_listeners=[],
+            global_listeners_lock=threading.Lock(),
+            skip_permissions=False,
+            auth_config=AuthConfig(enabled=False),
+            cors_origins=["http://example.com"],
+        )
+        client = TestClient(app)
+        resp = client.get(
+            "/health",
+            headers={"Origin": "http://example.com"},
+        )
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://example.com"
+        client.close()

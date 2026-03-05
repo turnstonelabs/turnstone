@@ -104,7 +104,7 @@ class AuthMiddleware:
         if request.method == "OPTIONS":
             await self.app(scope, receive, send)
             return
-        from turnstone.core.auth import check_request
+        from turnstone.core.auth import JWT_AUD_CONSOLE, check_request
 
         auth_config = request.app.state.auth_config
         jwt_secret = getattr(request.app.state, "jwt_secret", "")
@@ -120,6 +120,7 @@ class AuthMiddleware:
             auth_header,
             cookie_header,
             jwt_secret=jwt_secret,
+            jwt_audience=JWT_AUD_CONSOLE,
             storage=storage,
         )
         if not allowed:
@@ -346,9 +347,12 @@ async def health(request: Request) -> JSONResponse:
 async def auth_login(request: Request) -> Response:
     """Authenticate via username:password or legacy token, return JWT."""
     from turnstone.core.auth import (
+        JWT_AUD_CONSOLE,
         AuthResult,
+        LoginRateLimiter,
         _authenticate_token,
         create_jwt,
+        is_secure_request,
         make_set_cookie,
         verify_password,
     )
@@ -361,9 +365,30 @@ async def auth_login(request: Request) -> Response:
     auth_config = request.app.state.auth_config
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
     storage = getattr(request.app.state, "auth_storage", None)
+    login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
+
+    username = body.get("username", "")
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Check login rate limits
+    if login_limiter is not None:
+        ip_ok, ip_retry = login_limiter.check(f"ip:{client_ip}")
+        if not ip_ok:
+            return JSONResponse(
+                {"error": "Too many login attempts"},
+                status_code=429,
+                headers={"Retry-After": str(ip_retry)},
+            )
+        if username:
+            user_ok, user_retry = login_limiter.check(f"user:{username}")
+            if not user_ok:
+                return JSONResponse(
+                    {"error": "Too many login attempts"},
+                    status_code=429,
+                    headers={"Retry-After": str(user_retry)},
+                )
 
     result: AuthResult | None = None
-    username = body.get("username", "")
     password = body.get("password", "")
 
     if username and password and storage is not None:
@@ -379,10 +404,15 @@ async def auth_login(request: Request) -> Response:
             body["token"],
             auth_config,
             jwt_secret=jwt_secret,
+            jwt_audience=JWT_AUD_CONSOLE,
             storage=storage,
         )
 
     if result is None:
+        if login_limiter is not None:
+            login_limiter.record(f"ip:{client_ip}")
+            if username:
+                login_limiter.record(f"user:{username}")
         return JSONResponse({"error": "Invalid credentials"}, status_code=401)
 
     jwt_token = ""
@@ -392,6 +422,7 @@ async def auth_login(request: Request) -> Response:
             scopes=result.scopes,
             source=result.token_source,
             secret=jwt_secret,
+            audience=JWT_AUD_CONSOLE,
         )
 
     role = "full" if result.has_scope("write") else "read"
@@ -402,10 +433,11 @@ async def auth_login(request: Request) -> Response:
     if result.user_id:
         resp_body["user_id"] = result.user_id
 
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     cookie_value = jwt_token if jwt_token else body.get("token", "")
     if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value)
+        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, secure=secure)
     return response
 
 
@@ -446,7 +478,13 @@ async def auth_setup(request: Request) -> JSONResponse:
     """
     import uuid
 
-    from turnstone.core.auth import create_jwt, hash_password, make_set_cookie
+    from turnstone.core.auth import (
+        JWT_AUD_CONSOLE,
+        create_jwt,
+        hash_password,
+        is_secure_request,
+        make_set_cookie,
+    )
 
     storage = getattr(request.app.state, "auth_storage", None)
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
@@ -495,6 +533,7 @@ async def auth_setup(request: Request) -> JSONResponse:
             scopes=scopes,
             source="password",
             secret=jwt_secret,
+            audience=JWT_AUD_CONSOLE,
         )
 
     resp_body: dict[str, str] = {
@@ -507,9 +546,10 @@ async def auth_setup(request: Request) -> JSONResponse:
     if jwt_token:
         resp_body["jwt"] = jwt_token
 
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token)
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
     return response
 
 
@@ -1071,6 +1111,7 @@ def create_app(
     jwt_secret: str = "",
     auth_storage: Any = None,
     proxy_auth_token: str = "",
+    cors_origins: list[str] | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -1130,15 +1171,7 @@ def create_app(
             Route("/node/{node_id}/api/{path:path}", proxy_api, methods=["GET", "POST"]),
             Route("/node/{node_id}/{path:path}", proxy_non_api),
         ],
-        middleware=[
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["GET", "POST", "OPTIONS"],
-                allow_headers=["Content-Type", "Authorization"],
-            ),
-            Middleware(AuthMiddleware),
-        ],
+        middleware=_build_console_middleware(cors_origins),
         lifespan=_lifespan,
     )
     app.state.collector = collector
@@ -1147,7 +1180,27 @@ def create_app(
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_auth_token = proxy_auth_token
+
+    from turnstone.core.auth import LoginRateLimiter
+
+    app.state.login_limiter = LoginRateLimiter()
     return app
+
+
+def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Middleware]:
+    """Build the middleware stack with optional CORS."""
+    stack: list[Middleware] = []
+    if cors_origins:
+        stack.append(
+            Middleware(
+                CORSMiddleware,
+                allow_origins=cors_origins,
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Authorization"],
+            )
+        )
+    stack.append(Middleware(AuthMiddleware))
+    return stack
 
 
 # ---------------------------------------------------------------------------
@@ -1243,22 +1296,32 @@ def main() -> None:
         password=args.redis_password,
     )
 
-    # If no explicit auth token is provided, mint a service JWT using the
-    # shared secret so the collector can poll server nodes.
+    # If no explicit auth token is provided, use a ServiceTokenManager
+    # so collector JWTs auto-rotate.  A shared JWT secret is required for
+    # multi-service deployments — ephemeral secrets differ per process.
     collector_token = args.auth_token
+    collector_token_mgr = None
     if not collector_token:
         _jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
-        if _jwt_secret:
-            from turnstone.core.auth import create_jwt
-
-            collector_token = create_jwt(
-                user_id="console-collector",
-                scopes=frozenset({"read"}),
-                source="console",
-                secret=_jwt_secret,
-                expiry_hours=168,  # 1 week — console restarts refresh
+        if not _jwt_secret:
+            log.error(
+                "TURNSTONE_JWT_SECRET is not set and no --auth-token provided. "
+                "The console cannot authenticate to server nodes. Set TURNSTONE_JWT_SECRET "
+                "to a shared secret (at least 32 characters) or pass --auth-token."
             )
-            log.info("console.collector_jwt_minted")
+            raise SystemExit(1)
+        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
+
+        collector_token_mgr = ServiceTokenManager(
+            user_id="console-collector",
+            scopes=frozenset({"read"}),
+            source="console",
+            secret=_jwt_secret,
+            audience=JWT_AUD_SERVER,
+            expiry_hours=1,
+        )
+        collector_token = collector_token_mgr.token
+        log.info("console.collector_jwt_minted")
 
     collector = ClusterCollector(
         broker=broker,
@@ -1286,20 +1349,26 @@ def main() -> None:
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
 
-    # If no explicit auth token is provided, mint a service JWT using the
-    # shared secret so the console can proxy requests to the server.
+    # If no explicit auth token is provided, use a ServiceTokenManager
+    # so proxy JWTs auto-rotate.
     proxy_token = args.auth_token
+    proxy_token_mgr = None
     if not proxy_token and jwt_secret:
-        from turnstone.core.auth import create_jwt
+        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
 
-        proxy_token = create_jwt(
+        proxy_token_mgr = ServiceTokenManager(
             user_id="console-proxy",
             scopes=frozenset({"write"}),
             source="console",
             secret=jwt_secret,
-            expiry_hours=168,  # 1 week — console restarts refresh
+            audience=JWT_AUD_SERVER,
+            expiry_hours=1,
         )
-        log.info("console.jwt_minted")
+        proxy_token = proxy_token_mgr.token
+        log.info("console.proxy_jwt_minted")
+
+    cors_env = os.environ.get("TURNSTONE_CORS_ORIGINS", "").strip()
+    cors_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else None
 
     app = create_app(
         collector=collector,
@@ -1308,6 +1377,7 @@ def main() -> None:
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
         proxy_auth_token=proxy_token,
+        cors_origins=cors_origins,
     )
 
     log.info("Console starting on http://%s:%s", args.host, args.port)

@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,6 +38,11 @@ log = logging.getLogger(__name__)
 AUTH_COOKIE = "turnstone_auth"
 TOKEN_PREFIX = "ts_"
 TOKEN_BYTES = 32  # 64 hex chars after prefix
+
+JWT_ISSUER = "turnstone"
+JWT_AUD_SERVER = "turnstone-server"
+JWT_AUD_CONSOLE = "turnstone-console"
+_MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve"})
 
@@ -206,21 +212,25 @@ def parse_scopes(scopes_str: str) -> frozenset[str]:
 def load_jwt_secret() -> str:
     """Load JWT signing secret from env or config, or auto-generate."""
     secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
-    if secret:
+    if not secret:
+        from turnstone.core.config import load_config
+
+        auth_cfg = load_config("auth")
+        secret = str(auth_cfg.get("jwt_secret", "")).strip()
+
+    if not secret:
+        # Auto-generate an ephemeral secret
+        secret = secrets.token_hex(32)
+        log.warning(
+            "No JWT secret configured — using ephemeral secret (tokens will not survive restart)"
+        )
         return secret
 
-    from turnstone.core.config import load_config
-
-    auth_cfg = load_config("auth")
-    secret = str(auth_cfg.get("jwt_secret", "")).strip()
-    if secret:
-        return secret
-
-    # Auto-generate an ephemeral secret
-    secret = secrets.token_hex(32)
-    log.warning(
-        "No JWT secret configured — using ephemeral secret (tokens will not survive restart)"
-    )
+    if len(secret) < _MIN_SECRET_LENGTH:
+        log.warning(
+            "JWT secret is shorter than %d characters — consider using a stronger secret",
+            _MIN_SECRET_LENGTH,
+        )
     return secret
 
 
@@ -230,27 +240,45 @@ def create_jwt(
     source: str,
     secret: str,
     expiry_hours: int = 24,
+    audience: str = "",
 ) -> str:
     """Create a signed JWT with user identity and scopes."""
     import jwt
 
     now = int(time.time())
-    payload = {
+    payload: dict[str, Any] = {
         "sub": user_id,
         "scopes": ",".join(sorted(scopes)),
         "src": source,
+        "iss": JWT_ISSUER,
         "iat": now,
         "exp": now + expiry_hours * 3600,
     }
+    if audience:
+        payload["aud"] = audience
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
-def validate_jwt(token: str, secret: str) -> AuthResult | None:
-    """Validate a JWT and return an AuthResult, or None on failure."""
+def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | None:
+    """Validate a JWT and return an AuthResult, or None on failure.
+
+    When *audience* is non-empty the ``aud`` claim is verified.  Tokens
+    without an ``aud`` claim are accepted when *audience* is empty (backward
+    compatibility during the rollout window).
+    """
     import jwt
 
+    options: dict[str, bool] = {}
+    if not audience:
+        options["verify_aud"] = False
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        payload = jwt.decode(
+            token,
+            secret,
+            algorithms=["HS256"],
+            audience=audience if audience else None,
+            options=options,
+        )
     except jwt.InvalidTokenError:
         return None
 
@@ -400,6 +428,7 @@ def check_request(
     cookie_header: str | None = None,
     *,
     jwt_secret: str = "",
+    jwt_audience: str = "",
     storage: Any = None,
 ) -> tuple[bool, int, str, AuthResult | None]:
     """Validate a request against the auth config.
@@ -428,7 +457,9 @@ def check_request(
         return False, 401, "Unauthorized: missing or invalid token", None
 
     # Authenticate
-    result = _authenticate_token(raw_token, auth_config, jwt_secret=jwt_secret, storage=storage)
+    result = _authenticate_token(
+        raw_token, auth_config, jwt_secret=jwt_secret, jwt_audience=jwt_audience, storage=storage
+    )
     if result is None:
         return False, 401, "Unauthorized: missing or invalid token", None
 
@@ -445,13 +476,14 @@ def _authenticate_token(
     auth_config: AuthConfig,
     *,
     jwt_secret: str = "",
+    jwt_audience: str = "",
     storage: Any = None,
 ) -> AuthResult | None:
     """Identify token type and authenticate it."""
     # 1. JWT (contains dots) — attempt validation, fall through on failure
     if "." in token and jwt_secret:
         try:
-            jwt_result = validate_jwt(token, jwt_secret)
+            jwt_result = validate_jwt(token, jwt_secret, audience=jwt_audience)
         except Exception:
             jwt_result = None
         if jwt_result is not None:
@@ -530,10 +562,15 @@ def _extract_cookie(cookie_header: str | None, name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def make_set_cookie(token: str, max_age: int = 86400 * 30, secure: bool = False) -> str:
-    """Return a ``Set-Cookie`` header value that stores the auth token."""
+def make_set_cookie(token: str, max_age: int = 86400, *, secure: bool | None = None) -> str:
+    """Return a ``Set-Cookie`` header value that stores the auth token.
+
+    When *secure* is ``None`` (default) the ``Secure`` flag is set
+    unconditionally.  Pass ``secure=False`` only for plaintext development.
+    *max_age* defaults to 24 hours to match the default JWT expiry.
+    """
     val = f"{AUTH_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
-    if secure:
+    if secure is None or secure:
         val += "; Secure"
     return val
 
@@ -541,3 +578,135 @@ def make_set_cookie(token: str, max_age: int = 86400 * 30, secure: bool = False)
 def make_clear_cookie() -> str:
     """Return a ``Set-Cookie`` header value that expires the auth cookie."""
     return f"{AUTH_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+
+
+def is_secure_request(headers: dict[str, str], scheme: str = "") -> bool:
+    """Return ``True`` if the request arrived over HTTPS.
+
+    Checks the URL scheme and the ``X-Forwarded-Proto`` header (set by
+    reverse proxies and load balancers).
+    """
+    if scheme == "https":
+        return True
+    proto = headers.get("x-forwarded-proto", "")
+    return proto.lower() == "https"
+
+
+# ---------------------------------------------------------------------------
+# Login rate limiter
+# ---------------------------------------------------------------------------
+
+
+class LoginRateLimiter:
+    """Sliding-window rate limiter for login attempts.
+
+    Tracks per-key (IP or username) attempt timestamps and rejects when
+    *max_attempts* are exceeded within *window_seconds*.
+    """
+
+    MAX_KEYS: int = 50_000
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 300) -> None:
+        self._max_attempts = max_attempts
+        self._window = window_seconds
+        self._attempts: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def check(self, key: str) -> tuple[bool, int]:
+        """Return ``(allowed, retry_after_seconds)``.
+
+        Does **not** record a new attempt — call :meth:`record` after a
+        failed login so successful logins don't consume the budget.
+        """
+        now = time.monotonic()
+        with self._lock:
+            timestamps = self._attempts.get(key)
+            if timestamps is None:
+                return True, 0
+            # Prune expired
+            cutoff = now - self._window
+            timestamps[:] = [t for t in timestamps if t > cutoff]
+            if not timestamps:
+                del self._attempts[key]
+                return True, 0
+            if len(timestamps) >= self._max_attempts:
+                retry_after = int(timestamps[0] - cutoff) + 1
+                return False, max(retry_after, 1)
+            return True, 0
+
+    def record(self, key: str) -> None:
+        """Record a failed login attempt."""
+        now = time.monotonic()
+        with self._lock:
+            if len(self._attempts) >= self.MAX_KEYS and key not in self._attempts:
+                return  # prevent memory exhaustion
+            self._attempts.setdefault(key, []).append(now)
+
+    def cleanup(self, max_age: float = 600.0) -> int:
+        """Remove stale entries older than *max_age* seconds."""
+        now = time.monotonic()
+        cutoff = now - max_age
+        with self._lock:
+            stale = [k for k, ts in self._attempts.items() if all(t <= cutoff for t in ts)]
+            for k in stale:
+                del self._attempts[k]
+        return len(stale)
+
+
+# ---------------------------------------------------------------------------
+# Service token manager (auto-rotating JWTs for service-to-service auth)
+# ---------------------------------------------------------------------------
+
+
+class ServiceTokenManager:
+    """Auto-rotating service JWT.  Thread-safe.
+
+    The :attr:`token` property returns a valid JWT, re-minting transparently
+    when the current token is within *refresh_margin* of expiry.
+    """
+
+    def __init__(
+        self,
+        user_id: str,
+        scopes: frozenset[str],
+        source: str,
+        secret: str,
+        audience: str = "",
+        expiry_hours: int = 1,
+        refresh_margin: float = 0.2,
+    ) -> None:
+        self._user_id = user_id
+        self._scopes = scopes
+        self._source = source
+        self._secret = secret
+        self._audience = audience
+        self._expiry_hours = expiry_hours
+        self._margin_seconds = expiry_hours * 3600 * refresh_margin
+        self._token: str = ""
+        self._expires_at: float = 0.0
+        self._lock = threading.Lock()
+
+    def _mint(self) -> None:
+        self._token = create_jwt(
+            user_id=self._user_id,
+            scopes=self._scopes,
+            source=self._source,
+            secret=self._secret,
+            expiry_hours=self._expiry_hours,
+            audience=self._audience,
+        )
+        self._expires_at = time.time() + self._expiry_hours * 3600
+        log.debug("Service JWT minted for %s (expires in %dh)", self._user_id, self._expiry_hours)
+
+    @property
+    def token(self) -> str:
+        """Return current token, re-minting if near expiry."""
+        with self._lock:
+            if time.time() >= self._expires_at - self._margin_seconds:
+                self._mint()
+            return self._token
+
+    @property
+    def bearer_header(self) -> dict[str, str]:
+        """Return an ``Authorization`` header dict with the current token."""
+        return {"Authorization": f"Bearer {self.token}"}

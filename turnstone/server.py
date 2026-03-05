@@ -352,7 +352,7 @@ class AuthMiddleware:
         if request.method == "OPTIONS":
             await self.app(scope, receive, send)
             return
-        from turnstone.core.auth import check_request
+        from turnstone.core.auth import JWT_AUD_SERVER, check_request
 
         auth_config = request.app.state.auth_config
         jwt_secret = getattr(request.app.state, "jwt_secret", "")
@@ -368,6 +368,7 @@ class AuthMiddleware:
             auth_header,
             cookie_header,
             jwt_secret=jwt_secret,
+            jwt_audience=JWT_AUD_SERVER,
             storage=storage,
         )
         if not allowed:
@@ -969,9 +970,12 @@ async def auth_login(request: Request) -> Response:
     - ``{"token": "..."}`` — legacy token-based login
     """
     from turnstone.core.auth import (
+        JWT_AUD_SERVER,
         AuthResult,
+        LoginRateLimiter,
         _authenticate_token,
         create_jwt,
+        is_secure_request,
         make_set_cookie,
         verify_password,
     )
@@ -980,9 +984,30 @@ async def auth_login(request: Request) -> Response:
     auth_config = request.app.state.auth_config
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
     storage = getattr(request.app.state, "auth_storage", None)
+    login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
+
+    username = body.get("username", "")
+    client_ip = request.client.host if request.client else "unknown"
+
+    # Check login rate limits (per-IP and per-username)
+    if login_limiter is not None:
+        ip_ok, ip_retry = login_limiter.check(f"ip:{client_ip}")
+        if not ip_ok:
+            return JSONResponse(
+                {"error": "Too many login attempts"},
+                status_code=429,
+                headers={"Retry-After": str(ip_retry)},
+            )
+        if username:
+            user_ok, user_retry = login_limiter.check(f"user:{username}")
+            if not user_ok:
+                return JSONResponse(
+                    {"error": "Too many login attempts"},
+                    status_code=429,
+                    headers={"Retry-After": str(user_retry)},
+                )
 
     result: AuthResult | None = None
-    username = body.get("username", "")
     password = body.get("password", "")
 
     if username and password and storage is not None:
@@ -998,10 +1023,16 @@ async def auth_login(request: Request) -> Response:
             body["token"],
             auth_config,
             jwt_secret=jwt_secret,
+            jwt_audience=JWT_AUD_SERVER,
             storage=storage,
         )
 
     if result is None:
+        # Record failed attempt for rate limiting
+        if login_limiter is not None:
+            login_limiter.record(f"ip:{client_ip}")
+            if username:
+                login_limiter.record(f"user:{username}")
         return JSONResponse({"error": "Invalid credentials"}, status_code=401)
 
     jwt_token = ""
@@ -1011,6 +1042,7 @@ async def auth_login(request: Request) -> Response:
             scopes=result.scopes,
             source=result.token_source,
             secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
         )
 
     role = "full" if result.has_scope("write") else "read"
@@ -1021,10 +1053,11 @@ async def auth_login(request: Request) -> Response:
     if result.user_id:
         resp_body["user_id"] = result.user_id
 
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     cookie_value = jwt_token if jwt_token else body.get("token", "")
     if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value)
+        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, secure=secure)
     return response
 
 
@@ -1063,7 +1096,13 @@ async def auth_setup(request: Request) -> JSONResponse:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
     import uuid
 
-    from turnstone.core.auth import create_jwt, hash_password, make_set_cookie
+    from turnstone.core.auth import (
+        JWT_AUD_SERVER,
+        create_jwt,
+        hash_password,
+        is_secure_request,
+        make_set_cookie,
+    )
 
     storage = getattr(request.app.state, "auth_storage", None)
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
@@ -1107,6 +1146,7 @@ async def auth_setup(request: Request) -> JSONResponse:
             scopes=scopes,
             source="password",
             secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
         )
 
     resp_body: dict[str, str] = {
@@ -1119,9 +1159,10 @@ async def auth_setup(request: Request) -> JSONResponse:
     if jwt_token:
         resp_body["jwt"] = jwt_token
 
+    secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token)
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
     return response
 
 
@@ -1225,6 +1266,30 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 
 
+def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]:
+    """Build the middleware stack with optional CORS."""
+    stack: list[Middleware] = [
+        Middleware(LogContextMiddleware),
+        Middleware(MetricsMiddleware),
+    ]
+    if cors_origins:
+        stack.append(
+            Middleware(
+                CORSMiddleware,
+                allow_origins=cors_origins,
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type", "Authorization"],
+            )
+        )
+    stack.extend(
+        [
+            Middleware(AuthMiddleware),
+            Middleware(RateLimitMiddleware),
+        ]
+    )
+    return stack
+
+
 def create_app(
     *,
     workstreams: WorkstreamManager,
@@ -1241,6 +1306,7 @@ def create_app(
     registry: Any = None,
     idle_timeout: int = 0,
     node_id: str = "",
+    cors_origins: list[str] | None = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1277,18 +1343,7 @@ def create_app(
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
         ],
-        middleware=[
-            Middleware(LogContextMiddleware),
-            Middleware(MetricsMiddleware),
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["GET", "POST", "OPTIONS"],
-                allow_headers=["Content-Type", "Authorization"],
-            ),
-            Middleware(AuthMiddleware),
-            Middleware(RateLimitMiddleware),
-        ],
+        middleware=_build_middleware(cors_origins),
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
@@ -1305,6 +1360,10 @@ def create_app(
     app.state.registry = registry
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
+
+    from turnstone.core.auth import LoginRateLimiter
+
+    app.state.login_limiter = LoginRateLimiter()
     return app
 
 
@@ -1703,6 +1762,9 @@ def main() -> None:
         log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
 
     # Build the ASGI app
+    cors_env = os.environ.get("TURNSTONE_CORS_ORIGINS", "").strip()
+    cors_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else None
+
     app = create_app(
         workstreams=manager,
         global_queue=global_queue,
@@ -1718,6 +1780,7 @@ def main() -> None:
         registry=registry,
         idle_timeout=args.workstream_idle_timeout,
         node_id=_node_id,
+        cors_origins=cors_origins,
     )
 
     log.info("Server starting on http://%s:%s", args.host, args.port)

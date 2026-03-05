@@ -76,6 +76,7 @@ class Bridge:
         node_id: str = "",
         heartbeat_ttl: int = 60,
         auth_token: str = "",
+        token_manager: Any = None,
     ) -> None:
         self._server_url = server_url.rstrip("/")
         self._broker = broker or RedisBroker()
@@ -85,12 +86,16 @@ class Bridge:
         self._heartbeat_ttl = heartbeat_ttl
         self._started_at = time.time()
         self._auth_token = auth_token
+        self._token_manager = token_manager  # ServiceTokenManager (auto-rotating)
 
-        # Shared httpx client for short-lived POST requests (main thread only)
-        headers: dict[str, str] = {}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        self._http = httpx.Client(base_url=self._server_url, timeout=30, headers=headers)
+        # Shared httpx client for short-lived POST requests (main thread only).
+        # Auth headers refreshed per-request via event hook so auto-rotating
+        # tokens are picked up transparently.
+        self._http = httpx.Client(
+            base_url=self._server_url,
+            timeout=30,
+            event_hooks={"request": [self._inject_auth]},
+        )
 
         # Protected by _lock — accessed from main, global SSE, and per-ws SSE threads
         self._lock = threading.Lock()
@@ -101,6 +106,21 @@ class Bridge:
         self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
         self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
         self._running = True
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        """Return current Authorization header, auto-rotating if managed."""
+        if self._token_manager is not None:
+            return dict(self._token_manager.bearer_header)
+        if self._auth_token:
+            return {"Authorization": f"Bearer {self._auth_token}"}
+        return {}
+
+    def _inject_auth(self, request: httpx.Request) -> None:
+        """httpx event hook: inject current auth header into each request."""
+        headers = self._auth_headers
+        for k, v in headers.items():
+            request.headers[k] = v
 
     # -- thread context helper ------------------------------------------------
 
@@ -510,11 +530,8 @@ class Bridge:
     def _ws_sse_loop(self, ws_id: str) -> None:
         """Consume per-workstream SSE and forward events."""
         # Each SSE thread gets its own httpx client (not thread-safe to share)
-        sse_headers: dict[str, str] = {}
-        if self._auth_token:
-            sse_headers["Authorization"] = f"Bearer {self._auth_token}"
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=sse_headers
+            base_url=self._server_url, timeout=None, headers=self._auth_headers
         ) as sse_client:
             while self._running:
                 try:
@@ -695,11 +712,8 @@ class Bridge:
 
     def _global_sse_loop(self) -> None:
         # Own httpx client for the long-lived SSE connection
-        sse_headers: dict[str, str] = {}
-        if self._auth_token:
-            sse_headers["Authorization"] = f"Bearer {self._auth_token}"
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=sse_headers
+            base_url=self._server_url, timeout=None, headers=self._auth_headers
         ) as sse_client:
             while self._running:
                 try:
@@ -885,22 +899,32 @@ def main() -> None:
         db=args.redis_db,
         password=args.redis_password,
     )
-    # If no explicit auth token is provided, mint a service JWT using the
-    # shared secret so the bridge can authenticate to the server.
+    # If no explicit auth token is provided, use a ServiceTokenManager
+    # so bridge JWTs auto-rotate (1-hour expiry, refreshed at 80%).
+    # A shared JWT secret is required for multi-service deployments —
+    # ephemeral secrets differ per process and break inter-service auth.
     auth_token = args.auth_token
+    token_manager = None
     if not auth_token:
         jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
-        if jwt_secret:
-            from turnstone.core.auth import create_jwt
-
-            auth_token = create_jwt(
-                user_id="bridge",
-                scopes=frozenset({"approve"}),
-                source="bridge",
-                secret=jwt_secret,
-                expiry_hours=168,  # 1 week — bridge restarts refresh
+        if not jwt_secret:
+            log.error(
+                "TURNSTONE_JWT_SECRET is not set and no --auth-token provided. "
+                "The bridge cannot authenticate to the server. Set TURNSTONE_JWT_SECRET "
+                "to a shared secret (at least 32 characters) or pass --auth-token."
             )
-            log.info("bridge.jwt_minted")
+            raise SystemExit(1)
+        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
+
+        token_manager = ServiceTokenManager(
+            user_id="bridge",
+            scopes=frozenset({"approve"}),
+            source="bridge",
+            secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
+            expiry_hours=1,
+        )
+        log.info("bridge.jwt_minted")
 
     bridge = Bridge(
         server_url=args.server_url,
@@ -909,6 +933,7 @@ def main() -> None:
         node_id=args.node_id,
         heartbeat_ttl=args.heartbeat_ttl,
         auth_token=auth_token,
+        token_manager=token_manager,
     )
     bridge.run()
 
