@@ -37,7 +37,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
-from turnstone.core.auth import AuthMiddleware
+from turnstone.core.auth import JWT_AUD_CONSOLE, AuthMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -286,7 +286,7 @@ async def health(request: Request) -> JSONResponse:
 
 async def auth_login(request: Request) -> Response:
     """Authenticate via username:password or legacy token, return JWT."""
-    from turnstone.core.auth import JWT_AUD_CONSOLE, handle_auth_login
+    from turnstone.core.auth import handle_auth_login
 
     return await handle_auth_login(request, JWT_AUD_CONSOLE)
 
@@ -307,7 +307,7 @@ async def auth_status(request: Request) -> Response:
 
 async def auth_setup(request: Request) -> Response:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
-    from turnstone.core.auth import JWT_AUD_CONSOLE, handle_auth_setup
+    from turnstone.core.auth import handle_auth_setup
 
     return await handle_auth_setup(request, JWT_AUD_CONSOLE)
 
@@ -976,7 +976,7 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
         from turnstone.core.web_helpers import cors_middleware
 
         stack.append(cors_middleware(cors_origins))
-    stack.append(Middleware(AuthMiddleware, jwt_audience="turnstone-console"))
+    stack.append(Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE))
     return stack
 
 

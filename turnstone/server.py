@@ -40,7 +40,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
-from turnstone.core.auth import AuthMiddleware
+from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
@@ -918,7 +918,7 @@ async def close_workstream(request: Request) -> JSONResponse:
 
 async def auth_login(request: Request) -> Response:
     """POST /v1/api/auth/login — authenticate and return JWT."""
-    from turnstone.core.auth import JWT_AUD_SERVER, handle_auth_login
+    from turnstone.core.auth import handle_auth_login
 
     return await handle_auth_login(request, JWT_AUD_SERVER)
 
@@ -939,7 +939,7 @@ async def auth_status(request: Request) -> Response:
 
 async def auth_setup(request: Request) -> Response:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
-    from turnstone.core.auth import JWT_AUD_SERVER, handle_auth_setup
+    from turnstone.core.auth import handle_auth_setup
 
     return await handle_auth_setup(request, JWT_AUD_SERVER)
 
@@ -1044,7 +1044,7 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
         stack.append(cors_middleware(cors_origins))
     stack.extend(
         [
-            Middleware(AuthMiddleware, jwt_audience="turnstone-server"),
+            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER),
             Middleware(RateLimitMiddleware),
         ]
     )

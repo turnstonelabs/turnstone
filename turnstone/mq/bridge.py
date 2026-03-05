@@ -529,9 +529,12 @@ class Bridge:
 
     def _ws_sse_loop(self, ws_id: str) -> None:
         """Consume per-workstream SSE and forward events."""
-        # Each SSE thread gets its own httpx client (not thread-safe to share)
+        # Each SSE thread gets its own httpx client (not thread-safe to share).
+        # Use event hooks so auth headers refresh on each reconnect.
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=self._auth_headers
+            base_url=self._server_url,
+            timeout=None,
+            event_hooks={"request": [self._inject_auth]},
         ) as sse_client:
             while self._running:
                 try:
@@ -711,9 +714,12 @@ class Bridge:
     # -- global SSE ----------------------------------------------------------
 
     def _global_sse_loop(self) -> None:
-        # Own httpx client for the long-lived SSE connection
+        # Own httpx client for the long-lived SSE connection.
+        # Use event hooks so auth headers refresh on each reconnect.
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=self._auth_headers
+            base_url=self._server_url,
+            timeout=None,
+            event_hooks={"request": [self._inject_auth]},
         ) as sse_client:
             while self._running:
                 try:

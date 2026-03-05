@@ -51,7 +51,7 @@ function initLogin() {
 
 function _buildLoginHTML() {
   return (
-    '<form id="login-box" action="javascript:void(0)">' +
+    '<form id="login-box">' +
     '<h2 id="login-title">' +
     escapeHtml(_AUTH_TITLE) +
     "</h2>" +

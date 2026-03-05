@@ -275,16 +275,16 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
     """
     import jwt
 
-    options: dict[str, bool] = {}
+    decode_opts: Any = None
     if not audience:
-        options["verify_aud"] = False
+        decode_opts = {"verify_aud": False}
     try:
         payload = jwt.decode(
             token,
             secret,
             algorithms=["HS256"],
             audience=audience if audience else None,
-            options=options,
+            options=decode_opts,
         )
     except jwt.InvalidTokenError:
         return None
