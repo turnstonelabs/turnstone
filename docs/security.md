@@ -55,8 +55,15 @@ Claims:
 | `sub` | User ID |
 | `scopes` | Comma-separated scope list (`read,write,approve`) |
 | `src` | Token source (`password`, `api_token`, `config`) |
+| `iss` | Issuer — always `turnstone` |
+| `aud` | Audience — `turnstone-server` or `turnstone-console` |
 | `iat` | Issued-at timestamp |
 | `exp` | Expiry timestamp |
+
+The `aud` claim prevents cross-service token reuse — a JWT issued for the
+console cannot be used to authenticate against a server node, and vice versa.
+Tokens without an `aud` claim are accepted during the rollout window when
+`audience` validation is not specified.
 
 ---
 
@@ -196,8 +203,8 @@ deployments.
 | `HttpOnly` | `true` | Prevents JavaScript access |
 | `SameSite` | `Lax` | CSRF protection |
 | `Path` | `/` | Available to all routes |
-| `Max-Age` | 30 days | Session lifetime |
-| `Secure` | conditional | Set when served over HTTPS |
+| `Max-Age` | 24 hours | Matches JWT expiry |
+| `Secure` | `true` (default) | Always set unless explicitly disabled for dev |
 
 ---
 
@@ -208,11 +215,17 @@ deployments.
 | Signing secret | `[auth] jwt_secret` | `TURNSTONE_JWT_SECRET` | Auto-generated ephemeral (warning logged) |
 | Expiry | `[auth] jwt_expiry_hours` | — | 24 hours |
 | Algorithm | — | — | HS256 (not configurable) |
+| Minimum secret length | — | — | 32 characters (warning if shorter) |
 
 All service nodes that need to validate JWTs must share the same signing
 secret. If no secret is configured, an ephemeral key is generated at
 startup and a warning is logged — JWTs will not survive restarts or work
 across nodes.
+
+The bridge and console **require** `TURNSTONE_JWT_SECRET` when no
+`--auth-token` is provided. They exit with an error if the secret is
+missing, since ephemeral secrets would silently break inter-service
+communication.
 
 ---
 
@@ -327,11 +340,29 @@ without any database.
 ### Proxy auth forwarding
 
 When the console proxies requests to server nodes (via `/node/{id}/...`
-routes), it extracts the user's JWT from the incoming request's cookie
-or `Authorization` header and forwards it as `Authorization: Bearer`
-to the upstream server.  This means a single login on the console
-grants access to all server UIs without re-authentication — the shared
-`TURNSTONE_JWT_SECRET` ensures tokens are valid on every node.
+routes), it uses a dedicated **service proxy token** with
+`aud: turnstone-server` and `write` scope.  The user's console JWT
+(which has `aud: turnstone-console`) is **not** forwarded — it would be
+rejected by the server's audience validation.
+
+The proxy token is managed by a `ServiceTokenManager` that auto-rotates
+1-hour JWTs, refreshing at 80% of lifetime.  If `--auth-token` is
+provided, that static token is used instead.
+
+### Service-to-service authentication
+
+The bridge and console collector use `ServiceTokenManager` for
+auto-rotating JWTs when communicating with server nodes:
+
+| Service | Identity | Scope | Purpose |
+|---------|----------|-------|---------|
+| Bridge | `bridge` | `approve` | Tool approval proxy, message relay |
+| Console collector | `console-collector` | `read` | Node health polling |
+| Console proxy | `console-proxy` | `write` | Proxied API calls |
+
+All service tokens use `aud: turnstone-server` and 1-hour expiry with
+automatic refresh.  The bridge injects auth headers per-request via httpx
+event hooks to ensure rotated tokens are picked up on SSE reconnects.
 
 ---
 
@@ -357,6 +388,38 @@ role = "full"
 | `TURNSTONE_AUTH_ENABLED=1` | Enable authentication |
 | `TURNSTONE_AUTH_TOKEN=tok_xxx` | Register a config-file token with `full` access |
 | `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (must match across nodes) |
+| `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |
+
+---
+
+## Login Rate Limiting
+
+The `/api/auth/login` endpoint is protected by a dedicated
+`LoginRateLimiter` (separate from the general API rate limiter).
+Limits are enforced per-IP and per-username with a sliding window:
+
+- **5 attempts** per **5-minute window** per key
+- Failed logins record against both `ip:{client_ip}` and `user:{username}`
+- Returns `429 Too Many Requests` with `Retry-After` header when exceeded
+- Successful logins do not consume the budget
+
+---
+
+## CORS Policy
+
+By default, no CORS headers are sent (same-origin only). To allow
+cross-origin requests, set `TURNSTONE_CORS_ORIGINS`:
+
+```bash
+# Allow specific origins
+TURNSTONE_CORS_ORIGINS=https://app.example.com,https://admin.example.com
+
+# Allow all origins (development only)
+TURNSTONE_CORS_ORIGINS=*
+```
+
+When the variable is empty or unset, the CORS middleware is not added
+and browsers enforce same-origin policy.
 
 ---
 
@@ -374,3 +437,14 @@ role = "full"
   authenticated request and injected into all log events.
 - **Scope enforcement** at the middleware layer before any handler
   executes. Path-to-scope mapping is defined statically.
+- **JWT audience isolation** — server and console JWTs have distinct
+  `aud` claims, preventing cross-service token reuse.
+- **Login brute-force protection** — per-IP and per-username rate
+  limiting on the login endpoint.
+- **Secure cookies by default** — `Secure` flag set unconditionally;
+  24-hour max-age matches JWT expiry.
+- **CORS restriction** — no CORS headers by default (same-origin only).
+- **Service JWT auto-rotation** — 1-hour expiry with transparent
+  refresh, eliminating long-lived static tokens for inter-service auth.
+- **Secret strength validation** — warning logged when JWT secret is
+  shorter than 32 characters.
