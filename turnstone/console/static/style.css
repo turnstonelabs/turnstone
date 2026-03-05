@@ -832,6 +832,58 @@
 .admin-btn-danger:hover { opacity: 1; background: rgba(248, 113, 113, 0.1); }
 .admin-btn-danger:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
 
+.admin-btn-action {
+  background: none;
+  border: 1px solid var(--border-strong);
+  color: var(--fg-dim);
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s, background 0.15s;
+  margin-right: 4px;
+}
+.admin-btn-action:hover { opacity: 1; background: rgba(255, 255, 255, 0.05); color: var(--fg); }
+.admin-btn-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Schedules grid: NAME | TYPE | SCHEDULE | TARGET | NEXT RUN | STATUS | ACTIONS */
+#admin-schedules .admin-colheaders,
+#admin-schedules .admin-row {
+  grid-template-columns: 1.5fr 60px 1.2fr 80px 130px 70px 170px;
+}
+
+/* Schedule runs grid: STARTED | NODE | STATUS | ERROR */
+.sched-runs-grid { grid-template-columns: 2fr 1fr 1fr 2fr; }
+
+/* Schedule status indicators */
+.sched-active { color: var(--green); font-weight: 500; }
+.sched-disabled { color: var(--fg-dim); }
+.sched-expired { color: var(--accent); }
+
+/* Wide modal variant for schedule forms */
+.admin-modal-wide { width: 480px; }
+
+/* Checkbox labels inside admin modals */
+.admin-modal label.admin-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--fg);
+  cursor: pointer;
+  margin-top: 14px;
+}
+.admin-modal label.admin-checkbox input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 /* Admin modals (reuse new-ws-overlay pattern) */
 .admin-modal {
   background: var(--bg-surface);
@@ -871,7 +923,7 @@
   margin-top: 12px;
 }
 .admin-modal label:first-of-type { margin-top: 0; }
-.admin-modal input, .admin-modal select {
+.admin-modal input:not([type="hidden"]), .admin-modal select, .admin-modal textarea {
   width: 100%;
   padding: 9px 12px;
   background: var(--bg);
@@ -882,12 +934,13 @@
   font-size: 13px;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-.admin-modal input:focus, .admin-modal select:focus {
+.admin-modal input:focus, .admin-modal select:focus, .admin-modal textarea:focus {
   border-color: var(--accent);
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
-.admin-modal input::placeholder { color: var(--fg-dim); opacity: 0.6; }
+.admin-modal input::placeholder, .admin-modal textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
+.admin-modal textarea { resize: vertical; min-height: 40px; }
 .admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; display: none; }
 
 .modal-buttons { display: flex; gap: 10px; margin-top: 20px; }
@@ -925,7 +978,8 @@
 .modal-submit:focus-visible { outline: 2px solid var(--fg-bright); outline-offset: 2px; }
 .modal-submit:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
 
-#create-user-overlay, #create-token-overlay, #token-created-overlay, #create-channel-overlay, #confirm-overlay {
+#create-user-overlay, #create-token-overlay, #token-created-overlay, #create-channel-overlay, #confirm-overlay,
+#create-schedule-overlay, #edit-schedule-overlay, #schedule-runs-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -969,6 +1023,10 @@
     grid-template-columns: 80px 1fr 80px;
   }
   #admin-channels .admin-col-created { display: none; }
+  #admin-schedules .admin-colheaders, #admin-schedules .admin-row {
+    grid-template-columns: 1fr 60px 80px 130px;
+  }
+  .admin-col-sschedule, .admin-col-starget, .admin-col-snext { display: none; }
 }
 
 /* ==========================================================================
@@ -981,7 +1039,7 @@
   .node-link, .dash-cell-node, .pagination button { transition: none; }
   .dash-row.has-link::after, .node-group-header::before { transition: none; }
   #new-ws-box select, #new-ws-box input, #new-ws-buttons button { transition: none; }
-  .admin-tab, .admin-row, .admin-btn-danger { transition: none; }
+  .admin-tab, .admin-row, .admin-btn-danger, .admin-btn-action { transition: none; }
   .admin-action-btn, .modal-cancel, .modal-submit { transition: none; }
   .admin-modal input, .admin-modal select { transition: none; }
 }

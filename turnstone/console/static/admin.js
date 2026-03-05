@@ -46,10 +46,13 @@ function switchAdminTab(tab) {
     tab === "tokens" ? "" : "none";
   document.getElementById("admin-channels").style.display =
     tab === "channels" ? "" : "none";
+  document.getElementById("admin-schedules").style.display =
+    tab === "schedules" ? "" : "none";
 
   if (tab === "users") loadAdminUsers();
   if (tab === "tokens") _populateTokenUserSelect();
   if (tab === "channels") _populateChannelUserSelect();
+  if (tab === "schedules") loadAdminSchedules();
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +377,511 @@ function confirmUnlinkChannel(channelType, channelUserId) {
 }
 
 // ---------------------------------------------------------------------------
+// Schedules
+// ---------------------------------------------------------------------------
+
+var _csTrapHandler = null;
+var _esTrapHandler = null;
+var _srTrapHandler = null;
+var _editScheduleTriggerEl = null;
+var _runsScheduleTriggerEl = null;
+
+function loadAdminSchedules() {
+  authFetch("/v1/api/admin/schedules")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load schedules");
+      return r.json();
+    })
+    .then(function (data) {
+      _renderSchedules(data.schedules || []);
+    })
+    .catch(function () {
+      document.getElementById("admin-schedules-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load schedules</div>';
+    });
+}
+
+function _renderSchedules(schedules) {
+  var container = document.getElementById("admin-schedules-table");
+  if (!schedules.length) {
+    container.innerHTML =
+      '<div class="dashboard-empty">No scheduled tasks. Create one to get started.</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < schedules.length; i++) {
+    var s = schedules[i];
+    var typeLabel = s.schedule_type === "cron" ? "cron" : "at";
+    var typeCls = s.schedule_type === "cron" ? "scope-write" : "scope-approve";
+    var schedule =
+      s.schedule_type === "cron"
+        ? s.cron_expr
+        : (s.at_time || "").slice(0, 16).replace("T", " ");
+    var target = s.target_mode;
+    var nextRun = s.next_run
+      ? escapeHtml(s.next_run).slice(0, 16).replace("T", " ")
+      : "\u2014";
+    var enabled = s.enabled;
+    var statusCls = enabled ? "sched-active" : "sched-disabled";
+    var statusLabel = enabled ? "active" : "disabled";
+    var statusDot = enabled ? "\u25cf " : "\u25cb ";
+    if (s.schedule_type === "at" && !enabled && s.last_run) {
+      statusCls = "sched-expired";
+      statusLabel = "completed";
+      statusDot = "\u25c9 ";
+    }
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-sname">' +
+      escapeHtml(s.name) +
+      "</span>" +
+      '<span class="admin-col admin-col-stype"><span class="scope-badge ' +
+      typeCls +
+      '">' +
+      typeLabel +
+      "</span></span>" +
+      '<span class="admin-col admin-col-sschedule"><code>' +
+      escapeHtml(schedule) +
+      "</code></span>" +
+      '<span class="admin-col admin-col-starget">' +
+      escapeHtml(target) +
+      "</span>" +
+      '<span class="admin-col admin-col-snext">' +
+      nextRun +
+      "</span>" +
+      '<span class="admin-col admin-col-sstatus"><span class="' +
+      statusCls +
+      '">' +
+      statusDot +
+      statusLabel +
+      "</span></span>" +
+      '<span class="admin-col admin-col-actions">' +
+      '<button class="admin-btn-action" data-edit-sched="' +
+      escapeHtml(s.task_id) +
+      '" title="Edit">edit</button>' +
+      '<button class="admin-btn-action" data-runs-sched="' +
+      escapeHtml(s.task_id) +
+      '" title="Run history">runs</button>' +
+      '<button class="admin-btn-action" data-toggle-sched="' +
+      escapeHtml(s.task_id) +
+      '" data-enabled="' +
+      (enabled ? "1" : "0") +
+      '" title="' +
+      (enabled ? "Disable" : "Enable") +
+      '">' +
+      (enabled ? "disable" : "enable") +
+      "</button>" +
+      '<button class="admin-btn-danger" data-delete-sched="' +
+      escapeHtml(s.task_id) +
+      '" data-sname="' +
+      escapeHtml(s.name) +
+      '" title="Delete">delete</button>' +
+      "</span></div>";
+  }
+  container.innerHTML = html;
+  // Bind buttons
+  var editBtns = container.querySelectorAll("[data-edit-sched]");
+  for (var j = 0; j < editBtns.length; j++) {
+    editBtns[j].addEventListener("click", function () {
+      showEditScheduleModal(this.getAttribute("data-edit-sched"));
+    });
+  }
+  var runsBtns = container.querySelectorAll("[data-runs-sched]");
+  for (var k = 0; k < runsBtns.length; k++) {
+    runsBtns[k].addEventListener("click", function () {
+      showScheduleRuns(this.getAttribute("data-runs-sched"));
+    });
+  }
+  var toggleBtns = container.querySelectorAll("[data-toggle-sched]");
+  for (var m = 0; m < toggleBtns.length; m++) {
+    toggleBtns[m].addEventListener("click", function () {
+      toggleSchedule(
+        this.getAttribute("data-toggle-sched"),
+        this.getAttribute("data-enabled") === "1",
+      );
+    });
+  }
+  var delBtns = container.querySelectorAll("[data-delete-sched]");
+  for (var n = 0; n < delBtns.length; n++) {
+    delBtns[n].addEventListener("click", function () {
+      confirmDeleteSchedule(
+        this.getAttribute("data-delete-sched"),
+        this.getAttribute("data-sname"),
+      );
+    });
+  }
+}
+
+function toggleSchedule(taskId, currentlyEnabled) {
+  authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: !currentlyEnabled }),
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error("Toggle failed");
+      showToast(currentlyEnabled ? "Schedule disabled" : "Schedule enabled");
+      loadAdminSchedules();
+    })
+    .catch(function () {
+      showToast("Failed to toggle schedule");
+    });
+}
+
+function confirmDeleteSchedule(taskId, name) {
+  showConfirmModal(
+    "Delete Schedule",
+    "Delete schedule \u2018" +
+      name +
+      "\u2019 and its run history? This cannot be undone.",
+    "Delete",
+    function () {
+      authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Delete failed");
+          showToast("Schedule deleted");
+          loadAdminSchedules();
+        })
+        .catch(function () {
+          showToast("Failed to delete schedule");
+        });
+    },
+  );
+}
+
+// --- Create Schedule Modal ---
+
+function toggleScheduleTypeFields() {
+  var t = document.getElementById("cs-type").value;
+  document.getElementById("cs-cron-group").style.display =
+    t === "cron" ? "" : "none";
+  document.getElementById("cs-at-group").style.display =
+    t === "at" ? "" : "none";
+  if (t === "cron") document.getElementById("cs-cron").focus();
+  else document.getElementById("cs-at").focus();
+}
+
+function toggleScheduleNodeField() {
+  var v = document.getElementById("cs-target").value;
+  document.getElementById("cs-node-group").style.display =
+    v === "node" ? "" : "none";
+  if (v === "node") document.getElementById("cs-node").focus();
+}
+
+function showCreateScheduleModal() {
+  var overlay = document.getElementById("create-schedule-overlay");
+  overlay.style.display = "flex";
+  document.getElementById("create-schedule-error").style.display = "none";
+  document.getElementById("cs-name").value = "";
+  document.getElementById("cs-desc").value = "";
+  document.getElementById("cs-type").value = "cron";
+  document.getElementById("cs-cron").value = "";
+  document.getElementById("cs-at").value = "";
+  document.getElementById("cs-target").value = "auto";
+  document.getElementById("cs-node").value = "";
+  document.getElementById("cs-model").value = "";
+  document.getElementById("cs-message").value = "";
+  document.getElementById("cs-autoapprove").checked = false;
+  toggleScheduleTypeFields();
+  toggleScheduleNodeField();
+  document.getElementById("cs-submit").disabled = false;
+  document.getElementById("cs-submit").textContent = "Create";
+  _csTrapHandler = _installTrap(
+    "create-schedule-overlay",
+    "create-schedule-box",
+  );
+  setTimeout(function () {
+    document.getElementById("cs-name").focus();
+  }, 50);
+}
+
+function hideCreateScheduleModal() {
+  document.getElementById("create-schedule-overlay").style.display = "none";
+  _csTrapHandler = _removeTrap(_csTrapHandler);
+  var trigger = document.querySelector("#admin-schedules .admin-action-btn");
+  if (trigger) trigger.focus();
+}
+
+function submitCreateSchedule() {
+  var name = (document.getElementById("cs-name").value || "").trim();
+  var desc = (document.getElementById("cs-desc").value || "").trim();
+  var schedType = document.getElementById("cs-type").value;
+  var cronExpr = (document.getElementById("cs-cron").value || "").trim();
+  var atTime = document.getElementById("cs-at").value || "";
+  var targetMode = document.getElementById("cs-target").value;
+  var nodeId = (document.getElementById("cs-node").value || "").trim();
+  var model = (document.getElementById("cs-model").value || "").trim();
+  var message = (document.getElementById("cs-message").value || "").trim();
+  var autoApprove = document.getElementById("cs-autoapprove").checked;
+  var errEl = document.getElementById("create-schedule-error");
+
+  if (!name) return _showModalError(errEl, "Name is required");
+  if (!message) return _showModalError(errEl, "Initial message is required");
+  if (schedType === "cron" && !cronExpr)
+    return _showModalError(errEl, "Cron expression is required");
+  if (schedType === "at" && !atTime)
+    return _showModalError(errEl, "Run time is required");
+
+  // Convert datetime-local to ISO8601
+  if (schedType === "at" && atTime) {
+    atTime = atTime.replace("T", "T") + ":00";
+  }
+
+  if (targetMode === "node") targetMode = nodeId;
+
+  var btn = document.getElementById("cs-submit");
+  btn.disabled = true;
+  btn.textContent = "Creating\u2026";
+
+  authFetch("/v1/api/admin/schedules", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name,
+      description: desc,
+      schedule_type: schedType,
+      cron_expr: cronExpr,
+      at_time: atTime,
+      target_mode: targetMode,
+      model: model,
+      initial_message: message,
+      auto_approve: autoApprove,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreateScheduleModal();
+      showToast("Schedule '" + name + "' created");
+      loadAdminSchedules();
+    })
+    .catch(function (err) {
+      btn.disabled = false;
+      btn.textContent = "Create";
+      _showModalError(errEl, err.message || "Failed to create schedule");
+    });
+}
+
+// --- Edit Schedule Modal ---
+
+function toggleEditScheduleTypeFields() {
+  var t = document.getElementById("es-type").value;
+  document.getElementById("es-cron-group").style.display =
+    t === "cron" ? "" : "none";
+  document.getElementById("es-at-group").style.display =
+    t === "at" ? "" : "none";
+  if (t === "cron") document.getElementById("es-cron").focus();
+  else document.getElementById("es-at").focus();
+}
+
+function toggleEditScheduleNodeField() {
+  var v = document.getElementById("es-target").value;
+  document.getElementById("es-node-group").style.display =
+    v === "node" ? "" : "none";
+  if (v === "node") document.getElementById("es-node").focus();
+}
+
+function showEditScheduleModal(taskId) {
+  _editScheduleTriggerEl = document.activeElement;
+  authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId))
+    .then(function (r) {
+      if (!r.ok) throw new Error("Not found");
+      return r.json();
+    })
+    .then(function (s) {
+      document.getElementById("es-id").value = s.task_id;
+      document.getElementById("es-name").value = s.name || "";
+      document.getElementById("es-desc").value = s.description || "";
+      document.getElementById("es-type").value = s.schedule_type;
+      document.getElementById("es-cron").value = s.cron_expr || "";
+      document.getElementById("es-at").value = (s.at_time || "").slice(0, 16);
+      var isSpecificNode =
+        s.target_mode &&
+        s.target_mode !== "auto" &&
+        s.target_mode !== "pool" &&
+        s.target_mode !== "all";
+      document.getElementById("es-target").value = isSpecificNode
+        ? "node"
+        : s.target_mode;
+      document.getElementById("es-node").value = isSpecificNode
+        ? s.target_mode
+        : "";
+      document.getElementById("es-model").value = s.model || "";
+      document.getElementById("es-message").value = s.initial_message || "";
+      document.getElementById("es-autoapprove").checked = !!s.auto_approve;
+      document.getElementById("es-enabled").checked = !!s.enabled;
+      toggleEditScheduleTypeFields();
+      toggleEditScheduleNodeField();
+      document.getElementById("edit-schedule-error").style.display = "none";
+      document.getElementById("es-submit").disabled = false;
+      document.getElementById("es-submit").textContent = "Save";
+      var overlay = document.getElementById("edit-schedule-overlay");
+      overlay.style.display = "flex";
+      _esTrapHandler = _installTrap(
+        "edit-schedule-overlay",
+        "edit-schedule-box",
+      );
+      setTimeout(function () {
+        document.getElementById("es-name").focus();
+      }, 50);
+    })
+    .catch(function () {
+      showToast("Failed to load schedule");
+    });
+}
+
+function hideEditScheduleModal() {
+  document.getElementById("edit-schedule-overlay").style.display = "none";
+  _esTrapHandler = _removeTrap(_esTrapHandler);
+  if (_editScheduleTriggerEl && _editScheduleTriggerEl.isConnected) {
+    _editScheduleTriggerEl.focus();
+  }
+  _editScheduleTriggerEl = null;
+}
+
+function submitEditSchedule() {
+  var taskId = document.getElementById("es-id").value;
+  var name = (document.getElementById("es-name").value || "").trim();
+  var message = (document.getElementById("es-message").value || "").trim();
+  var schedType = document.getElementById("es-type").value;
+  var cronExpr = (document.getElementById("es-cron").value || "").trim();
+  var targetMode = document.getElementById("es-target").value;
+  if (targetMode === "node")
+    targetMode = (document.getElementById("es-node").value || "").trim();
+  var atTime = document.getElementById("es-at").value || "";
+  if (atTime && atTime.length === 16) atTime += ":00";
+
+  var errEl = document.getElementById("edit-schedule-error");
+
+  if (!name) return _showModalError(errEl, "Name is required");
+  if (!message) return _showModalError(errEl, "Initial message is required");
+  if (schedType === "cron" && !cronExpr)
+    return _showModalError(errEl, "Cron expression is required");
+  if (schedType === "at" && !atTime)
+    return _showModalError(errEl, "Run time is required");
+
+  var btn = document.getElementById("es-submit");
+  btn.disabled = true;
+  btn.textContent = "Saving\u2026";
+
+  authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: (document.getElementById("es-name").value || "").trim(),
+      description: (document.getElementById("es-desc").value || "").trim(),
+      schedule_type: document.getElementById("es-type").value,
+      cron_expr: (document.getElementById("es-cron").value || "").trim(),
+      at_time: atTime,
+      target_mode: targetMode,
+      model: (document.getElementById("es-model").value || "").trim(),
+      initial_message: (
+        document.getElementById("es-message").value || ""
+      ).trim(),
+      auto_approve: document.getElementById("es-autoapprove").checked,
+      enabled: document.getElementById("es-enabled").checked,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideEditScheduleModal();
+      showToast("Schedule updated");
+      loadAdminSchedules();
+    })
+    .catch(function (err) {
+      btn.disabled = false;
+      btn.textContent = "Save";
+      _showModalError(errEl, err.message || "Failed to update schedule");
+    });
+}
+
+// --- Schedule Runs Modal ---
+
+function showScheduleRuns(taskId) {
+  _runsScheduleTriggerEl = document.activeElement;
+  authFetch(
+    "/v1/api/admin/schedules/" + encodeURIComponent(taskId) + "/runs?limit=50",
+  )
+    .then(function (r) {
+      if (!r.ok) throw new Error("Not found");
+      return r.json();
+    })
+    .then(function (data) {
+      var runs = data.runs || [];
+      var container = document.getElementById("schedule-runs-table");
+      if (!runs.length) {
+        container.innerHTML = '<div class="dashboard-empty">No runs yet</div>';
+      } else {
+        var html =
+          '<div class="admin-colheaders sched-runs-grid" aria-hidden="true">' +
+          '<span class="admin-col">STARTED</span>' +
+          '<span class="admin-col">NODE</span>' +
+          '<span class="admin-col">STATUS</span>' +
+          '<span class="admin-col">ERROR</span></div>';
+        for (var i = 0; i < runs.length; i++) {
+          var r = runs[i];
+          var statusCls =
+            r.status === "dispatched"
+              ? "sched-active"
+              : r.status === "failed"
+                ? "sched-expired"
+                : "";
+          html +=
+            '<div class="admin-row sched-runs-grid">' +
+            '<span class="admin-col">' +
+            escapeHtml(r.started || "")
+              .slice(0, 19)
+              .replace("T", " ") +
+            "</span>" +
+            '<span class="admin-col">' +
+            escapeHtml(r.node_id || "\u2014") +
+            "</span>" +
+            '<span class="admin-col"><span class="' +
+            statusCls +
+            '">' +
+            escapeHtml(r.status) +
+            "</span></span>" +
+            '<span class="admin-col">' +
+            escapeHtml(r.error || "\u2014") +
+            "</span></div>";
+        }
+        container.innerHTML = html;
+      }
+      var overlay = document.getElementById("schedule-runs-overlay");
+      overlay.style.display = "flex";
+      _srTrapHandler = _installTrap(
+        "schedule-runs-overlay",
+        "schedule-runs-box",
+      );
+    })
+    .catch(function () {
+      showToast("Failed to load run history");
+    });
+}
+
+function hideScheduleRunsModal() {
+  document.getElementById("schedule-runs-overlay").style.display = "none";
+  _srTrapHandler = _removeTrap(_srTrapHandler);
+  if (_runsScheduleTriggerEl && _runsScheduleTriggerEl.isConnected) {
+    _runsScheduleTriggerEl.focus();
+  }
+  _runsScheduleTriggerEl = null;
+}
+
+// ---------------------------------------------------------------------------
 // Create Channel Link Modal
 // ---------------------------------------------------------------------------
 
@@ -678,6 +1186,10 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "token-created-overlay") hideTokenCreatedModal();
         else if (overlayId === "create-channel-overlay")
           hideCreateChannelModal();
+        else if (overlayId === "create-schedule-overlay")
+          hideCreateScheduleModal();
+        else if (overlayId === "edit-schedule-overlay") hideEditScheduleModal();
+        else if (overlayId === "schedule-runs-overlay") hideScheduleRunsModal();
         else if (overlayId === "confirm-overlay") hideConfirmModal();
       }
     };
@@ -721,6 +1233,24 @@ document.addEventListener("keydown", function (e) {
     hideCreateChannelModal();
     return;
   }
+  var cso = document.getElementById("create-schedule-overlay");
+  if (cso && cso.style.display !== "none") {
+    e.preventDefault();
+    hideCreateScheduleModal();
+    return;
+  }
+  var eso = document.getElementById("edit-schedule-overlay");
+  if (eso && eso.style.display !== "none") {
+    e.preventDefault();
+    hideEditScheduleModal();
+    return;
+  }
+  var sro = document.getElementById("schedule-runs-overlay");
+  if (sro && sro.style.display !== "none") {
+    e.preventDefault();
+    hideScheduleRunsModal();
+    return;
+  }
   var cf = document.getElementById("confirm-overlay");
   if (cf && cf.style.display !== "none") {
     e.preventDefault();
@@ -735,7 +1265,7 @@ document.addEventListener("keydown", function (e) {
   if (!tablist) return;
   tablist.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var tabOrder = ["users", "tokens", "channels"];
+    var tabOrder = ["users", "tokens", "channels", "schedules"];
     var idx = tabOrder.indexOf(_adminTab);
     if (e.key === "ArrowRight") idx = (idx + 1) % tabOrder.length;
     else idx = (idx - 1 + tabOrder.length) % tabOrder.length;

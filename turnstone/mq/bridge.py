@@ -362,6 +362,9 @@ class Bridge:
         model = getattr(msg, "model", "")
         initial_message = getattr(msg, "initial_message", "")
         resume_session = getattr(msg, "resume_session", "")
+        user_id = getattr(msg, "user_id", "")
+        if user_id:
+            log.info("bridge.create_ws user_id=%s name=%s model=%s", user_id, name, model)
         ws_id, resumed = self._create_ws_on_server(
             name=name,
             auto_approve=auto_approve,

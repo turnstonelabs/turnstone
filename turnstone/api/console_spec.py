@@ -23,13 +23,18 @@ from turnstone.api.schemas import (
     AuthSetupRequest,
     AuthSetupResponse,
     AuthStatusResponse,
+    CreateScheduleRequest,
     CreateTokenRequest,
     CreateTokenResponse,
     CreateUserRequest,
     ErrorResponse,
+    ListScheduleRunsResponse,
+    ListSchedulesResponse,
     ListTokensResponse,
     ListUsersResponse,
+    ScheduleInfo,
     StatusResponse,
+    UpdateScheduleRequest,
     UserInfo,
 )
 
@@ -182,6 +187,61 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[404],
         tags=["Admin"],
     ),
+    # --- Schedules ---
+    EndpointSpec(
+        "/v1/api/admin/schedules",
+        "GET",
+        "List all scheduled tasks",
+        response_model=ListSchedulesResponse,
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/schedules",
+        "POST",
+        "Create a scheduled task",
+        request_model=CreateScheduleRequest,
+        response_model=ScheduleInfo,
+        error_codes=[400],
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/schedules/{task_id}",
+        "GET",
+        "Get a scheduled task",
+        response_model=ScheduleInfo,
+        error_codes=[404],
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/schedules/{task_id}",
+        "PUT",
+        "Update a scheduled task",
+        request_model=UpdateScheduleRequest,
+        response_model=ScheduleInfo,
+        error_codes=[400, 404],
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/schedules/{task_id}",
+        "DELETE",
+        "Delete a scheduled task",
+        response_model=StatusResponse,
+        error_codes=[404],
+        tags=["Schedules"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/schedules/{task_id}/runs",
+        "GET",
+        "List run history for a scheduled task",
+        response_model=ListScheduleRunsResponse,
+        query_params=[
+            QueryParam(
+                "limit", "Max results (default 50, max 200)", schema_type="integer", default=50
+            ),
+        ],
+        error_codes=[404],
+        tags=["Schedules"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -213,6 +273,11 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    CreateScheduleRequest,
+    UpdateScheduleRequest,
+    ScheduleInfo,
+    ListSchedulesResponse,
+    ListScheduleRunsResponse,
 ]
 
 

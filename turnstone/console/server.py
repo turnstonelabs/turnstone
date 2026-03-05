@@ -620,8 +620,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
         headers=headers,
     )
+    # Start scheduler if configured
+    scheduler = getattr(app.state, "scheduler", None)
+    if scheduler is not None:
+        scheduler.start()
     yield
     # Shutdown
+    if scheduler is not None:
+        scheduler.stop()
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
@@ -879,6 +885,265 @@ async def admin_delete_channel(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin API endpoints — scheduled tasks
+# ---------------------------------------------------------------------------
+
+
+def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
+    """Convert DB row ints/csv to JSON-friendly bools/lists."""
+    tools_str = task.get("auto_approve_tools", "")
+    task["auto_approve_tools"] = [s.strip() for s in tools_str.split(",") if s.strip()]
+    task["auto_approve"] = bool(task.get("auto_approve", 0))
+    task["enabled"] = bool(task.get("enabled", 1))
+    return task
+
+
+def _compute_next_run(schedule_type: str, cron_expr: str, at_time: str) -> str:
+    """Compute the next run time for a schedule. Empty string if invalid."""
+    if schedule_type == "at":
+        return at_time
+    if schedule_type == "cron" and cron_expr:
+        from datetime import UTC, datetime
+
+        from croniter import croniter
+
+        cron = croniter(cron_expr, datetime.now(UTC))
+        next_dt = cron.get_next(datetime)
+        return str(next_dt.strftime("%Y-%m-%dT%H:%M:%S"))
+    return ""
+
+
+def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) -> str | None:
+    """Validate schedule type/expression. Returns error string or None."""
+    if schedule_type not in ("cron", "at"):
+        return "schedule_type must be 'cron' or 'at'"
+    if schedule_type == "cron":
+        if not cron_expr:
+            return "cron_expr is required when schedule_type is 'cron'"
+        from croniter import croniter
+
+        if not croniter.is_valid(cron_expr):
+            return f"Invalid cron expression: {cron_expr}"
+    if schedule_type == "at":
+        if not at_time:
+            return "at_time is required when schedule_type is 'at'"
+        from datetime import UTC, datetime
+
+        try:
+            dt = datetime.fromisoformat(at_time)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            if dt <= datetime.now(UTC):
+                return "at_time must be in the future"
+        except ValueError:
+            return "at_time must be a valid ISO8601 timestamp"
+    return None
+
+
+async def admin_list_schedules(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/schedules — list all scheduled tasks."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    tasks = storage.list_scheduled_tasks()
+    for t in tasks:
+        _normalize_task_dict(t)
+    return JSONResponse({"schedules": tasks})
+
+
+async def admin_create_schedule(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/schedules — create a scheduled task."""
+    import uuid
+
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:256]
+    description = str(body.get("description", "")).strip()[:1024]
+    schedule_type = str(body.get("schedule_type", "")).strip()
+    cron_expr = str(body.get("cron_expr", "")).strip()[:256]
+    at_time = str(body.get("at_time", "")).strip()[:64]
+    target_mode = str(body.get("target_mode", "auto")).strip()[:256]
+    model = str(body.get("model", "")).strip()[:128]
+    initial_message = str(body.get("initial_message", "")).strip()[:4096]
+    auto_approve = bool(body.get("auto_approve", False))
+    raw_tools = body.get("auto_approve_tools", [])
+    auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
+    enabled = bool(body.get("enabled", True))
+
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if not initial_message:
+        return JSONResponse({"error": "initial_message is required"}, status_code=400)
+
+    validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
+    if validation_err:
+        return JSONResponse({"error": validation_err}, status_code=400)
+
+    if not target_mode:
+        return JSONResponse({"error": "target_mode is required"}, status_code=400)
+
+    # Cap total schedule count to prevent unbounded growth
+    max_schedules = 200
+    existing = storage.list_scheduled_tasks()
+    if len(existing) >= max_schedules:
+        return JSONResponse(
+            {"error": f"Maximum of {max_schedules} schedules reached"}, status_code=409
+        )
+
+    next_run = _compute_next_run(schedule_type, cron_expr, at_time)
+    task_id = uuid.uuid4().hex
+    created_by = getattr(getattr(request, "state", None), "user_id", "")
+
+    storage.create_scheduled_task(
+        task_id=task_id,
+        name=name,
+        description=description,
+        schedule_type=schedule_type,
+        cron_expr=cron_expr,
+        at_time=at_time,
+        target_mode=target_mode,
+        model=model,
+        initial_message=initial_message,
+        auto_approve=auto_approve,
+        auto_approve_tools=auto_approve_tools,
+        created_by=created_by,
+        next_run=next_run if enabled else "",
+    )
+    task = storage.get_scheduled_task(task_id)
+    if task:
+        _normalize_task_dict(task)
+    return JSONResponse(task)
+
+
+async def admin_get_schedule(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/schedules/{task_id} — get single task."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    task_id = request.path_params["task_id"]
+    task = storage.get_scheduled_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+    _normalize_task_dict(task)
+    return JSONResponse(task)
+
+
+async def admin_update_schedule(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/schedules/{task_id} — partial update."""
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    task_id = request.path_params["task_id"]
+
+    existing = storage.get_scheduled_task(task_id)
+    if existing is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        updates["name"] = str(body["name"]).strip()[:256]
+    if "description" in body:
+        updates["description"] = str(body["description"]).strip()[:1024]
+    if "schedule_type" in body:
+        updates["schedule_type"] = str(body["schedule_type"]).strip()
+    if "cron_expr" in body:
+        updates["cron_expr"] = str(body["cron_expr"]).strip()[:256]
+    if "at_time" in body:
+        updates["at_time"] = str(body["at_time"]).strip()[:64]
+    if "target_mode" in body:
+        updates["target_mode"] = str(body["target_mode"]).strip()[:256]
+    if "model" in body:
+        updates["model"] = str(body["model"]).strip()[:128]
+    if "initial_message" in body:
+        updates["initial_message"] = str(body["initial_message"]).strip()[:4096]
+    if "auto_approve" in body:
+        updates["auto_approve"] = bool(body["auto_approve"])
+    if "auto_approve_tools" in body:
+        raw = body["auto_approve_tools"]
+        updates["auto_approve_tools"] = raw if isinstance(raw, list) else []
+    if "enabled" in body:
+        updates["enabled"] = bool(body["enabled"])
+
+    # Validate schedule fields if changed
+    stype = updates.get("schedule_type", existing["schedule_type"])
+    cexpr = updates.get("cron_expr", existing["cron_expr"])
+    atime = updates.get("at_time", existing["at_time"])
+    if "schedule_type" in updates or "cron_expr" in updates or "at_time" in updates:
+        validation_err = _validate_schedule_fields(stype, cexpr, atime)
+        if validation_err:
+            return JSONResponse({"error": validation_err}, status_code=400)
+
+    # Recompute next_run if schedule changed
+    if any(k in updates for k in ("schedule_type", "cron_expr", "at_time", "enabled")):
+        enabled = updates.get("enabled", bool(existing.get("enabled", 1)))
+        if enabled:
+            updates["next_run"] = _compute_next_run(stype, cexpr, atime)
+        else:
+            updates["next_run"] = ""
+
+    storage.update_scheduled_task(task_id, **updates)
+    task = storage.get_scheduled_task(task_id)
+    if task:
+        tools_str = task.get("auto_approve_tools", "")
+        task["auto_approve_tools"] = [s.strip() for s in tools_str.split(",") if s.strip()]
+        task["auto_approve"] = bool(task.get("auto_approve", 0))
+        task["enabled"] = bool(task.get("enabled", 1))
+    return JSONResponse(task)
+
+
+async def admin_delete_schedule(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/schedules/{task_id} — delete task + runs."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    task_id = request.path_params["task_id"]
+    if storage.delete_scheduled_task(task_id):
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+
+async def admin_list_schedule_runs(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/schedules/{task_id}/runs — run history."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    task_id = request.path_params["task_id"]
+
+    # Verify task exists
+    if storage.get_scheduled_task(task_id) is None:
+        return JSONResponse({"error": "Schedule not found"}, status_code=404)
+
+    try:
+        limit = min(int(request.query_params.get("limit", "50")), 200)
+    except (ValueError, TypeError):
+        limit = 50
+    runs = storage.list_task_runs(task_id, limit=limit)
+    return JSONResponse({"runs": runs})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -937,6 +1202,16 @@ def create_app(
                         admin_delete_channel,
                         methods=["DELETE"],
                     ),
+                    Route("/api/admin/schedules", admin_list_schedules),
+                    Route("/api/admin/schedules", admin_create_schedule, methods=["POST"]),
+                    Route("/api/admin/schedules/{task_id}", admin_get_schedule),
+                    Route("/api/admin/schedules/{task_id}", admin_update_schedule, methods=["PUT"]),
+                    Route(
+                        "/api/admin/schedules/{task_id}",
+                        admin_delete_schedule,
+                        methods=["DELETE"],
+                    ),
+                    Route("/api/admin/schedules/{task_id}/runs", admin_list_schedule_runs),
                 ],
             ),
             Route("/health", health),
@@ -966,6 +1241,20 @@ def create_app(
     from turnstone.core.auth import LoginRateLimiter
 
     app.state.login_limiter = LoginRateLimiter()
+
+    # Scheduler — start background thread if storage is available
+    if auth_storage is not None:
+        from turnstone.console.scheduler import TaskScheduler
+
+        scheduler = TaskScheduler(
+            broker=broker,
+            collector=collector,
+            storage=auth_storage,
+        )
+        app.state.scheduler = scheduler
+    else:
+        app.state.scheduler = None
+
     return app
 
 

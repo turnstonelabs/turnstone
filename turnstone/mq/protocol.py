@@ -96,6 +96,7 @@ class CreateWorkstreamMessage(InboundMessage):
     model: str = ""
     initial_message: str = ""
     resume_session: str = ""
+    user_id: str = ""
 
 
 @dataclass

@@ -155,3 +155,87 @@ class AuthStatusResponse(BaseModel):
     auth_enabled: bool
     has_users: bool
     setup_required: bool
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+
+class CreateScheduleRequest(BaseModel):
+    """POST /v1/api/admin/schedules request body."""
+
+    name: str = Field(description="Human-readable schedule name")
+    description: str = Field(default="", description="Optional description")
+    schedule_type: str = Field(description="'cron' or 'at'")
+    cron_expr: str = Field(default="", description="Cron expression (when schedule_type='cron')")
+    at_time: str = Field(default="", description="ISO8601 timestamp (when schedule_type='at')")
+    target_mode: str = Field(default="auto", description="auto, pool, all, or specific node_id")
+    model: str = Field(default="", description="Model alias for the workstream")
+    initial_message: str = Field(description="Message sent to the new workstream")
+    auto_approve: bool = Field(default=False)
+    auto_approve_tools: list[str] = Field(default_factory=list)
+    enabled: bool = Field(default=True)
+
+
+class UpdateScheduleRequest(BaseModel):
+    """PUT /v1/api/admin/schedules/{task_id} request body (partial update)."""
+
+    name: str | None = None
+    description: str | None = None
+    schedule_type: str | None = None
+    cron_expr: str | None = None
+    at_time: str | None = None
+    target_mode: str | None = None
+    model: str | None = None
+    initial_message: str | None = None
+    auto_approve: bool | None = None
+    auto_approve_tools: list[str] | None = None
+    enabled: bool | None = None
+
+
+class ScheduleInfo(BaseModel):
+    """Scheduled task details."""
+
+    task_id: str
+    name: str
+    description: str = ""
+    schedule_type: str
+    cron_expr: str = ""
+    at_time: str = ""
+    target_mode: str = "auto"
+    model: str = ""
+    initial_message: str
+    auto_approve: bool = False
+    auto_approve_tools: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    created_by: str = ""
+    last_run: str | None = None
+    next_run: str | None = None
+    created: str = ""
+    updated: str = ""
+
+
+class ListSchedulesResponse(BaseModel):
+    """GET /v1/api/admin/schedules response."""
+
+    schedules: list[ScheduleInfo]
+
+
+class ScheduleRunInfo(BaseModel):
+    """Single execution record for a scheduled task."""
+
+    run_id: str
+    task_id: str
+    node_id: str = ""
+    ws_id: str = ""
+    correlation_id: str = ""
+    started: str
+    status: str = "dispatched"
+    error: str = ""
+
+
+class ListScheduleRunsResponse(BaseModel):
+    """GET /v1/api/admin/schedules/{task_id}/runs response."""
+
+    runs: list[ScheduleRunInfo]

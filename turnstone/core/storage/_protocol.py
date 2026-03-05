@@ -249,6 +249,69 @@ class StorageBackend(Protocol):
         """Remove a channel route. Returns True if existed."""
         ...
 
+    # -- Scheduled tasks -------------------------------------------------------
+
+    def create_scheduled_task(
+        self,
+        task_id: str,
+        name: str,
+        description: str,
+        schedule_type: str,
+        cron_expr: str,
+        at_time: str,
+        target_mode: str,
+        model: str,
+        initial_message: str,
+        auto_approve: bool,
+        auto_approve_tools: list[str],
+        created_by: str,
+        next_run: str,
+    ) -> None:
+        """Create a scheduled task. No-op if task_id already exists."""
+        ...
+
+    def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
+        """Return scheduled task dict or None."""
+        ...
+
+    def list_scheduled_tasks(self) -> list[dict[str, Any]]:
+        """Return all scheduled tasks ordered by created DESC."""
+        ...
+
+    def update_scheduled_task(self, task_id: str, **fields: Any) -> bool:
+        """Update specified fields on a scheduled task. Returns True if found."""
+        ...
+
+    def delete_scheduled_task(self, task_id: str) -> bool:
+        """Delete a scheduled task and its run history. Returns True if found."""
+        ...
+
+    def list_due_tasks(self, now: str) -> list[dict[str, Any]]:
+        """Return enabled tasks whose next_run <= now, ordered by next_run."""
+        ...
+
+    def record_task_run(
+        self,
+        run_id: str,
+        task_id: str,
+        node_id: str,
+        ws_id: str,
+        correlation_id: str,
+        started: str,
+        status: str,
+        error: str,
+    ) -> None:
+        """Record a scheduled task execution."""
+        ...
+
+    def list_task_runs(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """List run history for a task, ordered by started DESC."""
+        ...
+
+    def prune_task_runs(self, retention_days: int = 90) -> int:
+        """Delete task runs older than retention_days. Returns count deleted."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
