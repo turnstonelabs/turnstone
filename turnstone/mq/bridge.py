@@ -76,6 +76,7 @@ class Bridge:
         node_id: str = "",
         heartbeat_ttl: int = 60,
         auth_token: str = "",
+        token_manager: Any = None,
     ) -> None:
         self._server_url = server_url.rstrip("/")
         self._broker = broker or RedisBroker()
@@ -85,12 +86,16 @@ class Bridge:
         self._heartbeat_ttl = heartbeat_ttl
         self._started_at = time.time()
         self._auth_token = auth_token
+        self._token_manager = token_manager  # ServiceTokenManager (auto-rotating)
 
-        # Shared httpx client for short-lived POST requests (main thread only)
-        headers: dict[str, str] = {}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        self._http = httpx.Client(base_url=self._server_url, timeout=30, headers=headers)
+        # Shared httpx client for short-lived POST requests (main thread only).
+        # Auth headers refreshed per-request via event hook so auto-rotating
+        # tokens are picked up transparently.
+        self._http = httpx.Client(
+            base_url=self._server_url,
+            timeout=30,
+            event_hooks={"request": [self._inject_auth]},
+        )
 
         # Protected by _lock — accessed from main, global SSE, and per-ws SSE threads
         self._lock = threading.Lock()
@@ -101,6 +106,21 @@ class Bridge:
         self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
         self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
         self._running = True
+
+    @property
+    def _auth_headers(self) -> dict[str, str]:
+        """Return current Authorization header, auto-rotating if managed."""
+        if self._token_manager is not None:
+            return dict(self._token_manager.bearer_header)
+        if self._auth_token:
+            return {"Authorization": f"Bearer {self._auth_token}"}
+        return {}
+
+    def _inject_auth(self, request: httpx.Request) -> None:
+        """httpx event hook: inject current auth header into each request."""
+        headers = self._auth_headers
+        for k, v in headers.items():
+            request.headers[k] = v
 
     # -- thread context helper ------------------------------------------------
 
@@ -509,12 +529,12 @@ class Bridge:
 
     def _ws_sse_loop(self, ws_id: str) -> None:
         """Consume per-workstream SSE and forward events."""
-        # Each SSE thread gets its own httpx client (not thread-safe to share)
-        sse_headers: dict[str, str] = {}
-        if self._auth_token:
-            sse_headers["Authorization"] = f"Bearer {self._auth_token}"
+        # Each SSE thread gets its own httpx client (not thread-safe to share).
+        # Use event hooks so auth headers refresh on each reconnect.
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=sse_headers
+            base_url=self._server_url,
+            timeout=None,
+            event_hooks={"request": [self._inject_auth]},
         ) as sse_client:
             while self._running:
                 try:
@@ -694,12 +714,12 @@ class Bridge:
     # -- global SSE ----------------------------------------------------------
 
     def _global_sse_loop(self) -> None:
-        # Own httpx client for the long-lived SSE connection
-        sse_headers: dict[str, str] = {}
-        if self._auth_token:
-            sse_headers["Authorization"] = f"Bearer {self._auth_token}"
+        # Own httpx client for the long-lived SSE connection.
+        # Use event hooks so auth headers refresh on each reconnect.
         with httpx.Client(
-            base_url=self._server_url, timeout=None, headers=sse_headers
+            base_url=self._server_url,
+            timeout=None,
+            event_hooks={"request": [self._inject_auth]},
         ) as sse_client:
             while self._running:
                 try:
@@ -818,20 +838,9 @@ def main() -> None:
         default="http://localhost:8080",
         help="turnstone-server URL (default: %(default)s)",
     )
-    parser.add_argument(
-        "--redis-host", default="localhost", help="Redis host (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--redis-port", type=int, default=6379, help="Redis port (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--redis-password",
-        default=os.environ.get("REDIS_PASSWORD"),
-        help="Redis password (default: $REDIS_PASSWORD)",
-    )
-    parser.add_argument(
-        "--redis-db", type=int, default=0, help="Redis DB number (default: %(default)s)"
-    )
+    from turnstone.mq.broker import add_redis_args
+
+    add_redis_args(parser)
     parser.add_argument(
         "--approval-timeout",
         type=float,
@@ -849,18 +858,9 @@ def main() -> None:
         default=60,
         help="Heartbeat TTL in seconds (default: %(default)s)",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto — JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
     parser.add_argument(
         "--auth-token",
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
@@ -871,36 +871,39 @@ def main() -> None:
     apply_config(parser, ["bridge", "redis", "auth"])
     args = parser.parse_args()
 
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="bridge",
-    )
+    configure_logging_from_args(args, "bridge")
 
-    broker = RedisBroker(
-        host=args.redis_host,
-        port=args.redis_port,
-        db=args.redis_db,
-        password=args.redis_password,
-    )
-    # If no explicit auth token is provided, mint a service JWT using the
-    # shared secret so the bridge can authenticate to the server.
+    from turnstone.mq.broker import broker_from_args
+
+    broker = broker_from_args(args)
+    # If no explicit auth token is provided, use a ServiceTokenManager
+    # so bridge JWTs auto-rotate (1-hour expiry, refreshed at 80%).
+    # A shared JWT secret is required for multi-service deployments —
+    # ephemeral secrets differ per process and break inter-service auth.
     auth_token = args.auth_token
+    token_manager = None
     if not auth_token:
         jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
-        if jwt_secret:
-            from turnstone.core.auth import create_jwt
-
-            auth_token = create_jwt(
-                user_id="bridge",
-                scopes=frozenset({"approve"}),
-                source="bridge",
-                secret=jwt_secret,
-                expiry_hours=168,  # 1 week — bridge restarts refresh
+        if not jwt_secret:
+            log.error(
+                "TURNSTONE_JWT_SECRET is not set and no --auth-token provided. "
+                "The bridge cannot authenticate to the server. Set TURNSTONE_JWT_SECRET "
+                "to a shared secret (at least 32 characters) or pass --auth-token."
             )
-            log.info("bridge.jwt_minted")
+            raise SystemExit(1)
+        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
+
+        token_manager = ServiceTokenManager(
+            user_id="bridge",
+            scopes=frozenset({"approve"}),
+            source="bridge",
+            secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
+            expiry_hours=1,
+        )
+        log.info("bridge.jwt_minted")
 
     bridge = Bridge(
         server_url=args.server_url,
@@ -909,6 +912,7 @@ def main() -> None:
         node_id=args.node_id,
         heartbeat_ttl=args.heartbeat_ttl,
         auth_token=auth_token,
+        token_manager=token_manager,
     )
     bridge.run()
 

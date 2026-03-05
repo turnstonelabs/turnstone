@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, Any
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
@@ -41,6 +40,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
+from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
@@ -61,8 +61,6 @@ log = logging.getLogger(__name__)
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"
 _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-_CSS = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
-_JS = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -337,55 +335,6 @@ def _build_history(
 # ---------------------------------------------------------------------------
 
 
-class AuthMiddleware:
-    """Check auth tokens on every HTTP request."""
-
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        request = Request(scope)
-        # Skip auth for CORS preflight — CORSMiddleware handles it
-        if request.method == "OPTIONS":
-            await self.app(scope, receive, send)
-            return
-        from turnstone.core.auth import check_request
-
-        auth_config = request.app.state.auth_config
-        jwt_secret = getattr(request.app.state, "jwt_secret", "")
-        storage = getattr(request.app.state, "auth_storage", None)
-        method = request.method
-        path = request.url.path
-        auth_header = request.headers.get("Authorization")
-        cookie_header = request.headers.get("Cookie")
-        allowed, status, msg, auth_result = check_request(
-            auth_config,
-            method,
-            path,
-            auth_header,
-            cookie_header,
-            jwt_secret=jwt_secret,
-            storage=storage,
-        )
-        if not allowed:
-            response = JSONResponse({"error": msg}, status_code=status)
-            await response(scope, receive, send)
-            return
-
-        # Set user_id in log context and stash auth result for handlers
-        if auth_result and auth_result.user_id:
-            from turnstone.core.log import ctx_user_id
-
-            ctx_user_id.set(auth_result.user_id)
-        if "state" not in scope:
-            scope["state"] = {}
-        scope["state"]["auth_result"] = auth_result
-        await self.app(scope, receive, send)
-
-
 class RateLimitMiddleware:
     """Per-IP token-bucket rate limiting."""
 
@@ -486,15 +435,6 @@ class LogContextMiddleware:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-async def _read_json(request: Request) -> dict[str, Any]:
-    """Read JSON body from request, returning {} on invalid/missing JSON."""
-    try:
-        body: dict[str, Any] = await request.json()
-        return body
-    except (ValueError, json.JSONDecodeError):
-        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -711,20 +651,19 @@ async def list_sessions_endpoint(request: Request) -> JSONResponse:
     return JSONResponse({"sessions": sessions})
 
 
+def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
+    """Count workstream states for health/metrics endpoints."""
+    counts = dict.fromkeys(("idle", "thinking", "running", "attention", "error"), 0)
+    for ws in wss:
+        counts[ws.state.value] = counts.get(ws.state.value, 0) + 1
+    return counts
+
+
 async def health(request: Request) -> JSONResponse:
     """GET /health — server health status."""
     mgr: WorkstreamManager = request.app.state.workstreams
     wss = mgr.list_all()
-    states: dict[str, int] = {
-        "idle": 0,
-        "thinking": 0,
-        "running": 0,
-        "attention": 0,
-        "error": 0,
-    }
-    for ws in wss:
-        state = ws.state.value
-        states[state] = states.get(state, 0) + 1
+    states = _count_ws_states(wss)
     monitor = getattr(request.app.state, "health_monitor", None)
     backend_ok = monitor.is_healthy if monitor else True
     data: dict[str, Any] = {
@@ -746,17 +685,9 @@ async def metrics_endpoint(request: Request) -> Response:
     """GET /metrics — Prometheus text exposition format."""
     mgr: WorkstreamManager = request.app.state.workstreams
     wss = mgr.list_all()
-    states: dict[str, int] = {
-        "idle": 0,
-        "thinking": 0,
-        "running": 0,
-        "attention": 0,
-        "error": 0,
-    }
+    states = _count_ws_states(wss)
     ws_data = []
     for ws in wss:
-        state = ws.state.value
-        states[state] = states.get(state, 0) + 1
         ui: WebUI = ws.ui  # type: ignore[assignment]
         with ui._ws_lock:
             ws_data.append(
@@ -781,7 +712,11 @@ async def metrics_endpoint(request: Request) -> Response:
 
 async def send_message(request: Request) -> JSONResponse:
     """POST /v1/api/send — send a user message to the workstream."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     message = body.get("message", "").strip()
     ws_id = body.get("ws_id")
     if not message:
@@ -821,7 +756,11 @@ async def send_message(request: Request) -> JSONResponse:
 
 async def approve(request: Request) -> JSONResponse:
     """POST /v1/api/approve — approve or deny a tool call."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     approved = body.get("approved", False)
     feedback = body.get("feedback")
     always = body.get("always", False)
@@ -838,7 +777,11 @@ async def approve(request: Request) -> JSONResponse:
 
 async def plan_feedback(request: Request) -> JSONResponse:
     """POST /v1/api/plan — respond to a plan review."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     feedback = body.get("feedback", "")
     ws_id = body.get("ws_id")
     mgr = request.app.state.workstreams
@@ -851,7 +794,11 @@ async def plan_feedback(request: Request) -> JSONResponse:
 
 async def command(request: Request) -> JSONResponse:
     """POST /v1/api/command — execute a slash command."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     cmd = body.get("command", "").strip()
     ws_id = body.get("ws_id")
     if not cmd:
@@ -892,7 +839,11 @@ async def command(request: Request) -> JSONResponse:
 
 async def create_workstream(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/new — create a new workstream."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     mgr: WorkstreamManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
     try:
@@ -953,7 +904,11 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 async def close_workstream(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/close — close a workstream."""
-    body = await _read_json(request)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
     ws_id = str(body.get("ws_id", ""))
     mgr = request.app.state.workstreams
     if mgr.close(ws_id):
@@ -962,179 +917,31 @@ async def close_workstream(request: Request) -> JSONResponse:
 
 
 async def auth_login(request: Request) -> Response:
-    """POST /v1/api/auth/login — authenticate and return JWT.
+    """POST /v1/api/auth/login — authenticate and return JWT."""
+    from turnstone.core.auth import handle_auth_login
 
-    Accepts either:
-    - ``{"username": "...", "password": "..."}`` — credential-based login
-    - ``{"token": "..."}`` — legacy token-based login
-    """
-    from turnstone.core.auth import (
-        AuthResult,
-        _authenticate_token,
-        create_jwt,
-        make_set_cookie,
-        verify_password,
-    )
-
-    body = await _read_json(request)
-    auth_config = request.app.state.auth_config
-    jwt_secret = getattr(request.app.state, "jwt_secret", "")
-    storage = getattr(request.app.state, "auth_storage", None)
-
-    result: AuthResult | None = None
-    username = body.get("username", "")
-    password = body.get("password", "")
-
-    if username and password and storage is not None:
-        user = storage.get_user_by_username(username)
-        if user and verify_password(password, user["password_hash"]):
-            result = AuthResult(
-                user_id=user["user_id"],
-                scopes=frozenset({"read", "write", "approve"}),
-                token_source="password",
-            )
-    elif body.get("token"):
-        result = _authenticate_token(
-            body["token"],
-            auth_config,
-            jwt_secret=jwt_secret,
-            storage=storage,
-        )
-
-    if result is None:
-        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
-
-    jwt_token = ""
-    if jwt_secret:
-        jwt_token = create_jwt(
-            user_id=result.user_id,
-            scopes=result.scopes,
-            source=result.token_source,
-            secret=jwt_secret,
-        )
-
-    role = "full" if result.has_scope("write") else "read"
-    scopes_str = ",".join(sorted(result.scopes))
-    resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
-    if jwt_token:
-        resp_body["jwt"] = jwt_token
-    if result.user_id:
-        resp_body["user_id"] = result.user_id
-
-    response = JSONResponse(resp_body)
-    cookie_value = jwt_token if jwt_token else body.get("token", "")
-    if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value)
-    return response
+    return await handle_auth_login(request, JWT_AUD_SERVER)
 
 
 async def auth_logout(request: Request) -> Response:
     """POST /v1/api/auth/logout — clear auth cookie."""
-    from turnstone.core.auth import make_clear_cookie
+    from turnstone.core.auth import handle_auth_logout
 
-    response = JSONResponse({"status": "ok"})
-    response.headers["Set-Cookie"] = make_clear_cookie()
-    return response
+    return await handle_auth_logout(request)
 
 
-async def auth_status(request: Request) -> JSONResponse:
+async def auth_status(request: Request) -> Response:
     """GET /v1/api/auth/status — public endpoint for login UI state detection."""
-    auth_config = request.app.state.auth_config
-    storage = getattr(request.app.state, "auth_storage", None)
+    from turnstone.core.auth import handle_auth_status
 
-    has_users = False
-    if storage is not None:
-        try:
-            users = storage.list_users()
-            has_users = len(users) > 0
-        except Exception:
-            pass
-
-    return JSONResponse(
-        {
-            "auth_enabled": auth_config.enabled,
-            "has_users": has_users,
-            "setup_required": auth_config.enabled and not has_users,
-        }
-    )
+    return await handle_auth_status(request)
 
 
-async def auth_setup(request: Request) -> JSONResponse:
+async def auth_setup(request: Request) -> Response:
     """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
-    import uuid
+    from turnstone.core.auth import handle_auth_setup
 
-    from turnstone.core.auth import create_jwt, hash_password, make_set_cookie
-
-    storage = getattr(request.app.state, "auth_storage", None)
-    jwt_secret = getattr(request.app.state, "jwt_secret", "")
-
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
-
-    body = await _read_json(request)
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
-    password = body.get("password", "")
-
-    from turnstone.core.auth import is_valid_username
-
-    if not is_valid_username(username):
-        return JSONResponse(
-            {"error": "Invalid username (1-64 chars: letters, digits, . _ -)"},
-            status_code=400,
-        )
-    if not display_name:
-        return JSONResponse({"error": "display_name is required"}, status_code=400)
-    if len(password) < 8:
-        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
-
-    user_id = uuid.uuid4().hex
-    pw_hash = hash_password(password)
-
-    # Atomic: insert only if no users exist (prevents TOCTOU race)
-    try:
-        created = storage.create_first_user(user_id, username, display_name, pw_hash)
-    except Exception:
-        return JSONResponse({"error": "Storage error"}, status_code=503)
-    if not created:
-        return JSONResponse({"error": "Setup already completed"}, status_code=409)
-
-    scopes = frozenset({"read", "write", "approve"})
-    jwt_token = ""
-    if jwt_secret:
-        jwt_token = create_jwt(
-            user_id=user_id,
-            scopes=scopes,
-            source="password",
-            secret=jwt_secret,
-        )
-
-    resp_body: dict[str, str] = {
-        "status": "ok",
-        "user_id": user_id,
-        "username": username,
-        "role": "full",
-        "scopes": ",".join(sorted(scopes)),
-    }
-    if jwt_token:
-        resp_body["jwt"] = jwt_token
-
-    response = JSONResponse(resp_body)
-    if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token)
-    return response
-
-
-# ---------------------------------------------------------------------------
-# Model auto-detection (shared with cli.py)
-# ---------------------------------------------------------------------------
-
-
-def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None]:
-    """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`."""
-    from turnstone.core.model_registry import detect_model as _detect
-
-    return _detect(client, provider=provider)
+    return await handle_auth_setup(request, JWT_AUD_SERVER)
 
 
 # ---------------------------------------------------------------------------
@@ -1225,6 +1032,25 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 
 
+def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]:
+    """Build the middleware stack with optional CORS."""
+    stack: list[Middleware] = [
+        Middleware(LogContextMiddleware),
+        Middleware(MetricsMiddleware),
+    ]
+    if cors_origins:
+        from turnstone.core.web_helpers import cors_middleware
+
+        stack.append(cors_middleware(cors_origins))
+    stack.extend(
+        [
+            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER),
+            Middleware(RateLimitMiddleware),
+        ]
+    )
+    return stack
+
+
 def create_app(
     *,
     workstreams: WorkstreamManager,
@@ -1241,6 +1067,7 @@ def create_app(
     registry: Any = None,
     idle_timeout: int = 0,
     node_id: str = "",
+    cors_origins: list[str] | None = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1277,18 +1104,7 @@ def create_app(
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
         ],
-        middleware=[
-            Middleware(LogContextMiddleware),
-            Middleware(MetricsMiddleware),
-            Middleware(
-                CORSMiddleware,
-                allow_origins=["*"],
-                allow_methods=["GET", "POST", "OPTIONS"],
-                allow_headers=["Content-Type", "Authorization"],
-            ),
-            Middleware(AuthMiddleware),
-            Middleware(RateLimitMiddleware),
-        ],
+        middleware=_build_middleware(cors_origins),
         lifespan=_lifespan,
     )
     app.state.workstreams = workstreams
@@ -1305,6 +1121,10 @@ def create_app(
     app.state.registry = registry
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
+
+    from turnstone.core.auth import LoginRateLimiter
+
+    app.state.login_limiter = LoginRateLimiter()
     return app
 
 
@@ -1500,18 +1320,9 @@ def main() -> None:
         default=60.0,
         help="Circuit breaker cooldown in seconds (default: 60)",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto — JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
     from turnstone.core.config import apply_config
 
     apply_config(
@@ -1520,13 +1331,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="server",
-    )
+    configure_logging_from_args(args, "server")
 
     # Initialize storage backend
     from turnstone.core.storage import init_storage
@@ -1563,6 +1370,8 @@ def main() -> None:
         model = args.model
         detected_ctx = None
     else:
+        from turnstone.core.model_registry import detect_model
+
         model, detected_ctx = detect_model(client, provider=provider_name)
 
     # Use detected context window when the user hasn't explicitly set one
@@ -1703,6 +1512,10 @@ def main() -> None:
         log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
 
     # Build the ASGI app
+    from turnstone.core.web_helpers import parse_cors_origins
+
+    cors_origins = parse_cors_origins()
+
     app = create_app(
         workstreams=manager,
         global_queue=global_queue,
@@ -1718,6 +1531,7 @@ def main() -> None:
         registry=registry,
         idle_timeout=args.workstream_idle_timeout,
         node_id=_node_id,
+        cors_origins=cors_origins,
     )
 
     log.info("Server starting on http://%s:%s", args.host, args.port)

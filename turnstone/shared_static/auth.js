@@ -51,7 +51,7 @@ function initLogin() {
 
 function _buildLoginHTML() {
   return (
-    '<div id="login-box">' +
+    '<form id="login-box">' +
     '<h2 id="login-title">' +
     escapeHtml(_AUTH_TITLE) +
     "</h2>" +
@@ -60,43 +60,46 @@ function _buildLoginHTML() {
     // --- Setup mode fields ---
     '<div id="setup-fields" style="display:none">' +
     '<label for="setup-username" class="login-label">Username</label>' +
-    '<input id="setup-username" type="text" placeholder="admin" autocomplete="username" spellcheck="false">' +
+    '<input id="setup-username" name="username" type="text" placeholder="admin" autocomplete="username" spellcheck="false">' +
     '<label for="setup-displayname" class="login-label">Display name</label>' +
-    '<input id="setup-displayname" type="text" placeholder="Administrator" autocomplete="name">' +
+    '<input id="setup-displayname" name="display_name" type="text" placeholder="Administrator" autocomplete="name">' +
     '<label for="setup-password" class="login-label">Password</label>' +
-    '<input id="setup-password" type="password" placeholder="Choose a strong password" autocomplete="new-password">' +
+    '<input id="setup-password" name="password" type="password" placeholder="Choose a strong password" autocomplete="new-password">' +
     '<label for="setup-confirm" class="login-label">Confirm password</label>' +
-    '<input id="setup-confirm" type="password" placeholder="Confirm password" autocomplete="new-password">' +
+    '<input id="setup-confirm" name="confirm" type="password" placeholder="Confirm password" autocomplete="new-password">' +
     "</div>" +
     // --- Login mode fields ---
     '<div id="login-fields">' +
     '<label for="login-username" class="login-label">Username</label>' +
-    '<input id="login-username" type="text" placeholder="Username" autocomplete="username" spellcheck="false">' +
+    '<input id="login-username" name="username" type="text" placeholder="Username" autocomplete="username" spellcheck="false">' +
     '<label for="login-password" class="login-label">Password</label>' +
-    '<input id="login-password" type="password" placeholder="Password" autocomplete="current-password">' +
+    '<input id="login-password" name="password" type="password" placeholder="Password" autocomplete="current-password">' +
     "</div>" +
     // --- Token mode fields ---
     '<div id="token-fields" style="display:none">' +
     '<label for="login-token" class="login-label">Auth token</label>' +
-    '<input id="login-token" type="password" placeholder="Enter auth token" autocomplete="off">' +
+    '<input id="login-token" name="token" type="password" placeholder="Enter auth token" autocomplete="off">' +
     "</div>" +
-    '<button id="login-submit">Sign in</button>' +
+    '<button id="login-submit" type="submit">Sign in</button>' +
     // --- Mode toggle ---
     '<div id="login-toggle" class="login-toggle">' +
     '<button id="toggle-token" class="login-link" type="button">Use token instead</button>' +
     "</div>" +
-    "</div>"
+    "</form>"
   );
 }
 
 function _bindLoginEvents() {
-  document.getElementById("login-submit").onclick = _handleSubmit;
+  // Handle form submission (button click, Enter key, and password manager fill)
+  document.getElementById("login-box").addEventListener("submit", function (e) {
+    e.preventDefault();
+    _handleSubmit();
+  });
 
-  // Enter key on all inputs
+  // Escape key clears errors
   var inputs = document.querySelectorAll("#login-box input");
   for (var i = 0; i < inputs.length; i++) {
     inputs[i].addEventListener("keydown", function (e) {
-      if (e.key === "Enter") _handleSubmit();
       if (e.key === "Escape") _clearError();
     });
   }

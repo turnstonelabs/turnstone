@@ -153,3 +153,33 @@ def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Return a structlog bound logger backed by the stdlib."""
     result: structlog.stdlib.BoundLogger = structlog.get_logger(name)
     return result
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+
+def add_log_args(parser: Any) -> None:
+    """Add ``--log-level`` and ``--log-format`` arguments to *parser*."""
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Log level (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-format",
+        default="auto",
+        choices=["auto", "json", "text"],
+        help="Log output format (default: auto — JSON when stderr is not a TTY)",
+    )
+
+
+def configure_logging_from_args(args: Any, service: str) -> None:
+    """Call :func:`configure_logging` using parsed CLI arguments."""
+    configure_logging(
+        level=args.log_level,
+        json_output={"json": True, "text": False}.get(args.log_format),
+        service=service,
+    )
