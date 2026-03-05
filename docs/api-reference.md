@@ -861,7 +861,7 @@ liveness probes.
 ```json
 {
   "status": "ok",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "node_id": "worker-01_a3f2",
   "uptime_seconds": 3614.72,
   "model": "llama-3.1-70b-instruct",
