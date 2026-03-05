@@ -90,6 +90,7 @@ html, body {
 body {
   display: flex;
   flex-direction: column;
+  overflow: hidden;
   background-image:
     radial-gradient(ellipse at 20% 0%, rgba(229, 160, 66, 0.03) 0%, transparent 50%),
     radial-gradient(ellipse at 80% 100%, rgba(103, 232, 249, 0.02) 0%, transparent 50%);

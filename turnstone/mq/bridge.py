@@ -832,20 +832,9 @@ def main() -> None:
         default="http://localhost:8080",
         help="turnstone-server URL (default: %(default)s)",
     )
-    parser.add_argument(
-        "--redis-host", default="localhost", help="Redis host (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--redis-port", type=int, default=6379, help="Redis port (default: %(default)s)"
-    )
-    parser.add_argument(
-        "--redis-password",
-        default=os.environ.get("REDIS_PASSWORD"),
-        help="Redis password (default: $REDIS_PASSWORD)",
-    )
-    parser.add_argument(
-        "--redis-db", type=int, default=0, help="Redis DB number (default: %(default)s)"
-    )
+    from turnstone.mq.broker import add_redis_args
+
+    add_redis_args(parser)
     parser.add_argument(
         "--approval-timeout",
         type=float,
@@ -863,18 +852,9 @@ def main() -> None:
         default=60,
         help="Heartbeat TTL in seconds (default: %(default)s)",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto — JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
     parser.add_argument(
         "--auth-token",
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
@@ -885,20 +865,13 @@ def main() -> None:
     apply_config(parser, ["bridge", "redis", "auth"])
     args = parser.parse_args()
 
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="bridge",
-    )
+    configure_logging_from_args(args, "bridge")
 
-    broker = RedisBroker(
-        host=args.redis_host,
-        port=args.redis_port,
-        db=args.redis_db,
-        password=args.redis_password,
-    )
+    from turnstone.mq.broker import broker_from_args
+
+    broker = broker_from_args(args)
     # If no explicit auth token is provided, use a ServiceTokenManager
     # so bridge JWTs auto-rotate (1-hour expiry, refreshed at 80%).
     # A shared JWT secret is required for multi-service deployments —

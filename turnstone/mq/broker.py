@@ -242,3 +242,58 @@ class RedisBroker:
         with contextlib.suppress(Exception):
             self._pubsub.close()
         self._pool.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers (shared across bridge, console, channels)
+# ---------------------------------------------------------------------------
+
+
+def add_redis_args(parser: Any) -> None:
+    """Add ``--redis-host``, ``--redis-port``, ``--redis-password``, ``--redis-db``."""
+    import os
+
+    parser.add_argument(
+        "--redis-host",
+        default=os.environ.get("REDIS_HOST", "localhost"),
+        help="Redis host (default: $REDIS_HOST or localhost)",
+    )
+    parser.add_argument(
+        "--redis-port",
+        type=int,
+        default=int(os.environ.get("REDIS_PORT", "6379")),
+        help="Redis port (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--redis-password",
+        default=os.environ.get("REDIS_PASSWORD"),
+        help="Redis password (default: $REDIS_PASSWORD)",
+    )
+    parser.add_argument(
+        "--redis-db",
+        type=int,
+        default=0,
+        help="Redis DB number (default: %(default)s)",
+    )
+
+
+def broker_from_args(args: Any) -> RedisBroker:
+    """Create a :class:`RedisBroker` from parsed CLI arguments."""
+    return RedisBroker(
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
+        password=args.redis_password,
+    )
+
+
+def async_broker_from_args(args: Any) -> Any:
+    """Create an :class:`AsyncRedisBroker` from parsed CLI arguments."""
+    from turnstone.mq.async_broker import AsyncRedisBroker
+
+    return AsyncRedisBroker(
+        host=args.redis_host,
+        port=args.redis_port,
+        db=args.redis_db,
+        password=args.redis_password,
+    )

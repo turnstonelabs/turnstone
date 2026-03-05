@@ -30,8 +30,6 @@ import httpx
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
@@ -39,12 +37,14 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
-from turnstone.mq.broker import RedisBroker
+from turnstone.core.auth import AuthMiddleware
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
-    from starlette.types import ASGIApp, Receive, Scope, Send
+    from starlette.requests import Request
+
+    from turnstone.mq.broker import RedisBroker
 
 log = logging.getLogger("turnstone.console.server")
 
@@ -55,15 +55,11 @@ log = logging.getLogger("turnstone.console.server")
 _STATIC_DIR = Path(__file__).parent / "static"
 _SHARED_DIR = Path(__file__).parent.parent / "shared_static"
 _HTML = ""
-_CSS = ""
-_JS = ""
 
 
 def _load_static() -> None:
-    global _HTML, _CSS, _JS
+    global _HTML
     _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    _CSS = (_STATIC_DIR / "style.css").read_text(encoding="utf-8")
-    _JS = (_STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -88,54 +84,6 @@ def _parse_int(
 # ---------------------------------------------------------------------------
 # Pure ASGI middleware
 # ---------------------------------------------------------------------------
-
-
-class AuthMiddleware:
-    """ASGI middleware that enforces bearer-token / cookie authentication."""
-
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        request = Request(scope)
-        if request.method == "OPTIONS":
-            await self.app(scope, receive, send)
-            return
-        from turnstone.core.auth import JWT_AUD_CONSOLE, check_request
-
-        auth_config = request.app.state.auth_config
-        jwt_secret = getattr(request.app.state, "jwt_secret", "")
-        storage = getattr(request.app.state, "auth_storage", None)
-        method = request.method
-        path = request.url.path
-        auth_header = request.headers.get("Authorization")
-        cookie_header = request.headers.get("Cookie")
-        allowed, status, msg, auth_result = check_request(
-            auth_config,
-            method,
-            path,
-            auth_header,
-            cookie_header,
-            jwt_secret=jwt_secret,
-            jwt_audience=JWT_AUD_CONSOLE,
-            storage=storage,
-        )
-        if not allowed:
-            response = JSONResponse({"error": msg}, status_code=status)
-            await response(scope, receive, send)
-            return
-
-        if auth_result and auth_result.user_id:
-            from turnstone.core.log import ctx_user_id
-
-            ctx_user_id.set(auth_result.user_id)
-        if "state" not in scope:
-            scope["state"] = {}
-        scope["state"]["auth_result"] = auth_result
-        await self.app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -189,24 +137,16 @@ _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
     """Build auth headers for proxied requests to upstream servers.
 
-    Forwards the user's JWT (from cookie or Bearer header) so that
-    upstream servers with auth enabled accept the proxied request.
-    Falls back to the static proxy_auth_token if configured.
+    Uses the service proxy token (``JWT_AUD_SERVER``) so the upstream node
+    accepts the request.  The user's console-audience JWT is *not* forwarded
+    — it would be rejected by the server's audience validation.
     """
-    # Prefer the incoming Authorization header (e.g. Bearer JWT)
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header:
-        return {"Authorization": auth_header}
+    # Prefer the auto-rotating ServiceTokenManager when available
+    mgr = getattr(request.app.state, "proxy_token_mgr", None)
+    if mgr is not None:
+        return dict(mgr.bearer_header)
 
-    # Extract JWT from cookie
-    from turnstone.core.auth import AUTH_COOKIE, _extract_cookie
-
-    cookie_header = request.headers.get("Cookie", "")
-    cookie_token = _extract_cookie(cookie_header, AUTH_COOKIE)
-    if cookie_token:
-        return {"Authorization": f"Bearer {cookie_token}"}
-
-    # Fall back to static proxy_auth_token
+    # Fall back to static proxy_auth_token (e.g. from --auth-token)
     static_token = getattr(request.app.state, "proxy_auth_token", "")
     if static_token:
         return {"Authorization": f"Bearer {static_token}"}
@@ -346,211 +286,30 @@ async def health(request: Request) -> JSONResponse:
 
 async def auth_login(request: Request) -> Response:
     """Authenticate via username:password or legacy token, return JWT."""
-    from turnstone.core.auth import (
-        JWT_AUD_CONSOLE,
-        AuthResult,
-        LoginRateLimiter,
-        _authenticate_token,
-        create_jwt,
-        is_secure_request,
-        make_set_cookie,
-        verify_password,
-    )
+    from turnstone.core.auth import JWT_AUD_CONSOLE, handle_auth_login
 
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    auth_config = request.app.state.auth_config
-    jwt_secret = getattr(request.app.state, "jwt_secret", "")
-    storage = getattr(request.app.state, "auth_storage", None)
-    login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
-
-    username = body.get("username", "")
-    client_ip = request.client.host if request.client else "unknown"
-
-    # Check login rate limits
-    if login_limiter is not None:
-        ip_ok, ip_retry = login_limiter.check(f"ip:{client_ip}")
-        if not ip_ok:
-            return JSONResponse(
-                {"error": "Too many login attempts"},
-                status_code=429,
-                headers={"Retry-After": str(ip_retry)},
-            )
-        if username:
-            user_ok, user_retry = login_limiter.check(f"user:{username}")
-            if not user_ok:
-                return JSONResponse(
-                    {"error": "Too many login attempts"},
-                    status_code=429,
-                    headers={"Retry-After": str(user_retry)},
-                )
-
-    result: AuthResult | None = None
-    password = body.get("password", "")
-
-    if username and password and storage is not None:
-        user = storage.get_user_by_username(username)
-        if user and verify_password(password, user["password_hash"]):
-            result = AuthResult(
-                user_id=user["user_id"],
-                scopes=frozenset({"read", "write", "approve"}),
-                token_source="password",
-            )
-    elif body.get("token"):
-        result = _authenticate_token(
-            body["token"],
-            auth_config,
-            jwt_secret=jwt_secret,
-            jwt_audience=JWT_AUD_CONSOLE,
-            storage=storage,
-        )
-
-    if result is None:
-        if login_limiter is not None:
-            login_limiter.record(f"ip:{client_ip}")
-            if username:
-                login_limiter.record(f"user:{username}")
-        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
-
-    jwt_token = ""
-    if jwt_secret:
-        jwt_token = create_jwt(
-            user_id=result.user_id,
-            scopes=result.scopes,
-            source=result.token_source,
-            secret=jwt_secret,
-            audience=JWT_AUD_CONSOLE,
-        )
-
-    role = "full" if result.has_scope("write") else "read"
-    scopes_str = ",".join(sorted(result.scopes))
-    resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
-    if jwt_token:
-        resp_body["jwt"] = jwt_token
-    if result.user_id:
-        resp_body["user_id"] = result.user_id
-
-    secure = is_secure_request(dict(request.headers), request.url.scheme)
-    response = JSONResponse(resp_body)
-    cookie_value = jwt_token if jwt_token else body.get("token", "")
-    if cookie_value:
-        response.headers["Set-Cookie"] = make_set_cookie(cookie_value, secure=secure)
-    return response
+    return await handle_auth_login(request, JWT_AUD_CONSOLE)
 
 
 async def auth_logout(request: Request) -> Response:
-    from turnstone.core.auth import make_clear_cookie
+    """POST /v1/api/auth/logout — clear auth cookie."""
+    from turnstone.core.auth import handle_auth_logout
 
-    response = JSONResponse({"status": "ok"})
-    response.headers["Set-Cookie"] = make_clear_cookie()
-    return response
+    return await handle_auth_logout(request)
 
 
-async def auth_status(request: Request) -> JSONResponse:
+async def auth_status(request: Request) -> Response:
     """GET /v1/api/auth/status — public endpoint for login UI state detection."""
-    auth_config = request.app.state.auth_config
-    storage = getattr(request.app.state, "auth_storage", None)
+    from turnstone.core.auth import handle_auth_status
 
-    has_users = False
-    if storage is not None:
-        try:
-            users = storage.list_users()
-            has_users = len(users) > 0
-        except Exception:
-            pass
-
-    return JSONResponse(
-        {
-            "auth_enabled": auth_config.enabled,
-            "has_users": has_users,
-            "setup_required": auth_config.enabled and not has_users,
-        }
-    )
+    return await handle_auth_status(request)
 
 
-async def auth_setup(request: Request) -> JSONResponse:
-    """POST /v1/api/auth/setup — create first admin user (public, one-time only).
+async def auth_setup(request: Request) -> Response:
+    """POST /v1/api/auth/setup — create first admin user (public, one-time only)."""
+    from turnstone.core.auth import JWT_AUD_CONSOLE, handle_auth_setup
 
-    Only works when auth is enabled and zero users exist. Returns JWT on success.
-    """
-    import uuid
-
-    from turnstone.core.auth import (
-        JWT_AUD_CONSOLE,
-        create_jwt,
-        hash_password,
-        is_secure_request,
-        make_set_cookie,
-    )
-
-    storage = getattr(request.app.state, "auth_storage", None)
-    jwt_secret = getattr(request.app.state, "jwt_secret", "")
-
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
-
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    username = body.get("username", "").strip()
-    display_name = body.get("display_name", "").strip()
-    password = body.get("password", "")
-
-    from turnstone.core.auth import is_valid_username
-
-    if not is_valid_username(username):
-        return JSONResponse(
-            {"error": "Invalid username (1-64 chars: letters, digits, . _ -)"},
-            status_code=400,
-        )
-    if not display_name:
-        return JSONResponse({"error": "display_name is required"}, status_code=400)
-    if len(password) < 8:
-        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
-
-    user_id = uuid.uuid4().hex
-    pw_hash = hash_password(password)
-
-    # Atomic: insert only if no users exist (prevents TOCTOU race)
-    try:
-        created = storage.create_first_user(user_id, username, display_name, pw_hash)
-    except Exception:
-        return JSONResponse({"error": "Storage error"}, status_code=503)
-    if not created:
-        return JSONResponse({"error": "Setup already completed"}, status_code=409)
-
-    # Issue JWT automatically
-    scopes = frozenset({"read", "write", "approve"})
-    jwt_token = ""
-    if jwt_secret:
-        jwt_token = create_jwt(
-            user_id=user_id,
-            scopes=scopes,
-            source="password",
-            secret=jwt_secret,
-            audience=JWT_AUD_CONSOLE,
-        )
-
-    resp_body: dict[str, str] = {
-        "status": "ok",
-        "user_id": user_id,
-        "username": username,
-        "role": "full",
-        "scopes": ",".join(sorted(scopes)),
-    }
-    if jwt_token:
-        resp_body["jwt"] = jwt_token
-
-    secure = is_secure_request(dict(request.headers), request.url.scheme)
-    response = JSONResponse(resp_body)
-    if jwt_token:
-        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
-    return response
+    return await handle_auth_setup(request, JWT_AUD_CONSOLE)
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +325,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
     - ``node_id`` set to ``"pool"`` → pushed to the shared queue for any bridge
     """
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     broker: RedisBroker = request.app.state.broker
     collector: ClusterCollector = request.app.state.collector
@@ -877,9 +637,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
 async def admin_list_users(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users — list all users."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     return JSONResponse({"users": storage.list_users()})
 
 
@@ -888,14 +650,17 @@ async def admin_create_user(request: Request) -> JSONResponse:
     import uuid
 
     from turnstone.core.auth import hash_password
+    from turnstone.core.web_helpers import require_storage_or_503
 
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     username = body.get("username", "").strip()
     display_name = body.get("display_name", "").strip()
@@ -934,9 +699,11 @@ async def admin_create_user(request: Request) -> JSONResponse:
 
 async def admin_delete_user(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/users/{user_id} — delete user + cascade tokens."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     user_id = request.path_params["user_id"]
     if storage.delete_user(user_id):
         return JSONResponse({"status": "ok"})
@@ -945,9 +712,11 @@ async def admin_delete_user(request: Request) -> JSONResponse:
 
 async def admin_list_tokens(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users/{user_id}/tokens — list tokens for a user."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     user_id = request.path_params["user_id"]
     return JSONResponse({"tokens": storage.list_api_tokens(user_id)})
 
@@ -957,10 +726,11 @@ async def admin_create_token(request: Request) -> JSONResponse:
     import uuid
 
     from turnstone.core.auth import generate_token, hash_token, token_prefix
+    from turnstone.core.web_helpers import require_storage_or_503
 
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     user_id = request.path_params["user_id"]
 
     # Verify user exists
@@ -1016,9 +786,11 @@ async def admin_create_token(request: Request) -> JSONResponse:
 
 async def admin_revoke_token(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/tokens/{token_id} — revoke an API token."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     token_id = request.path_params["token_id"]
     if storage.delete_api_token(token_id):
         return JSONResponse({"status": "ok"})
@@ -1032,9 +804,11 @@ async def admin_revoke_token(request: Request) -> JSONResponse:
 
 async def admin_list_channels(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users/{user_id}/channels — list channel links for a user."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     user_id = request.path_params["user_id"]
     channels = storage.list_channel_users_by_user(user_id)
     return JSONResponse({"channels": channels})
@@ -1042,14 +816,18 @@ async def admin_list_channels(request: Request) -> JSONResponse:
 
 async def admin_create_channel(request: Request) -> JSONResponse:
     """POST /v1/api/admin/users/{user_id}/channels — link a channel account."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     user_id = request.path_params["user_id"]
-    try:
-        body: dict[str, Any] = await request.json()
-    except (ValueError, json.JSONDecodeError):
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
 
     channel_type = body.get("channel_type", "").strip().lower()
     channel_user_id = body.get("channel_user_id", "").strip()
@@ -1088,9 +866,11 @@ async def admin_create_channel(request: Request) -> JSONResponse:
 
 async def admin_delete_channel(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/channels/{channel_type}/{channel_user_id} — unlink."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage is None:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
     channel_type = request.path_params["channel_type"]
     channel_user_id = request.path_params["channel_user_id"]
     if storage.delete_channel_user(channel_type, channel_user_id):
@@ -1111,6 +891,7 @@ def create_app(
     jwt_secret: str = "",
     auth_storage: Any = None,
     proxy_auth_token: str = "",
+    proxy_token_mgr: Any = None,
     cors_origins: list[str] | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
@@ -1180,6 +961,7 @@ def create_app(
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_auth_token = proxy_auth_token
+    app.state.proxy_token_mgr = proxy_token_mgr
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -1191,15 +973,10 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
     """Build the middleware stack with optional CORS."""
     stack: list[Middleware] = []
     if cors_origins:
-        stack.append(
-            Middleware(
-                CORSMiddleware,
-                allow_origins=cors_origins,
-                allow_methods=["GET", "POST", "OPTIONS"],
-                allow_headers=["Content-Type", "Authorization"],
-            )
-        )
-    stack.append(Middleware(AuthMiddleware))
+        from turnstone.core.web_helpers import cors_middleware
+
+        stack.append(cors_middleware(cors_origins))
+    stack.append(Middleware(AuthMiddleware, jwt_audience="turnstone-console"))
     return stack
 
 
@@ -1230,46 +1007,18 @@ def main() -> None:
         default=8090,
         help="Port to listen on (default: 8090)",
     )
-    parser.add_argument(
-        "--redis-host",
-        default="localhost",
-        help="Redis host (default: localhost)",
-    )
-    parser.add_argument(
-        "--redis-port",
-        type=int,
-        default=6379,
-        help="Redis port (default: 6379)",
-    )
-    parser.add_argument(
-        "--redis-password",
-        default=os.environ.get("REDIS_PASSWORD"),
-        help="Redis password (default: $REDIS_PASSWORD)",
-    )
-    parser.add_argument(
-        "--redis-db",
-        type=int,
-        default=0,
-        help="Redis DB number (default: 0)",
-    )
+    from turnstone.mq.broker import add_redis_args
+
+    add_redis_args(parser)
     parser.add_argument(
         "--poll-interval",
         type=float,
         default=10.0,
         help="Node polling interval in seconds (default: 10)",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: INFO)",
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto — JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
     parser.add_argument(
         "--auth-token",
         default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
@@ -1281,20 +1030,13 @@ def main() -> None:
     apply_config(parser, ["console", "redis", "auth"])
     args = parser.parse_args()
 
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="console",
-    )
+    configure_logging_from_args(args, "console")
 
-    broker = RedisBroker(
-        host=args.redis_host,
-        port=args.redis_port,
-        db=args.redis_db,
-        password=args.redis_password,
-    )
+    from turnstone.mq.broker import broker_from_args
+
+    broker = broker_from_args(args)
 
     # If no explicit auth token is provided, use a ServiceTokenManager
     # so collector JWTs auto-rotate.  A shared JWT secret is required for
@@ -1367,8 +1109,9 @@ def main() -> None:
         proxy_token = proxy_token_mgr.token
         log.info("console.proxy_jwt_minted")
 
-    cors_env = os.environ.get("TURNSTONE_CORS_ORIGINS", "").strip()
-    cors_origins = [o.strip() for o in cors_env.split(",") if o.strip()] if cors_env else None
+    from turnstone.core.web_helpers import parse_cors_origins
+
+    cors_origins = parse_cors_origins()
 
     app = create_app(
         collector=collector,
@@ -1377,6 +1120,7 @@ def main() -> None:
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
         proxy_auth_token=proxy_token,
+        proxy_token_mgr=proxy_token_mgr,
         cors_origins=cors_origins,
     )
 

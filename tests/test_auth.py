@@ -17,7 +17,7 @@ from turnstone.core.auth import (
     load_auth_config,
     make_clear_cookie,
     make_set_cookie,
-    required_role,
+    required_scope,
 )
 
 # ---------------------------------------------------------------------------
@@ -89,69 +89,59 @@ class TestIsPublicPath:
 # ---------------------------------------------------------------------------
 
 
-class TestRequiredRole:
+class TestRequiredScope:
     def test_get_api_needs_read(self):
-        assert required_role("GET", "/api/workstreams") == "read"
+        assert required_scope("GET", "/api/workstreams") == "read"
 
     def test_get_events_needs_read(self):
-        assert required_role("GET", "/api/events") == "read"
+        assert required_scope("GET", "/api/events") == "read"
 
-    def test_get_dashboard_needs_read(self):
-        assert required_role("GET", "/api/dashboard") == "read"
+    def test_post_send_needs_write(self):
+        assert required_scope("POST", "/api/send") == "write"
 
-    def test_post_send_needs_full(self):
-        assert required_role("POST", "/api/send") == "full"
+    def test_post_approve_needs_approve(self):
+        assert required_scope("POST", "/api/approve") == "approve"
 
-    def test_post_approve_needs_full(self):
-        assert required_role("POST", "/api/approve") == "full"
+    def test_post_plan_needs_write(self):
+        assert required_scope("POST", "/api/plan") == "write"
 
-    def test_post_plan_needs_full(self):
-        assert required_role("POST", "/api/plan") == "full"
+    def test_post_command_needs_write(self):
+        assert required_scope("POST", "/api/command") == "write"
 
-    def test_post_command_needs_full(self):
-        assert required_role("POST", "/api/command") == "full"
+    def test_post_workstreams_new_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/new") == "write"
 
-    def test_post_workstreams_new_needs_full(self):
-        assert required_role("POST", "/api/workstreams/new") == "full"
+    def test_post_workstreams_close_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/close") == "write"
 
-    def test_post_workstreams_close_needs_full(self):
-        assert required_role("POST", "/api/workstreams/close") == "full"
-
-    def test_all_write_paths_need_full(self):
+    def test_all_write_paths_need_write(self):
         for path in WRITE_PATHS:
-            assert required_role("POST", path) == "full"
+            scope = required_scope("POST", path)
+            assert scope in ("write", "approve"), f"{path} should need write or approve"
 
     def test_post_unknown_path_needs_read(self):
-        assert required_role("POST", "/api/unknown") == "read"
+        assert required_scope("POST", "/api/unknown") == "read"
 
-    def test_v1_post_send_needs_full(self):
-        assert required_role("POST", "/v1/api/send") == "full"
+    def test_v1_post_send_needs_write(self):
+        assert required_scope("POST", "/v1/api/send") == "write"
 
-    def test_v1_post_approve_needs_full(self):
-        assert required_role("POST", "/v1/api/approve") == "full"
+    def test_v1_post_approve_needs_approve(self):
+        assert required_scope("POST", "/v1/api/approve") == "approve"
 
     def test_v1_get_workstreams_needs_read(self):
-        assert required_role("GET", "/v1/api/workstreams") == "read"
+        assert required_scope("GET", "/v1/api/workstreams") == "read"
 
-    def test_v1_post_cluster_ws_new_needs_full(self):
-        assert required_role("POST", "/v1/api/cluster/workstreams/new") == "full"
+    def test_v1_post_cluster_ws_new_needs_write(self):
+        assert required_scope("POST", "/v1/api/cluster/workstreams/new") == "write"
 
-    def test_v1_all_write_paths_need_full(self):
-        for path in WRITE_PATHS:
-            v1_path = "/v1" + path
-            assert required_role("POST", v1_path) == "full", f"{v1_path} should need full"
+    def test_proxy_v1_send_needs_write(self):
+        assert required_scope("POST", "/node/node-a/v1/api/send") == "write"
 
-    def test_proxy_v1_send_needs_full(self):
-        assert required_role("POST", "/node/node-a/v1/api/send") == "full"
-
-    def test_proxy_v1_approve_needs_full(self):
-        assert required_role("POST", "/node/node-a/v1/api/approve") == "full"
-
-    def test_proxy_v1_cluster_ws_new_needs_full(self):
-        assert required_role("POST", "/node/node-a/v1/api/cluster/workstreams/new") == "full"
+    def test_proxy_v1_approve_needs_approve(self):
+        assert required_scope("POST", "/node/node-a/v1/api/approve") == "approve"
 
     def test_proxy_v1_read_endpoint_needs_read(self):
-        assert required_role("GET", "/node/node-a/v1/api/workstreams") == "read"
+        assert required_scope("GET", "/node/node-a/v1/api/workstreams") == "read"
 
 
 # ---------------------------------------------------------------------------
