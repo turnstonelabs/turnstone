@@ -81,24 +81,15 @@ def main() -> None:
         default=1,
         help="Nodes to kill per interval (default: 1)",
     )
-    parser.add_argument("--redis-host", default="localhost")
-    parser.add_argument("--redis-port", type=int, default=6379)
-    parser.add_argument("--redis-password", default=None)
-    parser.add_argument("--redis-db", type=int, default=0)
+    from turnstone.mq.broker import add_redis_args
+
+    add_redis_args(parser)
     parser.add_argument("--prefix", default="turnstone")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--metrics-file", default="", help="Write JSON metrics to file")
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto — JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
 
     args = parser.parse_args()
 
@@ -122,13 +113,9 @@ def main() -> None:
         metrics_file=args.metrics_file,
     )
 
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="sim",
-    )
+    configure_logging_from_args(args, "sim")
 
     try:
         asyncio.run(_run(config))

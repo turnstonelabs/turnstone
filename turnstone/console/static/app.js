@@ -52,12 +52,14 @@ function connectSSE() {
   }
   evtSource = new EventSource("/v1/api/cluster/events");
   var statusBar = document.getElementById("status-bar");
-  evtSource.onmessage = function (e) {
+  evtSource.onopen = function () {
     retryDelay = 1000;
     statusBar.classList.remove("disconnected");
     statusBar.textContent = "";
     var csb = document.getElementById("cluster-status-bar");
     if (csb) csb.classList.remove("stale");
+  };
+  evtSource.onmessage = function (e) {
     try {
       var data = JSON.parse(e.data);
       handleClusterEvent(data);

@@ -536,9 +536,12 @@ function connectContentSSE(wsId) {
   contentEvtSource = new EventSource(
     "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
   );
-  contentEvtSource.onmessage = function (e) {
+  contentEvtSource.onopen = function () {
     contentRetryDelay = 1000;
     statusBar.classList.remove("disconnected");
+    statusBar.textContent = "";
+  };
+  contentEvtSource.onmessage = function (e) {
     var data = JSON.parse(e.data);
     handleEvent(data);
   };
@@ -934,8 +937,10 @@ function connectGlobalSSE() {
     globalEvtSource = null;
   }
   globalEvtSource = new EventSource("/v1/api/events/global");
-  globalEvtSource.onmessage = function (e) {
+  globalEvtSource.onopen = function () {
     globalRetryDelay = 1000;
+  };
+  globalEvtSource.onmessage = function (e) {
     var data = JSON.parse(e.data);
     if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {

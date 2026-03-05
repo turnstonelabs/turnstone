@@ -22,28 +22,9 @@ def main() -> None:
     )
 
     # -- Redis ---------------------------------------------------------------
-    parser.add_argument(
-        "--redis-host",
-        default=os.environ.get("REDIS_HOST", "localhost"),
-        help="Redis host (default: $REDIS_HOST or localhost)",
-    )
-    parser.add_argument(
-        "--redis-port",
-        type=int,
-        default=int(os.environ.get("REDIS_PORT", "6379")),
-        help="Redis port (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--redis-password",
-        default=os.environ.get("REDIS_PASSWORD"),
-        help="Redis password (default: $REDIS_PASSWORD)",
-    )
-    parser.add_argument(
-        "--redis-db",
-        type=int,
-        default=0,
-        help="Redis DB number (default: %(default)s)",
-    )
+    from turnstone.mq.broker import add_redis_args
+
+    add_redis_args(parser)
 
     # -- Discord -------------------------------------------------------------
     parser.add_argument(
@@ -76,29 +57,16 @@ def main() -> None:
     )
 
     # -- Logging -------------------------------------------------------------
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--log-format",
-        default="auto",
-        choices=["auto", "json", "text"],
-        help="Log output format (default: auto -- JSON when stderr is not a TTY)",
-    )
+    from turnstone.core.log import add_log_args
+
+    add_log_args(parser)
 
     args = parser.parse_args()
 
     # -- Logging setup -------------------------------------------------------
-    from turnstone.core.log import configure_logging
+    from turnstone.core.log import configure_logging_from_args
 
-    configure_logging(
-        level=args.log_level,
-        json_output={"json": True, "text": False}.get(args.log_format),
-        service="channel",
-    )
+    configure_logging_from_args(args, "channel")
 
     from turnstone.core.log import get_logger
 
@@ -118,14 +86,9 @@ def main() -> None:
     )
 
     # -- Broker --------------------------------------------------------------
-    from turnstone.mq.async_broker import AsyncRedisBroker
+    from turnstone.mq.broker import async_broker_from_args
 
-    broker = AsyncRedisBroker(
-        host=args.redis_host,
-        port=args.redis_port,
-        db=args.redis_db,
-        password=args.redis_password,
-    )
+    broker = async_broker_from_args(args)
 
     # -- Adapter selection ---------------------------------------------------
     adapters_configured = False
