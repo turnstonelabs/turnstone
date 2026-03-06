@@ -28,30 +28,43 @@ graph LR
         Discord[Discord / Slack]
     end
 
+    Console[turnstone-console<br/><i>dashboard + proxy</i>]
+    Channel[turnstone-channel<br/><i>platform gateway</i>]
+
     subgraph Cluster
-        Console[turnstone-console<br/><i>dashboard + proxy</i>]
         Redis[(Redis MQ)]
-        Bridge[turnstone-bridge<br/><i>per node</i>]
-        Server[turnstone-server<br/><i>LLM + 15 tools</i>]
-        Channel[turnstone-channel<br/><i>platform gateway</i>]
+        DB[(PostgreSQL / SQLite)]
+
+        subgraph Node A
+            BridgeA[bridge]
+            ServerA[server]
+        end
+        subgraph Node B
+            BridgeB[bridge]
+            ServerB[server]
+        end
     end
 
     LLM[LLM Provider<br/><i>OpenAI · Anthropic · local</i>]
 
-    CLI --> Server
-    UI --> Server
+    CLI --> ServerA
+    UI --> ServerB
     SDK --> Redis
     Discord --> Channel
 
     Channel <--> Redis
     Console --> Redis
-    Redis --> Bridge
-    Bridge --> Server
-    Server --> LLM
+    Redis --> BridgeA & BridgeB
+    BridgeA --> ServerA
+    BridgeB --> ServerB
+    ServerA & ServerB --> LLM
 
-    Server -.->|notify| Channel
-    Bridge -.->|SSE events| Redis
-    Console -.->|proxy| Server
+    ServerA & ServerB --> DB
+    Console --> DB
+    Channel --> DB
+    ServerA -.->|notify| Channel
+    BridgeA & BridgeB -.->|events| Redis
+    Console -.->|proxy| ServerA & ServerB
 ```
 
 ## Quickstart
@@ -138,69 +151,7 @@ All frontends connect to any OpenAI-compatible API (vLLM, NVIDIA NIM/NGC, llama.
 
 ## Architecture
 
-```
-turnstone/
-├── core/              # UI-agnostic engine
-│   ├── session.py     # ChatSession — multi-turn loop, tool dispatch, agents
-│   ├── providers/     # LLM provider adapters (OpenAI, Anthropic)
-│   │   ├── _protocol.py   # LLMProvider protocol, ModelCapabilities, StreamChunk
-│   │   ├── _openai.py     # OpenAI-compatible (OpenAI, vLLM, llama.cpp)
-│   │   └── _anthropic.py  # Anthropic Messages API (native streaming, thinking)
-│   ├── tools.py       # Tool definitions (auto-loaded from JSON)
-│   ├── workstream.py  # WorkstreamManager — parallel independent sessions
-│   ├── mcp_client.py  # MCP client manager (external tool servers)
-│   ├── model_registry.py # ModelRegistry — named models, fallback routing, per-workstream selection
-│   ├── config.py      # Unified TOML config (~/.config/turnstone/config.toml)
-│   ├── memory.py      # Persistence facade (delegates to storage/)
-│   ├── storage/       # Pluggable storage backend (SQLite + PostgreSQL)
-│   ├── metrics.py     # Prometheus-compatible metrics collector
-│   ├── healthcheck.py # Backend health monitor + circuit breaker
-│   ├── ratelimit.py   # Per-IP token-bucket rate limiter
-│   ├── edit.py        # File editing (fuzzy match, indentation)
-│   ├── safety.py      # Path validation, sandbox checks
-│   ├── sandbox.py     # Command sandboxing
-│   └── web.py         # Web fetch/search helpers
-├── mq/                # Message queue integration
-│   ├── protocol.py    # Typed message dataclasses (JSON serialization)
-│   ├── broker.py      # Abstract MessageBroker + RedisBroker
-│   ├── bridge.py      # Bridge service (queue ↔ HTTP API, multi-node routing)
-│   └── client.py      # TurnstoneClient — Python API for external systems
-├── console/           # Cluster dashboard
-│   ├── collector.py   # ClusterCollector — aggregates all nodes via Redis + HTTP
-│   ├── server.py      # Dashboard Starlette/ASGI server + SSE
-│   └── static/        # Cluster dashboard web UI
-├── tools/             # Tool schemas (one JSON file per tool)
-├── ui/                # Frontend assets and terminal rendering
-│   └── static/        # Web UI (HTML, CSS, JS)
-├── sim/               # Cluster simulator
-│   ├── cluster.py     # SimCluster — orchestrates N nodes + dispatchers
-│   ├── node.py        # SimNode + SimWorkstream — protocol-compatible node
-│   ├── engine.py      # LLM + tool execution simulation
-│   ├── scenario.py    # 5 workload scenarios (steady, burst, node_failure, …)
-│   ├── metrics.py     # Latency, throughput, utilization collection
-│   └── cli.py         # CLI entry point (turnstone-sim)
-├── cli.py             # Terminal frontend (+ /cluster commands for console)
-├── server.py          # Web frontend (Starlette/ASGI + SSE)
-└── eval.py            # Evaluation and prompt optimization harness
-├── api/               # OpenAPI spec generation (Pydantic v2 models)
-├── sdk/               # Client SDKs (sync + async, Python)
-docs/
-├── architecture.md    # System architecture and threading model
-├── api-reference.md   # Web server API and SSE event reference
-├── sdk.md             # Client SDK reference (Python + TypeScript)
-├── console.md         # Cluster dashboard service (turnstone-console)
-├── docker.md          # Docker Compose deployment and configuration
-├── simulator.md       # Cluster simulator usage and scenarios
-├── tools.md           # Tool schemas, execution pipeline, approval flow
-├── eval.md            # Evaluation harness internals
-└── diagrams/          # UML architecture diagrams (PlantUML sources + PNGs)
-    └── png/           # Pre-rendered diagram images
-deploy/
-├── helm/turnstone/    # Helm chart for Kubernetes
-└── terraform/         # Terraform modules (AWS ECS/Fargate)
-```
-
-### Architecture Diagrams
+### Diagrams
 
 Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
 
