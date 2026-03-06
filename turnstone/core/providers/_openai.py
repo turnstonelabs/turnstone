@@ -45,6 +45,14 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
     ),
+    # GPT-5 pro — high reasoning only, extended output
+    "gpt-5-pro": ModelCapabilities(
+        context_window=400000,
+        max_output_tokens=272000,
+        supports_temperature=False,
+        reasoning_effort_values=("high",),
+        default_reasoning_effort="high",
+    ),
     # GPT-5.1 — temperature OK when reasoning_effort=none (default)
     "gpt-5.1": ModelCapabilities(
         context_window=400000,
@@ -58,6 +66,36 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
+    ),
+    # GPT-5.2 pro — always-reasoning variant
+    "gpt-5.2-pro": ModelCapabilities(
+        context_window=400000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        reasoning_effort_values=("medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
+    ),
+    # GPT-5.3 — same capabilities as 5.2 (matches gpt-5.3-chat-latest, codex)
+    "gpt-5.3": ModelCapabilities(
+        context_window=400000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="none",
+    ),
+    # GPT-5.4 — 1M context window
+    "gpt-5.4": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
+        default_reasoning_effort="none",
+    ),
+    # GPT-5.4 pro — always-reasoning, 1M context
+    "gpt-5.4-pro": ModelCapabilities(
+        context_window=1050000,
+        max_output_tokens=128000,
+        supports_temperature=False,
+        reasoning_effort_values=("medium", "high", "xhigh"),
+        default_reasoning_effort="medium",
     ),
     # O-series reasoning models
     "o1": ModelCapabilities(
