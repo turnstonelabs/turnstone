@@ -929,6 +929,194 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
+    # -- Scheduled tasks -------------------------------------------------------
+
+    def create_scheduled_task(
+        self,
+        task_id: str,
+        name: str,
+        description: str,
+        schedule_type: str,
+        cron_expr: str,
+        at_time: str,
+        target_mode: str,
+        model: str,
+        initial_message: str,
+        auto_approve: bool,
+        auto_approve_tools: list[str],
+        created_by: str,
+        next_run: str,
+    ) -> None:
+        from turnstone.core.storage._schema import scheduled_tasks
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(scheduled_tasks).prefix_with("OR IGNORE"),
+                {
+                    "task_id": task_id,
+                    "name": name,
+                    "description": description,
+                    "schedule_type": schedule_type,
+                    "cron_expr": cron_expr,
+                    "at_time": at_time,
+                    "target_mode": target_mode,
+                    "model": model,
+                    "initial_message": initial_message,
+                    "auto_approve": 1 if auto_approve else 0,
+                    "auto_approve_tools": ",".join(auto_approve_tools),
+                    "enabled": 1,
+                    "created_by": created_by,
+                    "next_run": next_run,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
+        from turnstone.core.storage._schema import scheduled_tasks
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(scheduled_tasks).where(scheduled_tasks.c.task_id == task_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row._mapping)
+
+    def list_scheduled_tasks(self) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import scheduled_tasks
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(scheduled_tasks).order_by(scheduled_tasks.c.created.desc())
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    _UPDATABLE_TASK_FIELDS = frozenset(
+        {
+            "name",
+            "description",
+            "schedule_type",
+            "cron_expr",
+            "at_time",
+            "target_mode",
+            "model",
+            "initial_message",
+            "auto_approve",
+            "auto_approve_tools",
+            "enabled",
+            "last_run",
+            "next_run",
+            "updated",
+        }
+    )
+
+    def update_scheduled_task(self, task_id: str, **fields: Any) -> bool:
+        from turnstone.core.storage._schema import scheduled_tasks
+
+        fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_TASK_FIELDS}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # Normalize boolean → int for auto_approve
+        if "auto_approve" in fields:
+            fields["auto_approve"] = 1 if fields["auto_approve"] else 0
+        if "auto_approve_tools" in fields and isinstance(fields["auto_approve_tools"], list):
+            fields["auto_approve_tools"] = ",".join(fields["auto_approve_tools"])
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(scheduled_tasks)
+                .where(scheduled_tasks.c.task_id == task_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_scheduled_task(self, task_id: str) -> bool:
+        from turnstone.core.storage._schema import scheduled_task_runs, scheduled_tasks
+
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.delete(scheduled_task_runs).where(scheduled_task_runs.c.task_id == task_id)
+            )
+            result = conn.execute(
+                sa.delete(scheduled_tasks).where(scheduled_tasks.c.task_id == task_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_due_tasks(self, now: str) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import scheduled_tasks
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(scheduled_tasks)
+                .where(
+                    (scheduled_tasks.c.enabled == 1)
+                    & (scheduled_tasks.c.next_run <= now)
+                    & (scheduled_tasks.c.next_run != "")
+                )
+                .order_by(scheduled_tasks.c.next_run)
+                .limit(100)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def record_task_run(
+        self,
+        run_id: str,
+        task_id: str,
+        node_id: str,
+        ws_id: str,
+        correlation_id: str,
+        started: str,
+        status: str,
+        error: str,
+    ) -> None:
+        from turnstone.core.storage._schema import scheduled_task_runs
+
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(scheduled_task_runs),
+                {
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "node_id": node_id,
+                    "ws_id": ws_id,
+                    "correlation_id": correlation_id,
+                    "started": started,
+                    "status": status,
+                    "error": error,
+                },
+            )
+            conn.commit()
+
+    def list_task_runs(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import scheduled_task_runs
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(scheduled_task_runs)
+                .where(scheduled_task_runs.c.task_id == task_id)
+                .order_by(scheduled_task_runs.c.started.desc())
+                .limit(limit)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def prune_task_runs(self, retention_days: int = 90) -> int:
+        from datetime import timedelta
+
+        from turnstone.core.storage._schema import scheduled_task_runs
+
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(scheduled_task_runs).where(scheduled_task_runs.c.started < cutoff)
+            )
+            conn.commit()
+            return result.rowcount
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
