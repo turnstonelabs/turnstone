@@ -1117,6 +1117,78 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount
 
+    # -- Service registry ------------------------------------------------------
+
+    def register_service(
+        self, service_type: str, service_id: str, url: str, metadata: str = "{}"
+    ) -> None:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        from turnstone.core.storage._schema import services
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = sqlite_insert(services).values(
+            service_type=service_type,
+            service_id=service_id,
+            url=url,
+            metadata=metadata,
+            last_heartbeat=now,
+            created=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["service_type", "service_id"],
+            set_={"url": url, "metadata": metadata, "last_heartbeat": now},
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def heartbeat_service(self, service_type: str, service_id: str) -> bool:
+        from turnstone.core.storage._schema import services
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(services)
+                .where(
+                    (services.c.service_type == service_type)
+                    & (services.c.service_id == service_id)
+                )
+                .values(last_heartbeat=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        from turnstone.core.storage._schema import services
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(services)
+                .where(
+                    (services.c.service_type == service_type)
+                    & (services.c.last_heartbeat >= cutoff)
+                )
+                .order_by(services.c.last_heartbeat.desc())
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def deregister_service(self, service_type: str, service_id: str) -> bool:
+        from turnstone.core.storage._schema import services
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(services).where(
+                    (services.c.service_type == service_type)
+                    & (services.c.service_id == service_id)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

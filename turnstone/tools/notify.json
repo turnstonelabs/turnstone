@@ -1,0 +1,35 @@
+{
+  "name": "notify",
+  "description": "Send a notification to a user or channel on an external platform (Discord, etc.). Use this to proactively alert people about task completion, errors, or important updates. Provide either 'username' for user-based targeting (sends to all linked channels) or 'channel_type' + 'channel_id' for direct targeting. Do not combine both.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "message": {
+        "type": "string",
+        "description": "The notification content (plain text, max 2000 chars)."
+      },
+      "username": {
+        "type": "string",
+        "description": "Turnstone username to notify. Sends to all linked channels for this user."
+      },
+      "channel_type": {
+        "type": "string",
+        "description": "Channel platform for direct targeting.",
+        "enum": ["discord"]
+      },
+      "channel_id": {
+        "type": "string",
+        "description": "Platform-specific channel or user ID for direct targeting."
+      },
+      "title": {
+        "type": "string",
+        "description": "Optional short title for the notification."
+      }
+    },
+    "required": ["message"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "message"
+}

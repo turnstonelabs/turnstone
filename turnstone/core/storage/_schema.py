@@ -182,3 +182,21 @@ scheduled_task_runs = sa.Table(
 
 sa.Index("idx_scheduled_task_runs_task_id", scheduled_task_runs.c.task_id)
 sa.Index("idx_scheduled_task_runs_started", scheduled_task_runs.c.started)
+
+# ---------------------------------------------------------------------------
+# Service registry
+# ---------------------------------------------------------------------------
+
+services = sa.Table(
+    "services",
+    metadata,
+    sa.Column("service_type", sa.Text, nullable=False),
+    sa.Column("service_id", sa.Text, nullable=False),
+    sa.Column("url", sa.Text, nullable=False),
+    sa.Column("metadata", sa.Text, nullable=False, server_default="{}"),
+    sa.Column("last_heartbeat", sa.Text, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("service_type", "service_id"),
+)
+
+sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)

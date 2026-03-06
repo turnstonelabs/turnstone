@@ -26,6 +26,7 @@ import httpx
 
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     delete_memory,
     delete_session,
@@ -49,6 +50,7 @@ from turnstone.core.memory import (
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
+from turnstone.core.storage._registry import get_storage
 from turnstone.core.tools import (
     AGENT_AUTO_TOOLS,
     AGENT_TOOLS,
@@ -60,6 +62,8 @@ from turnstone.core.tools import (
 )
 from turnstone.core.web import check_ssrf, strip_html
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
+
+log = get_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -89,6 +93,43 @@ class SessionUI(Protocol):
     def on_error(self, message: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# Notify auth helper (module-level, lazy-init)
+# ---------------------------------------------------------------------------
+
+_notify_token_manager: Any = None
+_notify_token_lock = threading.Lock()
+
+
+def _notify_auth_headers() -> dict[str, str]:
+    """Return Authorization headers for outbound notify requests."""
+    global _notify_token_manager
+
+    # Static token from env takes precedence
+    static_token = os.environ.get("TURNSTONE_CHANNEL_AUTH_TOKEN", "").strip()
+    if static_token:
+        return {"Authorization": f"Bearer {static_token}"}
+
+    # JWT via ServiceTokenManager
+    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    if not jwt_secret:
+        return {}
+
+    with _notify_token_lock:
+        if _notify_token_manager is None:
+            from turnstone.core.auth import JWT_AUD_CHANNEL, ServiceTokenManager
+
+            _notify_token_manager = ServiceTokenManager(
+                user_id="system",
+                scopes=frozenset({"write"}),
+                source="service",
+                secret=jwt_secret,
+                audience=JWT_AUD_CHANNEL,
+            )
+    header: dict[str, str] = _notify_token_manager.bearer_header
+    return header
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +203,7 @@ class ChatSession:
         self._system_tokens = 0  # tokens for system_messages
         self._assistant_pending_tokens = 0
         self.creative_mode = False
+        self._notify_count = 0
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         if mcp_client:
@@ -468,6 +510,7 @@ class ChatSession:
 
     def send(self, user_input: str) -> None:
         """Send user input and handle the response loop (including tool calls)."""
+        self._notify_count = 0
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
         save_message(self._session_id, "user", user_input)
@@ -1248,6 +1291,7 @@ class ChatSession:
             "remember": self._prepare_remember,
             "recall": self._prepare_recall,
             "forget": self._prepare_forget,
+            "notify": self._prepare_notify,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2393,6 +2437,183 @@ class ChatSession:
         output = "\n\n".join(parts) if parts else f"No results for '{query}'."
         self.ui.on_tool_result(call_id, "recall", output)
         return call_id, output
+
+    # -- Notify tool -----------------------------------------------------------
+
+    def _prepare_notify(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a channel notification."""
+        message = (args.get("message") or "").strip()
+        if not message:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: empty message",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: message is required",
+            }
+        if len(message) > 2000:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: message too long",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: message exceeds 2000 character limit",
+            }
+
+        username = (args.get("username") or "").strip()
+        channel_type = (args.get("channel_type") or "").strip()
+        channel_id = (args.get("channel_id") or "").strip()
+        title = (args.get("title") or "").strip()
+
+        has_username = bool(username)
+        has_direct = bool(channel_type and channel_id)
+
+        if has_username and has_direct:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: ambiguous target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide either username or channel_type+channel_id, not both",
+            }
+        if channel_type and not channel_id:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: incomplete target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: channel_id is required when channel_type is provided",
+            }
+        if channel_id and not channel_type:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: incomplete target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: channel_type is required when channel_id is provided",
+            }
+        if not has_username and not has_direct:
+            return {
+                "call_id": call_id,
+                "func_name": "notify",
+                "header": "\u2717 notify: no target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide username or channel_type+channel_id",
+            }
+
+        target_desc = f"@{username}" if has_username else f"{channel_type}:{channel_id}"
+
+        preview = message[:120] + ("..." if len(message) > 120 else "")
+        return {
+            "call_id": call_id,
+            "func_name": "notify",
+            "header": f"\u2709 notify \u2192 {target_desc}",
+            "preview": preview,
+            "needs_approval": False,
+            "execute": self._exec_notify,
+            "message": message,
+            "username": username,
+            "channel_type": channel_type,
+            "channel_id": channel_id,
+            "title": title,
+        }
+
+    _NOTIFY_MAX_RETRIES = 2
+    _NOTIFY_RETRY_DELAYS = (1.0, 3.0)
+
+    def _exec_notify(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Send a notification directly to the channel gateway via HTTP."""
+        call_id = item["call_id"]
+
+        if self._notify_count >= 5:
+            msg = "Error: notification rate limit exceeded (max 5 per turn)"
+            self.ui.on_tool_result(call_id, "notify", msg)
+            return call_id, msg
+
+        target: dict[str, str] = {}
+        if item.get("username"):
+            target["username"] = item["username"]
+        else:
+            target["channel_type"] = item["channel_type"]
+            target["channel_id"] = item["channel_id"]
+
+        payload = {
+            "target": target,
+            "message": item["message"],
+            "title": item.get("title", ""),
+        }
+
+        # Build auth headers for service-to-service call
+        auth_headers = _notify_auth_headers()
+
+        # Retry loop: attempt delivery, re-query services on each retry
+        # in case a gateway comes back online between attempts.
+        for attempt in range(1 + self._NOTIFY_MAX_RETRIES):
+            storage = get_storage()
+            services = storage.list_services("channel", max_age_seconds=120)
+            if not services:
+                if attempt < self._NOTIFY_MAX_RETRIES:
+                    delay = self._NOTIFY_RETRY_DELAYS[attempt]
+                    log.warning(
+                        "notify.no_services",
+                        attempt=attempt + 1,
+                        max_retries=self._NOTIFY_MAX_RETRIES,
+                        retry_delay=delay,
+                    )
+                    time.sleep(delay)
+                    continue
+                log.warning("notify.no_services_exhausted")
+                msg = "Error: no channel gateway services available"
+                self.ui.on_tool_result(call_id, "notify", msg)
+                return call_id, msg
+
+            # Try first healthy gateway, fall back to next
+            last_error: str = ""
+            for svc in services:
+                url = svc["url"].rstrip("/") + "/v1/api/notify"
+                # SSRF guard: only allow http(s) URLs
+                if not url.startswith(("http://", "https://")):
+                    continue
+                try:
+                    resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                    if resp.status_code < 300:
+                        self._notify_count += 1
+                        msg = "Notification sent successfully"
+                        self.ui.on_tool_result(call_id, "notify", msg)
+                        return call_id, msg
+                    last_error = f"HTTP {resp.status_code}"
+                except Exception as exc:
+                    last_error = type(exc).__name__
+                    continue  # try next gateway
+
+            # All gateways failed this attempt — retry if we have attempts left
+            if attempt < self._NOTIFY_MAX_RETRIES:
+                delay = self._NOTIFY_RETRY_DELAYS[attempt]
+                log.warning(
+                    "notify.all_gateways_failed",
+                    attempt=attempt + 1,
+                    max_retries=self._NOTIFY_MAX_RETRIES,
+                    last_error=last_error,
+                    gateway_count=len(services),
+                    retry_delay=delay,
+                )
+                time.sleep(delay)
+            else:
+                log.warning(
+                    "notify.delivery_failed",
+                    last_error=last_error,
+                    gateway_count=len(services),
+                )
+
+        msg = "Error: notification delivery failed"
+        self.ui.on_tool_result(call_id, "notify", msg)
+        return call_id, msg
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""

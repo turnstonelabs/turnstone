@@ -348,6 +348,32 @@ class TurnstoneBot:
         """Start the bot (async). Use this for multi-adapter ``asyncio.gather``."""
         await self._bot.start(self.config.bot_token, reconnect=True)
 
+    async def send(self, channel_id: str, content: str) -> str:
+        """Send a message to a Discord channel or user DM.
+
+        Implements the :class:`ChannelAdapter` protocol.  Tries the ID as a
+        channel first; if not found, attempts a user DM.  Long messages are
+        chunked via :func:`chunk_message`.
+        """
+        import discord
+
+        int_id = int(channel_id)
+        target: discord.abc.Messageable | None = self._bot.get_channel(int_id)  # type: ignore[assignment]
+        if target is None:
+            try:
+                user = await self._bot.fetch_user(int_id)
+                target = await user.create_dm()
+            except discord.NotFound as exc:
+                raise ValueError(f"Discord channel/user {channel_id} not found") from exc
+
+        content = discord.utils.escape_mentions(content)
+        chunks = chunk_message(content, self.config.max_message_length)
+        msg: discord.Message | None = None
+        for chunk in chunks:
+            msg = await target.send(chunk)  # type: ignore[union-attr]
+
+        return str(msg.id) if msg else ""
+
     async def stop(self) -> None:
         """Disconnect the bot and clean up subscriptions."""
         for ws_id in list(self._subscribed_ws):

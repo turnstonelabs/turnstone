@@ -1,8 +1,8 @@
 """Unified channel gateway entry point.
 
 Launches one or more channel adapters (Discord, Slack, etc.) connected to
-the turnstone cluster via Redis MQ.  Currently supports Discord; future
-adapters will be added as additional ``--*-token`` flags.
+the turnstone cluster via Redis MQ.  An HTTP server runs alongside for
+inbound notification delivery from the server.
 
 Run as: ``turnstone-channel --discord-token $TURNSTONE_DISCORD_TOKEN``
 """
@@ -10,6 +10,7 @@ Run as: ``turnstone-channel --discord-token $TURNSTONE_DISCORD_TOKEN``
 from __future__ import annotations
 
 import os
+import socket
 import sys
 
 
@@ -42,6 +43,26 @@ def main() -> None:
         "--discord-channels",
         default="",
         help="Comma-separated list of allowed Discord channel IDs (default: all)",
+    )
+
+    # -- HTTP server ---------------------------------------------------------
+    parser.add_argument(
+        "--http-host",
+        default="127.0.0.1",
+        help="HTTP server bind address (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=int(os.environ.get("TURNSTONE_CHANNEL_PORT", "8091")),
+        help="HTTP server port (default: $TURNSTONE_CHANNEL_PORT or 8091)",
+    )
+
+    # -- Auth ----------------------------------------------------------------
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("TURNSTONE_CHANNEL_AUTH_TOKEN", ""),
+        help="Static auth token for /v1/api/notify (default: $TURNSTONE_CHANNEL_AUTH_TOKEN)",
     )
 
     # -- Workstream defaults -------------------------------------------------
@@ -85,6 +106,10 @@ def main() -> None:
         path=db_path,
     )
 
+    # -- Auth config ---------------------------------------------------------
+    auth_token = args.auth_token
+    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+
     # -- Broker --------------------------------------------------------------
     from turnstone.mq.broker import async_broker_from_args
 
@@ -106,6 +131,9 @@ def main() -> None:
 
     # -- Run -----------------------------------------------------------------
     if args.discord_token:
+        import asyncio
+
+        from turnstone.channels._http import _get_service_id, create_channel_app
         from turnstone.channels.discord.bot import TurnstoneBot
         from turnstone.channels.discord.config import DiscordConfig
         from turnstone.core.storage._registry import get_storage
@@ -128,9 +156,78 @@ def main() -> None:
             allowed_channels=allowed_channels,
         )
 
-        bot = TurnstoneBot(config, broker, get_storage())
-        log.info("channel.starting", adapter="discord", guild_id=config.guild_id)
-        bot.run()
+        storage = get_storage()
+        bot = TurnstoneBot(config, broker, storage)
+        adapters = {"discord": bot}
+
+        # Create HTTP app for notification delivery
+        channel_app = create_channel_app(
+            adapters,  # type: ignore[arg-type]
+            storage,
+            auth_token=auth_token,
+            jwt_secret=jwt_secret,
+        )
+
+        log.info(
+            "channel.starting",
+            adapter="discord",
+            guild_id=config.guild_id,
+            http_port=args.http_port,
+        )
+
+        async def _run_all() -> None:
+            """Run Discord bot + HTTP server + service heartbeat concurrently."""
+            import uvicorn
+
+            service_id = _get_service_id()
+
+            # Resolve advertise address — 0.0.0.0/:: are not routable
+            if args.http_host in ("0.0.0.0", "::"):
+                advertise_host = socket.gethostname()
+            else:
+                advertise_host = args.http_host
+            service_url = f"http://{advertise_host}:{args.http_port}"
+
+            # Register in service registry
+            storage.register_service("channel", service_id, service_url)
+            log.info(
+                "channel.service_registered",
+                service_id=service_id,
+                url=service_url,
+            )
+
+            async def _heartbeat_loop() -> None:
+                """Periodically update service heartbeat."""
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
+                    except Exception:
+                        log.exception("channel.heartbeat_failed")
+
+            uv_config = uvicorn.Config(
+                channel_app,
+                host=args.http_host,
+                port=args.http_port,
+                log_level="warning",
+            )
+            server = uvicorn.Server(uv_config)
+
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            try:
+                await asyncio.gather(
+                    bot.start(),
+                    server.serve(),
+                )
+            finally:
+                heartbeat_task.cancel()
+                await asyncio.to_thread(storage.deregister_service, "channel", service_id)
+                log.info("channel.service_deregistered", service_id=service_id)
+
+        import contextlib
+
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(_run_all())
 
 
 if __name__ == "__main__":

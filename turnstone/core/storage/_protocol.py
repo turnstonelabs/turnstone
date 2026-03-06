@@ -312,6 +312,26 @@ class StorageBackend(Protocol):
         """Delete task runs older than retention_days. Returns count deleted."""
         ...
 
+    # -- Service registry ------------------------------------------------------
+
+    def register_service(
+        self, service_type: str, service_id: str, url: str, metadata: str = "{}"
+    ) -> None:
+        """Register or update a service instance. Upserts by (service_type, service_id)."""
+        ...
+
+    def heartbeat_service(self, service_type: str, service_id: str) -> bool:
+        """Update last_heartbeat for a registered service. Returns False if not found."""
+        ...
+
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        """Return healthy services of a given type (heartbeat within max_age_seconds)."""
+        ...
+
+    def deregister_service(self, service_type: str, service_id: str) -> bool:
+        """Remove a service registration. Returns True if existed."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

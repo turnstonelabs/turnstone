@@ -49,6 +49,7 @@ TOKEN_BYTES = 32  # 64 hex chars after prefix
 JWT_ISSUER = "turnstone"
 JWT_AUD_SERVER = "turnstone-server"
 JWT_AUD_CONSOLE = "turnstone-console"
+JWT_AUD_CHANNEL = "turnstone-channel"
 _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve"})
