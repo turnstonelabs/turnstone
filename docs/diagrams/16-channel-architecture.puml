@@ -44,11 +44,15 @@ class "turnstone-channel" as ChannelService <<service>> {
     asyncio event loop
     Structured logging (structlog)
     --log-level, --log-format
+    --
+    POST /v1/api/notify (HTTP)
+    GET  /health
 }
 
 class "DiscordBot" as Bot <<service>> {
     +on_message(msg)
     +on_interaction(interaction)
+    +send(channel_id, content)
     +run(token)
     --
     discord.py Client
@@ -56,6 +60,7 @@ class "DiscordBot" as Bot <<service>> {
     Sends replies + embeds
     Creates threads for workstreams
     Renders approval buttons
+    escape_mentions() on send
 }
 
 class "ChannelRouter" as Router <<service>> {
@@ -109,6 +114,9 @@ class "turnstone-server" as Server <<server>> {
     --
     LLM execution + tool use
     SSE event stream
+    --
+    notify tool: _exec_notify()
+    ServiceTokenManager (JWT)
 }
 
 ' -- Storage --
@@ -134,6 +142,18 @@ class "channel_routes" as CR <<storage>> {
     to turnstone workstreams
 }
 
+class "services" as SVC <<storage>> {
+    service_type (PK)
+    service_id (PK)
+    url
+    last_heartbeat
+    created
+    --
+    Heartbeat every 30s
+    Stale after 120s
+    ON CONFLICT DO UPDATE
+}
+
 ' -- Relationships --
 Discord --> Bot : gateway\nevents
 Bot --> Router : on_message\non_interaction
@@ -157,6 +177,11 @@ Teams .[hidden]. Slack
 ChannelService --> Bot : creates + runs
 ChannelService --> Router : creates
 ChannelService --> Broker : creates
+ChannelService --> SVC : register / heartbeat /\nderegister
+
+' -- Notification path (direct HTTP, bypasses MQ) --
+Server --> ChannelService : POST /v1/api/notify\n(JWT: aud=turnstone-channel)
+Server --> SVC : list_services("channel",\nmax_age_seconds=120)
 
 ' -- Notes --
 note right of Bot
@@ -206,6 +231,20 @@ note bottom of CU
   5. On success, inserts channel_users row
   6. Subsequent messages carry user_id
   7. AuthResult scopes applied by server
+end note
+
+note bottom of SVC
+  **Notification Flow** (direct HTTP, bypasses MQ)
+  1. LLM calls notify tool → _prepare_notify()
+  2. _exec_notify() checks rate limit (5/turn)
+  3. Queries services table for healthy gateways
+  4. Mints JWT (aud: turnstone-channel) via
+     ServiceTokenManager
+  5. POSTs to first healthy gateway
+  6. Gateway validates JWT, resolves target
+  7. adapter.send() → Discord API
+  8. On failure: retry up to 3× (1s, 3s backoff)
+  9. SSRF: only http(s) URLs allowed
 end note
 
 @enduml

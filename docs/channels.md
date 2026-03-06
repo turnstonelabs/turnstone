@@ -198,6 +198,9 @@ Plan review requests are displayed as a blue embed with:
 | `--redis-db` | — | `0` | Redis DB number |
 | `--model` | — | server default | Default model for new workstreams |
 | `--auto-approve` | — | `false` | Auto-approve ALL tool calls (skips approval buttons entirely) |
+| `--http-host` | — | `127.0.0.1` | HTTP server bind address for notify endpoint |
+| `--http-port` | `TURNSTONE_CHANNEL_PORT` | `8091` | HTTP server port |
+| `--auth-token` | `TURNSTONE_CHANNEL_AUTH_TOKEN` | — | Static auth token for `/v1/api/notify` (alternative to JWT) |
 | `--log-level` | `TURNSTONE_LOG_LEVEL` | `INFO` | Log level |
 | `--log-format` | `TURNSTONE_LOG_FORMAT` | `auto` | Log format (`auto`/`json`/`text`) |
 
@@ -239,6 +242,79 @@ See [Security: Database Schema](security.md#database-schema) for the
    fresh with no error.
 5. **Close** — `/close` command closes the workstream via MQ, deletes the
    route, unsubscribes from events, and archives the Discord thread.
+
+---
+
+## Notifications
+
+> See also: [Notification Flow diagram](diagrams/png/17-notify-flow.png)
+
+The `notify` tool allows the LLM to proactively send notifications to
+users or channels on external platforms. This is useful for alerting
+people about task completion, errors, or important updates without
+waiting for them to check in.
+
+### Targeting
+
+Two modes:
+
+- **Username** — provide a turnstone `username`. The gateway resolves
+  it via the `channel_users` table and sends to all linked channels
+  (e.g. Discord + future Slack).
+- **Direct** — provide `channel_type` + `channel_id` to target a
+  specific platform channel or user DM.
+
+### Delivery Flow
+
+Notifications bypass MQ for lower latency. The server calls the channel
+gateway directly over HTTP:
+
+1. The LLM calls the `notify` tool with a message and target
+2. `_exec_notify()` queries the `services` table for healthy channel
+   gateways (heartbeat within the last 120 seconds)
+3. The server mints a service JWT (`aud: turnstone-channel`) via
+   `ServiceTokenManager` and POSTs to the first healthy gateway
+4. The gateway validates the JWT, resolves the target, and calls
+   `adapter.send()` on the appropriate platform adapter
+5. On failure, the server tries the next gateway. If all fail, it
+   retries up to 2 more times (delays: 1s, 3s), re-querying the
+   service registry on each attempt
+
+### Service Registry
+
+The channel gateway registers itself in the `services` database table
+on startup and sends a heartbeat every 30 seconds. On shutdown it
+deregisters. Services are considered stale after 120 seconds (4 missed
+heartbeats) and are excluded from `list_services()` queries.
+
+The `services` table schema:
+
+| Column | Description |
+|--------|-------------|
+| `service_type` | Service category (e.g. `"channel"`) |
+| `service_id` | Unique instance ID (`channel-<hostname>-<random>`) |
+| `url` | HTTP base URL for the service |
+| `last_heartbeat` | ISO 8601 timestamp of last heartbeat |
+| `created` | ISO 8601 timestamp of initial registration |
+
+### Security
+
+- **Authentication** — the gateway's `POST /v1/api/notify` endpoint
+  requires authentication. Configure either `TURNSTONE_JWT_SECRET`
+  (the server mints JWTs with `aud: turnstone-channel` automatically)
+  or a static token via `--auth-token`. If neither is set, the
+  gateway fails closed and rejects all requests with 401. Server JWTs
+  (`aud: turnstone-server`) are rejected.
+- **Rate limit** — maximum 5 notifications per turn. The counter only
+  increments on successful delivery, so failures don't consume the
+  budget.
+- **SSRF protection** — only `http://` and `https://` service URLs
+  are allowed. Other schemes are silently skipped.
+- **Mention sanitization** — `discord.utils.escape_mentions()` is
+  applied before sending, preventing `@everyone` / `@here` abuse.
+- **Error redaction** — generic error messages are returned to the
+  LLM. Internal details (service IDs, URLs, exception messages) are
+  logged server-side only.
 
 ---
 

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+if TYPE_CHECKING:
+    from turnstone.core.session import ChatSession
 
-def _make_session():
+
+def _make_session() -> ChatSession:
     """Create a minimal ChatSession with mocked dependencies."""
     from unittest.mock import patch
 
@@ -177,6 +181,9 @@ class TestExecNotify:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+        }
 
         from unittest.mock import patch
 
@@ -240,6 +247,9 @@ class TestExecNotify:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+        }
 
         from unittest.mock import patch
 
@@ -350,6 +360,9 @@ class TestExecNotify:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+        }
 
         from unittest.mock import patch
 
@@ -412,7 +425,7 @@ class TestExecNotify:
         # First two calls return empty, third returns a service
         call_count = 0
 
-        def _list_services(stype: str, max_age_seconds: int = 120):
+        def _list_services(stype: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
             nonlocal call_count
             call_count += 1
             if call_count <= 2:
@@ -430,6 +443,9 @@ class TestExecNotify:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+        }
 
         from unittest.mock import patch
 
@@ -475,6 +491,9 @@ class TestExecNotify:
                 raise ConnectionError("refused")
             resp = MagicMock()
             resp.status_code = 200
+            resp.json.return_value = {
+                "results": [{"channel_type": "discord", "channel_id": "123", "status": "sent"}]
+            }
             return resp
 
         from unittest.mock import patch
@@ -560,3 +579,40 @@ class TestExecNotify:
         # 2 retry warnings + 1 final failure
         assert "notify.all_gateways_failed" in events
         assert "notify.delivery_failed" in events
+
+    def test_gateway_200_but_no_delivery(self, tmp_path):
+        """HTTP 200 with all results failed should not count as success."""
+        from turnstone.core.storage._sqlite import SQLiteBackend
+
+        storage = SQLiteBackend(str(tmp_path / "test.db"))
+        storage.register_service("channel", "ch-1", "http://localhost:8091")
+
+        session = _make_session()
+        item = {
+            "call_id": "call_1",
+            "func_name": "notify",
+            "message": "Hello!",
+            "username": "admin",
+            "channel_type": "",
+            "channel_id": "",
+            "title": "",
+        }
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "results": [{"channel_type": "discord", "channel_id": "123", "status": "no_adapter"}]
+        }
+
+        from unittest.mock import patch
+
+        with (
+            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.session.httpx.post", return_value=mock_resp),
+            patch.dict("os.environ", {}, clear=False),
+            patch("turnstone.core.session.time.sleep"),
+        ):
+            call_id, msg = session._exec_notify(item)
+
+        assert "delivery failed" in msg.lower()
+        assert session._notify_count == 0

@@ -1287,3 +1287,17 @@ to confirm success.
 Discord ships as the first adapter. See [channels.md](channels.md) for
 setup instructions, configuration reference, and the adapter development
 guide.
+
+### Notification Subsystem
+
+The `notify` tool enables the LLM to send notifications to users or
+channels without going through MQ. The server calls the channel gateway
+directly over HTTP for lower latency: `_exec_notify()` queries the
+`services` database table for healthy channel gateways (heartbeat within
+120 seconds), authenticates with a service JWT (`aud: turnstone-channel`),
+and POSTs to `POST /v1/api/notify` on the first healthy gateway. The
+gateway validates the JWT, resolves the target (username lookup via
+`channel_users` or direct `channel_type`+`channel_id`), and delegates to
+the appropriate `ChannelAdapter.send()`. Delivery retries up to 3 times
+with backoff, re-querying the service registry on each attempt. See
+[Notification Flow diagram](diagrams/png/17-notify-flow.png).

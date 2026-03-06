@@ -354,15 +354,22 @@ provided, that static token is used instead.
 The bridge and console collector use `ServiceTokenManager` for
 auto-rotating JWTs when communicating with server nodes:
 
-| Service | Identity | Scope | Purpose |
-|---------|----------|-------|---------|
-| Bridge | `bridge` | `approve` | Tool approval proxy, message relay |
-| Console collector | `console-collector` | `read` | Node health polling |
-| Console proxy | `console-proxy` | `write` | Proxied API calls |
+| Service | Identity | Scope | Audience | Purpose |
+|---------|----------|-------|----------|---------|
+| Bridge | `bridge` | `approve` | `turnstone-server` | Tool approval proxy, message relay |
+| Console collector | `console-collector` | `read` | `turnstone-server` | Node health polling |
+| Console proxy | `console-proxy` | `write` | `turnstone-server` | Proxied API calls |
+| Channel notify | `system` | `write` | `turnstone-channel` | Notification delivery to channel gateway |
 
-All service tokens use `aud: turnstone-server` and 1-hour expiry with
-automatic refresh.  The bridge injects auth headers per-request via httpx
-event hooks to ensure rotated tokens are picked up on SSE reconnects.
+Service tokens use 1-hour expiry with automatic refresh via
+`ServiceTokenManager`.  The bridge injects auth headers per-request via
+httpx event hooks to ensure rotated tokens are picked up on SSE
+reconnects.
+
+Note that the channel gateway uses a distinct JWT audience
+(`turnstone-channel`) from the server (`turnstone-server`) and console
+(`turnstone-console`).  A server-scoped JWT cannot authenticate to the
+channel gateway endpoint, and vice versa.
 
 ---
 

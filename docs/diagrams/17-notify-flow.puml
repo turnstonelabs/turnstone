@@ -1,0 +1,116 @@
+@startuml
+!theme plain
+title Turnstone — Notification Delivery Flow
+
+skinparam participant {
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<service>> #E8EAF6
+    BackgroundColor<<platform>> #E1BEE7
+}
+
+participant "ChatSession\n(turnstone-server)" as Session <<server>>
+participant "StorageBackend" as Storage <<storage>>
+participant "ServiceTokenManager" as STM <<server>>
+participant "Channel Gateway\n(_http.py)" as Gateway <<service>>
+participant "ChannelAdapter\n(Discord bot)" as Adapter <<service>>
+participant "Discord API" as Discord <<platform>>
+
+== Prepare Phase ==
+
+Session -> Session : _prepare_notify(call_id, args)
+note right
+  Validates:
+  - message (required, ≤2000 chars)
+  - target: username OR channel_type+channel_id
+  - no ambiguous targeting (both set)
+  - partial targeting errors
+end note
+
+== Execute Phase ==
+
+Session -> Session : _exec_notify(item)
+Session -> Session : check rate limit\n(≥5 per turn?)
+
+alt rate limit exceeded
+    Session --> Session : "Error: rate limit exceeded"
+end
+
+loop up to 3 attempts (retry delays: 1s, 3s)
+
+    Session -> Storage : list_services("channel",\nmax_age_seconds=120)
+    Storage --> Session : services[] (sorted by\nlast_heartbeat DESC)
+
+    alt no healthy services
+        Session -> Session : log.warning("notify.no_services")
+        Session -> Session : sleep(delay)
+    else services available
+
+        Session -> STM : bearer_header
+        note right
+          Lazy-init ServiceTokenManager
+          aud: turnstone-channel
+          scope: write
+          Auto-rotates 1h JWTs
+        end note
+        STM --> Session : Authorization: Bearer <jwt>
+
+        loop for each gateway (first-healthy)
+            Session -> Session : SSRF check:\nurl.startswith("http://"|"https://")
+
+            Session -> Gateway : POST /v1/api/notify\n+ Authorization header
+            Gateway -> Gateway : _check_auth()\nvalidate JWT (aud=turnstone-channel)\nor static token
+
+            alt auth failed
+                Gateway --> Session : 401 Unauthorized
+            else auth ok
+
+                alt username target
+                    Gateway -> Storage : get_user_by_username()
+                    Storage --> Gateway : user
+                    Gateway -> Storage : list_channel_users_by_user()
+                    Storage --> Gateway : linked channels
+                else direct target
+                    Gateway -> Gateway : use channel_type + channel_id
+                end
+
+                Gateway -> Adapter : send(channel_id, content)
+                note right
+                  escape_mentions() applied
+                  Chunked for 2000-char limit
+                end note
+                Adapter -> Discord : POST message
+                Discord --> Adapter : message_id
+                Adapter --> Gateway : message_id
+                Gateway --> Session : 200 {results: [{status: "sent"}]}
+
+                Session -> Session : _notify_count += 1
+                Session --> Session : "Notification sent successfully"
+                note right : Return — no further\ngateways tried
+            end
+        end
+
+        alt all gateways failed
+            Session -> Session : log.warning(\n"notify.all_gateways_failed")
+            Session -> Session : sleep(delay)
+        end
+
+    end
+end
+
+alt all retries exhausted
+    Session -> Session : log.warning("notify.delivery_failed")
+    Session --> Session : "Error: notification delivery failed"
+end
+
+== Service Registry (Background) ==
+
+note over Gateway, Storage
+  **Heartbeat Lifecycle**
+  1. Gateway startup: register_service("channel", id, url)
+  2. Every 30s: heartbeat_service("channel", id)
+  3. Shutdown: deregister_service("channel", id)
+  4. Stale after 120s (4 missed heartbeats)
+end note
+
+@enduml

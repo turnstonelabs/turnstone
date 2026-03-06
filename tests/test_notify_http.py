@@ -25,14 +25,22 @@ def mock_adapter():
 
 
 @pytest.fixture
-def client(storage, mock_adapter):
+def no_auth_client(storage, mock_adapter):
+    """Client with no auth configured (for fail-closed tests)."""
     app = create_channel_app({"discord": mock_adapter}, storage)
     return TestClient(app)
 
 
 @pytest.fixture
+def client(storage, mock_adapter):
+    """Default client with static auth token configured."""
+    app = create_channel_app({"discord": mock_adapter}, storage, auth_token="test-secret-token")
+    return TestClient(app)
+
+
+@pytest.fixture
 def authed_client(storage, mock_adapter):
-    """Client with static auth token configured."""
+    """Alias — same as client, for auth-specific test clarity."""
     app = create_channel_app({"discord": mock_adapter}, storage, auth_token="test-secret-token")
     return TestClient(app)
 
@@ -50,6 +58,9 @@ class TestNotifyEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": "Bearer test-secret-token"}
+
     def test_direct_discord_target(self, client, mock_adapter):
         resp = client.post(
             "/v1/api/notify",
@@ -57,6 +68,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "discord", "channel_id": "123456"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -73,6 +85,7 @@ class TestNotifyEndpoint:
                 "message": "Hello!",
                 "title": "Alert",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 200
         mock_adapter.send.assert_called_once_with("123456", "**Alert**\nHello!")
@@ -88,6 +101,7 @@ class TestNotifyEndpoint:
                 "target": {"username": "testuser"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -102,29 +116,44 @@ class TestNotifyEndpoint:
                 "target": {"username": "nobody"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 404
-        assert "not found" in resp.json()["error"]
+        error = resp.json()["error"]
+        assert "nobody" not in error
+        assert "not found or has no linked channels" in error
 
-    def test_user_no_channels(self, client, storage):
+    def test_user_no_channels(self, authed_client, storage):
         storage.create_user("u1", "testuser", "Test User", "hash")
 
-        resp = client.post(
+        resp = authed_client.post(
             "/v1/api/notify",
             json={
                 "target": {"username": "testuser"},
                 "message": "Hello!",
             },
+            headers={"Authorization": "Bearer test-secret-token"},
         )
         assert resp.status_code == 404
-        assert "no linked channels" in resp.json()["error"]
+        # Generic message — must not differentiate "not found" vs "no channels"
+        error = resp.json()["error"]
+        assert "testuser" not in error
+        assert "not found or has no linked channels" in error
 
     def test_missing_fields(self, client):
-        resp = client.post("/v1/api/notify", json={"target": {"username": "x"}})
+        resp = client.post(
+            "/v1/api/notify",
+            json={"target": {"username": "x"}},
+            headers=self._headers(),
+        )
         assert resp.status_code == 400
 
     def test_missing_target(self, client):
-        resp = client.post("/v1/api/notify", json={"message": "Hello!"})
+        resp = client.post(
+            "/v1/api/notify",
+            json={"message": "Hello!"},
+            headers=self._headers(),
+        )
         assert resp.status_code == 400
 
     def test_invalid_target(self, client):
@@ -134,6 +163,7 @@ class TestNotifyEndpoint:
                 "target": {"invalid": "field"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 400
 
@@ -145,6 +175,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "email", "channel_id": "test@example.com"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -158,6 +189,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "discord", "channel_id": "123456"},
                 "message": "Hello!",
             },
+            headers=self._headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -167,7 +199,22 @@ class TestNotifyEndpoint:
         resp = client.post(
             "/v1/api/notify",
             content=b"not json",
-            headers={"content-type": "application/json"},
+            headers={
+                "content-type": "application/json",
+                "Authorization": "Bearer test-secret-token",
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_whitespace_only_message(self, client):
+        """Whitespace-only messages should be rejected."""
+        resp = client.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123"},
+                "message": "   ",
+            },
+            headers=self._headers(),
         )
         assert resp.status_code == 400
 
@@ -175,16 +222,16 @@ class TestNotifyEndpoint:
 class TestNotifyAuth:
     """Tests for authentication on the /v1/api/notify endpoint."""
 
-    def test_no_auth_when_unconfigured(self, client, mock_adapter):
-        """Requests pass through when no auth is configured."""
-        resp = client.post(
+    def test_reject_when_unconfigured(self, no_auth_client):
+        """Requests are rejected (fail closed) when no auth is configured."""
+        resp = no_auth_client.post(
             "/v1/api/notify",
             json={
                 "target": {"channel_type": "discord", "channel_id": "123"},
                 "message": "Hello!",
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 401
 
     def test_reject_without_token(self, authed_client):
         """Requests without Authorization header are rejected when auth is configured."""

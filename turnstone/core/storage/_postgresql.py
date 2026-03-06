@@ -1089,7 +1089,7 @@ class PostgreSQLBackend:
                 created=now,
             )
             stmt = stmt.on_conflict_do_update(
-                constraint=services.primary_key,
+                index_elements=[services.c.service_type, services.c.service_id],
                 set_={"url": url, "metadata": metadata, "last_heartbeat": now},
             )
             conn.execute(stmt)

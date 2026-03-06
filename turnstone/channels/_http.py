@@ -37,7 +37,8 @@ def _check_auth(request: Request) -> JSONResponse | None:
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
 
     if not auth_token and not jwt_secret:
-        return None  # auth not configured
+        log.warning("notify.auth_not_configured")
+        return JSONResponse({"error": "authentication not configured"}, status_code=401)
 
     header = request.headers.get("Authorization", "")
     if not header.startswith("Bearer "):
@@ -78,8 +79,8 @@ async def _handle_notify(request: Request) -> JSONResponse:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
     target = body.get("target")
-    message = body.get("message", "")
-    title = body.get("title", "")
+    message = body.get("message", "").strip() if isinstance(body.get("message"), str) else ""
+    title = body.get("title", "").strip() if isinstance(body.get("title"), str) else ""
 
     if not target or not message:
         return JSONResponse({"error": "target and message are required"}, status_code=400)
@@ -91,13 +92,18 @@ async def _handle_notify(request: Request) -> JSONResponse:
     if "username" in target:
         user = await asyncio.to_thread(storage.get_user_by_username, target["username"])
         if user is None:
-            return JSONResponse({"error": f"user not found: {target['username']}"}, status_code=404)
+            log.warning("notify.user_not_found", username=target["username"])
+            return JSONResponse(
+                {"error": "target not found or has no linked channels"},
+                status_code=404,
+            )
         links = await asyncio.to_thread(storage.list_channel_users_by_user, user["user_id"])
         for link in links:
             targets.append((link["channel_type"], link["channel_user_id"]))
         if not targets:
+            log.warning("notify.user_no_linked_channels", username=target["username"])
             return JSONResponse(
-                {"error": f"user has no linked channels: {target['username']}"},
+                {"error": "target not found or has no linked channels"},
                 status_code=404,
             )
     elif "channel_type" in target and "channel_id" in target:

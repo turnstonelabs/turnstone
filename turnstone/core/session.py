@@ -2583,10 +2583,22 @@ class ChatSession:
                 try:
                     resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
                     if resp.status_code < 300:
-                        self._notify_count += 1
-                        msg = "Notification sent successfully"
-                        self.ui.on_tool_result(call_id, "notify", msg)
-                        return call_id, msg
+                        # Check that at least one target was actually delivered
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            last_error = "invalid gateway response"
+                            continue
+                        results = data.get("results") if isinstance(data, dict) else None
+                        if isinstance(results, list) and any(
+                            isinstance(r, dict) and r.get("status") == "sent" for r in results
+                        ):
+                            self._notify_count += 1
+                            msg = "Notification sent successfully"
+                            self.ui.on_tool_result(call_id, "notify", msg)
+                            return call_id, msg
+                        last_error = "no successful deliveries"
+                        continue
                     last_error = f"HTTP {resp.status_code}"
                 except Exception as exc:
                     last_error = type(exc).__name__
