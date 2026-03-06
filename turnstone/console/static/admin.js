@@ -624,9 +624,11 @@ function submitCreateSchedule() {
   if (schedType === "at" && !atTime)
     return _showModalError(errEl, "Run time is required");
 
-  // Convert datetime-local to ISO8601
+  // Normalize datetime-local to "YYYY-MM-DDTHH:MM:SS+00:00" (UTC)
   if (schedType === "at" && atTime) {
-    atTime = atTime.replace("T", "T") + ":00";
+    if (atTime.length === 16) atTime += ":00";
+    else if (atTime.length > 19) atTime = atTime.slice(0, 19);
+    atTime += "+00:00";
   }
 
   if (targetMode === "node") targetMode = nodeId;
@@ -756,7 +758,11 @@ function submitEditSchedule() {
   if (targetMode === "node")
     targetMode = (document.getElementById("es-node").value || "").trim();
   var atTime = document.getElementById("es-at").value || "";
-  if (atTime && atTime.length === 16) atTime += ":00";
+  if (atTime) {
+    if (atTime.length === 16) atTime += ":00";
+    else if (atTime.length > 19) atTime = atTime.slice(0, 19);
+    atTime += "+00:00";
+  }
 
   var errEl = document.getElementById("edit-schedule-error");
 
@@ -1152,7 +1158,7 @@ function _modalFocusTrap(boxId) {
       var box = document.getElementById(boxId);
       if (!box) return;
       var focusable = box.querySelectorAll(
-        "input:not([disabled]), select:not([disabled]), button:not([disabled])",
+        "input:not([disabled]):not([type='hidden']), select:not([disabled]), textarea:not([disabled]), button:not([disabled])",
       );
       var visible = [];
       for (var i = 0; i < focusable.length; i++) {

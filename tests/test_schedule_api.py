@@ -78,7 +78,7 @@ def _at_payload(**overrides):
         "name": "One-shot task",
         "description": "Run once",
         "schedule_type": "at",
-        "at_time": "2099-01-01T00:00:00",
+        "at_time": "2099-01-01T00:00:00+00:00",
         "target_mode": "auto",
         "model": "gpt-5",
         "initial_message": "Do the thing",
@@ -114,8 +114,8 @@ class TestScheduleAPI:
         assert resp.status_code == 200
         task = resp.json()
         assert task["schedule_type"] == "at"
-        assert task["at_time"] == "2099-01-01T00:00:00"
-        assert task["next_run"] == "2099-01-01T00:00:00"
+        assert task["at_time"] == "2099-01-01T00:00:00+00:00"
+        assert task["next_run"] == "2099-01-01T00:00:00+00:00"
 
     def test_create_missing_name(self, client):
         payload = _cron_payload()
@@ -132,10 +132,19 @@ class TestScheduleAPI:
         assert resp.status_code == 400
         assert "cron" in resp.json()["error"].lower()
 
+    def test_create_naive_at_time(self, client):
+        """Naive timestamps (no timezone) should be rejected."""
+        resp = client.post(
+            "/v1/api/admin/schedules",
+            json=_at_payload(at_time="2099-01-01T00:00:00"),
+        )
+        assert resp.status_code == 400
+        assert "timezone" in resp.json()["error"].lower()
+
     def test_create_past_at_time(self, client):
         resp = client.post(
             "/v1/api/admin/schedules",
-            json=_at_payload(at_time="2000-01-01T00:00:00"),
+            json=_at_payload(at_time="2000-01-01T00:00:00+00:00"),
         )
         assert resp.status_code == 400
         assert "future" in resp.json()["error"].lower()

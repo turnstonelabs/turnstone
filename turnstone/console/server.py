@@ -932,11 +932,13 @@ def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) 
         try:
             dt = datetime.fromisoformat(at_time)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
+                return (
+                    "at_time must include a timezone offset (e.g. 2024-01-01T12:00:00Z or +00:00)"
+                )
             if dt <= datetime.now(UTC):
                 return "at_time must be in the future"
         except ValueError:
-            return "at_time must be a valid ISO8601 timestamp"
+            return "at_time must be a valid ISO8601 timestamp with timezone"
     return None
 
 
@@ -1019,6 +1021,11 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         created_by=created_by,
         next_run=next_run if enabled else "",
     )
+
+    if not enabled:
+        # Storage backends default enabled=1 on create; persist user's choice
+        storage.update_scheduled_task(task_id, enabled=False)
+
     task = storage.get_scheduled_task(task_id)
     if task:
         _normalize_task_dict(task)
@@ -1086,15 +1093,23 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     stype = updates.get("schedule_type", existing["schedule_type"])
     cexpr = updates.get("cron_expr", existing["cron_expr"])
     atime = updates.get("at_time", existing["at_time"])
-    if "schedule_type" in updates or "cron_expr" in updates or "at_time" in updates:
+    schedule_fields_changed = (
+        "schedule_type" in updates or "cron_expr" in updates or "at_time" in updates
+    )
+    if schedule_fields_changed:
         validation_err = _validate_schedule_fields(stype, cexpr, atime)
         if validation_err:
             return JSONResponse({"error": validation_err}, status_code=400)
 
-    # Recompute next_run if schedule changed
-    if any(k in updates for k in ("schedule_type", "cron_expr", "at_time", "enabled")):
+    # Recompute next_run if schedule changed or enabled toggled
+    if schedule_fields_changed or "enabled" in updates:
         enabled = updates.get("enabled", bool(existing.get("enabled", 1)))
         if enabled:
+            # Re-validate at_time when re-enabling a one-shot task
+            if stype == "at" and not schedule_fields_changed:
+                validation_err = _validate_schedule_fields(stype, cexpr, atime)
+                if validation_err:
+                    return JSONResponse({"error": validation_err}, status_code=400)
             updates["next_run"] = _compute_next_run(stype, cexpr, atime)
         else:
             updates["next_run"] = ""
@@ -1102,10 +1117,7 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     storage.update_scheduled_task(task_id, **updates)
     task = storage.get_scheduled_task(task_id)
     if task:
-        tools_str = task.get("auto_approve_tools", "")
-        task["auto_approve_tools"] = [s.strip() for s in tools_str.split(",") if s.strip()]
-        task["auto_approve"] = bool(task.get("auto_approve", 0))
-        task["enabled"] = bool(task.get("enabled", 1))
+        _normalize_task_dict(task)
     return JSONResponse(task)
 
 
