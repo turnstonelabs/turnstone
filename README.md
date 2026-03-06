@@ -19,12 +19,39 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 - **Cluster dashboard** — real-time view of all nodes and workstreams, workstream creation with node targeting, reverse proxy for server UIs (only the console port needs network access)
 - **Cluster simulator** — test the stack at scale (up to 1000 nodes) without an LLM backend
 
-```
-External System → Message Queue → Bridge (per node) → Turnstone Server → LLM + Tools
-                                      ↓
-                                 Pub/Sub → Progress Events → External System
-                                      ↓
-                                 turnstone-console → Cluster Dashboard (browser)
+```mermaid
+graph LR
+    subgraph Clients
+        CLI[turnstone CLI]
+        UI[Browser UI]
+        SDK[SDK / API]
+        Discord[Discord / Slack]
+    end
+
+    subgraph Cluster
+        Console[turnstone-console<br/><i>dashboard + proxy</i>]
+        Redis[(Redis MQ)]
+        Bridge[turnstone-bridge<br/><i>per node</i>]
+        Server[turnstone-server<br/><i>LLM + 15 tools</i>]
+        Channel[turnstone-channel<br/><i>platform gateway</i>]
+    end
+
+    LLM[LLM Provider<br/><i>OpenAI · Anthropic · local</i>]
+
+    CLI --> Server
+    UI --> Server
+    SDK --> Redis
+    Discord --> Channel
+
+    Channel <--> Redis
+    Console --> Redis
+    Redis --> Bridge
+    Bridge --> Server
+    Server --> LLM
+
+    Server -.->|notify| Channel
+    Bridge -.->|SSE events| Redis
+    Console -.->|proxy| Server
 ```
 
 ## Quickstart
