@@ -1103,6 +1103,43 @@ class TestOpenAIParameterGating:
         assert "temperature" not in kwargs
         assert "reasoning_effort" not in kwargs
 
+    def test_gpt5_pro_unsupported_effort_falls_back(self) -> None:
+        """GPT-5 pro only supports 'high'; unsupported values fall back to default."""
+        caps = self.provider.get_capabilities("gpt-5-pro")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "high"  # fell back to default
+
+    def test_gpt5_pro_supported_effort_passes_through(self) -> None:
+        """GPT-5 pro accepts 'high' directly."""
+        caps = self.provider.get_capabilities("gpt-5-pro")
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_gpt54_1m_context_and_effort(self) -> None:
+        """GPT-5.4: 1M context, temperature when effort=none, xhigh supported."""
+        caps = self.provider.get_capabilities("gpt-5.4")
+        assert caps.context_window == 1050000
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        assert kwargs["temperature"] == 0.7
+        assert "reasoning_effort" not in kwargs
+        kwargs2: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
+        assert "temperature" not in kwargs2
+        assert kwargs2["reasoning_effort"] == "xhigh"
+
+    def test_gpt54_pro_no_temperature_always_reasoning(self) -> None:
+        """GPT-5.4 pro: no temperature, medium/high/xhigh only."""
+        caps = self.provider.get_capabilities("gpt-5.4-pro")
+        assert caps.context_window == 1050000
+        kwargs: dict[str, Any] = {}
+        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        assert "temperature" not in kwargs
+        assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
+
 
 class TestAnthropicReasoningNone:
     """Verify 'none' effort disables thinking for manual-thinking models."""

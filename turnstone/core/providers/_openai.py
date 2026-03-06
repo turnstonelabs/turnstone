@@ -183,7 +183,11 @@ class OpenAIProvider:
             else:
                 kwargs["temperature"] = temperature
         if caps.reasoning_effort_values and reasoning_effort and reasoning_effort != "none":
-            kwargs["reasoning_effort"] = reasoning_effort
+            # Validate against supported values; fall back to model default
+            if reasoning_effort in caps.reasoning_effort_values:
+                kwargs["reasoning_effort"] = reasoning_effort
+            elif caps.default_reasoning_effort and caps.default_reasoning_effort != "none":
+                kwargs["reasoning_effort"] = caps.default_reasoning_effort
 
     # -- web search ----------------------------------------------------------
 
