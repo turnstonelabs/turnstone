@@ -234,11 +234,10 @@ See [Security: Database Schema](security.md#database-schema) for the
 4. **Reactivation** — the next message in the thread detects the stale
    route (no MQ owner) and creates a new workstream with the old `ws_id`
    as `resume_ws` on the `CreateWorkstreamMessage`. The server resumes
-   the session during creation (no separate command or reverse lookup
+   the workstream during creation (no separate command or reverse lookup
    needed). The bridge emits a `WorkstreamResumedEvent` to the channel, and
-   the thread displays *"Session resumed: {name} ({count} messages
-   restored)"*. If the old session was pruned, the workstream starts
-   fresh with no error.
+   the thread displays *"Resumed: {name} ({count} messages restored)"*.
+   If the old workstream was pruned, a fresh one starts with no error.
 5. **Close** — `/close` command closes the workstream via MQ, deletes the
    route, unsubscribes from events, and archives the Discord thread.
 

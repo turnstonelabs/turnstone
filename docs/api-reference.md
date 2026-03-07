@@ -553,17 +553,16 @@ updated.
 }
 ```
 
-Each session object:
+Each saved workstream object:
 
 | Field           | Type        | Description                                |
 |-----------------|-------------|--------------------------------------------|
-| `ws_id`         | string      | Unique workstream/session identifier       |
+| `ws_id`         | string      | Unique workstream identifier               |
 | `alias`         | string/null | User-assigned short name                   |
 | `title`         | string/null | LLM-generated title                        |
-| `created`       | string      | ISO timestamp of session creation          |
+| `created`       | string      | ISO timestamp of workstream creation       |
 | `updated`       | string      | ISO timestamp of last message              |
-| `message_count` | int         | Number of messages in the session          |
-| `node_id`       | string/null | Server node that created the session       |
+| `message_count` | int         | Number of messages in the workstream       |
 
 ---
 

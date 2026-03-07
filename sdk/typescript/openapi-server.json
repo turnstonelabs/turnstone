@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.3.0",
+    "version": "0.4.2",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -10,7 +10,9 @@
       "get": {
         "summary": "List active workstreams",
         "operationId": "v1_api_workstreams_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -29,7 +31,9 @@
       "get": {
         "summary": "Dashboard with workstream details and aggregates",
         "operationId": "v1_api_dashboard_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -48,7 +52,9 @@
       "post": {
         "summary": "Create a new workstream",
         "operationId": "v1_api_workstreams_new_post",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -87,7 +93,9 @@
       "post": {
         "summary": "Close a workstream",
         "operationId": "v1_api_workstreams_close_post",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -126,7 +134,9 @@
       "post": {
         "summary": "Send a user message",
         "operationId": "v1_api_send_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -175,7 +185,9 @@
       "post": {
         "summary": "Approve or deny a tool call",
         "operationId": "v1_api_approve_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -214,7 +226,9 @@
       "post": {
         "summary": "Respond to a plan review",
         "operationId": "v1_api_plan_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -253,7 +267,9 @@
       "post": {
         "summary": "Execute a slash command",
         "operationId": "v1_api_command_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -302,7 +318,9 @@
       "get": {
         "summary": "Per-workstream SSE event stream",
         "operationId": "v1_api_events_get",
-        "tags": ["Streaming"],
+        "tags": [
+          "Streaming"
+        ],
         "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
@@ -336,7 +354,9 @@
       "get": {
         "summary": "Global SSE event stream",
         "operationId": "v1_api_events_global_get",
-        "tags": ["Streaming"],
+        "tags": [
+          "Streaming"
+        ],
         "description": "Global Server-Sent Events stream for state-change broadcasts across all workstreams. Returns text/event-stream.",
         "responses": {
           "200": {
@@ -349,7 +369,9 @@
       "get": {
         "summary": "List saved workstreams",
         "operationId": "v1_api_workstreams_saved_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -368,7 +390,9 @@
       "post": {
         "summary": "Authenticate with a token",
         "operationId": "v1_api_auth_login_post",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -403,11 +427,95 @@
         }
       }
     },
+    "/v1/api/auth/setup": {
+      "post": {
+        "summary": "Create first admin user",
+        "operationId": "v1_api_auth_setup_post",
+        "tags": [
+          "Auth"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthSetupRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthSetupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/status": {
+      "get": {
+        "summary": "Return auth state",
+        "operationId": "v1_api_auth_status_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/auth/logout": {
       "post": {
         "summary": "Clear auth cookie",
         "operationId": "v1_api_auth_logout_post",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -426,7 +534,9 @@
       "get": {
         "summary": "Server health check",
         "operationId": "health_get",
-        "tags": ["Observability"],
+        "tags": [
+          "Observability"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -453,7 +563,9 @@
             "type": "string"
           }
         },
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "title": "ErrorResponse",
         "type": "object"
       },
@@ -462,7 +574,9 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": ["ok"],
+            "examples": [
+              "ok"
+            ],
             "title": "Status",
             "type": "string"
           }
@@ -471,15 +585,27 @@
         "type": "object"
       },
       "AuthLoginRequest": {
-        "description": "POST /v1/api/auth/login request body.",
+        "description": "POST /v1/api/auth/login request body.\n\nEither username+password or token must be provided.",
         "properties": {
+          "username": {
+            "default": "",
+            "description": "Login username",
+            "title": "Username",
+            "type": "string"
+          },
+          "password": {
+            "default": "",
+            "description": "Login password",
+            "title": "Password",
+            "type": "string"
+          },
           "token": {
-            "description": "Bearer token to authenticate",
+            "default": "",
+            "description": "Legacy: bearer token to authenticate",
             "title": "Token",
             "type": "string"
           }
         },
-        "required": ["token"],
         "title": "AuthLoginRequest",
         "type": "object"
       },
@@ -491,15 +617,132 @@
             "title": "Status",
             "type": "string"
           },
+          "user_id": {
+            "default": "",
+            "description": "Authenticated user ID",
+            "title": "User Id",
+            "type": "string"
+          },
           "role": {
-            "description": "Assigned role",
-            "examples": ["full", "read"],
+            "description": "Legacy role",
+            "examples": [
+              "full",
+              "read"
+            ],
             "title": "Role",
+            "type": "string"
+          },
+          "scopes": {
+            "default": "",
+            "description": "Comma-separated scopes",
+            "examples": [
+              "read,write,approve"
+            ],
+            "title": "Scopes",
+            "type": "string"
+          },
+          "jwt": {
+            "default": "",
+            "description": "JWT session token (if JWT auth is configured)",
+            "title": "Jwt",
             "type": "string"
           }
         },
-        "required": ["role"],
+        "required": [
+          "role"
+        ],
         "title": "AuthLoginResponse",
+        "type": "object"
+      },
+      "AuthSetupRequest": {
+        "description": "POST /v1/api/auth/setup request body.",
+        "properties": {
+          "username": {
+            "description": "Login username (1-64 ASCII characters)",
+            "title": "Username",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Display name",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "password": {
+            "description": "Password (minimum 8 characters)",
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "display_name",
+          "password"
+        ],
+        "title": "AuthSetupRequest",
+        "type": "object"
+      },
+      "AuthSetupResponse": {
+        "description": "POST /v1/api/auth/setup success response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          },
+          "role": {
+            "default": "full",
+            "title": "Role",
+            "type": "string"
+          },
+          "scopes": {
+            "default": "approve,read,write",
+            "title": "Scopes",
+            "type": "string"
+          },
+          "jwt": {
+            "default": "",
+            "description": "JWT session token",
+            "title": "Jwt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "username"
+        ],
+        "title": "AuthSetupResponse",
+        "type": "object"
+      },
+      "AuthStatusResponse": {
+        "description": "GET /v1/api/auth/status response.",
+        "properties": {
+          "auth_enabled": {
+            "title": "Auth Enabled",
+            "type": "boolean"
+          },
+          "has_users": {
+            "title": "Has Users",
+            "type": "boolean"
+          },
+          "setup_required": {
+            "title": "Setup Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "auth_enabled",
+          "has_users",
+          "setup_required"
+        ],
+        "title": "AuthStatusResponse",
         "type": "object"
       },
       "SendRequest": {
@@ -515,7 +758,10 @@
             "type": "string"
           }
         },
-        "required": ["message", "ws_id"],
+        "required": [
+          "message",
+          "ws_id"
+        ],
         "title": "SendRequest",
         "type": "object"
       },
@@ -523,12 +769,17 @@
         "properties": {
           "status": {
             "description": "'ok' or 'busy'",
-            "examples": ["ok", "busy"],
+            "examples": [
+              "ok",
+              "busy"
+            ],
             "title": "Status",
             "type": "string"
           }
         },
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "title": "SendResponse",
         "type": "object"
       },
@@ -564,7 +815,10 @@
             "type": "string"
           }
         },
-        "required": ["approved", "ws_id"],
+        "required": [
+          "approved",
+          "ws_id"
+        ],
         "title": "ApproveRequest",
         "type": "object"
       },
@@ -581,7 +835,10 @@
             "type": "string"
           }
         },
-        "required": ["feedback", "ws_id"],
+        "required": [
+          "feedback",
+          "ws_id"
+        ],
         "title": "PlanFeedbackRequest",
         "type": "object"
       },
@@ -598,7 +855,10 @@
             "type": "string"
           }
         },
-        "required": ["command", "ws_id"],
+        "required": [
+          "command",
+          "ws_id"
+        ],
         "title": "CommandRequest",
         "type": "object"
       },
@@ -621,6 +881,12 @@
             "description": "Auto-approve all tool calls",
             "title": "Auto Approve",
             "type": "boolean"
+          },
+          "resume_ws": {
+            "default": "",
+            "description": "Workstream ID to resume atomically during creation (empty = fresh start)",
+            "title": "Resume Ws",
+            "type": "string"
           }
         },
         "title": "CreateWorkstreamRequest",
@@ -637,9 +903,24 @@
             "description": "Assigned workstream name",
             "title": "Name",
             "type": "string"
+          },
+          "resumed": {
+            "default": false,
+            "description": "Whether a previous workstream was resumed",
+            "title": "Resumed",
+            "type": "boolean"
+          },
+          "message_count": {
+            "default": 0,
+            "description": "Number of messages in the resumed workstream",
+            "title": "Message Count",
+            "type": "integer"
           }
         },
-        "required": ["ws_id", "name"],
+        "required": [
+          "ws_id",
+          "name"
+        ],
         "title": "CreateWorkstreamResponse",
         "type": "object"
       },
@@ -651,7 +932,9 @@
             "type": "string"
           }
         },
-        "required": ["ws_id"],
+        "required": [
+          "ws_id"
+        ],
         "title": "CloseWorkstreamRequest",
         "type": "object"
       },
@@ -665,7 +948,9 @@
             "type": "array"
           }
         },
-        "required": ["workstreams"],
+        "required": [
+          "workstreams"
+        ],
         "title": "ListWorkstreamsResponse",
         "type": "object"
       },
@@ -682,21 +967,13 @@
           "state": {
             "title": "State",
             "type": "string"
-          },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Session Id"
           }
         },
-        "required": ["id", "name", "state"],
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
         "title": "WorkstreamInfo",
         "type": "object"
       },
@@ -713,7 +990,10 @@
             "$ref": "#/components/schemas/DashboardAggregate"
           }
         },
-        "required": ["workstreams", "aggregate"],
+        "required": [
+          "workstreams",
+          "aggregate"
+        ],
         "title": "DashboardResponse",
         "type": "object"
       },
@@ -767,18 +1047,6 @@
             "title": "State",
             "type": "string"
           },
-          "session_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Session Id"
-          },
           "title": {
             "default": "",
             "title": "Title",
@@ -825,7 +1093,11 @@
             "type": "string"
           }
         },
-        "required": ["id", "name", "state"],
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
         "title": "DashboardWorkstream",
         "type": "object"
       },
@@ -839,7 +1111,9 @@
             "type": "array"
           }
         },
-        "required": ["workstreams"],
+        "required": [
+          "workstreams"
+        ],
         "title": "ListSavedWorkstreamsResponse",
         "type": "object"
       },
@@ -886,14 +1160,22 @@
             "type": "integer"
           }
         },
-        "required": ["ws_id", "created", "updated", "message_count"],
+        "required": [
+          "ws_id",
+          "created",
+          "updated",
+          "message_count"
+        ],
         "title": "SavedWorkstreamInfo",
         "type": "object"
       },
       "HealthResponse": {
         "properties": {
           "status": {
-            "examples": ["ok", "degraded"],
+            "examples": [
+              "ok",
+              "degraded"
+            ],
             "title": "Status",
             "type": "string"
           },
@@ -935,24 +1217,36 @@
             "default": null
           }
         },
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "title": "HealthResponse",
         "type": "object"
       },
       "BackendStatus": {
         "properties": {
           "status": {
-            "examples": ["up", "down"],
+            "examples": [
+              "up",
+              "down"
+            ],
             "title": "Status",
             "type": "string"
           },
           "circuit_state": {
-            "examples": ["closed", "open", "half_open"],
+            "examples": [
+              "closed",
+              "open",
+              "half_open"
+            ],
             "title": "Circuit State",
             "type": "string"
           }
         },
-        "required": ["status", "circuit_state"],
+        "required": [
+          "status",
+          "circuit_state"
+        ],
         "title": "BackendStatus",
         "type": "object"
       },
