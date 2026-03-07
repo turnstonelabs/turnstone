@@ -27,7 +27,7 @@ class TestServerSpec:
         expected = {
             "/v1/api/workstreams",
             "/v1/api/dashboard",
-            "/v1/api/sessions",
+            "/v1/api/workstreams/saved",
             "/v1/api/send",
             "/v1/api/approve",
             "/v1/api/plan",

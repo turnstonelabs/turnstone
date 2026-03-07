@@ -26,7 +26,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
-    ListSessionsResponse,
+    ListSavedWorkstreamsResponse,
     ListWorkstreamsResponse,
     SendResponse,
 )
@@ -76,7 +76,7 @@ class AsyncTurnstoneServer(_BaseClient):
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        resume_session: str = "",
+        resume_ws: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -85,8 +85,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["model"] = model
         if auto_approve:
             body["auto_approve"] = True
-        if resume_session:
-            body["resume_session"] = resume_session
+        if resume_ws:
+            body["resume_ws"] = resume_ws
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -214,10 +214,12 @@ class AsyncTurnstoneServer(_BaseClient):
                     await consume_task
         return result
 
-    # -- sessions ------------------------------------------------------------
+    # -- saved workstreams ----------------------------------------------------
 
-    async def list_sessions(self) -> ListSessionsResponse:
-        return await self._request("GET", "/v1/api/sessions", response_model=ListSessionsResponse)
+    async def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
+        return await self._request(
+            "GET", "/v1/api/workstreams/saved", response_model=ListSavedWorkstreamsResponse
+        )
 
     # -- auth ----------------------------------------------------------------
 
@@ -307,11 +309,11 @@ class TurnstoneServer:
         name: str = "",
         model: str = "",
         auto_approve: bool = False,
-        resume_session: str = "",
+        resume_ws: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
-                name=name, model=model, auto_approve=auto_approve, resume_session=resume_session
+                name=name, model=model, auto_approve=auto_approve, resume_ws=resume_ws
             )
         )
 
@@ -363,10 +365,10 @@ class TurnstoneServer:
             self._async.send_and_wait(message, ws_id, timeout=timeout, on_event=on_event)
         )
 
-    # -- sessions ------------------------------------------------------------
+    # -- saved workstreams ----------------------------------------------------
 
-    def list_sessions(self) -> ListSessionsResponse:
-        return self._runner.run(self._async.list_sessions())
+    def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
+        return self._runner.run(self._async.list_saved_workstreams())
 
     # -- auth ----------------------------------------------------------------
 

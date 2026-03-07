@@ -13,23 +13,19 @@ skinparam class {
 
 ' -- Protocol --
 interface "StorageBackend" as SB <<protocol>> {
-    +register_session(session_id, title, node_id, ws_id)
-    +save_message(session_id, role, content, ...)
-    +load_session_messages(session_id) → list[dict]
-    +list_sessions(limit) → list
-    +delete_session(session_id) → bool
-    +prune_sessions(retention_days) → (int, int)
-    +resolve_session(alias_or_id) → str | None
-    +save_session_config(session_id, config)
-    +load_session_config(session_id) → dict
-    +set_session_alias(session_id, alias) → bool
-    +get_session_name(session_id) → str | None
-    +update_session_title(session_id, title)
+    +save_message(ws_id, role, content, ...)
+    +load_messages(ws_id) → list[dict]
     +register_workstream(ws_id, node_id, name, state)
     +update_workstream_state(ws_id, state)
     +update_workstream_name(ws_id, name)
+    +set_workstream_alias(ws_id, alias) → bool
+    +update_workstream_title(ws_id, title)
+    +resolve_workstream(alias_or_id) → str | None
     +delete_workstream(ws_id) → bool
+    +prune_workstreams(retention_days) → (int, int)
     +list_workstreams(node_id, limit) → list
+    +save_workstream_config(ws_id, config)
+    +load_workstream_config(ws_id) → dict
     +kv_get(key) → str | None
     +kv_set(key, value) → str | None
     +kv_delete(key) → bool
@@ -68,9 +64,8 @@ class "_schema.py" as Schema <<schema>> {
     +metadata: MetaData
     +memories: Table
     +conversations: Table
-    +sessions: Table (node_id, ws_id, user_id)
-    +workstreams: Table (node_id, user_id, state)
-    +session_config: Table
+    +workstreams: Table (node_id, alias, title, state)
+    +workstream_config: Table
     +users: Table (username, password_hash)
     +api_tokens: Table (token_hash, scopes)
     +channel_users: Table (channel_type)
@@ -106,14 +101,14 @@ class "_registry.py" as Registry {
 
 ' -- Facade --
 class "memory.py" as Facade <<facade>> {
-    +register_session()
     +save_message()
-    +load_session_messages()
+    +load_messages()
     +register_workstream()
     +update_workstream_state()
+    +save_workstream_config()
     +save_memory() / delete_memory()
     +search_memories()
-    +... (all 22 functions)
+    +... (all delegated functions)
     --
     Thin delegation to
     get_storage()

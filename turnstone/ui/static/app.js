@@ -617,12 +617,12 @@ function toggleDashboard() {
 function loadDashboard() {
   var tableEl = document.getElementById("dash-ws-table");
   tableEl.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
-  document.getElementById("dashboard-session-cards").innerHTML =
+  document.getElementById("dashboard-saved-cards").innerHTML =
     '<div class="dashboard-empty">Loading\u2026</div>';
   var dashP = authFetch("/v1/api/dashboard").then(function (r) {
     return r.json();
   });
-  var sessP = authFetch("/v1/api/sessions").then(function (r) {
+  var sessP = authFetch("/v1/api/workstreams/saved").then(function (r) {
     return r.json();
   });
   Promise.all([dashP, sessP])
@@ -631,19 +631,19 @@ function loadDashboard() {
       var wsList = dashData.workstreams || [];
       var agg = dashData.aggregate || {};
       renderDashboardTable(wsList, agg);
-      // Collect active session IDs for dedup
-      var activeSessionIds = {};
+      // Collect active ws IDs for dedup
+      var activeWsIds = {};
       wsList.forEach(function (ws) {
-        if (ws.session_id) activeSessionIds[ws.session_id] = true;
+        activeWsIds[ws.id] = true;
       });
-      var sessList = (res[1].sessions || []).filter(function (s) {
-        return !activeSessionIds[s.session_id];
+      var savedList = (res[1].workstreams || []).filter(function (s) {
+        return !activeWsIds[s.ws_id];
       });
-      renderDashboardSessions(sessList);
+      renderSavedWorkstreams(savedList);
     })
     .catch(function () {
       tableEl.innerHTML = '<div class="dashboard-empty">Failed to load</div>';
-      document.getElementById("dashboard-session-cards").innerHTML =
+      document.getElementById("dashboard-saved-cards").innerHTML =
         '<div class="dashboard-empty">Failed to load</div>';
     });
 }
@@ -800,30 +800,30 @@ function updateDashFooter(agg) {
       ")";
   }
 }
-function renderDashboardSessions(sessions) {
-  var c = document.getElementById("dashboard-session-cards");
+function renderSavedWorkstreams(items) {
+  var c = document.getElementById("dashboard-saved-cards");
   c.innerHTML = "";
-  if (!sessions.length) {
-    c.innerHTML = '<div class="dashboard-empty">No saved sessions</div>';
+  if (!items.length) {
+    c.innerHTML = '<div class="dashboard-empty">No saved workstreams</div>';
     return;
   }
-  sessions.forEach(function (sess) {
+  items.forEach(function (sess) {
     var card = document.createElement("div");
     card.className = "dashboard-card";
     card.setAttribute("role", "button");
     card.setAttribute("tabindex", "0");
-    var label = sess.alias || sess.title || sess.session_id;
+    var label = sess.alias || sess.title || sess.ws_id;
     card.setAttribute("aria-label", "Resume: " + label);
     card.onclick = function () {
-      dashboardResumeSession(sess.session_id);
+      dashboardResumeSession(sess.ws_id);
     };
     card.onkeydown = function (e) {
       if (e.key === "Enter" || e.key === " ") {
         e.preventDefault();
-        dashboardResumeSession(sess.session_id);
+        dashboardResumeSession(sess.ws_id);
       }
     };
-    var title = sess.alias || sess.title || sess.session_id.substring(0, 12);
+    var title = sess.alias || sess.title || sess.ws_id.substring(0, 12);
     var meta = sess.message_count + " msgs";
     if (sess.updated) meta += " \u00b7 " + formatRelativeTime(sess.updated);
     card.innerHTML =
@@ -861,11 +861,11 @@ function dashboardSwitchWorkstream(wsId) {
     switchTab(wsId);
   } else loadDashboard();
 }
-function dashboardResumeSession(sessionId) {
+function dashboardResumeSession(wsId) {
   authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ resume_session: sessionId }),
+    body: JSON.stringify({ resume_ws: wsId }),
   })
     .then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
@@ -879,7 +879,7 @@ function dashboardResumeSession(sessionId) {
       // Resume handled atomically by server — history arrives via SSE.
     })
     .catch(function (err) {
-      showToast("Failed to resume session", "error");
+      showToast("Failed to resume workstream", "error");
     });
 }
 function dashboardNewChat() {

@@ -259,19 +259,13 @@ class MetricsCollector:
 
         # Per-workstream metrics (only when data is provided)
         if workstream_metrics:
-            # turnstone_workstream_info — exposes session_id as a label for joining,
-            # without propagating that high-cardinality label to counters.
-            lines.append(
-                "# HELP turnstone_workstream_info Workstream metadata"
-                " (join on session_id for per-session queries)"
-            )
+            lines.append("# HELP turnstone_workstream_info Workstream metadata")
             lines.append("# TYPE turnstone_workstream_info gauge")
             for wm in workstream_metrics:
                 lstr = _fmt_labels(
                     {
                         "ws_id": wm["ws_id"],
                         "name": wm["name"],
-                        "session_id": wm["session_id"],
                     }
                 )
                 lines.append(f"turnstone_workstream_info{lstr} 1")

@@ -14,28 +14,28 @@ def backend(tmp_path):
     reset_storage()
 
 
-# -- Session operations --------------------------------------------------------
+# -- Workstream registration ---------------------------------------------------
 
 
-class TestRegisterSession:
-    def test_register_creates_session(self, backend):
-        backend.register_session("s1", title="Test")
-        name = backend.get_session_name("s1")
+class TestRegisterWorkstream:
+    def test_register_creates_workstream(self, backend):
+        backend.register_workstream("s1", title="Test")
+        name = backend.get_workstream_display_name("s1")
         assert name == "Test"
 
     def test_register_idempotent(self, backend):
-        backend.register_session("s1", title="First")
-        backend.register_session("s1", title="Second")
-        name = backend.get_session_name("s1")
+        backend.register_workstream("s1", title="First")
+        backend.register_workstream("s1", title="Second")
+        name = backend.get_workstream_display_name("s1")
         assert name == "First"  # INSERT OR IGNORE preserves first
 
 
 class TestSaveAndLoadMessages:
     def test_roundtrip(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "hello")
         backend.save_message("s1", "assistant", "world")
-        msgs = backend.load_session_messages("s1")
+        msgs = backend.load_messages("s1")
         assert len(msgs) == 2
         assert msgs[0]["role"] == "user"
         assert msgs[0]["content"] == "hello"
@@ -43,12 +43,12 @@ class TestSaveAndLoadMessages:
         assert msgs[1]["content"] == "world"
 
     def test_tool_call_grouping(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "do something")
         backend.save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="c1")
         backend.save_message("s1", "tool_result", "file.txt", tool_call_id="c1")
         backend.save_message("s1", "assistant", "done")
-        msgs = backend.load_session_messages("s1")
+        msgs = backend.load_messages("s1")
         assert len(msgs) == 4
         assert msgs[1]["role"] == "assistant"
         assert len(msgs[1]["tool_calls"]) == 1
@@ -57,136 +57,136 @@ class TestSaveAndLoadMessages:
         assert msgs[2]["content"] == "file.txt"
 
     def test_incomplete_turn_repair(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "do something")
         backend.save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="c1")
         backend.save_message("s1", "tool_call", None, "read", '{"path":"a"}', tool_call_id="c2")
         # Only 1 result for 2 calls — incomplete turn
         backend.save_message("s1", "tool_result", "ok", tool_call_id="c1")
-        msgs = backend.load_session_messages("s1")
+        msgs = backend.load_messages("s1")
         # Incomplete turn should be stripped
         assert len(msgs) == 1  # only the user message remains
 
     def test_provider_data_preserved(self, backend):
         import json
 
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         pd = json.dumps({"encrypted": True})
         backend.save_message("s1", "assistant", "hi", provider_data=pd)
-        msgs = backend.load_session_messages("s1")
+        msgs = backend.load_messages("s1")
         assert msgs[0].get("_provider_content") == {"encrypted": True}
 
-    def test_empty_session_returns_empty(self, backend):
-        assert backend.load_session_messages("nonexistent") == []
+    def test_empty_workstream_returns_empty(self, backend):
+        assert backend.load_messages("nonexistent") == []
 
 
-class TestListSessions:
-    def test_lists_sessions_with_messages(self, backend):
-        backend.register_session("s1")
+class TestListWorkstreamsWithHistory:
+    def test_lists_workstreams_with_messages(self, backend):
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "hi")
-        backend.register_session("s2")  # no messages
-        rows = backend.list_sessions()
+        backend.register_workstream("s2")  # no messages
+        rows = backend.list_workstreams_with_history()
         assert len(rows) == 1
         assert rows[0][0] == "s1"
 
     def test_respects_limit(self, backend):
         for i in range(5):
             sid = f"s{i}"
-            backend.register_session(sid)
+            backend.register_workstream(sid)
             backend.save_message(sid, "user", f"msg {i}")
-        rows = backend.list_sessions(limit=3)
+        rows = backend.list_workstreams_with_history(limit=3)
         assert len(rows) == 3
 
 
-class TestDeleteSession:
+class TestDeleteWorkstream:
     def test_deletes_all_data(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "hi")
-        backend.save_session_config("s1", {"temp": "0.5"})
-        assert backend.delete_session("s1")
-        assert backend.load_session_messages("s1") == []
-        assert backend.load_session_config("s1") == {}
-        assert backend.get_session_name("s1") is None
+        backend.save_workstream_config("s1", {"temp": "0.5"})
+        assert backend.delete_workstream("s1")
+        assert backend.load_messages("s1") == []
+        assert backend.load_workstream_config("s1") == {}
+        assert backend.get_workstream_display_name("s1") is None
 
 
-class TestPruneSessions:
+class TestPruneWorkstreams:
     def test_orphan_removed(self, backend):
-        backend.register_session("orphan")
-        orphans, stale = backend.prune_sessions()
+        backend.register_workstream("orphan")
+        orphans, stale = backend.prune_workstreams()
         assert orphans == 1
 
     def test_stale_removed(self, backend):
         import sqlalchemy as sa
 
-        backend.register_session("old")
+        backend.register_workstream("old")
         backend.save_message("old", "user", "hi")
         # Force old timestamp
         with backend._engine.connect() as conn:
             conn.execute(
-                sa.text("UPDATE sessions SET updated = '2020-01-01' WHERE session_id = 'old'")
+                sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = 'old'")
             )
             conn.commit()
-        _, stale = backend.prune_sessions(retention_days=30)
+        _, stale = backend.prune_workstreams(retention_days=30)
         assert stale == 1
 
 
-class TestResolveSession:
+class TestResolveWorkstream:
     def test_exact_alias(self, backend):
-        backend.register_session("s1")
-        backend.set_session_alias("s1", "myalias")
-        assert backend.resolve_session("myalias") == "s1"
+        backend.register_workstream("s1")
+        backend.set_workstream_alias("s1", "myalias")
+        assert backend.resolve_workstream("myalias") == "s1"
 
     def test_exact_id(self, backend):
-        backend.register_session("abc-123-def")
-        assert backend.resolve_session("abc-123-def") == "abc-123-def"
+        backend.register_workstream("abc-123-def")
+        assert backend.resolve_workstream("abc-123-def") == "abc-123-def"
 
     def test_prefix_match(self, backend):
-        backend.register_session("abc-123-def")
-        assert backend.resolve_session("abc") == "abc-123-def"
+        backend.register_workstream("abc-123-def")
+        assert backend.resolve_workstream("abc") == "abc-123-def"
 
     def test_not_found(self, backend):
-        assert backend.resolve_session("nonexistent") is None
+        assert backend.resolve_workstream("nonexistent") is None
 
 
-# -- Session config ------------------------------------------------------------
+# -- Workstream config ---------------------------------------------------------
 
 
-class TestSessionConfig:
+class TestWorkstreamConfig:
     def test_roundtrip(self, backend):
-        backend.register_session("s1")
-        backend.save_session_config("s1", {"temperature": "0.7", "effort": "high"})
-        cfg = backend.load_session_config("s1")
+        backend.register_workstream("s1")
+        backend.save_workstream_config("s1", {"temperature": "0.7", "effort": "high"})
+        cfg = backend.load_workstream_config("s1")
         assert cfg == {"temperature": "0.7", "effort": "high"}
 
     def test_empty_config(self, backend):
-        assert backend.load_session_config("nonexistent") == {}
+        assert backend.load_workstream_config("nonexistent") == {}
 
 
-# -- Session metadata ----------------------------------------------------------
+# -- Workstream metadata ------------------------------------------------------
 
 
-class TestSessionMetadata:
+class TestWorkstreamMetadata:
     def test_alias(self, backend):
-        backend.register_session("s1")
-        assert backend.set_session_alias("s1", "my-session")
-        assert backend.get_session_name("s1") == "my-session"
+        backend.register_workstream("s1")
+        assert backend.set_workstream_alias("s1", "my-session")
+        assert backend.get_workstream_display_name("s1") == "my-session"
 
     def test_alias_conflict(self, backend):
-        backend.register_session("s1")
-        backend.register_session("s2")
-        backend.set_session_alias("s1", "taken")
-        assert not backend.set_session_alias("s2", "taken")
+        backend.register_workstream("s1")
+        backend.register_workstream("s2")
+        backend.set_workstream_alias("s1", "taken")
+        assert not backend.set_workstream_alias("s2", "taken")
 
     def test_title(self, backend):
-        backend.register_session("s1")
-        backend.update_session_title("s1", "My Title")
-        assert backend.get_session_name("s1") == "My Title"
+        backend.register_workstream("s1")
+        backend.update_workstream_title("s1", "My Title")
+        assert backend.get_workstream_display_name("s1") == "My Title"
 
     def test_alias_preferred_over_title(self, backend):
-        backend.register_session("s1")
-        backend.update_session_title("s1", "Title")
-        backend.set_session_alias("s1", "Alias")
-        assert backend.get_session_name("s1") == "Alias"
+        backend.register_workstream("s1")
+        backend.update_workstream_title("s1", "Title")
+        backend.set_workstream_alias("s1", "Alias")
+        assert backend.get_workstream_display_name("s1") == "Alias"
 
 
 # -- Key-value store -----------------------------------------------------------
@@ -234,7 +234,7 @@ class TestKVStore:
 
 class TestSearch:
     def test_search_history(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "hello world")
         backend.save_message("s1", "user", "goodbye world")
         results = backend.search_history("hello")
@@ -242,7 +242,7 @@ class TestSearch:
         assert any("hello" in str(r[3]) for r in results)
 
     def test_search_recent(self, backend):
-        backend.register_session("s1")
+        backend.register_workstream("s1")
         backend.save_message("s1", "user", "msg1")
         backend.save_message("s1", "user", "msg2")
         results = backend.search_history_recent(limit=1)
@@ -293,15 +293,14 @@ class TestWorkstreams:
         assert len(rows) == 1
         assert rows[0][0] == "ws1"
 
-    def test_session_with_ws_id(self, backend):
+    def test_workstream_with_messages_in_history(self, backend):
         backend.register_workstream("ws1", node_id="node-a")
-        backend.register_session("s1", node_id="node-a", ws_id="ws1")
-        backend.save_message("s1", "user", "hello")
-        rows = backend.list_sessions()
+        backend.save_message("ws1", "user", "hello")
+        rows = backend.list_workstreams_with_history()
         assert len(rows) == 1
-        # Columns: sid, alias, title, created, updated, count, node_id, ws_id
+        # Columns: ws_id, alias, title, created, updated, count, node_id
+        assert rows[0][0] == "ws1"
         assert rows[0][6] == "node-a"
-        assert rows[0][7] == "ws1"
 
 
 # -- Lifecycle -----------------------------------------------------------------

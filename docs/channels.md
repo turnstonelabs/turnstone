@@ -136,11 +136,11 @@ An admin can also force-link or unlink users via the console admin panel
   1.5 seconds.
 - If the workstream is evicted for capacity, the next message in the
   thread auto-creates a new workstream and atomically resumes the
-  previous session via the `resume_session` field on
-  `CreateWorkstreamMessage`. The server resumes the session during
-  workstream creation (same HTTP request), and the bridge emits a
-  `SessionResumedEvent` back to the channel. The thread receives a
-  *"Session resumed: {name} ({count} messages restored)"* confirmation.
+  previous workstream via the `resume_ws` field on
+  `CreateWorkstreamMessage`. The server resumes the workstream during
+  creation (same HTTP request), and the bridge emits a
+  `WorkstreamResumedEvent` back to the channel. The thread receives a
+  *"Resumed: {name} ({count} messages restored)"* confirmation.
 
 ### Slash Commands
 
@@ -232,11 +232,10 @@ See [Security: Database Schema](security.md#database-schema) for the
 3. **Eviction** — the server evicts an idle workstream for capacity. The
    route is preserved and the thread stays open.
 4. **Reactivation** — the next message in the thread detects the stale
-   route (no MQ owner), looks up the old session via
-   `get_session_id_by_ws()`, and creates a new workstream with
-   `resume_session` set atomically on the `CreateWorkstreamMessage`. The
-   server resumes the session during creation (no separate command
-   needed). The bridge emits a `SessionResumedEvent` to the channel, and
+   route (no MQ owner) and creates a new workstream with the old `ws_id`
+   as `resume_ws` on the `CreateWorkstreamMessage`. The server resumes
+   the session during creation (no separate command or reverse lookup
+   needed). The bridge emits a `WorkstreamResumedEvent` to the channel, and
    the thread displays *"Session resumed: {name} ({count} messages
    restored)"*. If the old session was pruned, the workstream starts
    fresh with no error.

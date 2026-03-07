@@ -14,7 +14,7 @@ def _make_session() -> ChatSession:
     from unittest.mock import patch
 
     with (
-        patch("turnstone.core.session.register_session"),
+        patch("turnstone.core.memory.register_workstream"),
         patch("turnstone.core.session.save_message"),
     ):
         from turnstone.core.session import ChatSession

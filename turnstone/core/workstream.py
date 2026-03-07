@@ -1,4 +1,4 @@
-"""Workstream manager — concurrent independent chat sessions.
+"""Workstream manager — concurrent independent conversations.
 
 A workstream is an independent conversation with its own ChatSession and UI
 adapter.  The WorkstreamManager coordinates multiple workstreams, tracks their
@@ -74,9 +74,10 @@ class WorkstreamManager:
         Args:
             session_factory: callable(ui, model_alias, ws_id) -> ChatSession.
                 Captures shared config (registry, temperature, …) so the
-                manager can create sessions without knowing those details.
-                *model_alias* selects a model from the registry (None = default).
-                *ws_id* links the session to its workstream in storage.
+                manager can create ChatSession instances without knowing
+                those details.  *model_alias* selects a model from the
+                registry (None = default).  *ws_id* is the persistent
+                identity used for all storage operations.
             max_workstreams: Maximum number of concurrent workstreams.  When at
                 capacity, ``create()`` will auto-evict the oldest IDLE
                 workstream before raising.
@@ -125,7 +126,7 @@ class WorkstreamManager:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
         """
-        # Fast-fail capacity check (avoids expensive session creation when full).
+        # Fast-fail capacity check (avoids expensive ChatSession creation when full).
         first_evicted: Workstream | None = None
         with self._lock:
             if len(self._workstreams) >= self._max_workstreams:
@@ -141,7 +142,7 @@ class WorkstreamManager:
 
             _m1.record_eviction()
 
-        # Create workstream and session outside the lock (session creation is
+        # Create workstream and ChatSession outside the lock (construction is
         # expensive — involves LLM client setup and DB writes).
         ws = Workstream(name=name)
         if ui_factory:

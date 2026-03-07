@@ -25,7 +25,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
-    ListSessionsResponse,
+    ListSavedWorkstreamsResponse,
     ListWorkstreamsResponse,
     PlanFeedbackRequest,
     SendRequest,
@@ -122,13 +122,13 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "across all workstreams. Returns text/event-stream.",
         tags=["Streaming"],
     ),
-    # --- Sessions ---
+    # --- Saved workstreams ---
     EndpointSpec(
-        "/v1/api/sessions",
+        "/v1/api/workstreams/saved",
         "GET",
-        "List saved sessions",
-        response_model=ListSessionsResponse,
-        tags=["Sessions"],
+        "List saved workstreams",
+        response_model=ListSavedWorkstreamsResponse,
+        tags=["Workstreams"],
     ),
     # --- Auth ---
     EndpointSpec(
@@ -191,7 +191,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CloseWorkstreamRequest,
     ListWorkstreamsResponse,
     DashboardResponse,
-    ListSessionsResponse,
+    ListSavedWorkstreamsResponse,
     HealthResponse,
 ]
 

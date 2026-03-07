@@ -9,26 +9,15 @@ from typing import Any, Protocol, runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every storage backend adapter must implement.
 
-    Provides session management, conversation persistence, key-value storage
+    Provides workstream management, conversation persistence, key-value storage
     (for memories), and full-text search.
     """
 
-    # -- Core session operations -----------------------------------------------
-
-    def register_session(
-        self,
-        session_id: str,
-        title: str | None = None,
-        node_id: str | None = None,
-        ws_id: str | None = None,
-        user_id: str | None = None,
-    ) -> None:
-        """Create a sessions row for a new session (no-op if already exists)."""
-        ...
+    # -- Core conversation operations ------------------------------------------
 
     def save_message(
         self,
-        session_id: str,
+        ws_id: str,
         role: str,
         content: str | None,
         tool_name: str | None = None,
@@ -39,50 +28,46 @@ class StorageBackend(Protocol):
         """Log a message to the conversations table."""
         ...
 
-    def load_session_messages(self, session_id: str) -> list[dict[str, Any]]:
-        """Load messages for a session and reconstruct OpenAI message format."""
+    def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
+        """Load messages for a workstream and reconstruct OpenAI message format."""
         ...
 
-    # -- Session management ----------------------------------------------------
+    # -- Workstream management -------------------------------------------------
 
-    def list_sessions(self, limit: int = 20) -> list[Any]:
-        """List recent sessions with message counts, ordered by updated DESC."""
+    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
+        """List workstreams that have messages, ordered by updated DESC."""
         ...
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a session and all its messages. Returns True on success."""
+    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
+        """Remove orphaned + stale unnamed workstreams. Returns (orphans, stale)."""
         ...
 
-    def prune_sessions(self, retention_days: int = 90) -> tuple[int, int]:
-        """Remove orphaned + stale unnamed sessions. Returns (orphans, stale)."""
+    def resolve_workstream(self, alias_or_id: str) -> str | None:
+        """Resolve an alias or ws_id (or prefix) to a full ws_id."""
         ...
 
-    def resolve_session(self, alias_or_id: str) -> str | None:
-        """Resolve an alias or session_id (or prefix) to a full session_id."""
+    # -- Workstream config -----------------------------------------------------
+
+    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+        """Persist workstream configuration key/value pairs."""
         ...
 
-    # -- Session config --------------------------------------------------------
-
-    def save_session_config(self, session_id: str, config: dict[str, str]) -> None:
-        """Persist session configuration key/value pairs."""
+    def load_workstream_config(self, ws_id: str) -> dict[str, str]:
+        """Load workstream configuration. Returns empty dict if none stored."""
         ...
 
-    def load_session_config(self, session_id: str) -> dict[str, str]:
-        """Load session configuration. Returns empty dict if none stored."""
-        ...
+    # -- Workstream metadata ---------------------------------------------------
 
-    # -- Session metadata ------------------------------------------------------
-
-    def set_session_alias(self, session_id: str, alias: str) -> bool:
+    def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
         """Set a human-friendly alias. Returns False if alias is taken."""
         ...
 
-    def get_session_name(self, session_id: str) -> str | None:
-        """Return the alias (or title) for a session, or None if unset."""
+    def get_workstream_display_name(self, ws_id: str) -> str | None:
+        """Return the alias (or title) for a workstream, or None if unset."""
         ...
 
-    def update_session_title(self, session_id: str, title: str) -> None:
-        """Set or update the auto-generated title for a session."""
+    def update_workstream_title(self, ws_id: str, title: str) -> None:
+        """Set or update the auto-generated title for a workstream."""
         ...
 
     # -- Generic key-value store (backs memories table) ------------------------
@@ -116,6 +101,8 @@ class StorageBackend(Protocol):
         name: str = "",
         state: str = "idle",
         user_id: str | None = None,
+        alias: str | None = None,
+        title: str | None = None,
     ) -> None:
         """Create a workstreams row (no-op if already exists)."""
         ...
@@ -129,7 +116,7 @@ class StorageBackend(Protocol):
         ...
 
     def delete_workstream(self, ws_id: str) -> bool:
-        """Delete a workstream. Returns True on success."""
+        """Delete a workstream and all its conversations + config."""
         ...
 
     def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
@@ -139,7 +126,7 @@ class StorageBackend(Protocol):
     # -- Conversation search ---------------------------------------------------
 
     def search_history(self, query: str, limit: int = 20) -> list[Any]:
-        """Search conversation history. Returns (timestamp, session_id, role, content, tool_name)."""
+        """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name)."""
         ...
 
     def search_history_recent(self, limit: int = 20) -> list[Any]:
@@ -217,12 +204,6 @@ class StorageBackend(Protocol):
 
     def delete_channel_user(self, channel_type: str, channel_user_id: str) -> bool:
         """Remove a channel user mapping. Returns True if existed."""
-        ...
-
-    # -- Session lookup by workstream ------------------------------------------
-
-    def get_session_id_by_ws(self, ws_id: str) -> str | None:
-        """Find the session_id associated with a workstream. Returns None if not found."""
         ...
 
     # -- Channel routing -------------------------------------------------------

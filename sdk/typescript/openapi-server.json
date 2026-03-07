@@ -10,9 +10,7 @@
       "get": {
         "summary": "List active workstreams",
         "operationId": "v1_api_workstreams_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
@@ -31,9 +29,7 @@
       "get": {
         "summary": "Dashboard with workstream details and aggregates",
         "operationId": "v1_api_dashboard_get",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
@@ -52,9 +48,7 @@
       "post": {
         "summary": "Create a new workstream",
         "operationId": "v1_api_workstreams_new_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "requestBody": {
           "required": true,
           "content": {
@@ -93,9 +87,7 @@
       "post": {
         "summary": "Close a workstream",
         "operationId": "v1_api_workstreams_close_post",
-        "tags": [
-          "Workstreams"
-        ],
+        "tags": ["Workstreams"],
         "requestBody": {
           "required": true,
           "content": {
@@ -134,9 +126,7 @@
       "post": {
         "summary": "Send a user message",
         "operationId": "v1_api_send_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "requestBody": {
           "required": true,
           "content": {
@@ -185,9 +175,7 @@
       "post": {
         "summary": "Approve or deny a tool call",
         "operationId": "v1_api_approve_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "requestBody": {
           "required": true,
           "content": {
@@ -226,9 +214,7 @@
       "post": {
         "summary": "Respond to a plan review",
         "operationId": "v1_api_plan_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "requestBody": {
           "required": true,
           "content": {
@@ -267,9 +253,7 @@
       "post": {
         "summary": "Execute a slash command",
         "operationId": "v1_api_command_post",
-        "tags": [
-          "Chat"
-        ],
+        "tags": ["Chat"],
         "requestBody": {
           "required": true,
           "content": {
@@ -318,9 +302,7 @@
       "get": {
         "summary": "Per-workstream SSE event stream",
         "operationId": "v1_api_events_get",
-        "tags": [
-          "Streaming"
-        ],
+        "tags": ["Streaming"],
         "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
@@ -354,9 +336,7 @@
       "get": {
         "summary": "Global SSE event stream",
         "operationId": "v1_api_events_global_get",
-        "tags": [
-          "Streaming"
-        ],
+        "tags": ["Streaming"],
         "description": "Global Server-Sent Events stream for state-change broadcasts across all workstreams. Returns text/event-stream.",
         "responses": {
           "200": {
@@ -365,20 +345,18 @@
         }
       }
     },
-    "/v1/api/sessions": {
+    "/v1/api/workstreams/saved": {
       "get": {
-        "summary": "List saved sessions",
-        "operationId": "v1_api_sessions_get",
-        "tags": [
-          "Sessions"
-        ],
+        "summary": "List saved workstreams",
+        "operationId": "v1_api_workstreams_saved_get",
+        "tags": ["Workstreams"],
         "responses": {
           "200": {
             "description": "Success",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListSessionsResponse"
+                  "$ref": "#/components/schemas/ListSavedWorkstreamsResponse"
                 }
               }
             }
@@ -390,9 +368,7 @@
       "post": {
         "summary": "Authenticate with a token",
         "operationId": "v1_api_auth_login_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "requestBody": {
           "required": true,
           "content": {
@@ -431,9 +407,7 @@
       "post": {
         "summary": "Clear auth cookie",
         "operationId": "v1_api_auth_logout_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "200": {
             "description": "Success",
@@ -452,9 +426,7 @@
       "get": {
         "summary": "Server health check",
         "operationId": "health_get",
-        "tags": [
-          "Observability"
-        ],
+        "tags": ["Observability"],
         "responses": {
           "200": {
             "description": "Success",
@@ -481,9 +453,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "error"
-        ],
+        "required": ["error"],
         "title": "ErrorResponse",
         "type": "object"
       },
@@ -492,9 +462,7 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": [
-              "ok"
-            ],
+            "examples": ["ok"],
             "title": "Status",
             "type": "string"
           }
@@ -511,9 +479,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "token"
-        ],
+        "required": ["token"],
         "title": "AuthLoginRequest",
         "type": "object"
       },
@@ -527,17 +493,12 @@
           },
           "role": {
             "description": "Assigned role",
-            "examples": [
-              "full",
-              "read"
-            ],
+            "examples": ["full", "read"],
             "title": "Role",
             "type": "string"
           }
         },
-        "required": [
-          "role"
-        ],
+        "required": ["role"],
         "title": "AuthLoginResponse",
         "type": "object"
       },
@@ -554,10 +515,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "message",
-          "ws_id"
-        ],
+        "required": ["message", "ws_id"],
         "title": "SendRequest",
         "type": "object"
       },
@@ -565,17 +523,12 @@
         "properties": {
           "status": {
             "description": "'ok' or 'busy'",
-            "examples": [
-              "ok",
-              "busy"
-            ],
+            "examples": ["ok", "busy"],
             "title": "Status",
             "type": "string"
           }
         },
-        "required": [
-          "status"
-        ],
+        "required": ["status"],
         "title": "SendResponse",
         "type": "object"
       },
@@ -611,10 +564,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "approved",
-          "ws_id"
-        ],
+        "required": ["approved", "ws_id"],
         "title": "ApproveRequest",
         "type": "object"
       },
@@ -631,10 +581,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "feedback",
-          "ws_id"
-        ],
+        "required": ["feedback", "ws_id"],
         "title": "PlanFeedbackRequest",
         "type": "object"
       },
@@ -651,10 +598,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "command",
-          "ws_id"
-        ],
+        "required": ["command", "ws_id"],
         "title": "CommandRequest",
         "type": "object"
       },
@@ -695,10 +639,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "ws_id",
-          "name"
-        ],
+        "required": ["ws_id", "name"],
         "title": "CreateWorkstreamResponse",
         "type": "object"
       },
@@ -710,9 +651,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "ws_id"
-        ],
+        "required": ["ws_id"],
         "title": "CloseWorkstreamRequest",
         "type": "object"
       },
@@ -726,9 +665,7 @@
             "type": "array"
           }
         },
-        "required": [
-          "workstreams"
-        ],
+        "required": ["workstreams"],
         "title": "ListWorkstreamsResponse",
         "type": "object"
       },
@@ -759,11 +696,7 @@
             "title": "Session Id"
           }
         },
-        "required": [
-          "id",
-          "name",
-          "state"
-        ],
+        "required": ["id", "name", "state"],
         "title": "WorkstreamInfo",
         "type": "object"
       },
@@ -780,10 +713,7 @@
             "$ref": "#/components/schemas/DashboardAggregate"
           }
         },
-        "required": [
-          "workstreams",
-          "aggregate"
-        ],
+        "required": ["workstreams", "aggregate"],
         "title": "DashboardResponse",
         "type": "object"
       },
@@ -895,34 +825,28 @@
             "type": "string"
           }
         },
-        "required": [
-          "id",
-          "name",
-          "state"
-        ],
+        "required": ["id", "name", "state"],
         "title": "DashboardWorkstream",
         "type": "object"
       },
-      "ListSessionsResponse": {
+      "ListSavedWorkstreamsResponse": {
         "properties": {
-          "sessions": {
+          "workstreams": {
             "items": {
-              "$ref": "#/components/schemas/SessionInfo"
+              "$ref": "#/components/schemas/SavedWorkstreamInfo"
             },
-            "title": "Sessions",
+            "title": "Workstreams",
             "type": "array"
           }
         },
-        "required": [
-          "sessions"
-        ],
-        "title": "ListSessionsResponse",
+        "required": ["workstreams"],
+        "title": "ListSavedWorkstreamsResponse",
         "type": "object"
       },
-      "SessionInfo": {
+      "SavedWorkstreamInfo": {
         "properties": {
-          "session_id": {
-            "title": "Session Id",
+          "ws_id": {
+            "title": "Ws Id",
             "type": "string"
           },
           "alias": {
@@ -962,22 +886,14 @@
             "type": "integer"
           }
         },
-        "required": [
-          "session_id",
-          "created",
-          "updated",
-          "message_count"
-        ],
-        "title": "SessionInfo",
+        "required": ["ws_id", "created", "updated", "message_count"],
+        "title": "SavedWorkstreamInfo",
         "type": "object"
       },
       "HealthResponse": {
         "properties": {
           "status": {
-            "examples": [
-              "ok",
-              "degraded"
-            ],
+            "examples": ["ok", "degraded"],
             "title": "Status",
             "type": "string"
           },
@@ -1019,36 +935,24 @@
             "default": null
           }
         },
-        "required": [
-          "status"
-        ],
+        "required": ["status"],
         "title": "HealthResponse",
         "type": "object"
       },
       "BackendStatus": {
         "properties": {
           "status": {
-            "examples": [
-              "up",
-              "down"
-            ],
+            "examples": ["up", "down"],
             "title": "Status",
             "type": "string"
           },
           "circuit_state": {
-            "examples": [
-              "closed",
-              "open",
-              "half_open"
-            ],
+            "examples": ["closed", "open", "half_open"],
             "title": "Circuit State",
             "type": "string"
           }
         },
-        "required": [
-          "status",
-          "circuit_state"
-        ],
+        "required": ["status", "circuit_state"],
         "title": "BackendStatus",
         "type": "object"
       },

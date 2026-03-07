@@ -22,7 +22,7 @@ conversations = sa.Table(
     "conversations",
     metadata,
     sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column("session_id", sa.Text, nullable=False, index=True),
+    sa.Column("ws_id", sa.Text, nullable=False, index=True),
     sa.Column("timestamp", sa.Text, nullable=False),
     sa.Column("role", sa.Text, nullable=False),
     sa.Column("content", sa.Text),
@@ -32,32 +32,14 @@ conversations = sa.Table(
     sa.Column("provider_data", sa.Text),
 )
 
-sessions = sa.Table(
-    "sessions",
-    metadata,
-    sa.Column("session_id", sa.Text, primary_key=True),
-    sa.Column("alias", sa.Text, unique=True),
-    sa.Column("title", sa.Text),
-    sa.Column("node_id", sa.Text),
-    sa.Column("ws_id", sa.Text),
-    sa.Column("user_id", sa.Text),
-    sa.Column("created", sa.Text, nullable=False),
-    sa.Column("updated", sa.Text, nullable=False),
-)
-
-# Additional indexes on sessions (name-based to avoid duplication with SA's auto-index)
-sa.Index("idx_sessions_alias", sessions.c.alias)
-sa.Index("idx_sessions_updated", sessions.c.updated)
-sa.Index("idx_sessions_node_id", sessions.c.node_id)
-sa.Index("idx_sessions_ws_id", sessions.c.ws_id)
-sa.Index("idx_sessions_user_id", sessions.c.user_id)
-
 workstreams = sa.Table(
     "workstreams",
     metadata,
     sa.Column("ws_id", sa.Text, primary_key=True),
     sa.Column("node_id", sa.Text),
     sa.Column("user_id", sa.Text),
+    sa.Column("alias", sa.Text, unique=True),
+    sa.Column("title", sa.Text),
     sa.Column("name", sa.Text, nullable=False, server_default=""),
     sa.Column("state", sa.Text, nullable=False, server_default="idle"),
     sa.Column("created", sa.Text, nullable=False),
@@ -67,14 +49,15 @@ workstreams = sa.Table(
 sa.Index("idx_workstreams_node_id", workstreams.c.node_id)
 sa.Index("idx_workstreams_state", workstreams.c.state)
 sa.Index("idx_workstreams_user_id", workstreams.c.user_id)
+sa.Index("idx_workstreams_alias", workstreams.c.alias)
 
-session_config = sa.Table(
-    "session_config",
+workstream_config = sa.Table(
+    "workstream_config",
     metadata,
-    sa.Column("session_id", sa.Text, nullable=False),
+    sa.Column("ws_id", sa.Text, nullable=False),
     sa.Column("key", sa.Text, nullable=False),
     sa.Column("value", sa.Text),
-    sa.PrimaryKeyConstraint("session_id", "key"),
+    sa.PrimaryKeyConstraint("ws_id", "key"),
 )
 
 # ---------------------------------------------------------------------------

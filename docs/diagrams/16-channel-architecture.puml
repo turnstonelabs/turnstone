@@ -195,13 +195,13 @@ note right of Bot
   5. Broker.push_inbound(SendMessage)
   6. Bridge pops from Redis, drives server
 
-  **Session Resume (evicted workstreams)**
+  **Workstream Resume (evicted workstreams)**
   1. Stale route detected (no MQ owner)
-  2. Old session looked up via get_session_id_by_ws()
+  2. Existing ws_id reused directly from route
   3. CreateWorkstreamMessage sent with
-     resume_session=<old_session_id>
+     resume_ws=<ws_id>
   4. Server resumes atomically during creation
-  5. Bridge emits SessionResumedEvent → thread
+  5. Bridge emits WorkstreamResumedEvent → thread
 end note
 
 note right of Broker

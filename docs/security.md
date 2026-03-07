@@ -73,7 +73,7 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 
 | Scope | Grants | Implies |
 |-------|--------|---------|
-| `read` | View workstreams, sessions, history | — |
+| `read` | View workstreams, saved workstreams, history | — |
 | `write` | Send messages, create/close workstreams | `read` |
 | `approve` | Approve tool calls, admin endpoints | `read`, `write` |
 

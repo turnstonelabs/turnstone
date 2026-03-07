@@ -515,8 +515,8 @@ Returns a list of all active workstreams.
 ```json
 {
   "workstreams": [
-    {"id": "abc123", "name": "default", "state": "idle", "session_id": "a1b2c3d4e5f6"},
-    {"id": "def456", "name": "hacker-news", "state": "thinking", "session_id": "c5d6e7f8a9b0"}
+    {"id": "abc123", "name": "default", "state": "idle"},
+    {"id": "def456", "name": "hacker-news", "state": "thinking"}
   ]
 }
 ```
@@ -528,22 +528,21 @@ Each workstream object:
 | `id`         | string      | Unique workstream routing identifier                   |
 | `name`       | string      | Display name (alias if set, otherwise `ws-xxxx`)       |
 | `state`      | string      | Current state (see state values above)                 |
-| `session_id` | string/null | Session ID of the workstream's `ChatSession`, used for deduplication against `/v1/api/sessions` |
 
 ---
 
-### `GET /v1/api/sessions`
+### `GET /v1/api/workstreams/saved`
 
-Returns a list of saved sessions from the database, ordered by most recently
+Returns a list of saved workstreams from the database, ordered by most recently
 updated.
 
 **Response:**
 
 ```json
 {
-  "sessions": [
+  "workstreams": [
     {
-      "session_id": "a1b2c3d4e5f6",
+      "ws_id": "a1b2c3d4e5f6",
       "alias": "refactor",
       "title": "JWT Authentication Refactor",
       "created": "2026-03-01 10:00:00",
@@ -558,14 +557,13 @@ Each session object:
 
 | Field           | Type        | Description                                |
 |-----------------|-------------|--------------------------------------------|
-| `session_id`    | string      | Unique 32-char hex UUID session identifier |
+| `ws_id`         | string      | Unique workstream/session identifier       |
 | `alias`         | string/null | User-assigned short name                   |
 | `title`         | string/null | LLM-generated title                        |
 | `created`       | string      | ISO timestamp of session creation          |
 | `updated`       | string      | ISO timestamp of last message              |
 | `message_count` | int         | Number of messages in the session          |
 | `node_id`       | string/null | Server node that created the session       |
-| `ws_id`         | string/null | Workstream the session belongs to          |
 
 ---
 
@@ -721,7 +719,7 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `name`           | string | auto    | Workstream display name                                        |
 | `model`          | string | default | Model alias from the registry (`[models.*]`)                   |
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
-| `resume_session` | string | ""      | Session ID to resume atomically during creation (empty = fresh)|
+| `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
 
 **Response (success):**
 

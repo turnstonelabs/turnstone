@@ -127,21 +127,7 @@ class TestApiTokenCRUD:
         assert "expires" not in tok
 
 
-class TestSessionWorkstreamUserId:
-    def test_register_session_with_user_id(self, db):
-        db.register_session("s1", user_id="u1")
-        # Verify via raw SQL that user_id is stored
-        import sqlalchemy as sa
-
-        from turnstone.core.storage._schema import sessions
-
-        with db._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(sessions.c.user_id).where(sessions.c.session_id == "s1")
-            ).fetchone()
-            assert row is not None
-            assert row[0] == "u1"
-
+class TestWorkstreamUserId:
     def test_register_workstream_with_user_id(self, db):
         db.register_workstream("ws1", user_id="u1")
         import sqlalchemy as sa
@@ -155,15 +141,15 @@ class TestSessionWorkstreamUserId:
             assert row is not None
             assert row[0] == "u1"
 
-    def test_register_session_without_user_id(self, db):
-        db.register_session("s1")
+    def test_register_workstream_without_user_id(self, db):
+        db.register_workstream("ws1")
         import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import sessions
+        from turnstone.core.storage._schema import workstreams
 
         with db._engine.connect() as conn:
             row = conn.execute(
-                sa.select(sessions.c.user_id).where(sessions.c.session_id == "s1")
+                sa.select(workstreams.c.user_id).where(workstreams.c.ws_id == "ws1")
             ).fetchone()
             assert row is not None
             assert row[0] is None

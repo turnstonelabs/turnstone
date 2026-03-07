@@ -29,23 +29,22 @@ from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     delete_memory,
-    delete_session,
-    get_session_name,
-    list_sessions,
+    delete_workstream,
+    get_workstream_display_name,
+    list_workstreams_with_history,
     load_memories,
-    load_session_config,
-    load_session_messages,
+    load_messages,
+    load_workstream_config,
     normalize_key,
-    register_session,
-    resolve_session,
+    resolve_workstream,
     save_memory,
     save_message,
-    save_session_config,
+    save_workstream_config,
     search_history,
     search_history_recent,
     search_memories,
-    set_session_alias,
-    update_session_title,
+    set_workstream_alias,
+    update_workstream_title,
 )
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
@@ -192,10 +191,8 @@ class ChatSession:
         self.debug = False
         self.auto_approve = False
         self._node_id = node_id
-        self._ws_id = ws_id
-        self._session_id = uuid.uuid4().hex
+        self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
-        register_session(self._session_id, node_id=self._node_id, ws_id=self._ws_id)
         self._read_files: set[str] = set()
         self.messages: list[dict[str, Any]] = []
         self._last_usage: dict[str, int] | None = None
@@ -219,17 +216,17 @@ class ChatSession:
         self._save_config()
 
     @property
-    def session_id(self) -> str:
-        return self._session_id
+    def ws_id(self) -> str:
+        return self._ws_id
 
     @property
     def model_alias(self) -> str | None:
         return self._model_alias
 
     def _save_config(self) -> None:
-        """Persist LLM-affecting config so resumed sessions behave identically."""
-        save_session_config(
-            self._session_id,
+        """Persist LLM-affecting config so resumed workstreams behave identically."""
+        save_workstream_config(
+            self._ws_id,
             {
                 "temperature": str(self.temperature),
                 "reasoning_effort": self.reasoning_effort,
@@ -298,32 +295,32 @@ class ChatSession:
             # Take first line, strip quotes
             title = raw.split("\n")[0].strip().strip('"').strip("'")
             if title:
-                update_session_title(self._session_id, title[:80])
+                update_workstream_title(self._ws_id, title[:80])
         except Exception:
             pass  # Title generation is non-critical
 
-    def resume_session(self, session_id: str) -> bool:
-        """Load messages from a previous session and resume it.
+    def resume(self, ws_id: str) -> bool:
+        """Load messages from a previous workstream and resume it.
 
         Replaces the current conversation with the loaded messages,
-        adopting the old session_id so new messages continue in the same
-        session.  Restores persisted config (temperature, reasoning_effort,
-        etc.) so the resumed session behaves identically to the original.
+        adopting the old ws_id so new messages continue in the same
+        workstream.  Restores persisted config (temperature, reasoning_effort,
+        etc.) so the resumed workstream behaves identically to the original.
         Returns True on success.
         """
-        messages = load_session_messages(session_id)
+        messages = load_messages(ws_id)
         if not messages:
             return False
-        self._session_id = session_id
+        self._ws_id = ws_id
         self.messages = messages
         self._read_files.clear()
         self._last_usage = None
-        self._title_generated = True  # don't re-title resumed sessions
+        self._title_generated = True  # don't re-title resumed workstreams
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
         # Restore persisted config
-        config = load_session_config(session_id)
+        config = load_workstream_config(ws_id)
         if config:
             if "temperature" in config:
                 self.temperature = float(config["temperature"])
@@ -513,7 +510,7 @@ class ChatSession:
         self._notify_count = 0
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
-        save_message(self._session_id, "user", user_input)
+        save_message(self._ws_id, "user", user_input)
 
         try:
             while True:
@@ -549,9 +546,7 @@ class ChatSession:
 
                     provider_data = _json.dumps(assistant_msg["_provider_content"])
                 if content or provider_data is not None:
-                    save_message(
-                        self._session_id, "assistant", content, provider_data=provider_data
-                    )
+                    save_message(self._ws_id, "assistant", content, provider_data=provider_data)
                 if tc:
                     for call in tc:
                         fn = call.get("function", {})
@@ -562,7 +557,7 @@ class ChatSession:
                             "recall",
                         ):
                             save_message(
-                                self._session_id,
+                                self._ws_id,
                                 "tool_call",
                                 None,
                                 name,
@@ -612,7 +607,7 @@ class ChatSession:
                         "recall",
                     ):
                         save_message(
-                            self._session_id,
+                            self._ws_id,
                             "tool_result",
                             output[:2000],
                             _tname,
@@ -2327,9 +2322,9 @@ class ChatSession:
     )
 
     def _exec_plan(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Run a planning agent and write the result to .plan-<session_id>.md."""
+        """Run a planning agent and write the result to .plan-<ws_id>.md."""
         call_id, prompt = item["call_id"], item["prompt"]
-        plan_path = f".plan-{self._session_id}.md"
+        plan_path = f".plan-{self._ws_id}.md"
 
         # If plan was called before in this session, the previous assistant
         # tool_call + tool result are already in self.messages — pass them
@@ -2908,29 +2903,31 @@ class ChatSession:
             self._read_files.clear()
             self._last_usage = None
             self._msg_tokens = []
-            self.ui.on_info("Context cleared (session preserved in database).")
+            self.ui.on_info("Context cleared (messages preserved in database).")
 
         elif cmd == "/new":
+            from turnstone.core.memory import register_workstream
+
             self.messages.clear()
             self._read_files.clear()
             self._last_usage = None
             self._msg_tokens = []
-            self._session_id = uuid.uuid4().hex
+            self._ws_id = uuid.uuid4().hex
             self._title_generated = False
-            register_session(self._session_id, node_id=self._node_id, ws_id=self._ws_id)
+            register_workstream(self._ws_id, node_id=self._node_id)
             self._save_config()
-            self.ui.on_info("New session started.")
+            self.ui.on_info("New workstream started.")
 
-        elif cmd == "/sessions":
-            rows = list_sessions(limit=20)
+        elif cmd == "/workstreams":
+            rows = list_workstreams_with_history(limit=20)
             if not rows:
-                self.ui.on_info("No saved sessions.")
+                self.ui.on_info("No saved workstreams.")
             else:
-                lines = ["Sessions:\n"]
-                for sid, alias, title, _created, updated, count, *_extra in rows:
-                    display_name = alias or sid
+                lines = ["Workstreams:\n"]
+                for wid, alias, title, _created, updated, count, *_extra in rows:
+                    display_name = alias or wid
                     display_title = f"  {title}" if title else ""
-                    marker = " *" if sid == self._session_id else "  "
+                    marker = " *" if wid == self._ws_id else "  "
                     lines.append(
                         f" {marker} {bold(display_name)}{display_title}  "
                         f"{dim(f'{count} msgs, {updated}')}"
@@ -2940,30 +2937,29 @@ class ChatSession:
         elif cmd == "/resume":
             if not arg:
                 self.ui.on_info(
-                    "Usage: /resume <alias_or_session_id>\n"
-                    "Use /sessions to list available sessions."
+                    "Usage: /resume <alias_or_ws_id>\nUse /workstreams to list available workstreams."
                 )
             else:
-                target_id = resolve_session(arg.strip())
+                target_id = resolve_workstream(arg.strip())
                 if not target_id:
-                    self.ui.on_info(f"Session not found: {arg.strip()}")
-                elif target_id == self._session_id:
-                    self.ui.on_info("Already in that session.")
-                elif self.resume_session(target_id):
+                    self.ui.on_info(f"Workstream not found: {arg.strip()}")
+                elif target_id == self._ws_id:
+                    self.ui.on_info("Already in that workstream.")
+                elif self.resume(target_id):
                     self.ui.on_info(
-                        f"Resumed session {bold(target_id)} ({len(self.messages)} messages loaded)"
+                        f"Resumed {bold(target_id)} ({len(self.messages)} messages loaded)"
                     )
-                    name = get_session_name(target_id)
+                    name = get_workstream_display_name(target_id)
                     if name:
                         self.ui.on_rename(name)
                 else:
-                    self.ui.on_info(f"Session {arg.strip()} has no messages.")
+                    self.ui.on_info(f"Workstream {arg.strip()} has no messages.")
 
         elif cmd == "/name":
             if not arg:
-                self.ui.on_info(f"Current session: {self._session_id}")
-            elif set_session_alias(self._session_id, arg.strip()):
-                self.ui.on_info(f"Session named: {bold(arg.strip())}")
+                self.ui.on_info(f"Current workstream: {self._ws_id}")
+            elif set_workstream_alias(self._ws_id, arg.strip()):
+                self.ui.on_info(f"Workstream named: {bold(arg.strip())}")
                 self.ui.on_rename(arg.strip())
             else:
                 self.ui.on_info(f"Alias '{arg.strip()}' is already in use.")
@@ -2971,18 +2967,18 @@ class ChatSession:
         elif cmd == "/delete":
             if not arg:
                 self.ui.on_info(
-                    "Usage: /delete <alias_or_session_id>\nUse /sessions to list sessions."
+                    "Usage: /delete <alias_or_ws_id>\nUse /workstreams to list workstreams."
                 )
             else:
-                target_id = resolve_session(arg.strip())
+                target_id = resolve_workstream(arg.strip())
                 if not target_id:
-                    self.ui.on_info(f"Session not found: {arg.strip()}")
-                elif target_id == self._session_id:
-                    self.ui.on_info("Cannot delete the active session.")
-                elif delete_session(target_id):
-                    self.ui.on_info(f"Deleted session {arg.strip()}")
+                    self.ui.on_info(f"Workstream not found: {arg.strip()}")
+                elif target_id == self._ws_id:
+                    self.ui.on_info("Cannot delete the active workstream.")
+                elif delete_workstream(target_id):
+                    self.ui.on_info(f"Deleted workstream {arg.strip()}")
                 else:
-                    self.ui.on_info(f"Failed to delete session {arg.strip()}")
+                    self.ui.on_info(f"Failed to delete workstream {arg.strip()}")
 
         elif cmd == "/history":
             query = arg.strip() if arg else None
@@ -3110,13 +3106,13 @@ class ChatSession:
                     [
                         "── Slash Commands ─────────────────────────────────────",
                         "  /instructions <text>   Set developer instructions",
-                        "  /clear                 Clear context (session preserved in database)",
-                        "  /new                   Start a new session (old session stays resumable)",
+                        "  /clear                 Clear context (workstream preserved in database)",
+                        "  /new                   Start a new workstream (old one stays resumable)",
                         "",
-                        "  /sessions              List saved sessions",
-                        "  /resume <id|alias>     Resume a previous session",
-                        "  /name <alias>          Name the current session",
-                        "  /delete <id|alias>     Delete a saved session",
+                        "  /workstreams           List saved workstreams",
+                        "  /resume <id|alias>     Resume a previous workstream",
+                        "  /name <alias>          Name the current workstream",
+                        "  /delete <id|alias>     Delete a saved workstream",
                         "",
                         "  /history [query]       Search conversation history (or show recent)",
                         "  /compact               Compact conversation (summarize old messages)",

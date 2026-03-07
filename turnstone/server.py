@@ -302,7 +302,7 @@ class WebUI:
 def _build_history(
     session: ChatSession, has_pending_approval: bool = False
 ) -> list[dict[str, Any]]:
-    """Build a history replay list from session messages.
+    """Build a history replay list from ChatSession messages.
 
     When ``has_pending_approval`` is True, the last assistant entry's
     tool_calls are marked ``"pending": True`` so the client renders them
@@ -566,7 +566,6 @@ async def list_workstreams(request: Request) -> JSONResponse:
                 "id": ws.id,
                 "name": ws.name,
                 "state": ws.state.value,
-                "session_id": ws.session.session_id if ws.session else None,
             }
         )
     return JSONResponse({"workstreams": result})
@@ -574,7 +573,7 @@ async def list_workstreams(request: Request) -> JSONResponse:
 
 async def dashboard(request: Request) -> JSONResponse:
     """GET /v1/api/dashboard — enriched workstream data + aggregate stats."""
-    from turnstone.core.memory import get_session_name
+    from turnstone.core.memory import get_workstream_display_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
     wss = mgr.list_all()
@@ -596,13 +595,12 @@ async def dashboard(request: Request) -> JSONResponse:
             active_count += 1
         title = ""
         if ws.session:
-            title = get_session_name(ws.session.session_id) or ""
+            title = get_workstream_display_name(ws.session.ws_id) or ""
         ws_list.append(
             {
                 "id": ws.id,
                 "name": ws.name,
                 "state": ws.state.value,
-                "session_id": ws.session.session_id if ws.session else None,
                 "title": title,
                 "tokens": tok,
                 "context_ratio": round(ctx, 3),
@@ -630,25 +628,23 @@ async def dashboard(request: Request) -> JSONResponse:
     )
 
 
-async def list_sessions_endpoint(request: Request) -> JSONResponse:
-    """GET /v1/api/sessions — list saved sessions."""
-    from turnstone.core.memory import list_sessions
+async def list_saved_workstreams(request: Request) -> JSONResponse:
+    """GET /v1/api/workstreams/saved — list saved workstreams with conversation history."""
+    from turnstone.core.memory import list_workstreams_with_history
 
-    rows = list_sessions(limit=50)
-    sessions = [
+    rows = list_workstreams_with_history(limit=50)
+    result = [
         {
-            "session_id": sid,
+            "ws_id": wid,
             "alias": alias,
             "title": title,
             "created": created,
             "updated": updated,
             "message_count": count,
-            "node_id": node_id,
-            "ws_id": ws_id,
         }
-        for sid, alias, title, created, updated, count, node_id, ws_id in rows
+        for wid, alias, title, created, updated, count, *_extra in rows
     ]
-    return JSONResponse({"sessions": sessions})
+    return JSONResponse({"workstreams": result})
 
 
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
@@ -694,7 +690,6 @@ async def metrics_endpoint(request: Request) -> Response:
                 {
                     "ws_id": ws.id,
                     "name": ws.name,
-                    "session_id": ws.session.session_id if ws.session else "",
                     "prompt_tokens": ui._ws_prompt_tokens,
                     "completion_tokens": ui._ws_completion_tokens,
                     "messages": ui._ws_messages,
@@ -814,7 +809,7 @@ async def command(request: Request) -> JSONResponse:
         should_exit = ws.session.handle_command(cmd)
         if should_exit:
             ui.on_info("Session ended. You can close this tab.")
-        # Handle UI updates for session-changing commands
+        # Handle UI updates for workstream-changing commands
         cmd_word = cmd.strip().split(None, 1)[0].lower()
         if cmd_word in ("/clear", "/new"):
             ui._enqueue({"type": "clear_ui"})
@@ -826,9 +821,9 @@ async def command(request: Request) -> JSONResponse:
         # Sync in-memory workstream name after any command that can change it.
         # This ensures /api/workstreams and future page loads see the right name.
         if cmd_word in ("/name", "/resume"):
-            from turnstone.core.memory import get_session_name
+            from turnstone.core.memory import get_workstream_display_name
 
-            updated_name = get_session_name(ws.session.session_id)
+            updated_name = get_workstream_display_name(ws.session.ws_id) if ws.session else None
             if updated_name:
                 ws.name = updated_name
     except Exception as e:
@@ -868,20 +863,18 @@ async def create_workstream(request: Request) -> JSONResponse:
                         "reason": "evicted",
                     }
                 )
-        # Atomic session resume during creation.
+        # Atomic workstream resume during creation.
         resumed = False
         message_count = 0
-        session_id = ""
-        resume_session_id = body.get("resume_session", "")
-        if resume_session_id and ws.session is not None:
-            from turnstone.core.memory import get_session_name, resolve_session
+        resume_ws_id = body.get("resume_ws", "")
+        if resume_ws_id and ws.session is not None:
+            from turnstone.core.memory import get_workstream_display_name, resolve_workstream
 
-            target_id = resolve_session(resume_session_id)
-            if target_id and ws.session.resume_session(target_id):
+            target_id = resolve_workstream(resume_ws_id)
+            if target_id and ws.session.resume(target_id):
                 resumed = True
-                session_id = target_id
                 message_count = len(ws.session.messages)
-                ws.name = get_session_name(target_id) or ws.name
+                ws.name = get_workstream_display_name(target_id) or ws.name
                 ui = ws.ui
                 if isinstance(ui, WebUI):
                     ui._enqueue({"type": "clear_ui"})
@@ -894,7 +887,6 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "ws_id": ws.id,
                 "name": ws.name,
                 "resumed": resumed,
-                "session_id": session_id,
                 "message_count": message_count,
             }
         )
@@ -1084,7 +1076,7 @@ def create_app(
                     Route("/api/events/global", global_events_sse),
                     Route("/api/workstreams", list_workstreams),
                     Route("/api/dashboard", dashboard),
-                    Route("/api/sessions", list_sessions_endpoint),
+                    Route("/api/workstreams/saved", list_saved_workstreams),
                     Route("/api/send", send_message, methods=["POST"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
@@ -1223,8 +1215,8 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         default=None,
-        metavar="SESSION",
-        help="Resume a previous session by alias or session_id",
+        metavar="WS",
+        help="Resume a previous workstream by alias or ws_id",
     )
     parser.add_argument(
         "--skip-permissions",
@@ -1248,11 +1240,11 @@ def main() -> None:
         help="Port to listen on (default: 8080)",
     )
     parser.add_argument(
-        "--session-retention-days",
+        "--retention-days",
         type=int,
         default=90,
         metavar="DAYS",
-        help="Delete unnamed sessions older than DAYS days on startup, 0 to disable (default: 90)",
+        help="Delete unnamed workstreams older than DAYS days on startup, 0 to disable (default: 90)",
     )
     parser.add_argument(
         "--workstream-idle-timeout",
@@ -1348,10 +1340,10 @@ def main() -> None:
     )
     init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
 
-    # Prune stale / empty sessions on startup
-    from turnstone.core.memory import prune_sessions
+    # Prune stale / empty workstreams on startup
+    from turnstone.core.memory import prune_workstreams
 
-    prune_sessions(retention_days=args.session_retention_days, log_fn=print)
+    prune_workstreams(retention_days=args.retention_days, log_fn=print)
 
     # Create client and detect model
     provider_name = args.provider
@@ -1488,16 +1480,16 @@ def main() -> None:
     # Handle --resume
     assert ws.session is not None
     if args.resume:
-        from turnstone.core.memory import resolve_session
+        from turnstone.core.memory import resolve_workstream
 
-        target_id = resolve_session(args.resume)
+        target_id = resolve_workstream(args.resume)
         if not target_id:
-            log.error("Session not found: %s", args.resume)
+            log.error("Workstream not found: %s", args.resume)
             sys.exit(1)
-        if not ws.session.resume_session(target_id):
-            log.error("Session '%s' has no messages.", args.resume)
+        if not ws.session.resume(target_id):
+            log.error("Workstream '%s' has no messages.", args.resume)
             sys.exit(1)
-        log.info("Resumed session %s (%d messages)", target_id, len(ws.session.messages))
+        log.info("Resumed workstream %s (%d messages)", target_id, len(ws.session.messages))
 
     # Record detected model in metrics
     _metrics.model = model

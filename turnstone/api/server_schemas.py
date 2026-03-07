@@ -39,18 +39,19 @@ class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")
     auto_approve: bool = Field(default=False, description="Auto-approve all tool calls")
-    resume_session: str = Field(
+    resume_ws: str = Field(
         default="",
-        description="Session ID to resume atomically during creation (empty = fresh start)",
+        description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
 
 
 class CreateWorkstreamResponse(BaseModel):
     ws_id: str = Field(description="Unique ID of the new workstream")
     name: str = Field(description="Assigned workstream name")
-    resumed: bool = Field(default=False, description="Whether a previous session was resumed")
-    session_id: str = Field(default="", description="Resolved session ID (set when resumed)")
-    message_count: int = Field(default=0, description="Number of messages in the resumed session")
+    resumed: bool = Field(default=False, description="Whether a previous workstream was resumed")
+    message_count: int = Field(
+        default=0, description="Number of messages in the resumed workstream"
+    )
 
 
 class CloseWorkstreamRequest(BaseModel):
@@ -66,7 +67,6 @@ class WorkstreamInfo(BaseModel):
     id: str
     name: str
     state: str
-    session_id: str | None = None
 
 
 class ListWorkstreamsResponse(BaseModel):
@@ -77,7 +77,6 @@ class DashboardWorkstream(BaseModel):
     id: str
     name: str
     state: str
-    session_id: str | None = None
     title: str = ""
     tokens: int = 0
     context_ratio: float = 0.0
@@ -104,12 +103,12 @@ class DashboardResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Sessions
+# Saved workstreams
 # ---------------------------------------------------------------------------
 
 
-class SessionInfo(BaseModel):
-    session_id: str
+class SavedWorkstreamInfo(BaseModel):
+    ws_id: str
     alias: str | None = None
     title: str | None = None
     created: str
@@ -117,8 +116,8 @@ class SessionInfo(BaseModel):
     message_count: int
 
 
-class ListSessionsResponse(BaseModel):
-    sessions: list[SessionInfo]
+class ListSavedWorkstreamsResponse(BaseModel):
+    workstreams: list[SavedWorkstreamInfo]
 
 
 # ---------------------------------------------------------------------------

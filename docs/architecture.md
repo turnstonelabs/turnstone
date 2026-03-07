@@ -472,7 +472,7 @@ independently, then returns the final content as the tool result.
 
 - **task**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
 - **plan**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
-  to `.plan-<session_id>.md` — unique per `ChatSession` so concurrent workstreams
+  to `.plan-<ws_id>.md` — unique per `ChatSession` so concurrent workstreams
   don't collide. On repeat invocations the prior `plan` tool call and its result
   are forwarded from `self.messages` so the agent refines the existing plan rather
   than starting over. Planning instructions are injected as a developer message
@@ -688,8 +688,11 @@ memories
   created  TEXT NOT NULL
   updated  TEXT NOT NULL
 
-sessions
-  session_id  TEXT PRIMARY KEY
+workstreams
+  ws_id       TEXT PRIMARY KEY
+  node_id     TEXT NOT NULL
+  name        TEXT NOT NULL
+  state       TEXT NOT NULL DEFAULT 'idle'
   alias       TEXT UNIQUE            -- user-assigned short name (nullable)
   title       TEXT                   -- LLM-generated title (nullable)
   created     TEXT NOT NULL
@@ -697,7 +700,7 @@ sessions
 
 conversations
   id            INTEGER PRIMARY KEY AUTOINCREMENT
-  session_id    TEXT NOT NULL
+  ws_id         TEXT NOT NULL
   timestamp     TEXT NOT NULL
   role          TEXT NOT NULL        -- user | assistant | tool_call | tool_result
   content       TEXT
@@ -706,8 +709,8 @@ conversations
   tool_call_id  TEXT                 -- links tool_call ↔ tool_result for resume
   provider_data TEXT                 -- raw provider content (e.g. Anthropic encrypted)
 
-session_config
-  session_id  TEXT NOT NULL          -- composite PK with key
+workstream_config
+  ws_id       TEXT NOT NULL          -- composite PK with key
   key         TEXT NOT NULL
   value       TEXT
 
@@ -722,22 +725,20 @@ and are the single source of truth for both backends and Alembic migrations.
 
 | Method | Purpose |
 |--------|---------|
-| `register_session(session_id, title, node_id, ws_id)` | Create a sessions row (no-op if exists) |
-| `save_message(session_id, role, content, ...)` | Log a message to conversations |
-| `load_session_messages(session_id)` | Reconstruct OpenAI message format from DB rows |
-| `list_sessions(limit)` | List sessions with >=1 message, ordered by updated DESC |
-| `delete_session(session_id)` | Delete session and all its messages |
-| `prune_sessions(retention_days)` | Remove empty sessions and old unnamed sessions |
-| `resolve_session(alias_or_id)` | Resolve alias, exact id, or id prefix to full session_id |
-| `save_session_config(session_id, config)` | Persist session configuration key/value pairs |
-| `load_session_config(session_id)` | Retrieve session configuration |
-| `set_session_alias(session_id, alias)` | Set user-friendly alias (returns False if taken) |
-| `get_session_name(session_id)` | Return alias if set, else title, else None |
-| `update_session_title(session_id, title)` | Set/update LLM-generated title |
 | `register_workstream(ws_id, node_id, name, state)` | Create a workstreams row (no-op if exists) |
+| `save_message(ws_id, role, content, ...)` | Log a message to conversations |
+| `load_messages(ws_id)` | Reconstruct OpenAI message format from DB rows |
+| `list_workstreams_with_history(limit)` | List workstreams with >=1 message, ordered by updated DESC |
+| `delete_workstream(ws_id)` | Delete workstream and cascade conversations + config |
+| `prune_workstreams(retention_days)` | Remove empty workstreams and old unnamed workstreams |
+| `resolve_workstream(alias_or_id)` | Resolve alias, exact id, or id prefix to full ws_id |
+| `save_workstream_config(ws_id, config)` | Persist workstream configuration key/value pairs |
+| `load_workstream_config(ws_id)` | Retrieve workstream configuration |
+| `set_workstream_alias(ws_id, alias)` | Set user-friendly alias (returns False if taken) |
+| `get_workstream_display_name(ws_id)` | Return alias if set, else title, else None |
+| `update_workstream_title(ws_id, title)` | Set/update LLM-generated title |
 | `update_workstream_state(ws_id, state)` | Update workstream state and bump timestamp |
 | `update_workstream_name(ws_id, name)` | Update workstream display name |
-| `delete_workstream(ws_id)` | Delete a workstream row |
 | `list_workstreams(node_id, limit)` | List workstreams, optionally by node |
 | `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Generic key-value store (backs memories table) |
 | `kv_list()` / `kv_search(query)` | List or search key-value pairs |
@@ -757,59 +758,59 @@ pool_size = 5                       # PostgreSQL connection pool size
 
 Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB_PATH`.
 
-### Session Persistence and Resume
+### Persistence and Resume
 
-Each `ChatSession` generates a full 32-char hex UUID `_session_id` on creation
-and registers it in the `sessions` table with the server's `node_id` and the
-owning `ws_id`. Messages are saved to `conversations` as they happen via
-`save_message()`. Workstreams are persisted to the `workstreams` table on
-creation, with state changes tracked via `update_workstream_state()`.
+`ws_id` is the sole persistent identity for both routing and conversation
+history. There is no separate `session_id` — the `workstreams` table holds
+alias, title, and state alongside the routing fields (`node_id`, `name`).
+Messages are saved to `conversations` (keyed by `ws_id`) as they happen
+via `save_message()`. Workstream state changes are tracked via
+`update_workstream_state()`.
 
 **Auto-titling:** After the first complete exchange (user message + assistant
 response), a background thread calls the LLM with a title-generation prompt
 (`reasoning_effort: "low"`, `max_completion_tokens: 200`). The generated
-title (3-8 words) is stored in `sessions.title`.
+title (3-8 words) is stored in `workstreams.title`.
 
-**Resume flow:** `ChatSession.resume_session(session_id)` calls
-`load_session_messages()` which reconstructs the OpenAI message format from
-database rows:
+**Resume flow:** `ChatSession.resume(ws_id)` calls `load_messages()` which
+reconstructs the OpenAI message format from database rows:
 
 - `user` and `assistant` rows map directly
 - Consecutive `tool_call` rows are grouped into one assistant message's
   `tool_calls` array, paired with subsequent `tool_result` rows via
   `tool_call_id` (or positional matching for legacy data)
-- **Interrupted session repair:** If the last assistant message has
-  `tool_calls` but fewer tool results than expected (session was
+- **Interrupted conversation repair:** If the last assistant message has
+  `tool_calls` but fewer tool results than expected (conversation was
   interrupted mid-execution), the incomplete turn is stripped so the
   LLM can re-generate cleanly
-- The session adopts the old `_session_id`, so new messages continue in
-  the same session
+- The `ChatSession` adopts the resumed `_ws_id`, so new messages continue
+  in the same workstream
 
 **Config persistence:** LLM-affecting parameters (`temperature`,
 `reasoning_effort`, `max_tokens`, `instructions`, `creative_mode`) are
-persisted to the `session_config` table on creation and whenever changed
-via slash commands. `resume_session()` restores these values so resumed
-sessions behave identically to the original.
+persisted to the `workstream_config` table on creation and whenever changed
+via slash commands. `resume()` restores these values so resumed workstreams
+behave identically to the original.
 
 **`/clear` vs `/new`:** `/clear` wipes in-memory context but preserves
-messages in the database for future resume. `/new` starts a fresh session
-(new `_session_id`), leaving the old session resumable.
+messages in the database for future resume. `/new` starts a fresh workstream
+(new `_ws_id`), leaving the old workstream resumable.
 
-**Resolution:** `resolve_session()` accepts aliases, exact session IDs, or
-session ID prefixes, enabling `turnstone --resume refactor` or `/resume abc12`.
+**Resolution:** `resolve_workstream()` accepts aliases, exact workstream IDs,
+or ID prefixes, enabling `turnstone --resume refactor` or `/resume abc12`.
 
-**Session listing:** `list_sessions()` only returns sessions that have at
-least one saved message (`WHERE EXISTS` on `conversations`). Sessions
-registered but never used (e.g., from process startup) are invisible until
-a message is sent.
+**Workstream listing:** `list_workstreams_with_history()` only returns
+workstreams that have at least one saved message (`WHERE EXISTS` on
+`conversations`). Workstreams registered but never used (e.g., from process
+startup) are invisible until a message is sent.
 
-**Session pruning:** `prune_sessions(retention_days, log_fn)` runs once at
-startup (CLI and server). It removes:
-- Sessions with no messages (orphaned registrations)
-- Unnamed sessions (`alias IS NULL`) older than `retention_days` days (default 90)
+**Workstream pruning:** `prune_workstreams(retention_days, log_fn)` runs once
+at startup (CLI and server). It removes:
+- Workstreams with no messages (orphaned registrations)
+- Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
 
-Named (aliased) sessions are never age-pruned. Configure with
-`--session-retention-days N` (0 = disable age pruning).
+Named (aliased) workstreams are never age-pruned. Configure with
+`--retention-days N` (0 = disable age pruning).
 
 ---
 
@@ -947,7 +948,7 @@ Three hierarchical scopes control endpoint access:
 
 | Scope | Grants | Endpoints |
 |-------|--------|-----------|
-| `read` | SSE streams, workstream listing, sessions | GET endpoints |
+| `read` | SSE streams, workstream listing, history | GET endpoints |
 | `write` | `read` + send, command, workstream create/close | POST to `/api/send`, `/api/command`, etc. |
 | `approve` | `write` + tool approval, admin operations | POST to `/api/approve`, `/api/admin/*` |
 
@@ -1239,7 +1240,7 @@ typed event dataclasses.
 
 **Two client pairs** (sync + async):
 
-- `TurnstoneServer` / `AsyncTurnstoneServer` — server API (workstreams, chat, streaming, sessions)
+- `TurnstoneServer` / `AsyncTurnstoneServer` — server API (workstreams, chat, streaming)
 - `TurnstoneConsole` / `AsyncTurnstoneConsole` — console API (cluster overview, nodes, workstreams)
 
 **Design**: async-first with thin sync wrappers. `_BaseClient` provides httpx
@@ -1279,11 +1280,11 @@ The `ChannelRouter` manages bidirectional routing: it maps platform
 channel/thread IDs to turnstone workstream IDs, handles workstream
 creation and stale-route recovery, and resolves platform users to
 turnstone identities via the `channel_users` table. When an evicted
-workstream is reactivated, the router uses atomic session resume via the
-`resume_session` field on `CreateWorkstreamMessage` — the server resumes
-the old session during workstream creation in a single HTTP request,
-eliminating ordering fragility. The bridge emits a `SessionResumedEvent`
-to confirm success.
+workstream is reactivated, the router uses atomic resume via the
+`resume_ws` field on `CreateWorkstreamMessage` — the server resumes
+the old workstream's conversation during creation in a single HTTP
+request, eliminating ordering fragility. The bridge emits a
+`WorkstreamResumedEvent` to confirm success.
 
 Discord ships as the first adapter. See [channels.md](channels.md) for
 setup instructions, configuration reference, and the adapter development

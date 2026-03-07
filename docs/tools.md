@@ -337,7 +337,7 @@ Plan before implementing -- an autonomous agent explores the codebase and writes
 |-----------|--------|----------|-------------|
 | `prompt`  | string | yes      | What to plan -- the goal, constraints, and scope. |
 
-- **What it does**: Spawns a planning sub-agent with `AGENT_TOOLS` (read-only tools: `read_file`, `search`, `math`, `man`, `web_fetch`, `web_search`). The agent explores the codebase and writes a structured plan to `.plan-<session_id>.md` (unique per session, so concurrent workstreams never collide). If the `plan` tool has been called before in the same session, the prior plan is passed to the agent as context so it refines rather than restarts. After completion, the user is prompted to review and can accept, reject, or annotate the plan.
+- **What it does**: Spawns a planning sub-agent with `AGENT_TOOLS` (read-only tools: `read_file`, `search`, `math`, `man`, `web_fetch`, `web_search`). The agent explores the codebase and writes a structured plan to `.plan-<ws_id>.md` (unique per workstream, so concurrent workstreams never collide). If the `plan` tool has been called before in the same session, the prior plan is passed to the agent as context so it refines rather than restarts. After completion, the user is prompted to review and can accept, reject, or annotate the plan.
 - **Auto-approve**: No -- requires user confirmation, plus post-execution review gate.
 - **Agent availability**: Not available to sub-agents (top-level only).
 

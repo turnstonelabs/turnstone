@@ -21,8 +21,8 @@ from turnstone.mq.protocol import (
     ErrorEvent,
     OutboundEvent,
     PlanReviewEvent,
-    SessionResumedEvent,
     TurnCompleteEvent,
+    WorkstreamResumedEvent,
 )
 
 if TYPE_CHECKING:
@@ -307,10 +307,10 @@ class TurnstoneBot:
             if sm is not None:
                 await sm.finalize()
 
-        elif isinstance(event, SessionResumedEvent):
-            name = event.name or "previous session"
+        elif isinstance(event, WorkstreamResumedEvent):
+            name = event.name or "previous workstream"
             count = event.message_count
-            await thread.send(f"*Session resumed: {name} ({count} messages restored)*")
+            await thread.send(f"*Resumed: {name} ({count} messages restored)*")
 
         elif isinstance(event, ErrorEvent):
             safe_msg = event.message[:500] if event.message else "An error occurred"

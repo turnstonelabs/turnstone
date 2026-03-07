@@ -34,7 +34,6 @@ from turnstone.mq.protocol import (
     OutboundEvent,
     PlanReviewEvent,
     ReasoningEvent,
-    SessionResumedEvent,
     StateChangeEvent,
     StatusEvent,
     StreamEndEvent,
@@ -46,6 +45,7 @@ from turnstone.mq.protocol import (
     WorkstreamCreatedEvent,
     WorkstreamListEvent,
     WorkstreamRenameEvent,
+    WorkstreamResumedEvent,
 )
 
 if TYPE_CHECKING:
@@ -361,7 +361,7 @@ class Bridge:
         auto_approve_tools = getattr(msg, "auto_approve_tools", [])
         model = getattr(msg, "model", "")
         initial_message = getattr(msg, "initial_message", "")
-        resume_session = getattr(msg, "resume_session", "")
+        resume_ws = getattr(msg, "resume_ws", "")
         user_id = getattr(msg, "user_id", "")
         if user_id:
             log.info("bridge.create_ws user_id=%s name=%s model=%s", user_id, name, model)
@@ -371,11 +371,11 @@ class Bridge:
             auto_approve_tools=auto_approve_tools,
             correlation_id=msg.correlation_id,
             model=model,
-            resume_session=resume_session,
+            resume_ws=resume_ws,
         )
-        # Send initial_message only when no session was actually resumed.
+        # Send initial_message only when no workstream was actually resumed.
         # Use the server's `resumed` response (not just the intent) so that
-        # a pruned/missing session falls back to sending the initial message.
+        # a pruned/missing workstream falls back to sending the initial message.
         if ws_id and initial_message and not resumed:
             # Track the send so the global SSE handler emits TurnCompleteEvent
             # when the workstream returns to idle.
@@ -438,15 +438,15 @@ class Bridge:
         auto_approve_tools: list[str],
         correlation_id: str,
         model: str = "",
-        resume_session: str = "",
+        resume_ws: str = "",
     ) -> tuple[str, bool]:
         """Create a workstream on the server.  Returns (ws_id, resumed)."""
         try:
             payload: dict[str, Any] = {"name": name, "auto_approve": auto_approve}
             if model:
                 payload["model"] = model
-            if resume_session:
-                payload["resume_session"] = resume_session
+            if resume_ws:
+                payload["resume_ws"] = resume_ws
             resp = self._http.post(
                 "/v1/api/workstreams/new",
                 json=payload,
@@ -475,15 +475,12 @@ class Bridge:
 
             self._start_ws_sse(ws_id)
 
-            resolved_session_id = data.get("session_id", "") if resumed else ""
-
             self._publish_global(
                 WorkstreamCreatedEvent(
                     ws_id=ws_id,
                     name=ws_name,
                     correlation_id=correlation_id,
                     resumed=resumed,
-                    session_id=resolved_session_id,
                     message_count=data.get("message_count", 0),
                 )
             )
@@ -500,10 +497,9 @@ class Bridge:
             if resumed:
                 self._publish_ws(
                     ws_id,
-                    SessionResumedEvent(
+                    WorkstreamResumedEvent(
                         ws_id=ws_id,
                         correlation_id=correlation_id,
-                        session_id=resolved_session_id,
                         message_count=data.get("message_count", 0),
                         name=ws_name,
                     ),

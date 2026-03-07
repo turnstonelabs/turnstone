@@ -1,6 +1,6 @@
 {
   "name": "plan",
-  "description": "Plan before implementing. An autonomous agent explores the codebase and writes a structured plan to .plan-<session_id>.md (unique per session to avoid workstream collisions). If a plan for this session already exists it is re-read and refined rather than overwritten from scratch. Use plan BEFORE writing code — when the user asks to build, add, refactor, or change something that touches multiple files or has unclear scope. The plan identifies files to modify, existing patterns to reuse, and risks to consider.",
+  "description": "Plan before implementing. An autonomous agent explores the codebase and writes a structured plan to .plan-<ws_id>.md (unique per workstream to avoid collisions). If a plan for this workstream already exists it is re-read and refined rather than overwritten from scratch. Use plan BEFORE writing code — when the user asks to build, add, refactor, or change something that touches multiple files or has unclear scope. The plan identifies files to modify, existing patterns to reuse, and risks to consider.",
   "parameters": {
     "type": "object",
     "properties": {

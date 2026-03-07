@@ -61,7 +61,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
     "session": {
         "instructions": "instructions",
-        "retention_days": "session_retention_days",
+        "retention_days": "retention_days",
         "compact_max_tokens": "compact_max_tokens",
         "auto_compact_pct": "auto_compact_pct",
     },

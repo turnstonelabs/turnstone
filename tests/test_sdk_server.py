@@ -148,19 +148,19 @@ async def test_command():
 
 
 # ---------------------------------------------------------------------------
-# Sessions
+# History
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.anyio
-async def test_list_sessions():
+async def test_list_saved_workstreams():
     transport = _mock_transport(
         {
-            "GET /v1/api/sessions": _json_response(
+            "GET /v1/api/workstreams/saved": _json_response(
                 {
-                    "sessions": [
+                    "workstreams": [
                         {
-                            "session_id": "s1",
+                            "ws_id": "s1",
                             "title": "test",
                             "created": "2024-01-01",
                             "updated": "2024-01-02",
@@ -173,8 +173,8 @@ async def test_list_sessions():
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
         client = AsyncTurnstoneServer(httpx_client=hc)
-        resp = await client.list_sessions()
-        assert len(resp.sessions) == 1
+        resp = await client.list_saved_workstreams()
+        assert len(resp.workstreams) == 1
 
 
 # ---------------------------------------------------------------------------

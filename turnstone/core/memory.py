@@ -21,22 +21,11 @@ def normalize_key(key: str) -> str:
     return key.lower().replace("-", "_").replace(" ", "_")
 
 
-# -- Core session operations ---------------------------------------------------
-
-
-def register_session(
-    session_id: str,
-    title: str | None = None,
-    node_id: str | None = None,
-    ws_id: str | None = None,
-) -> None:
-    """Create a sessions row for a new session (no-op if already exists)."""
-    with contextlib.suppress(Exception):
-        get_storage().register_session(session_id, title, node_id=node_id, ws_id=ws_id)
+# -- Core conversation operations ---------------------------------------------
 
 
 def save_message(
-    session_id: str,
+    ws_id: str,
     role: str,
     content: str | None,
     tool_name: str | None = None,
@@ -47,111 +36,19 @@ def save_message(
     """Log a message to the conversations table."""
     with contextlib.suppress(Exception):
         get_storage().save_message(
-            session_id, role, content, tool_name, tool_args, tool_call_id, provider_data
+            ws_id, role, content, tool_name, tool_args, tool_call_id, provider_data
         )
 
 
-def load_session_messages(session_id: str) -> list[dict[str, Any]]:
-    """Load messages for a session and reconstruct OpenAI message format."""
+def load_messages(ws_id: str) -> list[dict[str, Any]]:
+    """Load messages for a workstream and reconstruct OpenAI message format."""
     try:
-        return get_storage().load_session_messages(session_id)
+        return get_storage().load_messages(ws_id)
     except Exception:
         return []
 
 
-# -- Session management --------------------------------------------------------
-
-
-def list_sessions(limit: int = 20) -> list[Any]:
-    """List recent sessions with message counts."""
-    try:
-        return get_storage().list_sessions(limit)
-    except Exception:
-        return []
-
-
-def delete_session(session_id: str) -> bool:
-    """Delete a session and all its messages."""
-    try:
-        return get_storage().delete_session(session_id)
-    except Exception:
-        return False
-
-
-def prune_sessions(
-    retention_days: int = 90,
-    log_fn: Callable[[str], None] | None = None,
-) -> tuple[int, int]:
-    """Prune orphaned and stale sessions."""
-    try:
-        orphans, stale = get_storage().prune_sessions(retention_days)
-    except Exception:
-        return (0, 0)
-
-    if log_fn and (orphans or stale):
-        parts = []
-        if orphans:
-            parts.append(f"{orphans} empty session{'s' if orphans != 1 else ''}")
-        if stale:
-            parts.append(
-                f"{stale} session{'s' if stale != 1 else ''} older than {retention_days} days"
-            )
-        log_fn(f"[turnstone] Session cleanup: removed {', '.join(parts)}.")
-
-    return (orphans, stale)
-
-
-def resolve_session(alias_or_id: str) -> str | None:
-    """Resolve an alias or session_id (or prefix) to a full session_id."""
-    try:
-        return get_storage().resolve_session(alias_or_id)
-    except Exception:
-        return None
-
-
-# -- Session config ------------------------------------------------------------
-
-
-def save_session_config(session_id: str, config: dict[str, str]) -> None:
-    """Persist session configuration key/value pairs."""
-    with contextlib.suppress(Exception):
-        get_storage().save_session_config(session_id, config)
-
-
-def load_session_config(session_id: str) -> dict[str, str]:
-    """Load session configuration."""
-    try:
-        return get_storage().load_session_config(session_id)
-    except Exception:
-        return {}
-
-
-# -- Session metadata ----------------------------------------------------------
-
-
-def set_session_alias(session_id: str, alias: str) -> bool:
-    """Set a human-friendly alias. Returns False if alias is taken."""
-    try:
-        return get_storage().set_session_alias(session_id, alias)
-    except Exception:
-        return False
-
-
-def get_session_name(session_id: str) -> str | None:
-    """Return the alias (or title) for a session, or None if unset."""
-    try:
-        return get_storage().get_session_name(session_id)
-    except Exception:
-        return None
-
-
-def update_session_title(session_id: str, title: str) -> None:
-    """Set or update the auto-generated title for a session."""
-    with contextlib.suppress(Exception):
-        get_storage().update_session_title(session_id, title)
-
-
-# -- Workstream operations -----------------------------------------------------
+# -- Workstream management ----------------------------------------------------
 
 
 def register_workstream(
@@ -180,6 +77,95 @@ def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
         return get_storage().list_workstreams(node_id, limit)
     except Exception:
         return []
+
+
+def list_workstreams_with_history(limit: int = 20) -> list[Any]:
+    """List workstreams that have conversation messages."""
+    try:
+        return get_storage().list_workstreams_with_history(limit)
+    except Exception:
+        return []
+
+
+def delete_workstream(ws_id: str) -> bool:
+    """Delete a workstream and all its conversations + config."""
+    try:
+        return get_storage().delete_workstream(ws_id)
+    except Exception:
+        return False
+
+
+def prune_workstreams(
+    retention_days: int = 90,
+    log_fn: Callable[[str], None] | None = None,
+) -> tuple[int, int]:
+    """Prune orphaned and stale workstreams."""
+    try:
+        orphans, stale = get_storage().prune_workstreams(retention_days)
+    except Exception:
+        return (0, 0)
+
+    if log_fn and (orphans or stale):
+        parts = []
+        if orphans:
+            parts.append(f"{orphans} empty workstream{'s' if orphans != 1 else ''}")
+        if stale:
+            parts.append(
+                f"{stale} workstream{'s' if stale != 1 else ''} older than {retention_days} days"
+            )
+        log_fn(f"[turnstone] Cleanup: removed {', '.join(parts)}.")
+
+    return (orphans, stale)
+
+
+def resolve_workstream(alias_or_id: str) -> str | None:
+    """Resolve an alias or ws_id (or prefix) to a full ws_id."""
+    try:
+        return get_storage().resolve_workstream(alias_or_id)
+    except Exception:
+        return None
+
+
+# -- Workstream config --------------------------------------------------------
+
+
+def save_workstream_config(ws_id: str, config: dict[str, str]) -> None:
+    """Persist workstream configuration key/value pairs."""
+    with contextlib.suppress(Exception):
+        get_storage().save_workstream_config(ws_id, config)
+
+
+def load_workstream_config(ws_id: str) -> dict[str, str]:
+    """Load workstream configuration."""
+    try:
+        return get_storage().load_workstream_config(ws_id)
+    except Exception:
+        return {}
+
+
+# -- Workstream metadata ------------------------------------------------------
+
+
+def set_workstream_alias(ws_id: str, alias: str) -> bool:
+    """Set a human-friendly alias. Returns False if alias is taken."""
+    try:
+        return get_storage().set_workstream_alias(ws_id, alias)
+    except Exception:
+        return False
+
+
+def get_workstream_display_name(ws_id: str) -> str | None:
+    """Return the alias (or title) for a workstream, or None if unset."""
+    try:
+        return get_storage().get_workstream_display_name(ws_id)
+    except Exception:
+        return None
+
+
+def update_workstream_title(ws_id: str, title: str) -> None:
+    """Set or update the auto-generated title for a workstream."""
+    with contextlib.suppress(Exception):
+        get_storage().update_workstream_title(ws_id, title)
 
 
 # -- Key-value store (memories) ------------------------------------------------

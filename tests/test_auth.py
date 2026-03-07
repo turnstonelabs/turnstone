@@ -719,7 +719,7 @@ class TestServerAuth:
         srv_mod._metrics.model = "test-model"
 
         mock_session = MagicMock()
-        mock_session.session_id = "test-session-id"
+        mock_session.ws_id = "test-session-id"
 
         mock_ws = MagicMock()
         mock_ws.id = "test-ws"
@@ -937,7 +937,7 @@ class TestServerLogin:
         srv_mod._metrics.model = "test-model"
 
         mock_session = MagicMock()
-        mock_session.session_id = "test-session-id"
+        mock_session.ws_id = "test-session-id"
 
         mock_ws = MagicMock()
         mock_ws.id = "test-ws"

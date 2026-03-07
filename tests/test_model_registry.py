@@ -534,7 +534,7 @@ class TestWorkstreamModelParam:
             nonlocal captured_alias
             captured_alias = model_alias
             mock_session = MagicMock()
-            mock_session.session_id = "test123"
+            mock_session.ws_id = "test123"
             return mock_session
 
         mgr = WorkstreamManager(factory)
@@ -548,7 +548,7 @@ class TestWorkstreamModelParam:
             nonlocal captured_alias
             captured_alias = model_alias
             mock_session = MagicMock()
-            mock_session.session_id = "test123"
+            mock_session.ws_id = "test123"
             return mock_session
 
         from turnstone.core.workstream import WorkstreamManager

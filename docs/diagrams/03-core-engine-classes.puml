@@ -118,7 +118,7 @@ class "ChatSession" as ChatSession {
     - ui: SessionUI
     - messages: list[dict]
     - _msg_tokens: list[int]
-    - _session_id: str
+    - _ws_id: str
     - _mcp_client: MCPClientManager | None
     - _registry: ModelRegistry | None
     + model_alias: str | None {property}
@@ -130,7 +130,7 @@ class "ChatSession" as ChatSession {
     --
     + send(user_input: str)
     + handle_command(command: str)
-    + resume_session(session_id: str)
+    + resume(ws_id: str)
     - _save_config()
     - _stream_response(stream) → dict
     - _create_stream_with_retry(msgs) → Stream (+ fallback)

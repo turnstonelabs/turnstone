@@ -8,7 +8,7 @@ import type {
   CreateWorkstreamResponse,
   DashboardResponse,
   HealthResponse,
-  ListSessionsResponse,
+  ListSavedWorkstreamsResponse,
   ListWorkstreamsResponse,
   SendAndWaitOptions,
   SendResponse,
@@ -178,10 +178,10 @@ export class TurnstoneServer extends BaseClient {
     return result;
   }
 
-  // -- Sessions -------------------------------------------------------------
+  // -- Saved workstreams ----------------------------------------------------
 
-  async listSessions(): Promise<ListSessionsResponse> {
-    return this.request("GET", "/v1/api/sessions");
+  async listSavedWorkstreams(): Promise<ListSavedWorkstreamsResponse> {
+    return this.request("GET", "/v1/api/workstreams/saved");
   }
 
   // -- Auth -----------------------------------------------------------------

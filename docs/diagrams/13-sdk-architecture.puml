@@ -35,7 +35,7 @@ package "turnstone/sdk/ (Python)" {
         + stream_events(ws_id)
         + stream_global_events()
         + send_and_wait()
-        + list_sessions()
+        + list_saved_workstreams()
         + login() / logout()
         + health()
     }

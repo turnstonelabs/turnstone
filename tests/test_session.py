@@ -161,12 +161,12 @@ class TestPlanExec:
 
         return call_id, content, captured.get("messages", [])
 
-    def test_plan_file_uses_session_id(self, tmp_db, tmp_path, monkeypatch):
-        """Plan file is named .plan-<session_id>.md, not .plan.md."""
+    def test_plan_file_uses_ws_id(self, tmp_db, tmp_path, monkeypatch):
+        """Plan file is named .plan-<ws_id>.md, not .plan.md."""
         monkeypatch.chdir(tmp_path)
         session = _make_session()
         self._run_plan(session, "add feature")
-        expected = tmp_path / f".plan-{session._session_id}.md"
+        expected = tmp_path / f".plan-{session._ws_id}.md"
         assert expected.exists(), f"Expected {expected} to be created"
         assert not (tmp_path / ".plan.md").exists()
 
@@ -176,7 +176,7 @@ class TestPlanExec:
         session = _make_session()
         plan_content = "## Goal\n\nAdd a new endpoint."
         self._run_plan(session, "add endpoint", agent_return=plan_content)
-        plan_file = tmp_path / f".plan-{session._session_id}.md"
+        plan_file = tmp_path / f".plan-{session._ws_id}.md"
         assert plan_file.read_text() == plan_content
 
     def test_two_sessions_produce_different_files(self, tmp_db, tmp_path, monkeypatch):
@@ -184,7 +184,7 @@ class TestPlanExec:
         monkeypatch.chdir(tmp_path)
         s1 = _make_session()
         s2 = _make_session()
-        assert s1._session_id != s2._session_id
+        assert s1._ws_id != s2._ws_id
         self._run_plan(s1, "feature A")
         self._run_plan(s2, "feature B")
         files = list(tmp_path.glob(".plan-*.md"))

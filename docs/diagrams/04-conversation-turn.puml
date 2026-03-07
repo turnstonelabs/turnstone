@@ -18,7 +18,7 @@ User -> CS : send(user_input)
 activate CS
 
 CS -> CS : messages.append({role: "user", content: input})
-CS -> DB : save_message(session_id, "user", input)
+CS -> DB : save_message(ws_id, "user", input)
 
 == LLM Call Loop ==
 
@@ -65,8 +65,8 @@ group loop [while tool_calls present]
 
     CS -> CS : _update_token_table()\ncalibrate chars_per_token ratio
     CS -> CS : messages.append(assistant_msg)
-    CS -> DB : save_message(session_id, "assistant", content)
-    CS -> DB : save_message(session_id, "tool_call", ...) ×N
+    CS -> DB : save_message(ws_id, "assistant", content)
+    CS -> DB : save_message(ws_id, "tool_call", ...) ×N
 
     == Tool Dispatch (if tool_calls) ==
 
@@ -136,7 +136,7 @@ group loop [while tool_calls present]
 
         loop for each result
             CS -> CS : messages.append({role: "tool", ...})
-            CS -> DB : save_message(session_id, "tool_result", ...)
+            CS -> DB : save_message(ws_id, "tool_result", ...)
         end
 
         opt user_feedback from approval

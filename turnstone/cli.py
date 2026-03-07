@@ -41,7 +41,7 @@ SLASH_COMMANDS = [
     "/instructions",
     "/clear",
     "/new",
-    "/sessions",
+    "/workstreams",
     "/resume",
     "/name",
     "/delete",
@@ -787,8 +787,8 @@ def main() -> None:
     parser.add_argument(
         "--resume",
         default=None,
-        metavar="SESSION",
-        help="Resume a previous session by alias or session_id",
+        metavar="WS",
+        help="Resume a previous workstream by alias or ws_id",
     )
     parser.add_argument(
         "--skip-permissions",
@@ -801,11 +801,11 @@ def main() -> None:
         help="API key (default: $OPENAI_API_KEY, or 'dummy' for local servers)",
     )
     parser.add_argument(
-        "--session-retention-days",
+        "--retention-days",
         type=int,
         default=90,
         metavar="DAYS",
-        help="Delete unnamed sessions older than DAYS days on startup, 0 to disable (default: 90)",
+        help="Delete unnamed workstreams older than DAYS days on startup, 0 to disable (default: 90)",
     )
     parser.add_argument(
         "--console-url",
@@ -845,10 +845,10 @@ def main() -> None:
     )
     init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
 
-    # Prune stale / empty sessions on startup
-    from turnstone.core.memory import prune_sessions
+    # Prune stale / empty workstreams on startup
+    from turnstone.core.memory import prune_workstreams
 
-    prune_sessions(retention_days=args.session_retention_days, log_fn=print)
+    prune_workstreams(retention_days=args.retention_days, log_fn=print)
 
     # Set up readline
     setup_readline()
@@ -894,7 +894,7 @@ def main() -> None:
 
     mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
 
-    # Session factory — captures shared config for creating workstream sessions
+    # ChatSession factory — captures shared config for creating workstreams
     def session_factory(
         ui: SessionUI | None, model_alias: str | None = None, ws_id: str | None = None
     ) -> ChatSession:
@@ -929,19 +929,19 @@ def main() -> None:
 
     # Handle --resume
     if args.resume:
-        from turnstone.core.memory import resolve_session
+        from turnstone.core.memory import resolve_workstream
 
-        target_id = resolve_session(args.resume)
+        target_id = resolve_workstream(args.resume)
         if not target_id:
-            print(red(f"Session not found: {args.resume}"))
+            print(red(f"Workstream not found: {args.resume}"))
             sys.exit(1)
         if ws.session is None:
             print(red("No session available."))
             sys.exit(1)
-        if not ws.session.resume_session(target_id):
-            print(red(f"Session '{args.resume}' has no messages."))
+        if not ws.session.resume(target_id):
+            print(red(f"Workstream '{args.resume}' has no messages."))
             sys.exit(1)
-        print(f"Resumed session {bold(target_id)} ({len(ws.session.messages)} messages)")
+        print(f"Resumed workstream {bold(target_id)} ({len(ws.session.messages)} messages)")
 
     # Background attention notification — write to stderr while user types
     def _bg_attention_notify(ws_id: str, state: WorkstreamState) -> None:

@@ -150,7 +150,7 @@ class ChannelRouter:
                 owner = await self._broker.get_ws_owner(route["ws_id"])
                 if owner:
                     return route["ws_id"], False
-                # Workstream was evicted/closed — capture old ws_id for session
+                # Workstream was evicted/closed — capture old ws_id for
                 # resume, then remove the stale route.
                 old_ws_id = route["ws_id"]
                 await asyncio.to_thread(
@@ -163,20 +163,13 @@ class ChannelRouter:
                     channel_id=channel_id,
                 )
 
-            # 2. Look up old session for atomic resume (if stale route).
-            resume_session = ""
-            if old_ws_id:
-                old_sid: str | None = await asyncio.to_thread(
-                    self._storage.get_session_id_by_ws, old_ws_id
-                )
-                resume_session = old_sid or ""
-
-            # 3. Create via MQ with atomic resume.
+            # 2. Create via MQ with atomic resume (reuse old ws_id directly).
+            resume_ws = old_ws_id or ""
             msg = CreateWorkstreamMessage(
                 name=name,
                 model=model,
-                initial_message="" if resume_session else initial_message,
-                resume_session=resume_session,
+                initial_message="" if resume_ws else initial_message,
+                resume_ws=resume_ws,
                 auto_approve=self._auto_approve,
                 auto_approve_tools=list(self._auto_approve_tools),
             )
@@ -190,7 +183,7 @@ class ChannelRouter:
                 correlation_id=cid,
                 channel_type=channel_type,
                 channel_id=channel_id,
-                resume_session=resume_session or None,
+                resume_ws=resume_ws or None,
             )
 
             try:

@@ -15,9 +15,8 @@ from turnstone.core.storage._schema import (
     conversations,
     memories,
     metadata,
-    session_config,
-    sessions,
     users,
+    workstream_config,
     workstreams,
 )
 
@@ -82,35 +81,11 @@ class SQLiteBackend:
             except Exception:
                 self._fts5_available = False
 
-    # -- Core session operations -----------------------------------------------
-
-    def register_session(
-        self,
-        session_id: str,
-        title: str | None = None,
-        node_id: str | None = None,
-        ws_id: str | None = None,
-        user_id: str | None = None,
-    ) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
-            conn.execute(
-                sa.insert(sessions).prefix_with("OR IGNORE"),
-                {
-                    "session_id": session_id,
-                    "title": title,
-                    "node_id": node_id,
-                    "ws_id": ws_id,
-                    "user_id": user_id,
-                    "created": now,
-                    "updated": now,
-                },
-            )
-            conn.commit()
+    # -- Core conversation operations ------------------------------------------
 
     def save_message(
         self,
-        session_id: str,
+        ws_id: str,
         role: str,
         content: str | None,
         tool_name: str | None = None,
@@ -123,7 +98,7 @@ class SQLiteBackend:
             result = conn.execute(
                 sa.insert(conversations),
                 {
-                    "session_id": session_id,
+                    "ws_id": ws_id,
                     "timestamp": now,
                     "role": role,
                     "content": content,
@@ -145,13 +120,13 @@ class SQLiteBackend:
                     )
                 except Exception:
                     self._fts5_available = False
-            # Bump session updated timestamp
+            # Bump workstream updated timestamp
             conn.execute(
-                sa.update(sessions).where(sessions.c.session_id == session_id).values(updated=now)
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
             )
             conn.commit()
 
-    def load_session_messages(self, session_id: str) -> list[dict[str, Any]]:
+    def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.select(
@@ -162,52 +137,44 @@ class SQLiteBackend:
                     conversations.c.tool_call_id,
                     conversations.c.provider_data,
                 )
-                .where(conversations.c.session_id == session_id)
+                .where(conversations.c.ws_id == ws_id)
                 .order_by(conversations.c.id)
             ).fetchall()
 
-        return _reconstruct_messages(list(rows), session_id)
+        return _reconstruct_messages(list(rows), ws_id)
 
-    # -- Session management ----------------------------------------------------
+    # -- Workstream management -------------------------------------------------
 
-    def list_sessions(self, limit: int = 20) -> list[Any]:
+    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
         with self._engine.connect() as conn:
             return list(
                 conn.execute(
                     sa.text(
-                        "SELECT s.session_id, s.alias, s.title, s.created, s.updated, "
+                        "SELECT w.ws_id, w.alias, w.title, w.created, w.updated, "
                         "(SELECT COUNT(*) FROM conversations c "
-                        " WHERE c.session_id = s.session_id), "
-                        "s.node_id, s.ws_id "
-                        "FROM sessions s "
+                        " WHERE c.ws_id = w.ws_id), "
+                        "w.node_id "
+                        "FROM workstreams w "
                         "WHERE EXISTS "
-                        "  (SELECT 1 FROM conversations c WHERE c.session_id = s.session_id) "
-                        "ORDER BY s.updated DESC LIMIT :limit"
+                        "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
+                        "ORDER BY w.updated DESC LIMIT :limit"
                     ),
                     {"limit": limit},
                 ).fetchall()
             )
 
-    def delete_session(self, session_id: str) -> bool:
-        with self._engine.connect() as conn:
-            conn.execute(sa.delete(conversations).where(conversations.c.session_id == session_id))
-            conn.execute(sa.delete(session_config).where(session_config.c.session_id == session_id))
-            conn.execute(sa.delete(sessions).where(sessions.c.session_id == session_id))
-            conn.commit()
-            return True
-
-    def prune_sessions(self, retention_days: int = 90) -> tuple[int, int]:
+    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
         orphans = stale = 0
         with self._engine.connect() as conn:
-            # 1. Remove sessions with no messages
+            # 1. Remove workstreams with no messages
             orphan_ids = [
                 row[0]
                 for row in conn.execute(
                     sa.text(
-                        "SELECT session_id FROM sessions "
+                        "SELECT ws_id FROM workstreams "
                         "WHERE NOT EXISTS "
                         "  (SELECT 1 FROM conversations c "
-                        "   WHERE c.session_id = sessions.session_id)"
+                        "   WHERE c.ws_id = workstreams.ws_id)"
                     )
                 ).fetchall()
             ]
@@ -215,16 +182,16 @@ class SQLiteBackend:
                 placeholders = ",".join([":p" + str(i) for i in range(len(orphan_ids))])
                 params = {f"p{i}": oid for i, oid in enumerate(orphan_ids)}
                 conn.execute(
-                    sa.text(f"DELETE FROM session_config WHERE session_id IN ({placeholders})"),
+                    sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
                     params,
                 )
                 result = conn.execute(
-                    sa.text(f"DELETE FROM sessions WHERE session_id IN ({placeholders})"),
+                    sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
                     params,
                 )
                 orphans = result.rowcount
 
-            # 2. Remove old unnamed sessions
+            # 2. Remove old unnamed workstreams
             if retention_days > 0:
                 cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
                     "%Y-%m-%dT%H:%M:%S"
@@ -233,7 +200,7 @@ class SQLiteBackend:
                     row[0]
                     for row in conn.execute(
                         sa.text(
-                            "SELECT session_id FROM sessions "
+                            "SELECT ws_id FROM workstreams "
                             "WHERE alias IS NULL AND updated < :cutoff"
                         ),
                         {"cutoff": cutoff},
@@ -243,11 +210,15 @@ class SQLiteBackend:
                     placeholders = ",".join([":p" + str(i) for i in range(len(stale_ids))])
                     params = {f"p{i}": sid for i, sid in enumerate(stale_ids)}
                     conn.execute(
-                        sa.text(f"DELETE FROM session_config WHERE session_id IN ({placeholders})"),
+                        sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
+                        params,
+                    )
+                    conn.execute(
+                        sa.text(f"DELETE FROM conversations WHERE ws_id IN ({placeholders})"),
                         params,
                     )
                     result = conn.execute(
-                        sa.text(f"DELETE FROM sessions WHERE session_id IN ({placeholders})"),
+                        sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
                         params,
                     )
                     stale = result.rowcount
@@ -255,94 +226,71 @@ class SQLiteBackend:
             conn.commit()
         return (orphans, stale)
 
-    def resolve_session(self, alias_or_id: str) -> str | None:
+    def resolve_workstream(self, alias_or_id: str) -> str | None:
         with self._engine.connect() as conn:
             # 1. Exact alias match
             row = conn.execute(
-                sa.select(sessions.c.session_id).where(sessions.c.alias == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias_or_id)
             ).fetchone()
             if row:
                 return str(row[0])
-            # 2. Exact session_id match
+            # 2. Exact ws_id match
             row = conn.execute(
-                sa.select(sessions.c.session_id).where(sessions.c.session_id == alias_or_id)
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == alias_or_id)
             ).fetchone()
             if row:
                 return str(row[0])
-            # 3. Session_id prefix match
+            # 3. ws_id prefix match
             rows = conn.execute(
-                sa.select(sessions.c.session_id).where(
-                    sessions.c.session_id.like(alias_or_id + "%")
-                )
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.like(alias_or_id + "%"))
             ).fetchall()
             if len(rows) == 1:
                 return str(rows[0][0])
-            # 4. Legacy: check conversations table
-            row = conn.execute(
-                sa.text(
-                    "SELECT DISTINCT session_id FROM conversations WHERE session_id = :sid LIMIT 1"
-                ),
-                {"sid": alias_or_id},
-            ).fetchone()
-            if row:
-                # Auto-register legacy session
-                conn.execute(
-                    sa.text(
-                        "INSERT OR IGNORE INTO sessions "
-                        "(session_id, created, updated) VALUES ("
-                        ":sid, "
-                        "(SELECT MIN(timestamp) FROM conversations WHERE session_id = :sid), "
-                        "(SELECT MAX(timestamp) FROM conversations WHERE session_id = :sid))"
-                    ),
-                    {"sid": row[0]},
-                )
-                conn.commit()
-                return str(row[0])
             return None
 
-    # -- Session config --------------------------------------------------------
+    # -- Workstream config -----------------------------------------------------
 
-    def save_session_config(self, session_id: str, config: dict[str, str]) -> None:
+    def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
         with self._engine.connect() as conn:
             for key, value in config.items():
                 conn.execute(
                     sa.text(
-                        "INSERT OR REPLACE INTO session_config "
-                        "(session_id, key, value) VALUES (:sid, :key, :value)"
+                        "INSERT OR REPLACE INTO workstream_config "
+                        "(ws_id, key, value) VALUES (:wid, :key, :value)"
                     ),
-                    {"sid": session_id, "key": key, "value": value},
+                    {"wid": ws_id, "key": key, "value": value},
                 )
             conn.commit()
 
-    def load_session_config(self, session_id: str) -> dict[str, str]:
+    def load_workstream_config(self, ws_id: str) -> dict[str, str]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                sa.select(session_config.c.key, session_config.c.value).where(
-                    session_config.c.session_id == session_id
+                sa.select(workstream_config.c.key, workstream_config.c.value).where(
+                    workstream_config.c.ws_id == ws_id
                 )
             ).fetchall()
             return {row[0]: row[1] for row in rows}
 
-    # -- Session metadata ------------------------------------------------------
+    # -- Workstream metadata ---------------------------------------------------
 
-    def set_session_alias(self, session_id: str, alias: str) -> bool:
+    def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
         with self._engine.connect() as conn:
             existing = conn.execute(
-                sa.select(sessions.c.session_id).where(sessions.c.alias == alias)
+                sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
             ).fetchone()
-            if existing and existing[0] != session_id:
+            if existing and existing[0] != ws_id:
                 return False
             conn.execute(
-                sa.update(sessions).where(sessions.c.session_id == session_id).values(alias=alias)
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(alias=alias)
             )
             conn.commit()
             return True
 
-    def get_session_name(self, session_id: str) -> str | None:
+    def get_workstream_display_name(self, ws_id: str) -> str | None:
         with self._engine.connect() as conn:
             row = conn.execute(
-                sa.select(sessions.c.alias, sessions.c.title).where(
-                    sessions.c.session_id == session_id
+                sa.select(workstreams.c.alias, workstreams.c.title).where(
+                    workstreams.c.ws_id == ws_id
                 )
             ).fetchone()
             if row:
@@ -350,10 +298,10 @@ class SQLiteBackend:
                 return str(value) if value is not None else None
         return None
 
-    def update_session_title(self, session_id: str, title: str) -> None:
+    def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._engine.connect() as conn:
             conn.execute(
-                sa.update(sessions).where(sessions.c.session_id == session_id).values(title=title)
+                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(title=title)
             )
             conn.commit()
 
@@ -428,6 +376,8 @@ class SQLiteBackend:
         name: str = "",
         state: str = "idle",
         user_id: str | None = None,
+        alias: str | None = None,
+        title: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -437,6 +387,8 @@ class SQLiteBackend:
                     "ws_id": ws_id,
                     "node_id": node_id,
                     "user_id": user_id,
+                    "alias": alias,
+                    "title": title,
                     "name": name,
                     "state": state,
                     "created": now,
@@ -467,6 +419,8 @@ class SQLiteBackend:
 
     def delete_workstream(self, ws_id: str) -> bool:
         with self._engine.connect() as conn:
+            conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
+            conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0
@@ -500,7 +454,7 @@ class SQLiteBackend:
                 return list(
                     conn.execute(
                         sa.text(
-                            "SELECT c.timestamp, c.session_id, c.role, c.content, c.tool_name "
+                            "SELECT c.timestamp, c.ws_id, c.role, c.content, c.tool_name "
                             "FROM conversations_fts f "
                             "JOIN conversations c ON c.id = f.rowid "
                             "WHERE conversations_fts MATCH :query "
@@ -512,7 +466,7 @@ class SQLiteBackend:
             return list(
                 conn.execute(
                     sa.text(
-                        "SELECT timestamp, session_id, role, content, tool_name "
+                        "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations WHERE content LIKE :pattern ESCAPE '\\' "
                         "ORDER BY timestamp DESC LIMIT :limit"
                     ),
@@ -526,7 +480,7 @@ class SQLiteBackend:
             return list(
                 conn.execute(
                     sa.text(
-                        "SELECT timestamp, session_id, role, content, tool_name "
+                        "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations ORDER BY timestamp DESC LIMIT :limit"
                     ),
                     {"limit": capped},
@@ -731,15 +685,6 @@ class SQLiteBackend:
             result = conn.execute(sa.delete(api_tokens).where(api_tokens.c.token_id == token_id))
             conn.commit()
             return result.rowcount > 0
-
-    # -- Session lookup by workstream ------------------------------------------
-
-    def get_session_id_by_ws(self, ws_id: str) -> str | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(sessions.c.session_id).where(sessions.c.ws_id == ws_id)
-            ).fetchone()
-            return str(row[0]) if row else None
 
     # -- Channel user mapping ---------------------------------------------------
 
@@ -1195,7 +1140,7 @@ class SQLiteBackend:
         self._engine.dispose()
 
 
-def _reconstruct_messages(rows: list[Any], session_id: str) -> list[dict[str, Any]]:
+def _reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
     Handles tool_call / tool_result grouping and incomplete turn repair.
@@ -1233,7 +1178,7 @@ def _reconstruct_messages(rows: list[Any], session_id: str) -> list[dict[str, An
 
             while i < len(rows) and rows[i][0] == "tool_call":
                 _, _, tn, ta, stored_tc_id, _ = rows[i]
-                call_id = stored_tc_id or f"call_{session_id}_{i}"
+                call_id = stored_tc_id or f"call_{ws_id}_{i}"
                 assistant_msg["tool_calls"].append(
                     {
                         "id": call_id,

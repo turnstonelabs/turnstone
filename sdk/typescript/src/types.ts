@@ -71,14 +71,13 @@ export interface CreateWorkstreamRequest {
   name?: string;
   model?: string;
   auto_approve?: boolean;
-  resume_session?: string;
+  resume_ws?: string;
 }
 
 export interface CreateWorkstreamResponse {
   ws_id: string;
   name: string;
   resumed?: boolean;
-  session_id?: string;
   message_count?: number;
 }
 
@@ -90,7 +89,6 @@ export interface WorkstreamInfo {
   id: string;
   name: string;
   state: string;
-  session_id?: string | null;
 }
 
 export interface ListWorkstreamsResponse {
@@ -101,7 +99,6 @@ export interface DashboardWorkstream {
   id: string;
   name: string;
   state: string;
-  session_id?: string | null;
   title?: string;
   tokens?: number;
   context_ratio?: number;
@@ -128,11 +125,11 @@ export interface DashboardResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Server API — Sessions
+// Server API — Saved workstreams
 // ---------------------------------------------------------------------------
 
-export interface SessionInfo {
-  session_id: string;
+export interface SavedWorkstreamInfo {
+  ws_id: string;
   alias?: string | null;
   title?: string | null;
   created: string;
@@ -140,8 +137,8 @@ export interface SessionInfo {
   message_count: number;
 }
 
-export interface ListSessionsResponse {
-  sessions: SessionInfo[];
+export interface ListSavedWorkstreamsResponse {
+  workstreams: SavedWorkstreamInfo[];
 }
 
 // ---------------------------------------------------------------------------
