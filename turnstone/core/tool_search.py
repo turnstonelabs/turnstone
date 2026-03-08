@@ -182,6 +182,10 @@ class ToolSearchManager:
                 break
         return results
 
+    def get_expanded_names(self) -> list[str]:
+        """Return names of currently expanded (discovered) tools."""
+        return list(self._expanded.keys())
+
     def expand_visible(self, tool_names: list[str]) -> list[dict[str, Any]]:
         """Promote discovered tools to the visible set.
 

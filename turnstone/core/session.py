@@ -208,16 +208,23 @@ class ChatSession:
         self._notify_count = 0
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
+        self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         if mcp_client:
             mcp_tools = mcp_client.get_tools()
             self._tools = merge_mcp_tools(TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
+            # Register for tool-change notifications from MCP servers
+            self._mcp_refresh_cb = self._on_mcp_tools_changed
+            mcp_client.add_listener(self._mcp_refresh_cb)
         else:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
         # Dynamic tool search: defer MCP tools when tool count is high
+        self._tool_search_setting = tool_search
+        self._tool_search_threshold = tool_search_threshold
+        self._tool_search_max_results = tool_search_max_results
         self._tool_search: ToolSearchManager | None = None
         if tool_search == "on" or (
             tool_search == "auto" and len(self._tools) > tool_search_threshold
@@ -250,6 +257,90 @@ class ChatSession:
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
             },
+        )
+
+    # -- MCP tool refresh ----------------------------------------------------
+
+    def _on_mcp_tools_changed(self) -> None:
+        """Callback from MCPClientManager when the tool list changes.
+
+        Rebuilds merged tool lists and reconstructs ToolSearchManager.
+        Called on the MCP background thread — only lightweight work here.
+
+        Thread safety: each assignment creates a new object (copy-on-write).
+        Under CPython's GIL, individual reference assignments are atomic.
+        ``_try_stream`` captures tools at call time, so a concurrent refresh
+        between turns is safe; mid-stream the LLM request already holds
+        the old snapshot.
+        """
+        if not self._mcp_client:
+            return
+        mcp_tools = self._mcp_client.get_tools()
+        self._tools = merge_mcp_tools(TOOLS, mcp_tools)
+        self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
+        self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
+        self._rebuild_tool_search()
+
+    def _rebuild_tool_search(self) -> None:
+        """Reconstruct ToolSearchManager, preserving expanded tools."""
+        old_expanded = self._tool_search.get_expanded_names() if self._tool_search else []
+        if self._tool_search_setting == "on" or (
+            self._tool_search_setting == "auto" and len(self._tools) > self._tool_search_threshold
+        ):
+            self._tool_search = ToolSearchManager(
+                self._tools,
+                always_on_names=set(BUILTIN_TOOL_NAMES),
+                threshold=self._tool_search_threshold,
+                max_results=self._tool_search_max_results,
+            )
+            # Restore previously expanded tools that still exist
+            if old_expanded:
+                self._tool_search.expand_visible(old_expanded)
+        else:
+            self._tool_search = None
+
+    def close(self) -> None:
+        """Release resources (listener registrations, etc.)."""
+        if self._mcp_client and self._mcp_refresh_cb:
+            self._mcp_client.remove_listener(self._mcp_refresh_cb)
+            self._mcp_refresh_cb = None
+
+    def _handle_mcp_refresh(self, arg: str) -> None:
+        """Handle ``/mcp refresh [server]``."""
+        assert self._mcp_client is not None
+        tokens = arg.split(None, 1)  # ["refresh"] or ["refresh", "server"]
+        server_name: str | None = tokens[1] if len(tokens) > 1 else None
+
+        if server_name and server_name not in self._mcp_client.server_names:
+            known = ", ".join(self._mcp_client.server_names) or "(none)"
+            self.ui.on_error(f"Unknown MCP server: {server_name}. Known servers: {known}")
+            return
+
+        try:
+            results = self._mcp_client.refresh_sync(server_name)
+        except Exception as exc:
+            self.ui.on_error(f"MCP refresh failed: {exc}")
+            return
+
+        lines: list[str] = []
+        for srv, (added, removed) in sorted(results.items()):
+            if added or removed:
+                summary: list[str] = []
+                if added:
+                    summary.append(f"+{len(added)} added")
+                if removed:
+                    summary.append(f"-{len(removed)} removed")
+                lines.append(f"  {srv}: {', '.join(summary)}")
+                for name in added:
+                    lines.append(f"    {GREEN}+ {name}{RESET}")
+                for name in removed:
+                    lines.append(f"    {RED}- {name}{RESET}")
+            else:
+                lines.append(f"  {srv}: {dim('no changes')}")
+
+        header = "MCP refresh complete:"
+        self.ui.on_info(
+            "\n".join([header, *lines]) if lines else "MCP refresh complete: no servers to refresh."
         )
 
     def _truncate_output(self, output: str) -> str:
@@ -3193,6 +3284,8 @@ class ChatSession:
         elif cmd == "/mcp":
             if not self._mcp_client:
                 self.ui.on_info("No MCP servers configured.")
+            elif arg.startswith("refresh"):
+                self._handle_mcp_refresh(arg)
             else:
                 tools = self._mcp_client.get_tools()
                 if not tools:
@@ -3227,7 +3320,7 @@ class ChatSession:
                         "  /reason [low|med|high] Set/show reasoning effort",
                         "  /creative              Toggle creative writing mode (no tools)",
                         "  /debug                 Toggle raw SSE delta logging",
-                        "  /mcp                   List connected MCP tools",
+                        "  /mcp [refresh [server]] List or refresh MCP tools",
                         "  /help                  Show this help",
                         "  /exit                  Exit (also: Ctrl+D)",
                         "────────────────────────────────────────────────────────",

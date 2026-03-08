@@ -213,6 +213,9 @@ class WorkstreamManager:
                 ws.ui._plan_event.set()
             if hasattr(ws.ui, "_fg_event"):
                 ws.ui._fg_event.set()
+        # Release MCP listener registration
+        if ws.session and hasattr(ws.session, "close"):
+            ws.session.close()
 
     def close(self, ws_id: str) -> bool:
         """Close a workstream.  Returns False if it's the last one."""

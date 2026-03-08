@@ -144,6 +144,9 @@ class "ChatSession" as ChatSession {
     - _get_active_tools() → list[dict]
     - _prepare_tool_search() → None
     - _exec_tool_search(item) → (call_id, output)
+    - _on_mcp_tools_changed()
+    - _rebuild_tool_search()
+    + close()
     - _run_agent(messages, tools, ...) → str
     - _compact_messages(auto: bool)
     - _full_messages() → list[dict]
@@ -206,18 +209,26 @@ enum "WorkstreamState" as WsState {
 ' MCPClientManager
 class "MCPClientManager" as MCPMgr {
     - _sessions: dict[str, ClientSession]
+    - _per_server_tools: dict[str, list[dict]]
     - _tools: list[dict]
     - _tool_map: dict[str, tuple]
+    - _supports_list_changed: dict[str, bool]
+    - _listeners: list[Callable]
     --
     + start()
     + get_tools() → list[dict]
     + is_mcp_tool(name) → bool
     + call_tool_sync(name, args) → str
+    + refresh_sync(server?) → dict
+    + add_listener(callback)
+    + remove_listener(callback)
+    + server_names: list[str] {property}
     + shutdown()
     --
     Background asyncio event loop
     bridges async MCP SDK to
     sync ChatSession dispatch.
+    Push + periodic + manual refresh.
     --
     core/mcp_client.py
 }
@@ -227,12 +238,13 @@ class "ToolSearchManager" as ToolSearchMgr {
     - _all_tools: list[dict]
     - _always_on: list[dict]
     - _deferred: list[dict]
-    - _expanded: set[str]
+    - _expanded: dict[str, None]
     - _index: BM25Index
     --
     + should_activate() → bool
     + get_visible_tools() → list[dict]
     + get_deferred_tools() → list[dict]
+    + get_expanded_names() → list[str]
     + search(query, k) → list[dict]
     + expand_visible(names) → list[dict]
     + get_search_tool_definition() → dict

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import AsyncExitStack
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -411,3 +412,300 @@ class TestCreateMcpClient:
 
             result = create_mcp_client()
             assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tool refresh — _rebuild_tools, _refresh_server, listeners
+# ---------------------------------------------------------------------------
+
+
+class TestRebuildTools:
+    def test_rebuild_from_per_server(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_tools = {
+            "github": [_fake_openai_tool("mcp__github__search")],
+            "slack": [_fake_openai_tool("mcp__slack__send")],
+        }
+        mgr._rebuild_tools()
+        assert len(mgr._tools) == 2
+        names = {t["function"]["name"] for t in mgr._tools}
+        assert names == {"mcp__github__search", "mcp__slack__send"}
+        assert mgr._tool_map["mcp__github__search"] == ("github", "search")
+        assert mgr._tool_map["mcp__slack__send"] == ("slack", "send")
+
+    def test_rebuild_copy_on_write(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_tools = {"a": [_fake_openai_tool("mcp__a__x")]}
+        mgr._rebuild_tools()
+        old_tools = mgr._tools
+        old_map = mgr._tool_map
+        mgr._per_server_tools["b"] = [_fake_openai_tool("mcp__b__y")]
+        mgr._rebuild_tools()
+        assert mgr._tools is not old_tools
+        assert mgr._tool_map is not old_map
+
+    def test_rebuild_empty(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_tools = {}
+        mgr._rebuild_tools()
+        assert mgr._tools == []
+        assert mgr._tool_map == {}
+
+
+class TestRefreshServer:
+    def test_refresh_detects_added_tools(self):
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = MagicMock()
+            mock_result = MagicMock()
+            mock_result.tools = [
+                _fake_mcp_tool("search"),
+                _fake_mcp_tool("create"),  # new tool
+            ]
+            mock_session.list_tools = AsyncMock(return_value=mock_result)
+            mgr._sessions["github"] = mock_session
+            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            mgr._rebuild_tools()
+
+            added, removed = await mgr._refresh_server("github")
+            assert "mcp__github__create" in added
+            assert removed == []
+            assert len(mgr._tools) == 2
+
+        asyncio.run(_run())
+
+    def test_refresh_detects_removed_tools(self):
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = MagicMock()
+            mock_result = MagicMock()
+            mock_result.tools = []  # all tools removed
+            mock_session.list_tools = AsyncMock(return_value=mock_result)
+            mgr._sessions["github"] = mock_session
+            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            mgr._rebuild_tools()
+
+            added, removed = await mgr._refresh_server("github")
+            assert added == []
+            assert "mcp__github__search" in removed
+            assert mgr._tools == []
+
+        asyncio.run(_run())
+
+    def test_refresh_no_changes(self):
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = MagicMock()
+            mock_result = MagicMock()
+            mock_result.tools = [_fake_mcp_tool("search")]
+            mock_session.list_tools = AsyncMock(return_value=mock_result)
+            mgr._sessions["github"] = mock_session
+            mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
+            mgr._rebuild_tools()
+
+            added, removed = await mgr._refresh_server("github")
+            assert added == []
+            assert removed == []
+
+        asyncio.run(_run())
+
+    def test_refresh_disconnected_raises(self):
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            with pytest.raises(RuntimeError, match="not connected"):
+                await mgr._refresh_server("ghost")
+
+        asyncio.run(_run())
+
+
+class TestListeners:
+    def test_add_and_notify(self):
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        mgr.add_listener(lambda: calls.append(1))
+        mgr._per_server_tools = {"a": [_fake_openai_tool("mcp__a__x")]}
+        mgr._rebuild_tools()
+        assert len(calls) == 1
+
+    def test_remove_listener(self):
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        cb = lambda: calls.append(1)  # noqa: E731
+        mgr.add_listener(cb)
+        mgr.remove_listener(cb)
+        mgr._rebuild_tools()
+        assert calls == []
+
+    def test_remove_nonexistent_listener(self):
+        mgr = MCPClientManager({})
+        mgr.remove_listener(lambda: None)  # should not raise
+
+    def test_listener_error_does_not_propagate(self):
+        mgr = MCPClientManager({})
+        mgr.add_listener(lambda: 1 / 0)  # will raise ZeroDivisionError
+        mgr._rebuild_tools()  # should not raise
+
+
+class TestServerNames:
+    def test_server_names_property(self):
+        mgr = MCPClientManager({"github": {}, "slack": {}})
+        assert sorted(mgr.server_names) == ["github", "slack"]
+
+    def test_server_names_empty(self):
+        mgr = MCPClientManager({})
+        assert mgr.server_names == []
+
+
+# ---------------------------------------------------------------------------
+# Session integration — tool refresh propagation
+# ---------------------------------------------------------------------------
+
+
+class TestSessionRefresh:
+    @pytest.fixture()
+    def tmp_db(self, tmp_path):
+        from turnstone.core.storage import init_storage, reset_storage
+
+        reset_storage()
+        init_storage("sqlite", path=str(tmp_path / "test.db"), run_migrations=False)
+        yield
+        reset_storage()
+
+    def _make_session(self, mcp_client=None, **kwargs):
+        from turnstone.core.session import ChatSession
+
+        defaults: dict[str, Any] = dict(
+            client=MagicMock(),
+            model="test-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=4096,
+            tool_timeout=30,
+            mcp_client=mcp_client,
+        )
+        defaults.update(kwargs)
+        return ChatSession(**defaults)
+
+    def test_listener_registered_on_init(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = []
+        session = self._make_session(mcp_client=mock_mcp)
+        mock_mcp.add_listener.assert_called_once()
+        assert session._mcp_refresh_cb is not None
+
+    def test_no_listener_without_mcp(self, tmp_db):
+        session = self._make_session(mcp_client=None)
+        assert session._mcp_refresh_cb is None
+
+    def test_close_removes_listener(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = []
+        session = self._make_session(mcp_client=mock_mcp)
+        session.close()
+        mock_mcp.remove_listener.assert_called_once()
+        assert session._mcp_refresh_cb is None
+
+    def test_close_idempotent(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = []
+        session = self._make_session(mcp_client=mock_mcp)
+        session.close()
+        session.close()  # should not raise
+        assert mock_mcp.remove_listener.call_count == 1
+
+    def test_on_mcp_tools_changed_rebuilds_tools(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool("mcp__test__a")]
+        session = self._make_session(mcp_client=mock_mcp)
+        initial_count = len(session._tools)
+
+        # Simulate a tool refresh — MCP now has 2 tools
+        mock_mcp.get_tools.return_value = [
+            _fake_openai_tool("mcp__test__a"),
+            _fake_openai_tool("mcp__test__b"),
+        ]
+        session._on_mcp_tools_changed()
+        assert len(session._tools) == initial_count + 1
+
+    def test_tool_search_preserved_across_refresh(self, tmp_db):
+        # Create enough MCP tools to trigger tool search
+        mcp_tools = [_fake_openai_tool(f"mcp__srv__tool{i}") for i in range(25)]
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = mcp_tools
+        session = self._make_session(
+            mcp_client=mock_mcp,
+            tool_search="auto",
+            tool_search_threshold=20,
+        )
+        assert session._tool_search is not None
+
+        # Expand a tool
+        session._tool_search.expand_visible(["mcp__srv__tool0"])
+        assert "mcp__srv__tool0" in session._tool_search.get_expanded_names()
+
+        # Refresh with same tools
+        session._on_mcp_tools_changed()
+        assert session._tool_search is not None
+        assert "mcp__srv__tool0" in session._tool_search.get_expanded_names()
+
+    def test_tool_search_prunes_removed_from_expanded(self, tmp_db):
+        mcp_tools = [_fake_openai_tool(f"mcp__srv__tool{i}") for i in range(25)]
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = mcp_tools
+        session = self._make_session(
+            mcp_client=mock_mcp,
+            tool_search="auto",
+            tool_search_threshold=20,
+        )
+        session._tool_search.expand_visible(["mcp__srv__tool0"])
+
+        # Refresh with tool0 removed
+        new_tools = [_fake_openai_tool(f"mcp__srv__tool{i}") for i in range(1, 25)]
+        mock_mcp.get_tools.return_value = new_tools
+        session._on_mcp_tools_changed()
+        # tool0 was removed, so it should no longer be in expanded
+        expanded = session._tool_search.get_expanded_names()
+        assert "mcp__srv__tool0" not in expanded
+
+    def test_mcp_refresh_command(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["test"]
+        mock_mcp.refresh_sync.return_value = {"test": (["mcp__test__new"], [])}
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        mock_mcp.refresh_sync.assert_called_once_with(None)
+        session.ui.on_info.assert_called()
+
+    def test_mcp_refresh_specific_server(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["github", "slack"]
+        mock_mcp.refresh_sync.return_value = {"github": ([], [])}
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh github")
+        mock_mcp.refresh_sync.assert_called_once_with("github")
+
+    def test_mcp_refresh_unknown_server(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["github"]
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh nonexistent")
+        session.ui.on_error.assert_called_once()
+        assert "Unknown MCP server" in session.ui.on_error.call_args[0][0]
+
+    def test_mcp_refresh_error_handling(self, tmp_db):
+        mock_mcp = MagicMock()
+        mock_mcp.get_tools.return_value = [_fake_openai_tool()]
+        mock_mcp.server_names = ["test"]
+        mock_mcp.refresh_sync.side_effect = TimeoutError("timed out")
+        session = self._make_session(mcp_client=mock_mcp)
+
+        session.handle_command("/mcp refresh")
+        session.ui.on_error.assert_called_once()
+        assert "MCP refresh failed" in session.ui.on_error.call_args[0][0]

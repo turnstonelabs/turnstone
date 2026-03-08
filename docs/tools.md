@@ -526,7 +526,8 @@ MCP-compatible service.
 
 2. **Discovery**: At startup, `MCPClientManager` connects to each configured server
    (via stdio subprocess or HTTP), performs the MCP `initialize` handshake, and calls
-   `tools/list` to discover available tools.
+   `tools/list` to discover available tools. During the handshake, the manager checks
+   each server's capabilities for `tools.listChanged` support (push notifications).
 
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
@@ -607,4 +608,46 @@ MCP tools (3):
   mcp__github__search_repos  [MCP: github] Search GitHub repositories
   mcp__github__create_issue  [MCP: github] Create a GitHub issue
   mcp__postgres__query       [MCP: postgres] Run a SQL query
+```
+
+### Dynamic tool refresh
+
+MCP tool lists stay up-to-date without restart through three mechanisms:
+
+1. **Push notifications** -- MCP servers that declare `tools.listChanged: true` in
+   their capabilities send `notifications/tools/list_changed` when their tool list
+   changes. `MCPClientManager` registers a `message_handler` on each `ClientSession`
+   that triggers an immediate refresh for that server.
+
+2. **Periodic timer** -- Servers that do *not* support push notifications are polled
+   on a configurable interval (default 4 hours). The timer is staggered using a
+   launch-time seed (`monotonic_ns ^ pid`) so cluster nodes don't all hit MCP
+   servers simultaneously. Configure via `[mcp] refresh_interval` in `config.toml`
+   or `--mcp-refresh-interval SECONDS` on the CLI. Set to `0` to disable.
+
+3. **Manual** -- `/mcp refresh` re-fetches tools from all servers immediately.
+   `/mcp refresh <server>` targets a single server. If a server has disconnected,
+   manual refresh attempts reconnection.
+
+When tools change, `MCPClientManager` rebuilds its merged tool list using copy-on-write
+(new list/dict objects assigned atomically) and notifies all active `ChatSession`
+instances via registered listener callbacks. Each session rebuilds its `_tools`,
+`_task_tools`, `_agent_tools`, and reconstructs its `ToolSearchManager` (if active),
+preserving the set of previously expanded (discovered) tools.
+
+```toml
+[mcp]
+refresh_interval = 14400  # seconds (default 4h), 0 to disable
+```
+
+```
+/mcp refresh
+MCP refresh complete:
+  github: +1 added
+    + mcp__github__create_pr
+  postgres: no changes
+
+/mcp refresh github
+MCP refresh complete:
+  github: no changes
 ```

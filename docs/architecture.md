@@ -42,7 +42,7 @@ turnstone/
       __init__.py     create_provider() + create_client() factory functions
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
-    mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
+    mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh, async-sync bridge
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         Persistence facade (delegates to storage backend)
@@ -498,17 +498,32 @@ bridges this with a background asyncio event loop in a daemon thread.
 1. `create_mcp_client()` reads server configs from TOML or JSON
 2. `MCPClientManager.start()` launches the background event loop thread
 3. `_connect_all()` connects to each server (stdio subprocess or HTTP), runs
-   `initialize()` + `list_tools()`, converts schemas to OpenAI format
-4. `ChatSession.__init__` receives the manager and builds `self._tools` (built-in + MCP)
+   `initialize()` + `list_tools()`, converts schemas to OpenAI format, detects
+   `tools.listChanged` capability for push notification support
+4. `ChatSession.__init__` receives the manager, builds `self._tools` (built-in + MCP),
+   and registers a listener callback for tool-change notifications
 5. `_prepare_tool()` routes MCP tools to `_prepare_mcp_tool()` / `_exec_mcp_tool()`
 6. `_exec_mcp_tool()` calls `call_tool_sync()` which dispatches to the async loop
    via `asyncio.run_coroutine_threadsafe()`
 
+**Tool refresh:** Three mechanisms keep tools up-to-date without restart:
+- **Push:** Servers declaring `tools.listChanged` send `ToolListChangedNotification`;
+  the registered `message_handler` triggers immediate single-server refresh.
+- **Periodic:** Servers without push support are polled on a staggered interval
+  (default 4 h, configurable via `[mcp] refresh_interval` or `--mcp-refresh-interval`).
+- **Manual:** `/mcp refresh [server]` calls `refresh_sync()` for on-demand refresh
+  (also attempts reconnection for disconnected servers).
+
+When tools change, `_rebuild_tools()` creates new `_tools`/`_tool_map` objects
+(copy-on-write for thread safety) and notifies listener callbacks. Each `ChatSession`
+rebuilds its merged tool lists and reconstructs `ToolSearchManager` (preserving
+expanded tools).
+
 **Tool naming:** `mcp__{server}__{tool}` — double underscore delimiter, validated
 at connection time (server names with `__` are rejected).
 
-**Error isolation:** Per-server connection failures are caught and logged; other
-servers still connect. Tool execution errors return error strings to the LLM
+**Error isolation:** Per-server connection/refresh failures are caught and logged; other
+servers are unaffected. Tool execution errors return error strings to the LLM
 rather than crashing the session.
 
 ### Provider Adapter Layer

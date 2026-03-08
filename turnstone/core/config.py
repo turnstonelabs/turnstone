@@ -105,6 +105,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
     },
     "mcp": {
         "config_path": "mcp_config",
+        "refresh_interval": "mcp_refresh_interval",
     },
     "ratelimit": {
         "enabled": "ratelimit_enabled",

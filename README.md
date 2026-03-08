@@ -176,7 +176,7 @@ When the total tool count exceeds a configurable threshold (default 20), MCP too
 
 ### MCP Tool Servers
 
-Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) for connecting external tool servers. MCP tools are discovered at startup, converted to OpenAI function-calling format, and merged with built-in tools. Each MCP tool is prefixed with `mcp__{server}__{tool}` to avoid name collisions.
+Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) for connecting external tool servers. MCP tools are discovered at startup, converted to OpenAI function-calling format, and merged with built-in tools. Each MCP tool is prefixed with `mcp__{server}__{tool}` to avoid name collisions. Tool lists stay fresh via push notifications (`tools.listChanged`), periodic polling for servers without push, and manual `/mcp refresh`.
 
 Configure via `config.toml` or `--mcp-config`:
 
@@ -196,7 +196,7 @@ turnstone --mcp-config ~/.config/turnstone/mcp.json
 turnstone-server --mcp-config ~/.config/turnstone/mcp.json
 ```
 
-Use `/mcp` in the REPL to list connected tools. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
+Use `/mcp` in the REPL to list connected tools, `/mcp refresh` to re-fetch tool lists from servers. MCP tools require user approval by default (overridden by `--skip-permissions` or UI auto-approve).
 
 ### Multi-Model and Multi-Provider Support
 
@@ -294,6 +294,7 @@ path = ".turnstone.db" # SQLite file path (relative to working directory)
 
 [mcp]
 config_path = ""       # path to MCP JSON config file (alternative to TOML sections)
+refresh_interval = 14400  # periodic refresh for servers without push notifications (seconds, 0 to disable)
 
 [mcp.servers.example]  # one section per MCP server
 command = "npx"

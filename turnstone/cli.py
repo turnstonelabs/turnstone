@@ -841,6 +841,13 @@ def main() -> None:
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
+    parser.add_argument(
+        "--mcp-refresh-interval",
+        type=float,
+        default=14400,
+        metavar="SECONDS",
+        help="Periodic MCP tool refresh interval for servers without push notifications (default: 14400 = 4h, 0 to disable)",
+    )
     from turnstone.core.config import apply_config
 
     apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp", "database"])
@@ -910,7 +917,10 @@ def main() -> None:
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
 
-    mcp_client = create_mcp_client(getattr(args, "mcp_config", None))
+    mcp_client = create_mcp_client(
+        getattr(args, "mcp_config", None),
+        refresh_interval=getattr(args, "mcp_refresh_interval", 14400),
+    )
 
     # ChatSession factory — captures shared config for creating workstreams
     def session_factory(
@@ -1041,6 +1051,9 @@ def main() -> None:
             except Exception as e:
                 print(f"\n{red(f'Error: {e}')}")
 
+    # Close active session (removes MCP listener) before shutting down MCP
+    if active and active.session:
+        active.session.close()
     if mcp_client:
         mcp_client.shutdown()
     registry.shutdown()

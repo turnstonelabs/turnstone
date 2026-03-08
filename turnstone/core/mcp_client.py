@@ -7,19 +7,33 @@ Architecture: the MCP SDK is fully async, but turnstone's ChatSession is
 synchronous.  We bridge the two by running a dedicated asyncio event loop
 in a daemon thread.  ``call_tool_sync`` dispatches coroutines onto that loop
 via ``asyncio.run_coroutine_threadsafe``.
+
+Tool refresh: three mechanisms keep tool lists up-to-date without restart:
+  1. Push notifications — servers declaring ``tools.listChanged`` trigger
+     immediate refresh via ``ToolListChangedNotification``.
+  2. Periodic timer — servers *without* push support are polled on a
+     staggered interval (configurable, default 4 h, seeded at launch).
+  3. Manual — ``/mcp refresh [server]`` triggers ``refresh_sync()``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import random
 import threading
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+import mcp.types as mcp_types
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -27,6 +41,8 @@ from mcp.client.streamable_http import streamablehttp_client
 from turnstone.core.config import load_config
 
 log = logging.getLogger("turnstone.mcp")
+
+_DEFAULT_REFRESH_INTERVAL: float = 14400  # 4 hours
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +83,12 @@ class MCPClientManager:
     synchronous methods for tool discovery and invocation.
     """
 
-    def __init__(self, server_configs: dict[str, dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        server_configs: dict[str, dict[str, Any]],
+        *,
+        refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
+    ) -> None:
         self._server_configs = server_configs
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -79,6 +100,19 @@ class MCPClientManager:
         self._tool_map: dict[str, tuple[str, str]] = {}
         self._connected = threading.Event()
         self._error: str | None = None
+
+        # Per-server tool storage for surgical refresh
+        self._per_server_tools: dict[str, list[dict[str, Any]]] = {}
+        # Tracks which servers support push notifications
+        self._supports_list_changed: dict[str, bool] = {}
+
+        # Listener infrastructure (tool-change callbacks for ChatSession)
+        self._listeners: list[Callable[[], None]] = []
+        self._listeners_lock = threading.Lock()
+
+        # Periodic refresh for servers without push notifications
+        self._refresh_interval = refresh_interval
+        self._refresh_task: asyncio.Task[None] | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -108,6 +142,13 @@ class MCPClientManager:
 
         self._connected.set()
 
+        # Start periodic refresh for servers without push notifications
+        needs_periodic = any(
+            not self._supports_list_changed.get(name, False) for name in self._sessions
+        )
+        if needs_periodic and self._refresh_interval > 0:
+            self._refresh_task = asyncio.get_running_loop().create_task(self._periodic_refresh())
+
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a single MCP server and discover its tools."""
         assert self._exit_stack is not None
@@ -135,26 +176,187 @@ class MCPClientManager:
             )
             read, write = await self._exit_stack.enter_async_context(stdio_client(params))
 
-        session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+        # Register notification handler — lightweight; only acts on
+        # ToolListChangedNotification, which is a no-op if the server
+        # never sends it.
+        async def _on_notification(
+            msg: Any,  # RequestResponder | ServerNotification | Exception
+        ) -> None:
+            if isinstance(msg, mcp_types.ServerNotification) and isinstance(
+                msg.root, mcp_types.ToolListChangedNotification
+            ):
+                log.info("Received tools/list_changed from '%s'", name)
+                try:
+                    await self._refresh_server(name)
+                except Exception:
+                    log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
+
+        session = await self._exit_stack.enter_async_context(
+            ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
+        )
         await session.initialize()
         self._sessions[name] = session
 
+        # Check push notification support
+        caps = session.get_server_capabilities()
+        tools_cap = getattr(caps, "tools", None) if caps else None
+        self._supports_list_changed[name] = bool(getattr(tools_cap, "listChanged", False))
+
         # Discover tools
         result = await session.list_tools()
+        server_tools: list[dict[str, Any]] = []
         for tool in result.tools:
-            openai_def = _mcp_to_openai(name, tool)
-            prefixed = openai_def["function"]["name"]
-            self._tools.append(openai_def)
-            self._tool_map[prefixed] = (name, tool.name)
+            server_tools.append(_mcp_to_openai(name, tool))
 
+        self._per_server_tools[name] = server_tools
+        self._rebuild_tools()
+
+        push_status = " (push)" if self._supports_list_changed[name] else ""
         log.info(
-            "Connected MCP server '%s' — %d tool(s)",
+            "Connected MCP server '%s' — %d tool(s)%s",
             name,
             len(result.tools),
+            push_status,
         )
+
+    # -- tool refresh --------------------------------------------------------
+
+    def _rebuild_tools(self) -> None:
+        """Rebuild merged ``_tools`` and ``_tool_map`` from per-server state.
+
+        Uses copy-on-write: builds new objects, then assigns atomically.
+        Concurrent readers see either the old or new snapshot — both valid.
+        """
+        new_tools: list[dict[str, Any]] = []
+        new_map: dict[str, tuple[str, str]] = {}
+        for srv_name, srv_tools in self._per_server_tools.items():
+            for tool in srv_tools:
+                prefixed: str = tool["function"]["name"]
+                new_tools.append(tool)
+                # Extract original name from the mcp__server__original pattern
+                original = prefixed.split("__", 2)[2] if prefixed.count("__") >= 2 else prefixed
+                new_map[prefixed] = (srv_name, original)
+        self._tools = new_tools
+        self._tool_map = new_map
+        self._notify_listeners()
+
+    async def _refresh_server(self, name: str) -> tuple[list[str], list[str]]:
+        """Re-fetch tools for one server.  Returns ``(added, removed)`` names."""
+        session = self._sessions.get(name)
+        if session is None:
+            raise RuntimeError(f"MCP server '{name}' is not connected")
+
+        old_names = {t["function"]["name"] for t in self._per_server_tools.get(name, [])}
+
+        result = await session.list_tools()
+        server_tools = [_mcp_to_openai(name, tool) for tool in result.tools]
+        new_names = {t["function"]["name"] for t in server_tools}
+
+        self._per_server_tools[name] = server_tools
+        self._rebuild_tools()
+
+        added = sorted(new_names - old_names)
+        removed = sorted(old_names - new_names)
+        if added or removed:
+            log.info(
+                "Refreshed MCP server '%s': +%d/-%d tool(s)",
+                name,
+                len(added),
+                len(removed),
+            )
+        return added, removed
+
+    async def _refresh_all(
+        self, server_name: str | None = None
+    ) -> dict[str, tuple[list[str], list[str]]]:
+        """Refresh tools for one or all servers.
+
+        For disconnected servers (in config but not connected), attempts
+        reconnect.  Returns ``{server: (added, removed)}`` per server.
+        """
+        results: dict[str, tuple[list[str], list[str]]] = {}
+        targets = [server_name] if server_name else list(self._server_configs.keys())
+
+        for name in targets:
+            try:
+                if name not in self._sessions:
+                    # Attempt reconnect
+                    cfg = self._server_configs.get(name)
+                    if cfg:
+                        log.info("Reconnecting MCP server '%s'", name)
+                        await self._connect_one(name, cfg)
+                        new_names = [
+                            t["function"]["name"] for t in self._per_server_tools.get(name, [])
+                        ]
+                        results[name] = (new_names, [])
+                    continue
+                added, removed = await self._refresh_server(name)
+                results[name] = (added, removed)
+            except Exception:
+                log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
+                results[name] = ([], [])
+        return results
+
+    def refresh_sync(
+        self, server_name: str | None = None, timeout: int = 30
+    ) -> dict[str, tuple[list[str], list[str]]]:
+        """Refresh tools synchronously (blocks the calling thread).
+
+        Returns ``{server: (added_names, removed_names)}`` per server.
+        """
+        assert self._loop is not None
+        future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
+        return future.result(timeout=timeout)
+
+    async def _periodic_refresh(self) -> None:
+        """Periodically refresh servers that lack push notifications."""
+        # Stagger start using a launch-time seed so cluster nodes don't
+        # all hit MCP servers simultaneously.
+        seed = random.Random(time.monotonic_ns() ^ os.getpid()).random()
+        initial_delay = seed * self._refresh_interval
+        await asyncio.sleep(initial_delay)
+        while True:
+            await asyncio.sleep(self._refresh_interval)
+            for name in list(self._server_configs):
+                if self._supports_list_changed.get(name, False):
+                    continue  # has push — skip
+                if name not in self._sessions:
+                    continue  # not connected — skip (reconnect on manual refresh)
+                try:
+                    await self._refresh_server(name)
+                except Exception:
+                    log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
+
+    # -- listener infrastructure ---------------------------------------------
+
+    def add_listener(self, callback: Callable[[], None]) -> None:
+        """Register a callback invoked when the tool list changes."""
+        with self._listeners_lock:
+            self._listeners.append(callback)
+
+    def remove_listener(self, callback: Callable[[], None]) -> None:
+        """Unregister a tool-change callback."""
+        with self._listeners_lock, contextlib.suppress(ValueError):
+            self._listeners.remove(callback)
+
+    def _notify_listeners(self) -> None:
+        """Invoke all registered listeners (runs on MCP background thread)."""
+        with self._listeners_lock:
+            listeners = list(self._listeners)
+        for cb in listeners:
+            try:
+                cb()
+            except Exception:
+                log.warning("Tool-change listener raised", exc_info=True)
+
+    # -- lifecycle (shutdown) ------------------------------------------------
 
     def shutdown(self) -> None:
         """Close all MCP sessions and stop the background loop."""
+        # Cancel periodic refresh
+        if self._refresh_task and self._loop:
+            self._loop.call_soon_threadsafe(self._refresh_task.cancel)
+
         if self._loop and self._exit_stack:
             future = asyncio.run_coroutine_threadsafe(self._exit_stack.aclose(), self._loop)
             try:
@@ -182,6 +384,11 @@ class MCPClientManager:
     @property
     def server_count(self) -> int:
         return len(self._sessions)
+
+    @property
+    def server_names(self) -> list[str]:
+        """Return configured server names."""
+        return list(self._server_configs.keys())
 
     # -- tool invocation -----------------------------------------------------
 
@@ -273,7 +480,11 @@ def load_mcp_config(config_path: str | None = None) -> dict[str, dict[str, Any]]
     return {}
 
 
-def create_mcp_client(config_path: str | None = None) -> MCPClientManager | None:
+def create_mcp_client(
+    config_path: str | None = None,
+    *,
+    refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
+) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
     Returns *None* if no servers are configured.
@@ -282,6 +493,6 @@ def create_mcp_client(config_path: str | None = None) -> MCPClientManager | None
     if not servers:
         return None
 
-    mgr = MCPClientManager(servers)
+    mgr = MCPClientManager(servers, refresh_interval=refresh_interval)
     mgr.start()
     return mgr

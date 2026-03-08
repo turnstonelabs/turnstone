@@ -187,6 +187,14 @@ class TestToolSearchManager:
         added = manager.expand_visible(["nonexistent_tool"])
         assert added == []
 
+    def test_get_expanded_names_empty(self, manager):
+        assert manager.get_expanded_names() == []
+
+    def test_get_expanded_names_after_expand(self, manager):
+        manager.expand_visible(["mcp__github__create_issue", "mcp__slack__send_message"])
+        names = manager.get_expanded_names()
+        assert names == ["mcp__github__create_issue", "mcp__slack__send_message"]
+
     def test_deferred_excludes_expanded(self, manager):
         manager.expand_visible(["mcp__github__create_issue"])
         deferred = manager.get_deferred_tools()
