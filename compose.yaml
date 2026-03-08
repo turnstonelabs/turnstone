@@ -207,6 +207,7 @@ services:
       dockerfile: Dockerfile
     profiles:
       - production
+      - cluster
     command:
       - sh
       - -c

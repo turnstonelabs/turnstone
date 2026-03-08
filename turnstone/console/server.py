@@ -30,7 +30,7 @@ import httpx
 from sse_starlette import EventSourceResponse
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -568,7 +568,11 @@ async def _proxy_post(
 async def _proxy_sse(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
-    """Proxy an SSE stream from the target server to the browser."""
+    """Proxy an SSE stream from the target server to the browser.
+
+    Relays raw bytes verbatim so server-side ping comments, event framing,
+    and keepalives all pass through unchanged.
+    """
     target = f"{server_url}/{api_prefix}/{path}"
     if request.url.query:
         target += f"?{request.url.query}"
@@ -576,30 +580,33 @@ async def _proxy_sse(
     sse_client: httpx.AsyncClient = request.app.state.proxy_sse_client
     sse_auth = _proxy_auth_headers(request)
 
-    async def sse_generator() -> AsyncGenerator[dict[str, str], None]:
-        from httpx_sse import aconnect_sse
-
+    async def raw_stream() -> AsyncGenerator[bytes, None]:
         try:
-            async with aconnect_sse(sse_client, "GET", target, headers=sse_auth) as source:
-                if source.response.status_code != 200:
+            async with sse_client.stream(
+                "GET",
+                target,
+                headers={**sse_auth, "Accept": "text/event-stream", "Cache-Control": "no-store"},
+            ) as response:
+                if response.status_code != 200:
                     log.debug(
                         "SSE proxy received status %s from %s",
-                        source.response.status_code,
+                        response.status_code,
                         target,
                     )
-                    yield {
-                        "event": "error",
-                        "data": f"Upstream returned status {source.response.status_code}",
-                    }
+                    yield f"event: error\ndata: Upstream returned status {response.status_code}\n\n".encode()
                     return
-                async for sse in source.aiter_sse():
+                async for chunk in response.aiter_bytes():
                     if await request.is_disconnected():
                         return
-                    yield {"event": sse.event, "data": sse.data}
+                    yield chunk
         except httpx.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 
-    return EventSourceResponse(sse_generator(), ping=5)
+    return StreamingResponse(
+        raw_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------------------
