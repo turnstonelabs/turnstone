@@ -76,6 +76,7 @@ class ModelCapabilities:
     reasoning_effort_values: tuple[str, ...] = ()
     default_reasoning_effort: str = "medium"
     supports_web_search: bool = False
+    supports_tool_search: bool = False
 
 
 def _lookup_capabilities(
@@ -119,6 +120,7 @@ class LLMProvider(Protocol):
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks."""
         ...
@@ -134,6 +136,7 @@ class LLMProvider(Protocol):
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         """Create a non-streaming request, returning a normalized result."""
         ...

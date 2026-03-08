@@ -1933,3 +1933,119 @@ class TestAnthropicProviderBlocks:
         assert blocks[1]["input"] == {"query": "test"}  # parsed from accumulated JSON
         assert blocks[2]["type"] == "web_search_tool_result"
         assert blocks[2]["encrypted_content"] == "enc_data"
+
+
+# ---------------------------------------------------------------------------
+# Tool search tests
+# ---------------------------------------------------------------------------
+
+
+class TestAnthropicToolSearch:
+    """Test Anthropic provider tool search injection."""
+
+    @pytest.fixture()
+    def provider(self):
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        return AnthropicProvider()
+
+    def test_tool_search_capability_flag(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        assert caps.supports_tool_search is True
+
+    def test_tool_search_not_supported_on_haiku(self, provider):
+        caps = provider.get_capabilities("claude-haiku-4-5-20251001")
+        assert caps.supports_tool_search is False
+
+    def test_inject_tool_search_marks_deferred(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        tools = [
+            {"name": "bash", "description": "Run commands", "input_schema": {}},
+            {
+                "name": "mcp__github__create_issue",
+                "description": "Create issue",
+                "input_schema": {},
+            },
+        ]
+        deferred = frozenset(["mcp__github__create_issue"])
+        result = provider._inject_tool_search(tools, caps, deferred)
+        # bash should not be deferred
+        assert result[0].get("defer_loading") is None or result[0].get("defer_loading") is False
+        # MCP tool should be deferred
+        assert result[1]["defer_loading"] is True
+        # Search tool should be appended
+        assert result[-1]["type"] == "tool_search_tool_bm25_20251119"
+        assert result[-1]["name"] == "tool_search"
+
+    def test_inject_tool_search_no_op_without_deferred(self, provider):
+        caps = provider.get_capabilities("claude-opus-4-6-20260101")
+        tools = [{"name": "bash", "description": "Run commands", "input_schema": {}}]
+        result = provider._inject_tool_search(tools, caps, None)
+        assert result == tools
+
+    def test_inject_tool_search_no_op_on_unsupported_model(self, provider):
+        caps = provider.get_capabilities("claude-haiku-4-5-20251001")
+        tools = [{"name": "bash", "description": "Run commands", "input_schema": {}}]
+        deferred = frozenset(["some_tool"])
+        result = provider._inject_tool_search(tools, caps, deferred)
+        assert result == tools
+
+
+class TestOpenAIToolSearch:
+    """Test OpenAI provider tool search injection."""
+
+    @pytest.fixture()
+    def provider(self):
+        return OpenAIProvider()
+
+    def test_tool_search_capability_on_gpt54(self, provider):
+        caps = provider.get_capabilities("gpt-5.4")
+        assert caps.supports_tool_search is True
+
+    def test_tool_search_not_supported_on_gpt5(self, provider):
+        caps = provider.get_capabilities("gpt-5")
+        assert caps.supports_tool_search is False
+
+    def test_apply_tool_search_marks_deferred(self, provider):
+        caps = provider.get_capabilities("gpt-5.4")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+            {
+                "type": "function",
+                "function": {"name": "mcp__slack__send", "description": "Send message"},
+            },
+        ]
+        deferred = frozenset(["mcp__slack__send"])
+        result = provider._apply_tool_search(caps, tools, deferred)
+        assert result is not None
+        # bash not deferred
+        assert result[0].get("defer_loading") is None or result[0].get("defer_loading") is False
+        # slack tool deferred
+        assert result[1]["defer_loading"] is True
+
+    def test_apply_tool_search_no_op_without_deferred(self, provider):
+        caps = provider.get_capabilities("gpt-5.4")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+        ]
+        result = provider._apply_tool_search(caps, tools, None)
+        assert result == tools
+
+    def test_apply_tool_search_no_op_on_unsupported_model(self, provider):
+        caps = provider.get_capabilities("gpt-5")
+        tools = [
+            {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
+        ]
+        deferred = frozenset(["some_tool"])
+        result = provider._apply_tool_search(caps, tools, deferred)
+        assert result == tools
+
+
+class TestModelCapabilitiesToolSearch:
+    """Test supports_tool_search defaults and values."""
+
+    def test_default_is_false(self):
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_tool_search is False

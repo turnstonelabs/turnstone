@@ -82,20 +82,22 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
     ),
-    # GPT-5.4 — 1M context window
+    # GPT-5.4 — 1M context window, native tool search
     "gpt-5.4": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
+        supports_tool_search=True,
     ),
-    # GPT-5.4 pro — always-reasoning, 1M context
+    # GPT-5.4 pro — always-reasoning, 1M context, native tool search
     "gpt-5.4-pro": ModelCapabilities(
         context_window=1050000,
         max_output_tokens=128000,
         supports_temperature=False,
         reasoning_effort_values=("medium", "high", "xhigh"),
         default_reasoning_effort="medium",
+        supports_tool_search=True,
     ),
     # O-series reasoning models
     "o1": ModelCapabilities(
@@ -215,6 +217,30 @@ class OpenAIProvider:
         kwargs["web_search_options"] = {}
         return tools
 
+    # -- tool search ---------------------------------------------------------
+
+    def _apply_tool_search(
+        self,
+        caps: ModelCapabilities,
+        tools: list[dict[str, Any]] | None,
+        deferred_names: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]] | None:
+        """Mark deferred tools with ``defer_loading: true`` for native search.
+
+        For GPT-5.4+ models that support tool search, OpenAI's API handles
+        discovery automatically — no explicit search tool is needed.
+        """
+        if not caps.supports_tool_search or not deferred_names or not tools:
+            return tools
+        result = []
+        for tool in tools:
+            name = tool.get("function", {}).get("name", "")
+            if name in deferred_names:
+                result.append({**tool, "defer_loading": True})
+            else:
+                result.append(tool)
+        return result
+
     # -- streaming -----------------------------------------------------------
 
     def create_streaming(
@@ -228,6 +254,7 @@ class OpenAIProvider:
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> Iterator[StreamChunk]:
         caps = self.get_capabilities(model)
         kwargs: dict[str, Any] = {
@@ -239,6 +266,7 @@ class OpenAIProvider:
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
         tools = self._apply_web_search(kwargs, caps, tools)
+        tools = self._apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
         if extra_params:
@@ -332,6 +360,7 @@ class OpenAIProvider:
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         caps = self.get_capabilities(model)
         kwargs: dict[str, Any] = {
@@ -342,6 +371,7 @@ class OpenAIProvider:
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
         tools = self._apply_web_search(kwargs, caps, tools)
+        tools = self._apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
         if extra_params:

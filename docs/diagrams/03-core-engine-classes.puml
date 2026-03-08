@@ -108,6 +108,7 @@ class "ModelCapabilities" as ModelCaps <<frozen>> {
     + thinking_mode: str
     + supports_effort: bool
     + supports_web_search: bool
+    + supports_tool_search: bool
 }
 
 ' ChatSession
@@ -120,6 +121,7 @@ class "ChatSession" as ChatSession {
     - _msg_tokens: list[int]
     - _ws_id: str
     - _mcp_client: MCPClientManager | None
+    - _tool_search: ToolSearchManager | None
     - _registry: ModelRegistry | None
     + model_alias: str | None {property}
     - _tools: list[dict]
@@ -139,6 +141,9 @@ class "ChatSession" as ChatSession {
     - _prepare_tool(tc) → item dict
     - _prepare_mcp_tool(call_id, name, args) → item dict
     - _exec_mcp_tool(item) → (call_id, output)
+    - _get_active_tools() → list[dict]
+    - _prepare_tool_search() → None
+    - _exec_tool_search(item) → (call_id, output)
     - _run_agent(messages, tools, ...) → str
     - _compact_messages(auto: bool)
     - _full_messages() → list[dict]
@@ -215,6 +220,23 @@ class "MCPClientManager" as MCPMgr {
     sync ChatSession dispatch.
     --
     core/mcp_client.py
+}
+
+' ToolSearchManager
+class "ToolSearchManager" as ToolSearchMgr {
+    - _all_tools: list[dict]
+    - _always_on: list[dict]
+    - _deferred: list[dict]
+    - _expanded: set[str]
+    - _index: BM25Index
+    --
+    + should_activate() → bool
+    + get_visible_tools() → list[dict]
+    + get_deferred_tools() → list[dict]
+    + search(query, k) → list[dict]
+    + expand_visible(names) → list[dict]
+    + get_search_tool_definition() → dict
+    + format_search_results(tools) → str
 }
 
 ' ModelRegistry
@@ -317,6 +339,7 @@ LLMProvider <|.. AnthropicProv
 ChatSession --> SessionUI : uses
 ChatSession --> LLMProvider : delegates LLM calls
 ChatSession --> MCPMgr : optional
+ChatSession --o ToolSearchMgr : _tool_search
 ChatSession --> ModelReg : optional
 ChatSession <|-- HeadlessSession
 

@@ -11,7 +11,7 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 ## What it does
 
-Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. It runs as:
+Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. Native deferred tool loading for Anthropic and OpenAI APIs reduces token overhead and improves tool selection accuracy when MCP servers push the tool count past 30+; local models (vLLM, llama.cpp) get a transparent client-side BM25 fallback. It runs as:
 
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
 - **Queue-driven agents** — trigger workstreams via message queue, stream progress, approve or auto-approve tool use
@@ -151,7 +151,7 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 
 ## Tools
 
-14 built-in tools, 2 agent tools, plus external tools via MCP:
+15 built-in tools, 2 agent tools, plus external tools via MCP:
 
 | Tool | Description | Auto-approved |
 |------|-------------|:---:|
@@ -167,9 +167,12 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 | `remember` | Save persistent facts | yes |
 | `recall` | Search memories and history | yes |
 | `forget` | Remove a memory | yes |
+| `notify` | Send notifications to linked channels | yes |
 | `task` | Spawn autonomous sub-agent | |
 | `plan` | Explore codebase, write .plan.md | |
 | `mcp__*` | External tools from MCP servers | |
+
+When the total tool count exceeds a configurable threshold (default 20), MCP tools are automatically deferred using native `defer_loading` on Anthropic and OpenAI APIs, or a transparent client-side BM25 search for local models. The LLM discovers deferred tools on demand via a `tool_search` capability — no configuration needed beyond `--tool-search auto` (the default).
 
 ### MCP Tool Servers
 
@@ -248,6 +251,9 @@ agent_model = ""       # model alias for plan/task sub-agents
 [tools]
 timeout = 30
 skip_permissions = false
+search = "auto"            # "auto" (enable when >threshold tools), "on", "off"
+search_threshold = 20      # min tools before tool search activates
+search_max_results = 5     # max tools returned per search query
 
 [server]
 host = "0.0.0.0"
