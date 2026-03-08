@@ -51,6 +51,7 @@ schema plus turnstone-specific metadata keys:
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 15 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -68,6 +69,9 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 15
+  built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
+  the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
   - `call_id`, `func_name`, `header`, `preview` (for display)
   - `needs_approval` (bool)
@@ -435,6 +439,77 @@ Provide either `username` for user-based targeting or `channel_type` +
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
 | `forget`     | Memory     | Yes          | No    | No         | `key`       |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
+| `tool_search`| Search     | Yes          | No    | No         | `query`     |
+
+---
+
+## Dynamic Tool Search
+
+When many MCP tools are connected, the total tool count can grow large enough to
+consume significant context window tokens and reduce model accuracy. Dynamic tool
+search addresses this by deferring tools the model is unlikely to need on the
+current turn and letting it search for them on demand.
+
+### Three-tier approach
+
+Tool search uses the best available mechanism for each provider:
+
+1. **Anthropic (native)** -- Models that support it receive `defer_loading: true`
+   on deferred tool definitions plus the `tool_search_tool_bm25_20251119` server-side
+   search tool. Anthropic's API handles search and expansion transparently.
+
+2. **OpenAI GPT-5.4+ (native)** -- Models with hosted tool search receive
+   `defer_loading: true` on deferred definitions. The API handles search internally.
+
+3. **vLLM / llama.cpp / NIM (client-side BM25)** -- A synthetic `tool_search`
+   function tool is injected into the tool list. When the model calls it,
+   `_exec_tool_search()` runs a pure-Python BM25 index over tool names and
+   descriptions, then expands the matched tools into the visible set.
+
+### Configuration
+
+Tool search is configured in `config.toml` under the `[tools]` section:
+
+```toml
+[tools]
+search = "auto"           # "auto", "on", or "off"
+search_threshold = 20     # minimum total tool count to activate
+search_max_results = 5    # max tools returned per search call
+```
+
+CLI flags override the config file:
+
+- `--tool-search {auto,on,off}` -- force tool search on or off, or let turnstone
+  decide based on threshold (default: `auto`).
+- `--tool-search-threshold N` -- minimum tool count to activate (default: 20).
+- `--tool-search-max-results N` -- max results per search (default: 5).
+
+### How it works
+
+1. **Threshold check**: At session startup, `ToolSearchManager.should_activate()`
+   counts total tools (built-in + MCP). If the count is below the threshold, tool
+   search stays off and all tools are sent to the model directly.
+
+2. **Partitioning**: When active, tools are split into two sets:
+   - **Always-on** -- the 15 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+     These are always visible to the model.
+   - **Deferred** -- all MCP tools. These are not sent in the tool list unless
+     the model searches for them.
+
+3. **Search and expand**: When the model calls `tool_search` (client-side) or the
+   provider's native search returns results, the matched tools are added to the
+   visible set via `expand_visible()`. Once expanded, a tool stays visible for
+   the remainder of the session.
+
+4. **Multi-turn persistence**: Expanded tools are never removed. This avoids
+   confusing the model when it references a tool it discovered in an earlier turn.
+
+### Agent exemption
+
+Plan and task sub-agents do not use tool search. They operate on scoped tool
+sets (`AGENT_TOOLS` for plan agents, `TASK_AGENT_TOOLS` for task agents) with
+MCP tools merged in. Tool search is only active for the top-level session,
+where the model can interactively search for tools it needs.
 
 ---
 
@@ -456,8 +531,11 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 14 built-in tools via
+4. **Merging**: MCP tools are appended after the 15 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
+   When dynamic tool search is active, MCP tools are deferred rather than directly
+   visible -- the model discovers them via search as needed (see
+   [Dynamic Tool Search](#dynamic-tool-search) above).
 
 5. **Dispatch**: When the LLM calls an MCP tool, `_prepare_mcp_tool()` builds a
    generic approval preview and `_exec_mcp_tool()` calls `MCPClientManager.call_tool_sync()`,

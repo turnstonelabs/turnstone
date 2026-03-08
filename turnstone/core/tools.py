@@ -37,6 +37,7 @@ TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_a
 AGENT_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}
+BUILTIN_TOOL_NAMES = frozenset(_META)
 
 
 def merge_mcp_tools(

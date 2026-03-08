@@ -50,9 +50,11 @@ from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
 from turnstone.core.sandbox import execute_math_sandboxed
 from turnstone.core.storage._registry import get_storage
+from turnstone.core.tool_search import ToolSearchManager
 from turnstone.core.tools import (
     AGENT_AUTO_TOOLS,
     AGENT_TOOLS,
+    BUILTIN_TOOL_NAMES,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
@@ -158,6 +160,9 @@ class ChatSession:
         health_monitor: BackendHealthMonitor | None = None,
         node_id: str | None = None,
         ws_id: str | None = None,
+        tool_search: str = "auto",
+        tool_search_threshold: int = 20,
+        tool_search_max_results: int = 5,
     ):
         self.client = client
         self.model = model
@@ -212,6 +217,17 @@ class ChatSession:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
+        # Dynamic tool search: defer MCP tools when tool count is high
+        self._tool_search: ToolSearchManager | None = None
+        if tool_search == "on" or (
+            tool_search == "auto" and len(self._tools) > tool_search_threshold
+        ):
+            self._tool_search = ToolSearchManager(
+                self._tools,
+                always_on_names=set(BUILTIN_TOOL_NAMES),
+                threshold=tool_search_threshold,
+                max_results=tool_search_max_results,
+            )
         self._init_system_messages()
         self._save_config()
 
@@ -393,6 +409,14 @@ class ChatSession:
                 "Look up documentation → man:\n"
                 "   man(page='tar')",
             ]
+        # Tool search hint (client-side mode only — native mode needs no hint)
+        if self._tool_search:
+            caps = self._provider.get_capabilities(self.model)
+            if not caps.supports_tool_search:
+                dev_parts.append(
+                    "\n\nAdditional tools are available via tool_search. "
+                    "Use it when you need a capability not in your current tool set."
+                )
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -428,6 +452,41 @@ class ChatSession:
                 kwargs["reasoning_effort"] = reasoning_effort
             return {"chat_template_kwargs": kwargs}
         return None
+
+    # -- tool search helpers --------------------------------------------------
+
+    def _get_active_tools(self) -> list[dict[str, Any]] | None:
+        """Return the tool list to send to the LLM.
+
+        When tool search is active:
+        - Native mode (provider supports it): send all tools (provider
+          marks deferred ones with defer_loading).
+        - Client-side fallback: send visible tools + synthetic tool_search.
+
+        Without tool search: return self._tools unchanged.
+        """
+        if self.creative_mode:
+            return None
+        if not self._tool_search:
+            return self._tools
+        # Check if provider supports native tool search
+        caps = self._provider.get_capabilities(self.model)
+        if caps.supports_tool_search:
+            # Provider handles defer_loading — send all tools
+            return self._tools
+        # Client-side fallback: visible tools + search tool
+        visible = self._tool_search.get_visible_tools()
+        return visible + [self._tool_search.get_search_tool_definition()]
+
+    def _get_deferred_names(self) -> frozenset[str] | None:
+        """Return names of deferred tools for native provider search, or None."""
+        if not self._tool_search:
+            return None
+        caps = self._provider.get_capabilities(self.model)
+        if not caps.supports_tool_search:
+            return None  # Client-side mode — no deferred names for provider
+        deferred = self._tool_search.get_deferred_tools()
+        return frozenset(name for t in deferred if (name := t.get("function", {}).get("name", "")))
 
     # Retryable error names are now provided by LLMProvider.retryable_error_names.
     _MAX_RETRIES = 3
@@ -488,11 +547,12 @@ class ChatSession:
                     client=client,
                     model=model,
                     messages=msgs,
-                    tools=self._tools if not self.creative_mode else None,
+                    tools=self._get_active_tools(),
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     reasoning_effort=self.reasoning_effort,
                     extra_params=self._provider_extra_params(provider=prov),
+                    deferred_names=self._get_deferred_names(),
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -883,7 +943,8 @@ class ChatSession:
             f"{GRAY}[request] model={self.model}  "
             f"max_tokens={self.max_tokens}  temp={self.temperature}  "
             f"reasoning={self.reasoning_effort}  "
-            f"tools={0 if self.creative_mode else len(self._tools)}{RESET}"
+            f"tools={0 if self.creative_mode else len(self._get_active_tools() or [])}"
+            f"{' (search)' if self._tool_search else ''}{RESET}"
         )
         lines.append(f"{GRAY}[request] {len(msgs)} messages:{RESET}")
         for i, m in enumerate(msgs):
@@ -937,7 +998,8 @@ class ChatSession:
 
         # Calibrate chars_per_token ratio from actual usage.
         all_msgs = self._full_messages()  # system + self.messages (before append)
-        tool_def_chars = sum(len(json.dumps(t)) for t in self._tools)
+        active_tools = self._get_active_tools() or []
+        tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
         total_chars = sum(self._msg_char_count(m) for m in all_msgs) + tool_def_chars
         if total_chars > 0 and prompt_tok > 0:
             self._chars_per_token = total_chars / prompt_tok
@@ -1281,6 +1343,7 @@ class ChatSession:
             "man": self._prepare_man,
             "web_fetch": self._prepare_web_fetch,
             "web_search": self._prepare_web_search,
+            "tool_search": self._prepare_tool_search,
             "task": self._prepare_task,
             "plan": self._prepare_plan,
             "remember": self._prepare_remember,
@@ -1762,6 +1825,48 @@ class ChatSession:
             "max_results": max_results,
             "topic": topic,
         }
+
+    def _prepare_tool_search(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a tool search query (client-side BM25 fallback)."""
+        query = (args.get("query") or "").strip()
+        if not query:
+            return {
+                "call_id": call_id,
+                "func_name": "tool_search",
+                "header": "\u2717 tool_search: empty query",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: no query provided",
+            }
+        if not self._tool_search:
+            return {
+                "call_id": call_id,
+                "func_name": "tool_search",
+                "header": "\u2717 tool_search: not active",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Tool search is not active.",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "tool_search",
+            "header": f"\u2699 tool_search: {query[:80]}",
+            "preview": f"    {DIM}{query}{RESET}",
+            "needs_approval": False,
+            "execute": self._exec_tool_search,
+            "query": query,
+        }
+
+    def _exec_tool_search(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Execute a client-side tool search and expand visible tools."""
+        assert self._tool_search is not None
+        query = item["query"]
+        results = self._tool_search.search(query)
+        # Expand discovered tools into the visible set
+        names = [t.get("function", {}).get("name", "") for t in results]
+        self._tool_search.expand_visible(names)
+        output = self._tool_search.format_search_results(results)
+        return item["call_id"], output
 
     def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a general-purpose sub-agent task for approval."""

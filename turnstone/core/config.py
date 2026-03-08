@@ -70,6 +70,9 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "truncation": "tool_truncation",
         "agent_max_turns": "agent_max_turns",
         "skip_permissions": "skip_permissions",
+        "search": "tool_search",
+        "search_threshold": "tool_search_threshold",
+        "search_max_results": "tool_search_max_results",
     },
     "server": {
         "host": "host",

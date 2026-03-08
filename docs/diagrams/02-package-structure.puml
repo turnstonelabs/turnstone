@@ -41,6 +41,7 @@ package "turnstone/core/" <<Rectangle>> {
     component [healthcheck.py\nBackendHealthMonitor] as healthcheck <<core>>
     component [ratelimit.py\nRateLimiter] as ratelimit <<core>>
     component [mcp_client.py\nMCPClientManager] as mcp <<core>>
+    component [tool_search.py\nToolSearchManager, BM25] as toolsearch <<core>>
     component [model_registry.py\nModelRegistry] as registry <<core>>
 }
 
@@ -95,7 +96,7 @@ package "turnstone/sdk/" <<Rectangle>> {
 
 ' Tool schemas
 package "turnstone/tools/" <<Rectangle>> {
-    component [*.json\n14 tool schemas] as schemas <<artifact>>
+    component [*.json\n15 tool schemas] as schemas <<artifact>>
 }
 
 ' Entry point dependencies
@@ -136,6 +137,7 @@ session --> edit
 session --> web
 session --> healthcheck
 session --> mcp : optional
+session --> toolsearch : optional
 session --> registry : optional
 registry --> providers
 healthcheck --> metrics

@@ -1213,6 +1213,24 @@ def main() -> None:
         help="Tool output truncation limit in chars, 0 for auto (50%% of context window) (default: 0)",
     )
     parser.add_argument(
+        "--tool-search",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Dynamic tool search: auto (enable when tool count exceeds threshold), on, off (default: auto)",
+    )
+    parser.add_argument(
+        "--tool-search-threshold",
+        type=int,
+        default=20,
+        help="Min tools before tool search activates (default: 20)",
+    )
+    parser.add_argument(
+        "--tool-search-max-results",
+        type=int,
+        default=5,
+        help="Max tools returned per tool search query (default: 5)",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         metavar="WS",
@@ -1462,6 +1480,9 @@ def main() -> None:
             health_monitor=health_monitor,
             node_id=_node_id,
             ws_id=ws_id,
+            tool_search=args.tool_search,
+            tool_search_threshold=args.tool_search_threshold,
+            tool_search_max_results=args.tool_search_max_results,
         )
 
     # Create workstream manager and initial workstream

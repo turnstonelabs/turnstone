@@ -64,6 +64,9 @@ def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 # Tool version for Anthropic's server-side web search (update when new version ships)
 _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 
+# Tool search: server-side BM25 tool discovery for deferred tools
+_TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25_20251119"
+
 # -- model capabilities -------------------------------------------------------
 
 _ANTHROPIC_DEFAULT = ModelCapabilities(
@@ -83,6 +86,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_effort=True,
         effort_levels=("low", "medium", "high", "max"),
         supports_web_search=True,
+        supports_tool_search=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
         context_window=200000,
@@ -92,6 +96,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_effort=True,
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
+        supports_tool_search=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
         context_window=200000,
@@ -122,6 +127,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         token_param="max_tokens",
         thinking_mode="manual",
         supports_web_search=True,
+        supports_tool_search=True,
     ),
     "claude-sonnet-4": ModelCapabilities(
         context_window=200000,
@@ -129,6 +135,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         token_param="max_tokens",
         thinking_mode="manual",
         supports_web_search=True,
+        supports_tool_search=True,
     ),
 }
 
@@ -182,6 +189,31 @@ class AnthropicProvider:
         filtered.append({"type": _WEB_SEARCH_TOOL_TYPE, "name": "web_search"})
         return filtered
 
+    # -- tool search injection -----------------------------------------------
+
+    def _inject_tool_search(
+        self,
+        tools: list[dict[str, Any]],
+        caps: ModelCapabilities,
+        deferred_names: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Mark deferred tools and add native server-side search tool.
+
+        When the model supports tool search and ``deferred_names`` is provided,
+        tools whose name is in the deferred set get ``defer_loading: true``.
+        The BM25 search tool is appended so the model can discover them.
+        """
+        if not caps.supports_tool_search or not deferred_names:
+            return tools
+        result = []
+        for tool in tools:
+            if tool.get("name", "") in deferred_names:
+                result.append({**tool, "defer_loading": True})
+            else:
+                result.append(tool)
+        result.append({"type": _TOOL_SEARCH_TOOL_TYPE, "name": "tool_search"})
+        return result
+
     # -- shared param logic --------------------------------------------------
 
     def _build_thinking_and_kwargs(
@@ -195,6 +227,7 @@ class AnthropicProvider:
         system_prompt: str,
         model: str,
         tools: list[dict[str, Any]] | None,
+        deferred_names: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Build the full kwargs dict with thinking mode and effort params."""
         thinking_params: dict[str, Any] = {}
@@ -217,6 +250,7 @@ class AnthropicProvider:
         if tools:
             anthropic_tools = self.convert_tools(tools)
             anthropic_tools = self._inject_web_search(anthropic_tools, caps)
+            anthropic_tools = self._inject_tool_search(anthropic_tools, caps, deferred_names)
             kwargs["tools"] = anthropic_tools
         kwargs.update(thinking_params)
 
@@ -371,6 +405,7 @@ class AnthropicProvider:
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> Iterator[StreamChunk]:
         _ensure_anthropic()
         caps = self.get_capabilities(model)
@@ -385,6 +420,7 @@ class AnthropicProvider:
             system_prompt,
             model,
             tools,
+            deferred_names,
         )
 
         with client.messages.stream(**kwargs) as stream:
@@ -536,6 +572,7 @@ class AnthropicProvider:
         temperature: float = 0.5,
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
+        deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         _ensure_anthropic()
         caps = self.get_capabilities(model)
@@ -550,6 +587,7 @@ class AnthropicProvider:
             system_prompt,
             model,
             tools,
+            deferred_names,
         )
 
         response = client.messages.create(**kwargs)

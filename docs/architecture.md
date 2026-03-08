@@ -43,6 +43,7 @@ turnstone/
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, async-sync bridge
+    tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         Persistence facade (delegates to storage backend)
     storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
@@ -94,7 +95,7 @@ turnstone/
       style.css       Page-specific UI styles (dashboard layout, approval blocks)
       app.js          Page-specific client-side JavaScript (SSE, workstreams, markdown)
   tools/
-    *.json            14 tool schemas (OpenAI function-calling format + turnstone metadata)
+    *.json            15 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
 
 Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
