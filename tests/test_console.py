@@ -1,5 +1,6 @@
 """Tests for turnstone.console — collector and HTTP server."""
 
+import asyncio
 import json
 import queue
 from unittest.mock import MagicMock
@@ -1299,3 +1300,177 @@ class TestProxySharedStatic:
         resp = client.get("/node/unknown/shared/base.css")
         assert resp.status_code == 404
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# SSE proxy — raw byte passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestSSEProxy:
+    """Verify _proxy_sse forwards raw bytes including ping comments."""
+
+    def test_proxy_sse_preserves_pings_and_events(self):
+        """SSE proxy should forward ping comments and events verbatim."""
+        from turnstone.console.server import _proxy_sse
+
+        # Simulate an upstream SSE response with a ping comment and a real event
+        sse_payload = b': ping - 2026-03-08T12:00:00Z\n\nevent: message\ndata: {"type": "test"}\n\n'
+
+        class FakeResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                yield sse_payload
+
+            async def aclose(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class FakeClient:
+            def stream(self, method, url, **kwargs):
+                return FakeResponse()
+
+        class FakeRequest:
+            class url:  # noqa: N801
+                query = "ws_id=test123"
+
+            class app:  # noqa: N801
+                class state:  # noqa: N801
+                    proxy_sse_client = FakeClient()
+                    proxy_auth_token = ""
+
+            headers = {}
+
+            async def is_disconnected(self):
+                return False
+
+        async def _run():
+            response = await _proxy_sse(
+                FakeRequest(), "http://fake:8080", "events", api_prefix="v1/api"
+            )
+            assert response.media_type == "text/event-stream"
+            # Collect the streamed bytes
+            chunks: list[bytes] = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+            body = b"".join(chunks)
+            # Ping comment must be preserved (not filtered)
+            assert b": ping" in body
+            # Real event must be preserved
+            assert b"event: message" in body
+            assert b'"type": "test"' in body
+
+        asyncio.run(_run())
+
+    def test_proxy_sse_upstream_error_status(self):
+        """Non-200 upstream status should yield an error event."""
+
+        from turnstone.console.server import _proxy_sse
+
+        class FakeResponse:
+            status_code = 502
+
+            async def aiter_bytes(self):
+                return
+                yield  # make it an async generator
+
+            async def aclose(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class FakeClient:
+            def stream(self, method, url, **kwargs):
+                return FakeResponse()
+
+        class FakeRequest:
+            class url:  # noqa: N801
+                query = ""
+
+            class app:  # noqa: N801
+                class state:  # noqa: N801
+                    proxy_sse_client = FakeClient()
+                    proxy_auth_token = ""
+
+            headers = {}
+
+            async def is_disconnected(self):
+                return False
+
+        async def _run():
+            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
+            chunks: list[bytes] = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+            body = b"".join(chunks)
+            assert b"event: error" in body
+            assert b"502" in body
+
+        asyncio.run(_run())
+
+    def test_proxy_sse_disconnect_handling(self):
+        """Proxy should stop when browser disconnects."""
+
+        from turnstone.console.server import _proxy_sse
+
+        class FakeResponse:
+            status_code = 200
+
+            async def aiter_bytes(self):
+                yield b"data: chunk1\n\n"
+                yield b"data: chunk2\n\n"  # should not be reached
+                yield b"data: chunk3\n\n"
+
+            async def aclose(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+        class FakeClient:
+            def stream(self, method, url, **kwargs):
+                return FakeResponse()
+
+        call_count = 0
+
+        class FakeRequest:
+            class url:  # noqa: N801
+                query = ""
+
+            class app:  # noqa: N801
+                class state:  # noqa: N801
+                    proxy_sse_client = FakeClient()
+                    proxy_auth_token = ""
+
+            headers = {}
+
+            async def is_disconnected(self):
+                nonlocal call_count
+                call_count += 1
+                return call_count > 1  # disconnect after first chunk
+
+        async def _run():
+            response = await _proxy_sse(FakeRequest(), "http://fake:8080", "events")
+            chunks: list[bytes] = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+            body = b"".join(chunks)
+            assert b"chunk1" in body
+            # Should have stopped before chunk3
+            assert b"chunk3" not in body
+
+        asyncio.run(_run())

@@ -326,7 +326,7 @@ The server UI uses root-relative URLs (`/v1/api/send`, `/static/app.js`, `/share
 
 ### SSE Proxy
 
-SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied by creating a per-connection `httpx.AsyncClient(timeout=None)`, streaming the upstream response via `aiter_text()`, parsing SSE framing (`\n\n` delimiters), and re-emitting events through `EventSourceResponse`. Each proxied SSE stream requires its own httpx client since the shared client's 30-second timeout would kill long-lived connections.
+SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied as raw byte passthrough — the console opens an `httpx.AsyncClient.stream()` to the upstream server (with `read=None` and `pool=None` timeouts since SSE connections are long-lived) and relays every byte via `StreamingResponse`. This preserves server-side ping comments, event framing, and keepalives verbatim without parsing or re-encoding.
 
 ### Authentication
 

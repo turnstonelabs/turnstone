@@ -586,6 +586,7 @@ async def _proxy_sse(
                 "GET",
                 target,
                 headers={**sse_auth, "Accept": "text/event-stream", "Cache-Control": "no-store"},
+                timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
                     log.debug(
