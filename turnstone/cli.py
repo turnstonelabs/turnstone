@@ -841,9 +841,12 @@ def main() -> None:
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
+
+    from turnstone.core.config import nonneg_float
+
     parser.add_argument(
         "--mcp-refresh-interval",
-        type=float,
+        type=nonneg_float,
         default=14400,
         metavar="SECONDS",
         help="Periodic MCP tool refresh interval for servers without push notifications (default: 14400 = 4h, 0 to disable)",

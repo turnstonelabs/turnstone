@@ -90,6 +90,8 @@ class MCPClientManager:
         refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
     ) -> None:
         self._server_configs = server_configs
+        if refresh_interval < 0:
+            refresh_interval = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_stack: AsyncExitStack | None = None
@@ -316,7 +318,6 @@ class MCPClientManager:
         initial_delay = seed * self._refresh_interval
         await asyncio.sleep(initial_delay)
         while True:
-            await asyncio.sleep(self._refresh_interval)
             for name in list(self._server_configs):
                 if self._supports_list_changed.get(name, False):
                     continue  # has push — skip
@@ -326,6 +327,7 @@ class MCPClientManager:
                     await self._refresh_server(name)
                 except Exception:
                     log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
+            await asyncio.sleep(self._refresh_interval)
 
     # -- listener infrastructure ---------------------------------------------
 

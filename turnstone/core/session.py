@@ -265,7 +265,10 @@ class ChatSession:
         """Callback from MCPClientManager when the tool list changes.
 
         Rebuilds merged tool lists and reconstructs ToolSearchManager.
-        Called on the MCP background thread — only lightweight work here.
+        Called on the MCP background thread.  The work is O(n) where *n* is
+        the MCP tool count — ``merge_mcp_tools`` is list concatenation and
+        ``BM25Index`` construction over <50 tools completes in microseconds,
+        so this does not meaningfully block the MCP event loop.
 
         Thread safety: each assignment creates a new object (copy-on-write).
         Under CPython's GIL, individual reference assignments are atomic.
@@ -3284,7 +3287,7 @@ class ChatSession:
         elif cmd == "/mcp":
             if not self._mcp_client:
                 self.ui.on_info("No MCP servers configured.")
-            elif arg.startswith("refresh"):
+            elif arg and arg.split()[0] == "refresh":
                 self._handle_mcp_refresh(arg)
             else:
                 tools = self._mcp_client.get_tools()
