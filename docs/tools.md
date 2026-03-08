@@ -506,9 +506,10 @@ CLI flags override the config file:
 
 ### Agent exemption
 
-Plan and task sub-agents always receive the full, unfiltered tool list. Tool
-search is only active for the top-level session, where the model can interactively
-search for tools it needs.
+Plan and task sub-agents do not use tool search. They operate on scoped tool
+sets (`AGENT_TOOLS` for plan agents, `TASK_AGENT_TOOLS` for task agents) with
+MCP tools merged in. Tool search is only active for the top-level session,
+where the model can interactively search for tools it needs.
 
 ---
 

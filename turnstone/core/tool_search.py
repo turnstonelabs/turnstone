@@ -74,7 +74,7 @@ class BM25Index:
 # Tool search manager — partitions tools, tracks visibility
 # ---------------------------------------------------------------------------
 
-_MCP_PREFIX_RE = re.compile(r"^mcp__([^_]+)__")
+_MCP_PREFIX_RE = re.compile(r"^mcp__(.+?)__")
 
 
 def _tool_name(tool: dict[str, Any]) -> str:
@@ -104,7 +104,7 @@ def _mcp_server_summary(tools: list[dict[str, Any]]) -> str:
     parts = [f"{srv} ({cnt} tool{'s' if cnt != 1 else ''})" for srv, cnt in sorted(servers.items())]
     if other:
         parts.append(f"other ({other} tool{'s' if other != 1 else ''})")
-    return ", ".join(parts) if parts else "none"
+    return ", ".join(parts)
 
 
 class ToolSearchManager:
@@ -127,7 +127,7 @@ class ToolSearchManager:
         self._always_on: list[dict[str, Any]] = []
         self._deferred: list[dict[str, Any]] = []
         self._deferred_by_name: dict[str, dict[str, Any]] = {}
-        self._expanded: set[str] = set()
+        self._expanded: dict[str, None] = {}  # ordered set (preserves discovery order)
         self._threshold = threshold
         self._max_results = max_results
 
@@ -191,7 +191,7 @@ class ToolSearchManager:
         newly_added = []
         for name in tool_names:
             if name not in self._expanded and name in self._deferred_by_name:
-                self._expanded.add(name)
+                self._expanded[name] = None
                 newly_added.append(self._deferred_by_name[name])
         return newly_added
 

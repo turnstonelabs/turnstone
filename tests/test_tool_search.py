@@ -243,4 +243,4 @@ class TestMCPServerSummary:
         assert "other (1 tool)" in summary
 
     def test_empty_list(self):
-        assert _mcp_server_summary([]) == "none"
+        assert _mcp_server_summary([]) == ""

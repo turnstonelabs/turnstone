@@ -11,7 +11,7 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 ## What it does
 
-Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. Native deferred tool loading for Anthropic and OpenAI APIs reduces token overhead and improves tool selection accuracy when MCP servers push the tool count past 30+; local models (vLLM, llama.cpp) get a transparent client-side BM25 fallback. It runs as:
+Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. Native deferred tool loading for Anthropic and OpenAI APIs reduces token overhead and improves tool selection accuracy when MCP servers expose many tools; local models (vLLM, llama.cpp) get a transparent client-side BM25 fallback. It runs as:
 
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
 - **Queue-driven agents** — trigger workstreams via message queue, stream progress, approve or auto-approve tool use

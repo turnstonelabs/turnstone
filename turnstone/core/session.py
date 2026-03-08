@@ -219,15 +219,15 @@ class ChatSession:
             self._agent_tools = AGENT_TOOLS
         # Dynamic tool search: defer MCP tools when tool count is high
         self._tool_search: ToolSearchManager | None = None
-        if tool_search != "off":
-            mgr = ToolSearchManager(
+        if tool_search == "on" or (
+            tool_search == "auto" and len(self._tools) > tool_search_threshold
+        ):
+            self._tool_search = ToolSearchManager(
                 self._tools,
                 always_on_names=set(BUILTIN_TOOL_NAMES),
                 threshold=tool_search_threshold,
                 max_results=tool_search_max_results,
             )
-            if tool_search == "on" or mgr.should_activate():
-                self._tool_search = mgr
         self._init_system_messages()
         self._save_config()
 

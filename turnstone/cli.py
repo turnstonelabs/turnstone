@@ -788,7 +788,7 @@ def main() -> None:
         "--tool-search",
         choices=["auto", "on", "off"],
         default="auto",
-        help="Dynamic tool search: auto (enable when >20 tools), on, off (default: auto)",
+        help="Dynamic tool search: auto (enable when tool count exceeds threshold), on, off (default: auto)",
     )
     parser.add_argument(
         "--tool-search-threshold",
