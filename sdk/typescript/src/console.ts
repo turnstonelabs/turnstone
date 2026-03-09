@@ -6,6 +6,7 @@ import type {
   AuthStatusResponse,
   ClusterNodesResponse,
   ClusterOverviewResponse,
+  ClusterSnapshotResponse,
   ClusterWorkstreamsResponse,
   ConsoleCreateWsRequest,
   ConsoleCreateWsResponse,
@@ -31,6 +32,10 @@ export class TurnstoneConsole extends BaseClient {
 
   async overview(): Promise<ClusterOverviewResponse> {
     return this.request("GET", "/v1/api/cluster/overview");
+  }
+
+  async snapshot(): Promise<ClusterSnapshotResponse> {
+    return this.request("GET", "/v1/api/cluster/snapshot");
   }
 
   async nodes(opts?: NodesOptions): Promise<ClusterNodesResponse> {

@@ -95,6 +95,7 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `nodes(*, sort, limit, offset)` | `ClusterNodesResponse` |
 | | `workstreams(*, state, node, search, sort, page, per_page)` | `ClusterWorkstreamsResponse` |
 | | `node_detail(node_id)` | `NodeDetailResponse` |
+| | `snapshot()` | `ClusterSnapshotResponse` |
 | | `create_workstream(*, node_id, name, model, initial_message)` | `ConsoleCreateWsResponse` |
 | **Schedules** | `list_schedules()` | `ListSchedulesResponse` |
 | | `create_schedule(*, name, schedule_type, initial_message, ...)` | `ScheduleInfo` |
@@ -146,6 +147,9 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `node_lost` | `NodeLostEvent` | `node_id` |
 | `cluster_state` | `ClusterStateEvent` | `ws_id`, `node_id`, `state`, `tokens` |
 | `ws_created` | `ClusterWsCreatedEvent` | `ws_id`, `node_id`, `name` |
+| `ws_closed` | `ClusterWsClosedEvent` | `ws_id` |
+| `ws_rename` | `ClusterWsRenameEvent` | `ws_id`, `name` |
+| `snapshot` | `ClusterSnapshotEvent` | `nodes`, `overview`, `timestamp` |
 
 ### TurnResult
 

@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from turnstone.api.console_schemas import (
     ClusterNodesResponse,
     ClusterOverviewResponse,
+    ClusterSnapshotResponse,
     ClusterWorkstreamsResponse,
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
@@ -97,14 +98,23 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 404, 503],
         tags=["Cluster"],
     ),
+    EndpointSpec(
+        "/v1/api/cluster/snapshot",
+        "GET",
+        "Full cluster state snapshot",
+        description="Returns the complete cluster state: all nodes with their workstreams "
+        "and overview aggregates. Used for initial load and reconnection.",
+        response_model=ClusterSnapshotResponse,
+        tags=["Cluster"],
+    ),
     # --- Streaming ---
     EndpointSpec(
         "/v1/api/cluster/events",
         "GET",
         "Cluster SSE event stream",
         description="Server-Sent Events stream for real-time cluster updates. "
-        "Returns text/event-stream with node_joined, node_lost, cluster_state, "
-        "ws_created, ws_closed, ws_rename events.",
+        "First event is a 'snapshot' with full cluster state, followed by "
+        "node_joined, node_lost, cluster_state, ws_created, ws_closed, ws_rename events.",
         tags=["Streaming"],
     ),
     # --- Auth ---
@@ -270,6 +280,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ClusterNodesResponse,
     ClusterWorkstreamsResponse,
     NodeDetailResponse,
+    ClusterSnapshotResponse,
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,

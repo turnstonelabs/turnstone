@@ -40,7 +40,7 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.core.auth import JWT_AUD_CONSOLE, AuthMiddleware
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     from starlette.requests import Request
 
@@ -245,14 +245,25 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     return JSONResponse({"error": "Node not found"}, status_code=404)
 
 
+async def cluster_snapshot(request: Request) -> JSONResponse:
+    collector: ClusterCollector = request.app.state.collector
+    return JSONResponse(collector.get_snapshot())
+
+
 async def cluster_events_sse(request: Request) -> Response:
     collector: ClusterCollector = request.app.state.collector
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-    collector.register_listener(client_queue)
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
         try:
+            # Atomic snapshot+register — no event gap possible.
+            snap = await loop.run_in_executor(
+                None, collector.get_snapshot_and_register, client_queue
+            )
+            snap["type"] = "snapshot"
+            yield {"data": json.dumps(snap)}
+
             while True:
                 try:
                     event = await loop.run_in_executor(
@@ -596,10 +607,36 @@ async def _proxy_sse(
                     )
                     yield f"event: error\ndata: Upstream returned status {response.status_code}\n\n".encode()
                     return
-                async for chunk in response.aiter_bytes():
-                    if await request.is_disconnected():
-                        return
-                    yield chunk
+                byte_iter = response.aiter_bytes().__aiter__()
+
+                async def _read_next(it: AsyncIterator[bytes]) -> bytes:
+                    return await it.__anext__()
+
+                read_task: asyncio.Task[bytes] | None = None
+                try:
+                    while True:
+                        if await request.is_disconnected():
+                            return
+                        if read_task is None:
+                            read_task = asyncio.create_task(_read_next(byte_iter))
+                        ping_wait = asyncio.create_task(asyncio.sleep(3))
+                        done, _ = await asyncio.wait(
+                            {read_task, ping_wait},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if read_task in done:
+                            ping_wait.cancel()
+                            try:
+                                yield read_task.result()
+                            except StopAsyncIteration:
+                                return
+                            read_task = None
+                        else:
+                            # No upstream data in 3s — keepalive comment
+                            yield b": proxy-ping\n\n"
+                finally:
+                    if read_task is not None:
+                        read_task.cancel()
         except httpx.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 
@@ -1195,6 +1232,7 @@ def create_app(
                     Route("/api/cluster/workstreams", cluster_workstreams),
                     Route("/api/cluster/workstreams/new", create_workstream, methods=["POST"]),
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
+                    Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),

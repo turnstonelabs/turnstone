@@ -61,6 +61,8 @@ The collector (`turnstone/console/collector.py`) maintains an in-memory snapshot
 
 3. **Poll loop** — fetches `GET /v1/api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
 
+A `get_snapshot()` method builds the full cluster state under a single lock acquisition — overview aggregates and per-node workstream lists in one atomic read. This is served both as a REST endpoint and as the initial SSE event on client connect.
+
 ### Thread Safety
 
 All reads and writes to the node/workstream map are protected by a single `threading.Lock`. Query methods acquire the lock, copy data, and release before returning.
@@ -146,6 +148,38 @@ Single node detail with all its workstreams.
 }
 ```
 
+### `GET /v1/api/cluster/snapshot`
+
+Full cluster state in a single response — all nodes with their workstreams plus overview aggregates. Built under a single lock for internal consistency. Used by the browser on initial load and SSE reconnect.
+
+```json
+{
+  "nodes": [
+    {
+      "node_id": "db-west-04",
+      "server_url": "http://10.0.3.4:8080",
+      "max_ws": 10,
+      "reachable": true,
+      "version": "0.3.0",
+      "health": {"status": "ok", "version": "0.3.0"},
+      "aggregate": {"total_tokens": 48200, "total_tool_calls": 156},
+      "workstreams": [
+        {"id": "a1b2c3d4", "name": "perf-db-west", "state": "running", ...}
+      ]
+    }
+  ],
+  "overview": {
+    "nodes": 847,
+    "workstreams": 4219,
+    "states": {"running": 1847, "thinking": 312, "attention": 89, "idle": 1940, "error": 31},
+    "aggregate": {"total_tokens": 12400000, "total_tool_calls": 34200},
+    "version_drift": false,
+    "versions": ["0.3.0"]
+  },
+  "timestamp": 1709294400.0
+}
+```
+
 ### `POST /v1/api/cluster/workstreams/new`
 
 Create a new workstream on a target node. Dispatches a `CreateWorkstreamMessage` through the Redis MQ pipeline — the bridge on the target node picks it up and creates the workstream on the server. Requires `write` scope.
@@ -182,7 +216,7 @@ Creation is asynchronous — the response confirms the MQ message was dispatched
 
 ### `GET /v1/api/cluster/events`
 
-Server-Sent Events stream for real-time cluster updates.
+Server-Sent Events stream for real-time cluster updates. The first event is always a `snapshot` containing the full cluster state (same shape as `GET /v1/api/cluster/snapshot` with an added `type: "snapshot"` field), followed by incremental events:
 
 ```
 data: {"type":"cluster_state","ws_id":"a1b2","node_id":"db-west-04","state":"running"}
@@ -367,6 +401,8 @@ Triggered by the "+ new" header button. A modal dialog with:
 On submit, `POST /v1/api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
 
 All five views receive live updates via SSE — state cards update counts, node rows update metrics, workstream rows update state indicators.
+
+The browser maintains a local `clusterState` object that mirrors the cluster snapshot. It is initialized from the SSE `snapshot` event on connect (or via `GET /v1/api/cluster/snapshot` on initial page load) and updated incrementally by SSE events. View navigation reads from local state — no API round-trips needed after the initial snapshot.
 
 ### 5. Admin Panel
 

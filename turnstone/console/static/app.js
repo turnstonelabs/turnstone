@@ -1,9 +1,6 @@
 // --- Shared hooks ---
 window.onLoginSuccess = function () {
   connectSSE();
-  if (currentView === "overview") loadOverview();
-  else if (currentView === "node") drillDownToNode(currentNodeId);
-  else if (currentView === "filtered") loadFilteredWorkstreams();
 };
 window.onLogout = function () {
   if (evtSource) {
@@ -33,6 +30,8 @@ var _lastOverviewJson = "";
 var _lastNodesJson = "";
 var evtSource = null;
 var retryDelay = 1000;
+var clusterState = null;
+var _navigatingFromPopstate = false;
 
 // --- Constants ---
 var STATE_DISPLAY = {
@@ -43,6 +42,236 @@ var STATE_DISPLAY = {
   error: { symbol: "\u2716", label: "err" },
 };
 var STATE_ORDER = ["running", "thinking", "attention", "error", "idle"];
+
+// --- Cluster State Model ---
+function applySnapshot(data) {
+  clusterState = {
+    nodes: {},
+    overview: data.overview || {},
+    timestamp: data.timestamp || 0,
+  };
+  (data.nodes || []).forEach(function (n) {
+    clusterState.nodes[n.node_id] = n;
+  });
+  renderFromState();
+}
+
+function patchClusterState(data) {
+  if (!clusterState) return;
+  var t = data.type;
+  if (t === "cluster_state") {
+    var node = clusterState.nodes[data.node_id];
+    if (node) {
+      (node.workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id) {
+          if ("state" in data) ws.state = data.state;
+          if ("tokens" in data) ws.tokens = data.tokens;
+          if ("context_ratio" in data) ws.context_ratio = data.context_ratio;
+          if ("activity" in data) ws.activity = data.activity;
+          if ("activity_state" in data) ws.activity_state = data.activity_state;
+        }
+      });
+    }
+  } else if (t === "ws_created") {
+    var targetNode = clusterState.nodes[data.node_id];
+    if (targetNode) {
+      targetNode.workstreams = targetNode.workstreams || [];
+      targetNode.workstreams.push({
+        id: data.ws_id,
+        name: data.name || "",
+        state: "idle",
+        node: data.node_id,
+        server_url: targetNode.server_url || "",
+        title: data.title || "",
+        tokens: 0,
+        context_ratio: 0.0,
+        activity: "",
+        activity_state: "",
+        tool_calls: 0,
+      });
+    }
+  } else if (t === "ws_closed") {
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      var n = clusterState.nodes[nid];
+      n.workstreams = (n.workstreams || []).filter(function (ws) {
+        return ws.id !== data.ws_id;
+      });
+    });
+  } else if (t === "ws_rename") {
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        if (ws.id === data.ws_id) ws.name = data.name || "";
+      });
+    });
+  } else if (t === "node_joined") {
+    if (!clusterState.nodes[data.node_id]) {
+      clusterState.nodes[data.node_id] = {
+        node_id: data.node_id,
+        server_url: "",
+        max_ws: 10,
+        reachable: true,
+        version: "",
+        health: {},
+        aggregate: {},
+        workstreams: [],
+      };
+    }
+  } else if (t === "node_lost") {
+    delete clusterState.nodes[data.node_id];
+  } else {
+    return;
+  }
+  scheduleRender();
+}
+
+var _renderTimer = null;
+function scheduleRender() {
+  if (_renderTimer) return;
+  _renderTimer = requestAnimationFrame(function () {
+    _renderTimer = null;
+    recomputeOverview();
+    renderFromState();
+  });
+}
+
+function recomputeOverview() {
+  if (!clusterState) return;
+  var states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  var totalTokens = 0,
+    totalToolCalls = 0,
+    totalWs = 0;
+  var versions = {};
+  Object.keys(clusterState.nodes).forEach(function (nid) {
+    var node = clusterState.nodes[nid];
+    var nodeWsTokens = 0;
+    (node.workstreams || []).forEach(function (ws) {
+      var s = ws.state || "idle";
+      states[s] = (states[s] || 0) + 1;
+      totalWs++;
+      nodeWsTokens += ws.tokens || 0;
+    });
+    var aggTokens = (node.aggregate || {}).total_tokens || 0;
+    totalTokens += aggTokens || nodeWsTokens;
+    totalToolCalls += (node.aggregate || {}).total_tool_calls || 0;
+    if (node.version) versions[node.version] = true;
+  });
+  var versionList = Object.keys(versions).sort();
+  clusterState.overview = {
+    nodes: Object.keys(clusterState.nodes).length,
+    workstreams: totalWs,
+    states: states,
+    aggregate: {
+      total_tokens: totalTokens,
+      total_tool_calls: totalToolCalls,
+    },
+    version_drift: versionList.length > 1,
+    versions: versionList,
+  };
+}
+
+function buildNodeInfoFromSnapshot(node) {
+  var states = { running: 0, thinking: 0, attention: 0, idle: 0, error: 0 };
+  var ws = node.workstreams || [];
+  ws.forEach(function (w) {
+    var s = w.state || "idle";
+    states[s] = (states[s] || 0) + 1;
+  });
+  var aggTokens = (node.aggregate || {}).total_tokens || 0;
+  if (!aggTokens) {
+    ws.forEach(function (w) {
+      aggTokens += w.tokens || 0;
+    });
+  }
+  return {
+    node_id: node.node_id,
+    server_url: node.server_url || "",
+    ws_total: ws.length,
+    ws_running: states.running,
+    ws_thinking: states.thinking,
+    ws_attention: states.attention,
+    ws_idle: states.idle,
+    ws_error: states.error,
+    total_tokens: aggTokens,
+    ws_tokens: aggTokens,
+    max_ws: node.max_ws || 10,
+    started: node.started || 0,
+    reachable: node.reachable !== false,
+    health: node.health || {},
+    version: node.version || "",
+  };
+}
+
+function renderFromState() {
+  if (!clusterState) return;
+  renderStatusBar(clusterState.overview);
+  if (currentView === "overview") {
+    var nodesList = Object.keys(clusterState.nodes).map(function (nid) {
+      return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
+    });
+    nodesList.sort(function (a, b) {
+      var d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+      return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
+    });
+    renderNodeGroups(nodesList, nodesList.length);
+    document.getElementById("cluster-summary").textContent =
+      clusterState.overview.nodes +
+      " nodes \u00b7 " +
+      formatCount(clusterState.overview.workstreams) +
+      " workstreams";
+  } else if (currentView === "node" && currentNodeId) {
+    var snapNode = clusterState.nodes[currentNodeId];
+    if (snapNode) {
+      var wsList = snapNode.workstreams || [];
+      var active = wsList.filter(function (w) {
+        return w.state !== "idle";
+      }).length;
+      document.getElementById("node-ws-summary").textContent =
+        active + " active \u00b7 " + wsList.length + " total";
+      renderWsTable(document.getElementById("node-ws-table"), wsList);
+    }
+  } else if (currentView === "filtered") {
+    var allWs = [];
+    Object.keys(clusterState.nodes).forEach(function (nid) {
+      (clusterState.nodes[nid].workstreams || []).forEach(function (ws) {
+        allWs.push(ws);
+      });
+    });
+    if (currentFilter.state) {
+      allWs = allWs.filter(function (ws) {
+        return ws.state === currentFilter.state;
+      });
+    }
+    if (currentFilter.node) {
+      allWs = allWs.filter(function (ws) {
+        return ws.node === currentFilter.node;
+      });
+    }
+    var stateOrder = {
+      running: 0,
+      thinking: 1,
+      attention: 2,
+      error: 3,
+      idle: 4,
+    };
+    allWs.sort(function (a, b) {
+      return (stateOrder[a.state] || 9) - (stateOrder[b.state] || 9);
+    });
+    var total = allWs.length;
+    var perPage = currentFilter.per_page || 50;
+    var pages = Math.max(1, Math.ceil(total / perPage));
+    var page = Math.min(currentFilter.page || 1, pages);
+    var start = (page - 1) * perPage;
+    var pageWs = allWs.slice(start, start + perPage);
+    document.getElementById("filtered-summary").textContent =
+      "Page " + page + " of " + pages + " (" + total + " total)";
+    renderWsTable(document.getElementById("filtered-ws-table"), pageWs);
+    renderPagination(
+      document.getElementById("filtered-pagination"),
+      page,
+      pages,
+    );
+  }
+}
 
 // --- SSE Connection ---
 function connectSSE() {
@@ -94,19 +323,11 @@ function connectSSE() {
   };
 }
 
-var _refreshTimer = null;
-function scheduleRefresh() {
-  if (_refreshTimer) return;
-  _refreshTimer = setTimeout(function () {
-    _refreshTimer = null;
-    if (currentView === "overview") loadOverview();
-    else if (currentView === "node" && currentNodeId)
-      loadNodeDetail(currentNodeId);
-    else if (currentView === "filtered") loadFilteredWorkstreams();
-  }, 250);
-}
-
 function handleClusterEvent(data) {
+  if (data.type === "snapshot") {
+    applySnapshot(data);
+    return;
+  }
   if (
     data.type === "cluster_state" ||
     data.type === "ws_created" ||
@@ -115,7 +336,7 @@ function handleClusterEvent(data) {
     data.type === "node_joined" ||
     data.type === "node_lost"
   ) {
-    scheduleRefresh();
+    patchClusterState(data);
   }
   if (data.type === "ws_closed" && data.reason === "evicted") {
     showToast("Evicted" + (data.name ? ": " + data.name : "") + " (capacity)");
@@ -135,28 +356,18 @@ function showOverview() {
   if (adminView) adminView.style.display = "none";
   document.getElementById("breadcrumb").style.display = "none";
   document.getElementById("main").scrollTop = 0;
-  loadOverview();
-  history.pushState({ view: "overview" }, "");
+  if (clusterState) renderFromState();
+  else loadOverview();
+  if (!_navigatingFromPopstate) history.pushState({ view: "overview" }, "");
 }
 
 function loadOverview() {
-  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
-    return r.json();
-  });
-  var nodesP = authFetch("/v1/api/cluster/nodes?sort=activity&limit=1000").then(
-    function (r) {
+  authFetch("/v1/api/cluster/snapshot")
+    .then(function (r) {
       return r.json();
-    },
-  );
-  Promise.all([overviewP, nodesP])
-    .then(function (res) {
-      renderStatusBar(res[0]);
-      renderNodeGroups(res[1].nodes, res[1].total);
-      document.getElementById("cluster-summary").textContent =
-        res[0].nodes +
-        " nodes \u00b7 " +
-        formatCount(res[0].workstreams) +
-        " workstreams";
+    })
+    .then(function (data) {
+      applySnapshot(data);
     })
     .catch(function () {
       document.getElementById("node-table").innerHTML =
@@ -310,7 +521,8 @@ function groupNodes(nodes) {
   });
   groupOrder.forEach(function (prefix) {
     groupMap[prefix].nodes.sort(function (a, b) {
-      return b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+      var d = b.ws_running + b.ws_attention - (a.ws_running + a.ws_attention);
+      return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
   });
   var groups = groupOrder.map(function (p) {
@@ -653,38 +865,37 @@ function drillDownToNode(nodeId, serverUrl) {
   link.href = "/node/" + encodeURIComponent(nodeId) + "/";
   link.style.display = "";
   document.getElementById("main").scrollTop = 0;
-  document.getElementById("node-ws-table").innerHTML =
-    '<div class="dashboard-empty">Loading workstreams...</div>';
-  loadNodeDetail(nodeId);
+  if (clusterState && clusterState.nodes[nodeId]) {
+    renderFromState();
+  } else {
+    document.getElementById("node-ws-table").innerHTML =
+      '<div class="dashboard-empty">Loading workstreams...</div>';
+    loadNodeDetail(nodeId);
+  }
   document.getElementById("breadcrumb-home").focus();
-  history.pushState({ view: "node", nodeId: nodeId, serverUrl: serverUrl }, "");
+  if (!_navigatingFromPopstate)
+    history.pushState(
+      { view: "node", nodeId: nodeId, serverUrl: serverUrl },
+      "",
+    );
 }
 
 function loadNodeDetail(nodeId) {
-  var detailP = authFetch(
-    "/v1/api/cluster/node/" + encodeURIComponent(nodeId),
-  ).then(function (r) {
-    return r.json();
-  });
-  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
-    return r.json();
-  });
-  Promise.all([detailP, overviewP]).then(function (res) {
-    var data = res[0];
-    renderStatusBar(res[1]);
-    if (data.error) {
+  authFetch("/v1/api/cluster/snapshot")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      applySnapshot(data);
+      if (!clusterState || !clusterState.nodes[nodeId]) {
+        document.getElementById("node-ws-table").innerHTML =
+          '<div class="dashboard-empty">Node not found</div>';
+      }
+    })
+    .catch(function () {
       document.getElementById("node-ws-table").innerHTML =
-        '<div class="dashboard-empty">' + escapeHtml(data.error) + "</div>";
-      return;
-    }
-    var ws = data.workstreams || [];
-    var active = ws.filter(function (w) {
-      return w.state !== "idle";
-    }).length;
-    document.getElementById("node-ws-summary").textContent =
-      active + " active \u00b7 " + ws.length + " total";
-    renderWsTable(document.getElementById("node-ws-table"), ws);
-  });
+        '<div class="dashboard-empty">Failed to load</div>';
+    });
 }
 
 // --- Drill-down: Filtered ---
@@ -703,9 +914,11 @@ function drillDownByState(state) {
   document.getElementById("filtered-title").textContent =
     "WORKSTREAMS — " + sd.label.toUpperCase();
   document.getElementById("main").scrollTop = 0;
-  loadFilteredWorkstreams();
+  if (clusterState) renderFromState();
+  else loadFilteredWorkstreams();
   document.getElementById("breadcrumb-home").focus();
-  history.pushState({ view: "filtered", filter: currentFilter }, "");
+  if (!_navigatingFromPopstate)
+    history.pushState({ view: "filtered", filter: currentFilter }, "");
 }
 
 function drillDownByNode(nodeId) {
@@ -721,48 +934,20 @@ function drillDownByNode(nodeId) {
   document.getElementById("filtered-title").textContent =
     "WORKSTREAMS — " + nodeId;
   document.getElementById("main").scrollTop = 0;
-  loadFilteredWorkstreams();
+  if (clusterState) renderFromState();
+  else loadFilteredWorkstreams();
   document.getElementById("breadcrumb-home").focus();
-  history.pushState({ view: "filtered", filter: currentFilter }, "");
+  if (!_navigatingFromPopstate)
+    history.pushState({ view: "filtered", filter: currentFilter }, "");
 }
 
 function loadFilteredWorkstreams() {
-  var params =
-    "page=" + currentFilter.page + "&per_page=" + currentFilter.per_page;
-  if (currentFilter.state)
-    params += "&state=" + encodeURIComponent(currentFilter.state);
-  if (currentFilter.node)
-    params += "&node=" + encodeURIComponent(currentFilter.node);
-  var wsP = authFetch("/v1/api/cluster/workstreams?" + params).then(
-    function (r) {
+  authFetch("/v1/api/cluster/snapshot")
+    .then(function (r) {
       return r.json();
-    },
-  );
-  var overviewP = authFetch("/v1/api/cluster/overview").then(function (r) {
-    return r.json();
-  });
-  Promise.all([wsP, overviewP])
-    .then(function (res) {
-      var data = res[0];
-      renderStatusBar(res[1]);
-      document.getElementById("main").scrollTop = 0;
-      document.getElementById("filtered-summary").textContent =
-        "Page " +
-        data.page +
-        " of " +
-        data.pages +
-        " (" +
-        data.total +
-        " total)";
-      renderWsTable(
-        document.getElementById("filtered-ws-table"),
-        data.workstreams,
-      );
-      renderPagination(
-        document.getElementById("filtered-pagination"),
-        data.page,
-        data.pages,
-      );
+    })
+    .then(function (data) {
+      applySnapshot(data);
     })
     .catch(function () {
       document.getElementById("filtered-ws-table").innerHTML =
@@ -778,7 +963,8 @@ function renderPagination(container, page, pages) {
   prev.disabled = page <= 1;
   prev.onclick = function () {
     currentFilter.page--;
-    loadFilteredWorkstreams();
+    if (clusterState) renderFromState();
+    else loadFilteredWorkstreams();
   };
   container.appendChild(prev);
   var info = document.createElement("span");
@@ -789,7 +975,8 @@ function renderPagination(container, page, pages) {
   next.disabled = page >= pages;
   next.onclick = function () {
     currentFilter.page++;
-    loadFilteredWorkstreams();
+    if (clusterState) renderFromState();
+    else loadFilteredWorkstreams();
   };
   container.appendChild(next);
 }
@@ -923,19 +1110,24 @@ function renderWsTable(container, wsList) {
 window.addEventListener("popstate", function (e) {
   var overlay = document.getElementById("login-overlay");
   if (overlay && overlay.style.display !== "none") return;
-  if (!e.state) {
-    showOverview();
-    return;
-  }
-  if (e.state.view === "overview") showOverview();
-  else if (e.state.view === "admin" && typeof showAdmin === "function")
-    showAdmin();
-  else if (e.state.view === "node" && e.state.nodeId)
-    drillDownToNode(e.state.nodeId, e.state.serverUrl);
-  else if (e.state.view === "filtered" && e.state.filter) {
-    currentFilter = e.state.filter;
-    if (currentFilter.state) drillDownByState(currentFilter.state);
-    else if (currentFilter.node) drillDownByNode(currentFilter.node);
+  _navigatingFromPopstate = true;
+  try {
+    if (!e.state) {
+      showOverview();
+      return;
+    }
+    if (e.state.view === "overview") showOverview();
+    else if (e.state.view === "admin" && typeof showAdmin === "function")
+      showAdmin();
+    else if (e.state.view === "node" && e.state.nodeId)
+      drillDownToNode(e.state.nodeId, e.state.serverUrl);
+    else if (e.state.view === "filtered" && e.state.filter) {
+      currentFilter = e.state.filter;
+      if (currentFilter.state) drillDownByState(currentFilter.state);
+      else if (currentFilter.node) drillDownByNode(currentFilter.node);
+    }
+  } finally {
+    _navigatingFromPopstate = false;
   }
 });
 

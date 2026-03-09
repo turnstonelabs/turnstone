@@ -379,11 +379,11 @@ class ClusterCollector:
                 )
             total = len(items)
 
-        # Sort
+        # Sort (secondary key: node_id for stable ordering)
         if sort_by == "activity":
-            items.sort(key=lambda n: n["ws_running"] + n["ws_attention"], reverse=True)
+            items.sort(key=lambda n: (-(n["ws_running"] + n["ws_attention"]), n["node_id"]))
         elif sort_by == "tokens":
-            items.sort(key=lambda n: n["total_tokens"], reverse=True)
+            items.sort(key=lambda n: (-n["total_tokens"], n["node_id"]))
         elif sort_by == "name":
             items.sort(key=lambda n: n["node_id"])
 
@@ -454,6 +454,89 @@ class ClusterCollector:
                 "aggregate": dict(node.aggregate),
                 "reachable": node.reachable,
             }
+
+    def get_snapshot(self) -> dict[str, Any]:
+        """Build a complete cluster snapshot under a single lock.
+
+        Returns everything the UI needs to render the full dashboard:
+        all nodes with their workstreams plus pre-computed overview aggregates.
+        """
+        with self._lock:
+            return self._build_snapshot_locked()
+
+    def get_snapshot_and_register(self, q: queue.Queue[dict[str, Any]]) -> dict[str, Any]:
+        """Build snapshot and register listener atomically.
+
+        Acquiring both locks ensures no event can be published between
+        the snapshot read and the listener registration — the client
+        receives the snapshot followed by every subsequent event with
+        no gap.
+        """
+        with self._lock:
+            snap = self._build_snapshot_locked()
+            with self._listeners_lock:
+                self._listeners.append(q)
+        return snap
+
+    def _build_snapshot_locked(self) -> dict[str, Any]:
+        """Build snapshot data — caller must hold ``_lock``."""
+        nodes_out = []
+        states: dict[str, int] = {
+            "running": 0,
+            "thinking": 0,
+            "attention": 0,
+            "idle": 0,
+            "error": 0,
+        }
+        total_tokens = 0
+        total_tool_calls = 0
+        total_ws = 0
+        versions: set[str] = set()
+
+        for node in self._nodes.values():
+            ws_list = []
+            for ws in node.workstreams.values():
+                ws_list.append(dict(ws))
+                s = ws.get("state", "idle")
+                states[s] = states.get(s, 0) + 1
+                total_ws += 1
+
+            total_tokens += node.aggregate.get("total_tokens", 0)
+            total_tool_calls += node.aggregate.get("total_tool_calls", 0)
+            ver = node.health.get("version", "")
+            if ver:
+                versions.add(ver)
+
+            nodes_out.append(
+                {
+                    "node_id": node.node_id,
+                    "server_url": node.server_url,
+                    "max_ws": node.max_ws,
+                    "reachable": node.reachable,
+                    "version": ver,
+                    "health": dict(node.health),
+                    "aggregate": dict(node.aggregate),
+                    "workstreams": ws_list,
+                }
+            )
+
+        node_count = len(self._nodes)
+
+        return {
+            "nodes": nodes_out,
+            "overview": {
+                "nodes": node_count,
+                "workstreams": total_ws,
+                "states": states,
+                "aggregate": {
+                    "total_tokens": total_tokens,
+                    "total_tool_calls": total_tool_calls,
+                },
+                "version_drift": len(versions) > 1,
+                "versions": sorted(versions),
+            },
+            "timestamp": time.time(),
+        }
 
     # -- SSE listener management ---------------------------------------------
 

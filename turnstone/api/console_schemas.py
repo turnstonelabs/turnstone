@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ class ClusterNodeInfo(BaseModel):
     total_tokens: int = 0
     started: float = 0.0
     reachable: bool = True
-    health: dict[str, str] = Field(default_factory=dict)
+    health: dict[str, Any] = Field(default_factory=dict)
     version: str = ""
 
 
@@ -91,10 +93,32 @@ class ClusterWorkstreamsResponse(BaseModel):
 class NodeDetailResponse(BaseModel):
     node_id: str
     server_url: str = ""
-    health: dict[str, str] = Field(default_factory=dict)
+    health: dict[str, Any] = Field(default_factory=dict)
     workstreams: list[ClusterWorkstreamInfo] = []
     aggregate: dict[str, int] = Field(default_factory=dict)
     reachable: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Cluster snapshot
+# ---------------------------------------------------------------------------
+
+
+class ClusterSnapshotNode(BaseModel):
+    node_id: str
+    server_url: str = ""
+    max_ws: int = 10
+    reachable: bool = True
+    version: str = ""
+    health: dict[str, Any] = Field(default_factory=dict)
+    aggregate: dict[str, int] = Field(default_factory=dict)
+    workstreams: list[ClusterWorkstreamInfo] = []
+
+
+class ClusterSnapshotResponse(BaseModel):
+    nodes: list[ClusterSnapshotNode]
+    overview: ClusterOverviewResponse
+    timestamp: float = 0.0
 
 
 # ---------------------------------------------------------------------------
