@@ -247,6 +247,14 @@ class ClusterWsRenameEvent(ClusterEvent):
     name: str = ""
 
 
+@dataclass
+class ClusterSnapshotEvent(ClusterEvent):
+    type: str = "snapshot"
+    nodes: list[dict[str, Any]] = field(default_factory=list)
+    overview: dict[str, Any] = field(default_factory=dict)
+    timestamp: float = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Type registries (built after all classes are defined)
 # ---------------------------------------------------------------------------
@@ -296,5 +304,6 @@ _CLUSTER_REGISTRY: dict[str, type[ClusterEvent]] = {
         ClusterWsCreatedEvent,
         ClusterWsClosedEvent,
         ClusterWsRenameEvent,
+        ClusterSnapshotEvent,
     ]
 }

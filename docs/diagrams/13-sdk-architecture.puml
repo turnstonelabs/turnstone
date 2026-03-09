@@ -45,6 +45,7 @@ package "turnstone/sdk/ (Python)" {
         + nodes()
         + workstreams()
         + node_detail()
+        + snapshot()
         + create_workstream()
         + stream_cluster_events()
         + login() / logout()
@@ -129,6 +130,7 @@ package "sdk/typescript/ (TypeScript)" {
     class "TurnstoneConsole" as TSConsole <<ts>> {
         + overview()
         + nodes()
+        + snapshot()
         + clusterEvents()
         ...
     }

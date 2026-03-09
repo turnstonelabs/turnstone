@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.api.console_schemas import (
     ClusterNodesResponse,
     ClusterOverviewResponse,
+    ClusterSnapshotResponse,
     ClusterWorkstreamsResponse,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
@@ -100,6 +101,11 @@ class AsyncTurnstoneConsole(_BaseClient):
     async def node_detail(self, node_id: str) -> NodeDetailResponse:
         return await self._request(
             "GET", f"/v1/api/cluster/node/{node_id}", response_model=NodeDetailResponse
+        )
+
+    async def snapshot(self) -> ClusterSnapshotResponse:
+        return await self._request(
+            "GET", "/v1/api/cluster/snapshot", response_model=ClusterSnapshotResponse
         )
 
     async def create_workstream(
@@ -341,6 +347,9 @@ class TurnstoneConsole:
 
     def node_detail(self, node_id: str) -> NodeDetailResponse:
         return self._runner.run(self._async.node_detail(node_id))
+
+    def snapshot(self) -> ClusterSnapshotResponse:
+        return self._runner.run(self._async.snapshot())
 
     def create_workstream(
         self,

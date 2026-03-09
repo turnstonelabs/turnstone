@@ -446,6 +446,44 @@ class TestCollectorQueries:
     def test_get_node_detail_not_found(self, populated_collector):
         assert populated_collector.get_node_detail("nonexistent") is None
 
+    def test_get_snapshot_empty(self):
+        c = _make_collector()
+        snap = c.get_snapshot()
+        assert snap["nodes"] == []
+        assert snap["overview"]["nodes"] == 0
+        assert snap["overview"]["workstreams"] == 0
+        assert snap["overview"]["states"]["running"] == 0
+        assert "timestamp" in snap
+
+    def test_get_snapshot_with_nodes(self, populated_collector):
+        snap = populated_collector.get_snapshot()
+        assert len(snap["nodes"]) == 2
+        assert snap["overview"]["nodes"] == 2
+        assert snap["overview"]["workstreams"] == 3
+        assert snap["overview"]["states"]["running"] == 1
+        assert snap["overview"]["states"]["attention"] == 1
+        assert snap["overview"]["states"]["idle"] == 1
+        assert snap["overview"]["aggregate"]["total_tokens"] == 17000
+        assert snap["timestamp"] > 0
+        # Each node should embed its workstreams
+        node_ids = {n["node_id"] for n in snap["nodes"]}
+        assert node_ids == {"node-a", "node-b"}
+        for n in snap["nodes"]:
+            if n["node_id"] == "node-a":
+                assert len(n["workstreams"]) == 2
+            elif n["node_id"] == "node-b":
+                assert len(n["workstreams"]) == 1
+
+    def test_get_snapshot_consistency(self, populated_collector):
+        """Snapshot overview should match get_overview()."""
+        snap = populated_collector.get_snapshot()
+        overview = populated_collector.get_overview()
+        assert snap["overview"]["nodes"] == overview["nodes"]
+        assert snap["overview"]["workstreams"] == overview["workstreams"]
+        assert snap["overview"]["states"] == overview["states"]
+        assert snap["overview"]["aggregate"] == overview["aggregate"]
+        assert snap["overview"]["version_drift"] == overview["version_drift"]
+
 
 # ---------------------------------------------------------------------------
 # ClusterStateEvent protocol tests
@@ -536,6 +574,31 @@ class TestConsoleHTTPEndpoints:
             "workstreams": [],
             "aggregate": {},
         }
+        collector.get_snapshot.return_value = {
+            "nodes": [
+                {
+                    "node_id": "node-a",
+                    "server_url": "http://a:8080",
+                    "max_ws": 10,
+                    "reachable": True,
+                    "version": "0.5.0",
+                    "health": {},
+                    "aggregate": {"total_tokens": 50000, "total_tool_calls": 200},
+                    "workstreams": [
+                        {"id": "ws1", "name": "test", "state": "running", "node": "node-a"},
+                    ],
+                },
+            ],
+            "overview": {
+                "nodes": 3,
+                "workstreams": 15,
+                "states": {"running": 5, "thinking": 2, "attention": 1, "idle": 6, "error": 1},
+                "aggregate": {"total_tokens": 50000, "total_tool_calls": 200},
+                "version_drift": False,
+                "versions": ["0.5.0"],
+            },
+            "timestamp": 1234567890.0,
+        }
         return collector
 
     @pytest.fixture()
@@ -614,6 +677,16 @@ class TestConsoleHTTPEndpoints:
         status, data = self._get(client, "/v1/api/cluster/node/nonexistent")
         assert status == 404
         assert "error" in data
+
+    def test_get_snapshot(self, client, mock_collector):
+        status, data = self._get(client, "/v1/api/cluster/snapshot")
+        assert status == 200
+        assert len(data["nodes"]) == 1
+        assert data["nodes"][0]["node_id"] == "node-a"
+        assert data["overview"]["nodes"] == 3
+        assert data["overview"]["workstreams"] == 15
+        assert data["timestamp"] == 1234567890.0
+        mock_collector.get_snapshot.assert_called_once()
 
     def test_health_endpoint(self, client, mock_collector):
         status, data = self._get(client, "/health")

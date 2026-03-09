@@ -191,6 +191,13 @@ export interface ClusterWsRenameEvent {
   name: string;
 }
 
+export interface ClusterSnapshotEvent {
+  type: "snapshot";
+  nodes: Array<Record<string, unknown>>;
+  overview: Record<string, unknown>;
+  timestamp: number;
+}
+
 /** Discriminated union of all console cluster SSE event types. */
 export type ClusterEvent =
   | NodeJoinedEvent
@@ -198,7 +205,8 @@ export type ClusterEvent =
   | ClusterStateEvent
   | ClusterWsCreatedEvent
   | ClusterWsClosedEvent
-  | ClusterWsRenameEvent;
+  | ClusterWsRenameEvent
+  | ClusterSnapshotEvent;
 
 // ---------------------------------------------------------------------------
 // Type guards

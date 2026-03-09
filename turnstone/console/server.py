@@ -245,14 +245,25 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     return JSONResponse({"error": "Node not found"}, status_code=404)
 
 
+async def cluster_snapshot(request: Request) -> JSONResponse:
+    collector: ClusterCollector = request.app.state.collector
+    return JSONResponse(collector.get_snapshot())
+
+
 async def cluster_events_sse(request: Request) -> Response:
     collector: ClusterCollector = request.app.state.collector
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
-    collector.register_listener(client_queue)
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
         try:
+            # Snapshot first, then register — events between snapshot and
+            # registration are already captured by the snapshot, so no gap.
+            snap = await loop.run_in_executor(None, collector.get_snapshot)
+            snap["type"] = "snapshot"
+            collector.register_listener(client_queue)
+            yield {"data": json.dumps(snap)}
+
             while True:
                 try:
                     event = await loop.run_in_executor(
@@ -1195,6 +1206,7 @@ def create_app(
                     Route("/api/cluster/workstreams", cluster_workstreams),
                     Route("/api/cluster/workstreams/new", create_workstream, methods=["POST"]),
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
+                    Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),

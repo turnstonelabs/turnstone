@@ -244,6 +244,23 @@ export interface NodeDetailResponse {
   aggregate: ClusterAggregate;
 }
 
+export interface ClusterSnapshotNode {
+  node_id: string;
+  server_url: string;
+  max_ws: number;
+  reachable: boolean;
+  version: string;
+  health: Record<string, string>;
+  aggregate: Record<string, number>;
+  workstreams: ClusterWorkstreamInfo[];
+}
+
+export interface ClusterSnapshotResponse {
+  nodes: ClusterSnapshotNode[];
+  overview: ClusterOverviewResponse;
+  timestamp: number;
+}
+
 export interface ConsoleCreateWsRequest {
   node_id?: string;
   name?: string;

@@ -98,6 +98,28 @@ class NodeDetailResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Cluster snapshot
+# ---------------------------------------------------------------------------
+
+
+class ClusterSnapshotNode(BaseModel):
+    node_id: str
+    server_url: str = ""
+    max_ws: int = 10
+    reachable: bool = True
+    version: str = ""
+    health: dict[str, str] = Field(default_factory=dict)
+    aggregate: dict[str, int] = Field(default_factory=dict)
+    workstreams: list[ClusterWorkstreamInfo] = []
+
+
+class ClusterSnapshotResponse(BaseModel):
+    nodes: list[ClusterSnapshotNode]
+    overview: ClusterOverviewResponse
+    timestamp: float = 0.0
+
+
+# ---------------------------------------------------------------------------
 # Workstream creation
 # ---------------------------------------------------------------------------
 

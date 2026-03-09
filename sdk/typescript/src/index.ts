@@ -55,6 +55,7 @@ export type {
   ClusterWsCreatedEvent,
   ClusterWsClosedEvent,
   ClusterWsRenameEvent,
+  ClusterSnapshotEvent,
 } from "./events.js";
 
 export {
@@ -97,6 +98,8 @@ export type {
   ClusterOverviewResponse,
   ClusterNodeInfo,
   ClusterNodesResponse,
+  ClusterSnapshotNode,
+  ClusterSnapshotResponse,
   ClusterWorkstreamInfo,
   ClusterWorkstreamsResponse,
   NodeDetailResponse,
