@@ -156,7 +156,7 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 | Tool | Description | Auto-approved |
 |------|-------------|:---:|
 | `bash` | Execute shell commands | |
-| `read_file` | Read file contents | yes |
+| `read_file` | Read file contents (text or images with vision models) | yes |
 | `write_file` | Write/create files | |
 | `edit_file` | Fuzzy-match file editing | |
 | `search` | Search files by name/content | yes |

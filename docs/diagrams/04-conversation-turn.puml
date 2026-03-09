@@ -112,7 +112,7 @@ group loop [while tool_calls present]
         note right of TP
           Parallel execution:
           bash → Popen + line-by-line streaming
-          read_file → open().read()
+          read_file → open().read() or base64 image
           search → grep subprocess
           edit_file → string replace
           task/plan → _run_agent() sub-loop

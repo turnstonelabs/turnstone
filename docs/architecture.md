@@ -560,21 +560,23 @@ LLMProvider (protocol)
 |------|--------|
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage` |
-| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search` |
+| `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision` |
 | `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
-already in OpenAI format). Model capability lookup table covers
-GPT-5/5.1/5.2, O-series, and search models (`gpt-5-search-api`).
+already in OpenAI format), including multi-part content blocks (text + images)
+in tool results. Model capability lookup table covers GPT-5/5.1/5.2/5.3/5.4,
+O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
 For search models, injects `web_search_options` and removes the `web_search`
 function tool (the model always searches). Citations from `url_citation`
 annotations are formatted as footnotes. Unknown models (local servers) get
-permissive defaults and use Tavily for web search.
+permissive defaults with `supports_vision=False` and use Tavily for web search.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
 Anthropic content blocks, maps `system`/`developer` roles to the `system`
 parameter, groups consecutive `tool` result messages into user-role content
-blocks, and translates tool schemas from OpenAI function-calling format to
+blocks (converting `image_url` parts to Anthropic's `image` source format),
+and translates tool schemas from OpenAI function-calling format to
 Anthropic's `input_schema` format. Supports both manual and adaptive thinking
 modes, with effort parameter support for models like Claude Opus 4.6 and
 Sonnet 4.6. Replaces the `web_search` function tool with Anthropic's native
@@ -620,6 +622,18 @@ agent_model = "claude"
 
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"` and `"anthropic"`.
+An optional `[models.*.capabilities]` sub-table overrides per-model
+`ModelCapabilities` flags (useful for local models whose capabilities
+cannot be detected programmatically):
+
+```toml
+[models.qwen-vl]
+base_url = "http://localhost:8000/v1"
+model = "qwen-3.5-vl"
+
+[models.qwen-vl.capabilities]
+supports_vision = true
+```
 
 **Lifecycle:**
 1. `load_model_registry()` reads `[models.*]` sections from config.toml and

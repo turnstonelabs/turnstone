@@ -1,9 +1,11 @@
 """Tests for turnstone.core.session — ChatSession construction."""
 
+import base64
 import json
+import os
 from unittest.mock import MagicMock, patch
 
-from turnstone.core.session import ChatSession
+from turnstone.core.session import ChatSession, _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP
 
 
 class NullUI:
@@ -265,3 +267,154 @@ class TestPlanExec:
         call_id, content, _ = self._run_plan(session, "do stuff", agent_return=agent_output)
         assert call_id == "test-call-1"
         assert content == agent_output
+
+
+# ---------------------------------------------------------------------------
+# Vision / image support
+# ---------------------------------------------------------------------------
+
+
+class TestImageExtensions:
+    """Test _IMAGE_EXTENSIONS constant and detection logic."""
+
+    def test_common_image_extensions(self):
+        for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"):
+            assert ext in _IMAGE_EXTENSIONS, f"{ext} should be in _IMAGE_EXTENSIONS"
+
+    def test_svg_excluded(self):
+        assert ".svg" not in _IMAGE_EXTENSIONS
+
+    def test_text_extensions_excluded(self):
+        for ext in (".py", ".txt", ".json", ".md", ".rs", ".go"):
+            assert ext not in _IMAGE_EXTENSIONS
+
+
+class TestExecReadImage:
+    """Test _exec_read_image method."""
+
+    def _make_png(self, path: str, size: int = 100) -> None:
+        """Write a minimal valid-ish PNG header to a file."""
+        # 8-byte PNG signature + enough bytes to reach target size
+        header = b"\x89PNG\r\n\x1a\n"
+        with open(path, "wb") as f:
+            f.write(header + b"\x00" * max(0, size - len(header)))
+
+    def test_image_returns_content_parts(self, tmp_db, tmp_path):
+        """read_file on a PNG with vision support returns content parts."""
+        img = tmp_path / "test.png"
+        self._make_png(str(img))
+
+        session = _make_session()
+        # Mock provider to report vision support
+        mock_caps = MagicMock()
+        mock_caps.supports_vision = True
+        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
+
+        item = {"call_id": "c1", "path": str(img), "offset": None, "limit": None}
+        call_id, output = session._exec_read_file(item)
+
+        assert call_id == "c1"
+        assert isinstance(output, list)
+        assert len(output) == 2
+        assert output[0]["type"] == "text"
+        assert "test.png" in output[0]["text"]
+        assert output[1]["type"] == "image_url"
+        url = output[1]["image_url"]["url"]
+        assert url.startswith("data:image/png;base64,")
+        # Verify base64 round-trip
+        b64part = url.split(",", 1)[1]
+        decoded = base64.b64decode(b64part)
+        assert decoded == img.read_bytes()
+
+    def test_no_vision_returns_text(self, tmp_db, tmp_path):
+        """read_file on image with non-vision model returns text description."""
+        img = tmp_path / "photo.jpg"
+        self._make_png(str(img), size=2048)
+
+        session = _make_session()
+        mock_caps = MagicMock()
+        mock_caps.supports_vision = False
+        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
+
+        item = {"call_id": "c2", "path": str(img), "offset": None, "limit": None}
+        call_id, output = session._exec_read_file(item)
+
+        assert call_id == "c2"
+        assert isinstance(output, str)
+        assert "does not support vision" in output
+        assert "photo.jpg" in output
+
+    def test_oversized_image_returns_error(self, tmp_db, tmp_path):
+        """Images exceeding _IMAGE_SIZE_CAP return an error string."""
+        img = tmp_path / "huge.png"
+        # Write slightly over the cap
+        with open(img, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"\x00" * _IMAGE_SIZE_CAP)
+
+        session = _make_session()
+        mock_caps = MagicMock()
+        mock_caps.supports_vision = True
+        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
+
+        item = {"call_id": "c3", "path": str(img), "offset": None, "limit": None}
+        call_id, output = session._exec_read_file(item)
+
+        assert call_id == "c3"
+        assert isinstance(output, str)
+        assert "exceeds" in output
+
+    def test_missing_image_returns_error(self, tmp_db, tmp_path):
+        """read_file on non-existent image returns error."""
+        session = _make_session()
+        mock_caps = MagicMock()
+        mock_caps.supports_vision = True
+        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
+
+        item = {"call_id": "c4", "path": str(tmp_path / "nope.png"), "offset": None, "limit": None}
+        call_id, output = session._exec_read_file(item)
+        assert isinstance(output, str)
+        assert "not found" in output
+
+    def test_svg_read_as_text(self, tmp_db, tmp_path):
+        """SVG files are read as text, not as images."""
+        svg = tmp_path / "icon.svg"
+        svg.write_text('<svg xmlns="http://www.w3.org/2000/svg"><circle r="10"/></svg>')
+
+        session = _make_session()
+        item = {"call_id": "c5", "path": str(svg), "offset": None, "limit": None}
+        call_id, output = session._exec_read_file(item)
+        assert isinstance(output, str)
+        assert "<svg" in output  # Read as text
+
+
+class TestGetCapabilitiesOverride:
+    """Test _get_capabilities with config.toml overrides."""
+
+    def test_config_override_applies(self, tmp_db):
+        """capabilities dict from ModelConfig is merged onto provider caps."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        cfg = ModelConfig(
+            alias="qwen-vl",
+            base_url="http://localhost:8000/v1",
+            api_key="dummy",
+            model="qwen-3.5-vl",
+            capabilities={"supports_vision": True},
+        )
+        registry = ModelRegistry(
+            models={"qwen-vl": cfg},
+            default="qwen-vl",
+        )
+        session = _make_session(registry=registry, model_alias="qwen-vl")
+        # Ensure provider returns a real ModelCapabilities (not MagicMock)
+        session._provider.get_capabilities = MagicMock(return_value=ModelCapabilities())
+        caps = session._get_capabilities()
+        assert caps.supports_vision is True
+
+    def test_no_override_uses_provider_default(self, tmp_db):
+        """Without config override, provider defaults are used."""
+        session = _make_session()
+        caps = session._get_capabilities()
+        # Default OpenAI provider for unknown model → no vision
+        assert caps.supports_vision is False

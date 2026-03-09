@@ -77,6 +77,7 @@ class ModelCapabilities:
     default_reasoning_effort: str = "medium"
     supports_web_search: bool = False
     supports_tool_search: bool = False
+    supports_vision: bool = False
 
 
 def _lookup_capabilities(

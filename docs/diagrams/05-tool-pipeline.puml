@@ -100,7 +100,7 @@ partition "Phase 3: Execute" #E3F2FD {
         if item.denied → return denial message
         else → item["execute"](item)
           ├─ _exec_bash: subprocess.run(["bash", script.sh])
-          ├─ _exec_read_file: open().readlines()
+          ├─ _exec_read_file: open().readlines() or _exec_read_image (base64)
           ├─ _exec_write_file: makedirs + write
           ├─ _exec_edit_file: find_occurrences + replace
           ├─ _exec_search: grep subprocess

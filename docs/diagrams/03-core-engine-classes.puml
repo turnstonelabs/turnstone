@@ -109,6 +109,7 @@ class "ModelCapabilities" as ModelCaps <<frozen>> {
     + supports_effort: bool
     + supports_web_search: bool
     + supports_tool_search: bool
+    + supports_vision: bool
 }
 
 ' ChatSession

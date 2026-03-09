@@ -8,9 +8,12 @@ to receive events and handle approval prompts.
 
 from __future__ import annotations
 
+import base64
 import concurrent.futures
 import contextlib
+import dataclasses
 import json
+import mimetypes
 import os
 import re
 import signal
@@ -71,8 +74,21 @@ if TYPE_CHECKING:
 
     from turnstone.core.healthcheck import BackendHealthMonitor
     from turnstone.core.mcp_client import MCPClientManager
-    from turnstone.core.model_registry import ModelRegistry
-    from turnstone.core.providers import CompletionResult, LLMProvider, StreamChunk
+    from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.providers import (
+        CompletionResult,
+        LLMProvider,
+        ModelCapabilities,
+        StreamChunk,
+    )
+
+# Image extensions handled as vision content (SVG excluded — it's XML text)
+_IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
+)
+
+# 4 MB raw → ~5.3 MB base64, safely under Anthropic's per-block limit
+_IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -245,6 +261,18 @@ class ChatSession:
     @property
     def model_alias(self) -> str | None:
         return self._model_alias
+
+    def _get_capabilities(self) -> ModelCapabilities:
+        """Get model capabilities, applying config.toml overrides if present."""
+        caps = self._provider.get_capabilities(self.model)
+        if self._registry and self._model_alias:
+            cfg: ModelConfig = self._registry.get_config(self._model_alias)
+            if cfg.capabilities:
+                fields = {f.name for f in dataclasses.fields(type(caps))}
+                overrides = {k: v for k, v in cfg.capabilities.items() if k in fields}
+                if overrides:
+                    caps = dataclasses.replace(caps, **overrides)
+        return caps
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -505,7 +533,7 @@ class ChatSession:
             ]
         # Tool search hint (client-side mode only — native mode needs no hint)
         if self._tool_search:
-            caps = self._provider.get_capabilities(self.model)
+            caps = self._get_capabilities()
             if not caps.supports_tool_search:
                 dev_parts.append(
                     "\n\nAdditional tools are available via tool_search. "
@@ -564,7 +592,7 @@ class ChatSession:
         if not self._tool_search:
             return self._tools
         # Check if provider supports native tool search
-        caps = self._provider.get_capabilities(self.model)
+        caps = self._get_capabilities()
         if caps.supports_tool_search:
             # Provider handles defer_loading — send all tools
             return self._tools
@@ -576,7 +604,7 @@ class ChatSession:
         """Return names of deferred tools for native provider search, or None."""
         if not self._tool_search:
             return None
-        caps = self._provider.get_capabilities(self.model)
+        caps = self._get_capabilities()
         if not caps.supports_tool_search:
             return None  # Client-side mode — no deferred names for provider
         deferred = self._tool_search.get_deferred_tools()
@@ -746,13 +774,27 @@ class ChatSession:
                 # Map tool_call_id → tool name for logging
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
-                    tool_msg = {
+                    tool_msg: dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tc_id,
                         "content": output,
                     }
                     self.messages.append(tool_msg)
-                    self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
+
+                    # Token estimation — image content uses a fixed heuristic
+                    if isinstance(output, list):
+                        text_chars = sum(
+                            len(p.get("text", "")) for p in output if p.get("type") == "text"
+                        )
+                        image_count = sum(1 for p in output if p.get("type") == "image_url")
+                        tok_est = max(
+                            1,
+                            int(text_chars / self._chars_per_token) + image_count * 1000,
+                        )
+                    else:
+                        tok_est = max(1, int(len(output) / self._chars_per_token))
+                    self._msg_tokens.append(tok_est)
+
                     # Log tool result (skip memory tools to avoid noise)
                     _tname = _tc_names.get(tc_id, "")
                     if _tname not in (
@@ -760,10 +802,17 @@ class ChatSession:
                         "forget",
                         "recall",
                     ):
+                        # For image content, store text description only
+                        if isinstance(output, list):
+                            store_text = " ".join(
+                                p.get("text", "") for p in output if p.get("type") == "text"
+                            )[:2000]
+                        else:
+                            store_text = output[:2000]
                         save_message(
                             self._ws_id,
                             "tool_result",
-                            output[:2000],
+                            store_text,
                             _tname,
                             tool_call_id=tc_id,
                         )
@@ -1047,6 +1096,16 @@ class ChatSession:
             tool_calls = m.get("tool_calls")
             tc_id = m.get("tool_call_id")
 
+            # Flatten list content (image tool results) for display
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if p.get("type") == "text":
+                        parts.append(p.get("text", ""))
+                    elif p.get("type") == "image_url":
+                        parts.append("[image]")
+                content = " ".join(parts)
+
             # Truncate long content for readability
             if len(content) > 300:
                 display = content[:200] + f"...({len(content)} chars)..." + content[-50:]
@@ -1076,7 +1135,11 @@ class ChatSession:
 
     def _msg_char_count(self, msg: dict[str, Any]) -> int:
         """Count characters in a message, including tool call arguments."""
-        n = len(msg.get("content") or "")
+        content = msg.get("content")
+        if isinstance(content, list):
+            n = sum(len(p.get("text", "")) for p in content if p.get("type") == "text")
+        else:
+            n = len(content or "")
         for tc in msg.get("tool_calls", []):
             n += len(tc.get("function", {}).get("name", ""))
             n += len(tc.get("function", {}).get("arguments", ""))
@@ -1133,6 +1196,16 @@ class ChatSession:
         for m in messages:
             role = m["role"].upper()
             content = m.get("content") or ""
+
+            # Flatten list content (image tool results) to text for summary
+            if isinstance(content, list):
+                text_parts = []
+                for p in content:
+                    if p.get("type") == "text":
+                        text_parts.append(p["text"])
+                    elif p.get("type") == "image_url":
+                        text_parts.append("[image]")
+                content = " ".join(text_parts)
 
             if m.get("tool_calls"):
                 calls = []
@@ -1321,7 +1394,7 @@ class ChatSession:
 
     def _execute_tools(
         self, tool_calls: list[dict[str, Any]]
-    ) -> tuple[list[tuple[str, str]], str | None]:
+    ) -> tuple[list[tuple[str, str | list[dict[str, Any]]]], str | None]:
         """Execute tool calls with batch preview and approval.
 
         Returns (results, user_feedback) where user_feedback is an optional
@@ -1343,12 +1416,14 @@ class ChatSession:
             user_feedback = None  # feedback is in the denial_msg
 
         # Phase 3: execute
-        def run_one(item: dict[str, Any]) -> tuple[str, str]:
+        def run_one(
+            item: dict[str, Any],
+        ) -> tuple[str, str | list[dict[str, Any]]]:
             if item.get("error"):
                 return item["call_id"], item["error"]
             if item.get("denied"):
                 return item["call_id"], item.get("denial_msg", "Denied by user")
-            result: tuple[str, str] = item["execute"](item)
+            result: tuple[str, str | list[dict[str, Any]]] = item["execute"](item)
             return result
 
         if len(items) == 1:
@@ -1366,6 +1441,7 @@ class ChatSession:
                 and not self.auto_approve
             ):
                 cid, output = results[i]
+                assert isinstance(output, str)  # plan always returns text
                 # Let the UI present the plan for review
                 self._emit_state("attention")
                 resp = self.ui.on_plan_review(output)
@@ -2210,12 +2286,17 @@ class ChatSession:
             self.ui.on_error(msg)
             return call_id, msg
 
-    def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Read a file and return numbered lines, optionally sliced."""
+    def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
+        """Read a file and return numbered lines, or image content parts."""
         call_id, path = item["call_id"], item["path"]
         offset = item.get("offset")  # 1-based, or None
         limit = item.get("limit")  # max lines, or None
         resolved = os.path.realpath(path)
+
+        # Image file detection (branch before text open)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _IMAGE_EXTENSIONS:
+            return self._exec_read_image(call_id, path, resolved)
 
         try:
             with open(path) as f:
@@ -2250,6 +2331,60 @@ class ChatSession:
         self.ui.on_tool_result(call_id, "read_file", desc)
 
         return call_id, output if output else "(empty file)"
+
+    def _exec_read_image(
+        self, call_id: str, path: str, resolved: str
+    ) -> tuple[str, str | list[dict[str, Any]]]:
+        """Read an image file and return as base64 content parts for vision."""
+        caps = self._get_capabilities()
+        if not caps.supports_vision:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return call_id, f"Error: {path} not found"
+            self._read_files.add(resolved)
+            desc = f"image (no vision, {size:,} bytes)"
+            self.ui.on_tool_result(call_id, "read_file", desc)
+            return call_id, (
+                f"Binary image file: {path} ({size:,} bytes). "
+                "Current model does not support vision."
+            )
+
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            self._read_files.discard(resolved)
+            return call_id, f"Error: {path} not found"
+        except Exception as e:
+            self._read_files.discard(resolved)
+            return call_id, f"Error reading {path}: {e}"
+
+        if len(raw) > _IMAGE_SIZE_CAP:
+            self._read_files.add(resolved)
+            size_mb = len(raw) / (1024 * 1024)
+            cap_mb = _IMAGE_SIZE_CAP / (1024 * 1024)
+            return call_id, (
+                f"Error: image {path} is {size_mb:.1f} MB, "
+                f"exceeds {cap_mb:.0f} MB limit for vision."
+            )
+
+        self._read_files.add(resolved)
+        b64data = base64.b64encode(raw).decode("ascii")
+        mime, _ = mimetypes.guess_type(path)
+        if not mime:
+            mime = "image/png"
+
+        content_parts: list[dict[str, Any]] = [
+            {"type": "text", "text": f"Image file: {path} ({len(raw):,} bytes)"},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64data}"},
+            },
+        ]
+
+        self.ui.on_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
+        return call_id, content_parts
 
     def _exec_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search file contents for a regex pattern using grep."""

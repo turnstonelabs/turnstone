@@ -30,6 +30,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
+        supports_vision=True,
     ),
     "gpt-5-mini": ModelCapabilities(
         context_window=400000,
@@ -37,6 +38,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
+        supports_vision=True,
     ),
     "gpt-5-nano": ModelCapabilities(
         context_window=400000,
@@ -44,6 +46,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("minimal", "low", "medium", "high"),
         default_reasoning_effort="medium",
+        supports_vision=True,
     ),
     # GPT-5 pro — high reasoning only, extended output
     "gpt-5-pro": ModelCapabilities(
@@ -52,6 +55,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("high",),
         default_reasoning_effort="high",
+        supports_vision=True,
     ),
     # GPT-5.1 — temperature OK when reasoning_effort=none (default)
     "gpt-5.1": ModelCapabilities(
@@ -59,6 +63,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high"),
         default_reasoning_effort="none",
+        supports_vision=True,
     ),
     # GPT-5.2 — adds xhigh
     "gpt-5.2": ModelCapabilities(
@@ -66,6 +71,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
+        supports_vision=True,
     ),
     # GPT-5.2 pro — always-reasoning variant
     "gpt-5.2-pro": ModelCapabilities(
@@ -74,6 +80,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         reasoning_effort_values=("medium", "high", "xhigh"),
         default_reasoning_effort="medium",
+        supports_vision=True,
     ),
     # GPT-5.3 — same capabilities as 5.2 (matches gpt-5.3-chat-latest, codex)
     "gpt-5.3": ModelCapabilities(
@@ -81,6 +88,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=128000,
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
+        supports_vision=True,
     ),
     # GPT-5.4 — 1M context window, native tool search
     "gpt-5.4": ModelCapabilities(
@@ -89,6 +97,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("none", "low", "medium", "high", "xhigh"),
         default_reasoning_effort="none",
         supports_tool_search=True,
+        supports_vision=True,
     ),
     # GPT-5.4 pro — always-reasoning, 1M context, native tool search
     "gpt-5.4-pro": ModelCapabilities(
@@ -98,6 +107,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         reasoning_effort_values=("medium", "high", "xhigh"),
         default_reasoning_effort="medium",
         supports_tool_search=True,
+        supports_vision=True,
     ),
     # O-series reasoning models
     "o1": ModelCapabilities(
@@ -105,33 +115,39 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         max_output_tokens=100000,
         supports_temperature=False,
         supports_streaming=False,
+        supports_vision=True,
     ),
     "o1-mini": ModelCapabilities(
         context_window=128000,
         max_output_tokens=65536,
         supports_temperature=False,
         supports_streaming=False,
+        supports_vision=True,
     ),
     "o3": ModelCapabilities(
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        supports_vision=True,
     ),
     "o3-mini": ModelCapabilities(
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        supports_vision=True,
     ),
     "o3-pro": ModelCapabilities(
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
         supports_streaming=False,
+        supports_vision=True,
     ),
     "o4-mini": ModelCapabilities(
         context_window=200000,
         max_output_tokens=100000,
         supports_temperature=False,
+        supports_vision=True,
     ),
     # Search models — always search on every request, no reasoning_effort
     "gpt-5-search-api": ModelCapabilities(
@@ -140,6 +156,7 @@ _OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_temperature=False,
         supports_web_search=True,
         reasoning_effort_values=(),
+        supports_vision=True,
     ),
 }
 

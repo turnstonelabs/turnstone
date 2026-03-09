@@ -189,15 +189,17 @@ Execute a bash command and return stdout + stderr.
 
 ### read_file
 
-Read the contents of a file, returning numbered lines.
+Read the contents of a file, returning numbered lines for text files or
+base64-encoded image data for supported image formats.
 
 | Parameter | Type    | Required | Description |
 |-----------|---------|----------|-------------|
 | `path`    | string  | yes      | Absolute or relative file path. |
-| `offset`  | integer | no       | Line number to start from (1-based, default: 1). |
-| `limit`   | integer | no       | Maximum number of lines to read. Omit for full file. |
+| `offset`  | integer | no       | Line number to start from (1-based, default: 1). Text files only. |
+| `limit`   | integer | no       | Maximum number of lines to read. Omit for full file. Text files only. |
 
-- **What it does**: Reads the file and returns content with line numbers. Must be called before `edit_file` on the same path (the session tracks which files have been read).
+- **What it does**: For text files, reads and returns content with line numbers. For image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO), returns image data as multi-part content when the model supports vision, or a text description when it does not. SVG files are read as text. Images larger than 4 MB are rejected. Must be called before `edit_file` on the same path (the session tracks which files have been read).
+- **Vision support**: Controlled by `ModelCapabilities.supports_vision`. All commercial OpenAI and Anthropic models have vision enabled. Local models (vLLM, llama.cpp, NIM) default to off — enable via `[models.*.capabilities] supports_vision = true` in config.toml.
 - **Auto-approve**: Yes.
 - **Agent availability**: `agent` and `task_agent`.
 

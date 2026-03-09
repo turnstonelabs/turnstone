@@ -75,6 +75,7 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
     token_param="max_tokens",
     thinking_mode="manual",
     supports_web_search=True,
+    supports_vision=True,
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
@@ -87,6 +88,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         effort_levels=("low", "medium", "high", "max"),
         supports_web_search=True,
         supports_tool_search=True,
+        supports_vision=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
         context_window=200000,
@@ -97,6 +99,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
         supports_tool_search=True,
+        supports_vision=True,
     ),
     "claude-haiku-4-5": ModelCapabilities(
         context_window=200000,
@@ -104,6 +107,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         token_param="max_tokens",
         thinking_mode="manual",
         supports_web_search=True,
+        supports_vision=True,
     ),
     "claude-sonnet-4-5": ModelCapabilities(
         context_window=200000,
@@ -111,6 +115,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         token_param="max_tokens",
         thinking_mode="manual",
         supports_web_search=True,
+        supports_vision=True,
     ),
     "claude-opus-4-5": ModelCapabilities(
         context_window=200000,
@@ -120,6 +125,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_effort=True,
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
+        supports_vision=True,
     ),
     "claude-opus-4": ModelCapabilities(
         context_window=200000,
@@ -128,6 +134,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_tool_search=True,
+        supports_vision=True,
     ),
     "claude-sonnet-4": ModelCapabilities(
         context_window=200000,
@@ -136,6 +143,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         thinking_mode="manual",
         supports_web_search=True,
         supports_tool_search=True,
+        supports_vision=True,
     ),
 }
 
@@ -324,11 +332,15 @@ class AnthropicProvider:
                 tool_results: list[dict[str, Any]] = []
                 while i < len(messages) and messages[i]["role"] == "tool":
                     tool_msg = messages[i]
+                    content = tool_msg.get("content", "")
+                    # Convert image_url parts to Anthropic image format
+                    if isinstance(content, list):
+                        content = self._convert_content_parts(content)
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_msg.get("tool_call_id", ""),
-                            "content": tool_msg.get("content", ""),
+                            "content": content,
                         }
                     )
                     i += 1
@@ -345,6 +357,43 @@ class AnthropicProvider:
             i += 1
 
         return "\n\n".join(system_parts), _merge_consecutive(converted)
+
+    @staticmethod
+    def _convert_content_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Convert OpenAI-format content parts to Anthropic format.
+
+        Transforms ``image_url`` parts (with ``data:`` URIs) to Anthropic's
+        ``image`` source blocks.  Text parts pass through unchanged.
+        """
+        converted: list[dict[str, Any]] = []
+        for part in parts:
+            if part.get("type") == "image_url":
+                url = part.get("image_url", {}).get("url", "")
+                if url.startswith("data:") and "," in url:
+                    # Parse "data:image/png;base64,<data>"
+                    header, _, b64data = url.partition(",")
+                    media_type = header.split(":", 1)[1].split(";", 1)[0]
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64data,
+                            },
+                        }
+                    )
+                else:
+                    # URL-based image — pass as Anthropic URL source
+                    converted.append(
+                        {
+                            "type": "image",
+                            "source": {"type": "url", "url": url},
+                        }
+                    )
+            else:
+                converted.append(part)
+        return converted
 
     # -- tool conversion -----------------------------------------------------
 

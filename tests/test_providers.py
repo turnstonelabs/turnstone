@@ -2049,3 +2049,138 @@ class TestModelCapabilitiesToolSearch:
 
         caps = ModelCapabilities()
         assert caps.supports_tool_search is False
+
+
+# ---------------------------------------------------------------------------
+# Vision support
+# ---------------------------------------------------------------------------
+
+
+class TestVisionCapabilities:
+    """Test supports_vision flag across providers."""
+
+    def test_default_is_false(self) -> None:
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        caps = ModelCapabilities()
+        assert caps.supports_vision is False
+
+    def test_openai_commercial_supports_vision(self) -> None:
+        provider = OpenAIProvider()
+        for model in ("gpt-5", "gpt-5-mini", "gpt-5.4", "o3", "o4-mini"):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_vision is True, f"{model} should support vision"
+
+    def test_openai_default_no_vision(self) -> None:
+        """Unknown models (local servers) default to no vision."""
+        provider = OpenAIProvider()
+        caps = provider.get_capabilities("some-local-model")
+        assert caps.supports_vision is False
+
+    def test_anthropic_supports_vision(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        for model in ("claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"):
+            caps = provider.get_capabilities(model)
+            assert caps.supports_vision is True, f"{model} should support vision"
+
+    def test_anthropic_default_supports_vision(self) -> None:
+        """Anthropic default (unknown Claude model) supports vision."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-unknown-9")
+        assert caps.supports_vision is True
+
+
+class TestAnthropicVisionConversion:
+    """Test image content conversion in _convert_messages."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_tool_result_with_image_content(self) -> None:
+        """Tool result with list content converts image_url to Anthropic image."""
+        messages = [
+            {"role": "user", "content": "Read this image"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "img.png"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [
+                    {"type": "text", "text": "Image file: img.png (1024 bytes)"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+                    },
+                ],
+            },
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # Tool result should be in a user message
+        tool_user_msg = converted[2]
+        assert tool_user_msg["role"] == "user"
+        tool_result = tool_user_msg["content"][0]
+        assert tool_result["type"] == "tool_result"
+        assert tool_result["tool_use_id"] == "call_1"
+        # Content should be a list with converted image block
+        content = tool_result["content"]
+        assert isinstance(content, list)
+        assert content[0] == {"type": "text", "text": "Image file: img.png (1024 bytes)"}
+        assert content[1]["type"] == "image"
+        assert content[1]["source"]["type"] == "base64"
+        assert content[1]["source"]["media_type"] == "image/png"
+        assert content[1]["source"]["data"] == "iVBORw0KGgo="
+
+    def test_tool_result_with_string_content_unchanged(self) -> None:
+        """Tool result with plain string content is unchanged."""
+        messages = [
+            {"role": "user", "content": "Read file"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "function": {"name": "read_file", "arguments": '{"path": "f.py"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "   1\tprint('hello')",
+            },
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        tool_result = converted[2]["content"][0]
+        assert tool_result["content"] == "   1\tprint('hello')"
+
+    def test_convert_content_parts_static_method(self) -> None:
+        """_convert_content_parts handles both image_url and text."""
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        parts = [
+            {"type": "text", "text": "description"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"},
+            },
+        ]
+        result = AnthropicProvider._convert_content_parts(parts)
+        assert result[0] == {"type": "text", "text": "description"}
+        assert result[1]["type"] == "image"
+        assert result[1]["source"]["media_type"] == "image/jpeg"
+        assert result[1]["source"]["data"] == "/9j/4AAQ"
