@@ -283,7 +283,7 @@ class ClusterCollector:
             node.health = health
             node.aggregate = aggregate
             # Build new workstream map
-            old_ids = set(node.workstreams.keys())
+            old_ids = {k for k in node.workstreams if k}
             new_ws: dict[str, dict[str, Any]] = {}
             for ws in ws_list:
                 ws_id = ws.get("id", "")
@@ -294,7 +294,7 @@ class ClusterCollector:
                 new_ws[ws_id] = ws
             new_ids = set(new_ws.keys())
             # Detect additions not yet known to SSE clients
-            for ws_id in new_ids - old_ids:
+            for ws_id in sorted(new_ids - old_ids):
                 ws = new_ws[ws_id]
                 pending_events.append(
                     {
@@ -305,7 +305,7 @@ class ClusterCollector:
                     }
                 )
             # Detect removals
-            for ws_id in old_ids - new_ids:
+            for ws_id in sorted(old_ids - new_ids):
                 pending_events.append({"type": "ws_closed", "ws_id": ws_id})
             node.workstreams = new_ws
         # Fan out diffs to SSE listeners outside the lock
