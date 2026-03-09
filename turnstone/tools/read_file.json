@@ -1,6 +1,6 @@
 {
   "name": "read_file",
-  "description": "Read the contents of a file. Returns numbered lines for text files, or the image for supported image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO). Must be called before edit_file on the same path.",
+  "description": "Read the contents of a file. Returns numbered lines for text files. For image files (PNG, JPEG, GIF, WebP, BMP, TIFF, ICO), returns the image content if the model supports vision, or a text description otherwise. The offset and limit parameters apply to text files only.",
   "parameters": {
     "type": "object",
     "properties": {

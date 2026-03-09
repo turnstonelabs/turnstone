@@ -186,7 +186,9 @@ def load_model_registry(
             model=model_name,
             context_window=entry.get("context_window", context_window),
             provider=entry.get("provider", "openai"),
-            capabilities=entry.get("capabilities", {}),
+            capabilities=entry.get("capabilities", {})
+            if isinstance(entry.get("capabilities"), dict)
+            else {},
         )
 
     # Ensure a "default" entry from CLI args

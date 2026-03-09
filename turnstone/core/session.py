@@ -2340,8 +2340,9 @@ class ChatSession:
         if not caps.supports_vision:
             try:
                 size = os.path.getsize(path)
-            except OSError:
-                return call_id, f"Error: {path} not found"
+            except OSError as e:
+                self._read_files.discard(resolved)
+                return call_id, f"Error: {path}: {e}"
             self._read_files.add(resolved)
             desc = f"image (no vision, {size:,} bytes)"
             self.ui.on_tool_result(call_id, "read_file", desc)
@@ -2361,7 +2362,7 @@ class ChatSession:
             return call_id, f"Error reading {path}: {e}"
 
         if len(raw) > _IMAGE_SIZE_CAP:
-            self._read_files.add(resolved)
+            self._read_files.discard(resolved)
             size_mb = len(raw) / (1024 * 1024)
             cap_mb = _IMAGE_SIZE_CAP / (1024 * 1024)
             return call_id, (

@@ -2,10 +2,9 @@
 
 import base64
 import json
-import os
 from unittest.mock import MagicMock, patch
 
-from turnstone.core.session import ChatSession, _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP
+from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 
 
 class NullUI:

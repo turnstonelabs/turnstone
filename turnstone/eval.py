@@ -267,7 +267,15 @@ class HeadlessSession(ChatSession):
             with _suppress_stdout():
                 results, _ = self._execute_tools(assistant_msg["tool_calls"])
 
-            for tc, (tc_id, output) in zip(assistant_msg["tool_calls"], results, strict=False):
+            for tc, (tc_id, raw_output) in zip(assistant_msg["tool_calls"], results, strict=False):
+                # Flatten list content (image tool results) to text for logging
+                if isinstance(raw_output, list):
+                    output = " ".join(
+                        p.get("text", "[image]") if p.get("type") == "text" else "[image]"
+                        for p in raw_output
+                    )
+                else:
+                    output = raw_output
                 func_name = tc["function"]["name"]
                 args: dict[str, Any]
                 try:
@@ -302,7 +310,7 @@ class HeadlessSession(ChatSession):
                 tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc_id,
-                    "content": output,
+                    "content": raw_output,
                 }
                 self.messages.append(tool_msg)
                 self._msg_tokens.append(max(1, int(len(output) / self._chars_per_token)))
