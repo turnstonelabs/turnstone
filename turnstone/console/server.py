@@ -257,11 +257,11 @@ async def cluster_events_sse(request: Request) -> Response:
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
         try:
-            # Snapshot first, then register — events between snapshot and
-            # registration are already captured by the snapshot, so no gap.
-            snap = await loop.run_in_executor(None, collector.get_snapshot)
+            # Atomic snapshot+register — no event gap possible.
+            snap = await loop.run_in_executor(
+                None, collector.get_snapshot_and_register, client_queue
+            )
             snap["type"] = "snapshot"
-            collector.register_listener(client_queue)
             yield {"data": json.dumps(snap)}
 
             while True:
@@ -607,10 +607,19 @@ async def _proxy_sse(
                     )
                     yield f"event: error\ndata: Upstream returned status {response.status_code}\n\n".encode()
                     return
-                async for chunk in response.aiter_bytes():
+                byte_stream = response.aiter_bytes().__aiter__()
+                while True:
                     if await request.is_disconnected():
                         return
-                    yield chunk
+                    try:
+                        chunk = await asyncio.wait_for(byte_stream.__anext__(), timeout=3)
+                        yield chunk
+                    except TimeoutError:
+                        # No upstream data within 3s — send a keepalive
+                        # comment so the browser doesn't drop the connection.
+                        yield b": proxy-ping\n\n"
+                    except StopAsyncIteration:
+                        return
         except httpx.HTTPError:
             log.debug("SSE proxy stream ended for %s", target)
 

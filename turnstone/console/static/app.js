@@ -121,8 +121,17 @@ function patchClusterState(data) {
   } else {
     return;
   }
-  recomputeOverview();
-  renderFromState();
+  scheduleRender();
+}
+
+var _renderTimer = null;
+function scheduleRender() {
+  if (_renderTimer) return;
+  _renderTimer = requestAnimationFrame(function () {
+    _renderTimer = null;
+    recomputeOverview();
+    renderFromState();
+  });
 }
 
 function recomputeOverview() {

@@ -462,47 +462,65 @@ class ClusterCollector:
         all nodes with their workstreams plus pre-computed overview aggregates.
         """
         with self._lock:
-            nodes_out = []
-            states: dict[str, int] = {
-                "running": 0,
-                "thinking": 0,
-                "attention": 0,
-                "idle": 0,
-                "error": 0,
-            }
-            total_tokens = 0
-            total_tool_calls = 0
-            total_ws = 0
-            versions: set[str] = set()
+            return self._build_snapshot_locked()
 
-            for node in self._nodes.values():
-                ws_list = []
-                for ws in node.workstreams.values():
-                    ws_list.append(dict(ws))
-                    s = ws.get("state", "idle")
-                    states[s] = states.get(s, 0) + 1
-                    total_ws += 1
+    def get_snapshot_and_register(self, q: queue.Queue[dict[str, Any]]) -> dict[str, Any]:
+        """Build snapshot and register listener atomically.
 
-                total_tokens += node.aggregate.get("total_tokens", 0)
-                total_tool_calls += node.aggregate.get("total_tool_calls", 0)
-                ver = node.health.get("version", "")
-                if ver:
-                    versions.add(ver)
+        Acquiring both locks ensures no event can be published between
+        the snapshot read and the listener registration — the client
+        receives the snapshot followed by every subsequent event with
+        no gap.
+        """
+        with self._lock:
+            snap = self._build_snapshot_locked()
+            with self._listeners_lock:
+                self._listeners.append(q)
+        return snap
 
-                nodes_out.append(
-                    {
-                        "node_id": node.node_id,
-                        "server_url": node.server_url,
-                        "max_ws": node.max_ws,
-                        "reachable": node.reachable,
-                        "version": ver,
-                        "health": dict(node.health),
-                        "aggregate": dict(node.aggregate),
-                        "workstreams": ws_list,
-                    }
-                )
+    def _build_snapshot_locked(self) -> dict[str, Any]:
+        """Build snapshot data — caller must hold ``_lock``."""
+        nodes_out = []
+        states: dict[str, int] = {
+            "running": 0,
+            "thinking": 0,
+            "attention": 0,
+            "idle": 0,
+            "error": 0,
+        }
+        total_tokens = 0
+        total_tool_calls = 0
+        total_ws = 0
+        versions: set[str] = set()
 
-            node_count = len(self._nodes)
+        for node in self._nodes.values():
+            ws_list = []
+            for ws in node.workstreams.values():
+                ws_list.append(dict(ws))
+                s = ws.get("state", "idle")
+                states[s] = states.get(s, 0) + 1
+                total_ws += 1
+
+            total_tokens += node.aggregate.get("total_tokens", 0)
+            total_tool_calls += node.aggregate.get("total_tool_calls", 0)
+            ver = node.health.get("version", "")
+            if ver:
+                versions.add(ver)
+
+            nodes_out.append(
+                {
+                    "node_id": node.node_id,
+                    "server_url": node.server_url,
+                    "max_ws": node.max_ws,
+                    "reachable": node.reachable,
+                    "version": ver,
+                    "health": dict(node.health),
+                    "aggregate": dict(node.aggregate),
+                    "workstreams": ws_list,
+                }
+            )
+
+        node_count = len(self._nodes)
 
         return {
             "nodes": nodes_out,

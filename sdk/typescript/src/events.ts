@@ -1,3 +1,5 @@
+import type { ClusterOverviewResponse, ClusterSnapshotNode } from "./types.js";
+
 // ---------------------------------------------------------------------------
 // Server SSE events
 // ---------------------------------------------------------------------------
@@ -193,8 +195,8 @@ export interface ClusterWsRenameEvent {
 
 export interface ClusterSnapshotEvent {
   type: "snapshot";
-  nodes: Array<Record<string, unknown>>;
-  overview: Record<string, unknown>;
+  nodes: ClusterSnapshotNode[];
+  overview: ClusterOverviewResponse;
   timestamp: number;
 }
 
