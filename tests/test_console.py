@@ -202,6 +202,68 @@ class TestCollectorPolling:
         # Should not raise
         c._apply_poll("unknown", _dashboard_response(), {})
 
+    def test_apply_poll_emits_ws_created_for_new_workstream(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        dashboard = _dashboard_response(
+            workstreams=[{"id": "ws1", "name": "new-task", "state": "idle"}]
+        )
+        c._apply_poll("node-a", dashboard, {})
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_created"
+        assert event["ws_id"] == "ws1"
+        assert event["name"] == "new-task"
+        assert event["node_id"] == "node-a"
+
+    def test_apply_poll_emits_ws_closed_for_removed_workstream(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "old", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_poll("node-a", _dashboard_response(), {})
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_closed"
+        assert event["ws_id"] == "ws1"
+
+    def test_apply_poll_no_events_when_unchanged(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "same", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        dashboard = _dashboard_response(
+            workstreams=[{"id": "ws1", "name": "same", "state": "running"}]
+        )
+        c._apply_poll("node-a", dashboard, {})
+
+        assert q.empty()
+
+    def test_apply_poll_skips_empty_id_workstream(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        dashboard = _dashboard_response(workstreams=[{"name": "no-id", "state": "idle"}])
+        c._apply_poll("node-a", dashboard, {})
+
+        assert q.empty()
+        assert len(c._nodes["node-a"].workstreams) == 0
+
 
 class TestCollectorEvents:
     """Real-time event handling from cluster channel."""

@@ -206,9 +206,17 @@ class Bridge:
             data = resp.json()
             for ws in data.get("workstreams", []):
                 ws_id = ws["id"]
-                log.info("Recovered workstream %s (%s)", ws_id, ws.get("name", ""))
+                ws_name = ws.get("name", "")
+                log.info("Recovered workstream %s (%s)", ws_id, ws_name)
                 self._broker.set_ws_owner(ws_id, self._node_id)
                 self._start_ws_sse(ws_id)
+                self._publish_cluster(
+                    WorkstreamCreatedEvent(
+                        ws_id=ws_id,
+                        name=ws_name,
+                        node_id=self._node_id,
+                    )
+                )
         except Exception as exc:
             log.warning("Could not recover workstreams: %s", exc)
 

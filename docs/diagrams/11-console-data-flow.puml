@@ -78,7 +78,19 @@ activate NodeA
 NodeA --> CC : {status:"ok", version:"0.3.0",\nmodel:"...", workstreams:{...}}
 deactivate NodeA
 
+CC -> CC : Diff old vs new workstream IDs
 CC -> CC : Replace NodeSnapshot["nodeA"]\n.workstreams, .health, .aggregate
+CC -> CC : _fanout(ws_created) for\nnewly appeared workstreams
+CC -> CC : _fanout(ws_closed) for\nremoved workstreams
+
+note right of CC
+  Poll-diff fanout ensures
+  browser SSE clients learn
+  about workstreams that
+  appeared without a real-time
+  cluster event (e.g. bridge
+  startup recovery).
+end note
 
 CC -x NodeB : (SKIPPED: sim:// URL)
 

@@ -1186,6 +1186,9 @@ for existing workstreams are auto-routed via `turnstone:ws:{ws_id}` ownership ke
 If a bridge picks up a shared-queue message for a workstream owned by another node, it
 re-routes to that node's queue (1 extra hop). Bridges publish heartbeats to
 `turnstone:node:{node_id}` with configurable TTL for node discovery.
+On startup, `_recover_workstreams` re-registers ownership of existing
+workstreams and publishes `WorkstreamCreatedEvent` to the cluster channel
+so the console collector picks them up immediately.
 
 ### Cluster Console
 
@@ -1211,7 +1214,10 @@ The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
 endpoint uses `EventSourceResponse` with the same listener queue pattern as
 the main server. `ClusterCollector`'s background threads (event subscriber,
 node discovery, poll loop) use sync Redis clients and `ThreadPoolExecutor`
-for parallel HTTP polling.
+for parallel HTTP polling. The poll loop diffs workstream IDs between poll
+cycles and fans out synthetic `ws_created`/`ws_closed` SSE events for any
+changes, ensuring browser clients stay in sync even when real-time cluster
+events are missed (e.g. bridge startup recovery).
 
 The console has two write-path capabilities:
 

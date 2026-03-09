@@ -273,6 +273,7 @@ class ClusterCollector:
         """Apply polled data to the in-memory node snapshot."""
         ws_list = dashboard.get("workstreams", [])
         aggregate = dashboard.get("aggregate", {})
+        pending_events: list[dict[str, Any]] = []
         with self._lock:
             node = self._nodes.get(node_id)
             if not node:
@@ -281,12 +282,35 @@ class ClusterCollector:
             node.reachable = True
             node.health = health
             node.aggregate = aggregate
-            # Replace workstreams entirely from the authoritative poll
-            node.workstreams = {}
+            # Build new workstream map
+            old_ids = set(node.workstreams.keys())
+            new_ws: dict[str, dict[str, Any]] = {}
             for ws in ws_list:
+                ws_id = ws.get("id", "")
+                if not ws_id:
+                    continue
                 ws["node"] = node_id
                 ws["server_url"] = node.server_url
-                node.workstreams[ws.get("id", "")] = ws
+                new_ws[ws_id] = ws
+            new_ids = set(new_ws.keys())
+            # Detect additions not yet known to SSE clients
+            for ws_id in new_ids - old_ids:
+                ws = new_ws[ws_id]
+                pending_events.append(
+                    {
+                        "type": "ws_created",
+                        "ws_id": ws_id,
+                        "name": ws.get("name", ""),
+                        "node_id": node_id,
+                    }
+                )
+            # Detect removals
+            for ws_id in old_ids - new_ids:
+                pending_events.append({"type": "ws_closed", "ws_id": ws_id})
+            node.workstreams = new_ws
+        # Fan out diffs to SSE listeners outside the lock
+        for event in pending_events:
+            self._fanout(event)
 
     # -- query methods (thread-safe) -----------------------------------------
 
