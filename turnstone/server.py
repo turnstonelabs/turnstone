@@ -1594,6 +1594,10 @@ def main() -> None:
             ws = manager.create(
                 ui_factory=lambda wid: WebUI(ws_id=wid),
             )
+            # Restored workstreams run unattended — auto-approve tool calls
+            # to avoid blocking forever on approval with no connected user.
+            if isinstance(ws.ui, WebUI):
+                ws.ui.auto_approve = True
             if ws.session:
                 ws.session.resume(ws_id)
                 dispatch_fn = _make_watch_dispatch(ws, ws.session, ws.ui)

@@ -19,7 +19,7 @@
       },
       "stop_on": {
         "type": "string",
-        "description": "Python expression evaluated after each poll. Variables: output (str), data (parsed JSON or None), exit_code (int), prev_output (str|None), changed (bool). Truthy result fires the watch and auto-cancels. Omit to fire on any output change. Examples: 'data[\"state\"] == \"MERGED\"', '\"error\" in output', 'exit_code != 0'."
+        "description": "Python expression evaluated after each poll. Variables: output (str), data (parsed JSON or None), exit_code (int), prev_output (str|None), changed (bool). Truthy result fires the watch and auto-cancels. Omit for change-detection mode (first poll establishes a baseline, subsequent polls fire when output differs). Examples: 'data[\"state\"] == \"MERGED\"', '\"error\" in output', 'exit_code != 0'."
       },
       "name": {
         "type": "string",

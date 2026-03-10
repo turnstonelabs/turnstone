@@ -328,6 +328,11 @@ class WatchRunner:
         # Evaluate condition
         fired, reason = evaluate_condition(stop_on, output, exit_code, prev_output)
 
+        # Treat condition evaluation errors as terminal — don't silently
+        # loop until max_polls while the user/model never sees the problem.
+        if not fired and reason.startswith("condition error:"):
+            fired = True
+
         # Check max polls
         is_final = fired or poll_count >= max_polls
         if not fired and poll_count >= max_polls:

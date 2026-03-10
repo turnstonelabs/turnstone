@@ -157,7 +157,7 @@ note over UI, Storage
   **GET /v1/api/watches[?ws_id=X]**
   List active watches (for node or workstream)
 
-  **DELETE /v1/api/watches/{watch_id}**
+  **POST /v1/api/watches/{watch_id}/cancel**
   Cancel a watch (sets active=False)
 
   Both require write scope
