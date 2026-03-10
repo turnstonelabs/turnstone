@@ -59,7 +59,7 @@
       "user_prompt": "Change the default port from 8000 to 9000 in both server.py and config.py",
       "setup": {
         "files": {
-          "server.py": "from config import PORT\n\ndef run():\n    print(f'Listening on port {PORT}')\n",
+          "server.py": "import socket\n\ndef run():\n    sock = socket.socket()\n    sock.bind(('localhost', 8000))\n    print('Server running on port 8000')\n",
           "config.py": "PORT = 8000\nHOST = 'localhost'\n"
         }
       },
@@ -126,7 +126,7 @@
           "app.py": "import sqlite3\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\nDB = 'data.db'\n\ndef get_db():\n    return sqlite3.connect(DB)\n\n@app.route('/users')\ndef list_users():\n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    db.close()\n    return jsonify(users)\n\n@app.route('/users/<int:uid>')\ndef get_user(uid):\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()\n    db.close()\n    return jsonify(user)\n\nif __name__ == '__main__':\n    app.run(port=8000)\n"
         }
       },
-      "expected_actions": [{ "tool": "plan" }],
+      "expected_actions": [{ "tool": "create_plan" }],
       "match_mode": "subset"
     },
     {
@@ -173,6 +173,24 @@
       "user_prompt": "Look up the man page for tar and tell me what the --xattrs flag does",
       "expected_actions": [
         { "tool": "man", "args_pattern": { "page": "tar" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "math-calculation",
+      "description": "Use the math tool for precise calculations, not bash or mental math",
+      "user_prompt": "What is 2^64 - 1? Use the math tool to calculate it precisely.",
+      "expected_actions": [
+        { "tool": "math", "args_pattern": { "code": "2.*64" } }
+      ],
+      "match_mode": "subset"
+    },
+    {
+      "id": "web-search-query",
+      "description": "Use web_search for general knowledge lookups, not web_fetch",
+      "user_prompt": "Search the web for the current population of Tokyo",
+      "expected_actions": [
+        { "tool": "web_search", "args_pattern": { "query": "Tokyo" } }
       ],
       "match_mode": "subset"
     }
