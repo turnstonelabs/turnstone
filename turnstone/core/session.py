@@ -2096,7 +2096,7 @@ class ChatSession:
 
     def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a planning agent for approval."""
-        goal = (args.get("goal") or args.get("prompt") or "").strip()
+        goal = args.get("goal", "").strip()
         if not goal:
             return {
                 "call_id": call_id,
@@ -2113,7 +2113,7 @@ class ChatSession:
             "header": "\u2699 create_plan (planning agent)",
             "preview": f"    {DIM}{preview_text}{RESET}",
             "needs_approval": True,
-            "approval_label": "plan",
+            "approval_label": "create_plan",
             "execute": self._exec_plan,
             "prompt": goal,
         }

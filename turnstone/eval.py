@@ -251,9 +251,7 @@ class HeadlessSession(ChatSession):
             elapsed = time.monotonic() - t0
 
             if result.usage:
-                # Prompt tokens: use last turn's value (each turn re-sends
-                # the full conversation, so summing would over-count).
-                self._total_usage["prompt"] = result.usage.prompt_tokens
+                self._total_usage["prompt"] += result.usage.prompt_tokens
                 self._total_usage["completion"] += result.usage.completion_tokens
 
             assistant_msg: dict[str, Any] = {
@@ -430,6 +428,10 @@ def _run_single_test(
                     # shutdown(wait=False) lets the TimeoutError propagate
                     # immediately instead of blocking until the thread finishes.
                     # The orphaned thread will eventually exit on its own.
+                    # Note: threads cannot be force-killed in CPython. In the
+                    # parallel path this is moot since each test runs in a
+                    # subprocess that can be terminated. The serial path
+                    # accepts the leak as a trade-off for simpler code.
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = None
                     raise TimeoutError(f"Test timed out after {test_timeout}s") from None
@@ -788,7 +790,9 @@ def _run_iteration_parallel(
 
         for future in as_completed(futures):
             try:
-                result = future.result()
+                # Workers enforce their own test_timeout internally;
+                # this outer timeout catches process-level hangs.
+                result = future.result(timeout=test_timeout + 30)
             except Exception as exc:
                 item = futures[future]
                 result = {
@@ -1038,6 +1042,7 @@ def _run_iteration(
                                 "extra_tools": [],
                                 "detail": "Skipped (fast-fail)",
                                 "tool_sequence": [],
+                                "tool_args": [],
                                 "elapsed": 0,
                                 "skipped": True,
                             }
