@@ -739,32 +739,25 @@ class TestWebUIFanOut:
 
     def test_slow_consumer_does_not_block(self):
         """A full queue doesn't block the producer or starve other listeners."""
-        import queue as queue_mod
-
         from turnstone.server import WebUI
 
         ui = WebUI(ws_id="test")
         slow = ui._register_listener()
         fast = ui._register_listener()
 
-        # Fill the slow consumer's queue to capacity (maxsize=500)
+        # Fill only the slow consumer's queue directly to capacity
         for i in range(500):
-            ui._enqueue({"type": "content", "text": f"fill-{i}"})
+            slow.put_nowait({"type": "content", "text": f"fill-{i}"})
 
-        # Both should have 500 events
         assert slow.qsize() == 500
-        assert fast.qsize() == 500
+        assert fast.qsize() == 0
 
-        # Next event should be dropped on the full queue but delivered to fast
-        ui._enqueue({"type": "content", "text": "overflow"})
+        # Enqueue via fan-out — slow drops (full), fast receives
+        event = {"type": "content", "text": "overflow"}
+        ui._enqueue(event)
         assert slow.qsize() == 500  # still full, overflow dropped
-        assert fast.qsize() == 500  # also full, overflow dropped
-
-        # Drain one from fast, send another — fast gets it, slow doesn't
-        fast.get_nowait()
-        ui._enqueue({"type": "content", "text": "after-drain"})
-        assert fast.qsize() == 500
-        assert slow.qsize() == 500
+        assert fast.qsize() == 1
+        assert fast.get_nowait() == event
 
     def test_unregister_idempotent(self):
         """Double unregister does not raise."""

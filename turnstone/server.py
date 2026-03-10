@@ -117,9 +117,8 @@ class WebUI:
 
     def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
         """Remove a client queue from the listeners list."""
-        with self._listeners_lock:
-            with contextlib.suppress(ValueError):
-                self._listeners.remove(client_queue)
+        with self._listeners_lock, contextlib.suppress(ValueError):
+            self._listeners.remove(client_queue)
 
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel."""
@@ -523,6 +522,8 @@ async def events_sse(request: Request) -> Response:
                     event = await loop.run_in_executor(
                         None, functools.partial(client_queue.get, timeout=5)
                     )
+                    if event.get("type") == "ws_closed":
+                        return
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
                     pass

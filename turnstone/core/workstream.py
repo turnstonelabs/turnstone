@@ -216,12 +216,18 @@ class WorkstreamManager:
             # Notify SSE listeners so generators exit promptly
             if hasattr(ws.ui, "_listeners_lock"):
                 import contextlib
-                import queue
+                import queue as _queue
 
-                with ws.ui._listeners_lock:  # type: ignore[attr-defined]
+                with ws.ui._listeners_lock:
                     for lq in ws.ui._listeners:  # type: ignore[attr-defined]
-                        with contextlib.suppress(queue.Full):
+                        try:
                             lq.put_nowait({"type": "ws_closed"})
+                        except _queue.Full:
+                            with contextlib.suppress(_queue.Empty):
+                                lq.get_nowait()
+                            with contextlib.suppress(_queue.Full):
+                                lq.put_nowait({"type": "ws_closed"})
+                    ws.ui._listeners.clear()  # type: ignore[attr-defined]
         # Release MCP listener registration
         if ws.session and hasattr(ws.session, "close"):
             ws.session.close()
