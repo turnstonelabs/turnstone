@@ -1,0 +1,15 @@
+{
+  "name": "create_plan",
+  "description": "Create a structured plan before taking action. An autonomous agent explores the available context, identifies what needs to change, and writes a step-by-step plan. Call this tool when the user asks to plan, design, or think through an approach, or when a task is complex, touches multiple areas, or has unclear scope.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "goal": {
+        "type": "string",
+        "description": "The goal and scope of the plan, including any constraints."
+      }
+    },
+    "required": ["goal"]
+  },
+  "primary_key": "goal"
+}

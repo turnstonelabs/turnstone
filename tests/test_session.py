@@ -203,8 +203,8 @@ class TestPlanExec:
                         "id": tc_id,
                         "type": "function",
                         "function": {
-                            "name": "plan",
-                            "arguments": json.dumps({"prompt": prior_prompt}),
+                            "name": "create_plan",
+                            "arguments": json.dumps({"goal": prior_prompt}),
                         },
                     }
                 ],
@@ -239,7 +239,7 @@ class TestPlanExec:
             m for m in messages if m["role"] == "assistant" and m.get("tool_calls")
         ]
         assert len(assistant_with_tc) == 1
-        assert assistant_with_tc[0]["tool_calls"][0]["function"]["name"] == "plan"
+        assert assistant_with_tc[0]["tool_calls"][0]["function"]["name"] == "create_plan"
 
         # The real tool result is forwarded with its original content
         tool_msgs = [m for m in messages if m["role"] == "tool"]

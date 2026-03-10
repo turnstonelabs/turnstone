@@ -547,13 +547,15 @@ class ChatSession:
                 "   write_file(path='hello.py', content='...')\n\n"
                 "Find something across files → search:\n"
                 "   search(query='test_')\n\n"
-                "Complex or multi-step task → plan first:\n"
-                "   plan(prompt='refactor database from API')\n\n"
+                "Plan, design, or think through an approach → create_plan:\n"
+                "   create_plan(goal='refactor database from API')\n\n"
                 "Run a command, git, or tests → bash:\n"
                 "   bash(command='git log -5')\n"
                 "   bash(command='pytest')\n\n"
                 "Retrieve a URL → web_fetch:\n"
                 "   web_fetch(url='https://example.com')\n\n"
+                "Search the web for information → web_search:\n"
+                "   web_search(query='current population of Tokyo')\n\n"
                 "Look up documentation → man:\n"
                 "   man(page='tar')",
             ]
@@ -1464,7 +1466,7 @@ class ChatSession:
         # Post-plan gate: prompt user on main thread after plan completes
         for i, item in enumerate(items):
             if (
-                item.get("func_name") == "plan"
+                item.get("func_name") == "create_plan"
                 and not item.get("error")
                 and not item.get("denied")
                 and not self.auto_approve
@@ -1544,7 +1546,7 @@ class ChatSession:
             "web_search": self._prepare_web_search,
             "tool_search": self._prepare_tool_search,
             "task": self._prepare_task,
-            "plan": self._prepare_plan,
+            "create_plan": self._prepare_plan,
             "remember": self._prepare_remember,
             "recall": self._prepare_recall,
             "forget": self._prepare_forget,
@@ -2094,26 +2096,26 @@ class ChatSession:
 
     def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a planning agent for approval."""
-        prompt = (args.get("prompt") or "").strip()
-        if not prompt:
+        goal = (args.get("goal") or args.get("prompt") or "").strip()
+        if not goal:
             return {
                 "call_id": call_id,
-                "func_name": "plan",
-                "header": "\u2717 plan: empty prompt",
+                "func_name": "create_plan",
+                "header": "\u2717 create_plan: empty goal",
                 "preview": "",
                 "needs_approval": False,
-                "error": "Error: empty prompt",
+                "error": "Error: empty goal",
             }
-        preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
+        preview_text = goal[:300] + ("..." if len(goal) > 300 else "")
         return {
             "call_id": call_id,
-            "func_name": "plan",
-            "header": "\u2699 plan (planning agent)",
+            "func_name": "create_plan",
+            "header": "\u2699 create_plan (planning agent)",
             "preview": f"    {DIM}{preview_text}{RESET}",
             "needs_approval": True,
             "approval_label": "plan",
             "execute": self._exec_plan,
-            "prompt": prompt,
+            "prompt": goal,
         }
 
     def _prepare_remember(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -2577,7 +2579,7 @@ class ChatSession:
                 tool_name = tc_dict["function"]["name"]
 
                 # Guard 1: block recursive agent calls.
-                if tool_name in ("task", "plan"):
+                if tool_name in ("task", "create_plan"):
                     output = "Error: agents cannot spawn further agents"
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
@@ -2698,7 +2700,7 @@ class ChatSession:
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
-                    if tc.get("function", {}).get("name") == "plan":
+                    if tc.get("function", {}).get("name") == "create_plan":
                         tc_id = tc["id"]
                         for j in range(i + 1, len(self.messages)):
                             if (
