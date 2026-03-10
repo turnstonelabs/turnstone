@@ -82,8 +82,8 @@ class WebUI:
 
     def __init__(self, ws_id: str = "") -> None:
         self.ws_id = ws_id
-        self._event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-        self._sse_generation = 0  # incremented on each new SSE connection
+        self._listeners: list[queue.Queue[dict[str, Any]]] = []
+        self._listeners_lock = threading.Lock()
         self._approval_event = threading.Event()
         self._approval_result: tuple[bool, str | None] = (False, None)
         self._pending_approval: dict[str, Any] | None = None  # re-sent on SSE reconnect
@@ -102,7 +102,24 @@ class WebUI:
         self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
 
     def _enqueue(self, data: dict[str, Any]) -> None:
-        self._event_queue.put(data)
+        with self._listeners_lock:
+            snapshot = list(self._listeners)
+        for lq in snapshot:
+            with contextlib.suppress(queue.Full):
+                lq.put_nowait(data)
+
+    def _register_listener(self) -> queue.Queue[dict[str, Any]]:
+        """Create a per-client queue and register it as a listener."""
+        client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+        with self._listeners_lock:
+            self._listeners.append(client_queue)
+        return client_queue
+
+    def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
+        """Remove a client queue from the listeners list."""
+        with self._listeners_lock:
+            with contextlib.suppress(ValueError):
+                self._listeners.remove(client_queue)
 
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel."""
@@ -473,14 +490,8 @@ async def events_sse(request: Request) -> Response:
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
 
-    # Drain stale events so this client starts fresh.  A race with the
-    # worker thread is acceptable: worst case we discard one fresh event,
-    # and the client catches up via the history replay below.
-    while not ui._event_queue.empty():
-        try:
-            ui._event_queue.get_nowait()
-        except queue.Empty:
-            break
+    # Each client gets its own queue — no drain needed.
+    client_queue = ui._register_listener()
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         assert ws.session is not None
@@ -510,13 +521,14 @@ async def events_sse(request: Request) -> Response:
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(ui._event_queue.get, timeout=5)
+                        None, functools.partial(client_queue.get, timeout=5)
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
                     pass
         finally:
             _metrics.record_sse_disconnect()
+            ui._unregister_listener(client_queue)
 
     return EventSourceResponse(event_generator(), ping=5)
 

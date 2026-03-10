@@ -460,13 +460,13 @@ The server sends an SSE comment every 5 seconds when no events are pending:
 This prevents proxies and browsers from closing the connection due to
 inactivity.
 
-#### Generation mechanism
+#### Multi-consumer fan-out
 
-Each new SSE connection to a workstream increments an internal
-`_sse_generation` counter. The previous SSE handler detects the generation
-mismatch and exits its event loop, ensuring only one active SSE connection per
-workstream at a time. The event queue is drained of stale events before the new
-connection begins streaming.
+Each SSE connection to a workstream receives its own delivery queue.  Events
+produced by the worker thread are fanned out to all registered listener queues,
+so multiple consumers (browser, bridge, console proxy, SDK) can connect
+simultaneously and each receives every event.  On reconnect the client receives
+a full history replay, so no catch-up mechanism is needed.
 
 ---
 

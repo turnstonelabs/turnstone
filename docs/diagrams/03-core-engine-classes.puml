@@ -41,7 +41,7 @@ class "WorkstreamTerminalUI" as WsTermUI {
 }
 
 class "WebUI" as WebUI {
-    - _event_queue: Queue
+    - _listeners: list[Queue]
     - _approval_event: Event
     - _plan_event: Event
     - _ws_prompt_tokens: int

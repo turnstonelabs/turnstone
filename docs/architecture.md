@@ -1113,7 +1113,7 @@ context manager handles startup/shutdown (health monitor, MCP client,
 registry).
 
 Each workstream's `WebUI` has:
-- `_event_queue` (per-workstream SSE events, `queue.Queue`)
+- `_listeners` (per-client SSE queues, fan-out on `_enqueue()`)
 - `_approval_event` / `_plan_event` (`threading.Event` for blocking)
 - `_global_queue` (class variable, shared, for state broadcasts)
 
