@@ -1,0 +1,36 @@
+{
+  "name": "watch",
+  "description": "Set up periodic polling of a shell command within this workstream. Actions: 'create' starts a new watch, 'list' shows active watches, 'cancel' stops a watch. Watch results are injected into the conversation when the stop condition is met or output changes. Use for monitoring CI/CD, PR status, deployments, file changes, etc.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["create", "list", "cancel"],
+        "description": "Action to perform."
+      },
+      "command": {
+        "type": "string",
+        "description": "Shell command to poll (required for 'create')."
+      },
+      "poll_every": {
+        "type": "string",
+        "description": "Poll interval as duration (e.g., '30s', '5m', '1h'). Default: '5m'."
+      },
+      "stop_on": {
+        "type": "string",
+        "description": "Python expression evaluated after each poll. Variables: output (str), data (parsed JSON or None), exit_code (int), prev_output (str|None), changed (bool). Truthy result fires the watch and auto-cancels. Omit to fire on any output change. Examples: 'data[\"state\"] == \"MERGED\"', '\"error\" in output', 'exit_code != 0'."
+      },
+      "name": {
+        "type": "string",
+        "description": "Human-readable name (e.g., 'pr-review'). Required for 'create', used as identifier for 'cancel'."
+      },
+      "max_polls": {
+        "type": "integer",
+        "description": "Max poll cycles before auto-cancel. Default: 100."
+      }
+    },
+    "required": ["action"]
+  },
+  "primary_key": "command"
+}

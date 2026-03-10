@@ -15,6 +15,7 @@ import dataclasses
 import json
 import mimetypes
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -222,6 +223,10 @@ class ChatSession:
         self._assistant_pending_tokens = 0
         self.creative_mode = False
         self._notify_count = 0
+        # Watch support: server-level runner injected via set_watch_runner()
+        self._watch_runner: Any = None  # WatchRunner | None
+        self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._watch_dispatch_depth = 0
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -330,11 +335,32 @@ class ChatSession:
         else:
             self._tool_search = None
 
+    def set_watch_runner(self, runner: Any, dispatch_fn: Any = None) -> None:
+        """Inject the server-level WatchRunner (called after workstream setup).
+
+        If *dispatch_fn* is provided (the server passes one that can start
+        worker threads), it is registered directly.  Otherwise a simple
+        enqueue fallback is used — suitable only when ``send()`` is already
+        active (Path A).
+        """
+        self._watch_runner = runner
+        if dispatch_fn is not None:
+            runner.set_dispatch_fn(self._ws_id, dispatch_fn)
+        else:
+            pending = self._watch_pending
+
+            def _enqueue(msg: str) -> None:
+                pending.put({"message": msg})
+
+            runner.set_dispatch_fn(self._ws_id, _enqueue)
+
     def close(self) -> None:
         """Release resources (listener registrations, etc.)."""
         if self._mcp_client and self._mcp_refresh_cb:
             self._mcp_client.remove_listener(self._mcp_refresh_cb)
             self._mcp_refresh_cb = None
+        if self._watch_runner:
+            self._watch_runner.remove_dispatch_fn(self._ws_id)
 
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
@@ -766,6 +792,9 @@ class ChatSession:
                         self._title_generated = True
                         threading.Thread(target=self._generate_title, daemon=True).start()
                     self._emit_state("idle")
+                    # Dispatch any pending watch results (chains into
+                    # a new send() within the same worker thread).
+                    self._dispatch_pending_watch(self._watch_dispatch_depth)
                     break
 
                 # Execute tool calls (potentially in parallel)
@@ -1520,6 +1549,7 @@ class ChatSession:
             "recall": self._prepare_recall,
             "forget": self._prepare_forget,
             "notify": self._prepare_notify,
+            "watch": self._prepare_watch,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2956,6 +2986,289 @@ class ChatSession:
         msg = "Error: notification delivery failed"
         self.ui.on_tool_result(call_id, "notify", msg)
         return call_id, msg
+
+    # -- Watch tool ----------------------------------------------------------
+
+    def _prepare_watch(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        from turnstone.core.watch import (
+            MAX_INTERVAL,
+            MAX_WATCHES_PER_WS,
+            MIN_INTERVAL,
+            parse_duration,
+            validate_condition,
+        )
+
+        action = args.get("action", "")
+        if action == "list":
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": "\u23f1 watch: list",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_watch,
+                "action": "list",
+            }
+        if action == "cancel":
+            name = args.get("name", "")
+            if not name:
+                return {
+                    "call_id": call_id,
+                    "func_name": "watch",
+                    "header": "\u2717 watch cancel: missing name",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: 'name' is required for cancel",
+                }
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f'\u23f1 watch: cancel "{name}"',
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_watch,
+                "action": "cancel",
+                "watch_name": name,
+            }
+        if action != "create":
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 watch: unknown action '{action}'",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: unknown action '{action}'. Use create, list, or cancel.",
+            }
+
+        # --- action=create ---
+        command = sanitize_command(args.get("command", ""))
+        if not command:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": "\u2717 watch create: missing command",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: 'command' is required for create",
+            }
+        blocked = is_command_blocked(command)
+        if blocked:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 {blocked}",
+                "preview": "",
+                "needs_approval": False,
+                "error": blocked,
+            }
+
+        # Parse poll interval
+        poll_every_str = args.get("poll_every", "5m")
+        try:
+            interval_secs = parse_duration(poll_every_str)
+        except ValueError as exc:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 watch: invalid poll_every: {exc}",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: invalid poll_every: {exc}",
+            }
+        if interval_secs < MIN_INTERVAL:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 watch: interval too short (min {MIN_INTERVAL}s)",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: minimum poll interval is {MIN_INTERVAL}s",
+            }
+        if interval_secs > MAX_INTERVAL:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 watch: interval too long (max {MAX_INTERVAL}s)",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: maximum poll interval is {MAX_INTERVAL}s",
+            }
+
+        # Validate stop condition
+        stop_on = args.get("stop_on")
+        if stop_on is not None:
+            err = validate_condition(stop_on)
+            if err:
+                return {
+                    "call_id": call_id,
+                    "func_name": "watch",
+                    "header": f"\u2717 watch: {err}",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": f"Error: {err}",
+                }
+
+        # Check max watches limit and duplicate names
+        storage = get_storage()
+        existing: list[dict[str, Any]] = []
+        if storage:
+            existing = storage.list_watches_for_ws(self._ws_id)
+            if len(existing) >= MAX_WATCHES_PER_WS:
+                return {
+                    "call_id": call_id,
+                    "func_name": "watch",
+                    "header": f"\u2717 watch: limit reached ({MAX_WATCHES_PER_WS})",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": f"Error: maximum {MAX_WATCHES_PER_WS} active watches per workstream",
+                }
+
+        name = args.get("name", "")
+        if not name:
+            name = f"watch-{uuid.uuid4().hex[:4]}"
+        elif storage and any(w["name"] == name for w in existing):
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f'\u2717 watch: name "{name}" already in use',
+                "preview": "",
+                "needs_approval": False,
+                "error": f'Error: a watch named "{name}" already exists in this workstream',
+            }
+        max_polls = args.get("max_polls", 100)
+        try:
+            max_polls = int(max_polls)
+        except (ValueError, TypeError):
+            max_polls = 100
+
+        display_cmd = command.split("\n")[0]
+        condition_display = f", stop_on={stop_on}" if stop_on else ", on change"
+        return {
+            "call_id": call_id,
+            "func_name": "watch",
+            "header": f'\u23f1 watch: "{name}" every {poll_every_str}',
+            "preview": f"    {display_cmd}{condition_display}",
+            "needs_approval": True,
+            "approval_label": "watch",
+            "execute": self._exec_watch,
+            "action": "create",
+            "command": command,
+            "interval_secs": interval_secs,
+            "stop_on": stop_on,
+            "watch_name": name,
+            "max_polls": max_polls,
+        }
+
+    def _exec_watch(self, item: dict[str, Any]) -> tuple[str, str]:
+        from datetime import UTC, datetime, timedelta
+
+        call_id = item["call_id"]
+        action = item["action"]
+        storage = get_storage()
+
+        if action == "list":
+            if not storage:
+                msg = "No watches (storage unavailable)"
+                self.ui.on_tool_result(call_id, "watch", msg)
+                return call_id, msg
+            watches = storage.list_watches_for_ws(self._ws_id)
+            if not watches:
+                msg = "No active watches."
+                self.ui.on_tool_result(call_id, "watch", msg)
+                return call_id, msg
+            from turnstone.core.watch import format_interval
+
+            lines = []
+            for w in watches:
+                condition = w.get("stop_on") or "on change"
+                lines.append(
+                    f"  {w['name']} ({w['watch_id'][:8]}): "
+                    f"every {format_interval(w['interval_secs'])}, "
+                    f"poll #{w['poll_count']}/{w['max_polls']}, "
+                    f"condition: {condition}, "
+                    f"cmd: {w['command'][:60]}"
+                )
+            msg = "Active watches:\n" + "\n".join(lines)
+            self.ui.on_tool_result(call_id, "watch", msg)
+            return call_id, msg
+
+        if action == "cancel":
+            name = item.get("watch_name", "")
+            if not storage:
+                msg = "Error: storage unavailable"
+                self.ui.on_tool_result(call_id, "watch", msg)
+                return call_id, msg
+            watches = storage.list_watches_for_ws(self._ws_id)
+            target = None
+            for w in watches:
+                if w["name"] == name or w["watch_id"].startswith(name):
+                    target = w
+                    break
+            if target is None:
+                msg = f'Watch "{name}" not found.'
+                self.ui.on_tool_result(call_id, "watch", msg)
+                return call_id, msg
+            storage.update_watch(target["watch_id"], active=False, next_poll="")
+            msg = f'Watch "{target["name"]}" cancelled.'
+            self.ui.on_tool_result(call_id, "watch", msg)
+            return call_id, msg
+
+        # action == "create"
+        if not storage:
+            msg = "Error: storage unavailable"
+            self.ui.on_tool_result(call_id, "watch", msg)
+            return call_id, msg
+
+        watch_id = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        next_poll = now + timedelta(seconds=item["interval_secs"])
+        storage.create_watch(
+            watch_id=watch_id,
+            ws_id=self._ws_id,
+            node_id=self._node_id or "",
+            name=item["watch_name"],
+            command=item["command"],
+            interval_secs=item["interval_secs"],
+            stop_on=item.get("stop_on"),
+            max_polls=item["max_polls"],
+            created_by="model",
+            next_poll=next_poll.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
+        from turnstone.core.watch import format_interval
+
+        stop_desc = f"stop_on: {item['stop_on']}" if item.get("stop_on") else "on output change"
+        msg = (
+            f'Watch "{item["watch_name"]}" created.\n'
+            f"  Polling every {format_interval(item['interval_secs'])}, "
+            f"max {item['max_polls']} polls\n"
+            f"  Command: {item['command']}\n"
+            f"  Condition: {stop_desc}"
+        )
+        self.ui.on_tool_result(call_id, "watch", msg)
+        return call_id, msg
+
+    _MAX_WATCH_CHAIN = 5  # max consecutive watch dispatches per worker thread
+
+    def _dispatch_pending_watch(self, depth: int = 0) -> None:
+        """Dispatch one pending watch result as a new send() turn.
+
+        Each ``send()`` chains back here on IDLE, so multiple queued results
+        are processed sequentially.  Depth is capped to prevent unbounded
+        stack growth.
+        """
+        if depth >= self._MAX_WATCH_CHAIN:
+            self._watch_dispatch_depth = 0
+            return
+        try:
+            result = self._watch_pending.get_nowait()
+        except queue.Empty:
+            self._watch_dispatch_depth = 0  # chain ended — reset for next user turn
+            return
+        message = result.get("message", "")
+        if message:
+            self._watch_dispatch_depth = depth + 1
+            self.send(message)
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""

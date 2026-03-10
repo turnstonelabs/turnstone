@@ -1,0 +1,166 @@
+@startuml
+!theme plain
+title Turnstone — Watch Tool Architecture
+
+skinparam participant {
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<ui>> #E8EAF6
+}
+
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "WatchRunner\n(watch.py)" as Runner <<server>>
+participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "WebUI / SSE\n(server.py)" as UI <<ui>>
+
+== Create Phase ==
+
+Session -> Session : _prepare_watch(action="create")
+note right
+  Validates:
+  - command via is_command_blocked()
+  - poll_every → parse_duration()
+  - stop_on → validate_condition()
+  - max watches limit (5)
+  - duplicate name check
+  needs_approval = True
+end note
+
+Session -> Storage : create_watch(watch_id, ws_id,\nnode_id, command, interval,\nstop_on, max_polls, next_poll)
+
+Session --> UI : tool_result:\n"Watch 'pr-review' created"
+
+== Poll Phase (WatchRunner daemon, every 15s) ==
+
+Runner -> Storage : list_due_watches(now)
+Storage --> Runner : due_watches[]
+note right
+  Filters:
+  active=1 AND
+  next_poll <= now AND
+  node_id matches
+end note
+
+loop for each due watch
+
+    Runner -> Runner : is_command_blocked()?
+    alt blocked
+        Runner -> Storage : update_watch(active=False)
+    else safe
+
+        Runner -> Runner : subprocess.run(command)
+        note right
+          timeout = tool_timeout
+          start_new_session = True
+          output truncated at 64KB
+        end note
+
+        Runner -> Runner : evaluate_condition(\nstop_on, output,\nexit_code, prev_output)
+        note right
+          **Variables:**
+          output, data, exit_code,
+          prev_output, changed
+
+          **Safe builtins only:**
+          len, str, int, sorted, ...
+          No import/open/exec/eval
+
+          **stop_on=None:**
+          fires on change (skip 1st poll)
+        end note
+
+        alt condition fired OR max_polls reached
+            Runner -> Storage : update_watch(\npoll_count++,\nlast_output, active=False)
+            Runner -> Runner : format_watch_message()
+            Runner -> Runner : _dispatch_result(ws_id, msg)
+        else not fired
+            Runner -> Storage : update_watch(\npoll_count++,\nlast_output, next_poll)
+        end
+
+    end
+end
+
+== Dispatch Phase ==
+
+note over Runner, Session
+  **Three dispatch paths:**
+end note
+
+alt Path A: workstream active + idle
+    Runner -> Session : dispatch_fn(message)\n→ _watch_pending.put()
+    Session -> Session : _dispatch_pending_watch()\n→ self.send(message)
+    Session -> UI : SSE: thinking, content,\ntool calls...
+    note right
+      Watch result appears as
+      synthetic user message.
+      Model sees it and responds.
+      Depth guard: max 5 chains.
+    end note
+
+else Path B: workstream active + busy
+    Runner -> Session : dispatch_fn(message)\n→ _watch_pending.put()
+    note right
+      Queued. Dispatched when
+      current send() reaches IDLE.
+    end note
+
+else Path C: workstream evicted
+    Runner -> Runner : restore_fn(ws_id)
+    note right
+      1. mgr.create() — may evict
+         another idle workstream
+      2. session.resume(ws_id)
+      3. set_watch_runner()
+      4. register new dispatch_fn
+    end note
+    Runner -> Session : restored dispatch_fn(message)
+end
+
+== Cancel / List ==
+
+Session -> Storage : list_watches_for_ws(ws_id)
+note right : action="list" (auto-approve)
+
+Session -> Storage : update_watch(active=False)
+note right : action="cancel" (auto-approve)
+
+== Server Lifecycle ==
+
+note over Runner, Storage
+  **Startup:**
+  1. WatchRunner created in main() with storage + node_id
+  2. restore_fn closure captures WorkstreamManager
+  3. Initial workstream: session.set_watch_runner(runner)
+  4. _lifespan(): runner.start() — daemon thread begins
+
+  **New workstream:**
+  session.set_watch_runner(runner) in create_workstream()
+  → registers dispatch_fn for ws_id
+
+  **Eviction / close:**
+  session.close() → runner.remove_dispatch_fn(ws_id)
+  Watches remain active in DB — WatchRunner uses restore_fn
+
+  **Restart recovery:**
+  Overdue watches fire ONE immediate poll
+  next_poll updated to now + interval
+  Normal cadence resumes
+
+  **Shutdown:**
+  _lifespan(): runner.stop() — joins thread
+end note
+
+== REST API ==
+
+note over UI, Storage
+  **GET /v1/api/watches[?ws_id=X]**
+  List active watches (for node or workstream)
+
+  **DELETE /v1/api/watches/{watch_id}**
+  Cancel a watch (sets active=False)
+
+  Both require write scope
+end note
+
+@enduml

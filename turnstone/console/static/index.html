@@ -81,6 +81,7 @@
       <button id="tab-tokens" class="admin-tab" data-tab="tokens" role="tab" aria-selected="false" aria-controls="admin-tokens" tabindex="-1" onclick="switchAdminTab('tokens')">Tokens</button>
       <button id="tab-channels" class="admin-tab" data-tab="channels" role="tab" aria-selected="false" aria-controls="admin-channels" tabindex="-1" onclick="switchAdminTab('channels')">Channels</button>
       <button id="tab-schedules" class="admin-tab" data-tab="schedules" role="tab" aria-selected="false" aria-controls="admin-schedules" tabindex="-1" onclick="switchAdminTab('schedules')">Schedules</button>
+      <button id="tab-watches" class="admin-tab" data-tab="watches" role="tab" aria-selected="false" aria-controls="admin-watches" tabindex="-1" onclick="switchAdminTab('watches')">Watches</button>
     </div>
 
     <!-- Users Tab -->
@@ -161,6 +162,30 @@
       </div>
       <div id="admin-schedules-table" role="list" aria-label="Scheduled tasks" aria-live="polite">
         <div class="dashboard-empty">Loading schedules...</div>
+      </div>
+    </div>
+
+    <!-- Watches Tab -->
+    <div id="admin-watches" class="admin-panel" role="tabpanel" aria-labelledby="tab-watches" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">WATCHES</span>
+        <label for="admin-watch-node" class="sr-only">Filter watches by node</label>
+        <select id="admin-watch-node" onchange="loadAdminWatches()">
+          <option value="">All nodes</option>
+        </select>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-wname">NAME</span>
+        <span class="admin-col admin-col-wnode">NODE</span>
+        <span class="admin-col admin-col-wcmd">COMMAND</span>
+        <span class="admin-col admin-col-winterval">INTERVAL</span>
+        <span class="admin-col admin-col-wpoll">POLL</span>
+        <span class="admin-col admin-col-wcond">CONDITION</span>
+        <span class="admin-col admin-col-wstatus">STATUS</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-watches-table" role="list" aria-label="Watches" aria-live="polite">
+        <div class="dashboard-empty">Loading watches...</div>
       </div>
     </div>
   </div>

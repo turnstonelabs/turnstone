@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 15 built-in tools plus any number of external MCP tools to the
+turnstone exposes 16 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 15 tool definitions (sent to the model). |
+| `TOOLS`             | All 16 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 15 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 16 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -422,6 +422,81 @@ Provide either `username` for user-based targeting or `channel_type` +
 
 ---
 
+### watch
+
+Set up periodic polling of a shell command within the current workstream.
+Results are injected back into the conversation as synthetic user messages,
+triggering the model to respond and act. Use for monitoring CI/CD pipelines,
+PR reviews, deployments, file changes, etc.
+
+| Parameter   | Type    | Required | Description |
+|-------------|---------|----------|-------------|
+| `action`    | string  | yes      | `create`, `list`, or `cancel`. |
+| `command`   | string  | create   | Shell command to poll periodically. |
+| `poll_every`| string  | no       | Poll interval as duration (`30s`, `5m`, `1h`). Default: `5m`. |
+| `stop_on`   | string  | no       | Python expression for stop condition (see below). Omit for change detection. |
+| `name`      | string  | create   | Human-readable watch name (e.g. `pr-review`). Used as identifier for cancel. |
+| `max_polls` | integer | no       | Max poll cycles before auto-cancel. Default: 100. |
+
+**Actions:**
+
+- `create` — Start a new watch. Requires approval (same as bash — runs shell
+  commands). Persists to the `watches` table; the server-level `WatchRunner`
+  daemon polls every 15 seconds for due watches.
+- `list` — Show all active watches in this workstream. Auto-approved.
+- `cancel` — Stop a watch by name or ID prefix. Auto-approved.
+
+**Stop condition DSL** — The `stop_on` parameter accepts a Python expression
+evaluated after each poll. Available variables:
+
+| Variable      | Type       | Description |
+|---------------|------------|-------------|
+| `output`      | `str`      | stdout (+stderr) of the command. |
+| `data`        | `Any`      | `json.loads(output)`, or `None` if not valid JSON. |
+| `exit_code`   | `int`      | Process exit code. |
+| `prev_output` | `str|None` | Previous poll's stdout (`None` on first poll). |
+| `changed`     | `bool`     | `True` if output differs from previous poll. |
+
+Safe builtins: `len`, `str`, `int`, `float`, `bool`, `abs`, `min`, `max`,
+`any`, `all`, `isinstance`, `sorted`. No `import`, `open`, `exec`, or
+`eval`. Security model: equivalent to `bash` — the model already has shell
+access.
+
+**Examples:**
+```
+data["state"] == "MERGED"
+"error" in output
+exit_code != 0
+changed and "ready" in output.lower()
+data.get("mergedAt") is not None
+```
+
+**Lifecycle:**
+
+1. Model calls `watch(action="create", ...)` — persisted to SQLite.
+2. `WatchRunner` daemon polls for due watches every 15s.
+3. Each poll runs the command, evaluates the condition.
+4. When the condition fires (or max polls reached), the result is injected
+   as a synthetic user message and the watch auto-cancels.
+5. If the workstream was evicted, it is restored before injection.
+6. Watches survive server restart (overdue watches fire once on recovery).
+
+**Constraints:**
+
+- Max 5 active watches per workstream.
+- Poll interval: 10s–24h.
+- Output truncated at 64 KB.
+- Max 5 consecutive watch dispatches per worker thread (depth guard).
+- Duplicate names rejected within the same workstream.
+
+- **Auto-approve**: `create` requires approval; `list` and `cancel` are auto-approved.
+- **Agent availability**: Main session only — not available to plan/task sub-agents.
+
+> See [Watch Architecture](diagrams/png/18-watch-architecture.png) for the
+> full poll → evaluate → dispatch flow.
+
+---
+
 ## Summary Table
 
 | Tool         | Category   | Auto-approve | agent | task_agent | primary_key |
@@ -441,6 +516,7 @@ Provide either `username` for user-based targeting or `channel_type` +
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
 | `forget`     | Memory     | Yes          | No    | No         | `key`       |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
+| `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---

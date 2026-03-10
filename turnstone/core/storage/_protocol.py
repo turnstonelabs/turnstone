@@ -293,6 +293,52 @@ class StorageBackend(Protocol):
         """Delete task runs older than retention_days. Returns count deleted."""
         ...
 
+    # -- Watches ---------------------------------------------------------------
+
+    def create_watch(
+        self,
+        watch_id: str,
+        ws_id: str,
+        node_id: str,
+        name: str,
+        command: str,
+        interval_secs: float,
+        stop_on: str | None,
+        max_polls: int,
+        created_by: str,
+        next_poll: str,
+    ) -> None:
+        """Create a watch. No-op if watch_id already exists."""
+        ...
+
+    def get_watch(self, watch_id: str) -> dict[str, Any] | None:
+        """Return watch dict or None."""
+        ...
+
+    def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
+        """Return active watches for a workstream, ordered by created DESC."""
+        ...
+
+    def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
+        """Return all active watches on a node, ordered by created DESC."""
+        ...
+
+    def list_due_watches(self, now: str) -> list[dict[str, Any]]:
+        """Return active watches whose next_poll <= now, ordered by next_poll."""
+        ...
+
+    def update_watch(self, watch_id: str, **fields: Any) -> bool:
+        """Update specified fields on a watch. Returns True if found."""
+        ...
+
+    def delete_watch(self, watch_id: str) -> bool:
+        """Delete a watch. Returns True if found."""
+        ...
+
+    def delete_watches_for_ws(self, ws_id: str) -> int:
+        """Delete all watches for a workstream. Returns count deleted."""
+        ...
+
     # -- Service registry ------------------------------------------------------
 
     def register_service(

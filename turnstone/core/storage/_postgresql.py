@@ -1011,6 +1011,139 @@ class PostgreSQLBackend:
             conn.commit()
             return result.rowcount
 
+    # -- Watches ---------------------------------------------------------------
+
+    def create_watch(
+        self,
+        watch_id: str,
+        ws_id: str,
+        node_id: str,
+        name: str,
+        command: str,
+        interval_secs: float,
+        stop_on: str | None,
+        max_polls: int,
+        created_by: str,
+        next_poll: str,
+    ) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        from turnstone.core.storage._schema import watches
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                postgresql.insert(watches)
+                .values(
+                    watch_id=watch_id,
+                    ws_id=ws_id,
+                    node_id=node_id,
+                    name=name,
+                    command=command,
+                    interval_secs=interval_secs,
+                    stop_on=stop_on,
+                    max_polls=max_polls,
+                    poll_count=0,
+                    active=1,
+                    created_by=created_by,
+                    next_poll=next_poll,
+                    created=now,
+                    updated=now,
+                )
+                .on_conflict_do_nothing()
+            )
+            conn.commit()
+
+    def get_watch(self, watch_id: str) -> dict[str, Any] | None:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(watches).where(watches.c.watch_id == watch_id)).fetchone()
+            if row is None:
+                return None
+            return dict(row._mapping)
+
+    def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(watches)
+                .where((watches.c.ws_id == ws_id) & (watches.c.active == 1))
+                .order_by(watches.c.created.desc())
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(watches)
+                .where((watches.c.node_id == node_id) & (watches.c.active == 1))
+                .order_by(watches.c.created.desc())
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def list_due_watches(self, now: str) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(watches)
+                .where(
+                    (watches.c.active == 1)
+                    & (watches.c.next_poll <= now)
+                    & (watches.c.next_poll != "")
+                )
+                .order_by(watches.c.next_poll)
+                .limit(100)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    _UPDATABLE_WATCH_FIELDS = frozenset(
+        {
+            "name",
+            "poll_count",
+            "last_output",
+            "last_exit_code",
+            "last_poll",
+            "next_poll",
+            "active",
+            "updated",
+        }
+    )
+
+    def update_watch(self, watch_id: str, **fields: Any) -> bool:
+        from turnstone.core.storage._schema import watches
+
+        fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_WATCH_FIELDS}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "active" in fields:
+            fields["active"] = 1 if fields["active"] else 0
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(watches).where(watches.c.watch_id == watch_id).values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_watch(self, watch_id: str) -> bool:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(watches).where(watches.c.watch_id == watch_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_watches_for_ws(self, ws_id: str) -> int:
+        from turnstone.core.storage._schema import watches
+
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(watches).where(watches.c.ws_id == ws_id))
+            conn.commit()
+            return result.rowcount
+
     # -- Service registry ------------------------------------------------------
 
     def register_service(

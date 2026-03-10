@@ -863,6 +863,16 @@
 .sched-disabled { color: var(--fg-dim); }
 .sched-expired { color: var(--accent); }
 
+/* Watches grid: NAME | NODE | COMMAND | INTERVAL | POLL | CONDITION | STATUS | ACTIONS */
+#admin-watches .admin-colheaders,
+#admin-watches .admin-row {
+  grid-template-columns: 1.2fr 80px 1.5fr 60px 70px 1fr 70px 70px;
+}
+
+/* Watch status indicators */
+.watch-active { color: var(--green); font-weight: 500; }
+.watch-completed { color: var(--accent); }
+
 /* Wide modal variant for schedule forms */
 .admin-modal-wide { width: 480px; }
 
@@ -1027,6 +1037,10 @@
     grid-template-columns: 1fr 60px 80px 130px;
   }
   .admin-col-sschedule, .admin-col-starget, .admin-col-snext { display: none; }
+  #admin-watches .admin-colheaders, #admin-watches .admin-row {
+    grid-template-columns: 1.2fr 80px 70px 70px 70px;
+  }
+  .admin-col-wcmd, .admin-col-wcond, .admin-col-winterval { display: none; }
 }
 
 /* ==========================================================================

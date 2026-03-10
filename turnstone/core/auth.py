@@ -390,6 +390,13 @@ def required_scope(method: str, path: str) -> str:
     # Write endpoints
     if method == "POST" and normalized in WRITE_PATHS:
         return "write"
+    # Watch cancel has a path parameter: /api/watches/{id}/cancel
+    if (
+        method == "POST"
+        and normalized.startswith("/api/watches/")
+        and normalized.endswith("/cancel")
+    ):
+        return "write"
 
     # Console proxy routes: /node/{node_id}/api/{tail} or /node/{node_id}/v1/api/{tail}
     if method == "POST" and normalized.startswith("/node/"):

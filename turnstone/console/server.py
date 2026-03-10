@@ -1180,6 +1180,88 @@ async def admin_list_schedule_runs(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin API endpoints — watches (aggregated from nodes)
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_watches(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/watches — aggregate watches from all nodes."""
+    collector: ClusterCollector = request.app.state.collector
+    nodes, _ = collector.get_nodes(limit=500)
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+
+    async def _fetch_node(node: dict[str, Any]) -> list[dict[str, Any]]:
+        server_url = (node.get("server_url") or "").rstrip("/")
+        if not server_url:
+            return []
+        try:
+            resp = await client.get(f"{server_url}/v1/api/watches", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                watches: list[dict[str, Any]] = data.get("watches", [])
+                # Tag each watch with node_id in case the server omits it
+                for w in watches:
+                    if not w.get("node_id"):
+                        w["node_id"] = node["node_id"]
+                return watches
+        except Exception:
+            log.debug("Failed to fetch watches from node %s", node.get("node_id"))
+        return []
+
+    tasks = [_fetch_node(n) for n in nodes]
+    results = await asyncio.gather(*tasks)
+    all_watches: list[dict[str, Any]] = []
+    for batch in results:
+        all_watches.extend(batch)
+    # Sort: active first, then by created descending (stable sort trick)
+    all_watches.sort(key=lambda w: w.get("created", ""), reverse=True)
+    all_watches.sort(key=lambda w: not w.get("active", False))
+    return JSONResponse({"watches": all_watches})
+
+
+_VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
+
+
+async def admin_cancel_watch(request: Request) -> Response:
+    """POST /v1/api/admin/watches/{watch_id}/cancel — proxy cancel to the owning node."""
+    from turnstone.core.web_helpers import read_json_or_400
+
+    watch_id = request.path_params["watch_id"]
+    if not watch_id or not _VALID_WATCH_ID.match(watch_id) or len(watch_id) > 128:
+        return JSONResponse({"error": "Invalid watch_id"}, status_code=400)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    node_id = str(body.get("node_id", "") or request.query_params.get("node_id", "")).strip()
+    if not node_id:
+        return JSONResponse({"error": "node_id is required"}, status_code=400)
+
+    server_url = _get_server_url(request, node_id)
+    if not server_url:
+        return JSONResponse({"error": "Node not found"}, status_code=404)
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = {"Content-Type": "application/json"}
+    headers.update(_proxy_auth_headers(request))
+    try:
+        resp = await client.post(
+            f"{server_url}/v1/api/watches/{watch_id}/cancel",
+            content=b"{}",
+            headers=headers,
+        )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            media_type=resp.headers.get("content-type", "application/json"),
+        )
+    except httpx.HTTPError:
+        return JSONResponse({"error": "Node unreachable"}, status_code=502)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -1249,6 +1331,12 @@ def create_app(
                         methods=["DELETE"],
                     ),
                     Route("/api/admin/schedules/{task_id}/runs", admin_list_schedule_runs),
+                    Route("/api/admin/watches", admin_list_watches),
+                    Route(
+                        "/api/admin/watches/{watch_id}/cancel",
+                        admin_cancel_watch,
+                        methods=["POST"],
+                    ),
                 ],
             ),
             Route("/health", health),

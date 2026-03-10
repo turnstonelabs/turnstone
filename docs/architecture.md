@@ -44,6 +44,7 @@ turnstone/
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh, async-sync bridge
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
+    watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         Persistence facade (delegates to storage backend)
     storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL

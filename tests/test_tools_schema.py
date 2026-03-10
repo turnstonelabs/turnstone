@@ -72,7 +72,7 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 15
+        assert len(TOOLS) == 16
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 7
@@ -102,6 +102,7 @@ class TestToolsMetadata:
             "recall": "query",
             "forget": "key",
             "notify": "message",
+            "watch": "command",
         }
         assert expected == PRIMARY_KEY_MAP
 

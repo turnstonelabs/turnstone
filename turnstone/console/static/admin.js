@@ -10,6 +10,7 @@ var _ctTrapHandler = null;
 var _tcTrapHandler = null;
 var _ccTrapHandler = null;
 var _cfTrapHandler = null;
+var _adminWatches = [];
 var _confirmCallbackFn = null;
 var _confirmTriggerEl = null;
 
@@ -48,11 +49,14 @@ function switchAdminTab(tab) {
     tab === "channels" ? "" : "none";
   document.getElementById("admin-schedules").style.display =
     tab === "schedules" ? "" : "none";
+  document.getElementById("admin-watches").style.display =
+    tab === "watches" ? "" : "none";
 
   if (tab === "users") loadAdminUsers();
   if (tab === "tokens") _populateTokenUserSelect();
   if (tab === "channels") _populateChannelUserSelect();
   if (tab === "schedules") loadAdminSchedules();
+  if (tab === "watches") loadAdminWatches();
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +892,167 @@ function hideScheduleRunsModal() {
 }
 
 // ---------------------------------------------------------------------------
+// Watches
+// ---------------------------------------------------------------------------
+
+function _populateWatchNodeSelect() {
+  var sel = document.getElementById("admin-watch-node");
+  var current = sel.value;
+  var seen = {};
+  sel.innerHTML = '<option value="">All nodes</option>';
+  for (var i = 0; i < _adminWatches.length; i++) {
+    var nid = _adminWatches[i].node_id || "";
+    if (nid && !seen[nid]) {
+      seen[nid] = true;
+      var opt = document.createElement("option");
+      opt.value = nid;
+      opt.textContent = nid;
+      sel.appendChild(opt);
+    }
+  }
+  if (current) sel.value = current;
+}
+
+function loadAdminWatches() {
+  authFetch("/v1/api/admin/watches")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load watches");
+      return r.json();
+    })
+    .then(function (data) {
+      _adminWatches = data.watches || [];
+      _populateWatchNodeSelect();
+      var nodeFilter = document.getElementById("admin-watch-node").value;
+      var filtered = _adminWatches;
+      if (nodeFilter) {
+        filtered = _adminWatches.filter(function (w) {
+          return w.node_id === nodeFilter;
+        });
+      }
+      _renderWatches(filtered);
+    })
+    .catch(function () {
+      document.getElementById("admin-watches-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load watches</div>';
+    });
+}
+
+function _formatInterval(secs) {
+  if (!secs || secs <= 0) return "\u2014";
+  if (secs >= 3600) return Math.round(secs / 3600) + "h";
+  if (secs >= 60) return Math.round(secs / 60) + "m";
+  return secs + "s";
+}
+
+function _renderWatches(watches) {
+  var container = document.getElementById("admin-watches-table");
+  if (!watches.length) {
+    container.innerHTML =
+      '<div class="dashboard-empty">No active watches. Watches are created when workstreams use the watch tool.</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < watches.length; i++) {
+    var w = watches[i];
+    var name = w.name || w.watch_id || "\u2014";
+    var nodeShort = (w.node_id || "").slice(0, 8);
+    var cmd = w.command || "";
+    var cmdTrunc = cmd.length > 40 ? cmd.slice(0, 40) + "\u2026" : cmd;
+    var interval = _formatInterval(w.interval_secs);
+    var pollMax = w.max_polls ? w.max_polls : "\u221e";
+    var pollLabel = (w.poll_count || 0) + "/" + pollMax;
+    var cond = w.stop_on || "on change";
+    var condTrunc = cond.length > 30 ? cond.slice(0, 30) + "\u2026" : cond;
+    var active = w.active;
+    var statusCls = active ? "watch-active" : "watch-completed";
+    var statusLabel = active ? "active" : "done";
+    var statusDot = active ? "\u25cf " : "\u25cb ";
+    var cancelBtn = active
+      ? '<button class="admin-btn-danger" data-cancel-watch="' +
+        escapeHtml(w.watch_id) +
+        '" data-watch-node="' +
+        escapeHtml(w.node_id || "") +
+        '" data-watch-name="' +
+        escapeHtml(name) +
+        '" title="Cancel watch">cancel</button>'
+      : "";
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-wname">' +
+      escapeHtml(name) +
+      "</span>" +
+      '<span class="admin-col admin-col-wnode" title="' +
+      escapeHtml(w.node_id || "") +
+      '"><code>' +
+      escapeHtml(nodeShort) +
+      "</code></span>" +
+      '<span class="admin-col admin-col-wcmd" title="' +
+      escapeHtml(cmd) +
+      '"><code>' +
+      escapeHtml(cmdTrunc) +
+      "</code></span>" +
+      '<span class="admin-col admin-col-winterval">' +
+      escapeHtml(interval) +
+      "</span>" +
+      '<span class="admin-col admin-col-wpoll"><code>' +
+      escapeHtml(pollLabel) +
+      "</code></span>" +
+      '<span class="admin-col admin-col-wcond" title="' +
+      escapeHtml(cond) +
+      '">' +
+      escapeHtml(condTrunc) +
+      "</span>" +
+      '<span class="admin-col admin-col-wstatus"><span class="' +
+      statusCls +
+      '">' +
+      statusDot +
+      statusLabel +
+      "</span></span>" +
+      '<span class="admin-col admin-col-actions">' +
+      cancelBtn +
+      "</span></div>";
+  }
+  container.innerHTML = html;
+  // Bind cancel buttons
+  var btns = container.querySelectorAll("[data-cancel-watch]");
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].addEventListener("click", function () {
+      _cancelWatch(
+        this.getAttribute("data-cancel-watch"),
+        this.getAttribute("data-watch-node"),
+        this.getAttribute("data-watch-name"),
+      );
+    });
+  }
+}
+
+function _cancelWatch(watchId, nodeId, name) {
+  showConfirmModal(
+    "Cancel Watch",
+    "Cancel watch \u2018" + name + "\u2019? This will stop future polling.",
+    "Cancel watch",
+    function () {
+      authFetch(
+        "/v1/api/admin/watches/" + encodeURIComponent(watchId) + "/cancel",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ node_id: nodeId }),
+        },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error("Cancel failed");
+          showToast("Watch '" + name + "' cancelled");
+          loadAdminWatches();
+        })
+        .catch(function () {
+          showToast("Failed to cancel watch");
+        });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Create Channel Link Modal
 // ---------------------------------------------------------------------------
 
@@ -1271,7 +1436,7 @@ document.addEventListener("keydown", function (e) {
   if (!tablist) return;
   tablist.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var tabOrder = ["users", "tokens", "channels", "schedules"];
+    var tabOrder = ["users", "tokens", "channels", "schedules", "watches"];
     var idx = tabOrder.indexOf(_adminTab);
     if (e.key === "ArrowRight") idx = (idx + 1) % tabOrder.length;
     else idx = (idx - 1 + tabOrder.length) % tabOrder.length;

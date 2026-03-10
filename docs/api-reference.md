@@ -774,6 +774,79 @@ Status code: `400`
 
 ---
 
+### `GET /v1/api/watches`
+
+List active watches on this server node. Optionally filter by workstream.
+Requires `write` scope.
+
+**Query parameters:**
+
+| Parameter | Type   | Required | Description                        |
+|-----------|--------|----------|------------------------------------|
+| `ws_id`   | string | no       | Filter to watches for this workstream. If omitted, returns all watches on the node. |
+
+**Response:**
+
+```json
+{
+  "watches": [
+    {
+      "watch_id": "abc123def456...",
+      "ws_id": "ws-1",
+      "node_id": "host_a1b2",
+      "name": "pr-review",
+      "command": "gh pr view --json state",
+      "interval_secs": 300.0,
+      "stop_on": "data[\"state\"] == \"MERGED\"",
+      "max_polls": 100,
+      "poll_count": 5,
+      "last_output": "{\"state\": \"OPEN\"}",
+      "last_poll": "2026-03-09T12:00:00",
+      "next_poll": "2026-03-09T12:05:00",
+      "active": 1,
+      "created": "2026-03-09T11:30:00"
+    }
+  ]
+}
+```
+
+---
+
+### `POST /v1/api/watches/{watch_id}/cancel`
+
+Cancel an active watch. Sets `active=0` and clears `next_poll`.
+Requires `write` scope. Verifies node ownership in multi-node deployments.
+
+**Path parameters:**
+
+| Parameter  | Type   | Description     |
+|------------|--------|-----------------|
+| `watch_id` | string | Watch ID to cancel |
+
+**Response (success):**
+
+```json
+{"status": "ok", "watch_id": "abc123def456..."}
+```
+
+**Error (not found):**
+
+```json
+{"error": "Watch not found"}
+```
+
+Status code: `404`
+
+**Error (wrong node):**
+
+```json
+{"error": "Watch belongs to another node"}
+```
+
+Status code: `403`
+
+---
+
 ### `OPTIONS` (any path)
 
 Handles CORS preflight requests.

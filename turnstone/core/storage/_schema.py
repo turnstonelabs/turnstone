@@ -170,6 +170,40 @@ sa.Index("idx_scheduled_task_runs_started", scheduled_task_runs.c.started)
 # Service registry
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Watches — in-session periodic command polling
+# ---------------------------------------------------------------------------
+
+watches = sa.Table(
+    "watches",
+    metadata,
+    sa.Column("watch_id", sa.Text, primary_key=True),
+    sa.Column("ws_id", sa.Text, nullable=False),
+    sa.Column("node_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("command", sa.Text, nullable=False),
+    sa.Column("interval_secs", sa.Float, nullable=False),
+    sa.Column("stop_on", sa.Text),  # Python expression, NULL = change detection
+    sa.Column("max_polls", sa.Integer, nullable=False, server_default="100"),
+    sa.Column("poll_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("last_output", sa.Text),
+    sa.Column("last_exit_code", sa.Integer),
+    sa.Column("last_poll", sa.Text),  # ISO8601
+    sa.Column("next_poll", sa.Text),  # ISO8601
+    sa.Column("active", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_watches_active_next", watches.c.active, watches.c.next_poll)
+sa.Index("idx_watches_ws_id", watches.c.ws_id)
+sa.Index("idx_watches_node_id", watches.c.node_id)
+
+# ---------------------------------------------------------------------------
+# Service registry
+# ---------------------------------------------------------------------------
+
 services = sa.Table(
     "services",
     metadata,

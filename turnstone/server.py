@@ -699,6 +699,35 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
+    """Create a dispatch function for watch results on a workstream.
+
+    Handles both idle (start worker thread) and busy (enqueue for IDLE drain)
+    cases.  Mirrors the ``send_message`` worker-thread pattern.
+    """
+    pending = session._watch_pending
+
+    def dispatch(msg: str) -> None:
+        if ws.worker_thread and ws.worker_thread.is_alive():
+            # Workstream is busy — queue for drain at IDLE (Path A)
+            pending.put({"message": msg})
+            return
+
+        # Workstream is idle — start a worker thread (Path B)
+        def run() -> None:
+            try:
+                session.send(msg)
+            except Exception as exc:
+                if ui:
+                    ui.on_error(f"Watch error: {exc}")
+
+        t = threading.Thread(target=run, daemon=True)
+        ws.worker_thread = t
+        t.start()
+
+    return dispatch
+
+
 async def send_message(request: Request) -> JSONResponse:
     """POST /v1/api/send — send a user message to the workstream."""
     from turnstone.core.web_helpers import read_json_or_400
@@ -844,6 +873,12 @@ async def create_workstream(request: Request) -> JSONResponse:
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
             ws.ui.auto_approve = True
+        # Register watch runner for this workstream
+        runner = getattr(request.app.state, "watch_runner", None)
+        if runner and ws.session:
+            ws.session.set_watch_runner(
+                runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
+            )
         # Emit eviction event if a workstream was evicted to make room
         evicted = mgr.last_evicted
         if evicted is not None:
@@ -900,6 +935,42 @@ async def close_workstream(request: Request) -> JSONResponse:
     if mgr.close(ws_id):
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
+
+
+async def list_watches(request: Request) -> JSONResponse:
+    """GET /v1/api/watches — list active watches, optionally filtered by ws_id."""
+    from turnstone.core.storage._registry import get_storage
+
+    storage = get_storage()
+    if not storage:
+        return JSONResponse({"watches": []})
+    ws_id = request.query_params.get("ws_id")
+    if ws_id:
+        watches = storage.list_watches_for_ws(ws_id)
+    else:
+        node_id = getattr(request.app.state, "node_id", "")
+        watches = storage.list_watches_for_node(node_id) if node_id else []
+    return JSONResponse({"watches": watches})
+
+
+async def cancel_watch(request: Request) -> JSONResponse:
+    """POST /v1/api/watches/{watch_id}/cancel — cancel an active watch."""
+    from turnstone.core.storage._registry import get_storage
+
+    watch_id = request.path_params["watch_id"]
+    storage = get_storage()
+    if not storage:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=500)
+    watch = storage.get_watch(watch_id)
+    if not watch:
+        return JSONResponse({"error": "Watch not found"}, status_code=404)
+    # Verify node ownership in multi-node deployments
+    node_id = getattr(request.app.state, "node_id", "")
+    watch_node = watch.get("node_id", "")
+    if watch_node and node_id and watch_node != node_id:
+        return JSONResponse({"error": "Watch belongs to another node"}, status_code=403)
+    storage.update_watch(watch_id, active=False, next_poll="")
+    return JSONResponse({"status": "ok", "watch_id": watch_id})
 
 
 async def auth_login(request: Request) -> Response:
@@ -1003,8 +1074,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             daemon=True,
         )
         cleanup.start()
+    # Start watch runner (periodic command polling)
+    if app.state.watch_runner:
+        app.state.watch_runner.start()
     yield
     # Shutdown
+    if app.state.watch_runner:
+        app.state.watch_runner.stop()
     if app.state.health_monitor:
         app.state.health_monitor.stop()
     if app.state.mcp_client:
@@ -1054,6 +1130,7 @@ def create_app(
     idle_timeout: int = 0,
     node_id: str = "",
     cors_origins: list[str] | None = None,
+    watch_runner: Any = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1077,6 +1154,8 @@ def create_app(
                     Route("/api/command", command, methods=["POST"]),
                     Route("/api/workstreams/new", create_workstream, methods=["POST"]),
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
+                    Route("/api/watches", list_watches),
+                    Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
@@ -1107,6 +1186,7 @@ def create_app(
     app.state.registry = registry
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
+    app.state.watch_runner = watch_runner
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -1492,11 +1572,43 @@ def main() -> None:
             tool_search_max_results=args.tool_search_max_results,
         )
 
-    # Create workstream manager and initial workstream
+    # Create WatchRunner (periodic command polling, server-level)
+    from turnstone.core.storage import get_storage as _get_storage
+    from turnstone.core.watch import WatchRunner
+
+    # Create workstream manager first (watch restore_fn captures it)
     manager = WorkstreamManager(
         session_factory, max_workstreams=args.max_workstreams, node_id=_node_id
     )
     WebUI._workstream_mgr = manager
+
+    def _watch_restore_fn(ws_id: str) -> Any:
+        """Restore an evicted workstream so a watch can deliver results.
+
+        Returns a callable that starts a worker thread to send() the watch
+        result.  Unlike the normal dispatch path (which enqueues for IDLE
+        drain), the restored workstream has no active send() loop, so we
+        must start a worker thread directly — same pattern as send_message().
+        """
+        try:
+            ws = manager.create(
+                ui_factory=lambda wid: WebUI(ws_id=wid),
+            )
+            if ws.session:
+                ws.session.resume(ws_id)
+                dispatch_fn = _make_watch_dispatch(ws, ws.session, ws.ui)
+                ws.session.set_watch_runner(_watch_runner, dispatch_fn=dispatch_fn)
+                return dispatch_fn
+        except RuntimeError:
+            log.warning("watch_restore: cannot restore ws %s (all slots active)", ws_id)
+        return None
+
+    _watch_runner = WatchRunner(
+        storage=_get_storage(),
+        node_id=_node_id,
+        tool_timeout=args.tool_timeout,
+        restore_fn=_watch_restore_fn,
+    )
     ws = manager.create(
         name="default",
         ui_factory=lambda wid: WebUI(ws_id=wid),
@@ -1507,6 +1619,9 @@ def main() -> None:
 
     # Handle --resume
     assert ws.session is not None
+    ws.session.set_watch_runner(
+        _watch_runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
+    )
     if args.resume:
         from turnstone.core.memory import resolve_workstream
 
@@ -1552,6 +1667,7 @@ def main() -> None:
         idle_timeout=args.workstream_idle_timeout,
         node_id=_node_id,
         cors_origins=cors_origins,
+        watch_runner=_watch_runner,
     )
 
     log.info("Server starting on http://%s:%s", args.host, args.port)
