@@ -97,7 +97,7 @@ class TestToolsMetadata:
             "web_fetch": "url",
             "web_search": "query",
             "task": "prompt",
-            "plan": "prompt",
+            "create_plan": "goal",
             "remember": "key",
             "recall": "query",
             "forget": "key",
