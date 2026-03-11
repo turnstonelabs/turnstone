@@ -19,6 +19,7 @@ function setBusy(b) {
   sendBtn.disabled = b;
   sendBtn.style.display = b ? "none" : "";
   stopBtn.style.display = b ? "" : "none";
+  stopBtn.disabled = !b;
 }
 
 // --- Workstream state ---

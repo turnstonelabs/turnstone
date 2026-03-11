@@ -913,13 +913,15 @@ async def cancel_generation(request: Request) -> JSONResponse:
     session = ws.session
     if session is None:
         return JSONResponse({"error": "No session"}, status_code=400)
-    # Set the cooperative cancel flag (worker thread checks at checkpoints)
-    session.cancel()
-    # Unblock any pending approval/plan review waits
-    ui.resolve_approval(False, "Cancelled by user")
-    ui.resolve_plan("reject")
-    # Emit cancelled SSE event so SDK consumers get a typed signal
-    ui._enqueue({"type": "cancelled"})
+    # Only act if generation is actually in progress
+    if ws.worker_thread and ws.worker_thread.is_alive():
+        # Set the cooperative cancel flag (worker thread checks at checkpoints)
+        session.cancel()
+        # Unblock any pending approval/plan review waits
+        ui.resolve_approval(False, "Cancelled by user")
+        ui.resolve_plan("reject")
+        # Emit cancelled SSE event so SDK consumers get a typed signal
+        ui._enqueue({"type": "cancelled"})
     return JSONResponse({"status": "ok"})
 
 
