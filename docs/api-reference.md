@@ -448,6 +448,14 @@ after `/clear` or `/new` commands).
 {"type": "clear_ui"}
 ```
 
+**`cancelled`** -- the generation was cancelled by the user (via the Stop
+button or `POST /v1/api/cancel`). The client should finalize any in-progress
+assistant message with whatever partial content was streamed.
+
+```json
+{"type": "cancelled"}
+```
+
 #### Keepalive
 
 The server sends an SSE comment every 5 seconds when no events are pending:
@@ -698,6 +706,43 @@ containing the resumed session's messages.
 |--------|------------------------------------|----------------------|
 | 400    | `{"error": "Empty command"}`       | Command is empty     |
 | 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found    |
+
+---
+
+### `POST /v1/api/cancel`
+
+Cancels the active generation in a workstream. Sets a cooperative cancellation
+flag that is checked at multiple points in the generation loop (per streaming
+chunk, before tool execution, inside bash commands). The session transitions to
+`idle` state and preserves any partial content already streamed.
+
+If the workstream is waiting for tool approval or plan review, the pending
+prompt is automatically denied/rejected to unblock the worker thread.
+
+Calling this endpoint when the workstream is already idle is a harmless no-op.
+
+**Request body:**
+
+```json
+{"ws_id": "abc123"}
+```
+
+| Field  | Type   | Required | Description          |
+|--------|--------|----------|----------------------|
+| `ws_id`| string | yes      | Target workstream ID |
+
+**Response:**
+
+```json
+{"status": "ok"}
+```
+
+**Error responses:**
+
+| Status | Body                               | Condition              |
+|--------|------------------------------------|------------------------|
+| 400    | `{"error": "No session"}`          | Session not initialized|
+| 404    | `{"error": "Unknown workstream"}`  | `ws_id` not found      |
 
 ---
 

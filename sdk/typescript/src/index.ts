@@ -45,6 +45,7 @@ export type {
   ErrorEvent,
   BusyErrorEvent,
   ClearUiEvent,
+  CancelledEvent,
   WsStateEvent,
   WsActivityEvent,
   WsRenameEvent,
@@ -67,6 +68,7 @@ export {
   isWsStateEvent,
   isApproveRequestEvent,
   isPlanReviewEvent,
+  isCancelledEvent,
 } from "./events.js";
 
 // Request/response types

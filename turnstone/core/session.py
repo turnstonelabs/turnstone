@@ -83,6 +83,19 @@ if TYPE_CHECKING:
         StreamChunk,
     )
 
+# ---------------------------------------------------------------------------
+# Cancellation support
+# ---------------------------------------------------------------------------
+
+
+class GenerationCancelled(BaseException):
+    """Raised when generation is cancelled via ``ChatSession.cancel()``.
+
+    Subclasses ``BaseException`` so that broad ``except Exception`` handlers
+    in tool execution code do not accidentally swallow it.
+    """
+
+
 # Image extensions handled as vision content (SVG excluded — it's XML text)
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
@@ -227,6 +240,9 @@ class ChatSession:
         self._watch_runner: Any = None  # WatchRunner | None
         self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue()
         self._watch_dispatch_depth = 0
+        # Cooperative cancellation: set from outside to stop generation
+        self._cancel_event = threading.Event()
+        self._cancelled_partial_msg: dict[str, Any] | None = None
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -715,15 +731,35 @@ class ChatSession:
         assert last_err is not None  # unreachable, but satisfies type checker
         raise last_err
 
+    # -- Cancellation -------------------------------------------------------
+
+    def cancel(self) -> None:
+        """Request cancellation of the current generation.
+
+        Thread-safe — may be called from any thread (e.g. an HTTP handler)
+        while the worker thread is inside ``send()``.
+        """
+        self._cancel_event.set()
+
+    def _check_cancelled(self) -> None:
+        """Raise ``GenerationCancelled`` if cancellation has been requested."""
+        if self._cancel_event.is_set():
+            raise GenerationCancelled()
+
+    # -- Main generation loop ------------------------------------------------
+
     def send(self, user_input: str) -> None:
         """Send user input and handle the response loop (including tool calls)."""
         self._notify_count = 0
+        self._cancel_event.clear()
+        self._cancelled_partial_msg = None
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
         save_message(self._ws_id, "user", user_input)
 
         try:
             while True:
+                self._check_cancelled()
                 msgs = self._full_messages()
 
                 if self.debug:
@@ -851,6 +887,40 @@ class ChatSession:
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
                     self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
+        except GenerationCancelled:
+            # Cooperative cancellation — preserve partial content if available.
+            if self._cancelled_partial_msg:
+                # _stream_response was interrupted — save partial assistant msg
+                msg = self._cancelled_partial_msg
+                self._cancelled_partial_msg = None
+                self.messages.append(msg)
+                tok_est = max(
+                    1,
+                    int(self._msg_char_count(msg) / self._chars_per_token),
+                )
+                self._msg_tokens.append(tok_est)
+                content = msg.get("content", "")
+                if content:
+                    save_message(self._ws_id, "assistant", content)
+            else:
+                # Cancelled during tool execution — roll back incomplete results
+                while self.messages and self.messages[-1]["role"] == "tool":
+                    self.messages.pop()
+                    if self._msg_tokens:
+                        self._msg_tokens.pop()
+                while (
+                    self.messages
+                    and self.messages[-1]["role"] == "assistant"
+                    and self.messages[-1].get("tool_calls")
+                ):
+                    self.messages.pop()
+                    if self._msg_tokens:
+                        self._msg_tokens.pop()
+            self._cancel_event.clear()
+            self.ui.on_info("[Generation cancelled]")
+            self._emit_state("idle")
+            # Do NOT re-raise — return normally so server worker thread
+            # completes cleanly.
         except KeyboardInterrupt:
             # Remove any partial tool results, then the originating assistant
             # message with unanswered tool_calls — keep _msg_tokens in sync
@@ -980,91 +1050,107 @@ class ChatSession:
                 first_token = False
 
         finish_reason = None
-        for chunk in stream:
-            # Track finish_reason (e.g. "stop", "length", "tool_calls")
-            if chunk.finish_reason:
-                finish_reason = chunk.finish_reason
+        try:
+            for chunk in stream:
+                self._check_cancelled()
+                # Track finish_reason (e.g. "stop", "length", "tool_calls")
+                if chunk.finish_reason:
+                    finish_reason = chunk.finish_reason
 
-            # Accumulate usage (Anthropic sends prompt tokens in message_start
-            # and completion tokens in message_delta as separate events)
-            if chunk.usage:
-                if self._last_usage is None:
-                    self._last_usage = {
-                        "prompt_tokens": chunk.usage.prompt_tokens,
-                        "completion_tokens": chunk.usage.completion_tokens,
-                        "total_tokens": chunk.usage.total_tokens,
-                    }
-                else:
-                    self._last_usage["prompt_tokens"] = max(
-                        self._last_usage["prompt_tokens"], chunk.usage.prompt_tokens
-                    )
-                    self._last_usage["completion_tokens"] = max(
-                        self._last_usage["completion_tokens"], chunk.usage.completion_tokens
-                    )
-                    self._last_usage["total_tokens"] = (
-                        self._last_usage["prompt_tokens"] + self._last_usage["completion_tokens"]
-                    )
-
-            if self.debug:
-                parts = []
-                if chunk.content_delta:
-                    parts.append(f"content={chunk.content_delta!r}")
-                if chunk.reasoning_delta:
-                    parts.append(f"reasoning={chunk.reasoning_delta!r}")
-                if chunk.tool_call_deltas:
-                    parts.append("tool_calls=...")
-                if parts:
-                    self.ui.on_info(f"{GRAY}[delta: {', '.join(parts)}]{RESET}")
-
-            # Path 1: reasoning field (provider-normalized reasoning_delta)
-            if chunk.reasoning_delta:
-                _stop_spinner_once()
-                reasoning_parts.append(chunk.reasoning_delta)
-                in_think = True
-                path1_reasoning = True
-                if self.show_reasoning:
-                    self.ui.on_reasoning_token(chunk.reasoning_delta)
-
-            # Path 2: regular content (may contain <think> tags)
-            if chunk.content_delta:
-                _stop_spinner_once()
-                # Close reasoning if transitioning from Path 1 reasoning
-                if path1_reasoning:
-                    path1_reasoning = False
-                    in_think = False
-                pending += chunk.content_delta
-                _drain_pending()
-
-            # Handle tool call deltas
-            if chunk.tool_call_deltas:
-                _stop_spinner_once()
-                # Close reasoning if transitioning from reasoning
-                if in_think:
-                    in_think = False
-                for tcd in chunk.tool_call_deltas:
-                    idx = tcd.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
+                # Accumulate usage (Anthropic sends prompt tokens in message_start
+                # and completion tokens in message_delta as separate events)
+                if chunk.usage:
+                    if self._last_usage is None:
+                        self._last_usage = {
+                            "prompt_tokens": chunk.usage.prompt_tokens,
+                            "completion_tokens": chunk.usage.completion_tokens,
+                            "total_tokens": chunk.usage.total_tokens,
                         }
-                    tc = tool_calls_acc[idx]
-                    if tcd.id:
-                        tc["id"] = tcd.id
-                    if tcd.name:
-                        tc["function"]["name"] = tcd.name
-                    if tcd.arguments_delta:
-                        tc["function"]["arguments"] += tcd.arguments_delta
+                    else:
+                        self._last_usage["prompt_tokens"] = max(
+                            self._last_usage["prompt_tokens"], chunk.usage.prompt_tokens
+                        )
+                        self._last_usage["completion_tokens"] = max(
+                            self._last_usage["completion_tokens"], chunk.usage.completion_tokens
+                        )
+                        self._last_usage["total_tokens"] = (
+                            self._last_usage["prompt_tokens"]
+                            + self._last_usage["completion_tokens"]
+                        )
 
-            # Informational messages (e.g. server-side web search status)
-            if chunk.info_delta:
-                _stop_spinner_once()
-                self.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
+                if self.debug:
+                    parts = []
+                    if chunk.content_delta:
+                        parts.append(f"content={chunk.content_delta!r}")
+                    if chunk.reasoning_delta:
+                        parts.append(f"reasoning={chunk.reasoning_delta!r}")
+                    if chunk.tool_call_deltas:
+                        parts.append("tool_calls=...")
+                    if parts:
+                        self.ui.on_info(f"{GRAY}[delta: {', '.join(parts)}]{RESET}")
 
-            # Raw provider content blocks (for multi-turn preservation)
-            if chunk.provider_blocks:
-                provider_blocks = chunk.provider_blocks
+                # Path 1: reasoning field (provider-normalized reasoning_delta)
+                if chunk.reasoning_delta:
+                    _stop_spinner_once()
+                    reasoning_parts.append(chunk.reasoning_delta)
+                    in_think = True
+                    path1_reasoning = True
+                    if self.show_reasoning:
+                        self.ui.on_reasoning_token(chunk.reasoning_delta)
+
+                # Path 2: regular content (may contain <think> tags)
+                if chunk.content_delta:
+                    _stop_spinner_once()
+                    # Close reasoning if transitioning from Path 1 reasoning
+                    if path1_reasoning:
+                        path1_reasoning = False
+                        in_think = False
+                    pending += chunk.content_delta
+                    _drain_pending()
+
+                # Handle tool call deltas
+                if chunk.tool_call_deltas:
+                    _stop_spinner_once()
+                    # Close reasoning if transitioning from reasoning
+                    if in_think:
+                        in_think = False
+                    for tcd in chunk.tool_call_deltas:
+                        idx = tcd.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        tc = tool_calls_acc[idx]
+                        if tcd.id:
+                            tc["id"] = tcd.id
+                        if tcd.name:
+                            tc["function"]["name"] = tcd.name
+                        if tcd.arguments_delta:
+                            tc["function"]["arguments"] += tcd.arguments_delta
+
+                # Informational messages (e.g. server-side web search status)
+                if chunk.info_delta:
+                    _stop_spinner_once()
+                    self.ui.on_info(f"{GRAY}{chunk.info_delta}{RESET}")
+
+                # Raw provider content blocks (for multi-turn preservation)
+                if chunk.provider_blocks:
+                    provider_blocks = chunk.provider_blocks
+        except GenerationCancelled:
+            # Flush whatever was buffered and build a partial message
+            if pending:
+                _flush_text(pending, in_think)
+            self.ui.on_stream_end()
+            partial: dict[str, Any] = {"role": "assistant"}
+            partial_content = "".join(content_parts)
+            partial["content"] = partial_content or None
+            # Deliberately omit tool_calls — they are incomplete
+            if provider_blocks:
+                partial["_provider_content"] = provider_blocks
+            self._cancelled_partial_msg = partial
+            raise
 
         # Flush any remaining buffered text
         if pending:
@@ -1446,7 +1532,9 @@ class ChatSession:
                     item["denial_msg"] = user_feedback or "Denied by user"
             user_feedback = None  # feedback is in the denial_msg
 
-        # Phase 3: execute
+        # Phase 3: execute (check cancellation before starting)
+        self._check_cancelled()
+
         def run_one(
             item: dict[str, Any],
         ) -> tuple[str, str | list[dict[str, Any]]]:
@@ -2285,6 +2373,15 @@ class ChatSession:
                         stdout_parts.append(line)
                         with contextlib.suppress(Exception):
                             self.ui.on_tool_output_chunk(call_id, line)
+                        # Check cancellation during long-running commands
+                        if self._cancel_event.is_set():
+                            with contextlib.suppress(OSError, ProcessLookupError):
+                                try:
+                                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                except OSError:
+                                    with contextlib.suppress(OSError, ProcessLookupError):
+                                        proc.kill()
+                            raise GenerationCancelled()
                 finally:
                     timer.cancel()
 
@@ -2548,6 +2645,7 @@ class ChatSession:
 
         turn = 0
         while max_tool_turns < 0 or turn < max_tool_turns:
+            self._check_cancelled()
             try:
                 result = _api_call(agent_messages)
             except Exception as e:
@@ -2589,6 +2687,7 @@ class ChatSession:
             # concurrent _read_files mutation from worker threads.
             tool_names = {t["function"]["name"] for t in tools}
             for tc_dict in result.tool_calls:
+                self._check_cancelled()
                 tool_name = tc_dict["function"]["name"]
 
                 # Guard 1: block recursive agent calls.
@@ -2695,7 +2794,7 @@ class ChatSession:
                 tools=self._task_tools,
                 auto_tools=self._TASK_AUTO_TOOLS,
             )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(task interrupted by user)"
         except Exception as e:
             self.ui.on_info(f"[task error] {e}")
@@ -2748,7 +2847,7 @@ class ChatSession:
                 label="plan",
                 reasoning_effort="high",
             )
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(plan interrupted by user)"
         except Exception as e:
             self.ui.on_info(f"[plan error] {e}")

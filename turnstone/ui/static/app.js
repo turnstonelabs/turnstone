@@ -1,6 +1,7 @@
 const messagesEl = document.getElementById("messages");
 const inputEl = document.getElementById("input");
 const sendBtn = document.getElementById("send-btn");
+const stopBtn = document.getElementById("stop-btn");
 const statusBar = document.getElementById("status-bar");
 const modelName = document.getElementById("model-name");
 const tabBar = document.getElementById("tab-bar");
@@ -12,6 +13,13 @@ let isThinking = false;
 let busy = false;
 let pendingApproval = false;
 let approvalBlockEl = null;
+
+function setBusy(b) {
+  busy = b;
+  sendBtn.disabled = b;
+  sendBtn.style.display = b ? "none" : "";
+  stopBtn.style.display = b ? "" : "none";
+}
 
 // --- Workstream state ---
 let workstreams = {}; // ws_id -> {name, state}
@@ -469,10 +477,9 @@ function switchTab(wsId) {
   currentAssistantEl = null;
   currentReasoningEl = null;
   contentBuffer = "";
-  busy = false;
+  setBusy(false);
   pendingApproval = false;
   approvalBlockEl = null;
-  sendBtn.disabled = false;
   inputEl.disabled = false;
 
   currentWsId = wsId;
@@ -912,8 +919,7 @@ function dashboardSendMessage() {
       hideDashboard();
       input.disabled = false;
       btn.disabled = false;
-      busy = true;
-      sendBtn.disabled = true;
+      setBusy(true);
       addUserMessage(text);
       authFetch("/v1/api/send", {
         method: "POST",
@@ -921,8 +927,7 @@ function dashboardSendMessage() {
         body: JSON.stringify({ message: text, ws_id: data.ws_id }),
       }).catch(function (err) {
         addErrorMessage("Connection error: " + err.message);
-        busy = false;
-        sendBtn.disabled = false;
+        setBusy(false);
       });
     })
     .catch(function () {
@@ -1009,6 +1014,7 @@ function handleEvent(evt) {
   switch (evt.type) {
     case "thinking_start":
       isThinking = true;
+      setBusy(true);
       removeEmptyState();
       addThinkingIndicator();
       break;
@@ -1051,8 +1057,7 @@ function handleEvent(evt) {
       currentAssistantEl = null;
       currentReasoningEl = null;
       contentBuffer = "";
-      busy = false;
-      sendBtn.disabled = false;
+      setBusy(false);
       inputEl.focus();
       scrollToBottom(true);
       break;
@@ -1087,14 +1092,21 @@ function handleEvent(evt) {
 
     case "error":
       addErrorMessage(evt.message);
-      busy = false;
-      sendBtn.disabled = false;
+      setBusy(false);
       break;
 
     case "busy_error":
       addErrorMessage(evt.message);
-      busy = false;
-      sendBtn.disabled = false;
+      setBusy(false);
+      break;
+
+    case "cancelled":
+      currentAssistantEl = null;
+      currentReasoningEl = null;
+      contentBuffer = "";
+      setBusy(false);
+      inputEl.focus();
+      scrollToBottom(true);
       break;
 
     case "connected":
@@ -1598,8 +1610,7 @@ function sendMessage() {
     return;
   }
 
-  busy = true;
-  sendBtn.disabled = true;
+  setBusy(true);
   addUserMessage(text);
   inputEl.value = "";
   autoResize();
@@ -1610,9 +1621,22 @@ function sendMessage() {
     body: JSON.stringify({ message: text, ws_id: currentWsId }),
   }).catch(function (err) {
     addErrorMessage("Connection error: " + err.message);
-    busy = false;
-    sendBtn.disabled = false;
+    setBusy(false);
   });
+}
+
+function cancelGeneration() {
+  if (!busy || !currentWsId) return;
+  stopBtn.disabled = true;
+  authFetch("/v1/api/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ws_id: currentWsId }),
+  }).catch(function (err) {
+    addErrorMessage("Cancel error: " + err.message);
+    stopBtn.disabled = false; // Re-enable only on error so user can retry
+  });
+  // On success, button stays disabled until setBusy(false) hides it
 }
 
 // --- Textarea auto-resize and keyboard shortcuts ---
@@ -1652,6 +1676,12 @@ document.addEventListener("keydown", function (e) {
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
     hideDashboard();
+    return;
+  }
+  // Escape: cancel generation when busy
+  if (e.key === "Escape" && busy && !pendingApproval) {
+    e.preventDefault();
+    cancelGeneration();
     return;
   }
   // Ctrl+D: toggle dashboard

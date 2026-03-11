@@ -241,6 +241,7 @@ class Bridge:
             "command": self._handle_command,
             "create_workstream": self._handle_create_ws,
             "close_workstream": self._handle_close_ws,
+            "cancel": self._handle_cancel,
         }
         # Messages that are always local (no routing needed)
         local_handlers = {
@@ -347,6 +348,20 @@ class Bridge:
         request_id = getattr(msg, "request_id", "")
         if request_id:
             self._broker.push_response(request_id, msg.to_json())
+
+    def _handle_cancel(self, msg: InboundMessage) -> None:
+        ws_id = getattr(msg, "ws_id", "")
+        resp = self._http.post("/v1/api/cancel", json={"ws_id": ws_id})
+        data = resp.json()
+        self._publish_ws(
+            ws_id,
+            AckEvent(
+                ws_id=ws_id,
+                correlation_id=msg.correlation_id,
+                status="ok" if data.get("status") == "ok" else "error",
+                detail=data.get("error", ""),
+            ),
+        )
 
     def _handle_command(self, msg: InboundMessage) -> None:
         ws_id = getattr(msg, "ws_id", "")

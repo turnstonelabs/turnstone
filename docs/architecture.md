@@ -129,6 +129,7 @@ A user message flows through the system as follows:
      |                                  on_reasoning_token() / on_content_token()
      |                                  accumulate tool_calls from deltas
      |                                  track finish_reason
+     |                                  _check_cancelled() per chunk (cooperative cancel)
      v
  finish_reason check:
      +--- "length"  --> warn, discard partial tool_calls
@@ -174,11 +175,13 @@ Phase 2: APPROVE (serial, blocking)
   _emit_state("running")
 
 Phase 3: EXECUTE (parallel)
+  _check_cancelled()  <-- cancellation checkpoint before execution starts
   if len(items) == 1:
     run_one(items[0])
   else:
     ThreadPoolExecutor(max_workers=4).map(run_one, items)
   Bash tool streams stdout line-by-line via ui.on_tool_output_chunk(call_id, line)
+    (cancel_event also checked per line — kills process group on cancel)
   Final output (stdout + stderr) delivered via ui.on_tool_result(call_id, name, output)
   call_id links tool_info items → streaming chunks → final result
   For plan tool: post-execution gate via ui.on_plan_review()
@@ -209,6 +212,11 @@ The engine emits state changes via `_emit_state()` which calls
   "idle"       --->  no more tool calls, turn complete
       |
   (or "error"  --->  exception or KeyboardInterrupt)
+
+  cancel() may be called from any state. It sets a cooperative flag
+  checked at each streaming chunk, before tool execution, and inside
+  bash commands. The session transitions to "idle" with partial
+  content preserved, emitting on_info("[Generation cancelled]").
 ```
 
 ---
@@ -1172,6 +1180,10 @@ bridge auto-approves via `POST /v1/api/approve`. Otherwise, it publishes an
 `ApprovalRequestEvent` to the outbound channel with a `request_id`, then blocks on
 `BLPOP` of a Redis response queue (`turnstone:resp:{request_id}`) until the client pushes
 a response or the approval timeout (default 3600s / 1 hour) expires.
+
+**Cancellation:** The `CancelMessage` (type `"cancel"`) is a routed inbound message.
+The bridge dispatches it to `POST /v1/api/cancel` on the server owning the workstream,
+which sets the cooperative cancel flag and unblocks any pending approval/plan waits.
 
 **Completion detection:** The bridge tracks which `correlation_id` maps to which
 `ws_id` for active sends. When the global SSE reports `ws_state → idle` for a tracked

@@ -19,6 +19,7 @@ from turnstone.api.schemas import (
 )
 from turnstone.api.server_schemas import (
     ApproveRequest,
+    CancelRequest,
     CloseWorkstreamRequest,
     CommandRequest,
     CreateWorkstreamRequest,
@@ -99,6 +100,15 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Execute a slash command",
         request_model=CommandRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 404],
+        tags=["Chat"],
+    ),
+    EndpointSpec(
+        "/v1/api/cancel",
+        "POST",
+        "Cancel the active generation in a workstream",
+        request_model=CancelRequest,
         response_model=StatusResponse,
         error_codes=[400, 404],
         tags=["Chat"],
@@ -186,6 +196,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ApproveRequest,
     PlanFeedbackRequest,
     CommandRequest,
+    CancelRequest,
     CreateWorkstreamRequest,
     CreateWorkstreamResponse,
     CloseWorkstreamRequest,

@@ -149,6 +149,11 @@ class ClearUiEvent(ServerEvent):
     type: str = "clear_ui"
 
 
+@dataclass
+class CancelledEvent(ServerEvent):
+    type: str = "cancelled"
+
+
 # ---------------------------------------------------------------------------
 # Server global events  (/v1/api/events/global)
 # ---------------------------------------------------------------------------
@@ -288,6 +293,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         ErrorEvent,
         BusyErrorEvent,
         ClearUiEvent,
+        CancelledEvent,
         WsStateEvent,
         WsActivityEvent,
         WsRenameEvent,

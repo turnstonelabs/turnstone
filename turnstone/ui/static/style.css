@@ -303,6 +303,9 @@
 }
 #input-area button:hover { filter: brightness(1.1); }
 #input-area button:disabled { opacity: 0.35; cursor: not-allowed; filter: none; }
+#stop-btn { background: var(--red, #c94040); }
+#stop-btn:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
+[data-theme="light"] #stop-btn { color: #fff; }
 
 /* ==========================================================================
    Inline approval blocks

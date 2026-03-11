@@ -57,6 +57,14 @@ group loop [while tool_calls present]
         end
     end
 
+        note right of CS
+          **Cancellation checkpoint:**
+          _check_cancelled() runs per chunk.
+          If cancel_event is set, raises
+          GenerationCancelled — preserves
+          partial content, emits idle state.
+        end note
+
     LLM --> CS : stream complete (usage stats)
     deactivate LLM
 
@@ -144,6 +152,12 @@ group loop [while tool_calls present]
         end
 
         note right of CS : Loop back for next LLM call
+
+    else GenerationCancelled
+        CS -> CS : Preserve partial content\nor roll back incomplete tools
+        CS -> UI : on_info("[Generation cancelled]")
+        CS -> UI : on_state_change("idle")
+        CS --> User : return (no re-raise)
     end
 
 end

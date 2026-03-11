@@ -40,6 +40,12 @@ running --> error : Exception during\ntool execution
 
 error --> thinking : New send() call\n_emit_state("thinking")
 
+thinking --> idle : cancel() called\n_emit_state("idle")
+
+running --> idle : cancel() called\n_emit_state("idle")
+
+attention --> idle : cancel() unblocks\napproval/plan wait\n_emit_state("idle")
+
 note right of thinking
   **Emitted via:**
   session._emit_state(state)

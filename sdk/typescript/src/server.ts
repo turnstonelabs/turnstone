@@ -86,6 +86,12 @@ export class TurnstoneServer extends BaseClient {
     });
   }
 
+  async cancel(wsId: string): Promise<StatusResponse> {
+    return this.request("POST", "/v1/api/cancel", {
+      json: { ws_id: wsId },
+    });
+  }
+
   // -- Streaming ------------------------------------------------------------
 
   async *streamEvents(wsId: string): AsyncIterableIterator<ServerEvent> {

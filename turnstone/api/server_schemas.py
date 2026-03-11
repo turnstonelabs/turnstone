@@ -35,6 +35,10 @@ class CommandRequest(BaseModel):
     ws_id: str = Field(description="Target workstream ID")
 
 
+class CancelRequest(BaseModel):
+    ws_id: str = Field(description="Target workstream ID")
+
+
 class CreateWorkstreamRequest(BaseModel):
     name: str = Field(default="", description="Workstream display name (auto-generated if empty)")
     model: str = Field(default="", description="Model alias from registry")

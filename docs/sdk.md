@@ -75,6 +75,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `approve(*, ws_id, approved, feedback, always)` | `StatusResponse` |
 | | `plan_feedback(*, ws_id, feedback)` | `StatusResponse` |
 | | `command(*, ws_id, command)` | `StatusResponse` |
+| | `cancel(ws_id)` | `StatusResponse` |
 | **Streaming** | `stream_events(ws_id)` | `Iterator[ServerEvent]` |
 | | `stream_global_events()` | `Iterator[ServerEvent]` |
 | **High-level** | `send_and_wait(message, ws_id, *, timeout, on_event)` | `TurnResult` |
@@ -129,6 +130,7 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `error` | `ErrorEvent` | `message` |
 | `info` | `InfoEvent` | `message` |
 | `stream_end` | `StreamEndEvent` | — |
+| `cancelled` | `CancelledEvent` | — |
 
 **Global events** (from `stream_global_events()`):
 

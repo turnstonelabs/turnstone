@@ -43,7 +43,7 @@ from turnstone.api.server_spec import build_server_spec
 from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
-from turnstone.core.session import ChatSession, SessionUI  # noqa: F401
+from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 
@@ -842,6 +842,10 @@ async def send_message(request: Request) -> JSONResponse:
         assert ui is not None
         try:
             session.send(message)
+        except GenerationCancelled:
+            # Safety net — send() normally handles this internally.
+            ui._enqueue({"type": "stream_end"})
+            ui.on_state_change("idle")
         except Exception as e:
             ui.on_error(f"Error: {e}")
             ui._enqueue({"type": "stream_end"})
@@ -891,6 +895,31 @@ async def plan_feedback(request: Request) -> JSONResponse:
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
     ui.resolve_plan(feedback)
+    return JSONResponse({"status": "ok"})
+
+
+async def cancel_generation(request: Request) -> JSONResponse:
+    """POST /v1/api/cancel — cancel the active generation in a workstream."""
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    ws_id = body.get("ws_id")
+    mgr = request.app.state.workstreams
+    ws, ui = _get_ws(mgr, ws_id)
+    if not ws or not ui:
+        return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+    session = ws.session
+    if session is None:
+        return JSONResponse({"error": "No session"}, status_code=400)
+    # Set the cooperative cancel flag (worker thread checks at checkpoints)
+    session.cancel()
+    # Unblock any pending approval/plan review waits
+    ui.resolve_approval(False, "Cancelled by user")
+    ui.resolve_plan("reject")
+    # Emit cancelled SSE event so SDK consumers get a typed signal
+    ui._enqueue({"type": "cancelled"})
     return JSONResponse({"status": "ok"})
 
 
@@ -1238,6 +1267,7 @@ def create_app(
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),
+                    Route("/api/cancel", cancel_generation, methods=["POST"]),
                     Route("/api/workstreams/new", create_workstream, methods=["POST"]),
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
                     Route("/api/watches", list_watches),

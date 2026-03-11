@@ -159,6 +159,7 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/send",
         "/api/plan",
         "/api/command",
+        "/api/cancel",
         "/api/workstreams/new",
         "/api/workstreams/close",
         "/api/cluster/workstreams/new",

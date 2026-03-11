@@ -88,6 +88,8 @@ partition "Phase 2: Approve" #FFF3E0 {
 }
 
 partition "Phase 3: Execute" #E3F2FD {
+    :_check_cancelled();
+    note right: Cancellation checkpoint:\nraises GenerationCancelled if\ncancel event is set
     if (single tool call?) then (yes)
         :Execute sequentially:\nrun_one(items[0]);
     else (multiple)

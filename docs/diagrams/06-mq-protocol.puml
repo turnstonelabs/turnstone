@@ -79,6 +79,12 @@ package "Inbound Messages (Client → Bridge)" #FFF3E0 {
         type = "list_nodes"
     }
 
+    class CancelMessage {
+        type = "cancel"
+        --
+        + ws_id: str
+    }
+
     IM <|-- SendMessage
     IM <|-- ApproveMessage
     IM <|-- PlanFeedbackMessage
@@ -88,6 +94,7 @@ package "Inbound Messages (Client → Bridge)" #FFF3E0 {
     IM <|-- ListWorkstreamsMessage
     IM <|-- HealthMessage
     IM <|-- ListNodesMessage
+    IM <|-- CancelMessage
 }
 
 package "Outbound Events (Bridge → Client)" #E3F2FD {

@@ -8,6 +8,7 @@ from turnstone.mq.protocol import (
     AckEvent,
     ApprovalRequestEvent,
     ApproveMessage,
+    CancelMessage,
     CloseWorkstreamMessage,
     CommandMessage,
     ContentEvent,
@@ -68,6 +69,7 @@ INBOUND_TYPES = [
     (ListWorkstreamsMessage, {}),
     (HealthMessage, {}),
     (ListNodesMessage, {}),
+    (CancelMessage, {"ws_id": "abc"}),
 ]
 
 

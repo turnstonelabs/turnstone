@@ -95,6 +95,10 @@ export interface ClearUiEvent {
   type: "clear_ui";
 }
 
+export interface CancelledEvent {
+  type: "cancelled";
+}
+
 // Global events
 
 export interface WsStateEvent {
@@ -145,6 +149,7 @@ export type ServerEvent =
   | ErrorEvent
   | BusyErrorEvent
   | ClearUiEvent
+  | CancelledEvent
   | WsStateEvent
   | WsActivityEvent
   | WsRenameEvent
@@ -246,4 +251,8 @@ export function isApproveRequestEvent(
 
 export function isPlanReviewEvent(e: ServerEvent): e is PlanReviewEvent {
   return e.type === "plan_review";
+}
+
+export function isCancelledEvent(e: ServerEvent): e is CancelledEvent {
+  return e.type === "cancelled";
 }

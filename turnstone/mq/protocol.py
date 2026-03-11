@@ -128,6 +128,14 @@ class ListNodesMessage(InboundMessage):
     type: str = "list_nodes"
 
 
+@dataclass
+class CancelMessage(InboundMessage):
+    """Cancel the active generation in a workstream."""
+
+    type: str = "cancel"
+    ws_id: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Outbound events (bridge → client)
 # ---------------------------------------------------------------------------
@@ -383,6 +391,7 @@ _INBOUND_REGISTRY: dict[str, type[InboundMessage]] = {
         ListWorkstreamsMessage,
         HealthMessage,
         ListNodesMessage,
+        CancelMessage,
     ]
 }
 

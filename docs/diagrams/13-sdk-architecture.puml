@@ -32,6 +32,7 @@ package "turnstone/sdk/ (Python)" {
         + approve()
         + plan_feedback()
         + command()
+        + cancel(ws_id)
         + stream_events(ws_id)
         + stream_global_events()
         + send_and_wait()

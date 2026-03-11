@@ -87,6 +87,7 @@
 <div id="input-area">
   <textarea id="input" rows="1" placeholder="Type a message... (Shift+Enter for newline)" aria-label="Message input"></textarea>
   <button id="send-btn" onclick="sendMessage()">Send</button>
+  <button id="stop-btn" onclick="cancelGeneration()" style="display:none" aria-label="Stop generation">&#9632; Stop</button>
 </div>
 
 <div id="toast" role="status" aria-live="polite"></div>
@@ -106,6 +107,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
   ]},
   { title: "Chat", keys: [
     { desc: "Send message", badge: '<span class="kb-key">Enter</span>' },
+    { desc: "Stop generation", badge: '<span class="kb-key">Esc</span>' },
     { desc: "New line", badge: '<span class="kb-key">Shift+Enter</span>' }
   ]},
   { title: "Navigation", keys: [
