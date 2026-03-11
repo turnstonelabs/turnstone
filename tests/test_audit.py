@@ -1,9 +1,11 @@
 """Tests for turnstone.core.audit."""
 
 import json
+
 import pytest
-from turnstone.core.storage._sqlite import SQLiteBackend
+
 from turnstone.core.audit import record_audit
+from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 @pytest.fixture

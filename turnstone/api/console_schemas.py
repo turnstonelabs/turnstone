@@ -199,6 +199,9 @@ class UserRoleInfo(BaseModel):
     display_name: str
     permissions: str
     builtin: bool
+    org_id: str
+    created: str
+    updated: str
     assigned_by: str
     assignment_created: str
 
@@ -339,6 +342,7 @@ class AuditEventInfo(BaseModel):
     resource_id: str
     detail: str
     ip_address: str
+    created: str
 
 
 class ListAuditEventsResponse(BaseModel):

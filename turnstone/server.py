@@ -223,15 +223,23 @@ class WebUI:
                                 it["needs_approval"] = False
                             else:
                                 still_pending.append(it)
+                        # Rebuild serialized to reflect policy verdicts
+                        serialized = [
+                            {
+                                "call_id": it.get("call_id", ""),
+                                "header": it.get("header", ""),
+                                "preview": it.get("preview", ""),
+                                "func_name": it.get("func_name", ""),
+                                "approval_label": it.get("approval_label", it.get("func_name", "")),
+                                "needs_approval": it.get("needs_approval", False),
+                                "error": it.get("denial_msg") if it.get("denied") else None,
+                            }
+                            for it in items
+                        ]
                         # If all were resolved by policy, check if any were denied
                         if not still_pending:
-                            any_denied = any(it.get("denied") for it in pending)
+                            any_denied = any(it.get("denied") for it in items)
                             if any_denied:
-                                # Re-serialize with updated denial info
-                                for s, it in zip(serialized, items, strict=False):
-                                    s["error"] = (
-                                        it.get("denial_msg") if it.get("denied") else s.get("error")
-                                    )
                                 self._enqueue({"type": "tool_info", "items": serialized})
                                 return False, "Blocked by tool policy"
                         pending = still_pending

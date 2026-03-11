@@ -1,8 +1,9 @@
 """Tests for turnstone.core.policy."""
 
 import pytest
+
+from turnstone.core.policy import evaluate_tool_policies_batch, evaluate_tool_policy
 from turnstone.core.storage._sqlite import SQLiteBackend
-from turnstone.core.policy import evaluate_tool_policy, evaluate_tool_policies_batch
 
 
 @pytest.fixture

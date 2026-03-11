@@ -97,7 +97,7 @@ Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 > See also: [Governance documentation](governance.md)
 
 Scopes provide coarse endpoint-level access control. For finer-grained
-enforcement, the governance layer adds 13 named permissions checked
+enforcement, the governance layer adds 15 named permissions checked
 per-endpoint by `require_permission()`. Permissions are bundled into
 roles; users are assigned roles via the `user_roles` join table.
 
@@ -111,7 +111,7 @@ Three built-in roles are seeded by migration 008:
 
 | Role | Permissions |
 |------|-------------|
-| admin | All 13 permissions |
+| admin | All 15 permissions |
 | operator | read, write, workstreams.create, workstreams.close |
 | viewer | read |
 

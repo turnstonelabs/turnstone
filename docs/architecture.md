@@ -1350,7 +1350,7 @@ with backoff, re-querying the service registry on each attempt. See
 Turnstone governance extends the Phase 1 auth system with role-based access
 control (RBAC), tool execution policies, prompt templates, usage tracking,
 and audit logging. The permission model has two layers: legacy scopes
-(`read`, `write`, `approve`) checked by `AuthMiddleware`, and 13 granular
+(`read`, `write`, `approve`) checked by `AuthMiddleware`, and 15 granular
 permissions checked per-endpoint by `require_permission()`. Three built-in
 roles (admin, operator, viewer) are seeded by migration 008; custom roles
 can be created with any permission subset. JWTs carry both `scopes` and

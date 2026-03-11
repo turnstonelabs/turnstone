@@ -65,12 +65,26 @@ function showAdmin() {
   if (visibleTabs.length > 0) {
     switchAdminTab(visibleTabs[0].getAttribute("data-tab"));
   } else {
-    loadAdminUsers();
+    // No tabs visible — show empty state instead of loading an inaccessible tab
+    var panels = document.querySelectorAll(".admin-panel");
+    for (var j = 0; j < panels.length; j++) panels[j].style.display = "none";
+    var empty = document.getElementById("admin-no-permissions");
+    if (!empty) {
+      empty = document.createElement("div");
+      empty.id = "admin-no-permissions";
+      empty.className = "dashboard-empty";
+      empty.textContent = "You do not have permissions to view any admin tabs.";
+      document.getElementById("view-admin").appendChild(empty);
+    }
+    empty.style.display = "";
   }
 }
 
 function switchAdminTab(tab) {
   _adminTab = tab;
+  // Hide no-permissions empty state if it was showing
+  var noPerms = document.getElementById("admin-no-permissions");
+  if (noPerms) noPerms.style.display = "none";
   var tabs = document.querySelectorAll(".admin-tab");
   for (var i = 0; i < tabs.length; i++) {
     var isActive = tabs[i].getAttribute("data-tab") === tab;
