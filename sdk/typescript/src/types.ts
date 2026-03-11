@@ -504,6 +504,7 @@ export interface AuditEventInfo {
   resource_id: string;
   detail: string;
   ip_address: string;
+  created: string;
 }
 
 export interface AuditQueryOptions {

@@ -20,7 +20,18 @@ from turnstone.api.console_schemas import (
     ClusterWorkstreamsResponse,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    ListAuditEventsResponse,
+    ListOrgsResponse,
+    ListPromptTemplatesResponse,
+    ListRolesResponse,
+    ListToolPoliciesResponse,
+    ListUserRolesResponse,
     NodeDetailResponse,
+    OrgInfo,
+    PromptTemplateInfo,
+    RoleInfo,
+    ToolPolicyInfo,
+    UsageResponse,
 )
 from turnstone.api.schemas import (
     AuthLoginResponse,
@@ -295,60 +306,79 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     # -- governance: roles ---------------------------------------------------
 
-    async def list_roles(self) -> dict[str, Any]:
+    async def list_roles(self) -> ListRolesResponse:
         """List all roles."""
-        return await self._request("GET", "/v1/api/admin/roles")
+        return await self._request("GET", "/v1/api/admin/roles", response_model=ListRolesResponse)
 
     async def create_role(
         self, name: str, display_name: str = "", permissions: str = "read"
-    ) -> dict[str, Any]:
+    ) -> RoleInfo:
         """Create a custom role."""
         body: dict[str, Any] = {"name": name, "permissions": permissions}
         if display_name:
             body["display_name"] = display_name
-        return await self._request("POST", "/v1/api/admin/roles", json_body=body)
-
-    async def update_role(self, role_id: str, **fields: Any) -> dict[str, Any]:
-        """Update a role's display_name and/or permissions."""
-        return await self._request("PUT", f"/v1/api/admin/roles/{role_id}", json_body=fields)
-
-    async def delete_role(self, role_id: str) -> dict[str, Any]:
-        """Delete a custom role."""
-        return await self._request("DELETE", f"/v1/api/admin/roles/{role_id}")
-
-    async def list_user_roles(self, user_id: str) -> dict[str, Any]:
-        """List roles assigned to a user."""
-        return await self._request("GET", f"/v1/api/admin/users/{user_id}/roles")
-
-    async def assign_role(self, user_id: str, role_id: str) -> dict[str, Any]:
-        """Assign a role to a user."""
         return await self._request(
-            "POST", f"/v1/api/admin/users/{user_id}/roles", json_body={"role_id": role_id}
+            "POST", "/v1/api/admin/roles", json_body=body, response_model=RoleInfo
         )
 
-    async def unassign_role(self, user_id: str, role_id: str) -> dict[str, Any]:
+    async def update_role(self, role_id: str, **fields: Any) -> RoleInfo:
+        """Update a role's display_name and/or permissions."""
+        return await self._request(
+            "PUT", f"/v1/api/admin/roles/{role_id}", json_body=fields, response_model=RoleInfo
+        )
+
+    async def delete_role(self, role_id: str) -> StatusResponse:
+        """Delete a custom role."""
+        return await self._request(
+            "DELETE", f"/v1/api/admin/roles/{role_id}", response_model=StatusResponse
+        )
+
+    async def list_user_roles(self, user_id: str) -> ListUserRolesResponse:
+        """List roles assigned to a user."""
+        return await self._request(
+            "GET", f"/v1/api/admin/users/{user_id}/roles", response_model=ListUserRolesResponse
+        )
+
+    async def assign_role(self, user_id: str, role_id: str) -> StatusResponse:
+        """Assign a role to a user."""
+        return await self._request(
+            "POST",
+            f"/v1/api/admin/users/{user_id}/roles",
+            json_body={"role_id": role_id},
+            response_model=StatusResponse,
+        )
+
+    async def unassign_role(self, user_id: str, role_id: str) -> StatusResponse:
         """Unassign a role from a user."""
-        return await self._request("DELETE", f"/v1/api/admin/users/{user_id}/roles/{role_id}")
+        return await self._request(
+            "DELETE",
+            f"/v1/api/admin/users/{user_id}/roles/{role_id}",
+            response_model=StatusResponse,
+        )
 
     # -- governance: organizations -------------------------------------------
 
-    async def list_orgs(self) -> dict[str, Any]:
+    async def list_orgs(self) -> ListOrgsResponse:
         """List organizations."""
-        return await self._request("GET", "/v1/api/admin/orgs")
+        return await self._request("GET", "/v1/api/admin/orgs", response_model=ListOrgsResponse)
 
-    async def get_org(self, org_id: str) -> dict[str, Any]:
+    async def get_org(self, org_id: str) -> OrgInfo:
         """Get organization details."""
-        return await self._request("GET", f"/v1/api/admin/orgs/{org_id}")
+        return await self._request("GET", f"/v1/api/admin/orgs/{org_id}", response_model=OrgInfo)
 
-    async def update_org(self, org_id: str, **fields: Any) -> dict[str, Any]:
+    async def update_org(self, org_id: str, **fields: Any) -> OrgInfo:
         """Update organization settings."""
-        return await self._request("PUT", f"/v1/api/admin/orgs/{org_id}", json_body=fields)
+        return await self._request(
+            "PUT", f"/v1/api/admin/orgs/{org_id}", json_body=fields, response_model=OrgInfo
+        )
 
     # -- governance: tool policies -------------------------------------------
 
-    async def list_policies(self) -> dict[str, Any]:
+    async def list_policies(self) -> ListToolPoliciesResponse:
         """List tool policies ordered by priority."""
-        return await self._request("GET", "/v1/api/admin/policies")
+        return await self._request(
+            "GET", "/v1/api/admin/policies", response_model=ListToolPoliciesResponse
+        )
 
     async def create_policy(
         self,
@@ -357,7 +387,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         action: str,
         priority: int = 0,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> ToolPolicyInfo:
         """Create a tool policy."""
         body: dict[str, Any] = {
             "name": name,
@@ -366,21 +396,32 @@ class AsyncTurnstoneConsole(_BaseClient):
             "priority": priority,
             **kwargs,
         }
-        return await self._request("POST", "/v1/api/admin/policies", json_body=body)
+        return await self._request(
+            "POST", "/v1/api/admin/policies", json_body=body, response_model=ToolPolicyInfo
+        )
 
-    async def update_policy(self, policy_id: str, **fields: Any) -> dict[str, Any]:
+    async def update_policy(self, policy_id: str, **fields: Any) -> ToolPolicyInfo:
         """Update a tool policy."""
-        return await self._request("PUT", f"/v1/api/admin/policies/{policy_id}", json_body=fields)
+        return await self._request(
+            "PUT",
+            f"/v1/api/admin/policies/{policy_id}",
+            json_body=fields,
+            response_model=ToolPolicyInfo,
+        )
 
-    async def delete_policy(self, policy_id: str) -> dict[str, Any]:
+    async def delete_policy(self, policy_id: str) -> StatusResponse:
         """Delete a tool policy."""
-        return await self._request("DELETE", f"/v1/api/admin/policies/{policy_id}")
+        return await self._request(
+            "DELETE", f"/v1/api/admin/policies/{policy_id}", response_model=StatusResponse
+        )
 
     # -- governance: prompt templates ----------------------------------------
 
-    async def list_templates(self) -> dict[str, Any]:
+    async def list_templates(self) -> ListPromptTemplatesResponse:
         """List prompt templates."""
-        return await self._request("GET", "/v1/api/admin/templates")
+        return await self._request(
+            "GET", "/v1/api/admin/templates", response_model=ListPromptTemplatesResponse
+        )
 
     async def create_template(
         self,
@@ -390,7 +431,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         variables: str = "[]",
         is_default: bool = False,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> PromptTemplateInfo:
         """Create a prompt template."""
         body: dict[str, Any] = {
             "name": name,
@@ -400,17 +441,26 @@ class AsyncTurnstoneConsole(_BaseClient):
             "is_default": is_default,
             **kwargs,
         }
-        return await self._request("POST", "/v1/api/admin/templates", json_body=body)
-
-    async def update_template(self, template_id: str, **fields: Any) -> dict[str, Any]:
-        """Update a prompt template."""
         return await self._request(
-            "PUT", f"/v1/api/admin/templates/{template_id}", json_body=fields
+            "POST", "/v1/api/admin/templates", json_body=body, response_model=PromptTemplateInfo
         )
 
-    async def delete_template(self, template_id: str) -> dict[str, Any]:
+    async def update_template(self, template_id: str, **fields: Any) -> PromptTemplateInfo:
+        """Update a prompt template."""
+        return await self._request(
+            "PUT",
+            f"/v1/api/admin/templates/{template_id}",
+            json_body=fields,
+            response_model=PromptTemplateInfo,
+        )
+
+    async def delete_template(self, template_id: str) -> StatusResponse:
         """Delete a prompt template."""
-        return await self._request("DELETE", f"/v1/api/admin/templates/{template_id}")
+        return await self._request(
+            "DELETE",
+            f"/v1/api/admin/templates/{template_id}",
+            response_model=StatusResponse,
+        )
 
     # -- governance: usage & audit -------------------------------------------
 
@@ -421,7 +471,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         user_id: str = "",
         model: str = "",
         group_by: str = "",
-    ) -> dict[str, Any]:
+    ) -> UsageResponse:
         """Query aggregated usage data."""
         params: dict[str, Any] = {"since": since}
         if until:
@@ -432,7 +482,9 @@ class AsyncTurnstoneConsole(_BaseClient):
             params["model"] = model
         if group_by:
             params["group_by"] = group_by
-        return await self._request("GET", "/v1/api/admin/usage", params=params)
+        return await self._request(
+            "GET", "/v1/api/admin/usage", params=params, response_model=UsageResponse
+        )
 
     async def get_audit(
         self,
@@ -442,7 +494,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         until: str = "",
         limit: int = 50,
         offset: int = 0,
-    ) -> dict[str, Any]:
+    ) -> ListAuditEventsResponse:
         """Query paginated audit events."""
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if action:
@@ -453,7 +505,9 @@ class AsyncTurnstoneConsole(_BaseClient):
             params["since"] = since
         if until:
             params["until"] = until
-        return await self._request("GET", "/v1/api/admin/audit", params=params)
+        return await self._request(
+            "GET", "/v1/api/admin/audit", params=params, response_model=ListAuditEventsResponse
+        )
 
 
 class TurnstoneConsole:
@@ -633,45 +687,43 @@ class TurnstoneConsole:
 
     # -- governance: roles ---------------------------------------------------
 
-    def list_roles(self) -> dict[str, Any]:
+    def list_roles(self) -> ListRolesResponse:
         return self._runner.run(self._async.list_roles())
 
-    def create_role(
-        self, name: str, display_name: str = "", permissions: str = "read"
-    ) -> dict[str, Any]:
+    def create_role(self, name: str, display_name: str = "", permissions: str = "read") -> RoleInfo:
         return self._runner.run(
             self._async.create_role(name, display_name=display_name, permissions=permissions)
         )
 
-    def update_role(self, role_id: str, **fields: Any) -> dict[str, Any]:
+    def update_role(self, role_id: str, **fields: Any) -> RoleInfo:
         return self._runner.run(self._async.update_role(role_id, **fields))
 
-    def delete_role(self, role_id: str) -> dict[str, Any]:
+    def delete_role(self, role_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_role(role_id))
 
-    def list_user_roles(self, user_id: str) -> dict[str, Any]:
+    def list_user_roles(self, user_id: str) -> ListUserRolesResponse:
         return self._runner.run(self._async.list_user_roles(user_id))
 
-    def assign_role(self, user_id: str, role_id: str) -> dict[str, Any]:
+    def assign_role(self, user_id: str, role_id: str) -> StatusResponse:
         return self._runner.run(self._async.assign_role(user_id, role_id))
 
-    def unassign_role(self, user_id: str, role_id: str) -> dict[str, Any]:
+    def unassign_role(self, user_id: str, role_id: str) -> StatusResponse:
         return self._runner.run(self._async.unassign_role(user_id, role_id))
 
     # -- governance: organizations -------------------------------------------
 
-    def list_orgs(self) -> dict[str, Any]:
+    def list_orgs(self) -> ListOrgsResponse:
         return self._runner.run(self._async.list_orgs())
 
-    def get_org(self, org_id: str) -> dict[str, Any]:
+    def get_org(self, org_id: str) -> OrgInfo:
         return self._runner.run(self._async.get_org(org_id))
 
-    def update_org(self, org_id: str, **fields: Any) -> dict[str, Any]:
+    def update_org(self, org_id: str, **fields: Any) -> OrgInfo:
         return self._runner.run(self._async.update_org(org_id, **fields))
 
     # -- governance: tool policies -------------------------------------------
 
-    def list_policies(self) -> dict[str, Any]:
+    def list_policies(self) -> ListToolPoliciesResponse:
         return self._runner.run(self._async.list_policies())
 
     def create_policy(
@@ -681,20 +733,20 @@ class TurnstoneConsole:
         action: str,
         priority: int = 0,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> ToolPolicyInfo:
         return self._runner.run(
             self._async.create_policy(name, tool_pattern, action, priority=priority, **kwargs)
         )
 
-    def update_policy(self, policy_id: str, **fields: Any) -> dict[str, Any]:
+    def update_policy(self, policy_id: str, **fields: Any) -> ToolPolicyInfo:
         return self._runner.run(self._async.update_policy(policy_id, **fields))
 
-    def delete_policy(self, policy_id: str) -> dict[str, Any]:
+    def delete_policy(self, policy_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_policy(policy_id))
 
     # -- governance: prompt templates ----------------------------------------
 
-    def list_templates(self) -> dict[str, Any]:
+    def list_templates(self) -> ListPromptTemplatesResponse:
         return self._runner.run(self._async.list_templates())
 
     def create_template(
@@ -705,7 +757,7 @@ class TurnstoneConsole:
         variables: str = "[]",
         is_default: bool = False,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> PromptTemplateInfo:
         return self._runner.run(
             self._async.create_template(
                 name,
@@ -717,10 +769,10 @@ class TurnstoneConsole:
             )
         )
 
-    def update_template(self, template_id: str, **fields: Any) -> dict[str, Any]:
+    def update_template(self, template_id: str, **fields: Any) -> PromptTemplateInfo:
         return self._runner.run(self._async.update_template(template_id, **fields))
 
-    def delete_template(self, template_id: str) -> dict[str, Any]:
+    def delete_template(self, template_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_template(template_id))
 
     # -- governance: usage & audit -------------------------------------------
@@ -732,7 +784,7 @@ class TurnstoneConsole:
         user_id: str = "",
         model: str = "",
         group_by: str = "",
-    ) -> dict[str, Any]:
+    ) -> UsageResponse:
         return self._runner.run(
             self._async.get_usage(
                 since, until=until, user_id=user_id, model=model, group_by=group_by
@@ -747,7 +799,7 @@ class TurnstoneConsole:
         until: str = "",
         limit: int = 50,
         offset: int = 0,
-    ) -> dict[str, Any]:
+    ) -> ListAuditEventsResponse:
         return self._runner.run(
             self._async.get_audit(
                 action=action,

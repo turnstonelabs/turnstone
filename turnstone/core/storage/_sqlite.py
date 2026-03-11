@@ -1775,7 +1775,7 @@ class SQLiteBackend:
                 audit_events.c.detail,
                 audit_events.c.ip_address,
                 audit_events.c.created,
-            ).order_by(audit_events.c.timestamp.desc())
+            ).order_by(audit_events.c.timestamp.desc(), audit_events.c.event_id.desc())
             if action:
                 q = q.where(audit_events.c.action == action)
             if user_id:

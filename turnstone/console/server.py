@@ -1420,13 +1420,21 @@ async def admin_cancel_watch(request: Request) -> Response:
 def _audit_context(request: Request) -> tuple[str, str]:
     """Extract (user_id, ip_address) from request for audit logging.
 
-    Prefers ``X-Forwarded-For`` when present (matching the existing
-    ``is_secure_request()`` trust model for ``X-Forwarded-Proto``).
+    Honors ``X-Forwarded-For`` only when the request appears to come
+    through a trusted proxy (``X-Forwarded-Proto`` is set), matching the
+    existing ``is_secure_request()`` trust model.  Falls back to
+    ``request.client.host`` otherwise.
     """
+    from turnstone.core.auth import is_secure_request
+
     auth_result = getattr(request.state, "auth_result", None)
     user_id = auth_result.user_id if auth_result else ""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    ip = forwarded.split(",")[0].strip() if forwarded else ""
+    ip = ""
+    # Only trust X-Forwarded-For when behind a proxy that sets X-Forwarded-Proto
+    if is_secure_request(dict(request.headers), request.url.scheme):
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            ip = forwarded.split(",")[0].strip()
     if not ip:
         ip = request.client.host if request.client else ""
     return user_id, ip
@@ -2159,6 +2167,12 @@ async def admin_usage(request: Request) -> JSONResponse:
     user_id = params.get("user_id", "")
     model = params.get("model", "")
     group_by = params.get("group_by", "day")
+
+    if group_by not in ("day", "hour", "model", "user"):
+        return JSONResponse(
+            {"error": "group_by must be one of: day, hour, model, user"},
+            status_code=400,
+        )
 
     if not since:
         since = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")

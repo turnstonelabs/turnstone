@@ -385,6 +385,8 @@ function _submitSetup() {
 function _storePermissions(data) {
   if (data && data.permissions) {
     sessionStorage.setItem("turnstone_permissions", data.permissions);
+  } else {
+    sessionStorage.removeItem("turnstone_permissions");
   }
 }
 

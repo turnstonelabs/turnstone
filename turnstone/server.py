@@ -80,8 +80,9 @@ class WebUI:
     _global_queue: queue.Queue[dict[str, Any]] | None = None
     _workstream_mgr: WorkstreamManager | None = None
 
-    def __init__(self, ws_id: str = "") -> None:
+    def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
+        self._user_id = user_id
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._approval_event = threading.Event()
@@ -329,7 +330,7 @@ class WebUI:
 
                 storage.record_usage_event(
                     event_id=uuid.uuid4().hex,
-                    user_id="",
+                    user_id=self._user_id,
                     ws_id=self.ws_id,
                     node_id="",
                     model=usage.get("model", ""),
@@ -947,10 +948,12 @@ async def create_workstream(request: Request) -> JSONResponse:
         return body
     mgr: WorkstreamManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = getattr(auth, "user_id", "") or ""
     try:
         ws = mgr.create(
             name=body.get("name", ""),
-            ui_factory=lambda wid: WebUI(ws_id=wid),
+            ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
             model=body.get("model") or None,
         )
         assert isinstance(ws.ui, WebUI)
