@@ -1,6 +1,8 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ClusterEvent } from "./events.js";
 import type {
+  AuditQueryOptions,
+  AuditResponse,
   AuthLoginResponse,
   AuthSetupResponse,
   AuthStatusResponse,
@@ -11,14 +13,28 @@ import type {
   ConsoleCreateWsRequest,
   ConsoleCreateWsResponse,
   ConsoleHealthResponse,
+  CreatePolicyOptions,
+  CreateRoleOptions,
   CreateScheduleRequest,
+  CreateTemplateOptions,
   ListScheduleRunsResponse,
   ListSchedulesResponse,
   NodeDetailResponse,
   NodesOptions,
+  OrgInfo,
+  PromptTemplateInfo,
+  RoleInfo,
   ScheduleInfo,
   StatusResponse,
+  ToolPolicyInfo,
+  UpdateOrgOptions,
+  UpdatePolicyOptions,
+  UpdateRoleOptions,
   UpdateScheduleRequest,
+  UpdateTemplateOptions,
+  UsageQueryOptions,
+  UsageResponse,
+  UserRoleInfo,
   WorkstreamsOptions,
 } from "./types.js";
 
@@ -156,5 +172,126 @@ export class TurnstoneConsole extends BaseClient {
     return this.request("GET", `/v1/api/admin/schedules/${taskId}/runs`, {
       params: { limit: opts?.limit ?? 50 },
     });
+  }
+
+  // -- Governance: Roles ------------------------------------------------------
+
+  async listRoles(): Promise<{ roles: RoleInfo[] }> {
+    return this.request("GET", "/v1/api/admin/roles");
+  }
+
+  async createRole(opts: CreateRoleOptions): Promise<RoleInfo> {
+    return this.request("POST", "/v1/api/admin/roles", { json: opts });
+  }
+
+  async updateRole(roleId: string, opts: UpdateRoleOptions): Promise<RoleInfo> {
+    return this.request("PUT", `/v1/api/admin/roles/${roleId}`, {
+      json: opts,
+    });
+  }
+
+  async deleteRole(roleId: string): Promise<StatusResponse> {
+    return this.request("DELETE", `/v1/api/admin/roles/${roleId}`);
+  }
+
+  async listUserRoles(userId: string): Promise<{ roles: UserRoleInfo[] }> {
+    return this.request("GET", `/v1/api/admin/users/${userId}/roles`);
+  }
+
+  async assignRole(userId: string, roleId: string): Promise<StatusResponse> {
+    return this.request("POST", `/v1/api/admin/users/${userId}/roles`, {
+      json: { role_id: roleId },
+    });
+  }
+
+  async unassignRole(userId: string, roleId: string): Promise<StatusResponse> {
+    return this.request(
+      "DELETE",
+      `/v1/api/admin/users/${userId}/roles/${roleId}`,
+    );
+  }
+
+  // -- Governance: Organizations ----------------------------------------------
+
+  async listOrgs(): Promise<{ orgs: OrgInfo[] }> {
+    return this.request("GET", "/v1/api/admin/orgs");
+  }
+
+  async getOrg(orgId: string): Promise<OrgInfo> {
+    return this.request("GET", `/v1/api/admin/orgs/${orgId}`);
+  }
+
+  async updateOrg(orgId: string, opts: UpdateOrgOptions): Promise<OrgInfo> {
+    return this.request("PUT", `/v1/api/admin/orgs/${orgId}`, { json: opts });
+  }
+
+  // -- Governance: Tool Policies ----------------------------------------------
+
+  async listPolicies(): Promise<{ policies: ToolPolicyInfo[] }> {
+    return this.request("GET", "/v1/api/admin/policies");
+  }
+
+  async createPolicy(opts: CreatePolicyOptions): Promise<ToolPolicyInfo> {
+    return this.request("POST", "/v1/api/admin/policies", { json: opts });
+  }
+
+  async updatePolicy(
+    policyId: string,
+    opts: UpdatePolicyOptions,
+  ): Promise<ToolPolicyInfo> {
+    return this.request("PUT", `/v1/api/admin/policies/${policyId}`, {
+      json: opts,
+    });
+  }
+
+  async deletePolicy(policyId: string): Promise<StatusResponse> {
+    return this.request("DELETE", `/v1/api/admin/policies/${policyId}`);
+  }
+
+  // -- Governance: Prompt Templates -------------------------------------------
+
+  async listTemplates(): Promise<{ templates: PromptTemplateInfo[] }> {
+    return this.request("GET", "/v1/api/admin/templates");
+  }
+
+  async createTemplate(
+    opts: CreateTemplateOptions,
+  ): Promise<PromptTemplateInfo> {
+    return this.request("POST", "/v1/api/admin/templates", { json: opts });
+  }
+
+  async updateTemplate(
+    templateId: string,
+    opts: UpdateTemplateOptions,
+  ): Promise<PromptTemplateInfo> {
+    return this.request("PUT", `/v1/api/admin/templates/${templateId}`, {
+      json: opts,
+    });
+  }
+
+  async deleteTemplate(templateId: string): Promise<StatusResponse> {
+    return this.request("DELETE", `/v1/api/admin/templates/${templateId}`);
+  }
+
+  // -- Governance: Usage & Audit ----------------------------------------------
+
+  async getUsage(opts: UsageQueryOptions): Promise<UsageResponse> {
+    const params: Record<string, string> = { since: opts.since };
+    if (opts.until) params.until = opts.until;
+    if (opts.user_id) params.user_id = opts.user_id;
+    if (opts.model) params.model = opts.model;
+    if (opts.group_by) params.group_by = opts.group_by;
+    return this.request("GET", "/v1/api/admin/usage", { params });
+  }
+
+  async getAudit(opts?: AuditQueryOptions): Promise<AuditResponse> {
+    const params: Record<string, string> = {};
+    if (opts?.action) params.action = opts.action;
+    if (opts?.user_id) params.user_id = opts.user_id;
+    if (opts?.since) params.since = opts.since;
+    if (opts?.until) params.until = opts.until;
+    if (opts?.limit !== undefined) params.limit = String(opts.limit);
+    if (opts?.offset !== undefined) params.offset = String(opts.offset);
+    return this.request("GET", "/v1/api/admin/audit", { params });
   }
 }

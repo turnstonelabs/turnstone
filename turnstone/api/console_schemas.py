@@ -156,3 +156,191 @@ class ConsoleHealthResponse(BaseModel):
     workstreams: int = 0
     version_drift: bool = False
     versions: list[str] = []
+
+
+# ---------------------------------------------------------------------------
+# Governance: Roles
+# ---------------------------------------------------------------------------
+
+
+class RoleInfo(BaseModel):
+    role_id: str
+    name: str
+    display_name: str
+    permissions: str
+    builtin: bool
+    org_id: str
+    created: str
+    updated: str
+
+
+class CreateRoleRequest(BaseModel):
+    name: str
+    display_name: str = ""
+    permissions: str = "read"
+
+
+class UpdateRoleRequest(BaseModel):
+    display_name: str | None = None
+    permissions: str | None = None
+
+
+class ListRolesResponse(BaseModel):
+    roles: list[RoleInfo]
+
+
+class AssignRoleRequest(BaseModel):
+    role_id: str
+
+
+class UserRoleInfo(BaseModel):
+    role_id: str
+    name: str
+    display_name: str
+    permissions: str
+    builtin: bool
+    assigned_by: str
+    assignment_created: str
+
+
+class ListUserRolesResponse(BaseModel):
+    roles: list[UserRoleInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Orgs
+# ---------------------------------------------------------------------------
+
+
+class OrgInfo(BaseModel):
+    org_id: str
+    name: str
+    display_name: str
+    settings: str
+    created: str
+    updated: str
+
+
+class UpdateOrgRequest(BaseModel):
+    display_name: str | None = None
+    settings: str | None = None
+
+
+class ListOrgsResponse(BaseModel):
+    orgs: list[OrgInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Tool Policies
+# ---------------------------------------------------------------------------
+
+
+class ToolPolicyInfo(BaseModel):
+    policy_id: str
+    name: str
+    tool_pattern: str
+    action: str
+    priority: int
+    org_id: str
+    enabled: bool
+    created_by: str
+    created: str
+    updated: str
+
+
+class CreateToolPolicyRequest(BaseModel):
+    name: str
+    tool_pattern: str
+    action: str  # allow, deny, ask
+    priority: int = 0
+    org_id: str = ""
+    enabled: bool = True
+
+
+class UpdateToolPolicyRequest(BaseModel):
+    name: str | None = None
+    tool_pattern: str | None = None
+    action: str | None = None
+    priority: int | None = None
+    enabled: bool | None = None
+
+
+class ListToolPoliciesResponse(BaseModel):
+    policies: list[ToolPolicyInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Prompt Templates
+# ---------------------------------------------------------------------------
+
+
+class PromptTemplateInfo(BaseModel):
+    template_id: str
+    name: str
+    category: str
+    content: str
+    variables: str
+    is_default: bool
+    org_id: str
+    created_by: str
+    created: str
+    updated: str
+
+
+class CreatePromptTemplateRequest(BaseModel):
+    name: str
+    content: str
+    category: str = "general"
+    variables: str = "[]"
+    is_default: bool = False
+    org_id: str = ""
+
+
+class UpdatePromptTemplateRequest(BaseModel):
+    name: str | None = None
+    content: str | None = None
+    category: str | None = None
+    variables: str | None = None
+    is_default: bool | None = None
+
+
+class ListPromptTemplatesResponse(BaseModel):
+    templates: list[PromptTemplateInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Usage
+# ---------------------------------------------------------------------------
+
+
+class UsageBreakdownItem(BaseModel):
+    key: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    tool_calls_count: int = 0
+
+
+class UsageResponse(BaseModel):
+    summary: list[UsageBreakdownItem]
+    breakdown: list[UsageBreakdownItem]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Audit
+# ---------------------------------------------------------------------------
+
+
+class AuditEventInfo(BaseModel):
+    event_id: str
+    timestamp: str
+    user_id: str
+    action: str
+    resource_type: str
+    resource_id: str
+    detail: str
+    ip_address: str
+
+
+class ListAuditEventsResponse(BaseModel):
+    events: list[AuditEventInfo]
+    total: int

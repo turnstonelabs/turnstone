@@ -1340,3 +1340,28 @@ gateway validates the JWT, resolves the target (username lookup via
 the appropriate `ChannelAdapter.send()`. Delivery retries up to 3 times
 with backoff, re-querying the service registry on each attempt. See
 [Notification Flow diagram](diagrams/png/17-notify-flow.png).
+
+---
+
+## Governance
+
+> See also: [Governance documentation](governance.md) | [Governance Architecture diagram](diagrams/19-governance-architecture.puml)
+
+Turnstone governance extends the Phase 1 auth system with role-based access
+control (RBAC), tool execution policies, prompt templates, usage tracking,
+and audit logging. The permission model has two layers: legacy scopes
+(`read`, `write`, `approve`) checked by `AuthMiddleware`, and 13 granular
+permissions checked per-endpoint by `require_permission()`. Three built-in
+roles (admin, operator, viewer) are seeded by migration 008; custom roles
+can be created with any permission subset. JWTs carry both `scopes` and
+`permissions` claims for backward compatibility.
+
+Tool policies use glob pattern matching (`fnmatch`) with priority-ordered
+first-match-wins evaluation to control tool execution (allow/deny/ask).
+Prompt templates provide reusable system messages with `{{variable}}`
+substitution. Usage events are recorded per-LLM-request for token
+accounting. An append-only audit log captures all admin mutations.
+
+The console admin panel adds 5 governance tabs (Roles, Policies, Templates,
+Usage, Audit) for a total of 10 tabs, all permission-gated. Both Python
+and TypeScript SDKs expose governance methods on the console client.

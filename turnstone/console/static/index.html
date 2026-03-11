@@ -82,6 +82,11 @@
       <button id="tab-channels" class="admin-tab" data-tab="channels" role="tab" aria-selected="false" aria-controls="admin-channels" tabindex="-1" onclick="switchAdminTab('channels')">Channels</button>
       <button id="tab-schedules" class="admin-tab" data-tab="schedules" role="tab" aria-selected="false" aria-controls="admin-schedules" tabindex="-1" onclick="switchAdminTab('schedules')">Schedules</button>
       <button id="tab-watches" class="admin-tab" data-tab="watches" role="tab" aria-selected="false" aria-controls="admin-watches" tabindex="-1" onclick="switchAdminTab('watches')">Watches</button>
+      <button id="tab-roles" class="admin-tab" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
+      <button id="tab-policies" class="admin-tab" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
+      <button id="tab-templates" class="admin-tab" data-tab="templates" role="tab" aria-selected="false" aria-controls="admin-templates" tabindex="-1" onclick="switchAdminTab('templates')">Templates</button>
+      <button id="tab-usage" class="admin-tab" data-tab="usage" role="tab" aria-selected="false" aria-controls="admin-usage" tabindex="-1" onclick="switchAdminTab('usage')">Usage</button>
+      <button id="tab-audit" class="admin-tab" data-tab="audit" role="tab" aria-selected="false" aria-controls="admin-audit" tabindex="-1" onclick="switchAdminTab('audit')">Audit</button>
     </div>
 
     <!-- Users Tab -->
@@ -186,6 +191,118 @@
       </div>
       <div id="admin-watches-table" role="list" aria-label="Watches" aria-live="polite">
         <div class="dashboard-empty">Loading watches...</div>
+      </div>
+    </div>
+
+    <!-- Roles Tab -->
+    <div id="admin-roles" class="admin-panel" role="tabpanel" aria-labelledby="tab-roles" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">ROLES</span>
+        <button class="admin-action-btn" onclick="showCreateRoleModal()">+ Create role</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-rname">NAME</span>
+        <span class="admin-col admin-col-rperms">PERMISSIONS</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-roles-table" role="list" aria-label="Roles" aria-live="polite">
+        <div class="dashboard-empty">Loading roles...</div>
+      </div>
+    </div>
+
+    <!-- Policies Tab -->
+    <div id="admin-policies" class="admin-panel" role="tabpanel" aria-labelledby="tab-policies" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">TOOL POLICIES</span>
+        <button class="admin-action-btn" onclick="showCreatePolicyModal()">+ Create policy</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-pname">NAME</span>
+        <span class="admin-col admin-col-ppattern">PATTERN</span>
+        <span class="admin-col admin-col-paction">ACTION</span>
+        <span class="admin-col admin-col-ppriority">PRI</span>
+        <span class="admin-col admin-col-pstatus">STATUS</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-policies-table" role="list" aria-label="Tool policies" aria-live="polite">
+        <div class="dashboard-empty">Loading policies...</div>
+      </div>
+    </div>
+
+    <!-- Templates Tab -->
+    <div id="admin-templates" class="admin-panel" role="tabpanel" aria-labelledby="tab-templates" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">PROMPT TEMPLATES</span>
+        <button class="admin-action-btn" onclick="showCreateTemplateModal()">+ Create template</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-tmname">NAME</span>
+        <span class="admin-col admin-col-tmcat">CATEGORY</span>
+        <span class="admin-col admin-col-tmvars">VARIABLES</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-templates-table" role="list" aria-label="Prompt templates" aria-live="polite">
+        <div class="dashboard-empty">Loading templates...</div>
+      </div>
+    </div>
+
+    <!-- Usage Tab -->
+    <div id="admin-usage" class="admin-panel" role="tabpanel" aria-labelledby="tab-usage" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">USAGE</span>
+        <div class="usage-range-group" role="group" aria-label="Time range">
+          <button class="usage-range-btn" data-range="24h" aria-pressed="false" onclick="setUsageRange('24h')">24h</button>
+          <button class="usage-range-btn active" data-range="7d" aria-pressed="true" onclick="setUsageRange('7d')">7d</button>
+          <button class="usage-range-btn" data-range="30d" aria-pressed="false" onclick="setUsageRange('30d')">30d</button>
+        </div>
+        <div class="usage-range-group" role="group" aria-label="Group by">
+          <button class="usage-group-btn active" data-group="day" aria-pressed="true" onclick="setUsageGroupBy('day')">day</button>
+          <button class="usage-group-btn" data-group="model" aria-pressed="false" onclick="setUsageGroupBy('model')">model</button>
+          <button class="usage-group-btn" data-group="user" aria-pressed="false" onclick="setUsageGroupBy('user')">user</button>
+        </div>
+      </div>
+      <div id="admin-usage-content">
+        <div class="dashboard-empty">Loading usage data...</div>
+      </div>
+    </div>
+
+    <!-- Audit Tab -->
+    <div id="admin-audit" class="admin-panel" role="tabpanel" aria-labelledby="tab-audit" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">AUDIT LOG</span>
+        <label for="audit-action-filter" class="sr-only">Filter by action</label>
+        <select id="audit-action-filter" onchange="loadGovAudit()">
+          <option value="">All actions</option>
+          <option value="user.create">user.create</option>
+          <option value="user.delete">user.delete</option>
+          <option value="token.create">token.create</option>
+          <option value="token.revoke">token.revoke</option>
+          <option value="role.create">role.create</option>
+          <option value="role.update">role.update</option>
+          <option value="role.delete">role.delete</option>
+          <option value="role.assign">role.assign</option>
+          <option value="role.unassign">role.unassign</option>
+          <option value="policy.create">policy.create</option>
+          <option value="policy.update">policy.update</option>
+          <option value="policy.delete">policy.delete</option>
+          <option value="template.create">template.create</option>
+          <option value="template.update">template.update</option>
+          <option value="template.delete">template.delete</option>
+        </select>
+        <label for="audit-user-filter" class="sr-only">Filter by user</label>
+        <select id="audit-user-filter" onchange="loadGovAudit()">
+          <option value="">All users</option>
+        </select>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-atime">TIME</span>
+        <span class="admin-col admin-col-auser">USER</span>
+        <span class="admin-col admin-col-aaction">ACTION</span>
+        <span class="admin-col admin-col-aresource">RESOURCE</span>
+        <span class="admin-col admin-col-adetail">DETAIL</span>
+      </div>
+      <div id="admin-audit-table" role="list" aria-label="Audit events" aria-live="polite">
+        <div class="dashboard-empty">Loading audit log...</div>
       </div>
     </div>
   </div>
@@ -434,7 +551,162 @@ window.TURNSTONE_KB_SHORTCUTS = [
   </div>
 </div>
 
+<!-- Create Role Modal -->
+<div id="create-role-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-role-title">
+  <div id="create-role-box" class="admin-modal admin-modal-wide">
+    <h2 id="create-role-title">Create Role</h2>
+    <div id="create-role-error" role="alert" aria-live="assertive"></div>
+    <label for="cr-name">Name</label>
+    <input id="cr-name" type="text" placeholder="e.g. security-reviewer" autocomplete="off" spellcheck="false">
+    <label for="cr-displayname">Display name</label>
+    <input id="cr-displayname" type="text" placeholder="Security Reviewer" autocomplete="off">
+    <fieldset class="perm-fieldset"><legend>Permissions</legend>
+    <div id="cr-perms-container" role="group" aria-label="Permissions"></div>
+    </fieldset>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateRoleModal()">Cancel</button>
+      <button id="cr-submit" class="modal-submit" onclick="submitCreateRole()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Role Modal -->
+<div id="edit-role-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-role-title">
+  <div id="edit-role-box" class="admin-modal admin-modal-wide">
+    <h2 id="edit-role-title">Edit Role</h2>
+    <div id="edit-role-error" role="alert" aria-live="assertive"></div>
+    <input id="er-id" type="hidden">
+    <label for="er-name">Display name</label>
+    <input id="er-name" type="text" autocomplete="off">
+    <fieldset class="perm-fieldset"><legend>Permissions</legend>
+    <div id="er-perms-container" role="group" aria-label="Permissions"></div>
+    </fieldset>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideEditRoleModal()">Cancel</button>
+      <button id="er-submit" class="modal-submit" onclick="submitEditRole()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- User Roles Modal -->
+<div id="user-roles-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="user-roles-title">
+  <div id="user-roles-box" class="admin-modal">
+    <h2 id="user-roles-title">Assign Roles</h2>
+    <div id="user-roles-error" role="alert" aria-live="assertive"></div>
+    <input id="ur-user-id" type="hidden">
+    <div id="ur-roles-container"></div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideUserRolesModal()">Cancel</button>
+      <button class="modal-submit" onclick="submitUserRoles()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Policy Modal -->
+<div id="create-policy-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-policy-title">
+  <div id="create-policy-box" class="admin-modal">
+    <h2 id="create-policy-title">Create Tool Policy</h2>
+    <div id="create-policy-error" role="alert" aria-live="assertive"></div>
+    <label for="cp-name">Name</label>
+    <input id="cp-name" type="text" placeholder="e.g. Block shell access" autocomplete="off">
+    <label for="cp-pattern">Tool pattern <span class="label-hint">glob syntax: bash*, file_write, *</span></label>
+    <input id="cp-pattern" type="text" placeholder="bash*" autocomplete="off" spellcheck="false">
+    <label for="cp-action">Action</label>
+    <select id="cp-action">
+      <option value="ask">Ask (require approval)</option>
+      <option value="allow">Allow (auto-approve)</option>
+      <option value="deny">Deny (block)</option>
+    </select>
+    <label for="cp-priority">Priority <span class="label-hint">higher = evaluated first</span></label>
+    <input id="cp-priority" type="number" value="0" min="0" max="9999">
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreatePolicyModal()">Cancel</button>
+      <button id="cp-submit" class="modal-submit" onclick="submitCreatePolicy()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Policy Modal -->
+<div id="edit-policy-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-policy-title">
+  <div id="edit-policy-box" class="admin-modal">
+    <h2 id="edit-policy-title">Edit Tool Policy</h2>
+    <div id="edit-policy-error" role="alert" aria-live="assertive"></div>
+    <input id="ep-id" type="hidden">
+    <label for="ep-name">Name</label>
+    <input id="ep-name" type="text" autocomplete="off">
+    <label for="ep-pattern">Tool pattern</label>
+    <input id="ep-pattern" type="text" autocomplete="off" spellcheck="false">
+    <label for="ep-action">Action</label>
+    <select id="ep-action">
+      <option value="ask">Ask (require approval)</option>
+      <option value="allow">Allow (auto-approve)</option>
+      <option value="deny">Deny (block)</option>
+    </select>
+    <label for="ep-priority">Priority</label>
+    <input id="ep-priority" type="number" value="0" min="0" max="9999">
+    <label class="admin-checkbox"><input id="ep-enabled" type="checkbox" checked> Enabled</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideEditPolicyModal()">Cancel</button>
+      <button id="ep-submit" class="modal-submit" onclick="submitEditPolicy()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Template Modal -->
+<div id="create-template-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-template-title">
+  <div id="create-template-box" class="admin-modal admin-modal-wide">
+    <h2 id="create-template-title">Create Prompt Template</h2>
+    <div id="create-template-error" role="alert" aria-live="assertive"></div>
+    <label for="ctm-name">Name</label>
+    <input id="ctm-name" type="text" placeholder="e.g. Code Review Agent" autocomplete="off">
+    <label for="ctm-category">Category</label>
+    <select id="ctm-category">
+      <option value="general">General</option>
+      <option value="engineering">Engineering</option>
+      <option value="support">Support</option>
+      <option value="custom">Custom</option>
+    </select>
+    <label for="ctm-content">Content <span class="label-hint">system message text, use {{variable}} for placeholders</span></label>
+    <textarea id="ctm-content" rows="6" placeholder="You are a helpful assistant for {{project_name}}..."></textarea>
+    <label for="ctm-variables">Variables <span class="label-hint">comma-separated list</span></label>
+    <input id="ctm-variables" type="text" placeholder="project_name, review_focus" autocomplete="off">
+    <label class="admin-checkbox"><input id="ctm-default" type="checkbox"> Set as default for new workstreams</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateTemplateModal()">Cancel</button>
+      <button id="ctm-submit" class="modal-submit" onclick="submitCreateTemplate()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Template Modal -->
+<div id="edit-template-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-template-title">
+  <div id="edit-template-box" class="admin-modal admin-modal-wide">
+    <h2 id="edit-template-title">Edit Prompt Template</h2>
+    <div id="edit-template-error" role="alert" aria-live="assertive"></div>
+    <input id="etm-id" type="hidden">
+    <label for="etm-name">Name</label>
+    <input id="etm-name" type="text" autocomplete="off">
+    <label for="etm-category">Category</label>
+    <select id="etm-category">
+      <option value="general">General</option>
+      <option value="engineering">Engineering</option>
+      <option value="support">Support</option>
+      <option value="custom">Custom</option>
+    </select>
+    <label for="etm-content">Content</label>
+    <textarea id="etm-content" rows="6"></textarea>
+    <label for="etm-variables">Variables</label>
+    <input id="etm-variables" type="text" autocomplete="off">
+    <label class="admin-checkbox"><input id="etm-default" type="checkbox"> Set as default</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideEditTemplateModal()">Cancel</button>
+      <button id="etm-submit" class="modal-submit" onclick="submitEditTemplate()">Save</button>
+    </div>
+  </div>
+</div>
+
 <script src="/static/admin.js"></script>
+<script src="/static/governance.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,0 +1,69 @@
+@startuml
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "IBM Plex Mono"
+skinparam componentStyle rectangle
+
+title Turnstone Governance Architecture
+
+package "Auth Flow" {
+  [Login/Token Auth] as auth
+  [_load_user_permissions()] as perms
+  [_permissions_to_scopes()] as scopes
+  [create_jwt()] as jwt
+}
+
+package "Middleware" {
+  [AuthMiddleware\n(scope check)] as mw
+  [require_permission()\n(granular check)] as rp
+}
+
+package "Governance Storage" {
+  database "roles" as roles_db
+  database "user_roles" as ur_db
+  database "orgs" as orgs_db
+  database "tool_policies" as tp_db
+  database "prompt_templates" as pt_db
+  database "usage_events" as ue_db
+  database "audit_events" as ae_db
+}
+
+package "Runtime Enforcement" {
+  [evaluate_tool_policies_batch()] as eval
+  [WebUI.approve_tools()] as approve
+  [record_usage_event()] as usage
+  [record_audit()] as audit
+}
+
+package "Console UI" {
+  [Admin Panel\n10 tabs] as ui
+  [governance.js] as govjs
+  [sessionStorage\npermissions] as ss
+}
+
+auth --> perms : user_id
+perms --> roles_db : JOIN user_roles + roles
+perms --> scopes : permission set
+scopes --> jwt : scopes + permissions
+
+jwt --> mw : JWT in cookie/header
+mw --> rp : scope OK → check permission
+
+rp --> ui : 403 or allow
+
+eval --> tp_db : list_tool_policies()
+approve --> eval : tool names
+approve --> ae_db : (via audit)
+
+usage --> ue_db : on_status()
+audit --> ae_db : admin handlers
+
+govjs --> roles_db : /v1/api/admin/roles
+govjs --> tp_db : /v1/api/admin/policies
+govjs --> pt_db : /v1/api/admin/templates
+govjs --> ue_db : /v1/api/admin/usage
+govjs --> ae_db : /v1/api/admin/audit
+
+auth -[hidden]-> mw
+mw -[hidden]-> approve
+@enduml

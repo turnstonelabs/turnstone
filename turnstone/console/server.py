@@ -667,9 +667,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
 async def admin_list_users(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users — list all users."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
     return JSONResponse({"users": storage.list_users()})
@@ -679,10 +683,13 @@ async def admin_create_user(request: Request) -> JSONResponse:
     """POST /v1/api/admin/users — create a new user."""
     import uuid
 
-    from turnstone.core.auth import hash_password
+    from turnstone.core.auth import hash_password, require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
 
@@ -715,6 +722,20 @@ async def admin_create_user(request: Request) -> JSONResponse:
     user_id = uuid.uuid4().hex
     pw_hash = hash_password(password)
     storage.create_user(user_id, username, display_name, pw_hash)
+
+    from turnstone.core.audit import record_audit
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "user.create",
+        "user",
+        user_id,
+        {"username": username},
+        ip,
+    )
+
     # Read back to get the storage-canonical created timestamp
     user = storage.get_user(user_id)
     return JSONResponse(
@@ -729,22 +750,48 @@ async def admin_create_user(request: Request) -> JSONResponse:
 
 async def admin_delete_user(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/users/{user_id} — delete user + cascade tokens."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
     user_id = request.path_params["user_id"]
+    # Prevent self-deletion
+    auth_result = getattr(request.state, "auth_result", None)
+    if auth_result and auth_result.user_id == user_id:
+        return JSONResponse({"error": "Cannot delete your own account"}, status_code=400)
+    # Look up username for the audit trail before deleting
+    target_user = storage.get_user(user_id)
     if storage.delete_user(user_id):
+        from turnstone.core.audit import record_audit
+
+        audit_uid, ip = _audit_context(request)
+        record_audit(
+            storage,
+            audit_uid,
+            "user.delete",
+            "user",
+            user_id,
+            {"username": target_user.get("username", "") if target_user else ""},
+            ip,
+        )
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "User not found"}, status_code=404)
 
 
 async def admin_list_tokens(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users/{user_id}/tokens — list tokens for a user."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
     user_id = request.path_params["user_id"]
@@ -755,10 +802,13 @@ async def admin_create_token(request: Request) -> JSONResponse:
     """POST /v1/api/admin/users/{user_id}/tokens — create API token."""
     import uuid
 
-    from turnstone.core.auth import generate_token, hash_token, token_prefix
+    from turnstone.core.auth import generate_token, hash_token, require_permission, token_prefix
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
     user_id = request.path_params["user_id"]
@@ -804,6 +854,20 @@ async def admin_create_token(request: Request) -> JSONResponse:
         scopes=scopes,
         expires=expires,
     )
+
+    from turnstone.core.audit import record_audit
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "token.create",
+        "token",
+        tid,
+        {"name": name},
+        ip,
+    )
+
     return JSONResponse(
         {
             "token": raw,
@@ -816,13 +880,29 @@ async def admin_create_token(request: Request) -> JSONResponse:
 
 async def admin_revoke_token(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/tokens/{token_id} — revoke an API token."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
     token_id = request.path_params["token_id"]
     if storage.delete_api_token(token_id):
+        from turnstone.core.audit import record_audit
+
+        audit_uid, ip = _audit_context(request)
+        record_audit(
+            storage,
+            audit_uid,
+            "token.revoke",
+            "token",
+            token_id,
+            {},
+            ip,
+        )
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "Token not found"}, status_code=404)
 
@@ -834,9 +914,13 @@ async def admin_revoke_token(request: Request) -> JSONResponse:
 
 async def admin_list_channels(request: Request) -> JSONResponse:
     """GET /v1/api/admin/users/{user_id}/channels — list channel links for a user."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
     user_id = request.path_params["user_id"]
@@ -846,9 +930,13 @@ async def admin_list_channels(request: Request) -> JSONResponse:
 
 async def admin_create_channel(request: Request) -> JSONResponse:
     """POST /v1/api/admin/users/{user_id}/channels — link a channel account."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
     if err:
         return err
     user_id = request.path_params["user_id"]
@@ -891,19 +979,49 @@ async def admin_create_channel(request: Request) -> JSONResponse:
             {"error": f"Channel user already linked to user {result['user_id']}"},
             status_code=409,
         )
+
+    from turnstone.core.audit import record_audit
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "channel.link",
+        "channel",
+        channel_user_id,
+        {"channel_type": channel_type, "user_id": user_id},
+        ip,
+    )
+
     return JSONResponse(result)
 
 
 async def admin_delete_channel(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/channels/{channel_type}/{channel_user_id} — unlink."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
     channel_type = request.path_params["channel_type"]
     channel_user_id = request.path_params["channel_user_id"]
     if storage.delete_channel_user(channel_type, channel_user_id):
+        from turnstone.core.audit import record_audit
+
+        audit_uid, ip = _audit_context(request)
+        record_audit(
+            storage,
+            audit_uid,
+            "channel.unlink",
+            "channel",
+            channel_user_id,
+            {"channel_type": channel_type},
+            ip,
+        )
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "Channel link not found"}, status_code=404)
 
@@ -968,9 +1086,13 @@ def _validate_schedule_fields(schedule_type: str, cron_expr: str, at_time: str) 
 
 async def admin_list_schedules(request: Request) -> JSONResponse:
     """GET /v1/api/admin/schedules — list all scheduled tasks."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
     tasks = storage.list_scheduled_tasks()
@@ -983,9 +1105,13 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     """POST /v1/api/admin/schedules — create a scheduled task."""
     import uuid
 
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
 
@@ -1058,9 +1184,13 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
 
 async def admin_get_schedule(request: Request) -> JSONResponse:
     """GET /v1/api/admin/schedules/{task_id} — get single task."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
     task_id = request.path_params["task_id"]
@@ -1073,9 +1203,13 @@ async def admin_get_schedule(request: Request) -> JSONResponse:
 
 async def admin_update_schedule(request: Request) -> JSONResponse:
     """PUT /v1/api/admin/schedules/{task_id} — partial update."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
     task_id = request.path_params["task_id"]
@@ -1147,9 +1281,13 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
 
 async def admin_delete_schedule(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/schedules/{task_id} — delete task + runs."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
     task_id = request.path_params["task_id"]
@@ -1160,9 +1298,13 @@ async def admin_delete_schedule(request: Request) -> JSONResponse:
 
 async def admin_list_schedule_runs(request: Request) -> JSONResponse:
     """GET /v1/api/admin/schedules/{task_id}/runs — run history."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.schedules")
     if err:
         return err
     task_id = request.path_params["task_id"]
@@ -1186,6 +1328,11 @@ async def admin_list_schedule_runs(request: Request) -> JSONResponse:
 
 async def admin_list_watches(request: Request) -> JSONResponse:
     """GET /v1/api/admin/watches — aggregate watches from all nodes."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.watches")
+    if err:
+        return err
     collector: ClusterCollector = request.app.state.collector
     nodes, _ = collector.get_nodes(limit=500)
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -1225,8 +1372,12 @@ _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
 
 async def admin_cancel_watch(request: Request) -> Response:
     """POST /v1/api/admin/watches/{watch_id}/cancel — proxy cancel to the owning node."""
+    from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import read_json_or_400
 
+    err = require_permission(request, "admin.watches")
+    if err:
+        return err
     watch_id = request.path_params["watch_id"]
     if not watch_id or not _VALID_WATCH_ID.match(watch_id) or len(watch_id) > 128:
         return JSONResponse({"error": "Invalid watch_id"}, status_code=400)
@@ -1259,6 +1410,813 @@ async def admin_cancel_watch(request: Request) -> Response:
         )
     except httpx.HTTPError:
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
+
+
+# ---------------------------------------------------------------------------
+# Admin API endpoints — governance (roles, orgs, policies, templates, usage, audit)
+# ---------------------------------------------------------------------------
+
+
+def _audit_context(request: Request) -> tuple[str, str]:
+    """Extract (user_id, ip_address) from request for audit logging.
+
+    Prefers ``X-Forwarded-For`` when present (matching the existing
+    ``is_secure_request()`` trust model for ``X-Forwarded-Proto``).
+    """
+    auth_result = getattr(request.state, "auth_result", None)
+    user_id = auth_result.user_id if auth_result else ""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else ""
+    if not ip:
+        ip = request.client.host if request.client else ""
+    return user_id, ip
+
+
+_VALID_PERMISSIONS = frozenset(
+    {
+        "read",
+        "write",
+        "approve",
+        "admin.users",
+        "admin.roles",
+        "admin.orgs",
+        "admin.policies",
+        "admin.templates",
+        "admin.audit",
+        "admin.usage",
+        "admin.schedules",
+        "admin.watches",
+        "tools.approve",
+        "workstreams.create",
+        "workstreams.close",
+    }
+)
+
+
+async def admin_list_roles(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/roles — list all roles."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+    return JSONResponse({"roles": storage.list_roles()})
+
+
+async def admin_create_role(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/roles — create a new role."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import is_valid_username, require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:128]
+    display_name = str(body.get("display_name", "")).strip()[:256]
+    permissions = str(body.get("permissions", "")).strip()
+
+    if not is_valid_username(name):
+        return JSONResponse(
+            {"error": "Invalid name (1-64 chars: letters, digits, . _ -)"},
+            status_code=400,
+        )
+    if not display_name:
+        display_name = name
+
+    # Validate permissions against the allowed set
+    if permissions:
+        perm_list = [p.strip() for p in permissions.split(",") if p.strip()]
+        invalid = [p for p in perm_list if p not in _VALID_PERMISSIONS]
+        if invalid:
+            return JSONResponse(
+                {"error": f"Invalid permissions: {', '.join(invalid)}"},
+                status_code=400,
+            )
+
+    # Check for duplicate name
+    if storage.get_role_by_name(name) is not None:
+        return JSONResponse({"error": f"Role '{name}' already exists"}, status_code=409)
+
+    role_id = uuid.uuid4().hex
+    storage.create_role(
+        role_id=role_id,
+        name=name,
+        display_name=display_name,
+        permissions=permissions,
+        builtin=False,
+        org_id="",
+    )
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "role.create", "role", role_id, {"name": name}, ip)
+
+    role = storage.get_role(role_id)
+    if role is None:
+        return JSONResponse({"error": "Role creation failed"}, status_code=500)
+    return JSONResponse(role)
+
+
+async def admin_update_role(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/roles/{role_id} — update a custom role."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    existing = storage.get_role(role_id)
+    if existing is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    if existing.get("builtin"):
+        return JSONResponse({"error": "Cannot modify builtin role"}, status_code=400)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "display_name" in body:
+        updates["display_name"] = str(body["display_name"]).strip()[:256]
+    if "permissions" in body:
+        raw_perms = str(body["permissions"]).strip()
+        if raw_perms:
+            perm_list = [p.strip() for p in raw_perms.split(",") if p.strip()]
+            invalid = [p for p in perm_list if p not in _VALID_PERMISSIONS]
+            if invalid:
+                return JSONResponse(
+                    {"error": f"Invalid permissions: {', '.join(invalid)}"},
+                    status_code=400,
+                )
+        updates["permissions"] = raw_perms
+
+    storage.update_role(role_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "role.update", "role", role_id, updates, ip)
+
+    role = storage.get_role(role_id)
+    return JSONResponse(role)
+
+
+async def admin_delete_role(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/roles/{role_id} — delete a custom role."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.roles")
+    if err:
+        return err
+
+    role_id = request.path_params["role_id"]
+    existing = storage.get_role(role_id)
+    if existing is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+    if existing.get("builtin"):
+        return JSONResponse({"error": "Cannot delete builtin role"}, status_code=400)
+
+    storage.delete_role(role_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "role.delete",
+        "role",
+        role_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_list_user_roles(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/users/{user_id}/roles — list roles assigned to a user."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+
+    user_id = request.path_params["user_id"]
+    return JSONResponse({"roles": storage.list_user_roles(user_id)})
+
+
+async def admin_assign_role(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/users/{user_id}/roles — assign a role to a user."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+
+    user_id = request.path_params["user_id"]
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    role_id = str(body.get("role_id", "")).strip()
+    if not role_id:
+        return JSONResponse({"error": "role_id is required"}, status_code=400)
+
+    audit_uid, ip = _audit_context(request)
+
+    # Validate that user exists
+    if storage.get_user(user_id) is None:
+        return JSONResponse({"error": "User not found"}, status_code=404)
+
+    # Validate that role exists
+    target_role = storage.get_role(role_id)
+    if target_role is None:
+        return JSONResponse({"error": "Role not found"}, status_code=404)
+
+    # Prevent self-assignment
+    auth_result = getattr(request.state, "auth_result", None)
+    if auth_result and auth_result.user_id == user_id:
+        return JSONResponse({"error": "Cannot modify own role assignments"}, status_code=403)
+
+    # Ensure caller holds all permissions present in the target role
+    target_perms = set(
+        p.strip() for p in target_role.get("permissions", "").split(",") if p.strip()
+    )
+    if (
+        auth_result
+        and auth_result.permissions
+        and not target_perms.issubset(auth_result.permissions)
+    ):
+        return JSONResponse(
+            {"error": "Cannot assign role with permissions you do not hold"},
+            status_code=403,
+        )
+
+    storage.assign_role(user_id, role_id, assigned_by=audit_uid)
+    record_audit(
+        storage,
+        audit_uid,
+        "role.assign",
+        "user",
+        user_id,
+        {"role_id": role_id},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_unassign_role(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/users/{user_id}/roles/{role_id} — unassign a role."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+
+    user_id = request.path_params["user_id"]
+    role_id = request.path_params["role_id"]
+
+    audit_uid, ip = _audit_context(request)
+
+    # Prevent self-modification
+    if audit_uid and audit_uid == user_id:
+        return JSONResponse({"error": "Cannot modify own role assignments"}, status_code=403)
+
+    if storage.unassign_role(user_id, role_id):
+        record_audit(
+            storage,
+            audit_uid,
+            "role.unassign",
+            "user",
+            user_id,
+            {"role_id": role_id},
+            ip,
+        )
+        return JSONResponse({"status": "ok"})
+    return JSONResponse({"error": "Role assignment not found"}, status_code=404)
+
+
+async def admin_list_orgs(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/orgs — list all organizations."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.orgs")
+    if err:
+        return err
+    return JSONResponse({"orgs": storage.list_orgs()})
+
+
+async def admin_get_org(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/orgs/{org_id} — get a single organization."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.orgs")
+    if err:
+        return err
+
+    org_id = request.path_params["org_id"]
+    org = storage.get_org(org_id)
+    if org is None:
+        return JSONResponse({"error": "Organization not found"}, status_code=404)
+    return JSONResponse(org)
+
+
+async def admin_update_org(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/orgs/{org_id} — update an organization."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.orgs")
+    if err:
+        return err
+
+    org_id = request.path_params["org_id"]
+    existing = storage.get_org(org_id)
+    if existing is None:
+        return JSONResponse({"error": "Organization not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "display_name" in body:
+        updates["display_name"] = str(body["display_name"]).strip()[:256]
+    if "settings" in body:
+        settings_str = str(body["settings"]).strip()
+        try:
+            json.loads(settings_str)
+        except (json.JSONDecodeError, TypeError):
+            return JSONResponse({"error": "settings must be valid JSON"}, status_code=400)
+        updates["settings"] = settings_str
+
+    storage.update_org(org_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "org.update", "org", org_id, updates, ip)
+
+    org = storage.get_org(org_id)
+    return JSONResponse(org)
+
+
+async def admin_list_policies(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/policies — list all tool policies."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.policies")
+    if err:
+        return err
+    return JSONResponse({"policies": storage.list_tool_policies()})
+
+
+async def admin_create_policy(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/policies — create a tool policy."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.policies")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:256]
+    tool_pattern = str(body.get("tool_pattern", "")).strip()[:256]
+    action = str(body.get("action", "")).strip().lower()
+    priority = int(body.get("priority", 0)) if isinstance(body.get("priority"), (int, float)) else 0
+    org_id = str(body.get("org_id", "")).strip()[:64]
+    enabled = bool(body.get("enabled", True))
+
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if not tool_pattern:
+        return JSONResponse({"error": "tool_pattern is required"}, status_code=400)
+    if action not in ("allow", "deny", "ask"):
+        return JSONResponse(
+            {"error": "action must be one of: allow, deny, ask"},
+            status_code=400,
+        )
+
+    audit_uid, ip = _audit_context(request)
+
+    policy_id = uuid.uuid4().hex
+    storage.create_tool_policy(
+        policy_id=policy_id,
+        name=name,
+        tool_pattern=tool_pattern,
+        action=action,
+        priority=priority,
+        org_id=org_id,
+        enabled=enabled,
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "policy.create",
+        "policy",
+        policy_id,
+        {"name": name},
+        ip,
+    )
+
+    policy = storage.get_tool_policy(policy_id)
+    return JSONResponse(policy)
+
+
+async def admin_update_policy(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/policies/{policy_id} — update a tool policy."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.policies")
+    if err:
+        return err
+
+    policy_id = request.path_params["policy_id"]
+    existing = storage.get_tool_policy(policy_id)
+    if existing is None:
+        return JSONResponse({"error": "Policy not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        updates["name"] = str(body["name"]).strip()[:256]
+    if "tool_pattern" in body:
+        updates["tool_pattern"] = str(body["tool_pattern"]).strip()[:256]
+    if "action" in body:
+        act = str(body["action"]).strip().lower()
+        if act not in ("allow", "deny", "ask"):
+            return JSONResponse(
+                {"error": "action must be one of: allow, deny, ask"},
+                status_code=400,
+            )
+        updates["action"] = act
+    if "priority" in body:
+        updates["priority"] = (
+            int(body["priority"]) if isinstance(body["priority"], (int, float)) else 0
+        )
+    if "enabled" in body:
+        updates["enabled"] = bool(body["enabled"])
+
+    storage.update_tool_policy(policy_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "policy.update", "policy", policy_id, updates, ip)
+
+    policy = storage.get_tool_policy(policy_id)
+    return JSONResponse(policy)
+
+
+async def admin_delete_policy(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/policies/{policy_id} — delete a tool policy."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.policies")
+    if err:
+        return err
+
+    policy_id = request.path_params["policy_id"]
+    existing = storage.get_tool_policy(policy_id)
+    if existing is None:
+        return JSONResponse({"error": "Policy not found"}, status_code=404)
+
+    storage.delete_tool_policy(policy_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "policy.delete",
+        "policy",
+        policy_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_list_templates(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/templates — list all prompt templates."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.templates")
+    if err:
+        return err
+    return JSONResponse({"templates": storage.list_prompt_templates()})
+
+
+async def admin_create_template(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/templates — create a prompt template."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.templates")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:256]
+    content = str(body.get("content", "")).strip()
+    category = str(body.get("category", "general")).strip()[:64]
+    variables = str(body.get("variables", "[]")).strip()
+    try:
+        json.loads(variables)
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
+    is_default = bool(body.get("is_default", False))
+    org_id = str(body.get("org_id", "")).strip()[:64]
+
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+
+    audit_uid, ip = _audit_context(request)
+
+    template_id = uuid.uuid4().hex
+    storage.create_prompt_template(
+        template_id=template_id,
+        name=name,
+        category=category,
+        content=content,
+        variables=variables,
+        is_default=is_default,
+        org_id=org_id,
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "template.create",
+        "template",
+        template_id,
+        {"name": name},
+        ip,
+    )
+
+    template = storage.get_prompt_template(template_id)
+    return JSONResponse(template)
+
+
+async def admin_update_template(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/templates/{template_id} — update a prompt template."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.templates")
+    if err:
+        return err
+
+    template_id = request.path_params["template_id"]
+    existing = storage.get_prompt_template(template_id)
+    if existing is None:
+        return JSONResponse({"error": "Template not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        updates["name"] = str(body["name"]).strip()[:256]
+    if "content" in body:
+        updates["content"] = str(body["content"]).strip()
+    if "category" in body:
+        updates["category"] = str(body["category"]).strip()[:64]
+    if "variables" in body:
+        var_str = str(body["variables"]).strip()
+        try:
+            json.loads(var_str)
+        except (json.JSONDecodeError, TypeError):
+            return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
+        updates["variables"] = var_str
+    if "is_default" in body:
+        updates["is_default"] = bool(body["is_default"])
+
+    storage.update_prompt_template(template_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "template.update",
+        "template",
+        template_id,
+        updates,
+        ip,
+    )
+
+    template = storage.get_prompt_template(template_id)
+    return JSONResponse(template)
+
+
+async def admin_delete_template(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/templates/{template_id} — delete a prompt template."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.templates")
+    if err:
+        return err
+
+    template_id = request.path_params["template_id"]
+    existing = storage.get_prompt_template(template_id)
+    if existing is None:
+        return JSONResponse({"error": "Template not found"}, status_code=404)
+
+    storage.delete_prompt_template(template_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "template.delete",
+        "template",
+        template_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_usage(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/usage — query usage data."""
+    from datetime import UTC, datetime, timedelta
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.usage")
+    if err:
+        return err
+
+    params = dict(request.query_params)
+    since = params.get("since", "")
+    until = params.get("until", "")
+    user_id = params.get("user_id", "")
+    model = params.get("model", "")
+    group_by = params.get("group_by", "day")
+
+    if not since:
+        since = (datetime.now(UTC) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    summary = storage.query_usage(since=since, until=until, user_id=user_id, model=model)
+    breakdown = storage.query_usage(
+        since=since,
+        until=until,
+        user_id=user_id,
+        model=model,
+        group_by=group_by,
+    )
+
+    return JSONResponse({"summary": summary, "breakdown": breakdown})
+
+
+async def admin_audit(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/audit — query audit events."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.audit")
+    if err:
+        return err
+
+    params = dict(request.query_params)
+    action = params.get("action", "")
+    user_id = params.get("user_id", "")
+    since = params.get("since", "")
+    until = params.get("until", "")
+    try:
+        limit = min(int(params.get("limit", "50")), 200)
+    except (ValueError, TypeError):
+        limit = 50
+    try:
+        offset = max(int(params.get("offset", "0")), 0)
+    except (ValueError, TypeError):
+        offset = 0
+
+    events = storage.list_audit_events(
+        action=action,
+        user_id=user_id,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+    )
+    total = storage.count_audit_events(
+        action=action,
+        user_id=user_id,
+        since=since,
+        until=until,
+    )
+
+    return JSONResponse({"events": events, "total": total})
 
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +2295,55 @@ def create_app(
                         admin_cancel_watch,
                         methods=["POST"],
                     ),
+                    # Governance: Roles
+                    Route("/api/admin/roles", admin_list_roles),
+                    Route("/api/admin/roles", admin_create_role, methods=["POST"]),
+                    Route("/api/admin/roles/{role_id}", admin_update_role, methods=["PUT"]),
+                    Route("/api/admin/roles/{role_id}", admin_delete_role, methods=["DELETE"]),
+                    Route("/api/admin/users/{user_id}/roles", admin_list_user_roles),
+                    Route(
+                        "/api/admin/users/{user_id}/roles",
+                        admin_assign_role,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/users/{user_id}/roles/{role_id}",
+                        admin_unassign_role,
+                        methods=["DELETE"],
+                    ),
+                    # Governance: Orgs
+                    Route("/api/admin/orgs", admin_list_orgs),
+                    Route("/api/admin/orgs/{org_id}", admin_get_org),
+                    Route("/api/admin/orgs/{org_id}", admin_update_org, methods=["PUT"]),
+                    # Governance: Tool policies
+                    Route("/api/admin/policies", admin_list_policies),
+                    Route("/api/admin/policies", admin_create_policy, methods=["POST"]),
+                    Route(
+                        "/api/admin/policies/{policy_id}",
+                        admin_update_policy,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/policies/{policy_id}",
+                        admin_delete_policy,
+                        methods=["DELETE"],
+                    ),
+                    # Governance: Prompt templates
+                    Route("/api/admin/templates", admin_list_templates),
+                    Route("/api/admin/templates", admin_create_template, methods=["POST"]),
+                    Route(
+                        "/api/admin/templates/{template_id}",
+                        admin_update_template,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/templates/{template_id}",
+                        admin_delete_template,
+                        methods=["DELETE"],
+                    ),
+                    # Governance: Usage & Audit
+                    Route("/api/admin/usage", admin_usage),
+                    Route("/api/admin/audit", admin_audit),
                 ],
             ),
             Route("/health", health),

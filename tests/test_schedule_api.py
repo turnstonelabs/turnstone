@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
 import pytest
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Mount, Route
 from starlette.testclient import TestClient
+
+if TYPE_CHECKING:
+    from starlette.requests import Request
+    from starlette.responses import Response
 
 from turnstone.console.server import (
     admin_create_schedule,
@@ -15,7 +23,19 @@ from turnstone.console.server import (
     admin_list_schedules,
     admin_update_schedule,
 )
+from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+
+class _InjectAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: Any) -> Response:
+        request.state.auth_result = AuthResult(
+            user_id="test-admin",
+            scopes=frozenset({"approve"}),
+            token_source="config",
+            permissions=frozenset({"admin.schedules"}),
+        )
+        return await call_next(request)
 
 
 @pytest.fixture
@@ -52,6 +72,7 @@ def client(storage):
                 ],
             ),
         ],
+        middleware=[Middleware(_InjectAuthMiddleware)],
     )
     app.state.auth_storage = storage
     return TestClient(app)

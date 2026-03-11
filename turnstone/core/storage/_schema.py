@@ -71,6 +71,7 @@ users = sa.Table(
     sa.Column("username", sa.Text, nullable=False, unique=True),
     sa.Column("display_name", sa.Text, nullable=False),
     sa.Column("password_hash", sa.Text, nullable=False),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
 )
 
@@ -217,3 +218,114 @@ services = sa.Table(
 )
 
 sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)
+
+# ---------------------------------------------------------------------------
+# Governance tables — RBAC, orgs, policies, templates, usage, audit
+# ---------------------------------------------------------------------------
+
+orgs = sa.Table(
+    "orgs",
+    metadata,
+    sa.Column("org_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("display_name", sa.Text, nullable=False),
+    sa.Column("settings", sa.Text, nullable=False, server_default="{}"),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+roles = sa.Table(
+    "roles",
+    metadata,
+    sa.Column("role_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("display_name", sa.Text, nullable=False),
+    sa.Column("permissions", sa.Text, nullable=False),  # comma-separated
+    sa.Column("builtin", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+user_roles = sa.Table(
+    "user_roles",
+    metadata,
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("role_id", sa.Text, nullable=False),
+    sa.Column("assigned_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("user_id", "role_id"),
+)
+
+sa.Index("idx_user_roles_role_id", user_roles.c.role_id)
+
+tool_policies = sa.Table(
+    "tool_policies",
+    metadata,
+    sa.Column("policy_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("tool_pattern", sa.Text, nullable=False),
+    sa.Column("action", sa.Text, nullable=False),  # allow / deny / ask
+    sa.Column("priority", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_tool_policies_priority", tool_policies.c.priority.desc())
+sa.Index("idx_tool_policies_org", tool_policies.c.org_id)
+
+prompt_templates = sa.Table(
+    "prompt_templates",
+    metadata,
+    sa.Column("template_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("category", sa.Text, nullable=False, server_default="general"),
+    sa.Column("content", sa.Text, nullable=False),
+    sa.Column("variables", sa.Text, nullable=False, server_default="[]"),  # JSON array
+    sa.Column("is_default", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+usage_events = sa.Table(
+    "usage_events",
+    metadata,
+    sa.Column("event_id", sa.Text, primary_key=True),
+    sa.Column("timestamp", sa.Text, nullable=False),
+    sa.Column("user_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("ws_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("node_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("model", sa.Text, nullable=False, server_default=""),
+    sa.Column("prompt_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("completion_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("tool_calls_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_usage_events_timestamp", usage_events.c.timestamp)
+sa.Index("idx_usage_events_user", usage_events.c.user_id, usage_events.c.timestamp)
+sa.Index("idx_usage_events_model", usage_events.c.model, usage_events.c.timestamp)
+sa.Index("idx_usage_events_ws", usage_events.c.ws_id)
+
+audit_events = sa.Table(
+    "audit_events",
+    metadata,
+    sa.Column("event_id", sa.Text, primary_key=True),
+    sa.Column("timestamp", sa.Text, nullable=False),
+    sa.Column("user_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("action", sa.Text, nullable=False),
+    sa.Column("resource_type", sa.Text, nullable=False, server_default=""),
+    sa.Column("resource_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("detail", sa.Text, nullable=False, server_default="{}"),
+    sa.Column("ip_address", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_audit_timestamp", audit_events.c.timestamp)
+sa.Index("idx_audit_action", audit_events.c.action)
+sa.Index("idx_audit_user", audit_events.c.user_id)

@@ -709,6 +709,11 @@
   color: var(--accent);
   border-bottom-color: var(--accent);
 }
+.admin-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
 
 .admin-toolbar {
   display: flex;
@@ -989,7 +994,10 @@
 .modal-submit:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
 
 #create-user-overlay, #create-token-overlay, #token-created-overlay, #create-channel-overlay, #confirm-overlay,
-#create-schedule-overlay, #edit-schedule-overlay, #schedule-runs-overlay {
+#create-schedule-overlay, #edit-schedule-overlay, #schedule-runs-overlay,
+#create-role-overlay, #edit-role-overlay, #user-roles-overlay,
+#create-policy-overlay, #edit-policy-overlay,
+#create-template-overlay, #edit-template-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1041,6 +1049,263 @@
     grid-template-columns: 1.2fr 80px 70px 70px 70px;
   }
   .admin-col-wcmd, .admin-col-wcond, .admin-col-winterval { display: none; }
+}
+
+/* ==========================================================================
+   Admin tabs — horizontal scroll for 10+ tabs
+   ========================================================================== */
+.admin-tabs {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  flex-wrap: nowrap;
+  scrollbar-width: thin;
+}
+
+/* ==========================================================================
+   Governance: Roles grid
+   ========================================================================== */
+#admin-roles .admin-colheaders,
+#admin-roles .admin-row {
+  grid-template-columns: 160px 1fr 110px;
+}
+
+/* ==========================================================================
+   Governance: Tool Policies grid
+   ========================================================================== */
+#admin-policies .admin-colheaders,
+#admin-policies .admin-row {
+  grid-template-columns: 1.2fr 1fr 70px 50px 80px 140px;
+}
+
+/* Policy action badges */
+.policy-badge {
+  display: inline-block;
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 8px;
+  border-radius: 2px;
+}
+.policy-allow {
+  color: var(--green);
+  background: var(--green-glow);
+  border: 1px solid var(--green-glow);
+}
+.policy-deny {
+  color: var(--red);
+  background: var(--red-glow);
+  border: 1px solid var(--red-glow);
+}
+.policy-ask {
+  color: var(--yellow);
+  background: var(--yellow-glow);
+  border: 1px solid var(--yellow-glow);
+}
+
+/* ==========================================================================
+   Governance: Prompt Templates grid
+   ========================================================================== */
+#admin-templates .admin-colheaders,
+#admin-templates .admin-row {
+  grid-template-columns: 1.5fr 100px 1fr 140px;
+}
+
+/* ==========================================================================
+   Governance: Audit grid
+   ========================================================================== */
+#admin-audit .admin-colheaders,
+#admin-audit .admin-row {
+  grid-template-columns: 80px 80px 1fr 120px 1.5fr;
+}
+
+/* Audit action badges */
+.audit-badge {
+  display: inline-block;
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--bg-highlight);
+  color: var(--fg-dim);
+  border: 1px solid var(--border);
+}
+.audit-danger { color: var(--red); border-color: var(--red-glow); }
+.audit-success { color: var(--green); border-color: var(--green-glow); }
+
+/* ==========================================================================
+   Governance: Usage dashboard
+   ========================================================================== */
+.usage-summary {
+  display: flex;
+  gap: 24px;
+  padding: 16px 0 20px;
+  flex-wrap: wrap;
+}
+.usage-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.usage-readout-value {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--fg-bright);
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  letter-spacing: -0.02em;
+}
+.usage-readout-label {
+  font-size: 10px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+
+/* Usage bar chart */
+.usage-chart { padding-top: 4px; }
+.usage-bar-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 60px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+}
+.usage-bar-label {
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.usage-bar-track {
+  height: 16px;
+  background: var(--bg-highlight);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.usage-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  min-width: 2px;
+  transition: width 0.3s ease;
+  box-shadow: 0 0 6px var(--accent-glow);
+}
+.usage-bar-value {
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* Usage range/group buttons */
+.usage-range-group {
+  display: flex;
+  gap: 2px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.usage-range-btn, .usage-group-btn {
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: none;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.usage-range-btn:hover, .usage-group-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--fg);
+}
+.usage-range-btn.active, .usage-group-btn.active {
+  background: var(--accent-dim);
+  color: var(--accent);
+}
+.usage-range-btn:focus-visible, .usage-group-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ==========================================================================
+   Governance: Permission grid (modal checkboxes)
+   ========================================================================== */
+.perm-fieldset {
+  border: none;
+  padding: 0;
+  margin: 12px 0 0;
+}
+.perm-fieldset legend {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  padding: 0;
+  margin-bottom: 4px;
+}
+.perm-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+  padding: 8px 0;
+}
+.perm-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--fg);
+  padding: 3px 0;
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.perm-checkbox input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* ==========================================================================
+   Governance: Responsive
+   ========================================================================== */
+@media (max-width: 700px) {
+  #admin-roles .admin-colheaders, #admin-roles .admin-row {
+    grid-template-columns: 1fr 100px;
+  }
+  .admin-col-rperms { display: none; }
+  #admin-policies .admin-colheaders, #admin-policies .admin-row {
+    grid-template-columns: 1fr 70px 50px 100px;
+  }
+  .admin-col-pstatus, .admin-col-ppriority { display: none; }
+  #admin-templates .admin-colheaders, #admin-templates .admin-row {
+    grid-template-columns: 1fr 100px;
+  }
+  .admin-col-tmcat, .admin-col-tmvars { display: none; }
+  #admin-audit .admin-colheaders, #admin-audit .admin-row {
+    grid-template-columns: 60px 1fr 100px;
+  }
+  .admin-col-auser, .admin-col-adetail { display: none; }
+  .usage-readout-value { font-size: 18px; }
+  .usage-bar-row { grid-template-columns: 70px 1fr 50px; }
+  .perm-grid { grid-template-columns: 1fr; }
 }
 
 /* ==========================================================================

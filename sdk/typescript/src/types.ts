@@ -355,6 +355,172 @@ export interface ListScheduleRunsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Console API — Governance: Roles
+// ---------------------------------------------------------------------------
+
+export interface RoleInfo {
+  role_id: string;
+  name: string;
+  display_name: string;
+  permissions: string;
+  builtin: boolean;
+  org_id: string;
+  created: string;
+  updated: string;
+}
+
+export interface CreateRoleOptions {
+  name: string;
+  display_name?: string;
+  permissions?: string;
+}
+
+export interface UpdateRoleOptions {
+  display_name?: string;
+  permissions?: string;
+}
+
+export interface UserRoleInfo extends RoleInfo {
+  assigned_by: string;
+  assignment_created: string;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Orgs
+// ---------------------------------------------------------------------------
+
+export interface OrgInfo {
+  org_id: string;
+  name: string;
+  display_name: string;
+  settings: string;
+  created: string;
+  updated: string;
+}
+
+export interface UpdateOrgOptions {
+  display_name?: string;
+  settings?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Tool Policies
+// ---------------------------------------------------------------------------
+
+export interface ToolPolicyInfo {
+  policy_id: string;
+  name: string;
+  tool_pattern: string;
+  action: string;
+  priority: number;
+  org_id: string;
+  enabled: boolean;
+  created_by: string;
+  created: string;
+  updated: string;
+}
+
+export interface CreatePolicyOptions {
+  name: string;
+  tool_pattern: string;
+  action: string;
+  priority?: number;
+  org_id?: string;
+  enabled?: boolean;
+}
+
+export interface UpdatePolicyOptions {
+  name?: string;
+  tool_pattern?: string;
+  action?: string;
+  priority?: number;
+  enabled?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Prompt Templates
+// ---------------------------------------------------------------------------
+
+export interface PromptTemplateInfo {
+  template_id: string;
+  name: string;
+  category: string;
+  content: string;
+  variables: string;
+  is_default: boolean;
+  org_id: string;
+  created_by: string;
+  created: string;
+  updated: string;
+}
+
+export interface CreateTemplateOptions {
+  name: string;
+  content: string;
+  category?: string;
+  variables?: string;
+  is_default?: boolean;
+  org_id?: string;
+}
+
+export interface UpdateTemplateOptions {
+  name?: string;
+  content?: string;
+  category?: string;
+  variables?: string;
+  is_default?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Usage & Audit
+// ---------------------------------------------------------------------------
+
+export interface UsageBreakdownItem {
+  key?: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tool_calls_count: number;
+}
+
+export interface UsageResponse {
+  summary: UsageBreakdownItem[];
+  breakdown: UsageBreakdownItem[];
+}
+
+export interface UsageQueryOptions {
+  since: string;
+  until?: string;
+  user_id?: string;
+  model?: string;
+  group_by?: string;
+}
+
+export interface AuditEventInfo {
+  event_id: string;
+  timestamp: string;
+  user_id: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  detail: string;
+  ip_address: string;
+}
+
+export interface AuditQueryOptions {
+  action?: string;
+  user_id?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AuditResponse {
+  events: AuditEventInfo[];
+  total: number;
+}
+
+// ---------------------------------------------------------------------------
 // SDK-specific types
 // ---------------------------------------------------------------------------
 

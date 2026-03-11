@@ -198,6 +198,47 @@ class WebUI:
                 }
             )
 
+        # -- Tool policy evaluation -----------------------------------------------
+        # Check admin-defined tool policies before the auto_approve check.
+        if pending:
+            try:
+                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    tool_names = [it.get("func_name", "") for it in pending if it.get("func_name")]
+                    if tool_names:
+                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
+                        still_pending = []
+                        for it in pending:
+                            fname = it.get("func_name", "")
+                            verdict = verdicts.get(fname)
+                            if verdict == "deny":
+                                it["denied"] = True
+                                it["denial_msg"] = (
+                                    f"Blocked by tool policy (pattern match for '{fname}')"
+                                )
+                            elif verdict == "allow":
+                                it["needs_approval"] = False
+                            else:
+                                still_pending.append(it)
+                        # If all were resolved by policy, check if any were denied
+                        if not still_pending:
+                            any_denied = any(it.get("denied") for it in pending)
+                            if any_denied:
+                                # Re-serialize with updated denial info
+                                for s, it in zip(serialized, items, strict=False):
+                                    s["error"] = (
+                                        it.get("denial_msg") if it.get("denied") else s.get("error")
+                                    )
+                                self._enqueue({"type": "tool_info", "items": serialized})
+                                return False, "Blocked by tool policy"
+                        pending = still_pending
+            except Exception:
+                log.debug("Tool policy evaluation failed", exc_info=True)
+        # -- End tool policy evaluation -------------------------------------------
+
         if not pending or self.auto_approve:
             # Track auto-approved tool activity
             first = items[0] if items else {}
@@ -258,6 +299,7 @@ class WebUI:
             self._ws_prompt_tokens += usage["prompt_tokens"]
             self._ws_completion_tokens += usage["completion_tokens"]
             self._ws_context_ratio = total_tok / context_window if context_window > 0 else 0.0
+            tool_count = sum(self._ws_tool_calls.values())
         self._enqueue(
             {
                 "type": "status",
@@ -269,6 +311,26 @@ class WebUI:
                 "effort": effort,
             }
         )
+        # Record usage event for governance dashboard
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is not None:
+                import uuid
+
+                storage.record_usage_event(
+                    event_id=uuid.uuid4().hex,
+                    user_id="",
+                    ws_id=self.ws_id,
+                    node_id="",
+                    model=usage.get("model", ""),
+                    prompt_tokens=usage["prompt_tokens"],
+                    completion_tokens=usage["completion_tokens"],
+                    tool_calls_count=tool_count,
+                )
+        except Exception:
+            pass  # Non-critical — never break the response pipeline
 
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()

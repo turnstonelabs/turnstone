@@ -65,6 +65,14 @@ class TestUserCRUD:
         db.delete_user("u1")
         assert len(db.list_api_tokens("u1")) == 0
 
+    def test_delete_cascades_user_roles(self, db):
+        db.create_user("u1", "admin", "Admin", "$2b$hash")
+        db.create_role("r1", "editor", "Editor", "read,write", builtin=False, org_id="")
+        db.assign_role("u1", "r1")
+        assert len(db.list_user_roles("u1")) == 1
+        db.delete_user("u1")
+        assert len(db.list_user_roles("u1")) == 0
+
 
 class TestApiTokenCRUD:
     def test_create_and_lookup_by_hash(self, db):

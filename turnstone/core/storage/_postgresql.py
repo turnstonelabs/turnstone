@@ -10,9 +10,16 @@ import sqlalchemy as sa
 
 from turnstone.core.storage._schema import (
     api_tokens,
+    audit_events,
     conversations,
     memories,
     metadata,
+    orgs,
+    prompt_templates,
+    roles,
+    tool_policies,
+    usage_events,
+    user_roles,
     users,
     workstream_config,
     workstreams,
@@ -20,6 +27,23 @@ from turnstone.core.storage._schema import (
 from turnstone.core.storage._sqlite import _reconstruct_messages
 
 log = logging.getLogger(__name__)
+
+
+def _row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
+    """Convert a SQLAlchemy row to a dict, casting named fields to bool."""
+    d = dict(row._mapping)
+    for key in bool_fields:
+        if key in d:
+            d[key] = bool(d[key])
+    return d
+
+
+# -- Field allowlists for governance update methods ---------------------------
+
+_ROLE_MUTABLE = frozenset({"display_name", "permissions"})
+_ORG_MUTABLE = frozenset({"display_name", "settings"})
+_POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
+_TEMPLATE_MUTABLE = frozenset({"name", "content", "category", "variables", "is_default"})
 
 
 class PostgreSQLBackend:
@@ -531,6 +555,7 @@ class PostgreSQLBackend:
         from turnstone.core.storage._schema import channel_users
 
         with self._engine.connect() as conn:
+            conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
@@ -1215,6 +1240,559 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Roles -----------------------------------------------------------------
+
+    def create_role(
+        self,
+        role_id: str,
+        name: str,
+        display_name: str,
+        permissions: str,
+        builtin: bool,
+        org_id: str = "",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            existing = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    sa.insert(roles),
+                    {
+                        "role_id": role_id,
+                        "name": name,
+                        "display_name": display_name,
+                        "permissions": permissions,
+                        "builtin": 1 if builtin else 0,
+                        "org_id": org_id,
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            conn.commit()
+
+    def get_role(self, role_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(roles).where(roles.c.role_id == role_id)).fetchone()
+            if row:
+                return _row_to_dict(row, "builtin")
+            return None
+
+    def get_role_by_name(self, name: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(roles).where(roles.c.name == name)).fetchone()
+            if row:
+                return _row_to_dict(row, "builtin")
+            return None
+
+    def list_roles(self, org_id: str = "") -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(roles).order_by(roles.c.name.asc())
+            if org_id:
+                q = q.where(roles.c.org_id == org_id)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "builtin") for r in rows]
+
+    def update_role(self, role_id: str, **fields: Any) -> bool:
+        dropped = set(fields) - _ROLE_MUTABLE
+        if dropped:
+            log.warning("update_role: ignoring unknown fields: %s", dropped)
+        fields = {k: v for k, v in fields.items() if k in _ROLE_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(roles).where(roles.c.role_id == role_id).values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_role(self, role_id: str) -> bool:
+        with self._engine.connect() as conn:
+            conn.execute(sa.delete(user_roles).where(user_roles.c.role_id == role_id))
+            result = conn.execute(sa.delete(roles).where(roles.c.role_id == role_id))
+            conn.commit()
+            return result.rowcount > 0
+
+    def assign_role(self, user_id: str, role_id: str, assigned_by: str = "") -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            existing = conn.execute(
+                sa.select(user_roles.c.user_id).where(
+                    (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
+                )
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    sa.insert(user_roles),
+                    {
+                        "user_id": user_id,
+                        "role_id": role_id,
+                        "assigned_by": assigned_by,
+                        "created": now,
+                    },
+                )
+            conn.commit()
+
+    def unassign_role(self, user_id: str, role_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(user_roles).where(
+                    (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_user_roles(self, user_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    roles.c.role_id,
+                    roles.c.name,
+                    roles.c.display_name,
+                    roles.c.permissions,
+                    roles.c.builtin,
+                    roles.c.org_id,
+                    roles.c.created,
+                    roles.c.updated,
+                    user_roles.c.assigned_by,
+                    user_roles.c.created.label("assignment_created"),
+                )
+                .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+                .where(user_roles.c.user_id == user_id)
+            ).fetchall()
+            return [
+                {
+                    "role_id": r[0],
+                    "name": r[1],
+                    "display_name": r[2],
+                    "permissions": r[3],
+                    "builtin": bool(r[4]),
+                    "org_id": r[5],
+                    "created": r[6],
+                    "updated": r[7],
+                    "assigned_by": r[8],
+                    "assignment_created": r[9],
+                }
+                for r in rows
+            ]
+
+    def get_user_permissions(self, user_id: str) -> set[str]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(roles.c.permissions)
+                .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
+                .where(user_roles.c.user_id == user_id)
+            ).fetchall()
+            perms: set[str] = set()
+            for r in rows:
+                if r[0]:
+                    for p in r[0].split(","):
+                        p = p.strip()
+                        if p:
+                            perms.add(p)
+            return perms
+
+    # -- Organizations ---------------------------------------------------------
+
+    def create_org(self, org_id: str, name: str, display_name: str, settings: str = "{}") -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            existing = conn.execute(
+                sa.select(orgs.c.org_id).where(orgs.c.org_id == org_id)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    sa.insert(orgs),
+                    {
+                        "org_id": org_id,
+                        "name": name,
+                        "display_name": display_name,
+                        "settings": settings,
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            conn.commit()
+
+    def get_org(self, org_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(orgs).where(orgs.c.org_id == org_id)).fetchone()
+            if row:
+                return _row_to_dict(row)
+            return None
+
+    def list_orgs(self) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.select(orgs).order_by(orgs.c.name)).fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+    def update_org(self, org_id: str, **fields: Any) -> bool:
+        dropped = set(fields) - _ORG_MUTABLE
+        if dropped:
+            log.warning("update_org: ignoring unknown fields: %s", dropped)
+        fields = {k: v for k, v in fields.items() if k in _ORG_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.update(orgs).where(orgs.c.org_id == org_id).values(**fields))
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Tool policies ---------------------------------------------------------
+
+    def create_tool_policy(
+        self,
+        policy_id: str,
+        name: str,
+        tool_pattern: str,
+        action: str,
+        priority: int,
+        org_id: str = "",
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(tool_policies),
+                {
+                    "policy_id": policy_id,
+                    "name": name,
+                    "tool_pattern": tool_pattern,
+                    "action": action,
+                    "priority": priority,
+                    "org_id": org_id,
+                    "enabled": 1 if enabled else 0,
+                    "created_by": created_by,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(tool_policies).where(tool_policies.c.policy_id == policy_id)
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "enabled")
+            return None
+
+    def list_tool_policies(self, org_id: str = "") -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(tool_policies).order_by(tool_policies.c.priority.desc())
+            if org_id:
+                q = q.where(tool_policies.c.org_id == org_id)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "enabled") for r in rows]
+
+    def update_tool_policy(self, policy_id: str, **fields: Any) -> bool:
+        dropped = set(fields) - _POLICY_MUTABLE
+        if dropped:
+            log.warning("update_tool_policy: ignoring unknown fields: %s", dropped)
+        fields = {k: v for k, v in fields.items() if k in _POLICY_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "enabled" in fields:
+            fields["enabled"] = int(fields["enabled"])
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(tool_policies)
+                .where(tool_policies.c.policy_id == policy_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_tool_policy(self, policy_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(tool_policies).where(tool_policies.c.policy_id == policy_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Prompt templates ------------------------------------------------------
+
+    def create_prompt_template(
+        self,
+        template_id: str,
+        name: str,
+        category: str,
+        content: str,
+        variables: str = "[]",
+        is_default: bool = False,
+        org_id: str = "",
+        created_by: str = "",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(prompt_templates),
+                {
+                    "template_id": template_id,
+                    "name": name,
+                    "category": category,
+                    "content": content,
+                    "variables": variables,
+                    "is_default": 1 if is_default else 0,
+                    "org_id": org_id,
+                    "created_by": created_by,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_prompt_template(self, template_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "is_default")
+            return None
+
+    def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(prompt_templates).order_by(prompt_templates.c.name)
+            if org_id:
+                q = q.where(prompt_templates.c.org_id == org_id)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "is_default") for r in rows]
+
+    def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
+        dropped = set(fields) - _TEMPLATE_MUTABLE
+        if dropped:
+            log.warning("update_prompt_template: ignoring unknown fields: %s", dropped)
+        fields = {k: v for k, v in fields.items() if k in _TEMPLATE_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "is_default" in fields:
+            fields["is_default"] = int(fields["is_default"])
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(prompt_templates)
+                .where(prompt_templates.c.template_id == template_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_prompt_template(self, template_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(prompt_templates).where(prompt_templates.c.template_id == template_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Usage events ----------------------------------------------------------
+
+    def record_usage_event(
+        self,
+        event_id: str,
+        user_id: str = "",
+        ws_id: str = "",
+        node_id: str = "",
+        model: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        tool_calls_count: int = 0,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(usage_events),
+                {
+                    "event_id": event_id,
+                    "timestamp": now,
+                    "user_id": user_id,
+                    "ws_id": ws_id,
+                    "node_id": node_id,
+                    "model": model,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "tool_calls_count": tool_calls_count,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def query_usage(
+        self,
+        since: str,
+        until: str = "",
+        user_id: str = "",
+        model: str = "",
+        group_by: str = "",
+    ) -> list[dict[str, Any]]:
+        clauses = ["timestamp >= :since"]
+        params: dict[str, Any] = {"since": since}
+        if until:
+            clauses.append("timestamp <= :until")
+            params["until"] = until
+        if user_id:
+            clauses.append("user_id = :user_id")
+            params["user_id"] = user_id
+        if model:
+            clauses.append("model = :model")
+            params["model"] = model
+        where = " AND ".join(clauses)
+
+        if group_by == "day":
+            key_expr = "substring(timestamp from 1 for 10)"
+        elif group_by == "hour":
+            key_expr = "substring(timestamp from 1 for 13)"
+        elif group_by == "model":
+            key_expr = "model"
+        elif group_by == "user":
+            key_expr = "user_id"
+        else:
+            # No grouping — single summary row
+            sql = (
+                f"SELECT SUM(prompt_tokens), SUM(completion_tokens), "
+                f"SUM(tool_calls_count) FROM usage_events WHERE {where}"
+            )
+            with self._engine.connect() as conn:
+                row = conn.execute(sa.text(sql), params).fetchone()
+                if row:
+                    return [
+                        {
+                            "prompt_tokens": row[0] or 0,
+                            "completion_tokens": row[1] or 0,
+                            "tool_calls_count": row[2] or 0,
+                        }
+                    ]
+                return [{"prompt_tokens": 0, "completion_tokens": 0, "tool_calls_count": 0}]
+
+        sql = (
+            f"SELECT {key_expr} AS key, SUM(prompt_tokens), SUM(completion_tokens), "
+            f"SUM(tool_calls_count) FROM usage_events WHERE {where} "
+            f"GROUP BY {key_expr} ORDER BY key ASC"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).fetchall()
+            return [
+                {
+                    "key": r[0],
+                    "prompt_tokens": r[1] or 0,
+                    "completion_tokens": r[2] or 0,
+                    "tool_calls_count": r[3] or 0,
+                }
+                for r in rows
+            ]
+
+    def prune_usage_events(self, retention_days: int = 90) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(usage_events).where(usage_events.c.timestamp < cutoff))
+            conn.commit()
+            return result.rowcount
+
+    # -- Audit events ----------------------------------------------------------
+
+    def record_audit_event(
+        self,
+        event_id: str,
+        user_id: str = "",
+        action: str = "",
+        resource_type: str = "",
+        resource_id: str = "",
+        detail: str = "{}",
+        ip_address: str = "",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(audit_events),
+                {
+                    "event_id": event_id,
+                    "timestamp": now,
+                    "user_id": user_id,
+                    "action": action,
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "detail": detail,
+                    "ip_address": ip_address,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def list_audit_events(
+        self,
+        action: str = "",
+        user_id: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(
+                audit_events.c.event_id,
+                audit_events.c.timestamp,
+                audit_events.c.user_id,
+                audit_events.c.action,
+                audit_events.c.resource_type,
+                audit_events.c.resource_id,
+                audit_events.c.detail,
+                audit_events.c.ip_address,
+                audit_events.c.created,
+            ).order_by(audit_events.c.timestamp.desc())
+            if action:
+                q = q.where(audit_events.c.action == action)
+            if user_id:
+                q = q.where(audit_events.c.user_id == user_id)
+            if since:
+                q = q.where(audit_events.c.timestamp >= since)
+            if until:
+                q = q.where(audit_events.c.timestamp <= until)
+            q = q.limit(limit).offset(offset)
+            rows = conn.execute(q).fetchall()
+            return [
+                {
+                    "event_id": r[0],
+                    "timestamp": r[1],
+                    "user_id": r[2],
+                    "action": r[3],
+                    "resource_type": r[4],
+                    "resource_id": r[5],
+                    "detail": r[6],
+                    "ip_address": r[7],
+                    "created": r[8],
+                }
+                for r in rows
+            ]
+
+    def count_audit_events(
+        self,
+        action: str = "",
+        user_id: str = "",
+        since: str = "",
+        until: str = "",
+    ) -> int:
+        with self._engine.connect() as conn:
+            q = sa.select(sa.func.count()).select_from(audit_events)
+            if action:
+                q = q.where(audit_events.c.action == action)
+            if user_id:
+                q = q.where(audit_events.c.user_id == user_id)
+            if since:
+                q = q.where(audit_events.c.timestamp >= since)
+            if until:
+                q = q.where(audit_events.c.timestamp <= until)
+            row = conn.execute(q).fetchone()
+            return row[0] if row else 0
+
+    def prune_audit_events(self, retention_days: int = 365) -> int:
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(sa.delete(audit_events).where(audit_events.c.timestamp < cutoff))
+            conn.commit()
+            return result.rowcount
 
     # -- Lifecycle -------------------------------------------------------------
 

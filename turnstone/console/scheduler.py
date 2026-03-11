@@ -112,6 +112,18 @@ class TaskScheduler:
                 pruned = self._storage.prune_task_runs(retention_days=90)
                 if pruned:
                     log.info("scheduler.pruned_runs", count=pruned)
+                try:
+                    usage_pruned = self._storage.prune_usage_events(retention_days=90)
+                    if usage_pruned:
+                        log.info("scheduler.pruned_usage", count=usage_pruned)
+                except Exception:
+                    log.warning("scheduler.prune_usage_error", exc_info=True)
+                try:
+                    audit_pruned = self._storage.prune_audit_events(retention_days=365)
+                    if audit_pruned:
+                        log.info("scheduler.pruned_audit", count=audit_pruned)
+                except Exception:
+                    log.warning("scheduler.prune_audit_error", exc_info=True)
         finally:
             # Only release our own lock (safe even if TTL expired and another took it)
             self._broker._redis.eval(  # type: ignore[no-untyped-call]

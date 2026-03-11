@@ -92,6 +92,34 @@ Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
 `/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`.
 
+### RBAC (Granular Permissions)
+
+> See also: [Governance documentation](governance.md)
+
+Scopes provide coarse endpoint-level access control. For finer-grained
+enforcement, the governance layer adds 13 named permissions checked
+per-endpoint by `require_permission()`. Permissions are bundled into
+roles; users are assigned roles via the `user_roles` join table.
+
+At login, `_load_user_permissions()` aggregates all permissions from
+the user's assigned roles. `_permissions_to_scopes()` derives legacy
+scopes for backward compatibility (e.g., any `admin.*` permission
+implies the `approve` scope). The JWT carries both `scopes` and
+`permissions` claims.
+
+Three built-in roles are seeded by migration 008:
+
+| Role | Permissions |
+|------|-------------|
+| admin | All 13 permissions |
+| operator | read, write, workstreams.create, workstreams.close |
+| viewer | read |
+
+Custom roles can be created with any subset of the valid permissions.
+Role creation and update validate permissions against a static allowlist.
+Self-assignment is blocked, and assigning a role requires the caller to
+hold a superset of the target role's permissions.
+
 ---
 
 ## Login Flows

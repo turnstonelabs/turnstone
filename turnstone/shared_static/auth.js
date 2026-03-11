@@ -274,8 +274,9 @@ function _submitLogin() {
       if (!r.ok) throw new Error("server");
       return r.json();
     })
-    .then(function () {
+    .then(function (data) {
       _setBusy(false);
+      _storePermissions(data);
       _onSuccess();
     })
     .catch(function (err) {
@@ -306,8 +307,9 @@ function _submitToken() {
       if (!r.ok) throw new Error("server");
       return r.json();
     })
-    .then(function () {
+    .then(function (data) {
       _setBusy(false);
+      _storePermissions(data);
       _onSuccess();
     })
     .catch(function (err) {
@@ -369,14 +371,21 @@ function _submitSetup() {
         });
       return r.json();
     })
-    .then(function () {
+    .then(function (data) {
       _setBusy(false);
+      _storePermissions(data);
       _onSuccess();
     })
     .catch(function (err) {
       _setBusy(false);
       _showError(err.message || "Setup failed \u2014 try again");
     });
+}
+
+function _storePermissions(data) {
+  if (data && data.permissions) {
+    sessionStorage.setItem("turnstone_permissions", data.permissions);
+  }
 }
 
 function _setBusy(busy, label) {
@@ -403,6 +412,7 @@ function _onSuccess() {
 
 function logout() {
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
+    sessionStorage.removeItem("turnstone_permissions");
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();
   });

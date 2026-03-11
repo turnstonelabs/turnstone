@@ -29,7 +29,44 @@ function showAdmin() {
   document.getElementById("breadcrumb-label").textContent = "Admin";
   document.getElementById("main").scrollTop = 0;
   history.pushState({ view: "admin" }, "");
-  loadAdminUsers();
+
+  // Permission gating: hide tabs the user cannot access
+  var perms = sessionStorage.getItem("turnstone_permissions") || "";
+  var tabPerms = {
+    users: "admin.users",
+    tokens: "admin.users",
+    channels: "admin.users",
+    schedules: "admin.schedules",
+    watches: "admin.watches",
+    roles: "admin.roles",
+    policies: "admin.policies",
+    templates: "admin.templates",
+    usage: "admin.usage",
+    audit: "admin.audit",
+  };
+  if (perms) {
+    var permSet = perms.split(",");
+    var tabs = document.querySelectorAll(".admin-tab");
+    for (var i = 0; i < tabs.length; i++) {
+      var tabName = tabs[i].getAttribute("data-tab");
+      var needed = tabPerms[tabName];
+      if (needed && permSet.indexOf(needed) < 0) {
+        tabs[i].style.display = "none";
+      } else {
+        tabs[i].style.display = "";
+      }
+    }
+  }
+
+  // Switch to the first visible tab
+  var visibleTabs = document.querySelectorAll(
+    '.admin-tab:not([style*="display: none"])',
+  );
+  if (visibleTabs.length > 0) {
+    switchAdminTab(visibleTabs[0].getAttribute("data-tab"));
+  } else {
+    loadAdminUsers();
+  }
 }
 
 function switchAdminTab(tab) {
@@ -41,22 +78,36 @@ function switchAdminTab(tab) {
     tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
     tabs[i].setAttribute("tabindex", isActive ? "0" : "-1");
   }
-  document.getElementById("admin-users").style.display =
-    tab === "users" ? "" : "none";
-  document.getElementById("admin-tokens").style.display =
-    tab === "tokens" ? "" : "none";
-  document.getElementById("admin-channels").style.display =
-    tab === "channels" ? "" : "none";
-  document.getElementById("admin-schedules").style.display =
-    tab === "schedules" ? "" : "none";
-  document.getElementById("admin-watches").style.display =
-    tab === "watches" ? "" : "none";
+  var panels = [
+    "users",
+    "tokens",
+    "channels",
+    "schedules",
+    "watches",
+    "roles",
+    "policies",
+    "templates",
+    "usage",
+    "audit",
+  ];
+  for (var p = 0; p < panels.length; p++) {
+    var el = document.getElementById("admin-" + panels[p]);
+    if (el) el.style.display = panels[p] === tab ? "" : "none";
+  }
 
   if (tab === "users") loadAdminUsers();
   if (tab === "tokens") _populateTokenUserSelect();
   if (tab === "channels") _populateChannelUserSelect();
   if (tab === "schedules") loadAdminSchedules();
   if (tab === "watches") loadAdminWatches();
+  if (tab === "roles") loadGovRoles();
+  if (tab === "policies") loadGovPolicies();
+  if (tab === "templates") loadGovTemplates();
+  if (tab === "usage") loadGovUsage();
+  if (tab === "audit") {
+    _populateAuditUserFilter();
+    loadGovAudit();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +153,9 @@ function _renderUsers(users) {
       escapeHtml(u.created || "").slice(0, 10) +
       "</span>" +
       '<span class="admin-col admin-col-actions">' +
+      '<button class="admin-btn-action" data-user-roles="' +
+      escapeHtml(u.user_id) +
+      '" title="Manage roles">roles</button>' +
       '<button class="admin-btn-danger" data-delete-user="' +
       escapeHtml(u.user_id) +
       '" data-username="' +
@@ -111,6 +165,13 @@ function _renderUsers(users) {
       "</div>";
   }
   container.innerHTML = html;
+  // Bind roles buttons
+  var roleBtns = container.querySelectorAll("[data-user-roles]");
+  for (var rj = 0; rj < roleBtns.length; rj++) {
+    roleBtns[rj].addEventListener("click", function () {
+      showUserRolesModal(this.getAttribute("data-user-roles"));
+    });
+  }
   // Bind delete buttons via delegation (avoids inline JS injection)
   var btns = container.querySelectorAll("[data-delete-user]");
   for (var j = 0; j < btns.length; j++) {
@@ -1362,6 +1423,14 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "edit-schedule-overlay") hideEditScheduleModal();
         else if (overlayId === "schedule-runs-overlay") hideScheduleRunsModal();
         else if (overlayId === "confirm-overlay") hideConfirmModal();
+        else if (overlayId === "create-role-overlay") hideCreateRoleModal();
+        else if (overlayId === "edit-role-overlay") hideEditRoleModal();
+        else if (overlayId === "user-roles-overlay") hideUserRolesModal();
+        else if (overlayId === "create-policy-overlay") hideCreatePolicyModal();
+        else if (overlayId === "edit-policy-overlay") hideEditPolicyModal();
+        else if (overlayId === "create-template-overlay")
+          hideCreateTemplateModal();
+        else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
       }
     };
   }
@@ -1428,6 +1497,24 @@ document.addEventListener("keydown", function (e) {
     hideConfirmModal();
     return;
   }
+  // Governance modals
+  var govOverlays = [
+    ["create-role-overlay", hideCreateRoleModal],
+    ["edit-role-overlay", hideEditRoleModal],
+    ["user-roles-overlay", hideUserRolesModal],
+    ["create-policy-overlay", hideCreatePolicyModal],
+    ["edit-policy-overlay", hideEditPolicyModal],
+    ["create-template-overlay", hideCreateTemplateModal],
+    ["edit-template-overlay", hideEditTemplateModal],
+  ];
+  for (var gi = 0; gi < govOverlays.length; gi++) {
+    var govEl = document.getElementById(govOverlays[gi][0]);
+    if (govEl && govEl.style.display !== "none") {
+      e.preventDefault();
+      govOverlays[gi][1]();
+      return;
+    }
+  }
 });
 
 // Tab arrow key navigation
@@ -1436,7 +1523,14 @@ document.addEventListener("keydown", function (e) {
   if (!tablist) return;
   tablist.addEventListener("keydown", function (e) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var tabOrder = ["users", "tokens", "channels", "schedules", "watches"];
+    var allTabs = document.querySelectorAll(
+      '.admin-tab:not([style*="display: none"])',
+    );
+    var tabOrder = [];
+    for (var ti = 0; ti < allTabs.length; ti++) {
+      tabOrder.push(allTabs[ti].getAttribute("data-tab"));
+    }
+    if (tabOrder.length === 0) return;
     var idx = tabOrder.indexOf(_adminTab);
     if (e.key === "ArrowRight") idx = (idx + 1) % tabOrder.length;
     else idx = (idx - 1 + tabOrder.length) % tabOrder.length;

@@ -18,6 +18,7 @@ always accessible without authentication.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -33,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from starlette.requests import Request
-    from starlette.responses import Response
+    from starlette.responses import JSONResponse, Response
     from starlette.types import ASGIApp, Receive, Scope, Send
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,60 @@ _ROLE_TO_SCOPES: dict[str, frozenset[str]] = {
     "read": frozenset({"read"}),
     "full": frozenset({"read", "write", "approve"}),
 }
+
+# ---------------------------------------------------------------------------
+# RBAC helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_user_permissions(storage: Any, user_id: str) -> set[str]:
+    """Load the union of all permissions from a user's assigned roles."""
+    try:
+        result: set[str] = storage.get_user_permissions(user_id)
+        return result
+    except Exception:
+        log.warning("Failed to load permissions for user %s", user_id)
+        return set()
+
+
+def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
+    """Derive legacy scopes from a granular permission set."""
+    scopes: set[str] = set()
+    if not permissions:
+        scopes.add("read")
+        return frozenset(scopes)
+    for perm in permissions:
+        if perm in VALID_SCOPES:
+            scopes.update(SCOPE_HIERARCHY.get(perm, {perm}))
+    # Any admin.* permission requires access to admin endpoints → approve scope
+    if any(p.startswith("admin.") for p in permissions):
+        scopes.update(SCOPE_HIERARCHY["approve"])
+    if not scopes:
+        scopes.add("read")
+    return frozenset(scopes)
+
+
+def require_permission(request: Request, permission: str) -> JSONResponse | None:
+    """Return a 403 JSONResponse if the user lacks *permission*, else None.
+
+    Call from admin handlers after the middleware scope check passes.
+    Config-file tokens (no user_id) are treated as full-access.
+    """
+    from starlette.responses import JSONResponse
+
+    auth_result: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
+    if auth_result is None:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    # Config-file tokens (no user_id) are treated as full-access
+    if not auth_result.user_id:
+        return None
+    if auth_result.has_permission(permission):
+        return None
+    return JSONResponse(
+        {"error": f"Forbidden: missing '{permission}' permission"},
+        status_code=403,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Path classification
@@ -133,10 +188,15 @@ class AuthResult:
     user_id: str  # empty string for config-file tokens
     scopes: frozenset[str]
     token_source: str  # "config", "jwt", "database"
+    permissions: frozenset[str] = frozenset()
 
     def has_scope(self, scope: str) -> bool:
         """Return True if this result includes *scope*."""
         return scope in self.scopes
+
+    def has_permission(self, permission: str) -> bool:
+        """Return True if this result includes *permission*."""
+        return permission in self.permissions
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +309,9 @@ def create_jwt(
     secret: str,
     expiry_hours: int = 24,
     audience: str = "",
+    permissions: frozenset[str] = frozenset(),
 ) -> str:
-    """Create a signed JWT with user identity and scopes."""
+    """Create a signed JWT with user identity, scopes, and permissions."""
     import jwt
 
     now = int(time.time())
@@ -264,6 +325,8 @@ def create_jwt(
     }
     if audience:
         payload["aud"] = audience
+    if permissions:
+        payload["permissions"] = ",".join(sorted(permissions))
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
@@ -293,11 +356,15 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
     user_id = payload.get("sub", "")
     scopes_str = payload.get("scopes", "")
     source = payload.get("src", "jwt")
+    perms_str = payload.get("permissions", "")
+
+    perms = frozenset(p for p in perms_str.split(",") if p) if perms_str else frozenset()
 
     return AuthResult(
         user_id=user_id,
         scopes=parse_scopes(scopes_str),
         token_source=source,
+        permissions=perms,
     )
 
 
@@ -531,10 +598,12 @@ def _authenticate_api_token(token: str, storage: Any) -> AuthResult | None:
         if exp_dt < now:
             return None
 
+    perms = _load_user_permissions(storage, row["user_id"]) if storage else set()
     return AuthResult(
         user_id=row["user_id"],
         scopes=parse_scopes(row["scopes"]),
         token_source="database",
+        permissions=frozenset(perms),
     )
 
 
@@ -835,10 +904,14 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
     if username and password and storage is not None:
         user = storage.get_user_by_username(username)
         if user and verify_password(password, user["password_hash"]):
+            # Derive scopes and permissions from assigned roles
+            perms = _load_user_permissions(storage, user["user_id"])
+            scopes = _permissions_to_scopes(perms)
             result = AuthResult(
                 user_id=user["user_id"],
-                scopes=frozenset({"read", "write", "approve"}),
+                scopes=scopes,
                 token_source="password",
+                permissions=frozenset(perms),
             )
     elif body.get("token"):
         result = _authenticate_token(
@@ -865,11 +938,14 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
             source=result.token_source,
             secret=jwt_secret,
             audience=audience,
+            permissions=result.permissions,
         )
 
     role = "full" if result.has_scope("write") else "read"
     scopes_str = ",".join(sorted(result.scopes))
     resp_body: dict[str, str] = {"status": "ok", "role": role, "scopes": scopes_str}
+    if result.permissions:
+        resp_body["permissions"] = ",".join(sorted(result.permissions))
     if jwt_token:
         resp_body["jwt"] = jwt_token
     if result.user_id:
@@ -959,7 +1035,33 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
     if not created:
         return JSONResponse({"error": "Setup already completed"}, status_code=409)
 
-    scopes = frozenset({"read", "write", "approve"})
+    # Assign admin role to the first user — fail setup if this breaks,
+    # otherwise the admin is created with read-only access and locked out.
+    try:
+        storage.assign_role(user_id, "builtin-admin", "")
+    except Exception:
+        log.error("Failed to assign admin role to first user %s — aborting setup", user_id)
+        # Roll back the user creation so setup can be retried
+        with contextlib.suppress(Exception):
+            storage.delete_user(user_id)
+        return JSONResponse(
+            {"error": "Failed to assign admin role. Ensure migrations have run."},
+            status_code=503,
+        )
+
+    # Derive permissions from roles
+    perms = _load_user_permissions(storage, user_id)
+    if not perms:
+        log.error(
+            "First user %s has no permissions after role assignment — aborting setup", user_id
+        )
+        with contextlib.suppress(Exception):
+            storage.delete_user(user_id)
+        return JSONResponse(
+            {"error": "Failed to load permissions. Ensure migrations have run."},
+            status_code=503,
+        )
+    scopes = _permissions_to_scopes(perms)
     jwt_token = ""
     if jwt_secret:
         jwt_token = create_jwt(
@@ -968,6 +1070,7 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
             source="password",
             secret=jwt_secret,
             audience=audience,
+            permissions=frozenset(perms),
         )
 
     resp_body: dict[str, str] = {
@@ -977,6 +1080,8 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
         "role": "full",
         "scopes": ",".join(sorted(scopes)),
     }
+    if perms:
+        resp_body["permissions"] = ",".join(sorted(perms))
     if jwt_token:
         resp_body["jwt"] = jwt_token
 

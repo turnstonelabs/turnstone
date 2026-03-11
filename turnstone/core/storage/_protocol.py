@@ -359,6 +359,210 @@ class StorageBackend(Protocol):
         """Remove a service registration. Returns True if existed."""
         ...
 
+    # -- Roles (RBAC) ----------------------------------------------------------
+
+    def create_role(
+        self,
+        role_id: str,
+        name: str,
+        display_name: str,
+        permissions: str,
+        builtin: bool,
+        org_id: str,
+    ) -> None:
+        """Create a role. No-op if role_id already exists."""
+        ...
+
+    def get_role(self, role_id: str) -> dict[str, Any] | None:
+        """Return role dict or None."""
+        ...
+
+    def get_role_by_name(self, name: str) -> dict[str, Any] | None:
+        """Lookup role by name. Returns same dict as get_role or None."""
+        ...
+
+    def list_roles(self, org_id: str = "") -> list[dict[str, Any]]:
+        """Return all roles, optionally filtered by org_id. Ordered by name."""
+        ...
+
+    def update_role(self, role_id: str, **fields: Any) -> bool:
+        """Update specified fields on a role. Returns True if found."""
+        ...
+
+    def delete_role(self, role_id: str) -> bool:
+        """Delete a custom role. Returns True if found."""
+        ...
+
+    def assign_role(self, user_id: str, role_id: str, assigned_by: str) -> None:
+        """Assign a role to a user. No-op if already assigned."""
+        ...
+
+    def unassign_role(self, user_id: str, role_id: str) -> bool:
+        """Unassign a role from a user. Returns True if existed."""
+        ...
+
+    def list_user_roles(self, user_id: str) -> list[dict[str, Any]]:
+        """List roles assigned to a user (joins user_roles with roles)."""
+        ...
+
+    def get_user_permissions(self, user_id: str) -> set[str]:
+        """Return the union of all permissions from the user's assigned roles."""
+        ...
+
+    # -- Organizations ---------------------------------------------------------
+
+    def create_org(self, org_id: str, name: str, display_name: str, settings: str = "{}") -> None:
+        """Create an organization. No-op if org_id already exists."""
+        ...
+
+    def get_org(self, org_id: str) -> dict[str, Any] | None:
+        """Return org dict or None."""
+        ...
+
+    def list_orgs(self) -> list[dict[str, Any]]:
+        """Return all organizations ordered by name."""
+        ...
+
+    def update_org(self, org_id: str, **fields: Any) -> bool:
+        """Update specified fields on an org. Returns True if found."""
+        ...
+
+    # -- Tool policies ---------------------------------------------------------
+
+    def create_tool_policy(
+        self,
+        policy_id: str,
+        name: str,
+        tool_pattern: str,
+        action: str,
+        priority: int,
+        org_id: str,
+        enabled: bool,
+        created_by: str,
+    ) -> None:
+        """Create a tool policy."""
+        ...
+
+    def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
+        """Return tool policy dict or None."""
+        ...
+
+    def list_tool_policies(self, org_id: str = "") -> list[dict[str, Any]]:
+        """Return all tool policies ordered by priority DESC."""
+        ...
+
+    def update_tool_policy(self, policy_id: str, **fields: Any) -> bool:
+        """Update specified fields on a tool policy. Returns True if found."""
+        ...
+
+    def delete_tool_policy(self, policy_id: str) -> bool:
+        """Delete a tool policy. Returns True if found."""
+        ...
+
+    # -- Prompt templates ------------------------------------------------------
+
+    def create_prompt_template(
+        self,
+        template_id: str,
+        name: str,
+        category: str,
+        content: str,
+        variables: str,
+        is_default: bool,
+        org_id: str,
+        created_by: str,
+    ) -> None:
+        """Create a prompt template."""
+        ...
+
+    def get_prompt_template(self, template_id: str) -> dict[str, Any] | None:
+        """Return prompt template dict or None."""
+        ...
+
+    def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+        """Return all prompt templates ordered by name."""
+        ...
+
+    def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
+        """Update specified fields on a prompt template. Returns True if found."""
+        ...
+
+    def delete_prompt_template(self, template_id: str) -> bool:
+        """Delete a prompt template. Returns True if found."""
+        ...
+
+    # -- Usage events ----------------------------------------------------------
+
+    def record_usage_event(
+        self,
+        event_id: str,
+        user_id: str,
+        ws_id: str,
+        node_id: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        tool_calls_count: int,
+    ) -> None:
+        """Record a usage event (token counts, tool calls for one LLM request)."""
+        ...
+
+    def query_usage(
+        self,
+        since: str,
+        until: str = "",
+        user_id: str = "",
+        model: str = "",
+        group_by: str = "",
+    ) -> list[dict[str, Any]]:
+        """Query aggregated usage data. group_by: 'day', 'hour', 'model', 'user'."""
+        ...
+
+    def prune_usage_events(self, retention_days: int = 90) -> int:
+        """Delete usage events older than retention_days. Returns count deleted."""
+        ...
+
+    # -- Audit events ----------------------------------------------------------
+
+    def record_audit_event(
+        self,
+        event_id: str,
+        user_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        detail: str,
+        ip_address: str,
+    ) -> None:
+        """Record an audit event."""
+        ...
+
+    def list_audit_events(
+        self,
+        action: str = "",
+        user_id: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List audit events with optional filters, ordered by timestamp DESC."""
+        ...
+
+    def count_audit_events(
+        self,
+        action: str = "",
+        user_id: str = "",
+        since: str = "",
+        until: str = "",
+    ) -> int:
+        """Count audit events matching the filters."""
+        ...
+
+    def prune_audit_events(self, retention_days: int = 365) -> int:
+        """Delete audit events older than retention_days. Returns count deleted."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
