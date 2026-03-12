@@ -312,6 +312,60 @@ class TestParseFooter:
 # ---------------------------------------------------------------------------
 
 
+class TestWsEventFinalization:
+    """TurnCompleteEvent should finalize streaming messages in the Discord bot."""
+
+    def test_turn_complete_finalizes_streaming(self):
+        """ContentEvent + TurnCompleteEvent(correlation_id='') finalizes the message."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.mq.protocol import ContentEvent, TurnCompleteEvent
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot.config.streaming_edit_interval = 1.5
+        bot.config.auto_approve = False
+        bot.config.auto_approve_tools = []
+        bot._streaming = {}
+
+        # Use the real _on_ws_event method
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+
+        thread = AsyncMock()
+
+        # Feed content event
+        content_raw = ContentEvent(ws_id="ws-1", text="Hello world").to_json()
+        _run(bot._on_ws_event("ws-1", thread, content_raw))
+
+        # StreamingMessage should exist
+        assert "ws-1" in bot._streaming
+        sm = bot._streaming["ws-1"]
+
+        # Feed turn complete with empty correlation_id (server-UI-initiated)
+        complete_raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
+        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+
+        # StreamingMessage should be removed and finalized
+        assert "ws-1" not in bot._streaming
+
+    def test_turn_complete_no_streaming_is_noop(self):
+        """TurnCompleteEvent without prior content should not error."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot._streaming = {}
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+
+        thread = AsyncMock()
+
+        complete_raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
+        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+
+        # No error, no streaming message
+        assert "ws-1" not in bot._streaming
+
+
 class TestChannelCLI:
     """Tests for the channel CLI entry point."""
 

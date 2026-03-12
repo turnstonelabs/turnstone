@@ -264,7 +264,8 @@ class TurnCompleteEvent(OutboundEvent):
     """Emitted when a workstream finishes processing (returns to IDLE).
 
     This is a synthetic event produced by the bridge when it detects
-    the ws_state transition to 'idle' after a send.
+    the ws_state transition to 'idle'.  ``correlation_id`` is set for
+    MQ-initiated turns and empty for turns initiated from the server UI.
     """
 
     type: str = "turn_complete"

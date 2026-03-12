@@ -789,12 +789,13 @@ class Bridge:
                 )
             )
 
-            # Completion detection
+            # Completion detection — emit for all idle transitions so
+            # channel adapters can finalize streaming messages even when
+            # the turn was initiated from the server UI (no correlation_id).
             if state == "idle":
                 with self._lock:
                     cid = self._active_sends.pop(ws_id, None)
-                if cid:
-                    self._publish_ws(ws_id, TurnCompleteEvent(ws_id=ws_id, correlation_id=cid))
+                self._publish_ws(ws_id, TurnCompleteEvent(ws_id=ws_id, correlation_id=cid or ""))
 
         elif etype == "ws_rename":
             self._publish_global(WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", "")))
