@@ -217,6 +217,7 @@ class TestFullLifecycleResourcesPrompts:
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5)
+            loop.close()
 
     def test_get_prompt_sync_dispatches_correctly(self, mgr: MCPClientManager) -> None:
         """get_prompt_sync dispatches to the correct session via a real asyncio loop."""

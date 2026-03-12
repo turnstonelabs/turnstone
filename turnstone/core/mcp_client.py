@@ -510,13 +510,26 @@ class MCPClientManager:
                     prefix = tmpl_uri[:brace] if brace >= 0 else tmpl_uri
                     if prefix:
                         if prefix in new_prefixes:
-                            log.warning(
-                                "Template prefix collision: '%s' from '%s' overrides '%s'",
-                                prefix,
-                                srv_name,
-                                new_prefixes[prefix][0],
-                            )
-                        new_prefixes[prefix] = (srv_name, tmpl_uri)
+                            existing_srv, existing_tmpl = new_prefixes[prefix]
+                            if len(tmpl_uri) > len(existing_tmpl):
+                                log.warning(
+                                    "Template prefix collision: '%s' from '%s' overrides '%s'"
+                                    " (keeping more specific template)",
+                                    prefix,
+                                    srv_name,
+                                    existing_srv,
+                                )
+                                new_prefixes[prefix] = (srv_name, tmpl_uri)
+                            else:
+                                log.warning(
+                                    "Template prefix collision: '%s' from '%s' ignored in"
+                                    " favor of '%s' (keeping more specific template)",
+                                    prefix,
+                                    srv_name,
+                                    existing_srv,
+                                )
+                        else:
+                            new_prefixes[prefix] = (srv_name, tmpl_uri)
 
         self._resources = new_resources
         self._resource_map = new_map
@@ -918,8 +931,9 @@ class MCPClientManager:
         """Find the longest matching template prefix for an expanded URI.
 
         Returns ``(server_name, template_uri)`` or *None* if no match.
-        Longest prefix wins to handle nested templates (e.g.,
-        ``db://tables/`` vs ``db://tables/{t}/rows/``).
+        The match uses the longest static prefix stored in
+        ``_template_prefixes`` (the portion of each template URI before
+        the first ``{``), with simple ``startswith`` matching.
         """
         best: tuple[str, str] | None = None
         best_len = 0

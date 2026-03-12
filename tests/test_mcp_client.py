@@ -1046,33 +1046,42 @@ class TestMCPResources:
     def test_template_longest_prefix_wins(self):
         """When two templates have overlapping prefixes, the longer one wins."""
         mgr = MCPClientManager({})
+        # Use templates with genuinely different prefix lengths:
+        # "db://data/" (6 chars after scheme) vs "db://data/tables/" (13 chars after scheme)
         mgr._per_server_resources = {
-            "db": [
+            "short": [
                 {
-                    "uri": "db://tables/{table}",
+                    "uri": "db://data/{collection}",
+                    "name": "collection",
+                    "description": "",
+                    "mimeType": "",
+                    "server": "short",
+                    "template": True,
+                },
+            ],
+            "long": [
+                {
+                    "uri": "db://data/tables/{table}",
                     "name": "table",
                     "description": "",
                     "mimeType": "",
-                    "server": "db",
-                    "template": True,
-                },
-                {
-                    "uri": "db://tables/{table}/rows/{id}",
-                    "name": "row",
-                    "description": "",
-                    "mimeType": "",
-                    "server": "db",
+                    "server": "long",
                     "template": True,
                 },
             ],
         }
         mgr._rebuild_resources()
-        # "db://tables/users/rows/42" should match the longer prefix
-        result = mgr._match_template("db://tables/users/rows/42")
+        # "db://data/tables/users" matches both prefixes ("db://data/" and
+        # "db://data/tables/") — the longer one should win
+        result = mgr._match_template("db://data/tables/users")
         assert result is not None
-        _, template_uri = result
-        # The longer prefix "db://tables/{table}/rows/" wins over "db://tables/"
-        assert template_uri == "db://tables/{table}/rows/{id}"
+        server, template_uri = result
+        assert server == "long"
+        assert template_uri == "db://data/tables/{table}"
+        # URI that only matches the short prefix
+        result2 = mgr._match_template("db://data/views/active")
+        assert result2 is not None
+        assert result2[0] == "short"
 
     def test_template_no_match_raises(self):
         """Completely unrelated URI still raises ValueError."""
