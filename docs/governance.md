@@ -43,15 +43,26 @@ Admin-defined rules that control tool execution:
 - **Priority**: Higher priority evaluated first, first match wins
 - **Enforcement**: `evaluate_tool_policies_batch()` called in `WebUI.approve_tools()`
   before the `auto_approve` check
+- **MCP granular policies**: MCP resources and prompts are evaluated using their
+  `approval_label` for fine-grained control:
+  - Resource reads: `mcp_resource__{uri}` (e.g., `mcp_resource__file:///docs/*` to allow,
+    `mcp_resource__*` to deny all)
+  - Prompt invocations: `mcp__{server}__{prompt}` (e.g., `mcp__trusted__*` to allow,
+    `mcp__*` to require approval for all)
+  - Built-in tools continue to use `func_name` for backward compatibility
 
 ### Prompt Templates
 
 Reusable system message templates with variable substitution:
 
 - **Variables**: `{{variable_name}}` placeholders in content
-- **Categories**: general, engineering, support, custom
+- **Categories**: general, engineering, support, custom, mcp
 - **Default flag**: `is_default=true` templates intended for new workstreams
 - **Storage**: `prompt_templates` table with JSON `variables` array
+- **MCP sync**: MCP server prompts are auto-synced into prompt_templates with
+  `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual templates take
+  precedence on name collision. Admin UI shows origin badge and disables
+  edit/delete for MCP-sourced templates. See `docs/tools.md` MCP Prompts section
 
 ### Usage Tracking
 

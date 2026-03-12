@@ -619,11 +619,12 @@ class ChatSession:
                     "Use it when you need a capability not in your current tool set."
                 )
         # MCP resource catalog (lets the model know what's available for read_resource)
+        # Only concrete resources — templates are not directly readable.
         if self._mcp_client:
-            resources = self._mcp_client.get_resources()
-            if resources:
+            concrete = [r for r in self._mcp_client.get_resources() if not r.get("template")]
+            if concrete:
                 lines = ["\n<mcp-resources>"]
-                for r in resources[:50]:
+                for r in concrete[:50]:
                     safe_uri = _html_escape(r["uri"])
                     desc = r.get("description", "")
                     if desc:
@@ -2417,7 +2418,7 @@ class ChatSession:
             "header": f"\u2699 mcp:{display}",
             "preview": f"{DIM}{preview}{RESET}",
             "needs_approval": True,
-            "approval_label": "mcp_tool",
+            "approval_label": func_name,
             "execute": self._exec_mcp_tool,
             "mcp_func_name": func_name,
             "mcp_args": args,
@@ -2442,6 +2443,23 @@ class ChatSession:
         output = self._truncate_output(output)
         self.ui.on_tool_result(call_id, func_name, output)
         return call_id, output
+
+    @staticmethod
+    def _normalize_resource_uri(uri: str) -> str:
+        """Normalize a resource URI for policy matching.
+
+        Resolves ``..`` path segments to prevent traversal bypasses
+        where ``file:///docs/../etc/passwd`` would match a policy
+        allowing ``mcp_resource__file:///docs/*``.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(uri)
+        if parsed.path:
+            import posixpath
+
+            parsed = parsed._replace(path=posixpath.normpath(parsed.path))
+        return urlunparse(parsed)
 
     def _prepare_read_resource(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare an MCP resource read."""
@@ -2470,7 +2488,7 @@ class ChatSession:
             "header": "\u2699 read_resource",
             "preview": f"{DIM}    uri: {uri}{RESET}",
             "needs_approval": True,
-            "approval_label": "mcp_resource",
+            "approval_label": f"mcp_resource__{self._normalize_resource_uri(uri)}",
             "execute": self._exec_read_resource,
             "resource_uri": uri,
         }
@@ -2525,7 +2543,17 @@ class ChatSession:
                 "needs_approval": False,
                 "error": f"Unknown MCP prompt: {name}",
             }
-        arguments = args.get("arguments") or {}
+        raw_arguments = args.get("arguments") or {}
+        if not isinstance(raw_arguments, dict):
+            return {
+                "call_id": call_id,
+                "func_name": "use_prompt",
+                "header": "\u2717 use_prompt: arguments must be an object",
+                "preview": "",
+                "needs_approval": False,
+                "error": "arguments must be a JSON object with string values",
+            }
+        arguments = {str(k): str(v) for k, v in raw_arguments.items()}
         preview_parts = [f"    {DIM}name: {name}"]
         if arguments:
             preview_parts.append(f"    arguments: {arguments}")
@@ -2536,7 +2564,7 @@ class ChatSession:
             "header": "\u2699 use_prompt",
             "preview": "\n".join(preview_parts),
             "needs_approval": True,
-            "approval_label": "mcp_prompt",
+            "approval_label": name,
             "execute": self._exec_use_prompt,
             "prompt_name": name,
             "prompt_arguments": arguments,

@@ -452,6 +452,9 @@ export interface PromptTemplateInfo {
   created_by: string;
   created: string;
   updated: string;
+  origin: string;
+  mcp_server: string;
+  readonly: boolean;
 }
 
 export interface CreateTemplateOptions {

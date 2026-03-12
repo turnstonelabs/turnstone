@@ -209,17 +209,21 @@ class WebUI:
 
                 storage = get_storage()
                 if storage is not None:
-                    tool_names = [it.get("func_name", "") for it in pending if it.get("func_name")]
+                    tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in pending
+                        if it.get("func_name")
+                    ]
                     if tool_names:
                         verdicts = evaluate_tool_policies_batch(storage, tool_names)
                         still_pending = []
                         for it in pending:
-                            fname = it.get("func_name", "")
-                            verdict = verdicts.get(fname)
+                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                            verdict = verdicts.get(policy_name)
                             if verdict == "deny":
                                 it["denied"] = True
                                 it["denial_msg"] = (
-                                    f"Blocked by tool policy (pattern match for '{fname}')"
+                                    f"Blocked by tool policy (pattern match for '{policy_name}')"
                                 )
                             elif verdict == "allow":
                                 it["needs_approval"] = False
