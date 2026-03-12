@@ -374,7 +374,9 @@ class WebUI:
             WebUI._global_queue.put({"type": "ws_rename", "ws_id": self.ws_id, "name": name})
 
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
-        """Called by the HTTP handler when the user approves/denies."""
+        """Resolve a pending approval, whether triggered by the HTTP handler
+        (user approves/denies in the browser) or by server-initiated flows
+        such as cancellations or timeouts."""
         self._approval_result = (approved, feedback)
         self._enqueue(
             {

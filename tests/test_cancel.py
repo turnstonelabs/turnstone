@@ -391,11 +391,13 @@ class TestStreamFlushBeforeToolCalls:
                 return_value=stream_content_then_tool(),
             ),
             patch.object(session, "_full_messages", return_value=[]),
+            # Prevent real tool execution (e.g., bash) during this test.
+            patch.object(session, "_execute_tools", return_value=([], None)),
         ):
             session.send("test")
 
         # All content should have been emitted
-        total = "".join(v for t, *v in events if t == "content" for v in v)
+        total = "".join(e[1] for e in events if e[0] == "content")
         assert total == "Hello world, this is a test message"
 
         # No content events after stream_end
