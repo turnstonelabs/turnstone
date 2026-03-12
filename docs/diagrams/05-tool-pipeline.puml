@@ -33,10 +33,10 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ write_file    │ ✓ Yes            │
             │ edit_file     │ ✓ Yes            │
             │ search        │ ✗ Auto-approve   │
-            │ math          │ ✓ Yes            │
+            │ math          │ ✗ Auto-approve   │
             │ man           │ ✗ Auto-approve   │
-            │ web_fetch     │ ✓ Yes            │
-            │ web_search    │ ✓ Yes            │
+            │ web_fetch     │ ✗ Auto-approve   │
+            │ web_search    │ ✗ Auto-approve   │
             │ tool_search   │ ✗ Auto-approve   │
             │ task          │ ✓ Yes            │
             │ plan          │ ✓ Yes            │

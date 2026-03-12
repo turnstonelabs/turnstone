@@ -1177,10 +1177,42 @@
               }
             ],
             "default": null
+          },
+          "mcp": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/McpStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": ["status"],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "McpStatus": {
+        "properties": {
+          "servers": {
+            "default": 0,
+            "title": "Servers",
+            "type": "integer"
+          },
+          "resources": {
+            "default": 0,
+            "title": "Resources",
+            "type": "integer"
+          },
+          "prompts": {
+            "default": 0,
+            "title": "Prompts",
+            "type": "integer"
+          }
+        },
+        "title": "McpStatus",
         "type": "object"
       },
       "BackendStatus": {
