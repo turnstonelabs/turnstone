@@ -12,6 +12,14 @@
   font-family: var(--font-display);
   letter-spacing: 0.02em;
 }
+#mcp-status {
+  color: var(--magenta);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  opacity: 0;
+  transition: opacity 0.3s;
+  cursor: default;
+}
 #health-indicator {
   font-size: 11px;
   padding: 2px 8px;
@@ -699,5 +707,6 @@
   .approval-btn, .approval-feedback-input,
   #plan-buttons button, #input-area button,
   .dashboard-new-btn, .dashboard-input,
-  #health-indicator, #hamburger-btn { transition: none; }
+  #health-indicator, #hamburger-btn,
+  #mcp-status { transition: none; }
 }

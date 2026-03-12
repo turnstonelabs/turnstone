@@ -36,6 +36,7 @@
   --yellow-glow: rgba(251, 191, 36, 0.25);
   --accent-glow-strong: rgba(229, 160, 66, 0.3);
   --cyan-glow: rgba(103, 232, 249, 0.2);
+  --magenta-glow: rgba(192, 132, 252, 0.25);
 
   /* Structure */
   --border: rgba(255, 255, 255, 0.06);
@@ -73,6 +74,7 @@
   --yellow-glow: rgba(180, 83, 9, 0.25);
   --accent-glow-strong: rgba(140, 94, 27, 0.15);
   --cyan-glow: rgba(14, 116, 144, 0.2);
+  --magenta-glow: rgba(124, 58, 237, 0.2);
   --border: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.12);
   --code-bg: #f0f1f5;

@@ -102,6 +102,7 @@ class MetricsCollector:
         workstream_states: dict[str, int],
         total_workstreams: int,
         workstream_metrics: list[dict[str, Any]] | None = None,
+        mcp_info: dict[str, int] | None = None,
     ) -> str:
         """Return Prometheus text exposition format (v0.0.4)."""
         lines: list[str] = []
@@ -321,6 +322,24 @@ class MetricsCollector:
                 lines.append(
                     f"turnstone_workstream_context_ratio{lstr} {_fmt_value(wm['context_ratio'])}"
                 )
+
+        # MCP gauges (optional)
+        if mcp_info:
+            gauge(
+                "turnstone_mcp_servers",
+                "Number of connected MCP servers",
+                mcp_info.get("servers", 0),
+            )
+            gauge(
+                "turnstone_mcp_resources",
+                "Number of MCP resources available",
+                mcp_info.get("resources", 0),
+            )
+            gauge(
+                "turnstone_mcp_prompts",
+                "Number of MCP prompts available",
+                mcp_info.get("prompts", 0),
+            )
 
         lines.append("")  # trailing newline
         return "\n".join(lines)

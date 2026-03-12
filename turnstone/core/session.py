@@ -2448,17 +2448,21 @@ class ChatSession:
     def _normalize_resource_uri(uri: str) -> str:
         """Normalize a resource URI for policy matching.
 
-        Resolves ``..`` path segments to prevent traversal bypasses
-        where ``file:///docs/../etc/passwd`` would match a policy
+        Decodes percent-encoded path segments (e.g. ``%2e%2e`` → ``..``)
+        then resolves ``..`` to prevent traversal bypasses where
+        ``file:///docs/%2e%2e/etc/passwd`` would match a policy
         allowing ``mcp_resource__file:///docs/*``.
         """
-        from urllib.parse import urlparse, urlunparse
+        import posixpath
+        from urllib.parse import quote, unquote, urlparse, urlunparse
 
         parsed = urlparse(uri)
         if parsed.path:
-            import posixpath
-
-            parsed = parsed._replace(path=posixpath.normpath(parsed.path))
+            decoded = unquote(parsed.path)
+            normalized = posixpath.normpath(decoded)
+            if parsed.path.startswith("/") and not normalized.startswith("/"):
+                normalized = "/" + normalized
+            parsed = parsed._replace(path=quote(normalized, safe="/"))
         return urlunparse(parsed)
 
     def _prepare_read_resource(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:

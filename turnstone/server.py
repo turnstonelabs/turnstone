@@ -768,6 +768,13 @@ async def health(request: Request) -> JSONResponse:
             "circuit_state": monitor.circuit_state.value if monitor else "closed",
         },
     }
+    mc = getattr(request.app.state, "mcp_client", None)
+    if mc:
+        data["mcp"] = {
+            "servers": mc.server_count,
+            "resources": len(mc.get_resources()),
+            "prompts": len(mc.get_prompts()),
+        }
     return JSONResponse(data)
 
 
@@ -791,10 +798,19 @@ async def metrics_endpoint(request: Request) -> Response:
                     "context_ratio": ui._ws_context_ratio,
                 }
             )
+    mcp_info = None
+    mc = getattr(request.app.state, "mcp_client", None)
+    if mc:
+        mcp_info = {
+            "servers": mc.server_count,
+            "resources": len(mc.get_resources()),
+            "prompts": len(mc.get_prompts()),
+        }
     content = _metrics.generate_text(
         workstream_states=states,
         total_workstreams=len(wss),
         workstream_metrics=ws_data,
+        mcp_info=mcp_info,
     )
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 

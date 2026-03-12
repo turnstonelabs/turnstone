@@ -149,6 +149,13 @@ def test_normalize_resource_uri_prevents_traversal():
     assert ChatSession._normalize_resource_uri("file:///a/b/../../c") == "file:///c"
     # Non-file scheme (netloc preserved, path normalized)
     assert ChatSession._normalize_resource_uri("db://host/tables/../secrets") == "db://host/secrets"
+    # Percent-encoded traversal decoded before normalization
+    assert (
+        ChatSession._normalize_resource_uri("file:///docs/%2e%2e/etc/passwd")
+        == "file:///etc/passwd"
+    )
+    # Mixed percent-encoded and literal traversal
+    assert ChatSession._normalize_resource_uri("file:///a/%2e%2e/b/../c") == "file:///c"
 
 
 def test_mcp_tool_granular_policy(storage):

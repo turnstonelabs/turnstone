@@ -166,6 +166,17 @@
   opacity: 0.7;
 }
 
+/* MCP indicator dot — LED effect with magenta glow */
+.csb-mcp-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--magenta);
+  box-shadow: 0 0 4px var(--magenta-glow);
+  display: inline-block;
+  flex-shrink: 0;
+}
+
 .csb-loading { color: var(--fg-dim); font-size: 11px; font-style: italic; opacity: 0.8; }
 
 #cluster-status-bar.stale { border-top-color: var(--yellow); }
@@ -455,6 +466,16 @@
 .dash-cell-node:hover { text-decoration: underline; color: var(--fg-bright); }
 
 /* ==========================================================================
+   MCP summary in node detail
+   ========================================================================== */
+#node-mcp-summary {
+  color: var(--magenta);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  margin-left: 12px;
+}
+
+/* ==========================================================================
    Node link
    ========================================================================== */
 .node-link {
@@ -665,6 +686,7 @@
   .node-group-header .node-group-cell:last-child { display: none; }
   .ncol-version, .node-cell-version { display: none; }
   .ncol-health, .node-cell-health { display: none; }
+  #node-mcp-summary { display: none; }
   #main { padding: 16px; padding-bottom: 60px; }
 }
 @media (max-width: 480px) {

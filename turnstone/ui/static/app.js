@@ -42,6 +42,26 @@ function pollHealth() {
     .then(function (data) {
       pollHealth._failCount = 0;
       _lastHealth = data;
+      var mcpEl = document.getElementById("mcp-status");
+      if (mcpEl) {
+        if (data.mcp && data.mcp.servers > 0) {
+          mcpEl.textContent =
+            "MCP: " +
+            data.mcp.servers +
+            " server" +
+            (data.mcp.servers !== 1 ? "s" : "");
+          mcpEl.title =
+            data.mcp.resources +
+            " resources \u00b7 " +
+            data.mcp.prompts +
+            " prompts";
+          mcpEl.style.opacity = "1";
+        } else {
+          mcpEl.textContent = "";
+          mcpEl.title = "";
+          mcpEl.style.opacity = "0";
+        }
+      }
       var el = document.getElementById("health-indicator");
       if (!el) return;
       if (data.status === "degraded") {

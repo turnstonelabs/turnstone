@@ -597,6 +597,8 @@ where the model can interactively search for tools it needs.
 
 ## MCP Tools (External)
 
+> See also: [MCP Architecture diagram](diagrams/png/20-mcp-architecture.png)
+
 Turnstone supports the [Model Context Protocol](https://modelcontextprotocol.io/)
 (MCP) for connecting external tool servers — GitHub, databases, filesystems, or any
 MCP-compatible service.
@@ -849,3 +851,24 @@ governance table as first-class governed templates:
 The `use_prompt` tool allows the model to invoke any discovered MCP prompt at
 runtime. A catalog of up to 30 prompts is injected into the system message
 inside `<mcp-prompts>` XML tags so the model can discover available prompts.
+
+---
+
+## MCP UI Visibility
+
+MCP server, resource, and prompt counts are surfaced across the UI:
+
+- **Server `/health` endpoint**: Returns `mcp.servers`, `mcp.resources`,
+  `mcp.prompts` when MCP is configured
+- **Server UI**: Magenta status badge in the header showing server count,
+  with resource/prompt counts in tooltip
+- **Console cluster status bar**: MCP metrics (servers/resources/prompts)
+  with magenta LED dot indicator, shown after a divider from workstream
+  metrics
+- **Console node detail**: Per-node MCP summary showing server, resource,
+  and prompt counts
+- **Console collector**: Aggregates MCP counts across all nodes in the
+  cluster overview
+
+MCP indicators use the `--magenta` design token for consistent theming
+across light and dark modes.

@@ -1,0 +1,157 @@
+@startuml
+!theme plain
+title Turnstone — MCP Architecture (Resources, Prompts, Tools)
+
+skinparam participant {
+    BackgroundColor<<mcp>> #E1BEE7
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<ui>> #E8EAF6
+}
+
+participant "MCP Server\n(external)" as MCPSrv <<mcp>>
+participant "MCPClientManager\n(mcp_client.py)" as MCPMgr <<mcp>>
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "StorageBackend\n(governance)" as Storage <<storage>>
+participant "Server / Console\n(health + UI)" as UI <<server>>
+
+== Startup: Connection & Discovery ==
+
+MCPMgr -> MCPSrv : initialize (stdio or HTTP)
+MCPSrv --> MCPMgr : capabilities\n(tools, resources, prompts)
+
+MCPMgr -> MCPSrv : tools/list
+MCPSrv --> MCPMgr : Tool[]
+
+opt resources capability
+  MCPMgr -> MCPSrv : resources/list
+  MCPSrv --> MCPMgr : Resource[]
+  MCPMgr -> MCPSrv : resources/templates/list
+  MCPSrv --> MCPMgr : ResourceTemplate[]
+end
+
+opt prompts capability
+  MCPMgr -> MCPSrv : prompts/list
+  MCPSrv --> MCPMgr : Prompt[]
+end
+
+note over MCPMgr
+  Per-server storage:
+  _per_server_tools, _per_server_resources, _per_server_prompts
+  Copy-on-write rebuild into _tools, _resources, _prompts
+  Prefix: mcp__{server}__{name}
+end note
+
+MCPMgr -> Session : notify tool listeners
+MCPMgr -> Session : notify resource listeners
+
+== Governance Sync (on connect & refresh) ==
+
+MCPMgr -> Storage : sync_prompts_to_storage()
+note right
+  For each MCP prompt:
+  - Manual template exists? → skip
+  - MCP template exists? → update
+  - New? → create (origin="mcp",
+    readonly=True)
+  Removed prompts → delete
+  Protected by _sync_lock
+end note
+
+== set_storage() from entry point ==
+
+UI -> MCPMgr : set_storage(backend)
+note right
+  If servers already connected,
+  triggers immediate sync
+end note
+
+== Runtime: Tool Execution ==
+
+Session -> Session : _prepare_mcp_tool(func_name, args)
+note right
+  approval_label = func_name
+  (e.g. mcp__github__search)
+  needs_approval = True
+end note
+Session -> MCPMgr : call_tool_sync(name, args)
+MCPMgr -> MCPSrv : tools/call
+MCPSrv --> MCPMgr : ToolResult
+MCPMgr --> Session : output (text)
+
+== Runtime: Resource Read ==
+
+Session -> Session : _prepare_read_resource(uri)
+note right
+  approval_label = mcp_resource__{normalized_uri}
+  URI normalized (.. resolved)
+  needs_approval = True
+end note
+Session -> MCPMgr : read_resource_sync(uri)
+MCPMgr -> MCPSrv : resources/read
+MCPSrv --> MCPMgr : ReadResourceResult
+MCPMgr --> Session : content (text/blob)
+
+== Runtime: Prompt Invocation ==
+
+Session -> Session : _prepare_use_prompt(name, arguments)
+note right
+  approval_label = mcp__srv__prompt
+  Validated via is_mcp_prompt()
+  needs_approval = True
+end note
+Session -> MCPMgr : get_prompt_sync(name, args)
+MCPMgr -> MCPSrv : prompts/get
+MCPSrv --> MCPMgr : GetPromptResult
+MCPMgr --> Session : messages [{role, content}]
+
+== Three-Tier Refresh ==
+
+group Push Notifications
+  MCPSrv -> MCPMgr : ToolListChangedNotification
+  MCPMgr -> MCPMgr : _refresh_server_tools()
+
+  MCPSrv -> MCPMgr : ResourceListChangedNotification
+  MCPMgr -> MCPMgr : _refresh_server_resources()
+
+  MCPSrv -> MCPMgr : PromptListChangedNotification
+  MCPMgr -> MCPMgr : _refresh_server_prompts()
+  MCPMgr -> Storage : sync_prompts_to_storage()
+end
+
+group Periodic Polling (default 4h)
+  MCPMgr -> MCPMgr : _periodic_refresh()
+  note right
+    Only polls capabilities
+    without push support.
+    Staggered per-server.
+  end note
+end
+
+group Manual Refresh
+  Session -> MCPMgr : refresh_sync()
+  note right: /mcp refresh [server]
+end
+
+== Policy Evaluation ==
+
+note over Session
+  Tool policies use fnmatch on approval_label:
+  - mcp__github__* → allow (all GitHub tools/prompts)
+  - mcp_resource__file:///docs/* → allow
+  - mcp_resource__* → deny (block all resource reads)
+  - mcp__untrusted__* → ask
+end note
+
+== UI Visibility ==
+
+UI -> MCPMgr : server_count, get_resources(), get_prompts()
+note over UI
+  /health → mcp.servers, mcp.resources, mcp.prompts
+  Server UI: magenta status badge
+  Console: cluster status bar + node detail
+  System message: <mcp-resources> + <mcp-prompts> catalogs
+end note
+
+@enduml

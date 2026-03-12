@@ -320,6 +320,9 @@ class ClusterCollector:
         total_tokens = 0
         total_tool_calls = 0
         total_ws = 0
+        mcp_servers = 0
+        mcp_resources = 0
+        mcp_prompts = 0
         versions: set[str] = set()
         with self._lock:
             for node in self._nodes.values():
@@ -332,8 +335,12 @@ class ClusterCollector:
                 ver = node.health.get("version", "")
                 if ver:
                     versions.add(ver)
+                mcp = node.health.get("mcp", {})
+                mcp_servers += mcp.get("servers", 0)
+                mcp_resources += mcp.get("resources", 0)
+                mcp_prompts += mcp.get("prompts", 0)
             node_count = len(self._nodes)
-        return {
+        result: dict[str, Any] = {
             "nodes": node_count,
             "workstreams": total_ws,
             "states": states,
@@ -344,6 +351,11 @@ class ClusterCollector:
             "version_drift": len(versions) > 1,
             "versions": sorted(versions),
         }
+        if mcp_servers:
+            result["mcp_servers"] = mcp_servers
+            result["mcp_resources"] = mcp_resources
+            result["mcp_prompts"] = mcp_prompts
+        return result
 
     def get_version_info(self) -> dict[str, Any]:
         """Return per-node version map and drift flag."""
@@ -515,6 +527,9 @@ class ClusterCollector:
         total_tokens = 0
         total_tool_calls = 0
         total_ws = 0
+        mcp_servers = 0
+        mcp_resources = 0
+        mcp_prompts = 0
         versions: set[str] = set()
 
         for node in self._nodes.values():
@@ -530,6 +545,10 @@ class ClusterCollector:
             ver = node.health.get("version", "")
             if ver:
                 versions.add(ver)
+            mcp = node.health.get("mcp", {})
+            mcp_servers += mcp.get("servers", 0)
+            mcp_resources += mcp.get("resources", 0)
+            mcp_prompts += mcp.get("prompts", 0)
 
             nodes_out.append(
                 {
@@ -546,19 +565,25 @@ class ClusterCollector:
 
         node_count = len(self._nodes)
 
+        overview: dict[str, Any] = {
+            "nodes": node_count,
+            "workstreams": total_ws,
+            "states": states,
+            "aggregate": {
+                "total_tokens": total_tokens,
+                "total_tool_calls": total_tool_calls,
+            },
+            "version_drift": len(versions) > 1,
+            "versions": sorted(versions),
+        }
+        if mcp_servers:
+            overview["mcp_servers"] = mcp_servers
+            overview["mcp_resources"] = mcp_resources
+            overview["mcp_prompts"] = mcp_prompts
+
         return {
             "nodes": nodes_out,
-            "overview": {
-                "nodes": node_count,
-                "workstreams": total_ws,
-                "states": states,
-                "aggregate": {
-                    "total_tokens": total_tokens,
-                    "total_tool_calls": total_tool_calls,
-                },
-                "version_drift": len(versions) > 1,
-                "versions": sorted(versions),
-            },
+            "overview": overview,
             "timestamp": time.time(),
         }
 

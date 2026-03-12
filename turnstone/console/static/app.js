@@ -140,6 +140,9 @@ function recomputeOverview() {
   var totalTokens = 0,
     totalToolCalls = 0,
     totalWs = 0;
+  var mcpServers = 0,
+    mcpResources = 0,
+    mcpPrompts = 0;
   var versions = {};
   Object.keys(clusterState.nodes).forEach(function (nid) {
     var node = clusterState.nodes[nid];
@@ -154,6 +157,10 @@ function recomputeOverview() {
     totalTokens += aggTokens || nodeWsTokens;
     totalToolCalls += (node.aggregate || {}).total_tool_calls || 0;
     if (node.version) versions[node.version] = true;
+    var mcp = (node.health || {}).mcp || {};
+    mcpServers += mcp.servers || 0;
+    mcpResources += mcp.resources || 0;
+    mcpPrompts += mcp.prompts || 0;
   });
   var versionList = Object.keys(versions).sort();
   clusterState.overview = {
@@ -167,6 +174,11 @@ function recomputeOverview() {
     version_drift: versionList.length > 1,
     versions: versionList,
   };
+  if (mcpServers > 0) {
+    clusterState.overview.mcp_servers = mcpServers;
+    clusterState.overview.mcp_resources = mcpResources;
+    clusterState.overview.mcp_prompts = mcpPrompts;
+  }
 }
 
 function buildNodeInfoFromSnapshot(node) {
@@ -227,6 +239,23 @@ function renderFromState() {
       }).length;
       document.getElementById("node-ws-summary").textContent =
         active + " active \u00b7 " + wsList.length + " total";
+      var mcpSumEl = document.getElementById("node-mcp-summary");
+      if (mcpSumEl) {
+        var mcpInfo = snapNode.health && snapNode.health.mcp;
+        if (mcpInfo && mcpInfo.servers > 0) {
+          mcpSumEl.textContent =
+            mcpInfo.servers +
+            " MCP server" +
+            (mcpInfo.servers !== 1 ? "s" : "") +
+            " \u00b7 " +
+            mcpInfo.resources +
+            " resources \u00b7 " +
+            mcpInfo.prompts +
+            " prompts";
+        } else {
+          mcpSumEl.textContent = "";
+        }
+      }
       renderWsTable(document.getElementById("node-ws-table"), wsList);
     }
   } else if (currentView === "filtered") {
@@ -469,6 +498,43 @@ function renderStatusBar(overview) {
     verEl.appendChild(valSpan);
     verEl.appendChild(verLbl);
     metricsContainer.appendChild(verEl);
+  }
+  // MCP aggregate metrics
+  if (overview.mcp_servers && overview.mcp_servers > 0) {
+    var mcpDivider = document.createElement("span");
+    mcpDivider.className = "csb-divider";
+    mcpDivider.setAttribute("aria-hidden", "true");
+    metricsContainer.appendChild(mcpDivider);
+    var mcpTitles = {
+      mcp: "MCP servers",
+      rsrc: "MCP resources",
+      pmpt: "MCP prompts",
+    };
+    var mcpMetrics = [
+      { value: overview.mcp_servers, label: "mcp" },
+      { value: overview.mcp_resources, label: "rsrc" },
+      { value: overview.mcp_prompts, label: "pmpt" },
+    ];
+    mcpMetrics.forEach(function (m) {
+      var el = document.createElement("span");
+      el.className = "csb-metric";
+      el.title = mcpTitles[m.label] || "";
+      if (m.label === "mcp") {
+        var dot = document.createElement("span");
+        dot.className = "csb-mcp-dot";
+        dot.setAttribute("aria-hidden", "true");
+        el.appendChild(dot);
+      }
+      var valSpan = document.createElement("span");
+      valSpan.className = "csb-metric-value";
+      valSpan.textContent = formatCount(m.value);
+      var labelSpan = document.createElement("span");
+      labelSpan.className = "csb-metric-label";
+      labelSpan.textContent = m.label;
+      el.appendChild(valSpan);
+      el.appendChild(labelSpan);
+      metricsContainer.appendChild(el);
+    });
   }
 }
 
