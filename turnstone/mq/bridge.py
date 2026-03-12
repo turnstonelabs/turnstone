@@ -709,6 +709,11 @@ class Bridge:
         def _wait_plan() -> None:
             try:
                 raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
+                # Clear pending entry *before* posting response so that
+                # a subsequent plan review event (from the refinement
+                # loop) is not skipped by the duplicate guard.
+                with self._lock:
+                    self._pending_plan_reviews.pop(ws_id, None)
                 if raw_resp:
                     resp_msg = InboundMessage.from_json(raw_resp)
                     feedback = getattr(resp_msg, "feedback", "")
@@ -716,9 +721,16 @@ class Bridge:
                 else:
                     log.warning("Plan review timeout for ws %s — rejecting", ws_id)
                     self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
-            finally:
+            except Exception:
                 with self._lock:
                     self._pending_plan_reviews.pop(ws_id, None)
+                # Best-effort rejection so the server doesn't hang
+                with contextlib.suppress(Exception):
+                    self._http.post(
+                        "/v1/api/plan",
+                        json={"feedback": "reject", "ws_id": ws_id},
+                    )
+                raise
 
         threading.Thread(target=self._run_in_context(_wait_plan), daemon=True).start()
 

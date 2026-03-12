@@ -28,6 +28,7 @@
   --yellow: #fbbf24;
   --cyan: #67e8f9;
   --magenta: #c084fc;
+  --on-color: var(--bg);
 
   /* Glow variants for LED effects */
   --green-glow: rgba(52, 211, 153, 0.25);
@@ -66,6 +67,7 @@
   --yellow: #b45309;
   --cyan: #0e7490;
   --magenta: #7c3aed;
+  --on-color: #ffffff;
   --green-glow: rgba(4, 120, 87, 0.25);
   --red-glow: rgba(220, 38, 38, 0.25);
   --yellow-glow: rgba(180, 83, 9, 0.25);

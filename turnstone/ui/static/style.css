@@ -497,11 +497,23 @@
   cursor: pointer;
   font-weight: 600;
   letter-spacing: 0.02em;
-  transition: filter 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: filter 0.15s, background 0.2s;
 }
 #plan-buttons button:hover { filter: brightness(1.1); }
-#btn-plan-approve { background: var(--green); color: var(--bg); }
-#btn-plan-reject { background: var(--red); color: var(--bg); }
+#plan-buttons button:focus-visible { outline: 2px solid var(--fg-bright); outline-offset: 2px; }
+#plan-buttons button .key {
+  display: inline-block;
+  background: rgba(0,0,0,0.2);
+  border-radius: var(--radius-sm);
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+}
+#btn-plan-approve { background: var(--green); color: var(--on-color); }
+#btn-plan-reject { background: var(--red); color: var(--on-color); }
 
 /* ==========================================================================
    Focus indicators — server-specific overrides

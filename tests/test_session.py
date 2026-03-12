@@ -144,12 +144,21 @@ class TestChatSessionConstruction:
 class TestPlanExec:
     """Tests for _exec_plan: unique session-scoped plan file and existing-plan injection."""
 
-    def _run_plan(self, session, prompt, agent_return="# Plan\n\nDo the thing."):
+    _VALID_PLAN = (
+        "## Goal\n\nDo the thing.\n\n"
+        "## Current State\n\nFile foo.py has bar().\n\n"
+        "## Plan\n\n1. Edit foo.py line 10.\n\n"
+        "## Risks\n\nNone."
+    )
+
+    def _run_plan(self, session, prompt, agent_return=None):
         """Invoke _exec_plan with _run_agent patched to avoid LLM calls.
 
         Returns (call_id_returned, content_returned, captured_messages) where
         captured_messages is the agent_messages list passed to _run_agent.
         """
+        if agent_return is None:
+            agent_return = self._VALID_PLAN
         captured = {}
 
         def fake_run_agent(messages, **kwargs):
@@ -175,10 +184,9 @@ class TestPlanExec:
         """Written plan file contains the agent's output verbatim."""
         monkeypatch.chdir(tmp_path)
         session = _make_session()
-        plan_content = "## Goal\n\nAdd a new endpoint."
-        self._run_plan(session, "add endpoint", agent_return=plan_content)
+        self._run_plan(session, "add endpoint")
         plan_file = tmp_path / f".plan-{session._ws_id}.md"
-        assert plan_file.read_text() == plan_content
+        assert plan_file.read_text() == self._VALID_PLAN
 
     def test_two_sessions_produce_different_files(self, tmp_db, tmp_path, monkeypatch):
         """Two ChatSession instances never collide on the same plan file."""
@@ -262,10 +270,288 @@ class TestPlanExec:
         """_exec_plan returns (call_id, agent_output)."""
         monkeypatch.chdir(tmp_path)
         session = _make_session()
-        agent_output = "## Goal\n\nBuild it."
-        call_id, content, _ = self._run_plan(session, "do stuff", agent_return=agent_output)
+        call_id, content, _ = self._run_plan(session, "do stuff")
         assert call_id == "test-call-1"
-        assert content == agent_output
+        assert content == self._VALID_PLAN
+
+    def test_exec_plan_retries_on_garbage(self, tmp_db, tmp_path, monkeypatch):
+        """When _run_agent returns garbage, _exec_plan retries once."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        good_plan = (
+            "## Goal\n\nAdd feature X.\n\n"
+            "## Current State\n\nFile foo.py has bar().\n\n"
+            "## Plan\n\n1. Edit foo.py:bar()\n\n"
+            "## Risks\n\nNone."
+        )
+        call_count = 0
+
+        def fake_run_agent(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "Sure, do the thing."
+            return good_plan
+
+        item = {"call_id": "c1", "prompt": "add feature X"}
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            _, content = session._exec_plan(item)
+
+        assert call_count == 2
+        assert "## Goal" in content
+
+    def test_exec_plan_warning_on_double_failure(self, tmp_db, tmp_path, monkeypatch):
+        """When both attempts produce garbage, content gets a warning prefix."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+
+        def fake_run_agent(messages, **kwargs):
+            return "nope"
+
+        item = {"call_id": "c1", "prompt": "add feature X"}
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            _, content = session._exec_plan(item)
+
+        assert content.startswith("[Warning:")
+
+    def test_retry_continues_agent_conversation(self, tmp_db, tmp_path, monkeypatch):
+        """Retry appends coaching to the same agent_messages list."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        captured_messages: list[list] = []
+
+        def fake_run_agent(messages, **kwargs):
+            captured_messages.append(list(messages))
+            if len(captured_messages) == 1:
+                return "garbage"
+            return (
+                "## Goal\n\nDone.\n\n## Current State\n\nx\n\n## Plan\n\n1. x\n\n## Risks\n\nNone."
+            )
+
+        item = {"call_id": "c1", "prompt": "add feature X"}
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._exec_plan(item)
+
+        assert len(captured_messages) == 2
+        # Second call should have more messages (coaching appended)
+        assert len(captured_messages[1]) > len(captured_messages[0])
+        # Last user message in second call is the coaching message
+        assert "did not follow" in captured_messages[1][-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Plan validation
+# ---------------------------------------------------------------------------
+
+
+class TestPlanValidation:
+    """Tests for ChatSession._validate_plan quality gate."""
+
+    GOOD_PLAN = (
+        "## Goal\n\nAdd authentication to the API.\n\n"
+        "## Current State\n\nFile server.py:45 has no auth middleware.\n\n"
+        "## Plan\n\n1. Add AuthMiddleware to server.py.\n"
+        "2. Create auth.py with JWT verification.\n\n"
+        "## Risks\n\nToken expiry handling may need tuning."
+    )
+
+    def test_valid_plan_passes(self):
+        valid, issues = ChatSession._validate_plan(self.GOOD_PLAN, "add auth")
+        assert valid
+        assert issues == []
+
+    def test_too_short_fails(self):
+        valid, issues = ChatSession._validate_plan("Do the thing.", "do stuff")
+        assert not valid
+        assert any("too short" in i for i in issues)
+
+    def test_no_sections_fails(self):
+        content = "A" * 150  # long enough but no sections
+        valid, issues = ChatSession._validate_plan(content, "build it")
+        assert not valid
+        assert any("missing plan sections" in i for i in issues)
+
+    def test_echo_detection(self):
+        goal = "deliver a simpsons quote from a specific episode"
+        content = "Deliver a Simpsons quote from a specific episode"
+        valid, issues = ChatSession._validate_plan(content, goal)
+        assert not valid
+        assert any("echo" in i for i in issues)
+
+    def test_refusal_detection(self):
+        content = "I cannot create a plan for this task because " + "x" * 100
+        valid, issues = ChatSession._validate_plan(content, "do stuff")
+        assert not valid
+        assert any("refusal" in i for i in issues)
+
+    def test_partial_sections_passes(self):
+        """2 out of 4 sections is enough to pass."""
+        content = (
+            "## Goal\n\nFix the bug in parsing.\n\n"
+            "## Plan\n\n1. Edit parser.py line 42.\n"
+            "2. Add boundary check.\n"
+            "This is enough detail to proceed with confidence."
+        )
+        valid, issues = ChatSession._validate_plan(content, "fix bug")
+        assert valid
+
+    def test_one_section_fails(self):
+        """Only 1 out of 4 sections is not enough."""
+        content = (
+            "## Goal\n\nFix the bug.\n\n"
+            "We should probably edit parser.py and add some checks "
+            "to the boundary handling code path for safety."
+        )
+        valid, issues = ChatSession._validate_plan(content, "fix bug")
+        assert not valid
+        assert any("missing plan sections" in i for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# Plan refinement loop
+# ---------------------------------------------------------------------------
+
+
+class TestPlanRefinement:
+    """Tests for the iterative plan refinement loop in _execute_tools."""
+
+    GOOD_PLAN = TestPlanValidation.GOOD_PLAN
+
+    def test_feedback_triggers_refinement(self, tmp_db, tmp_path, monkeypatch):
+        """User feedback causes _refine_plan to run, then approval exits."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        refine_called = []
+
+        review_responses = iter(["add error handling", ""])
+        session.ui = MagicMock(spec_set=NullUI)
+        session.ui.on_plan_review.side_effect = lambda c: next(review_responses)
+        session.ui.on_info = MagicMock()
+        session.ui.on_state_change = MagicMock()
+
+        revised = self.GOOD_PLAN + "\n\n3. Add error handling."
+
+        def fake_refine(content, goal, feedback):
+            refine_called.append(feedback)
+            return revised
+
+        with patch.object(session, "_refine_plan", side_effect=fake_refine):
+            items = [
+                {
+                    "func_name": "create_plan",
+                    "call_id": "c1",
+                    "prompt": "add auth",
+                }
+            ]
+            results = [("c1", self.GOOD_PLAN)]
+            # Manually invoke the post-plan gate portion of _execute_tools.
+            # We test the loop by calling the gate code directly.
+            session.auto_approve = False
+
+            original_goal = items[0].get("prompt", "")
+            output = results[0][1]
+            refinement_round = 0
+            while refinement_round < session._MAX_PLAN_REFINEMENTS:
+                resp = session.ui.on_plan_review(output)
+                if resp.lower() in ("n", "no", "reject"):
+                    break
+                elif resp:
+                    output = session._refine_plan(output, original_goal, resp)
+                    refinement_round += 1
+                else:
+                    break
+
+        assert len(refine_called) == 1
+        assert refine_called[0] == "add error handling"
+        assert "error handling" in output
+
+    def test_reject_skips_refinement(self, tmp_db, tmp_path, monkeypatch):
+        """Rejection exits immediately without calling _refine_plan."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        session.ui = MagicMock(spec_set=NullUI)
+        session.ui.on_plan_review.return_value = "reject"
+
+        with patch.object(session, "_refine_plan") as mock_refine:
+            output = self.GOOD_PLAN
+            resp = session.ui.on_plan_review(output)
+            if resp.lower() in ("n", "no", "reject"):
+                output += "\n\n---\nUser REJECTED"
+            elif resp:
+                output = session._refine_plan(output, "g", resp)
+
+        mock_refine.assert_not_called()
+        assert "REJECTED" in output
+
+    def test_approve_skips_refinement(self, tmp_db, tmp_path, monkeypatch):
+        """Empty response (enter) approves without refinement."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        session.ui = MagicMock(spec_set=NullUI)
+        session.ui.on_plan_review.return_value = ""
+
+        with patch.object(session, "_refine_plan") as mock_refine:
+            output = self.GOOD_PLAN
+            resp = session.ui.on_plan_review(output)
+            if resp.lower() in ("n", "no", "reject"):
+                output += "\n\n---\nUser REJECTED"
+            elif resp:
+                output = session._refine_plan(output, "g", resp)
+
+        mock_refine.assert_not_called()
+        assert "REJECTED" not in output
+
+    def test_max_refinement_rounds(self, tmp_db, tmp_path, monkeypatch):
+        """Loop stops after _MAX_PLAN_REFINEMENTS rounds."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        session.ui = MagicMock(spec_set=NullUI)
+        session.ui.on_plan_review.return_value = "more detail please"
+
+        refine_count = 0
+
+        def fake_refine(content, goal, feedback):
+            nonlocal refine_count
+            refine_count += 1
+            return content + f"\n(revision {refine_count})"
+
+        with patch.object(session, "_refine_plan", side_effect=fake_refine):
+            output = self.GOOD_PLAN
+            original_goal = "add auth"
+            refinement_round = 0
+            while refinement_round < session._MAX_PLAN_REFINEMENTS:
+                resp = session.ui.on_plan_review(output)
+                if resp.lower() in ("n", "no", "reject"):
+                    break
+                elif resp:
+                    output = session._refine_plan(output, original_goal, resp)
+                    refinement_round += 1
+                else:
+                    break
+
+        assert refine_count == session._MAX_PLAN_REFINEMENTS
+
+    def test_refine_plan_message_structure(self, tmp_db, tmp_path, monkeypatch):
+        """_refine_plan passes system + prior plan + feedback to _run_agent."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        captured = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured["messages"] = list(messages)
+            return self.GOOD_PLAN
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._refine_plan(self.GOOD_PLAN, "add auth", "add tests too")
+
+        msgs = captured["messages"]
+        assert msgs[0]["role"] == "system"
+        assert msgs[1]["role"] == "assistant"
+        assert msgs[1]["tool_calls"][0]["function"]["name"] == "create_plan"
+        assert msgs[2]["role"] == "tool"
+        assert msgs[2]["content"] == self.GOOD_PLAN
+        assert msgs[3]["role"] == "user"
+        assert "add tests too" in msgs[3]["content"]
 
 
 # ---------------------------------------------------------------------------

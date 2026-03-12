@@ -1572,17 +1572,37 @@ function scrollToBottom(force) {
 // --- Plan review dialog ---
 function showPlanDialog(content) {
   document.getElementById("plan-content").textContent = content;
-  document.getElementById("plan-feedback").value = "";
+  var feedbackEl = document.getElementById("plan-feedback");
+  feedbackEl.value = "";
+  _updatePlanRejectBtn();
+  inputEl.disabled = true;
+  sendBtn.disabled = true;
   document.getElementById("plan-overlay").classList.add("active");
   setTimeout(function () {
-    document.getElementById("plan-feedback").focus();
+    feedbackEl.focus();
   }, 50);
+}
+
+function _updatePlanRejectBtn() {
+  var btn = document.getElementById("btn-plan-reject");
+  var hasFeedback =
+    document.getElementById("plan-feedback").value.trim().length > 0;
+  btn.innerHTML = hasFeedback
+    ? '<span class="key">Esc</span> Amend'
+    : '<span class="key">Esc</span> Reject';
+  btn.style.background = hasFeedback ? "var(--accent)" : "";
+  btn.style.color = hasFeedback ? "var(--on-color)" : "";
+  btn.onclick = function () {
+    resolvePlan(hasFeedback ? "" : "reject");
+  };
 }
 
 function resolvePlan(defaultFeedback) {
   let feedback = document.getElementById("plan-feedback").value.trim();
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
   document.getElementById("plan-overlay").classList.remove("active");
+  inputEl.disabled = false;
+  sendBtn.disabled = false;
   inputEl.focus();
   authFetch("/v1/api/plan", {
     method: "POST",
@@ -1647,6 +1667,9 @@ function autoResize() {
 }
 
 inputEl.addEventListener("input", autoResize);
+document
+  .getElementById("plan-feedback")
+  .addEventListener("input", _updatePlanRejectBtn);
 inputEl.addEventListener("keydown", function (e) {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();

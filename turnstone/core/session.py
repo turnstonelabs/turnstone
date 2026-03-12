@@ -1551,28 +1551,70 @@ class ChatSession:
             with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(run_one, items))
 
-        # Post-plan gate: prompt user on main thread after plan completes
+        # Post-plan gate: iterative review loop.  When the user gives
+        # feedback the plan agent re-runs and the revised plan is shown
+        # again, up to _MAX_PLAN_REFINEMENTS rounds.
         for i, item in enumerate(items):
-            if (
-                item.get("func_name") == "create_plan"
-                and not item.get("error")
-                and not item.get("denied")
-                and not self.auto_approve
-            ):
-                cid, output = results[i]
-                assert isinstance(output, str)  # plan always returns text
-                # Let the UI present the plan for review
-                self._emit_state("attention")
-                resp = self.ui.on_plan_review(output)
-                self._emit_state("running")
-                if resp.lower() in ("n", "no", "reject"):
-                    output += (
-                        "\n\n---\nUser REJECTED this plan. Do not proceed "
-                        "with implementation. Ask the user what they want instead."
-                    )
-                elif resp:
-                    output += f"\n\n---\nUser feedback on this plan: {resp}"
-                results[i] = (cid, output)
+            if item.get("func_name") != "create_plan" or item.get("error") or item.get("denied"):
+                continue
+
+            cid, output = results[i]
+            assert isinstance(output, str)  # plan always returns text
+            plan_path = f".plan-{self._ws_id}.md"
+
+            if not self.auto_approve:
+                original_goal = item.get("prompt", "")
+
+                refinement_round = 0
+                while refinement_round < self._MAX_PLAN_REFINEMENTS:
+                    self._emit_state("attention")
+                    resp = self.ui.on_plan_review(output)
+                    self._emit_state("running")
+
+                    if resp.lower() in ("n", "no", "reject"):
+                        output += (
+                            "\n\n---\nUser REJECTED this plan. Do not "
+                            "proceed with implementation. Ask the user "
+                            "what they want instead."
+                        )
+                        break
+                    elif resp:
+                        # Re-run plan agent with user feedback.
+                        # Strip any internal warning prefix so the
+                        # agent sees the raw plan content.
+                        raw = output
+                        _warn = "[Warning: plan may be incomplete or poorly structured]\n\n"
+                        if raw.startswith(_warn):
+                            raw = raw[len(_warn) :]
+                        try:
+                            output = self._refine_plan(
+                                raw,
+                                original_goal,
+                                resp,
+                            )
+                            refinement_round += 1
+                        except (KeyboardInterrupt, GenerationCancelled):
+                            output += "\n\n---\n(plan refinement interrupted)"
+                            break
+                        except Exception as e:
+                            self.ui.on_info(f"[plan refinement error] {e}")
+                            output += f"\n\n---\nUser feedback: {resp}"
+                            break
+                        # Loop continues → show revised plan to user
+                    else:
+                        break  # empty response = approve
+
+                # Write final version to disk (overwrites initial write)
+                try:
+                    with open(plan_path, "w") as f:
+                        f.write(output)
+                except OSError:
+                    pass
+
+            # Always include file path in the tool result so the
+            # outer model knows where the plan lives on disk.
+            output += f"\n\n---\nPlan saved to `{plan_path}`"
+            results[i] = (cid, output)
 
         return results, user_feedback
 
@@ -2811,6 +2853,61 @@ class ChatSession:
         "and functions in every step."
     )
 
+    _MIN_PLAN_LENGTH = 100
+    _PLAN_REQUIRED_SECTIONS = ("## goal", "## current state", "## plan", "## risks")
+    _MIN_PLAN_SECTIONS = 2
+    _MAX_PLAN_REFINEMENTS = 5
+
+    @staticmethod
+    def _validate_plan(content: str, goal: str) -> tuple[bool, list[str]]:
+        """Check if plan output meets minimum quality bar.
+
+        Returns ``(valid, issues)`` where *issues* is a list of
+        human-readable problem descriptions (empty when valid).
+        """
+        issues: list[str] = []
+        stripped = content.strip()
+        stripped_lower = stripped.lower()
+
+        # 1. Minimum length
+        if len(stripped) < ChatSession._MIN_PLAN_LENGTH:
+            issues.append(
+                f"too short ({len(stripped)} chars, minimum {ChatSession._MIN_PLAN_LENGTH})"
+            )
+
+        # 2. Section structure
+        found_sections = sum(
+            1 for section in ChatSession._PLAN_REQUIRED_SECTIONS if section in stripped_lower
+        )
+        if found_sections < ChatSession._MIN_PLAN_SECTIONS:
+            issues.append(
+                f"missing plan sections (found {found_sections}/"
+                f"{len(ChatSession._PLAN_REQUIRED_SECTIONS)}, "
+                f"need at least {ChatSession._MIN_PLAN_SECTIONS})"
+            )
+
+        # 3. Echo detection: plan is basically just the goal repeated
+        goal_stripped = goal.strip().lower()
+        if (
+            goal_stripped
+            and len(stripped) < len(goal_stripped) * 2
+            and goal_stripped in stripped_lower
+        ):
+            issues.append("plan appears to echo the goal without elaboration")
+
+        # 4. Refusal detection
+        refusal_starts = (
+            "i cannot",
+            "i'm sorry",
+            "i am sorry",
+            "error:",
+            "i can't",
+        )
+        if any(stripped_lower.startswith(r) for r in refusal_starts):
+            issues.append("plan appears to be a refusal or error")
+
+        return (len(issues) == 0, issues)
+
     def _exec_plan(self, item: dict[str, Any]) -> tuple[str, str]:
         """Run a planning agent and write the result to .plan-<ws_id>.md."""
         call_id, prompt = item["call_id"], item["prompt"]
@@ -2853,6 +2950,40 @@ class ChatSession:
             self.ui.on_info(f"[plan error] {e}")
             return call_id, f"Plan error: {e}"
 
+        # Validate plan quality — retry once with coaching on failure
+        valid, issues = self._validate_plan(content, prompt)
+        if not valid:
+            self.ui.on_info(f"[plan] quality issues: {', '.join(issues)}")
+            preview = content[:200] + ("..." if len(content) > 200 else "")
+            coaching = (
+                "Your previous response did not follow the required plan "
+                "format. A valid plan MUST include these markdown sections:\n"
+                "## Goal (1-2 sentences)\n"
+                "## Current State (files/line numbers found)\n"
+                "## Plan (numbered steps with file names and functions)\n"
+                "## Risks (edge cases and unknowns)\n\n"
+                f'Your previous response was: "{preview}"\n\n'
+                "Please try again. Explore the codebase first, then write "
+                "the plan."
+            )
+            agent_messages.append({"role": "user", "content": coaching})
+            try:
+                content = self._run_agent(
+                    agent_messages,
+                    label="plan",
+                    reasoning_effort="high",
+                )
+            except (KeyboardInterrupt, GenerationCancelled):
+                return call_id, "(plan interrupted by user)"
+            except Exception as e:
+                self.ui.on_info(f"[plan retry error] {e}")
+                return call_id, f"Plan error: {e}"
+
+            valid2, issues2 = self._validate_plan(content, prompt)
+            if not valid2:
+                self.ui.on_info(f"[plan] still has issues after retry: {', '.join(issues2)}")
+                content = "[Warning: plan may be incomplete or poorly structured]\n\n" + content
+
         # Write to file separately — always return content even if write fails
         try:
             with open(plan_path, "w") as f:
@@ -2862,6 +2993,60 @@ class ChatSession:
             self.ui.on_info(f"[plan] could not write {plan_path}: {e}")
 
         return call_id, content
+
+    def _refine_plan(
+        self,
+        original_content: str,
+        original_goal: str,
+        feedback: str,
+    ) -> str:
+        """Re-run the plan agent incorporating user feedback."""
+        tc_id = f"plan_refine_{uuid.uuid4().hex[:8]}"
+        agent_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self._PLAN_IDENTITY},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": "create_plan",
+                            "arguments": json.dumps({"goal": original_goal}),
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": original_content,
+            },
+            {
+                "role": "user",
+                "content": (
+                    "The user reviewed this plan and provided feedback:\n\n"
+                    f"{feedback}\n\n"
+                    "Please revise the plan accordingly. Keep the same "
+                    "format (## Goal, ## Current State, ## Plan, ## Risks) "
+                    "and address the feedback."
+                ),
+            },
+        ]
+
+        self.ui.on_info("[plan] revising based on feedback...")
+        content = self._run_agent(
+            agent_messages,
+            label="plan",
+            reasoning_effort="high",
+        )
+
+        valid, issues = self._validate_plan(content, original_goal)
+        if not valid:
+            self.ui.on_info(f"[plan] revised plan has issues: {', '.join(issues)}")
+
+        return content
 
     def _exec_remember(self, item: dict[str, Any]) -> tuple[str, str]:
         """Save a persistent memory."""

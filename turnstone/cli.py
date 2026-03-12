@@ -204,7 +204,8 @@ class TerminalUI(SessionUI):
         try:
             prompt_text = (
                 f"    \001{BOLD}\002Plan ready.\001{RESET}\002 "
-                f"\001{DIM}\002[enter to approve, or give feedback]\001{RESET}\002 "
+                f"\001{DIM}\002[enter to approve, feedback to amend, "
+                f"ctrl-c to reject]\001{RESET}\002 "
             )
             resp = input(prompt_text).strip()
         except EOFError:
