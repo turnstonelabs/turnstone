@@ -103,7 +103,9 @@ class TestFullLifecycleResourcesPrompts:
     @pytest.fixture()
     def db(self, tmp_path) -> SQLiteBackend:
         """Create a fresh SQLite backend for each test."""
-        return SQLiteBackend(str(tmp_path / "test.db"))
+        backend = SQLiteBackend(str(tmp_path / "test.db"))
+        yield backend
+        backend.close()
 
     def test_rebuild_resources_produces_merged_state(self, mgr: MCPClientManager) -> None:
         """_rebuild_resources merges per-server resources into a unified list."""
@@ -174,6 +176,7 @@ class TestFullLifecycleResourcesPrompts:
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5)
+            loop.close()
 
     def test_read_resource_sync_unknown_uri_raises(self, mgr: MCPClientManager) -> None:
         """read_resource_sync raises ValueError for an unknown URI."""
@@ -207,6 +210,7 @@ class TestFullLifecycleResourcesPrompts:
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=5)
+            loop.close()
 
     def test_get_prompt_sync_unknown_name_raises(self, mgr: MCPClientManager) -> None:
         """get_prompt_sync raises ValueError for an unknown prompt name."""
