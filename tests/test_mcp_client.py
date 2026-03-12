@@ -1018,6 +1018,122 @@ class TestMCPResources:
         assert mgr._resource_map["file:///a"] == ("fs", "file:///a")
         assert mgr._resource_map["db://table"] == ("db", "db://table")
 
+    def test_template_prefix_matching(self):
+        """Expanded URI matches template by prefix."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "db": [
+                {
+                    "uri": "db://tables/{table}/rows/{id}",
+                    "name": "row",
+                    "description": "A row",
+                    "mimeType": "application/json",
+                    "server": "db",
+                    "template": True,
+                },
+            ],
+        }
+        mgr._rebuild_resources()
+        # Template should not be in resource_map
+        assert "db://tables/{table}/rows/{id}" not in mgr._resource_map
+        # But prefix matching should find it
+        result = mgr._match_template("db://tables/users/rows/1")
+        assert result is not None
+        server, template_uri = result
+        assert server == "db"
+        assert template_uri == "db://tables/{table}/rows/{id}"
+
+    def test_template_longest_prefix_wins(self):
+        """When two templates have overlapping prefixes, the longer one wins."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "db": [
+                {
+                    "uri": "db://tables/{table}",
+                    "name": "table",
+                    "description": "",
+                    "mimeType": "",
+                    "server": "db",
+                    "template": True,
+                },
+                {
+                    "uri": "db://tables/{table}/rows/{id}",
+                    "name": "row",
+                    "description": "",
+                    "mimeType": "",
+                    "server": "db",
+                    "template": True,
+                },
+            ],
+        }
+        mgr._rebuild_resources()
+        # "db://tables/users/rows/42" should match the longer prefix
+        result = mgr._match_template("db://tables/users/rows/42")
+        assert result is not None
+        _, template_uri = result
+        # The longer prefix "db://tables/{table}/rows/" wins over "db://tables/"
+        assert template_uri == "db://tables/{table}/rows/{id}"
+
+    def test_template_no_match_raises(self):
+        """Completely unrelated URI still raises ValueError."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "db": [
+                {
+                    "uri": "db://tables/{table}",
+                    "name": "table",
+                    "description": "",
+                    "mimeType": "",
+                    "server": "db",
+                    "template": True,
+                },
+            ],
+        }
+        mgr._rebuild_resources()
+        assert mgr._match_template("file:///something") is None
+        with pytest.raises(ValueError, match="Unknown MCP resource"):
+            mgr.read_resource_sync("file:///something")
+
+    def test_read_resource_sync_with_template_uri(self):
+        """End-to-end: template discovered, expanded URI dispatched to correct server."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "db": [
+                {
+                    "uri": "db://tables/{table}/rows/{id}",
+                    "name": "row",
+                    "description": "A row",
+                    "mimeType": "application/json",
+                    "server": "db",
+                    "template": True,
+                },
+            ],
+        }
+        mgr._rebuild_resources()
+
+        mock_session = MagicMock()
+        mgr._sessions["db"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        text_content = MagicMock(spec=["text"])
+        text_content.text = '{"name": "Alice"}'
+        mock_result = MagicMock()
+        mock_result.contents = [text_content]
+        mock_session.read_resource = AsyncMock(return_value=mock_result)
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            output = mgr.read_resource_sync("db://tables/users/rows/1", timeout=5)
+            assert output == '{"name": "Alice"}'
+            mock_session.read_resource.assert_awaited_once_with("db://tables/users/rows/1")
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
 
 # ---------------------------------------------------------------------------
 # MCP Prompts

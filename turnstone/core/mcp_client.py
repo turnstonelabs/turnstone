@@ -132,6 +132,9 @@ class MCPClientManager:
         self._prompt_listeners: list[Callable[[], None]] = []
         self._prompt_listeners_lock = threading.Lock()
 
+        # Template prefix → (server_name, full_template_uri) for URI expansion
+        self._template_prefixes: dict[str, tuple[str, str]] = {}
+
         # Governance storage (optional — set via set_storage())
         self._storage: Any = None
         self._sync_lock = threading.Lock()
@@ -497,8 +500,27 @@ class MCPClientManager:
                         new_map[uri][0],
                     )
                 new_map[uri] = (srv_name, uri)
+        # Build template prefix map for URI expansion fallback
+        new_prefixes: dict[str, tuple[str, str]] = {}
+        for srv_name, srv_resources in self._per_server_resources.items():
+            for res in srv_resources:
+                if res.get("template"):
+                    tmpl_uri = res["uri"]
+                    brace = tmpl_uri.find("{")
+                    prefix = tmpl_uri[:brace] if brace >= 0 else tmpl_uri
+                    if prefix:
+                        if prefix in new_prefixes:
+                            log.warning(
+                                "Template prefix collision: '%s' from '%s' overrides '%s'",
+                                prefix,
+                                srv_name,
+                                new_prefixes[prefix][0],
+                            )
+                        new_prefixes[prefix] = (srv_name, tmpl_uri)
+
         self._resources = new_resources
         self._resource_map = new_map
+        self._template_prefixes = new_prefixes
         self._notify_resource_listeners()
 
     async def _refresh_server_resources(self, name: str) -> None:
@@ -787,6 +809,7 @@ class MCPClientManager:
         self._supports_list_changed.clear()
         self._resources = []
         self._resource_map = {}
+        self._template_prefixes = {}
         self._per_server_resources.clear()
         self._supports_resources.clear()
         self._supports_resource_list_changed.clear()
@@ -891,6 +914,21 @@ class MCPClientManager:
 
     # -- resource read -------------------------------------------------------
 
+    def _match_template(self, uri: str) -> tuple[str, str] | None:
+        """Find the longest matching template prefix for an expanded URI.
+
+        Returns ``(server_name, template_uri)`` or *None* if no match.
+        Longest prefix wins to handle nested templates (e.g.,
+        ``db://tables/`` vs ``db://tables/{t}/rows/``).
+        """
+        best: tuple[str, str] | None = None
+        best_len = 0
+        for prefix, mapping in self._template_prefixes.items():
+            if uri.startswith(prefix) and len(prefix) > best_len:
+                best = mapping
+                best_len = len(prefix)
+        return best
+
     def read_resource_sync(self, uri: str, timeout: int = 120) -> str:
         """Read a resource by URI synchronously (blocks the calling thread).
 
@@ -898,6 +936,9 @@ class MCPClientManager:
         for ``BlobResourceContents``.
         """
         mapping = self._resource_map.get(uri)
+        if mapping is None:
+            # Fall back to template prefix matching for expanded URIs
+            mapping = self._match_template(uri)
         if mapping is None:
             raise ValueError(f"Unknown MCP resource: {uri}")
         server_name, _ = mapping

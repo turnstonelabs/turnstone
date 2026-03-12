@@ -183,6 +183,41 @@ class TestFullLifecycleResourcesPrompts:
         with pytest.raises(ValueError, match="Unknown MCP resource"):
             mgr.read_resource_sync("file:///nonexistent")
 
+    def test_read_resource_via_template(self, mgr: MCPClientManager) -> None:
+        """Expanded template URI dispatched to correct server via real asyncio loop."""
+        loop = asyncio.new_event_loop()
+        import threading
+
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        mgr._loop = loop
+
+        try:
+            session = _make_mock_session()
+            mgr._sessions["alpha"] = session
+            # Register a template resource (no concrete resources)
+            mgr._per_server_resources["alpha"] = [
+                {
+                    "uri": "db://tables/{table}/rows/{id}",
+                    "name": "row",
+                    "description": "Fetch a row",
+                    "mimeType": "application/json",
+                    "server": "alpha",
+                    "template": True,
+                },
+            ]
+            mgr._rebuild_resources()
+
+            # Template should not be in _resource_map
+            assert "db://tables/{table}/rows/{id}" not in mgr._resource_map
+            # But expanded URI should resolve via prefix matching
+            result = mgr.read_resource_sync("db://tables/users/rows/42", timeout=5)
+            assert result == "resource content"
+            session.read_resource.assert_awaited_once_with("db://tables/users/rows/42")
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
+
     def test_get_prompt_sync_dispatches_correctly(self, mgr: MCPClientManager) -> None:
         """get_prompt_sync dispatches to the correct session via a real asyncio loop."""
         loop = asyncio.new_event_loop()
@@ -292,6 +327,14 @@ class TestFullLifecycleResourcesPrompts:
         mgr._rebuild_tools()
         mgr._per_server_resources["alpha"] = [
             _make_resource("file:///a.txt", "a", "alpha"),
+            {
+                "uri": "db://tables/{table}",
+                "name": "table",
+                "description": "",
+                "mimeType": "",
+                "server": "alpha",
+                "template": True,
+            },
         ]
         mgr._rebuild_resources()
         mgr._per_server_prompts["alpha"] = [
@@ -305,7 +348,8 @@ class TestFullLifecycleResourcesPrompts:
         # Verify populated
         assert len(mgr._sessions) == 1
         assert len(mgr._tools) == 1
-        assert len(mgr._resources) == 1
+        assert len(mgr._resources) == 2  # 1 concrete + 1 template
+        assert len(mgr._template_prefixes) == 1
         assert len(mgr._prompts) == 1
 
         mgr.shutdown()
@@ -315,6 +359,7 @@ class TestFullLifecycleResourcesPrompts:
         assert len(mgr._tool_map) == 0
         assert len(mgr._resources) == 0
         assert len(mgr._resource_map) == 0
+        assert len(mgr._template_prefixes) == 0
         assert len(mgr._prompts) == 0
         assert len(mgr._prompt_map) == 0
         assert len(mgr._listeners) == 0
