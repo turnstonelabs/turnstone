@@ -619,10 +619,11 @@ class ChatSession:
                     "Use it when you need a capability not in your current tool set."
                 )
         # MCP resource catalog (lets the model know what's available for read_resource)
-        # Only concrete resources — templates are not directly readable.
         if self._mcp_client:
-            concrete = [r for r in self._mcp_client.get_resources() if not r.get("template")]
-            if concrete:
+            all_resources = self._mcp_client.get_resources()
+            concrete = [r for r in all_resources if not r.get("template")]
+            templates = [r for r in all_resources if r.get("template")]
+            if concrete or templates:
                 lines = ["\n<mcp-resources>"]
                 for r in concrete[:50]:
                     safe_uri = _html_escape(r["uri"])
@@ -630,6 +631,15 @@ class ChatSession:
                     if desc:
                         desc = f"  {_html_escape(desc[:100])}"
                     lines.append(f"  {safe_uri}{desc}")
+                if templates:
+                    lines.append("")
+                    lines.append("Resource templates (construct a URI and use read_resource):")
+                    for t in templates[:20]:
+                        safe_uri = _html_escape(t["uri"])
+                        desc = t.get("description", "")
+                        if desc:
+                            desc = f"  {_html_escape(desc[:100])}"
+                        lines.append(f"  {safe_uri}{desc}")
                 lines.append("</mcp-resources>")
                 lines.append("Use read_resource(uri='...') to access the resources listed above.")
                 dev_parts.append("\n".join(lines))
@@ -4303,8 +4313,9 @@ class ChatSession:
                         mcp_lines.append("")
                     mcp_lines.append(f"MCP resources ({len(resources)}):")
                     for r in resources:
+                        prefix = "[template] " if r.get("template") else ""
                         desc = r.get("description", "")[:80]
-                        mcp_lines.append(f"  {r['uri']}  {dim(desc)}")
+                        mcp_lines.append(f"  {prefix}{r['uri']}  {dim(desc)}")
                 if prompts:
                     if mcp_lines:
                         mcp_lines.append("")
