@@ -665,6 +665,31 @@ class TestWebUI:
         assert ui._approval_result == (True, "looks good")
         t.join()
 
+    def test_resolve_approval_emits_event(self):
+        """resolve_approval should enqueue an approval_resolved SSE event."""
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test-emit")
+        listener = ui._register_listener()
+
+        # Drain any init events
+        while not listener.empty():
+            listener.get_nowait()
+
+        ui.resolve_approval(False, "Approval timed out")
+
+        # Collect events from the listener
+        events = []
+        while not listener.empty():
+            events.append(listener.get_nowait())
+
+        ui._unregister_listener(listener)
+
+        resolved = [e for e in events if e.get("type") == "approval_resolved"]
+        assert len(resolved) == 1
+        assert resolved[0]["approved"] is False
+        assert resolved[0]["feedback"] == "Approval timed out"
+
     def test_resolve_plan(self):
         from turnstone.server import WebUI
 

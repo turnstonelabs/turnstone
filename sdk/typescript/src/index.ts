@@ -37,6 +37,7 @@ export type {
   StreamEndEvent,
   ToolInfoEvent,
   ApproveRequestEvent,
+  ApprovalResolvedEvent,
   ToolResultEvent,
   ToolOutputChunkEvent,
   StatusEvent,
@@ -67,6 +68,7 @@ export {
   isToolResultEvent,
   isWsStateEvent,
   isApproveRequestEvent,
+  isApprovalResolvedEvent,
   isPlanReviewEvent,
   isCancelledEvent,
 } from "./events.js";

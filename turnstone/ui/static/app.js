@@ -1071,6 +1071,10 @@ function handleEvent(evt) {
       showInlineToolBlock(evt.items, false);
       break;
 
+    case "approval_resolved":
+      resolveInlineApproval(evt.approved, false, evt.feedback, true);
+      break;
+
     case "tool_output_chunk":
       appendToolOutputChunk(evt.call_id || "", evt.chunk);
       break;
@@ -1378,7 +1382,7 @@ function showInlineToolBlock(items, autoApproved) {
   scrollToBottom();
 }
 
-function resolveInlineApproval(approved, always, feedback) {
+function resolveInlineApproval(approved, always, feedback, skipPost) {
   if (!approvalBlockEl) return;
   pendingApproval = false;
 
@@ -1406,19 +1410,21 @@ function resolveInlineApproval(approved, always, feedback) {
   sendBtn.disabled = busy;
   inputEl.focus();
 
-  // POST to server with ws_id
-  authFetch("/v1/api/approve", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      approved: approved,
-      feedback: feedback || null,
-      always: !!always,
-      ws_id: currentWsId,
-    }),
-  }).catch(function (err) {
-    addErrorMessage("Connection error: " + err.message);
-  });
+  // POST to server with ws_id (skip when server already resolved, e.g. timeout)
+  if (!skipPost) {
+    authFetch("/v1/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        approved: approved,
+        feedback: feedback || null,
+        always: !!always,
+        ws_id: currentWsId,
+      }),
+    }).catch(function (err) {
+      addErrorMessage("Connection error: " + err.message);
+    });
+  }
 
   scrollToBottom();
 }

@@ -95,6 +95,13 @@ class ApproveRequestEvent(ServerEvent):
 
 
 @dataclass
+class ApprovalResolvedEvent(ServerEvent):
+    type: str = "approval_resolved"
+    approved: bool = False
+    feedback: str = ""
+
+
+@dataclass
 class ToolResultEvent(ServerEvent):
     type: str = "tool_result"
     call_id: str = ""
@@ -285,6 +292,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         StreamEndEvent,
         ToolInfoEvent,
         ApproveRequestEvent,
+        ApprovalResolvedEvent,
         ToolResultEvent,
         ToolOutputChunkEvent,
         StatusEvent,
