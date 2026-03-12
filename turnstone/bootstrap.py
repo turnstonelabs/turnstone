@@ -60,9 +60,10 @@ Turnstone is a multi-node AI orchestration platform. A deployment consists of:
 - **Channel** (optional): Discord/Slack gateway
 
 ## Deployment Profiles (compose.yaml)
-- **Default**: redis + 1 server + 1 bridge + console (SQLite, good for dev/testing)
-- **Production** (`--profile production`): + PostgreSQL + channel gateway (single node, production-ready)
-- **Cluster** (`--profile cluster`): 10-node server/bridge fleet + PostgreSQL + channel (multi-node)
+- **Default** (no flag): redis + console only (infrastructure, good for running external servers)
+- **Production** (`--profile production`): redis + 1 server + 1 bridge + console + PostgreSQL + channel (single node)
+- **Cluster** (`--profile cluster`): 10-node server/bridge fleet + PostgreSQL + channel + console (multi-node)
+- **ddgCluster** (`--profile ddgCluster`): Cluster + DuckDuckGo Search MCP sidecar (web search via MCP, no API key needed)
 
 ## Environment Variables (.env)
 The compose.yaml reads these from a `.env` file:
@@ -100,6 +101,15 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `TURNSTONE_DISCORD_TOKEN` — Discord bot token
 - `TURNSTONE_DISCORD_GUILD` — Restrict to single guild ID
 
+### MCP Integration (optional)
+- `MCP_CONFIG` — Path to MCP server config inside the container \
+(e.g., `/etc/turnstone/mcp-ddg.json`). When set, servers connect to configured MCP servers on startup.
+- The `ddgCluster` profile runs a DuckDuckGo Search MCP sidecar (Python) that provides \
+`duckduckgo_web_search` and `duckduckgo_fetch_content` tools to every node. No API key required. \
+The sidecar uses MCP streamable-http transport with DNS rebinding protection disabled \
+(required for Docker internal networking) and binds to 0.0.0.0:3000 via FastMCP settings. \
+Safe search is disabled by default.
+
 ### Cluster
 - `HEARTBEAT_TTL` — Bridge heartbeat TTL in seconds (default: 60)
 - `APPROVAL_TIMEOUT` — Tool approval timeout in seconds (default: 3600)
@@ -130,8 +140,8 @@ Categories like "engineering", "analysis", etc.
 Walk the user through setting up their deployment step by step:
 
 1. **First**: Call `check_docker` and `read_file` on `.env` to detect existing state.
-2. **Deployment mode**: Ask if they want single-node (production) or multi-node (cluster). \
-Explain trade-offs.
+2. **Deployment mode**: Ask if they want single-node (`--profile production`) or multi-node \
+(`--profile cluster`). Explain trade-offs.
 3. **LLM provider for the deployment**: Which LLM backend their Turnstone will use \
 (may differ from this wizard's model). Ask for base URL, API key, model name.
 4. **Database**: SQLite (dev/simple) vs PostgreSQL (production/cluster). \
@@ -140,7 +150,9 @@ PostgreSQL is required for cluster mode.
 Use `generate_secret` for JWT secret, Redis password, auth token, and Postgres password. \
 Ask for initial admin username and password.
 6. **Ports**: Check defaults with `check_port`, suggest alternatives if conflicts.
-7. **Optional features**: Discord integration, web search (Tavily key).
+7. **Optional features**: Discord integration, web search (Tavily key), \
+DuckDuckGo Search MCP (for cluster — uses `ddgCluster` profile with \
+`MCP_CONFIG=/etc/turnstone/mcp-ddg.json`, no API key needed).
 8. **Generate .env**: Call `write_file` with the complete `.env` content.
 9. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
 user and any roles/policies/templates the user wants.
@@ -154,6 +166,12 @@ exact commands to run next (e.g., `docker compose --profile production up -d` th
 - When writing files, use `write_file` — the user will see a preview and confirm.
 - If an existing .env is detected, summarize what's configured and ask what to change.
 - For cluster mode, the compose.yaml has a fixed 10-node fleet — no override needed.
+- For cluster + DuckDuckGo Search, use `--profile ddgCluster` instead of `--profile cluster`. \
+Set `MCP_CONFIG=/etc/turnstone/mcp-ddg.json` in `.env`. No API key needed. \
+The DuckDuckGo MCP sidecar starts automatically and all cluster nodes connect to it. \
+Note: the MCP SDK's DNS rebinding protection must be disabled for Docker-internal networking \
+(the compose.yaml handles this), and the server must bind to 0.0.0.0 (not 127.0.0.1) to be \
+reachable from other containers.
 - The `DATABASE_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql://turnstone:<password>@postgres:5432/turnstone`).
 - For local LLM backends (vLLM, llama.cpp, Ollama, etc.), set `OPENAI_API_KEY=dummy` in the \
