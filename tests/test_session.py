@@ -522,15 +522,14 @@ class TestPlanRefinement:
             refinement_round = 0
             while True:
                 resp = session.ui.on_plan_review(output)
-                if resp.lower() in ("n", "no", "reject"):
+                if (
+                    resp.lower() in ("n", "no", "reject")
+                    or not resp
+                    or refinement_round >= session._MAX_PLAN_REFINEMENTS
+                ):
                     break
-                elif not resp:
-                    break
-                elif refinement_round >= session._MAX_PLAN_REFINEMENTS:
-                    break
-                else:
-                    output = session._refine_plan(output, original_goal, resp)
-                    refinement_round += 1
+                output = session._refine_plan(output, original_goal, resp)
+                refinement_round += 1
 
         assert refine_count == session._MAX_PLAN_REFINEMENTS
         # User gets one extra review call after max rounds (the final prompt)
