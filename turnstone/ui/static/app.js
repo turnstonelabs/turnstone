@@ -1625,7 +1625,12 @@ function resolvePlan(defaultFeedback) {
     _addInlinePlan(_planContent, action, feedback);
   } catch (err) {
     console.error("Failed to render inline plan:", err);
+    addInfoMessage("Plan " + action);
   }
+
+  // Show spinner while the model processes the plan result
+  setBusy(true);
+  addThinkingIndicator();
 }
 
 function _addInlinePlan(content, action, feedback) {
@@ -1647,7 +1652,11 @@ function _addInlinePlan(content, action, feedback) {
 
   var body = document.createElement("div");
   body.className = "plan-inline-body";
-  body.innerHTML = renderMarkdown(content);
+  try {
+    body.innerHTML = renderMarkdown(content);
+  } catch (e) {
+    body.textContent = content;
+  }
   if (content.split("\n").length > 12) {
     makeCollapsible(body);
     body.setAttribute(
