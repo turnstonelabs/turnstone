@@ -140,6 +140,7 @@ scheduled_tasks = sa.Table(
     sa.Column("initial_message", sa.Text, nullable=False),
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("auto_approve_tools", sa.Text, nullable=False, server_default=""),
+    sa.Column("template", sa.Text, nullable=False, server_default=""),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("last_run", sa.Text),

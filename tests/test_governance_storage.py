@@ -414,6 +414,19 @@ class TestPromptTemplateCRUD:
     def test_get_prompt_template_by_name_nonexistent(self, db):
         assert db.get_prompt_template_by_name("nope") is None
 
+    def test_list_default_templates(self, db):
+        db.create_prompt_template("t1", "alpha", "general", "A", is_default=True)
+        db.create_prompt_template("t2", "beta", "general", "B", is_default=False)
+        db.create_prompt_template("t3", "gamma", "general", "C", is_default=True)
+        result = db.list_default_templates()
+        assert len(result) == 2
+        assert result[0]["name"] == "alpha"
+        assert result[1]["name"] == "gamma"
+
+    def test_list_default_templates_empty(self, db):
+        db.create_prompt_template("t1", "alpha", "general", "A", is_default=False)
+        assert db.list_default_templates() == []
+
     def test_list_prompt_templates_by_origin(self, db):
         db.create_prompt_template("t1", "manual_one", "general", "A", origin="manual")
         db.create_prompt_template("t2", "mcp_one", "mcp", "B", origin="mcp", mcp_server="srv1")

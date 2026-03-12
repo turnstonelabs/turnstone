@@ -35,6 +35,13 @@ package "Runtime Enforcement" {
   [record_audit()] as audit
 }
 
+package "Template Runtime" {
+  [_load_templates()] as tload
+  [_render_template()\n{{model}}, {{ws_id}}, {{node_id}}] as trender
+  [_init_system_messages()] as tsys
+  [set_template() / /template] as tset
+}
+
 package "Console UI" {
   [Admin Panel\n10 tabs] as ui
   [governance.js] as govjs
@@ -63,6 +70,11 @@ govjs --> tp_db : /v1/api/admin/policies
 govjs --> pt_db : /v1/api/admin/templates
 govjs --> ue_db : /v1/api/admin/usage
 govjs --> ae_db : /v1/api/admin/audit
+
+tload --> pt_db : list_default_templates()\nor get_by_name()
+tload --> trender : template content
+trender --> tsys : rendered content
+tset --> tload : name or None
 
 auth -[hidden]-> mw
 mw -[hidden]-> approve

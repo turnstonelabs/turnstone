@@ -661,6 +661,7 @@ function showCreateScheduleModal() {
   document.getElementById("cs-target").value = "auto";
   document.getElementById("cs-node").value = "";
   document.getElementById("cs-model").value = "";
+  document.getElementById("cs-template").value = "";
   document.getElementById("cs-message").value = "";
   document.getElementById("cs-autoapprove").checked = false;
   toggleScheduleTypeFields();
@@ -693,6 +694,7 @@ function submitCreateSchedule() {
   var nodeId = (document.getElementById("cs-node").value || "").trim();
   var model = (document.getElementById("cs-model").value || "").trim();
   var message = (document.getElementById("cs-message").value || "").trim();
+  var template = (document.getElementById("cs-template").value || "").trim();
   var autoApprove = document.getElementById("cs-autoapprove").checked;
   var errEl = document.getElementById("create-schedule-error");
 
@@ -729,6 +731,7 @@ function submitCreateSchedule() {
       model: model,
       initial_message: message,
       auto_approve: autoApprove,
+      template: template,
     }),
   })
     .then(function (r) {
@@ -795,6 +798,7 @@ function showEditScheduleModal(taskId) {
         ? s.target_mode
         : "";
       document.getElementById("es-model").value = s.model || "";
+      document.getElementById("es-template").value = s.template || "";
       document.getElementById("es-message").value = s.initial_message || "";
       document.getElementById("es-autoapprove").checked = !!s.auto_approve;
       document.getElementById("es-enabled").checked = !!s.enabled;
@@ -867,6 +871,7 @@ function submitEditSchedule() {
       at_time: atTime,
       target_mode: targetMode,
       model: (document.getElementById("es-model").value || "").trim(),
+      template: (document.getElementById("es-template").value || "").trim(),
       initial_message: (
         document.getElementById("es-message").value || ""
       ).trim(),

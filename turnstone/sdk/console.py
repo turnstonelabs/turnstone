@@ -126,6 +126,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         name: str = "",
         model: str = "",
         initial_message: str = "",
+        template: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
         if node_id:
@@ -136,6 +137,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["model"] = model
         if initial_message:
             body["initial_message"] = initial_message
+        if template:
+            body["template"] = template
         return await self._request(
             "POST",
             "/v1/api/cluster/workstreams/new",
@@ -574,10 +577,15 @@ class TurnstoneConsole:
         name: str = "",
         model: str = "",
         initial_message: str = "",
+        template: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
             self._async.create_workstream(
-                node_id=node_id, name=name, model=model, initial_message=initial_message
+                node_id=node_id,
+                name=name,
+                model=model,
+                initial_message=initial_message,
+                template=template,
             )
         )
 

@@ -209,6 +209,20 @@ def test_create_workstream_target_node():
     assert restored.name == "debug-ws"
 
 
+def test_create_workstream_template_field():
+    msg = CreateWorkstreamMessage(name="ws", template="code-review")
+    assert msg.template == "code-review"
+    raw = msg.to_json()
+    restored = InboundMessage.from_json(raw)
+    assert isinstance(restored, CreateWorkstreamMessage)
+    assert restored.template == "code-review"
+
+
+def test_create_workstream_template_default_empty():
+    msg = CreateWorkstreamMessage(name="ws")
+    assert msg.template == ""
+
+
 def test_list_nodes_round_trip():
     msg = ListNodesMessage()
     raw = msg.to_json()

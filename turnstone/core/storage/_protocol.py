@@ -247,6 +247,7 @@ class StorageBackend(Protocol):
         auto_approve_tools: list[str],
         created_by: str,
         next_run: str,
+        template: str = "",
     ) -> None:
         """Create a scheduled task. No-op if task_id already exists."""
         ...
@@ -488,6 +489,10 @@ class StorageBackend(Protocol):
 
     def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
         """Return all prompt templates ordered by name."""
+        ...
+
+    def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+        """Return all templates where is_default=True, ordered by name."""
         ...
 
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:

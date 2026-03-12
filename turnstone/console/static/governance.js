@@ -761,6 +761,28 @@ function _renderGovTemplates(items) {
   });
 }
 
+function _detectTemplateVars(content) {
+  var matches = content.match(/\{\{(\w+)\}\}/g) || [];
+  var seen = {};
+  var result = [];
+  for (var i = 0; i < matches.length; i++) {
+    var v = matches[i].replace(/[{}]/g, "");
+    if (!seen[v]) {
+      seen[v] = true;
+      result.push(v);
+    }
+  }
+  return result;
+}
+
+function _updateVarsDisplay(contentId, displayId) {
+  var content = document.getElementById(contentId).value || "";
+  var vars = _detectTemplateVars(content);
+  document.getElementById(displayId).textContent = vars.length
+    ? vars.join(", ")
+    : "(none)";
+}
+
 function showCreateTemplateModal() {
   _ctmTriggerEl = document.activeElement;
   var ov = document.getElementById("create-template-overlay");
@@ -768,7 +790,10 @@ function showCreateTemplateModal() {
   document.getElementById("ctm-name").value = "";
   document.getElementById("ctm-category").value = "general";
   document.getElementById("ctm-content").value = "";
-  document.getElementById("ctm-variables").value = "";
+  document.getElementById("ctm-variables").textContent = "(none)";
+  document.getElementById("ctm-content").oninput = function () {
+    _updateVarsDisplay("ctm-content", "ctm-variables");
+  };
   document.getElementById("ctm-default").checked = false;
   document.getElementById("create-template-error").style.display = "none";
   document.getElementById("ctm-name").focus();
@@ -796,12 +821,7 @@ function submitCreateTemplate() {
     e.style.display = "";
     return;
   }
-  var vars = document.getElementById("ctm-variables").value.trim();
-  var varList = vars
-    ? vars.split(",").map(function (s) {
-        return s.trim();
-      })
-    : [];
+  var varList = _detectTemplateVars(content);
   document.getElementById("ctm-submit").disabled = true;
   authFetch("/v1/api/admin/templates", {
     method: "POST",
@@ -852,13 +872,10 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("etm-name").value = tmpl.name;
   document.getElementById("etm-category").value = tmpl.category;
   document.getElementById("etm-content").value = tmpl.content;
-  var vars = "";
-  try {
-    vars = JSON.parse(tmpl.variables || "[]").join(", ");
-  } catch (e) {
-    vars = tmpl.variables;
-  }
-  document.getElementById("etm-variables").value = vars;
+  _updateVarsDisplay("etm-content", "etm-variables");
+  document.getElementById("etm-content").oninput = function () {
+    _updateVarsDisplay("etm-content", "etm-variables");
+  };
   document.getElementById("etm-default").checked = tmpl.is_default;
   document.getElementById("edit-template-error").style.display = "none";
   _etmTrapHandler = _installTrap("edit-template-overlay", "edit-template-box");
@@ -876,12 +893,7 @@ function hideEditTemplateModal() {
 function submitEditTemplate() {
   var id = document.getElementById("etm-id").value;
   var content = document.getElementById("etm-content").value;
-  var vars = document.getElementById("etm-variables").value.trim();
-  var varList = vars
-    ? vars.split(",").map(function (s) {
-        return s.trim();
-      })
-    : [];
+  var varList = _detectTemplateVars(content);
   document.getElementById("etm-submit").disabled = true;
   authFetch("/v1/api/admin/templates/" + id, {
     method: "PUT",

@@ -21,3 +21,4 @@ class ChannelConfig:
     model: str = ""
     auto_approve: bool = False
     auto_approve_tools: list[str] = field(default_factory=list)
+    template: str = ""

@@ -47,6 +47,9 @@ class CreateWorkstreamRequest(BaseModel):
         default="",
         description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
+    template: str = Field(
+        default="", description="Prompt template name (replaces default templates)"
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):

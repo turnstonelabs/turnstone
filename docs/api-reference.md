@@ -764,6 +764,7 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `model`          | string | default | Model alias from the registry (`[models.*]`)                   |
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
+| `template`       | string | ""      | Prompt template name (replaces default templates; 400 if not found)|
 
 **Response (success):**
 

@@ -136,6 +136,9 @@ class ConsoleCreateWsRequest(BaseModel):
     initial_message: str = Field(
         default="", description="Optional first message sent after creation"
     )
+    template: str = Field(
+        default="", description="Prompt template name (replaces default templates)"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):

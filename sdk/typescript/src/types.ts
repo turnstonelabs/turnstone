@@ -72,6 +72,7 @@ export interface CreateWorkstreamRequest {
   model?: string;
   auto_approve?: boolean;
   resume_ws?: string;
+  template?: string;
 }
 
 export interface CreateWorkstreamResponse {
@@ -273,6 +274,7 @@ export interface ConsoleCreateWsRequest {
   name?: string;
   model?: string;
   initial_message?: string;
+  template?: string;
 }
 
 export interface ConsoleCreateWsResponse {

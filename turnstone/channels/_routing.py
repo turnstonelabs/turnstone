@@ -49,11 +49,13 @@ class ChannelRouter:
         *,
         auto_approve: bool = False,
         auto_approve_tools: list[str] | None = None,
+        template: str = "",
     ) -> None:
         self._broker = broker
         self._storage = storage
         self._auto_approve = auto_approve
         self._auto_approve_tools: list[str] = auto_approve_tools or []
+        self._template = template
         self._pending: dict[str, asyncio.Event] = {}
         self._pending_results: dict[str, str] = {}
         self._global_task: asyncio.Task[None] | None = None
@@ -172,6 +174,7 @@ class ChannelRouter:
                 resume_ws=resume_ws,
                 auto_approve=self._auto_approve,
                 auto_approve_tools=list(self._auto_approve_tools),
+                template=self._template,
             )
             cid = msg.correlation_id
             waiter = asyncio.Event()

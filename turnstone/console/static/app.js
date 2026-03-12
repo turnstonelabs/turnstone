@@ -1240,6 +1240,27 @@ function showNewWsModal() {
     .catch(function () {
       /* ignore — auto is always available */
     });
+  // Populate template dropdown
+  var tplSelect = document.getElementById("new-ws-template");
+  tplSelect.innerHTML = '<option value="">Use defaults</option>';
+  authFetch("/v1/api/admin/templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        var label = t.name;
+        if (t.is_default) label += " (default)";
+        if (t.origin === "mcp") label += " [MCP]";
+        opt.textContent = label;
+        tplSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — defaults still work */
+    });
   document.getElementById("new-ws-name").value = "";
   document.getElementById("new-ws-model").value = "";
   document.getElementById("new-ws-task").value = "";
@@ -1256,7 +1277,7 @@ function showNewWsModal() {
   _newWsTrapHandler = function (e) {
     if (e.key === "Tab") {
       var box = document.getElementById("new-ws-box");
-      var focusable = box.querySelectorAll("select, input, button");
+      var focusable = box.querySelectorAll("select, input, textarea, button");
       var first = focusable[0];
       var last = focusable[focusable.length - 1];
       if (e.shiftKey) {
@@ -1294,6 +1315,7 @@ function submitNewWs() {
   var nodeId = document.getElementById("new-ws-node").value;
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
+  var template = document.getElementById("new-ws-template").value;
   var task = document.getElementById("new-ws-task").value.trim();
   var errEl = document.getElementById("new-ws-error");
   var btn = document.getElementById("new-ws-submit");
@@ -1307,6 +1329,7 @@ function submitNewWs() {
   if (name) body.name = name;
   if (model) body.model = model;
   if (task) body.initial_message = task;
+  if (template) body.template = template;
 
   authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",
@@ -1347,7 +1370,11 @@ document.addEventListener("keydown", function (e) {
     e.preventDefault();
     hideNewWsModal();
   }
-  if (e.key === "Enter" && e.target.tagName !== "SELECT") {
+  if (
+    e.key === "Enter" &&
+    e.target.tagName !== "SELECT" &&
+    e.target.tagName !== "TEXTAREA"
+  ) {
     e.preventDefault();
     var btn = document.getElementById("new-ws-submit");
     if (btn && !btn.disabled) submitNewWs();

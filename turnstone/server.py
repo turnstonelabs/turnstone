@@ -1013,6 +1013,13 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
+    # Validate template exists before creating the workstream
+    body_template = body.get("template", "")
+    if body_template:
+        from turnstone.core.memory import get_prompt_template_by_name
+
+        if not get_prompt_template_by_name(body_template):
+            return JSONResponse({"error": f"Template not found: {body_template}"}, status_code=400)
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -1022,6 +1029,9 @@ async def create_workstream(request: Request) -> JSONResponse:
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
             ws.ui.auto_approve = True
+        # Per-workstream template override (already validated above)
+        if body_template and ws.session:
+            ws.session.set_template(body_template)
         # Register watch runner for this workstream
         runner = getattr(request.app.state, "watch_runner", None)
         if runner and ws.session:
@@ -1377,6 +1387,11 @@ def main() -> None:
         help="Developer instructions injected as developer message",
     )
     parser.add_argument(
+        "--template",
+        default=None,
+        help="Prompt template name (replaces default templates)",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.5,
@@ -1720,6 +1735,7 @@ def main() -> None:
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
+            template=args.template,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

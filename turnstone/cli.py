@@ -726,6 +726,11 @@ def main() -> None:
         help="Developer instructions injected as developer message",
     )
     parser.add_argument(
+        "--template",
+        default=None,
+        help="Prompt template name (replaces default templates)",
+    )
+    parser.add_argument(
         "--temperature",
         type=float,
         default=0.5,
@@ -952,6 +957,7 @@ def main() -> None:
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
+            template=args.template,
         )
 
     # Create workstream manager and initial workstream

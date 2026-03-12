@@ -53,16 +53,31 @@ Admin-defined rules that control tool execution:
 
 ### Prompt Templates
 
-Reusable system message templates with variable substitution:
+Admin-curated system message templates injected at workstream startup:
 
-- **Variables**: `{{variable_name}}` placeholders in content
+- **Runtime behavior**: Templates are loaded once at session creation and injected
+  into the system message *before* user `instructions`. Templates set the baseline;
+  instructions customize per-workstream behavior.
+- **Default templates**: All `is_default=true` templates auto-apply to new
+  workstreams, concatenated in alphabetical order by name. Use name prefixes
+  (e.g. `01-safety`, `02-style`) to control ordering.
+- **Explicit selection**: `--template <name>` CLI flag, `template` field on
+  `POST /v1/api/workstreams/new`, console creation modal dropdown, scheduled task
+  config, and channel adapter config. An explicit template *replaces* defaults.
+- **Variables**: Three built-in placeholders resolved at load time:
+  `{{model}}` (active model name), `{{ws_id}}` (workstream ID),
+  `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
+- **Runtime switching**: `/template <name>` to switch, `/template clear` to revert
+  to defaults, `/template` to show current. Persisted across resume.
 - **Categories**: general, engineering, support, custom, mcp
-- **Default flag**: `is_default=true` templates intended for new workstreams
-- **Storage**: `prompt_templates` table with JSON `variables` array
-- **MCP sync**: MCP server prompts are auto-synced into prompt_templates with
+- **Content limit**: 32 KB per template (enforced on create/update)
+- **Storage**: `prompt_templates` table with JSON `variables` array. Migration 010
+  adds `template` column to `scheduled_tasks`.
+- **MCP sync**: MCP server prompts auto-sync into prompt_templates with
   `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual templates take
-  precedence on name collision. Admin UI shows origin badge and disables
-  edit/delete for MCP-sourced templates. See `docs/tools.md` MCP Prompts section
+  precedence on name collision. MCP-synced content updates reset `is_default` to
+  prevent compromised servers from injecting defaults. Admin UI shows origin badge
+  and disables edit/delete for MCP-sourced templates.
 
 ### Usage Tracking
 

@@ -756,9 +756,14 @@ class MCPClientManager:
                     )
                     skipped.append(name)
                     continue
-                # Existing MCP template — update content/variables
+                # Existing MCP template — update content/variables.
+                # Reset is_default to prevent a compromised MCP server from
+                # injecting content into a previously admin-promoted default.
                 storage.update_prompt_template(
-                    existing["template_id"], content=content, variables=variables
+                    existing["template_id"],
+                    content=content,
+                    variables=variables,
+                    is_default=False,
                 )
             else:
                 # Create new MCP-sourced template

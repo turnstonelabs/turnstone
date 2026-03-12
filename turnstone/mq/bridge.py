@@ -388,6 +388,7 @@ class Bridge:
         initial_message = getattr(msg, "initial_message", "")
         resume_ws = getattr(msg, "resume_ws", "")
         user_id = getattr(msg, "user_id", "")
+        template = getattr(msg, "template", "")
         if user_id:
             log.info("bridge.create_ws user_id=%s name=%s model=%s", user_id, name, model)
         ws_id, resumed = self._create_ws_on_server(
@@ -397,6 +398,7 @@ class Bridge:
             correlation_id=msg.correlation_id,
             model=model,
             resume_ws=resume_ws,
+            template=template,
         )
         # Send initial_message only when no workstream was actually resumed.
         # Use the server's `resumed` response (not just the intent) so that
@@ -464,6 +466,7 @@ class Bridge:
         correlation_id: str,
         model: str = "",
         resume_ws: str = "",
+        template: str = "",
     ) -> tuple[str, bool]:
         """Create a workstream on the server.  Returns (ws_id, resumed)."""
         try:
@@ -472,6 +475,8 @@ class Bridge:
                 payload["model"] = model
             if resume_ws:
                 payload["resume_ws"] = resume_ws
+            if template:
+                payload["template"] = template
             resp = self._http.post(
                 "/v1/api/workstreams/new",
                 json=payload,

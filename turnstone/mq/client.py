@@ -126,6 +126,7 @@ class TurnstoneClient:
         auto_approve_tools: list[str] | None = None,
         target_node: str = "",
         initial_message: str = "",
+        template: str = "",
     ) -> str:
         """Create a workstream.  Returns correlation_id."""
         msg = CreateWorkstreamMessage(
@@ -134,6 +135,7 @@ class TurnstoneClient:
             auto_approve_tools=auto_approve_tools or [],
             target_node=target_node,
             initial_message=initial_message,
+            template=template,
         )
         self._broker.push_inbound(msg.to_json(), node_id=target_node)
         return msg.correlation_id

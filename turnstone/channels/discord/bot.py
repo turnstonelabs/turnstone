@@ -141,6 +141,7 @@ class TurnstoneBot:
             storage,
             auto_approve=config.auto_approve,
             auto_approve_tools=list(config.auto_approve_tools),
+            template=config.template,
         )
 
         self._subscribed_ws: set[str] = set()

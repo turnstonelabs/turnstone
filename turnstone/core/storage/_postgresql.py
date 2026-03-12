@@ -863,6 +863,7 @@ class PostgreSQLBackend:
         auto_approve_tools: list[str],
         created_by: str,
         next_run: str,
+        template: str = "",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -884,6 +885,7 @@ class PostgreSQLBackend:
                     initial_message=initial_message,
                     auto_approve=1 if auto_approve else 0,
                     auto_approve_tools=",".join(auto_approve_tools),
+                    template=template,
                     enabled=1,
                     created_by=created_by,
                     next_run=next_run,
@@ -926,6 +928,7 @@ class PostgreSQLBackend:
             "initial_message",
             "auto_approve",
             "auto_approve_tools",
+            "template",
             "enabled",
             "last_run",
             "next_run",
@@ -1559,6 +1562,18 @@ class PostgreSQLBackend:
     def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
             q = sa.select(prompt_templates).order_by(prompt_templates.c.name)
+            if org_id:
+                q = q.where(prompt_templates.c.org_id == org_id)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
+
+    def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = (
+                sa.select(prompt_templates)
+                .where(prompt_templates.c.is_default == 1)
+                .order_by(prompt_templates.c.name)
+            )
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
             rows = conn.execute(q).fetchall()

@@ -77,6 +77,7 @@ class AsyncTurnstoneServer(_BaseClient):
         model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
+        template: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -87,6 +88,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["auto_approve"] = True
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if template:
+            body["template"] = template
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -318,10 +321,15 @@ class TurnstoneServer:
         model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
+        template: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
-                name=name, model=model, auto_approve=auto_approve, resume_ws=resume_ws
+                name=name,
+                model=model,
+                auto_approve=auto_approve,
+                resume_ws=resume_ws,
+                template=template,
             )
         )
 

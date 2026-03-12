@@ -53,8 +53,9 @@ note right
   For each MCP prompt:
   - Manual template exists? → skip
   - MCP template exists? → update
+    (reset is_default=False)
   - New? → create (origin="mcp",
-    readonly=True)
+    readonly=True, is_default=False)
   Removed prompts → delete
   Protected by _sync_lock
 end note

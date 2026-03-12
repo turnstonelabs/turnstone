@@ -35,7 +35,9 @@ from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     delete_memory,
     delete_workstream,
+    get_prompt_template_by_name,
     get_workstream_display_name,
+    list_default_templates,
     list_workstreams_with_history,
     load_memories,
     load_messages,
@@ -104,6 +106,26 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 
 # 4 MB raw → ~5.3 MB base64, safely under Anthropic's per-block limit
 _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
+
+# Upper bound on total prompt template content injected into system messages
+_MAX_TEMPLATE_CONTENT: int = 32768
+
+
+_TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def _render_template(content: str, context: dict[str, str]) -> str:
+    """Replace ``{{variable}}`` placeholders in a single pass.
+
+    Unresolvable placeholders are kept as-is.  Single-pass avoids
+    cross-variable injection (e.g. a model name containing ``{{ws_id}}``).
+    """
+
+    def _replace(m: re.Match[str]) -> str:
+        return context.get(m.group(1), m.group(0))
+
+    return _TEMPLATE_VAR_RE.sub(_replace, content)
+
 
 # ---------------------------------------------------------------------------
 # SessionUI protocol — the contract every frontend must implement
@@ -194,6 +216,7 @@ class ChatSession:
         tool_search: str = "auto",
         tool_search_threshold: int = 20,
         tool_search_max_results: int = 5,
+        template: str | None = None,
     ):
         self.client = client
         self.model = model
@@ -281,6 +304,10 @@ class ChatSession:
                 threshold=tool_search_threshold,
                 max_results=tool_search_max_results,
             )
+        # Prompt template: explicit name overrides is_default templates
+        self._template_name: str | None = template
+        self._template_content: str | None = None
+        self._load_templates()
         self._init_system_messages()
         self._save_config()
 
@@ -314,8 +341,38 @@ class ChatSession:
                 "max_tokens": str(self.max_tokens),
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
+                "template": self._template_name or "",
             },
         )
+
+    def _load_templates(self) -> None:
+        """Load prompt templates from storage.  Called once at init and on /template."""
+        context = {
+            "model": self.model,
+            "ws_id": self._ws_id,
+            "node_id": self._node_id or "",
+        }
+        if self._template_name:
+            tpl = get_prompt_template_by_name(self._template_name)
+            if tpl:
+                self._template_content = _render_template(tpl["content"], context)
+            else:
+                log.warning("prompt_template.not_found", name=self._template_name)
+                self._template_content = None
+        else:
+            defaults = list_default_templates()
+            if defaults:
+                parts = [_render_template(t["content"], context) for t in defaults]
+                self._template_content = "\n\n".join(parts)
+            else:
+                self._template_content = None
+
+    def set_template(self, name: str | None) -> None:
+        """Set or clear the active prompt template."""
+        self._template_name = name
+        self._load_templates()
+        self._init_system_messages()
+        self._save_config()
 
     # -- MCP tool refresh ----------------------------------------------------
 
@@ -543,6 +600,9 @@ class ChatSession:
                 self.instructions = config["instructions"] or None
             if "creative_mode" in config:
                 self.creative_mode = config["creative_mode"] == "True"
+            if "template" in config:
+                self._template_name = config["template"] or None
+                self._load_templates()
             self._init_system_messages()
         return True
 
@@ -660,6 +720,13 @@ class ChatSession:
                     "to invoke the prompts listed above."
                 )
                 dev_parts.append("\n".join(lines))
+        if self._template_content:
+            tpl = self._template_content
+            if len(tpl) > _MAX_TEMPLATE_CONTENT:
+                log.warning("template_content.truncated", length=len(tpl))
+                tpl = tpl[:_MAX_TEMPLATE_CONTENT]
+            dev_parts.append("")
+            dev_parts.append(tpl)
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -4105,6 +4172,25 @@ class ChatSession:
                 self._save_config()
                 self.ui.on_info("Instructions updated.")
 
+        elif cmd == "/template":
+            if not arg:
+                if self._template_name:
+                    self.ui.on_info(f"Active template: {self._template_name}")
+                else:
+                    self.ui.on_info(
+                        "Using default templates. Usage: /template <name> or /template clear"
+                    )
+            elif arg.strip().lower() == "clear":
+                self.set_template(None)
+                self.ui.on_info("Template cleared; using defaults.")
+            else:
+                tpl = get_prompt_template_by_name(arg.strip())
+                if tpl:
+                    self.set_template(tpl["name"])
+                    self.ui.on_info(f"Template set: {tpl['name']}")
+                else:
+                    self.ui.on_error(f"Template not found: {arg.strip()}")
+
         elif cmd == "/clear":
             self.messages.clear()
             self._read_files.clear()
@@ -4337,6 +4423,7 @@ class ChatSession:
                     [
                         "── Slash Commands ─────────────────────────────────────",
                         "  /instructions <text>   Set developer instructions",
+                        "  /template [name|clear] Set/show/clear prompt template",
                         "  /clear                 Clear context (workstream preserved in database)",
                         "  /new                   Start a new workstream (old one stays resumable)",
                         "",

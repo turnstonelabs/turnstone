@@ -143,6 +143,25 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
         return {}
 
 
+# -- Prompt templates ---------------------------------------------------------
+
+
+def list_default_templates(org_id: str = "") -> list[dict[str, Any]]:
+    """Return all templates where is_default=True, ordered by name."""
+    try:
+        return get_storage().list_default_templates(org_id)
+    except Exception:
+        return []
+
+
+def get_prompt_template_by_name(name: str) -> dict[str, Any] | None:
+    """Lookup prompt template by name."""
+    try:
+        return get_storage().get_prompt_template_by_name(name)
+    except Exception:
+        return None
+
+
 # -- Workstream metadata ------------------------------------------------------
 
 
