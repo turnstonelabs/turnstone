@@ -1607,12 +1607,8 @@ function resolvePlan(defaultFeedback) {
   sendBtn.disabled = false;
   inputEl.focus();
 
-  // Render plan inline in the chat
-  var isReject = feedback === "reject";
-  var isAmend = feedback && !isReject;
-  var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
-  _addInlinePlan(_planContent, action, feedback);
-
+  // Critical: fire the API call first — this unblocks the server.
+  // The inline rendering below is cosmetic and must never prevent it.
   authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1620,9 +1616,20 @@ function resolvePlan(defaultFeedback) {
   }).catch(function (err) {
     addErrorMessage("Connection error: " + err.message);
   });
+
+  // Render plan inline in the chat (best-effort)
+  try {
+    var isReject = feedback === "reject";
+    var isAmend = feedback && !isReject;
+    var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+    _addInlinePlan(_planContent, action, feedback);
+  } catch (err) {
+    console.error("Failed to render inline plan:", err);
+  }
 }
 
 function _addInlinePlan(content, action, feedback) {
+  if (!content) return;
   var wrapper = document.createElement("div");
   wrapper.className = "plan-inline";
 
@@ -1641,7 +1648,9 @@ function _addInlinePlan(content, action, feedback) {
   var body = document.createElement("div");
   body.className = "plan-inline-body";
   body.innerHTML = renderMarkdown(content);
-  makeCollapsible(body);
+  if (content.split("\n").length > 12) {
+    makeCollapsible(body);
+  }
   wrapper.appendChild(body);
 
   if (feedback && action === "amending") {
