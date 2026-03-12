@@ -48,6 +48,12 @@ export interface ApproveRequestEvent {
   items: Array<Record<string, unknown>>;
 }
 
+export interface ApprovalResolvedEvent {
+  type: "approval_resolved";
+  approved: boolean;
+  feedback: string;
+}
+
 export interface ToolResultEvent {
   type: "tool_result";
   call_id: string;
@@ -141,6 +147,7 @@ export type ServerEvent =
   | StreamEndEvent
   | ToolInfoEvent
   | ApproveRequestEvent
+  | ApprovalResolvedEvent
   | ToolResultEvent
   | ToolOutputChunkEvent
   | StatusEvent
@@ -247,6 +254,12 @@ export function isApproveRequestEvent(
   e: ServerEvent,
 ): e is ApproveRequestEvent {
   return e.type === "approve_request";
+}
+
+export function isApprovalResolvedEvent(
+  e: ServerEvent,
+): e is ApprovalResolvedEvent {
+  return e.type === "approval_resolved";
 }
 
 export function isPlanReviewEvent(e: ServerEvent): e is PlanReviewEvent {

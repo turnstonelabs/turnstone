@@ -1111,6 +1111,11 @@ class ChatSession:
                 # Handle tool call deltas
                 if chunk.tool_call_deltas:
                     _stop_spinner_once()
+                    # Flush any buffered content — model has moved to tool calls,
+                    # so pending text cannot be a partial <think> tag.
+                    if pending:
+                        _flush_text(pending, in_think)
+                        pending = ""
                     # Close reasoning if transitioning from reasoning
                     if in_think:
                         in_think = False

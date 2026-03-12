@@ -376,6 +376,13 @@ class WebUI:
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Called by the HTTP handler when the user approves/denies."""
         self._approval_result = (approved, feedback)
+        self._enqueue(
+            {
+                "type": "approval_resolved",
+                "approved": approved,
+                "feedback": feedback or "",
+            }
+        )
         self._approval_event.set()
 
     def resolve_plan(self, feedback: str) -> None:

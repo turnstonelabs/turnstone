@@ -1,6 +1,7 @@
 """Tests for turnstone.sdk.events — SSE event deserialization."""
 
 from turnstone.sdk.events import (
+    ApprovalResolvedEvent,
     ApproveRequestEvent,
     BusyErrorEvent,
     ClearUiEvent,
@@ -90,6 +91,15 @@ def test_approve_request_event():
     e = ServerEvent.from_dict({"type": "approve_request", "items": items})
     assert isinstance(e, ApproveRequestEvent)
     assert len(e.items) == 1
+
+
+def test_approval_resolved_event():
+    e = ServerEvent.from_dict(
+        {"type": "approval_resolved", "approved": False, "feedback": "Approval timed out"}
+    )
+    assert isinstance(e, ApprovalResolvedEvent)
+    assert e.approved is False
+    assert e.feedback == "Approval timed out"
 
 
 def test_tool_result_event():

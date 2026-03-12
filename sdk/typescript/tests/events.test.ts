@@ -6,6 +6,7 @@ import {
   isToolResultEvent,
   isWsStateEvent,
   isApproveRequestEvent,
+  isApprovalResolvedEvent,
   isPlanReviewEvent,
   isReasoningEvent,
 } from "../src/events.js";
@@ -60,6 +61,15 @@ describe("event type guards", () => {
   it("isApproveRequestEvent", () => {
     const e: ServerEvent = { type: "approve_request", items: [] };
     expect(isApproveRequestEvent(e)).toBe(true);
+  });
+
+  it("isApprovalResolvedEvent", () => {
+    const e: ServerEvent = {
+      type: "approval_resolved",
+      approved: false,
+      feedback: "Approval timed out",
+    };
+    expect(isApprovalResolvedEvent(e)).toBe(true);
   });
 
   it("isPlanReviewEvent", () => {

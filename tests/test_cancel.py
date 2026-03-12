@@ -335,3 +335,70 @@ class TestGenerationCancelledException:
                 raise GenerationCancelled()
             except Exception:
                 pytest.fail("GenerationCancelled was caught by except Exception")
+
+
+class TestStreamFlushBeforeToolCalls:
+    """Content pending buffer must be flushed before tool call processing."""
+
+    def test_pending_content_flushed_before_tool_calls(self, tmp_db):
+        """All content tokens arrive via on_content_token before tool calls."""
+        events: list[tuple[str, ...]] = []
+
+        class TrackingUI(NullUI):
+            def on_content_token(self, text):
+                events.append(("content", text))
+
+            def on_stream_end(self):
+                events.append(("stream_end",))
+                super().on_stream_end()
+
+        ui = TrackingUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = ""
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        @dataclass
+        class FakeToolDelta:
+            index: int = 0
+            id: str = ""
+            name: str = ""
+            arguments_delta: str = ""
+
+        def stream_content_then_tool():
+            # Content long enough to leave chars in pending buffer
+            # (_MAX_TAG_LEN = 13, so _drain_pending retains last 13 chars)
+            yield FakeChunk(content_delta="Hello world, this is a test message")
+            yield FakeChunk(
+                tool_call_deltas=[FakeToolDelta(index=0, id="tc_1", name="bash")],
+            )
+            yield FakeChunk(
+                tool_call_deltas=[FakeToolDelta(index=0, arguments_delta='{"command":"echo hi"}')],
+                finish_reason="tool_calls",
+            )
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=stream_content_then_tool(),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # All content should have been emitted
+        total = "".join(v for t, *v in events if t == "content" for v in v)
+        assert total == "Hello world, this is a test message"
+
+        # No content events after stream_end
+        stream_end_idx = next(i for i, e in enumerate(events) if e[0] == "stream_end")
+        late_content = [e for e in events[stream_end_idx + 1 :] if e[0] == "content"]
+        assert late_content == [], f"Content after stream_end: {late_content}"
