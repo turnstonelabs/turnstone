@@ -339,7 +339,6 @@ class TestWsEventFinalization:
 
         # StreamingMessage should exist
         assert "ws-1" in bot._streaming
-        sm = bot._streaming["ws-1"]
 
         # Feed turn complete with empty correlation_id (server-UI-initiated)
         complete_raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
