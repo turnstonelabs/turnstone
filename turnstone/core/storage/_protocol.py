@@ -471,6 +471,9 @@ class StorageBackend(Protocol):
         is_default: bool,
         org_id: str,
         created_by: str,
+        origin: str = "manual",
+        mcp_server: str = "",
+        readonly: bool = False,
     ) -> None:
         """Create a prompt template."""
         ...
@@ -479,8 +482,16 @@ class StorageBackend(Protocol):
         """Return prompt template dict or None."""
         ...
 
+    def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
+        """Lookup prompt template by name. Returns same dict as get_prompt_template or None."""
+        ...
+
     def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
         """Return all prompt templates ordered by name."""
+        ...
+
+    def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
+        """Return all prompt templates with the given origin, ordered by name."""
         ...
 
     def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
@@ -489,6 +500,10 @@ class StorageBackend(Protocol):
 
     def delete_prompt_template(self, template_id: str) -> bool:
         """Delete a prompt template. Returns True if found."""
+        ...
+
+    def delete_prompt_templates_by_server(self, mcp_server: str) -> int:
+        """Delete all prompt templates from a given MCP server. Returns count deleted."""
         ...
 
     # -- Usage events ----------------------------------------------------------

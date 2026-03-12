@@ -375,6 +375,66 @@ class TestPromptTemplateCRUD:
         assert t2["is_default"] is False
         assert isinstance(t2["is_default"], bool)
 
+    def test_create_with_mcp_origin(self, db):
+        db.create_prompt_template(
+            "t1",
+            "mcp__srv__prompt",
+            "mcp",
+            "content",
+            variables="[]",
+            is_default=False,
+            org_id="",
+            created_by="",
+            origin="mcp",
+            mcp_server="srv",
+            readonly=True,
+        )
+        tpl = db.get_prompt_template("t1")
+        assert tpl is not None
+        assert tpl["origin"] == "mcp"
+        assert tpl["mcp_server"] == "srv"
+        assert tpl["readonly"] is True
+        assert isinstance(tpl["readonly"], bool)
+
+    def test_default_origin_values(self, db):
+        db.create_prompt_template("t1", "basic", "general", "Hello")
+        tpl = db.get_prompt_template("t1")
+        assert tpl is not None
+        assert tpl["origin"] == "manual"
+        assert tpl["mcp_server"] == ""
+        assert tpl["readonly"] is False
+
+    def test_get_prompt_template_by_name(self, db):
+        db.create_prompt_template("t1", "greeting", "general", "Hello!")
+        tpl = db.get_prompt_template_by_name("greeting")
+        assert tpl is not None
+        assert tpl["template_id"] == "t1"
+        assert tpl["name"] == "greeting"
+
+    def test_get_prompt_template_by_name_nonexistent(self, db):
+        assert db.get_prompt_template_by_name("nope") is None
+
+    def test_list_prompt_templates_by_origin(self, db):
+        db.create_prompt_template("t1", "manual_one", "general", "A", origin="manual")
+        db.create_prompt_template("t2", "mcp_one", "mcp", "B", origin="mcp", mcp_server="srv1")
+        db.create_prompt_template("t3", "mcp_two", "mcp", "C", origin="mcp", mcp_server="srv2")
+        result = db.list_prompt_templates_by_origin("mcp")
+        assert len(result) == 2
+        names = [r["name"] for r in result]
+        assert "mcp_one" in names
+        assert "mcp_two" in names
+
+    def test_delete_prompt_templates_by_server(self, db):
+        db.create_prompt_template("t1", "a", "mcp", "A", origin="mcp", mcp_server="srv1")
+        db.create_prompt_template("t2", "b", "mcp", "B", origin="mcp", mcp_server="srv1")
+        db.create_prompt_template("t3", "c", "mcp", "C", origin="mcp", mcp_server="srv2")
+        deleted = db.delete_prompt_templates_by_server("srv1")
+        assert deleted == 2
+        # Only srv2 template remains.
+        remaining = db.list_prompt_templates()
+        assert len(remaining) == 1
+        assert remaining[0]["mcp_server"] == "srv2"
+
 
 # ---------------------------------------------------------------------------
 # Usage Events

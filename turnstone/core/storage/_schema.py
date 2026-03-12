@@ -288,6 +288,9 @@ prompt_templates = sa.Table(
     sa.Column("is_default", sa.Integer, nullable=False, server_default="0"),
     sa.Column("org_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("origin", sa.Text, nullable=False, server_default="manual"),
+    sa.Column("mcp_server", sa.Text, nullable=False, server_default=""),
+    sa.Column("readonly", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )

@@ -2074,6 +2074,8 @@ async def admin_update_template(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(template_id)
     if existing is None:
         return JSONResponse({"error": "Template not found"}, status_code=404)
+    if existing.get("readonly"):
+        return JSONResponse({"error": "MCP-sourced templates are read-only"}, status_code=403)
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -2130,6 +2132,8 @@ async def admin_delete_template(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(template_id)
     if existing is None:
         return JSONResponse({"error": "Template not found"}, status_code=404)
+    if existing.get("readonly"):
+        return JSONResponse({"error": "MCP-sourced templates are read-only"}, status_code=403)
 
     storage.delete_prompt_template(template_id)
 

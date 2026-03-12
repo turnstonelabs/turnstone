@@ -24,6 +24,7 @@ import textwrap
 import threading
 import time
 import uuid
+from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -604,10 +605,11 @@ class ChatSession:
             if resources:
                 lines = ["\n<mcp-resources>"]
                 for r in resources[:50]:
+                    safe_uri = _html_escape(r["uri"])
                     desc = r.get("description", "")
                     if desc:
-                        desc = f"  {desc[:100]}"
-                    lines.append(f"  {r['uri']}{desc}")
+                        desc = f"  {_html_escape(desc[:100])}"
+                    lines.append(f"  {safe_uri}{desc}")
                 lines.append("</mcp-resources>")
                 lines.append("Use read_resource(uri='...') to access the resources listed above.")
                 dev_parts.append("\n".join(lines))
@@ -1674,6 +1676,7 @@ class ChatSession:
                 "pattern",
                 "prompt",
                 "query",
+                "uri",
                 "url",
             ):
                 m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
@@ -4145,34 +4148,34 @@ class ChatSession:
                 tools = self._mcp_client.get_tools()
                 resources = self._mcp_client.get_resources()
                 prompts = self._mcp_client.get_prompts()
-                lines: list[str] = []
+                mcp_lines = []
                 if tools:
-                    lines.append(f"MCP tools ({len(tools)}):")
+                    mcp_lines.append(f"MCP tools ({len(tools)}):")
                     for t in tools:
                         name = t["function"]["name"]
                         desc = t["function"].get("description", "")[:80]
-                        lines.append(f"  {name}  {dim(desc)}")
+                        mcp_lines.append(f"  {name}  {dim(desc)}")
                 if resources:
-                    if lines:
-                        lines.append("")
-                    lines.append(f"MCP resources ({len(resources)}):")
+                    if mcp_lines:
+                        mcp_lines.append("")
+                    mcp_lines.append(f"MCP resources ({len(resources)}):")
                     for r in resources:
                         desc = r.get("description", "")[:80]
-                        lines.append(f"  {r['uri']}  {dim(desc)}")
+                        mcp_lines.append(f"  {r['uri']}  {dim(desc)}")
                 if prompts:
-                    if lines:
-                        lines.append("")
-                    lines.append(f"MCP prompts ({len(prompts)}):")
+                    if mcp_lines:
+                        mcp_lines.append("")
+                    mcp_lines.append(f"MCP prompts ({len(prompts)}):")
                     for p in prompts:
                         arg_names = ", ".join(a["name"] for a in p.get("arguments", []))
                         desc = p.get("description", "")[:60]
-                        lines.append(f"  {p['name']}({arg_names})  {dim(desc)}")
-                if not lines:
+                        mcp_lines.append(f"  {p['name']}({arg_names})  {dim(desc)}")
+                if not mcp_lines:
                     self.ui.on_info(
                         "MCP client connected but no tools, resources, or prompts available."
                     )
                 else:
-                    self.ui.on_info("\n".join(lines))
+                    self.ui.on_info("\n".join(mcp_lines))
 
         elif cmd == "/help":
             self.ui.on_info(

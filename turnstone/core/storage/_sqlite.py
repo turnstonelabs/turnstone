@@ -1546,6 +1546,9 @@ class SQLiteBackend:
         is_default: bool = False,
         org_id: str = "",
         created_by: str = "",
+        origin: str = "manual",
+        mcp_server: str = "",
+        readonly: bool = False,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -1560,6 +1563,9 @@ class SQLiteBackend:
                     "is_default": 1 if is_default else 0,
                     "org_id": org_id,
                     "created_by": created_by,
+                    "origin": origin,
+                    "mcp_server": mcp_server,
+                    "readonly": 1 if readonly else 0,
                     "created": now,
                     "updated": now,
                 },
@@ -1572,7 +1578,16 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default")
+                return _row_to_dict(row, "is_default", "readonly")
+            return None
+
+    def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(prompt_templates).where(prompt_templates.c.name == name)
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "is_default", "readonly")
             return None
 
     def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
@@ -1581,7 +1596,16 @@ class SQLiteBackend:
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
             rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "is_default") for r in rows]
+            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
+
+    def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(prompt_templates)
+                .where(prompt_templates.c.origin == origin)
+                .order_by(prompt_templates.c.name)
+            ).fetchall()
+            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
 
     def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
         dropped = set(fields) - _TEMPLATE_MUTABLE
@@ -1607,6 +1631,14 @@ class SQLiteBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    def delete_prompt_templates_by_server(self, mcp_server: str) -> int:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(prompt_templates).where(prompt_templates.c.mcp_server == mcp_server)
+            )
+            conn.commit()
+            return result.rowcount
 
     # -- Usage events ----------------------------------------------------------
 

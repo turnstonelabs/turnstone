@@ -689,14 +689,23 @@ function _renderGovTemplates(items) {
     var defBadge = t.is_default
       ? '<span class="scope-badge scope-approve">default</span>'
       : "";
+    var originBadge =
+      t.origin === "mcp"
+        ? ' <span class="scope-badge scope-deny">mcp:' +
+          escapeHtml(t.mcp_server) +
+          "</span>"
+        : "";
     var catBadge =
       '<span class="scope-badge">' + escapeHtml(t.category) + "</span>";
+    var editDisabled = t.readonly ? " disabled" : "";
+    var deleteDisabled = t.readonly ? " disabled" : "";
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-tmname">' +
       escapeHtml(t.name) +
       " " +
       defBadge +
+      originBadge +
       "</span>" +
       '<span class="admin-col admin-col-tmcat">' +
       catBadge +
@@ -707,12 +716,16 @@ function _renderGovTemplates(items) {
       '<span class="admin-col admin-col-actions">' +
       '<button class="admin-btn-action" data-edit-tmpl="' +
       escapeHtml(t.template_id) +
-      '">edit</button>' +
+      '"' +
+      editDisabled +
+      ">edit</button>" +
       '<button class="admin-btn-danger" data-delete-tmpl="' +
       escapeHtml(t.template_id) +
       '" data-tmpl-name="' +
       escapeHtml(t.name) +
-      '">delete</button>' +
+      '"' +
+      deleteDisabled +
+      ">delete</button>" +
       "</span></div>";
   }
   el.innerHTML = html;

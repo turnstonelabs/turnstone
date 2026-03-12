@@ -286,6 +286,9 @@ class PromptTemplateInfo(BaseModel):
     is_default: bool
     org_id: str
     created_by: str
+    origin: str = "manual"
+    mcp_server: str = ""
+    readonly: bool = False
     created: str
     updated: str
 

@@ -812,5 +812,26 @@ the `initialize` handshake. Each prompt is stored with its prefixed name
 with the provided arguments and returns the expanded messages. This is used
 internally to expand prompt templates into conversation messages.
 
+### Governance Sync
+
+Discovered MCP prompts are automatically synced into the `prompt_templates`
+governance table as first-class governed templates:
+
+- **Origin tracking**: MCP-sourced templates have `origin="mcp"` and
+  `mcp_server` set to the server name. Manual templates have
+  `origin="manual"`.
+- **Read-only**: MCP-sourced templates are `readonly=True`. The admin API
+  returns 403 on update/delete attempts. The admin UI disables edit/delete
+  buttons and shows an origin badge.
+- **Precedence**: If a manual template and MCP prompt share the same name,
+  the manual template wins and the MCP prompt is skipped (with a log
+  warning).
+- **Lifecycle**: Templates are created on connect, updated on prompt list
+  refresh, and removed when the MCP server no longer exposes the prompt.
+  The sync runs automatically on connect, on `PromptListChangedNotification`,
+  and on manual `/mcp refresh`.
+- **Schema**: Migration 009 adds `origin`, `mcp_server`, and `readonly`
+  columns to the `prompt_templates` table.
+
 Prompt-based tool invocation (the `use_prompt` tool) is planned for a future
 chunk.

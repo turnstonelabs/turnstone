@@ -19,6 +19,7 @@ Refresh: three mechanisms keep tool/resource/prompt lists up-to-date:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -26,6 +27,7 @@ import os
 import random
 import threading
 import time
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -130,6 +132,9 @@ class MCPClientManager:
         self._prompt_listeners: list[Callable[[], None]] = []
         self._prompt_listeners_lock = threading.Lock()
 
+        # Governance storage (optional — set via set_storage())
+        self._storage: Any = None
+
         # Periodic refresh for servers without push notifications
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
@@ -165,8 +170,14 @@ class MCPClientManager:
         # Start periodic refresh for servers without push notifications
         needs_periodic = any(
             not self._supports_list_changed.get(name, False)
-            or not self._supports_resource_list_changed.get(name, False)
-            or not self._supports_prompt_list_changed.get(name, False)
+            or (
+                self._supports_resources.get(name, False)
+                and not self._supports_resource_list_changed.get(name, False)
+            )
+            or (
+                self._supports_prompts.get(name, False)
+                and not self._supports_prompt_list_changed.get(name, False)
+            )
             for name in self._sessions
         )
         if needs_periodic and self._refresh_interval > 0:
@@ -266,7 +277,8 @@ class MCPClientManager:
                         "server": name,
                     }
                 )
-            # Also include resource templates
+            # Also include resource templates (catalog-only — not directly
+            # readable via read_resource since they contain URI placeholders)
             tmpl_result = await session.list_resource_templates()
             for t in tmpl_result.resourceTemplates:
                 server_resources.append(
@@ -276,6 +288,7 @@ class MCPClientManager:
                         "description": t.description or "",
                         "mimeType": t.mimeType or "",
                         "server": name,
+                        "template": True,
                     }
                 )
             resource_count = len(server_resources)
@@ -324,6 +337,12 @@ class MCPClientManager:
             prompt_count,
             push_status,
         )
+
+        # Sync discovered prompts into governance storage
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after connect failed for '%s'", name, exc_info=True)
 
     # -- tool refresh --------------------------------------------------------
 
@@ -412,6 +431,13 @@ class MCPClientManager:
             except Exception:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
                 results[name] = ([], [])
+
+        # Final sync to clean up templates from servers that are no longer connected
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after refresh_all failed", exc_info=True)
+
         return results
 
     def refresh_sync(
@@ -460,6 +486,15 @@ class MCPClientManager:
             for res in srv_resources:
                 uri: str = res["uri"]
                 new_resources.append(res)
+                if res.get("template"):
+                    continue  # templates are catalog-only, not directly readable
+                if uri in new_map:
+                    log.warning(
+                        "Resource URI collision: '%s' from '%s' overrides '%s'",
+                        uri,
+                        srv_name,
+                        new_map[uri][0],
+                    )
                 new_map[uri] = (srv_name, uri)
         self._resources = new_resources
         self._resource_map = new_map
@@ -494,6 +529,7 @@ class MCPClientManager:
                     "description": t.description or "",
                     "mimeType": t.mimeType or "",
                     "server": name,
+                    "template": True,
                 }
             )
 
@@ -548,6 +584,12 @@ class MCPClientManager:
 
         self._per_server_prompts[name] = server_prompts
         self._rebuild_prompts()
+
+        # Sync discovered prompts into governance storage
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after refresh failed for '%s'", name, exc_info=True)
 
     # -- listener infrastructure ---------------------------------------------
 
@@ -610,6 +652,104 @@ class MCPClientManager:
                 cb()
             except Exception:
                 log.warning("Prompt-change listener raised", exc_info=True)
+
+    # -- governance storage sync ---------------------------------------------
+
+    def set_storage(self, storage: Any) -> None:
+        """Inject governance storage backend for prompt template sync.
+
+        If MCP servers are already connected, triggers an immediate sync
+        so prompts discovered during startup appear in governance storage
+        (``start()`` completes before ``set_storage()`` is called).
+        """
+        self._storage = storage
+        if self._connected.is_set():
+            try:
+                self.sync_prompts_to_storage()
+            except Exception:
+                log.warning("Prompt sync after set_storage failed", exc_info=True)
+
+    def sync_prompts_to_storage(self) -> dict[str, Any]:
+        """Sync discovered MCP prompts into the prompt_templates governance table.
+
+        Returns ``{"added": [...], "removed": [...], "skipped": [...]}``.
+        """
+        if self._storage is None:
+            return {"added": [], "removed": [], "skipped": []}
+
+        storage = self._storage
+        added: list[str] = []
+        removed: list[str] = []
+        skipped: list[str] = []
+
+        # Current MCP prompt names (the prefixed names used as template names)
+        current_names: set[str] = set()
+
+        for prompt in list(self._prompts):
+            name: str = prompt["name"][:256]
+            server: str = prompt["server"][:128]
+            current_names.add(name)
+
+            # Build content from description + argument schema
+            desc = prompt.get("description", "")[:4096]
+            args_list = prompt.get("arguments", [])
+            content_parts = [desc] if desc else []
+            if args_list:
+                content_parts.append("\nArguments:")
+                for arg in args_list:
+                    req = " (required)" if arg.get("required") else ""
+                    arg_desc = arg.get("description", "")[:512]
+                    content_parts.append(f"  - {arg['name'][:128]}{req}: {arg_desc}")
+            content = "\n".join(content_parts) if content_parts else name
+
+            # Variables = JSON list of argument names
+            variables = json.dumps([a["name"] for a in args_list])
+
+            existing = storage.get_prompt_template_by_name(name)
+            if existing is not None:
+                if existing.get("origin") == "manual":
+                    log.info(
+                        "Skipping MCP prompt '%s' — manual template with same name exists", name
+                    )
+                    skipped.append(name)
+                    continue
+                # Existing MCP template — update content/variables
+                storage.update_prompt_template(
+                    existing["template_id"], content=content, variables=variables
+                )
+            else:
+                # Create new MCP-sourced template
+                template_id = str(uuid.uuid4())
+                storage.create_prompt_template(
+                    template_id=template_id,
+                    name=name,
+                    category="mcp",
+                    content=content,
+                    variables=variables,
+                    is_default=False,
+                    org_id="",
+                    created_by="",
+                    origin="mcp",
+                    mcp_server=server,
+                    readonly=True,
+                )
+                added.append(name)
+
+        # Remove MCP templates whose prompts no longer exist
+        existing_mcp = storage.list_prompt_templates_by_origin("mcp")
+        for tpl in existing_mcp:
+            if tpl["name"] not in current_names:
+                storage.delete_prompt_template(tpl["template_id"])
+                removed.append(tpl["name"])
+
+        if added or removed:
+            log.info(
+                "MCP prompt sync: +%d added, -%d removed, %d skipped",
+                len(added),
+                len(removed),
+                len(skipped),
+            )
+        return {"added": added, "removed": removed, "skipped": skipped}
 
     # -- lifecycle (shutdown) ------------------------------------------------
 
@@ -706,7 +846,10 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(
             session.call_tool(original_name, arguments), self._loop
         )
-        result = future.result(timeout=timeout)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
 
         # Extract text from the content array
         texts: list[str] = []
@@ -742,7 +885,10 @@ class MCPClientManager:
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
-        result = future.result(timeout=timeout)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
 
         parts: list[str] = []
         for item in result.contents:
@@ -778,7 +924,10 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(
             session.get_prompt(original_name, arguments=arguments), self._loop
         )
-        result = future.result(timeout=timeout)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"MCP prompt retrieval timed out after {timeout}s") from None
 
         messages: list[dict[str, Any]] = []
         for msg in result.messages:

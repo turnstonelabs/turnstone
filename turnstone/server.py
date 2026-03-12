@@ -1813,6 +1813,7 @@ def main() -> None:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
             log.info("MCP tools: %d from %d server(s)", len(mcp_tools), mcp_client.server_count)
+        mcp_client.set_storage(get_storage())
     log.info(
         "Health monitor: probe every %ss, circuit breaker threshold=%s",
         args.health_probe_interval,

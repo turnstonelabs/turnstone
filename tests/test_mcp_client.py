@@ -864,9 +864,8 @@ class TestMCPResources:
         mgr._loop = asyncio.new_event_loop()
 
         # Mock the read_resource result
-        text_content = MagicMock()
+        text_content = MagicMock(spec=["text"])
         text_content.text = "Hello, world!"
-        del text_content.blob  # ensure blob attr is absent
         mock_result = MagicMock()
         mock_result.contents = [text_content]
         mock_session.read_resource = AsyncMock(return_value=mock_result)

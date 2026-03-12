@@ -1002,6 +1002,9 @@ def main() -> None:
         mcp_tools = mcp_client.get_tools()
         if mcp_tools:
             print(f"MCP tools: {len(mcp_tools)} from {mcp_client.server_count} server(s)")
+        from turnstone.core.storage import get_storage as _cli_get_storage
+
+        mcp_client.set_storage(_cli_get_storage())
     print("Type /help for commands, /ws for workstreams, /exit or Ctrl+D to quit.\n")
 
     # Prompt string -- use a short display name
