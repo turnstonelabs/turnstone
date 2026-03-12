@@ -10,9 +10,7 @@
       "get": {
         "summary": "Cluster state summary",
         "operationId": "v1_api_cluster_overview_get",
-        "tags": [
-          "Cluster"
-        ],
+        "tags": ["Cluster"],
         "responses": {
           "200": {
             "description": "Success",
@@ -31,9 +29,7 @@
       "get": {
         "summary": "Paginated node list",
         "operationId": "v1_api_cluster_nodes_get",
-        "tags": [
-          "Cluster"
-        ],
+        "tags": ["Cluster"],
         "parameters": [
           {
             "name": "sort",
@@ -42,11 +38,7 @@
             "schema": {
               "type": "string",
               "default": "activity",
-              "enum": [
-                "activity",
-                "tokens",
-                "name"
-              ]
+              "enum": ["activity", "tokens", "name"]
             },
             "description": "Sort field"
           },
@@ -89,9 +81,7 @@
       "get": {
         "summary": "Filtered workstream list",
         "operationId": "v1_api_cluster_workstreams_get",
-        "tags": [
-          "Cluster"
-        ],
+        "tags": ["Cluster"],
         "parameters": [
           {
             "name": "state",
@@ -99,13 +89,7 @@
             "required": false,
             "schema": {
               "type": "string",
-              "enum": [
-                "running",
-                "thinking",
-                "attention",
-                "idle",
-                "error"
-              ]
+              "enum": ["running", "thinking", "attention", "idle", "error"]
             },
             "description": "Filter by state"
           },
@@ -134,11 +118,7 @@
             "schema": {
               "type": "string",
               "default": "state",
-              "enum": [
-                "state",
-                "tokens",
-                "name"
-              ]
+              "enum": ["state", "tokens", "name"]
             },
             "description": "Sort field"
           },
@@ -181,9 +161,7 @@
       "get": {
         "summary": "Single node detail",
         "operationId": "v1_api_cluster_node_{node_id}_get",
-        "tags": [
-          "Cluster"
-        ],
+        "tags": ["Cluster"],
         "parameters": [
           {
             "name": "node_id",
@@ -222,9 +200,7 @@
       "post": {
         "summary": "Create workstream via MQ dispatch",
         "operationId": "v1_api_cluster_workstreams_new_post",
-        "tags": [
-          "Cluster"
-        ],
+        "tags": ["Cluster"],
         "requestBody": {
           "required": true,
           "content": {
@@ -283,9 +259,7 @@
       "get": {
         "summary": "Cluster SSE event stream",
         "operationId": "v1_api_cluster_events_get",
-        "tags": [
-          "Streaming"
-        ],
+        "tags": ["Streaming"],
         "description": "Server-Sent Events stream for real-time cluster updates. Returns text/event-stream with node_joined, node_lost, cluster_state, ws_created, ws_closed, ws_rename events.",
         "responses": {
           "200": {
@@ -298,9 +272,7 @@
       "post": {
         "summary": "Authenticate with a token",
         "operationId": "v1_api_auth_login_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "requestBody": {
           "required": true,
           "content": {
@@ -339,9 +311,7 @@
       "post": {
         "summary": "Clear auth cookie",
         "operationId": "v1_api_auth_logout_post",
-        "tags": [
-          "Auth"
-        ],
+        "tags": ["Auth"],
         "responses": {
           "200": {
             "description": "Success",
@@ -360,9 +330,7 @@
       "get": {
         "summary": "Console health check",
         "operationId": "health_get",
-        "tags": [
-          "Observability"
-        ],
+        "tags": ["Observability"],
         "responses": {
           "200": {
             "description": "Success",
@@ -389,9 +357,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "error"
-        ],
+        "required": ["error"],
         "title": "ErrorResponse",
         "type": "object"
       },
@@ -400,9 +366,7 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": [
-              "ok"
-            ],
+            "examples": ["ok"],
             "title": "Status",
             "type": "string"
           }
@@ -419,9 +383,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "token"
-        ],
+        "required": ["token"],
         "title": "AuthLoginRequest",
         "type": "object"
       },
@@ -435,17 +397,12 @@
           },
           "role": {
             "description": "Assigned role",
-            "examples": [
-              "full",
-              "read"
-            ],
+            "examples": ["full", "read"],
             "title": "Role",
             "type": "string"
           }
         },
-        "required": [
-          "role"
-        ],
+        "required": ["role"],
         "title": "AuthLoginResponse",
         "type": "object"
       },
@@ -557,9 +514,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "nodes"
-        ],
+        "required": ["nodes"],
         "title": "ClusterNodesResponse",
         "type": "object"
       },
@@ -632,9 +587,7 @@
             "type": "string"
           }
         },
-        "required": [
-          "node_id"
-        ],
+        "required": ["node_id"],
         "title": "ClusterNodeInfo",
         "type": "object"
       },
@@ -668,9 +621,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "workstreams"
-        ],
+        "required": ["workstreams"],
         "title": "ClusterWorkstreamsResponse",
         "type": "object"
       },
@@ -726,9 +677,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "id"
-        ],
+        "required": ["id"],
         "title": "ClusterWorkstreamInfo",
         "type": "object"
       },
@@ -771,9 +720,7 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "node_id"
-        ],
+        "required": ["node_id"],
         "title": "NodeDetailResponse",
         "type": "object"
       },
@@ -801,6 +748,12 @@
             "default": "",
             "description": "Optional first message sent after creation",
             "title": "Initial Message",
+            "type": "string"
+          },
+          "template": {
+            "default": "",
+            "description": "Prompt template name (replaces default templates)",
+            "title": "Template",
             "type": "string"
           }
         },
@@ -832,9 +785,7 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": [
-              "ok"
-            ],
+            "examples": ["ok"],
             "title": "Status",
             "type": "string"
           },

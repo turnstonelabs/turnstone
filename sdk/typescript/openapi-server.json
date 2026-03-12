@@ -877,6 +877,12 @@
             "description": "Workstream ID to resume atomically during creation (empty = fresh start)",
             "title": "Resume Ws",
             "type": "string"
+          },
+          "template": {
+            "default": "",
+            "description": "Prompt template name (replaces default templates)",
+            "title": "Template",
+            "type": "string"
           }
         },
         "title": "CreateWorkstreamRequest",

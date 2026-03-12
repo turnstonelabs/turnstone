@@ -1013,13 +1013,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
-    # Validate template exists before creating the workstream
     body_template = body.get("template", "")
-    if body_template:
-        from turnstone.core.memory import get_prompt_template_by_name
-
-        if not get_prompt_template_by_name(body_template):
-            return JSONResponse({"error": f"Template not found: {body_template}"}, status_code=400)
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -1029,9 +1023,6 @@ async def create_workstream(request: Request) -> JSONResponse:
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
             ws.ui.auto_approve = True
-        # Per-workstream template override (already validated above)
-        if body_template and ws.session:
-            ws.session.set_template(body_template)
         # Register watch runner for this workstream
         runner = getattr(request.app.state, "watch_runner", None)
         if runner and ws.session:
@@ -1069,6 +1060,19 @@ async def create_workstream(request: Request) -> JSONResponse:
                     history = _build_history(ws.session)
                     if history:
                         ui._enqueue({"type": "history", "messages": history})
+
+        # Per-workstream template override — only when not resumed (resumed
+        # workstreams restore their own template from workstream_config).
+        if body_template and not resumed and ws.session:
+            from turnstone.core.memory import get_prompt_template_by_name
+
+            if not get_prompt_template_by_name(body_template):
+                # Workstream already created — close it and return error
+                mgr.close(ws.id)
+                return JSONResponse(
+                    {"error": f"Template not found: {body_template}"}, status_code=400
+                )
+            ws.session.set_template(body_template)
 
         return JSONResponse(
             {

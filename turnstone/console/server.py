@@ -1151,6 +1151,8 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not initial_message:
         return JSONResponse({"error": "initial_message is required"}, status_code=400)
+    if template and not storage.get_prompt_template_by_name(template):
+        return JSONResponse({"error": f"Template not found: {template}"}, status_code=400)
 
     validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
     if validation_err:
@@ -1261,7 +1263,10 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         raw = body["auto_approve_tools"]
         updates["auto_approve_tools"] = raw if isinstance(raw, list) else []
     if "template" in body:
-        updates["template"] = str(body["template"]).strip()[:256]
+        tpl_name = str(body["template"]).strip()[:256]
+        if tpl_name and not storage.get_prompt_template_by_name(tpl_name):
+            return JSONResponse({"error": f"Template not found: {tpl_name}"}, status_code=400)
+        updates["template"] = tpl_name
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
