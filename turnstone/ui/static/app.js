@@ -1772,7 +1772,9 @@ document.addEventListener("keydown", function (e) {
       resolvePlan("");
     } else if (e.key === "Escape") {
       e.preventDefault();
-      resolvePlan("reject");
+      var hasFb =
+        document.getElementById("plan-feedback").value.trim().length > 0;
+      resolvePlan(hasFb ? "" : "reject");
     } else if (e.key === "Tab") {
       var focusable = document.querySelectorAll(
         "#plan-dialog input, #plan-dialog button",

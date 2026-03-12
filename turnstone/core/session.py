@@ -2957,7 +2957,8 @@ class ChatSession:
             preview = content[:200] + ("..." if len(content) > 200 else "")
             coaching = (
                 "Your previous response did not follow the required plan "
-                "format. A valid plan MUST include these markdown sections:\n"
+                "format. A valid plan should include at least two of "
+                "these markdown sections:\n"
                 "## Goal (1-2 sentences)\n"
                 "## Current State (files/line numbers found)\n"
                 "## Plan (numbered steps with file names and functions)\n"
