@@ -502,11 +502,12 @@ class TestPlanRefinement:
         assert "REJECTED" not in output
 
     def test_max_refinement_rounds(self, tmp_db, tmp_path, monkeypatch):
-        """Loop stops after _MAX_PLAN_REFINEMENTS rounds."""
+        """Loop stops after _MAX_PLAN_REFINEMENTS rounds with a final review."""
         monkeypatch.chdir(tmp_path)
         session = _make_session()
         session.ui = MagicMock(spec_set=NullUI)
         session.ui.on_plan_review.return_value = "more detail please"
+        session.ui.on_info = MagicMock()
 
         refine_count = 0
 
@@ -519,17 +520,21 @@ class TestPlanRefinement:
             output = self.GOOD_PLAN
             original_goal = "add auth"
             refinement_round = 0
-            while refinement_round < session._MAX_PLAN_REFINEMENTS:
+            while True:
                 resp = session.ui.on_plan_review(output)
                 if resp.lower() in ("n", "no", "reject"):
                     break
-                elif resp:
+                elif not resp:
+                    break
+                elif refinement_round >= session._MAX_PLAN_REFINEMENTS:
+                    break
+                else:
                     output = session._refine_plan(output, original_goal, resp)
                     refinement_round += 1
-                else:
-                    break
 
         assert refine_count == session._MAX_PLAN_REFINEMENTS
+        # User gets one extra review call after max rounds (the final prompt)
+        assert session.ui.on_plan_review.call_count == session._MAX_PLAN_REFINEMENTS + 1
 
     def test_refine_plan_message_structure(self, tmp_db, tmp_path, monkeypatch):
         """_refine_plan passes system + prior plan + feedback to _run_agent."""

@@ -1566,7 +1566,7 @@ class ChatSession:
                 original_goal = item.get("prompt", "")
 
                 refinement_round = 0
-                while refinement_round < self._MAX_PLAN_REFINEMENTS:
+                while True:
                     self._emit_state("attention")
                     resp = self.ui.on_plan_review(output)
                     self._emit_state("running")
@@ -1578,7 +1578,12 @@ class ChatSession:
                             "what they want instead."
                         )
                         break
-                    elif resp:
+                    elif not resp:
+                        break  # empty response = approve
+                    elif refinement_round >= self._MAX_PLAN_REFINEMENTS:
+                        self.ui.on_info("[plan] max refinement rounds reached")
+                        break
+                    else:
                         # Re-run plan agent with user feedback.
                         # Strip any internal warning prefix so the
                         # agent sees the raw plan content.
@@ -1601,8 +1606,6 @@ class ChatSession:
                             output += f"\n\n---\nUser feedback: {resp}"
                             break
                         # Loop continues → show revised plan to user
-                    else:
-                        break  # empty response = approve
 
                 # Write final version to disk (overwrites initial write)
                 try:

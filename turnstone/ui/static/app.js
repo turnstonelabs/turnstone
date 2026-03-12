@@ -1650,6 +1650,10 @@ function _addInlinePlan(content, action, feedback) {
   body.innerHTML = renderMarkdown(content);
   if (content.split("\n").length > 12) {
     makeCollapsible(body);
+    body.setAttribute(
+      "aria-label",
+      "Plan content (collapsed). Activate to expand.",
+    );
   }
   wrapper.appendChild(body);
 
