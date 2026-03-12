@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 16 built-in tools plus any number of external MCP tools to the
+turnstone exposes 17 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 16 tool definitions (sent to the model). |
+| `TOOLS`             | All 17 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 16 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 17 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 15
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -168,6 +168,7 @@ Every tool defines a `primary_key`. The mapping is:
 | `recall`     | `query`     |
 | `forget`     | `key`       |
 | `notify`     | `message`   |
+| `read_resource` | `uri`    |
 
 ---
 
@@ -517,6 +518,7 @@ data.get("mergedAt") is not None
 | `forget`     | Memory     | Yes          | No    | No         | `key`       |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
+| `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---
@@ -569,7 +571,7 @@ CLI flags override the config file:
    search stays off and all tools are sent to the model directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 15 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+   - **Always-on** -- the 17 built-in tools (members of `BUILTIN_TOOL_NAMES`).
      These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
@@ -610,7 +612,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 15 built-in tools via
+4. **Merging**: MCP tools are appended after the 17 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
@@ -729,3 +731,86 @@ MCP refresh complete:
 MCP refresh complete:
   github: no changes
 ```
+
+---
+
+## MCP Resources
+
+MCP servers can expose **resources** -- named data items (files, database rows,
+API responses) addressable by URI. turnstone discovers resources at startup and
+makes them available to the model via the `read_resource` built-in tool.
+
+### Discovery
+
+During the MCP `initialize` handshake, `MCPClientManager` checks each server's
+capabilities for the `resources` capability. For servers that declare it:
+
+1. `list_resources` fetches static resources (fixed URIs).
+2. `list_resource_templates` fetches URI templates (parameterized patterns like
+   `db://tables/{table}/rows/{id}`).
+
+Both are stored as `{uri, name, description, mimeType, server}` dicts and
+merged into a unified catalog.
+
+### Resource catalog in system message
+
+The first 50 resources are injected into the system message as an XML-delimited
+block so the model knows what URIs are available:
+
+```xml
+<mcp-resources>
+  file:///project/README.md  Project readme
+  db://users/schema  User table schema
+</mcp-resources>
+Use read_resource(uri='...') to access the resources listed above.
+```
+
+### read_resource tool
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `uri`     | string | yes      | The resource URI to read. |
+
+- **What it does**: Reads the resource from its MCP server via `MCPClientManager.read_resource_sync()`. Returns text content for text resources or base64-encoded data for binary resources. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (reads external data).
+- **Agent availability**: `agent` and `task_agent`.
+
+### Capability guards
+
+The `read_resource` tool schema is always loaded (it is a built-in JSON schema),
+but resource discovery only runs for servers that declare the `resources`
+capability. Servers without the capability contribute zero resources to the
+catalog.
+
+### Refresh
+
+Resource lists stay current through the same three-tier mechanism as tool lists:
+
+1. **Push** -- Servers declaring `resources.listChanged: true` send
+   `notifications/resources/list_changed`, triggering an immediate refresh.
+2. **Periodic** -- Servers without push are polled on the configured refresh
+   interval (default 4 hours, same timer as tools).
+3. **Manual** -- `/mcp refresh` re-fetches resources alongside tools.
+
+---
+
+## MCP Prompts
+
+MCP servers can also expose **prompts** -- reusable message templates with
+optional arguments. turnstone discovers prompts at startup for servers that
+declare the `prompts` capability.
+
+### Discovery
+
+Prompt discovery mirrors resource discovery: `list_prompts` is called during
+the `initialize` handshake. Each prompt is stored with its prefixed name
+(`mcp__{server}__{prompt}`), description, and argument schema.
+
+### Invocation
+
+`MCPClientManager.get_prompt_sync()` calls the server's `get_prompt` method
+with the provided arguments and returns the expanded messages. This is used
+internally to expand prompt templates into conversation messages.
+
+Prompt-based tool invocation (the `use_prompt` tool) is planned for a future
+chunk.

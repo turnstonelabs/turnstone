@@ -3,7 +3,7 @@
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
 memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) or
 Anthropic's native Messages API via pluggable provider adapters, and gives the
-model 14 built-in tools plus external tools via MCP (Model Context Protocol) for
+model 17 built-in tools plus external tools via MCP (Model Context Protocol) for
 reading, writing, searching, planning, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.

@@ -51,6 +51,83 @@ def _fake_openai_tool(name: str = "mcp__test__search") -> dict[str, Any]:
     }
 
 
+def _fake_mcp_resource(
+    uri: str = "file:///README.md",
+    name: str = "readme",
+    description: str = "Project readme",
+    mime_type: str = "text/plain",
+) -> MagicMock:
+    """Create a mock MCP Resource object matching the SDK's Resource type."""
+    res = MagicMock()
+    res.uri = uri
+    res.name = name
+    res.description = description
+    res.mimeType = mime_type
+    return res
+
+
+def _fake_resource_dict(
+    uri: str = "file:///README.md",
+    name: str = "readme",
+    description: str = "Project readme",
+    mime_type: str = "text/plain",
+    server: str = "test",
+) -> dict[str, Any]:
+    """Create a fake resource dict as stored in per-server state."""
+    return {
+        "uri": uri,
+        "name": name,
+        "description": description,
+        "mimeType": mime_type,
+        "server": server,
+    }
+
+
+def _fake_mcp_prompt(
+    name: str = "code_review",
+    description: str = "Generate a code review",
+    arguments: list[dict[str, Any]] | None = None,
+) -> MagicMock:
+    """Create a mock MCP Prompt object matching the SDK's Prompt type."""
+    prompt = MagicMock()
+    prompt.name = name
+    prompt.description = description
+    if arguments is None:
+        arg = MagicMock()
+        arg.name = "language"
+        arg.description = "Programming language"
+        arg.required = True
+        prompt.arguments = [arg]
+    else:
+        mock_args = []
+        for a in arguments:
+            arg = MagicMock()
+            arg.name = a["name"]
+            arg.description = a.get("description", "")
+            arg.required = a.get("required", False)
+            mock_args.append(arg)
+        prompt.arguments = mock_args
+    return prompt
+
+
+def _fake_prompt_dict(
+    name: str = "mcp__test__code_review",
+    original_name: str = "code_review",
+    server: str = "test",
+    description: str = "Generate a code review",
+) -> dict[str, Any]:
+    """Create a fake prompt dict as stored in per-server state."""
+    return {
+        "name": name,
+        "original_name": original_name,
+        "server": server,
+        "description": description,
+        "arguments": [
+            {"name": "language", "description": "Programming language", "required": True}
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Schema conversion
 # ---------------------------------------------------------------------------
@@ -453,6 +530,23 @@ class TestRebuildTools:
 
 
 class TestRefreshServer:
+    @staticmethod
+    def _add_empty_resource_prompt_mocks(
+        mgr: MCPClientManager, server_name: str, mock_session: MagicMock
+    ) -> None:
+        """Add empty list_resources/list_prompts mocks so _refresh_server works."""
+        mgr._supports_resources[server_name] = True
+        mgr._supports_prompts[server_name] = True
+        empty_res = MagicMock()
+        empty_res.resources = []
+        mock_session.list_resources = AsyncMock(return_value=empty_res)
+        empty_tmpl = MagicMock()
+        empty_tmpl.resourceTemplates = []
+        mock_session.list_resource_templates = AsyncMock(return_value=empty_tmpl)
+        empty_prompts = MagicMock()
+        empty_prompts.prompts = []
+        mock_session.list_prompts = AsyncMock(return_value=empty_prompts)
+
     def test_refresh_detects_added_tools(self):
         async def _run() -> None:
             mgr = MCPClientManager({})
@@ -463,6 +557,7 @@ class TestRefreshServer:
                 _fake_mcp_tool("create"),  # new tool
             ]
             mock_session.list_tools = AsyncMock(return_value=mock_result)
+            self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             mgr._sessions["github"] = mock_session
             mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
             mgr._rebuild_tools()
@@ -481,6 +576,7 @@ class TestRefreshServer:
             mock_result = MagicMock()
             mock_result.tools = []  # all tools removed
             mock_session.list_tools = AsyncMock(return_value=mock_result)
+            self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             mgr._sessions["github"] = mock_session
             mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
             mgr._rebuild_tools()
@@ -499,6 +595,7 @@ class TestRefreshServer:
             mock_result = MagicMock()
             mock_result.tools = [_fake_mcp_tool("search")]
             mock_session.list_tools = AsyncMock(return_value=mock_result)
+            self._add_empty_resource_prompt_mocks(mgr, "github", mock_session)
             mgr._sessions["github"] = mock_session
             mgr._per_server_tools["github"] = [_fake_openai_tool("mcp__github__search")]
             mgr._rebuild_tools()
@@ -513,7 +610,7 @@ class TestRefreshServer:
         async def _run() -> None:
             mgr = MCPClientManager({})
             with pytest.raises(RuntimeError, match="not connected"):
-                await mgr._refresh_server("ghost")
+                await mgr._refresh_server_tools("ghost")
 
         asyncio.run(_run())
 
@@ -709,3 +806,441 @@ class TestSessionRefresh:
         session.handle_command("/mcp refresh")
         session.ui.on_error.assert_called_once()
         assert "MCP refresh failed" in session.ui.on_error.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# MCP Resources
+# ---------------------------------------------------------------------------
+
+
+class TestMCPResources:
+    def test_resource_discovery(self):
+        """Mock list_resources() returning 2 resources, verify get_resources()."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "fs": [
+                _fake_resource_dict("file:///a.txt", "a", "File A", "text/plain", "fs"),
+                _fake_resource_dict("file:///b.txt", "b", "File B", "text/plain", "fs"),
+            ],
+        }
+        mgr._rebuild_resources()
+        resources = mgr.get_resources()
+        assert len(resources) == 2
+        uris = {r["uri"] for r in resources}
+        assert uris == {"file:///a.txt", "file:///b.txt"}
+        assert all(r["server"] == "fs" for r in resources)
+
+    def test_rebuild_resources_copy_on_write(self):
+        """Verify mutation safety — get_resources() returns independent copy."""
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "a": [_fake_resource_dict("file:///x", "x", "", "", "a")],
+        }
+        mgr._rebuild_resources()
+        old_resources = mgr._resources
+        old_map = mgr._resource_map
+        mgr._per_server_resources["b"] = [_fake_resource_dict("file:///y", "y", "", "", "b")]
+        mgr._rebuild_resources()
+        assert mgr._resources is not old_resources
+        assert mgr._resource_map is not old_map
+
+    def test_get_resources_returns_copy(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "a": [_fake_resource_dict("file:///x", "x", "", "", "a")],
+        }
+        mgr._rebuild_resources()
+        resources = mgr.get_resources()
+        assert len(resources) == 1
+        resources.clear()
+        assert len(mgr.get_resources()) == 1
+
+    def test_read_resource_sync(self):
+        """Mock session.read_resource(), verify text extraction."""
+        mgr = MCPClientManager({})
+        mgr._resource_map = {"file:///readme": ("fs", "file:///readme")}
+        mock_session = MagicMock()
+        mgr._sessions["fs"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        # Mock the read_resource result
+        text_content = MagicMock()
+        text_content.text = "Hello, world!"
+        del text_content.blob  # ensure blob attr is absent
+        mock_result = MagicMock()
+        mock_result.contents = [text_content]
+        mock_session.read_resource = AsyncMock(return_value=mock_result)
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            output = mgr.read_resource_sync("file:///readme", timeout=5)
+            assert output == "Hello, world!"
+            mock_session.read_resource.assert_awaited_once_with("file:///readme")
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
+    def test_read_resource_sync_blob(self):
+        """Verify base64 blob extraction."""
+        mgr = MCPClientManager({})
+        mgr._resource_map = {"file:///img.png": ("fs", "file:///img.png")}
+        mock_session = MagicMock()
+        mgr._sessions["fs"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        blob_content = MagicMock(spec=["blob"])
+        blob_content.blob = "aGVsbG8="
+        mock_result = MagicMock()
+        mock_result.contents = [blob_content]
+        mock_session.read_resource = AsyncMock(return_value=mock_result)
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            output = mgr.read_resource_sync("file:///img.png", timeout=5)
+            assert output == "aGVsbG8="
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
+    def test_read_resource_sync_unknown_uri(self):
+        mgr = MCPClientManager({})
+        with pytest.raises(ValueError, match="Unknown MCP resource"):
+            mgr.read_resource_sync("file:///nonexistent")
+
+    def test_read_resource_sync_disconnected(self):
+        mgr = MCPClientManager({})
+        mgr._resource_map = {"file:///x": ("dead", "file:///x")}
+        with pytest.raises(RuntimeError, match="not connected"):
+            mgr.read_resource_sync("file:///x")
+
+    def test_read_resource_sync_timeout(self):
+        """Verify timeout handling."""
+        mgr = MCPClientManager({})
+        mgr._resource_map = {"file:///x": ("fs", "file:///x")}
+        mock_session = MagicMock()
+        mgr._sessions["fs"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        async def _slow_read(_uri: str) -> None:
+            await asyncio.sleep(10)
+
+        mock_session.read_resource = _slow_read
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            with pytest.raises(TimeoutError):
+                mgr.read_resource_sync("file:///x", timeout=1)
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
+    def test_resource_listener_notification(self):
+        """Verify callback fires on rebuild."""
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        mgr.add_resource_listener(lambda: calls.append(1))
+        mgr._per_server_resources = {"a": [_fake_resource_dict()]}
+        mgr._rebuild_resources()
+        assert len(calls) == 1
+
+    def test_resource_listener_remove(self):
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        cb = lambda: calls.append(1)  # noqa: E731
+        mgr.add_resource_listener(cb)
+        mgr.remove_resource_listener(cb)
+        mgr._rebuild_resources()
+        assert calls == []
+
+    def test_resource_listener_error_does_not_propagate(self):
+        mgr = MCPClientManager({})
+        mgr.add_resource_listener(lambda: 1 / 0)
+        mgr._rebuild_resources()  # should not raise
+
+    def test_resource_refresh_on_notification(self):
+        """Mock notification, verify re-fetch of resources."""
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = MagicMock()
+            mgr._sessions["fs"] = mock_session
+            mgr._supports_resources["fs"] = True
+
+            # Initial state
+            mgr._per_server_resources["fs"] = [
+                _fake_resource_dict("file:///old", server="fs"),
+            ]
+            mgr._rebuild_resources()
+            assert len(mgr.get_resources()) == 1
+
+            # Mock the re-fetch returning a new resource
+            new_res = _fake_mcp_resource("file:///new", "new")
+            mock_res_result = MagicMock()
+            mock_res_result.resources = [new_res]
+            mock_session.list_resources = AsyncMock(return_value=mock_res_result)
+            mock_tmpl_result = MagicMock()
+            mock_tmpl_result.resourceTemplates = []
+            mock_session.list_resource_templates = AsyncMock(return_value=mock_tmpl_result)
+
+            await mgr._refresh_server_resources("fs")
+            resources = mgr.get_resources()
+            assert len(resources) == 1
+            assert resources[0]["uri"] == "file:///new"
+
+        asyncio.run(_run())
+
+    def test_rebuild_resources_empty(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {}
+        mgr._rebuild_resources()
+        assert mgr._resources == []
+        assert mgr._resource_map == {}
+
+    def test_rebuild_resources_multi_server(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {
+            "fs": [_fake_resource_dict("file:///a", server="fs")],
+            "db": [_fake_resource_dict("db://table", name="table", server="db")],
+        }
+        mgr._rebuild_resources()
+        assert len(mgr._resources) == 2
+        assert mgr._resource_map["file:///a"] == ("fs", "file:///a")
+        assert mgr._resource_map["db://table"] == ("db", "db://table")
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts
+# ---------------------------------------------------------------------------
+
+
+class TestMCPPrompts:
+    def test_prompt_discovery(self):
+        """Mock list_prompts(), verify get_prompts() with correct prefixed names."""
+        mgr = MCPClientManager({})
+        mgr._per_server_prompts = {
+            "tmpl": [
+                _fake_prompt_dict("mcp__tmpl__code_review", "code_review", "tmpl"),
+                _fake_prompt_dict("mcp__tmpl__summarize", "summarize", "tmpl"),
+            ],
+        }
+        mgr._rebuild_prompts()
+        prompts = mgr.get_prompts()
+        assert len(prompts) == 2
+        names = {p["name"] for p in prompts}
+        assert names == {"mcp__tmpl__code_review", "mcp__tmpl__summarize"}
+        # Verify map entries
+        assert mgr._prompt_map["mcp__tmpl__code_review"] == ("tmpl", "code_review")
+        assert mgr._prompt_map["mcp__tmpl__summarize"] == ("tmpl", "summarize")
+
+    def test_rebuild_prompts_copy_on_write(self):
+        """Verify mutation safety."""
+        mgr = MCPClientManager({})
+        mgr._per_server_prompts = {
+            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
+        }
+        mgr._rebuild_prompts()
+        old_prompts = mgr._prompts
+        old_map = mgr._prompt_map
+        mgr._per_server_prompts["b"] = [_fake_prompt_dict("mcp__b__p2", "p2", "b")]
+        mgr._rebuild_prompts()
+        assert mgr._prompts is not old_prompts
+        assert mgr._prompt_map is not old_map
+
+    def test_get_prompts_returns_copy(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_prompts = {
+            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
+        }
+        mgr._rebuild_prompts()
+        prompts = mgr.get_prompts()
+        assert len(prompts) == 1
+        prompts.clear()
+        assert len(mgr.get_prompts()) == 1
+
+    def test_get_prompt_sync(self):
+        """Mock session.get_prompt(), verify message conversion."""
+        mgr = MCPClientManager({})
+        mgr._prompt_map = {"mcp__tmpl__review": ("tmpl", "review")}
+        mock_session = MagicMock()
+        mgr._sessions["tmpl"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        # Build mock PromptMessage
+        msg1 = MagicMock()
+        msg1.role = "user"
+        msg1.content = MagicMock()
+        msg1.content.text = "Review this code"
+        msg2 = MagicMock()
+        msg2.role = "assistant"
+        msg2.content = MagicMock()
+        msg2.content.text = "Looks good!"
+        mock_result = MagicMock()
+        mock_result.messages = [msg1, msg2]
+        mock_session.get_prompt = AsyncMock(return_value=mock_result)
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            messages = mgr.get_prompt_sync(
+                "mcp__tmpl__review", arguments={"language": "python"}, timeout=5
+            )
+            assert len(messages) == 2
+            assert messages[0] == {"role": "user", "content": "Review this code"}
+            assert messages[1] == {"role": "assistant", "content": "Looks good!"}
+            mock_session.get_prompt.assert_awaited_once_with(
+                "review", arguments={"language": "python"}
+            )
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
+    def test_get_prompt_sync_unknown(self):
+        mgr = MCPClientManager({})
+        with pytest.raises(ValueError, match="Unknown MCP prompt"):
+            mgr.get_prompt_sync("mcp__no__such")
+
+    def test_get_prompt_sync_disconnected(self):
+        mgr = MCPClientManager({})
+        mgr._prompt_map = {"mcp__dead__p": ("dead", "p")}
+        with pytest.raises(RuntimeError, match="not connected"):
+            mgr.get_prompt_sync("mcp__dead__p")
+
+    def test_get_prompt_sync_timeout(self):
+        """Verify timeout handling."""
+        mgr = MCPClientManager({})
+        mgr._prompt_map = {"mcp__tmpl__slow": ("tmpl", "slow")}
+        mock_session = MagicMock()
+        mgr._sessions["tmpl"] = mock_session
+        mgr._loop = asyncio.new_event_loop()
+
+        async def _slow_prompt(_name: str, *, arguments: dict[str, str] | None = None) -> None:
+            await asyncio.sleep(10)
+
+        mock_session.get_prompt = _slow_prompt
+
+        thread = None
+        try:
+            thread = __import__("threading").Thread(target=mgr._loop.run_forever, daemon=True)
+            thread.start()
+            with pytest.raises(TimeoutError):
+                mgr.get_prompt_sync("mcp__tmpl__slow", timeout=1)
+        finally:
+            mgr._loop.call_soon_threadsafe(mgr._loop.stop)
+            if thread:
+                thread.join(timeout=5)
+            mgr._loop.close()
+
+    def test_prompt_listener_notification(self):
+        """Verify callback fires on rebuild."""
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        mgr.add_prompt_listener(lambda: calls.append(1))
+        mgr._per_server_prompts = {"a": [_fake_prompt_dict()]}
+        mgr._rebuild_prompts()
+        assert len(calls) == 1
+
+    def test_prompt_listener_remove(self):
+        mgr = MCPClientManager({})
+        calls: list[int] = []
+        cb = lambda: calls.append(1)  # noqa: E731
+        mgr.add_prompt_listener(cb)
+        mgr.remove_prompt_listener(cb)
+        mgr._rebuild_prompts()
+        assert calls == []
+
+    def test_prompt_listener_error_does_not_propagate(self):
+        mgr = MCPClientManager({})
+        mgr.add_prompt_listener(lambda: 1 / 0)
+        mgr._rebuild_prompts()  # should not raise
+
+    def test_is_mcp_prompt(self):
+        """Verify name lookup."""
+        mgr = MCPClientManager({})
+        mgr._prompt_map["mcp__tmpl__review"] = ("tmpl", "review")
+        assert mgr.is_mcp_prompt("mcp__tmpl__review") is True
+        assert mgr.is_mcp_prompt("nonexistent") is False
+
+    def test_prompt_refresh_on_notification(self):
+        """Mock notification, verify re-fetch of prompts."""
+
+        async def _run() -> None:
+            mgr = MCPClientManager({})
+            mock_session = MagicMock()
+            mgr._sessions["tmpl"] = mock_session
+            mgr._supports_prompts["tmpl"] = True
+
+            # Initial state
+            mgr._per_server_prompts["tmpl"] = [
+                _fake_prompt_dict("mcp__tmpl__old", "old", "tmpl"),
+            ]
+            mgr._rebuild_prompts()
+            assert len(mgr.get_prompts()) == 1
+
+            # Mock re-fetch returning a new prompt
+            new_prompt = _fake_mcp_prompt("new_prompt", "A new prompt")
+            mock_prompt_result = MagicMock()
+            mock_prompt_result.prompts = [new_prompt]
+            mock_session.list_prompts = AsyncMock(return_value=mock_prompt_result)
+
+            await mgr._refresh_server_prompts("tmpl")
+            prompts = mgr.get_prompts()
+            assert len(prompts) == 1
+            assert prompts[0]["name"] == "mcp__tmpl__new_prompt"
+            assert prompts[0]["original_name"] == "new_prompt"
+
+        asyncio.run(_run())
+
+    def test_rebuild_prompts_empty(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_prompts = {}
+        mgr._rebuild_prompts()
+        assert mgr._prompts == []
+        assert mgr._prompt_map == {}
+
+    def test_rebuild_prompts_multi_server(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_prompts = {
+            "a": [_fake_prompt_dict("mcp__a__p1", "p1", "a")],
+            "b": [_fake_prompt_dict("mcp__b__p2", "p2", "b")],
+        }
+        mgr._rebuild_prompts()
+        assert len(mgr._prompts) == 2
+        assert mgr._prompt_map["mcp__a__p1"] == ("a", "p1")
+        assert mgr._prompt_map["mcp__b__p2"] == ("b", "p2")
+
+
+# ---------------------------------------------------------------------------
+# Shutdown cleans up new state
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownCleanup:
+    def test_shutdown_clears_resources_and_prompts(self):
+        mgr = MCPClientManager({})
+        mgr._per_server_resources = {"a": [_fake_resource_dict()]}
+        mgr._rebuild_resources()
+        mgr._per_server_prompts = {"a": [_fake_prompt_dict()]}
+        mgr._rebuild_prompts()
+        assert mgr.get_resources() != []
+        assert mgr.get_prompts() != []
+
+        mgr.shutdown()
+        assert mgr.get_resources() == []
+        assert mgr.get_prompts() == []
+        assert mgr._resource_map == {}
+        assert mgr._prompt_map == {}

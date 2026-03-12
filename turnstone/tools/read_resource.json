@@ -1,0 +1,18 @@
+{
+  "name": "read_resource",
+  "description": "Read a resource from a connected MCP server by URI. Returns the resource content (text or base64-encoded binary). Use this to access data, files, or content exposed by connected MCP servers. Available resource URIs are listed in your system context.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "uri": {
+        "type": "string",
+        "description": "The resource URI to read (e.g. 'file:///path', 'db://table/row')."
+      }
+    },
+    "required": ["uri"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": false,
+  "primary_key": "uri"
+}

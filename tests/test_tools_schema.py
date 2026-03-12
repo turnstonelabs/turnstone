@@ -72,16 +72,24 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 16
+        assert len(TOOLS) == 17
 
     def test_agent_tools_count(self):
-        assert len(AGENT_TOOLS) == 7
+        assert len(AGENT_TOOLS) == 8
 
     def test_task_agent_tools_count(self):
-        assert len(TASK_AGENT_TOOLS) == 10
+        assert len(TASK_AGENT_TOOLS) == 11
 
     def test_auto_approve_sets_match(self):
-        expected = {"read_file", "search", "math", "man", "web_fetch", "web_search", "notify"}
+        expected = {
+            "read_file",
+            "search",
+            "math",
+            "man",
+            "web_fetch",
+            "web_search",
+            "notify",
+        }
         assert expected == AGENT_AUTO_TOOLS
         assert expected == TASK_AUTO_TOOLS
 
@@ -103,6 +111,7 @@ class TestToolsMetadata:
             "forget": "key",
             "notify": "message",
             "watch": "command",
+            "read_resource": "uri",
         }
         assert expected == PRIMARY_KEY_MAP
 

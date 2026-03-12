@@ -24,29 +24,30 @@ partition "Phase 1: Prepare" #E8F5E9 {
         :Dispatch to _prepare_{func_name}();
 
         note right
-            **Dispatch table (16 tools):**
-            ┌──────────────┬──────────────────┐
-            │ Tool         │ Needs Approval?  │
-            ├──────────────┼──────────────────┤
-            │ bash         │ ✓ Yes            │
-            │ read_file    │ ✗ Auto-approve   │
-            │ write_file   │ ✓ Yes            │
-            │ edit_file    │ ✓ Yes            │
-            │ search       │ ✗ Auto-approve   │
-            │ math         │ ✓ Yes            │
-            │ man          │ ✗ Auto-approve   │
-            │ web_fetch    │ ✓ Yes            │
-            │ web_search   │ ✓ Yes            │
-            │ tool_search  │ ✗ Auto-approve   │
-            │ task         │ ✓ Yes            │
-            │ plan         │ ✓ Yes            │
-            │ remember     │ ✗ Auto-approve   │
-            │ recall       │ ✗ Auto-approve   │
-            │ forget       │ ✗ Auto-approve   │
-            │ notify       │ ✗ Auto-approve   │
-            ├──────────────┼──────────────────┤
-            │ mcp__*       │ ✓ Yes (external) │
-            └──────────────┴──────────────────┘
+            **Dispatch table (17 tools):**
+            ┌───────────────┬──────────────────┐
+            │ Tool          │ Needs Approval?  │
+            ├───────────────┼──────────────────┤
+            │ bash          │ ✓ Yes            │
+            │ read_file     │ ✗ Auto-approve   │
+            │ write_file    │ ✓ Yes            │
+            │ edit_file     │ ✓ Yes            │
+            │ search        │ ✗ Auto-approve   │
+            │ math          │ ✓ Yes            │
+            │ man           │ ✗ Auto-approve   │
+            │ web_fetch     │ ✓ Yes            │
+            │ web_search    │ ✓ Yes            │
+            │ tool_search   │ ✗ Auto-approve   │
+            │ task          │ ✓ Yes            │
+            │ plan          │ ✓ Yes            │
+            │ remember      │ ✗ Auto-approve   │
+            │ recall        │ ✗ Auto-approve   │
+            │ forget        │ ✗ Auto-approve   │
+            │ notify        │ ✗ Auto-approve   │
+            │ read_resource │ ✓ Yes            │
+            ├───────────────┼──────────────────┤
+            │ mcp__*        │ ✓ Yes (external) │
+            └───────────────┴──────────────────┘
         end note
 
         :Build item dict:
@@ -117,6 +118,7 @@ partition "Phase 3: Execute" #E3F2FD {
           ├─ _exec_remember: SQLite INSERT OR REPLACE
           ├─ _exec_recall: SQLite FTS5/LIKE search
           ├─ _exec_forget: SQLite DELETE
+          ├─ _exec_read_resource: MCPClientManager.read_resource_sync()
           └─ _exec_mcp_tool: MCPClientManager.call_tool_sync()
     end note
 

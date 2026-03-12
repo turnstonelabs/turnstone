@@ -246,6 +246,7 @@ class ChatSession:
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
+        self._mcp_resource_cb: Any = None
         if mcp_client:
             mcp_tools = mcp_client.get_tools()
             self._tools = merge_mcp_tools(TOOLS, mcp_tools)
@@ -254,6 +255,9 @@ class ChatSession:
             # Register for tool-change notifications from MCP servers
             self._mcp_refresh_cb = self._on_mcp_tools_changed
             mcp_client.add_listener(self._mcp_refresh_cb)
+            # Register for resource-change notifications
+            self._mcp_resource_cb = self._on_mcp_resources_changed
+            mcp_client.add_resource_listener(self._mcp_resource_cb)
         else:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
@@ -333,6 +337,14 @@ class ChatSession:
         self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
         self._rebuild_tool_search()
 
+    def _on_mcp_resources_changed(self) -> None:
+        """Callback from MCPClientManager when the resource list changes.
+
+        Rebuilds the system message to update the resource catalog.
+        Called on the MCP background thread.
+        """
+        self._init_system_messages()
+
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
         old_expanded = self._tool_search.get_expanded_names() if self._tool_search else []
@@ -375,6 +387,9 @@ class ChatSession:
         if self._mcp_client and self._mcp_refresh_cb:
             self._mcp_client.remove_listener(self._mcp_refresh_cb)
             self._mcp_refresh_cb = None
+        if self._mcp_client and self._mcp_resource_cb:
+            self._mcp_client.remove_resource_listener(self._mcp_resource_cb)
+            self._mcp_resource_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
 
@@ -583,6 +598,19 @@ class ChatSession:
                     "\n\nAdditional tools are available via tool_search. "
                     "Use it when you need a capability not in your current tool set."
                 )
+        # MCP resource catalog (lets the model know what's available for read_resource)
+        if self._mcp_client:
+            resources = self._mcp_client.get_resources()
+            if resources:
+                lines = ["\n<mcp-resources>"]
+                for r in resources[:50]:
+                    desc = r.get("description", "")
+                    if desc:
+                        desc = f"  {desc[:100]}"
+                    lines.append(f"  {r['uri']}{desc}")
+                lines.append("</mcp-resources>")
+                lines.append("Use read_resource(uri='...') to access the resources listed above.")
+                dev_parts.append("\n".join(lines))
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -1690,6 +1718,7 @@ class ChatSession:
             "forget": self._prepare_forget,
             "notify": self._prepare_notify,
             "watch": self._prepare_watch,
+            "read_resource": self._prepare_read_resource,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2370,6 +2399,58 @@ class ChatSession:
 
         output = self._truncate_output(output)
         self.ui.on_tool_result(call_id, func_name, output)
+        return call_id, output
+
+    def _prepare_read_resource(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare an MCP resource read."""
+        uri = args.get("uri", "")
+        if not uri:
+            return {
+                "call_id": call_id,
+                "func_name": "read_resource",
+                "header": "\u2717 read_resource: missing uri",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Missing required parameter: uri",
+            }
+        if not self._mcp_client:
+            return {
+                "call_id": call_id,
+                "func_name": "read_resource",
+                "header": "\u2717 read_resource: no MCP servers",
+                "preview": "",
+                "needs_approval": False,
+                "error": "No MCP servers configured",
+            }
+        return {
+            "call_id": call_id,
+            "func_name": "read_resource",
+            "header": "\u2699 read_resource",
+            "preview": f"{DIM}    uri: {uri}{RESET}",
+            "needs_approval": True,
+            "approval_label": "mcp_resource",
+            "execute": self._exec_read_resource,
+            "resource_uri": uri,
+        }
+
+    def _exec_read_resource(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Read an MCP resource by URI."""
+        call_id: str = item["call_id"]
+        uri: str = item["resource_uri"]
+
+        assert self._mcp_client is not None
+        try:
+            output = self._mcp_client.read_resource_sync(uri, timeout=self.tool_timeout)
+        except TimeoutError:
+            output = f"MCP resource read timed out after {self.tool_timeout}s"
+            self.ui.on_error(output)
+        except Exception:
+            log.warning("MCP resource read failed for %s", uri, exc_info=True)
+            output = "MCP resource error: failed to read resource"
+            self.ui.on_error(output)
+
+        output = self._truncate_output(output)
+        self.ui.on_tool_result(call_id, "read_resource", output)
         return call_id, output
 
     # -- Execute methods (do the work, report output via UI) -------------------
@@ -4062,14 +4143,35 @@ class ChatSession:
                 self._handle_mcp_refresh(arg)
             else:
                 tools = self._mcp_client.get_tools()
-                if not tools:
-                    self.ui.on_info("MCP client connected but no tools available.")
-                else:
-                    lines = [f"MCP tools ({len(tools)}):"]
+                resources = self._mcp_client.get_resources()
+                prompts = self._mcp_client.get_prompts()
+                lines: list[str] = []
+                if tools:
+                    lines.append(f"MCP tools ({len(tools)}):")
                     for t in tools:
                         name = t["function"]["name"]
                         desc = t["function"].get("description", "")[:80]
                         lines.append(f"  {name}  {dim(desc)}")
+                if resources:
+                    if lines:
+                        lines.append("")
+                    lines.append(f"MCP resources ({len(resources)}):")
+                    for r in resources:
+                        desc = r.get("description", "")[:80]
+                        lines.append(f"  {r['uri']}  {dim(desc)}")
+                if prompts:
+                    if lines:
+                        lines.append("")
+                    lines.append(f"MCP prompts ({len(prompts)}):")
+                    for p in prompts:
+                        arg_names = ", ".join(a["name"] for a in p.get("arguments", []))
+                        desc = p.get("description", "")[:60]
+                        lines.append(f"  {p['name']}({arg_names})  {dim(desc)}")
+                if not lines:
+                    self.ui.on_info(
+                        "MCP client connected but no tools, resources, or prompts available."
+                    )
+                else:
                     self.ui.on_info("\n".join(lines))
 
         elif cmd == "/help":
@@ -4094,7 +4196,7 @@ class ChatSession:
                         "  /reason [low|med|high] Set/show reasoning effort",
                         "  /creative              Toggle creative writing mode (no tools)",
                         "  /debug                 Toggle raw SSE delta logging",
-                        "  /mcp [refresh [server]] List or refresh MCP tools",
+                        "  /mcp [refresh [server]] List or refresh MCP tools, resources, and prompts",
                         "  /help                  Show this help",
                         "  /exit                  Exit (also: Ctrl+D)",
                         "────────────────────────────────────────────────────────",

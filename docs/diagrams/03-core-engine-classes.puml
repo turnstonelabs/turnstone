@@ -211,15 +211,23 @@ enum "WorkstreamState" as WsState {
 class "MCPClientManager" as MCPMgr {
     - _sessions: dict[str, ClientSession]
     - _per_server_tools: dict[str, list[dict]]
+    - _per_server_resources: dict[str, list[dict]]
+    - _per_server_prompts: dict[str, list[dict]]
     - _tools: list[dict]
     - _tool_map: dict[str, tuple]
+    - _resource_map: dict[str, tuple]
+    - _prompt_map: dict[str, tuple]
     - _supports_list_changed: dict[str, bool]
     - _listeners: list[Callable]
     --
     + start()
     + get_tools() → list[dict]
+    + get_resources() → list[dict]
+    + get_prompts() → list[dict]
     + is_mcp_tool(name) → bool
     + call_tool_sync(name, args) → str
+    + read_resource_sync(uri) → str
+    + get_prompt_sync(name, args?) → list[dict]
     + refresh_sync(server?) → dict
     + add_listener(callback)
     + remove_listener(callback)
@@ -230,6 +238,8 @@ class "MCPClientManager" as MCPMgr {
     bridges async MCP SDK to
     sync ChatSession dispatch.
     Push + periodic + manual refresh.
+    Resources + prompts discovered
+    alongside tools at startup.
     --
     core/mcp_client.py
 }
