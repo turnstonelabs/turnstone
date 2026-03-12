@@ -1609,3 +1609,69 @@ class TestSSEProxy:
             assert b"chunk3" not in body
 
         asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Collector — MCP aggregation in get_overview()
+# ---------------------------------------------------------------------------
+
+
+class TestCollectorMCPAggregation:
+    """Verify MCP server/resource/prompt aggregation in overview and snapshot."""
+
+    def test_overview_mcp_aggregation(self):
+        """Two nodes with MCP data produce correct sums in the overview."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            health={"mcp": {"servers": 2, "resources": 5, "prompts": 3}},
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b",
+            server_url="http://b:8080",
+            health={"mcp": {"servers": 1, "resources": 4, "prompts": 2}},
+        )
+
+        overview = c.get_overview()
+        assert overview["mcp_servers"] == 3
+        assert overview["mcp_resources"] == 9
+        assert overview["mcp_prompts"] == 5
+
+    def test_overview_mcp_absent_when_zero(self):
+        """Nodes without MCP data produce no mcp_servers key in the overview."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            health={"status": "ok"},
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b",
+            server_url="http://b:8080",
+            health={},
+        )
+
+        overview = c.get_overview()
+        assert "mcp_servers" not in overview
+        assert "mcp_resources" not in overview
+        assert "mcp_prompts" not in overview
+
+    def test_overview_mcp_mixed_nodes(self):
+        """One node with MCP, one without — only the MCP node contributes."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            health={"mcp": {"servers": 3, "resources": 10, "prompts": 7}},
+        )
+        c._nodes["node-b"] = NodeSnapshot(
+            node_id="node-b",
+            server_url="http://b:8080",
+            health={"status": "ok"},
+        )
+
+        overview = c.get_overview()
+        assert overview["mcp_servers"] == 3
+        assert overview["mcp_resources"] == 10
+        assert overview["mcp_prompts"] == 7

@@ -502,10 +502,6 @@ class StorageBackend(Protocol):
         """Delete a prompt template. Returns True if found."""
         ...
 
-    def delete_prompt_templates_by_server(self, mcp_server: str) -> int:
-        """Delete all prompt templates from a given MCP server. Returns count deleted."""
-        ...
-
     # -- Usage events ----------------------------------------------------------
 
     def record_usage_event(

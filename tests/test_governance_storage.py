@@ -424,17 +424,6 @@ class TestPromptTemplateCRUD:
         assert "mcp_one" in names
         assert "mcp_two" in names
 
-    def test_delete_prompt_templates_by_server(self, db):
-        db.create_prompt_template("t1", "a", "mcp", "A", origin="mcp", mcp_server="srv1")
-        db.create_prompt_template("t2", "b", "mcp", "B", origin="mcp", mcp_server="srv1")
-        db.create_prompt_template("t3", "c", "mcp", "C", origin="mcp", mcp_server="srv2")
-        deleted = db.delete_prompt_templates_by_server("srv1")
-        assert deleted == 2
-        # Only srv2 template remains.
-        remaining = db.list_prompt_templates()
-        assert len(remaining) == 1
-        assert remaining[0]["mcp_server"] == "srv2"
-
 
 # ---------------------------------------------------------------------------
 # Usage Events

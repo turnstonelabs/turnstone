@@ -1598,14 +1598,6 @@ class PostgreSQLBackend:
             conn.commit()
             return result.rowcount > 0
 
-    def delete_prompt_templates_by_server(self, mcp_server: str) -> int:
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                sa.delete(prompt_templates).where(prompt_templates.c.mcp_server == mcp_server)
-            )
-            conn.commit()
-            return result.rowcount
-
     # -- Usage events ----------------------------------------------------------
 
     def record_usage_event(
