@@ -134,6 +134,7 @@ class MCPClientManager:
 
         # Governance storage (optional — set via set_storage())
         self._storage: Any = None
+        self._sync_lock = threading.Lock()
 
         # Periodic refresh for servers without push notifications
         self._refresh_interval = refresh_interval
@@ -673,10 +674,17 @@ class MCPClientManager:
         """Sync discovered MCP prompts into the prompt_templates governance table.
 
         Returns ``{"added": [...], "removed": [...], "skipped": [...]}``.
+        Thread-safe: serialized via ``_sync_lock`` to prevent races
+        between ``set_storage()`` (main thread) and MCP background thread.
         """
         if self._storage is None:
             return {"added": [], "removed": [], "skipped": []}
 
+        with self._sync_lock:
+            return self._sync_prompts_locked()
+
+    def _sync_prompts_locked(self) -> dict[str, Any]:
+        """Inner sync logic — must be called under ``_sync_lock``."""
         storage = self._storage
         added: list[str] = []
         removed: list[str] = []
@@ -787,6 +795,10 @@ class MCPClientManager:
         self._per_server_prompts.clear()
         self._supports_prompts.clear()
         self._supports_prompt_list_changed.clear()
+        # Clear listener lists to release callback references
+        self._listeners.clear()
+        self._resource_listeners.clear()
+        self._prompt_listeners.clear()
 
         log.info("MCP client shut down")
 

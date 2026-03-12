@@ -1,0 +1,23 @@
+{
+  "name": "use_prompt",
+  "description": "Invoke an MCP prompt template by name, expanding it into messages. Returns the expanded prompt content that can be used as context or instructions.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "The prompt name (e.g. 'mcp__server__prompt_name')."
+      },
+      "arguments": {
+        "type": "object",
+        "description": "Key-value argument pairs for the prompt.",
+        "additionalProperties": { "type": "string" }
+      }
+    },
+    "required": ["name"]
+  },
+  "agent": true,
+  "task_agent": true,
+  "auto_approve": false,
+  "primary_key": "name"
+}

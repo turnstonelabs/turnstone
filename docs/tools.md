@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 17 built-in tools plus any number of external MCP tools to the
+turnstone exposes 18 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 17 tool definitions (sent to the model). |
+| `TOOLS`             | All 18 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 17 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 18 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 18
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -169,6 +169,7 @@ Every tool defines a `primary_key`. The mapping is:
 | `forget`     | `key`       |
 | `notify`     | `message`   |
 | `read_resource` | `uri`    |
+| `use_prompt` | `name`     |
 
 ---
 
@@ -519,6 +520,7 @@ data.get("mergedAt") is not None
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
 | `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
+| `use_prompt` | MCP        | No           | Yes   | Yes        | `name`      |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---
@@ -571,7 +573,7 @@ CLI flags override the config file:
    search stays off and all tools are sent to the model directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 17 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+   - **Always-on** -- the 18 built-in tools (members of `BUILTIN_TOOL_NAMES`).
      These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
@@ -612,7 +614,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 17 built-in tools via
+4. **Merging**: MCP tools are appended after the 18 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
@@ -806,11 +808,22 @@ Prompt discovery mirrors resource discovery: `list_prompts` is called during
 the `initialize` handshake. Each prompt is stored with its prefixed name
 (`mcp__{server}__{prompt}`), description, and argument schema.
 
+### use_prompt tool
+
+| Parameter   | Type   | Required | Description |
+|-------------|--------|----------|-------------|
+| `name`      | string | yes      | The prompt name (e.g. `mcp__server__prompt_name`). |
+| `arguments` | object | no       | Key-value argument pairs for the prompt. Values must be strings. |
+
+- **What it does**: Invokes an MCP prompt template by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
+- **Auto-approve**: No -- requires user confirmation (invokes external prompt servers).
+- **Agent availability**: `agent` and `task_agent`.
+
 ### Invocation
 
 `MCPClientManager.get_prompt_sync()` calls the server's `get_prompt` method
-with the provided arguments and returns the expanded messages. This is used
-internally to expand prompt templates into conversation messages.
+with the provided arguments and returns the expanded messages. The `use_prompt`
+built-in tool exposes this to the model as a function call.
 
 ### Governance Sync
 
@@ -833,5 +846,6 @@ governance table as first-class governed templates:
 - **Schema**: Migration 009 adds `origin`, `mcp_server`, and `readonly`
   columns to the `prompt_templates` table.
 
-Prompt-based tool invocation (the `use_prompt` tool) is planned for a future
-chunk.
+The `use_prompt` tool allows the model to invoke any discovered MCP prompt at
+runtime. A catalog of up to 30 prompts is injected into the system message
+inside `<mcp-prompts>` XML tags so the model can discover available prompts.

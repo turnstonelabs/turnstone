@@ -96,7 +96,7 @@ package "turnstone/sdk/" <<Rectangle>> {
 
 ' Tool schemas
 package "turnstone/tools/" <<Rectangle>> {
-    component [*.json\n17 tool schemas] as schemas <<artifact>>
+    component [*.json\n18 tool schemas] as schemas <<artifact>>
 }
 
 ' Entry point dependencies
