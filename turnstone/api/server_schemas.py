@@ -143,6 +143,12 @@ class WorkstreamCounts(BaseModel):
     error: int = 0
 
 
+class McpStatus(BaseModel):
+    servers: int = 0
+    resources: int = 0
+    prompts: int = 0
+
+
 class HealthResponse(BaseModel):
     status: str = Field(examples=["ok", "degraded"])
     version: str = ""
@@ -150,3 +156,4 @@ class HealthResponse(BaseModel):
     model: str = ""
     workstreams: WorkstreamCounts = WorkstreamCounts()
     backend: BackendStatus | None = None
+    mcp: McpStatus | None = None

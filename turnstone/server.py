@@ -772,8 +772,8 @@ async def health(request: Request) -> JSONResponse:
     if mc:
         data["mcp"] = {
             "servers": mc.server_count,
-            "resources": len(mc.get_resources()),
-            "prompts": len(mc.get_prompts()),
+            "resources": mc.resource_count,
+            "prompts": mc.prompt_count,
         }
     return JSONResponse(data)
 
@@ -803,8 +803,8 @@ async def metrics_endpoint(request: Request) -> Response:
     if mc:
         mcp_info = {
             "servers": mc.server_count,
-            "resources": len(mc.get_resources()),
-            "prompts": len(mc.get_prompts()),
+            "resources": mc.resource_count,
+            "prompts": mc.prompt_count,
         }
     content = _metrics.generate_text(
         workstream_states=states,

@@ -159,6 +159,12 @@ export interface WorkstreamCounts {
   error?: number;
 }
 
+export interface McpStatus {
+  servers: number;
+  resources: number;
+  prompts: number;
+}
+
 export interface HealthResponse {
   status: string;
   version?: string;
@@ -166,6 +172,7 @@ export interface HealthResponse {
   model?: string;
   workstreams?: WorkstreamCounts;
   backend?: BackendStatus | null;
+  mcp?: McpStatus | null;
 }
 
 // ---------------------------------------------------------------------------

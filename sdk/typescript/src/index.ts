@@ -91,6 +91,7 @@ export type {
   SavedWorkstreamInfo,
   ListSavedWorkstreamsResponse,
   BackendStatus,
+  McpStatus,
   WorkstreamCounts,
   HealthResponse,
   AuthLoginRequest,

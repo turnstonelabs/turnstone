@@ -806,15 +806,25 @@ class MCPClientManager:
 
     def get_tools(self) -> list[dict[str, Any]]:
         """Return MCP tools in OpenAI function-calling format."""
-        return list(self._tools)
+        return [dict(t) for t in self._tools]
 
     def get_resources(self) -> list[dict[str, Any]]:
-        """Return discovered MCP resources."""
-        return list(self._resources)
+        """Return discovered MCP resources (shallow-copied dicts)."""
+        return [dict(r) for r in self._resources]
 
     def get_prompts(self) -> list[dict[str, Any]]:
-        """Return discovered MCP prompts."""
-        return list(self._prompts)
+        """Return discovered MCP prompts (shallow-copied dicts)."""
+        return [dict(p) for p in self._prompts]
+
+    @property
+    def resource_count(self) -> int:
+        """Number of discovered resources (no allocation)."""
+        return len(self._resources)
+
+    @property
+    def prompt_count(self) -> int:
+        """Number of discovered prompts (no allocation)."""
+        return len(self._prompts)
 
     def is_mcp_tool(self, func_name: str) -> bool:
         """Check whether *func_name* belongs to an MCP server."""

@@ -639,10 +639,11 @@ class ChatSession:
             if prompts:
                 lines = ["<mcp-prompts>"]
                 for p in prompts[:30]:
-                    arg_names = ", ".join(_html_escape(a["name"]) for a in p.get("arguments", []))
+                    # Names/args are NOT escaped — model must use exact strings
+                    # in use_prompt(). Only description (display-only) is escaped.
+                    arg_names = ", ".join(a["name"] for a in p.get("arguments", []))
                     desc = _html_escape(p.get("description", "")[:100])
-                    name = _html_escape(p["name"])
-                    lines.append(f"  {name}({arg_names})  {desc}")
+                    lines.append(f"  {p['name']}({arg_names})  {desc}")
                 lines.append("</mcp-prompts>")
                 lines.append(
                     "Use use_prompt(name='...', arguments={...}) "
