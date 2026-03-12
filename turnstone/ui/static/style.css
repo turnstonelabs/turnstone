@@ -515,6 +515,56 @@
 #btn-plan-approve { background: var(--green); color: var(--on-color); }
 #btn-plan-reject { background: var(--red); color: var(--on-color); }
 
+/* Inline plan block (rendered in chat after plan review) */
+.plan-inline {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.plan-inline-header {
+  padding: 6px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.plan-inline-label.plan-approved { color: var(--green); }
+.plan-inline-label.plan-rejected { color: var(--red); }
+.plan-inline-label.plan-amending { color: var(--accent); }
+.plan-inline-body {
+  padding: 10px 14px;
+  background: var(--code-bg);
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.plan-inline-body.collapsed { max-height: 150px; position: relative; }
+.plan-inline-body.collapsed::after {
+  content: 'click to expand';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  text-align: center;
+  padding: 8px 0 4px;
+  background: linear-gradient(transparent, var(--code-bg));
+  color: var(--fg-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+.plan-inline-body h2, .plan-inline-body h3 { font-size: 13px; margin: 10px 0 4px; color: var(--accent); }
+.plan-inline-body p { margin: 4px 0; }
+.plan-inline-body ol, .plan-inline-body ul { margin: 4px 0; padding-left: 20px; }
+.plan-inline-feedback {
+  padding: 6px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--accent);
+  font-style: italic;
+}
+
 /* ==========================================================================
    Focus indicators — server-specific overrides
    ========================================================================== */

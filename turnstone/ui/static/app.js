@@ -1570,7 +1570,9 @@ function scrollToBottom(force) {
 }
 
 // --- Plan review dialog ---
+var _planContent = "";
 function showPlanDialog(content) {
+  _planContent = content;
   document.getElementById("plan-content").textContent = content;
   var feedbackEl = document.getElementById("plan-feedback");
   feedbackEl.value = "";
@@ -1604,6 +1606,13 @@ function resolvePlan(defaultFeedback) {
   inputEl.disabled = false;
   sendBtn.disabled = false;
   inputEl.focus();
+
+  // Render plan inline in the chat
+  var isReject = feedback === "reject";
+  var isAmend = feedback && !isReject;
+  var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+  _addInlinePlan(_planContent, action, feedback);
+
   authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1611,6 +1620,39 @@ function resolvePlan(defaultFeedback) {
   }).catch(function (err) {
     addErrorMessage("Connection error: " + err.message);
   });
+}
+
+function _addInlinePlan(content, action, feedback) {
+  var wrapper = document.createElement("div");
+  wrapper.className = "plan-inline";
+
+  var header = document.createElement("div");
+  header.className = "plan-inline-header";
+  var label =
+    action === "rejected"
+      ? "Plan rejected"
+      : action === "amending"
+        ? "Plan — amending"
+        : "Plan approved";
+  header.innerHTML =
+    '<span class="plan-inline-label plan-' + action + '">' + label + "</span>";
+  wrapper.appendChild(header);
+
+  var body = document.createElement("div");
+  body.className = "plan-inline-body";
+  body.innerHTML = renderMarkdown(content);
+  makeCollapsible(body);
+  wrapper.appendChild(body);
+
+  if (feedback && action === "amending") {
+    var fb = document.createElement("div");
+    fb.className = "plan-inline-feedback";
+    fb.textContent = "Feedback: " + feedback;
+    wrapper.appendChild(fb);
+  }
+
+  messagesEl.appendChild(wrapper);
+  scrollToBottom();
 }
 
 // --- Send message ---
