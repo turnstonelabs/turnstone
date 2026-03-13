@@ -108,14 +108,15 @@ def upgrade() -> None:
                     last_assistant_id = None
                 i += 1
 
-        # Delete consumed tool_call rows
-        if ids_to_delete:
+        # Delete consumed tool_call rows (chunked to avoid SQL size limits)
+        chunk_size = 500
+        for start in range(0, len(ids_to_delete), chunk_size):
+            chunk = ids_to_delete[start : start + chunk_size]
+            placeholders = ",".join(f":id{j}" for j in range(len(chunk)))
+            params = {f"id{j}": cid for j, cid in enumerate(chunk)}
             conn.execute(
-                sa.text(
-                    "DELETE FROM conversations WHERE id IN ("
-                    + ",".join(str(d) for d in ids_to_delete)
-                    + ")"
-                )
+                sa.text(f"DELETE FROM conversations WHERE id IN ({placeholders})"),
+                params,
             )
 
     # 3. Rename tool_result → tool
@@ -125,7 +126,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     conn = op.get_bind()
 
-    # Restore tool_result role from tool rows that have a tool_call_id
+    # Restore tool_result role
     conn.execute(
         sa.text(
             "UPDATE conversations SET role = 'tool_result' "
@@ -133,40 +134,96 @@ def downgrade() -> None:
         )
     )
 
-    # Explode assistant rows that have tool_calls back into separate rows.
-    # For each assistant row with tool_calls, insert tool_call rows after it.
-    rows = conn.execute(
+    # Explode assistant rows that have tool_calls back into separate
+    # tool_call rows.  We must preserve chronological ordering by id,
+    # so we rebuild via a temp table rather than appending INSERTs
+    # (which would get new auto-increment IDs at the end).
+    import json as _json
+
+    rows_with_tc = conn.execute(
         sa.text(
             "SELECT id, ws_id, timestamp, tool_calls FROM conversations "
             "WHERE role = 'assistant' AND tool_calls IS NOT NULL"
         )
     ).fetchall()
 
-    import json as _json
+    if rows_with_tc:
+        # Build the expanded rows to insert after each assistant row.
+        # Key: assistant row id → list of tool_call dicts to insert.
+        expansions: dict[int, list[dict[str, str]]] = {}
+        for row_id, ws_id, ts, tc_json in rows_with_tc:
+            calls = _json.loads(tc_json)
+            expanded: list[dict[str, str]] = []
+            for call in calls:
+                fn = call.get("function", {})
+                expanded.append(
+                    {
+                        "ws_id": ws_id,
+                        "timestamp": ts,
+                        "role": "tool_call",
+                        "tool_name": fn.get("name", ""),
+                        "tool_args": fn.get("arguments", ""),
+                        "tool_call_id": call.get("id", ""),
+                    }
+                )
+            if expanded:
+                expansions[row_id] = expanded
 
-    for row_id, ws_id, ts, tc_json in rows:
-        calls = _json.loads(tc_json)
-        for call in calls:
-            fn = call.get("function", {})
+        # Create temp table, copy all rows with tool_call rows interleaved
+        conn.execute(sa.text("CREATE TABLE _conv_rebuild AS SELECT * FROM conversations WHERE 0"))
+        all_rows = conn.execute(
+            sa.text(
+                "SELECT id, ws_id, timestamp, role, content, tool_name, "
+                "tool_args, tool_call_id, provider_data, tool_calls "
+                "FROM conversations ORDER BY id"
+            )
+        ).fetchall()
+
+        for row in all_rows:
+            rid = row[0]
             conn.execute(
                 sa.text(
-                    "INSERT INTO conversations "
-                    "(ws_id, timestamp, role, content, tool_name, tool_args, tool_call_id) "
-                    "VALUES (:ws_id, :ts, 'tool_call', NULL, :tn, :ta, :tcid)"
+                    "INSERT INTO _conv_rebuild "
+                    "(ws_id, timestamp, role, content, tool_name, tool_args, "
+                    "tool_call_id, provider_data, tool_calls) "
+                    "VALUES (:ws_id, :ts, :role, :content, :tn, :ta, :tcid, :pd, NULL)"
                 ),
                 {
-                    "ws_id": ws_id,
-                    "ts": ts,
-                    "tn": fn.get("name", ""),
-                    "ta": fn.get("arguments", ""),
-                    "tcid": call.get("id", ""),
+                    "ws_id": row[1],
+                    "ts": row[2],
+                    "role": row[3],
+                    "content": row[4],
+                    "tn": row[5],
+                    "ta": row[6],
+                    "tcid": row[7],
+                    "pd": row[8],
                 },
             )
-        # Clear tool_calls column on the assistant row
+            # Insert expanded tool_call rows right after the assistant row
+            if rid in expansions:
+                for tc in expansions[rid]:
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO _conv_rebuild "
+                            "(ws_id, timestamp, role, content, tool_name, tool_args, "
+                            "tool_call_id, provider_data, tool_calls) "
+                            "VALUES (:ws_id, :ts, 'tool_call', NULL, :tn, :ta, :tcid, NULL, NULL)"
+                        ),
+                        tc,
+                    )
+
+        conn.execute(sa.text("DELETE FROM conversations"))
         conn.execute(
-            sa.text("UPDATE conversations SET tool_calls = NULL WHERE id = :rid"),
-            {"rid": row_id},
+            sa.text(
+                "INSERT INTO conversations "
+                "(ws_id, timestamp, role, content, tool_name, tool_args, "
+                "tool_call_id, provider_data, tool_calls) "
+                "SELECT ws_id, timestamp, role, content, tool_name, tool_args, "
+                "tool_call_id, provider_data, tool_calls "
+                "FROM _conv_rebuild ORDER BY id"
+            )
         )
+        conn.execute(sa.text("DROP TABLE _conv_rebuild"))
 
     with op.batch_alter_table("conversations") as batch_op:
         batch_op.drop_column("tool_calls")
