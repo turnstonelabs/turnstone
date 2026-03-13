@@ -765,6 +765,9 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
 | `template`       | string | ""      | Prompt template name (replaces default templates; 400 if not found)|
+| `ws_template`    | string | ""      | Workstream template name. Applies model, temperature, reasoning effort, max tokens, auto-approve policy, and token budget. Returns 400 if not found or disabled. |
+
+> **Template precedence:** When `ws_template` is specified, its model override takes effect before workstream creation. Both `template` (prompt template) and `ws_template` (workstream template) can be used together — `ws_template` controls the behavioral profile while `template` sets the system message text. If `ws_template` defines its own system prompt or prompt template reference, that takes precedence over the `template` parameter.
 
 **Response (success):**
 

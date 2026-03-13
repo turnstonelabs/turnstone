@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +23,8 @@ from turnstone.core.storage._schema import (
     user_roles,
     users,
     workstream_config,
+    workstream_template_versions,
+    workstream_templates,
     workstreams,
 )
 from turnstone.core.storage._sqlite import _reconstruct_messages
@@ -44,6 +47,25 @@ _ROLE_MUTABLE = frozenset({"display_name", "permissions"})
 _ORG_MUTABLE = frozenset({"display_name", "settings"})
 _POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
 _TEMPLATE_MUTABLE = frozenset({"name", "content", "category", "variables", "is_default"})
+_WS_TEMPLATE_MUTABLE = frozenset(
+    {
+        "name",
+        "description",
+        "system_prompt",
+        "prompt_template",
+        "prompt_template_hash",
+        "model",
+        "auto_approve",
+        "auto_approve_tools",
+        "temperature",
+        "reasoning_effort",
+        "max_tokens",
+        "token_budget",
+        "agent_max_turns",
+        "notify_on_complete",
+        "enabled",
+    }
+)
 
 
 class PostgreSQLBackend:
@@ -330,6 +352,8 @@ class PostgreSQLBackend:
         user_id: str | None = None,
         alias: str | None = None,
         title: str | None = None,
+        ws_template_id: str = "",
+        ws_template_version: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -347,6 +371,8 @@ class PostgreSQLBackend:
                         "state": state,
                         "alias": alias,
                         "title": title,
+                        "ws_template_id": ws_template_id,
+                        "ws_template_version": ws_template_version,
                         "created": now,
                         "updated": now,
                     },
@@ -360,6 +386,22 @@ class PostgreSQLBackend:
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
                 .values(state=state, updated=now)
+            )
+            conn.commit()
+
+    def update_workstream_template(
+        self, ws_id: str, ws_template_id: str, ws_template_version: int
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id == ws_id)
+                .values(
+                    ws_template_id=ws_template_id,
+                    ws_template_version=ws_template_version,
+                    updated=now,
+                )
             )
             conn.commit()
 
@@ -864,6 +906,7 @@ class PostgreSQLBackend:
         created_by: str,
         next_run: str,
         template: str = "",
+        ws_template: str = "",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -886,6 +929,7 @@ class PostgreSQLBackend:
                     auto_approve=1 if auto_approve else 0,
                     auto_approve_tools=",".join(auto_approve_tools),
                     template=template,
+                    ws_template=ws_template,
                     enabled=1,
                     created_by=created_by,
                     next_run=next_run,
@@ -929,6 +973,7 @@ class PostgreSQLBackend:
             "auto_approve",
             "auto_approve_tools",
             "template",
+            "ws_template",
             "enabled",
             "last_run",
             "next_run",
@@ -1612,6 +1657,182 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- Workstream templates --------------------------------------------------
+
+    def create_ws_template(
+        self,
+        ws_template_id: str,
+        name: str,
+        description: str = "",
+        system_prompt: str = "",
+        prompt_template: str = "",
+        prompt_template_hash: str = "",
+        model: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        temperature: float | None = None,
+        reasoning_effort: str = "",
+        max_tokens: int | None = None,
+        token_budget: int = 0,
+        agent_max_turns: int | None = None,
+        notify_on_complete: str = "{}",
+        org_id: str = "",
+        created_by: str = "",
+        enabled: bool = True,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(workstream_templates),
+                {
+                    "ws_template_id": ws_template_id,
+                    "name": name,
+                    "description": description,
+                    "system_prompt": system_prompt,
+                    "prompt_template": prompt_template,
+                    "prompt_template_hash": prompt_template_hash,
+                    "model": model,
+                    "auto_approve": 1 if auto_approve else 0,
+                    "auto_approve_tools": auto_approve_tools,
+                    "temperature": temperature,
+                    "reasoning_effort": reasoning_effort,
+                    "max_tokens": max_tokens,
+                    "token_budget": token_budget,
+                    "agent_max_turns": agent_max_turns,
+                    "notify_on_complete": notify_on_complete,
+                    "org_id": org_id,
+                    "created_by": created_by,
+                    "enabled": 1 if enabled else 0,
+                    "version": 1,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_ws_template(self, ws_template_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstream_templates).where(
+                    workstream_templates.c.ws_template_id == ws_template_id
+                )
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "auto_approve", "enabled")
+            return None
+
+    def get_ws_template_by_name(self, name: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstream_templates).where(workstream_templates.c.name == name)
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "auto_approve", "enabled")
+            return None
+
+    def list_ws_templates(
+        self, org_id: str = "", enabled_only: bool = False
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(workstream_templates).order_by(workstream_templates.c.name)
+            if org_id:
+                q = q.where(workstream_templates.c.org_id == org_id)
+            if enabled_only:
+                q = q.where(workstream_templates.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "auto_approve", "enabled") for r in rows]
+
+    def update_ws_template(self, ws_template_id: str, changed_by: str = "", **fields: Any) -> bool:
+        with self._engine.connect() as conn:
+            # Snapshot current state before updating
+            current = conn.execute(
+                sa.select(workstream_templates).where(
+                    workstream_templates.c.ws_template_id == ws_template_id
+                )
+            ).fetchone()
+            if not current:
+                return False
+            cur = _row_to_dict(current, "auto_approve", "enabled")
+
+            # Create version snapshot
+            now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+            conn.execute(
+                sa.insert(workstream_template_versions),
+                {
+                    "ws_template_id": ws_template_id,
+                    "version": cur["version"],
+                    "snapshot": json.dumps(cur, default=str),
+                    "changed_by": changed_by,
+                    "created": now,
+                },
+            )
+
+            # Filter to allowed fields
+            dropped = set(fields) - _WS_TEMPLATE_MUTABLE
+            if dropped:
+                log.warning("update_ws_template: ignoring unknown fields: %s", dropped)
+            fields = {k: v for k, v in fields.items() if k in _WS_TEMPLATE_MUTABLE}
+            fields["updated"] = now
+            fields["version"] = cur["version"] + 1
+            if "auto_approve" in fields:
+                fields["auto_approve"] = int(fields["auto_approve"])
+            if "enabled" in fields:
+                fields["enabled"] = int(fields["enabled"])
+
+            result = conn.execute(
+                sa.update(workstream_templates)
+                .where(workstream_templates.c.ws_template_id == ws_template_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_ws_template(self, ws_template_id: str) -> bool:
+        with self._engine.connect() as conn:
+            # Cascade-delete versions first
+            conn.execute(
+                sa.delete(workstream_template_versions).where(
+                    workstream_template_versions.c.ws_template_id == ws_template_id
+                )
+            )
+            result = conn.execute(
+                sa.delete(workstream_templates).where(
+                    workstream_templates.c.ws_template_id == ws_template_id
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def create_ws_template_version(
+        self,
+        ws_template_id: str,
+        version: int,
+        snapshot: str,
+        changed_by: str = "",
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(workstream_template_versions),
+                {
+                    "ws_template_id": ws_template_id,
+                    "version": version,
+                    "snapshot": snapshot,
+                    "changed_by": changed_by,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def list_ws_template_versions(self, ws_template_id: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(workstream_template_versions)
+                .where(workstream_template_versions.c.ws_template_id == ws_template_id)
+                .order_by(workstream_template_versions.c.version.desc())
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
 
     # -- Usage events ----------------------------------------------------------
 

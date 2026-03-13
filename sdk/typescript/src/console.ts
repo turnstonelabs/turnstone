@@ -17,6 +17,7 @@ import type {
   CreateRoleOptions,
   CreateScheduleRequest,
   CreateTemplateOptions,
+  CreateWsTemplateOptions,
   ListScheduleRunsResponse,
   ListSchedulesResponse,
   NodeDetailResponse,
@@ -32,10 +33,13 @@ import type {
   UpdateRoleOptions,
   UpdateScheduleRequest,
   UpdateTemplateOptions,
+  UpdateWsTemplateOptions,
   UsageQueryOptions,
   UsageResponse,
   UserRoleInfo,
   WorkstreamsOptions,
+  WsTemplateInfo,
+  WsTemplateVersionInfo,
 } from "./types.js";
 
 /** Async client for the turnstone console API. */
@@ -271,6 +275,51 @@ export class TurnstoneConsole extends BaseClient {
 
   async deleteTemplate(templateId: string): Promise<StatusResponse> {
     return this.request("DELETE", `/v1/api/admin/templates/${templateId}`);
+  }
+
+  // -- Governance: Workstream Templates ----------------------------------------
+
+  async listWsTemplates(): Promise<WsTemplateInfo[]> {
+    const data = await this.request<{ ws_templates: WsTemplateInfo[] }>(
+      "GET",
+      "/v1/api/admin/ws-templates",
+    );
+    return data.ws_templates || [];
+  }
+
+  async createWsTemplate(
+    opts: CreateWsTemplateOptions,
+  ): Promise<WsTemplateInfo> {
+    return this.request("POST", "/v1/api/admin/ws-templates", {
+      json: opts,
+    });
+  }
+
+  async getWsTemplate(wsTemplateId: string): Promise<WsTemplateInfo> {
+    return this.request("GET", `/v1/api/admin/ws-templates/${wsTemplateId}`);
+  }
+
+  async updateWsTemplate(
+    wsTemplateId: string,
+    opts: UpdateWsTemplateOptions,
+  ): Promise<WsTemplateInfo> {
+    return this.request("PUT", `/v1/api/admin/ws-templates/${wsTemplateId}`, {
+      json: opts,
+    });
+  }
+
+  async deleteWsTemplate(wsTemplateId: string): Promise<void> {
+    await this.request("DELETE", `/v1/api/admin/ws-templates/${wsTemplateId}`);
+  }
+
+  async listWsTemplateVersions(
+    wsTemplateId: string,
+  ): Promise<WsTemplateVersionInfo[]> {
+    const data = await this.request<{ versions: WsTemplateVersionInfo[] }>(
+      "GET",
+      `/v1/api/admin/ws-templates/${wsTemplateId}/versions`,
+    );
+    return data.versions || [];
   }
 
   // -- Governance: Usage & Audit ----------------------------------------------

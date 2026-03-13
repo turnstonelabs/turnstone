@@ -176,6 +176,7 @@ class CreateScheduleRequest(BaseModel):
     auto_approve: bool = Field(default=False)
     auto_approve_tools: list[str] = Field(default_factory=list)
     template: str = Field(default="", description="Prompt template name")
+    ws_template: str = Field(default="", description="Workstream template name")
     enabled: bool = Field(default=True)
 
 
@@ -193,6 +194,7 @@ class UpdateScheduleRequest(BaseModel):
     auto_approve: bool | None = None
     auto_approve_tools: list[str] | None = None
     template: str | None = None
+    ws_template: str | None = None
     enabled: bool | None = None
 
 
@@ -211,6 +213,7 @@ class ScheduleInfo(BaseModel):
     auto_approve: bool = False
     auto_approve_tools: list[str] = Field(default_factory=list)
     template: str = ""
+    ws_template: str = ""
     enabled: bool = True
     created_by: str = ""
     last_run: str | None = None

@@ -41,6 +41,7 @@ function showAdmin() {
     roles: "admin.roles",
     policies: "admin.policies",
     templates: "admin.templates",
+    "ws-templates": "admin.ws_templates",
     usage: "admin.usage",
     audit: "admin.audit",
   };
@@ -101,6 +102,7 @@ function switchAdminTab(tab) {
     "roles",
     "policies",
     "templates",
+    "ws-templates",
     "usage",
     "audit",
   ];
@@ -117,6 +119,7 @@ function switchAdminTab(tab) {
   if (tab === "roles") loadGovRoles();
   if (tab === "policies") loadGovPolicies();
   if (tab === "templates") loadGovTemplates();
+  if (tab === "ws-templates") loadGovWsTemplates();
   if (tab === "usage") loadGovUsage();
   if (tab === "audit") {
     _populateAuditUserFilter();
@@ -465,6 +468,28 @@ var _srTrapHandler = null;
 var _editScheduleTriggerEl = null;
 var _runsScheduleTriggerEl = null;
 
+function _populateWsTemplateSelect(selectId) {
+  var sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">None</option>';
+  authFetch("/v1/api/ws-templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.ws_templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        var label = t.name;
+        if (t.model) label += " (" + t.model + ")";
+        opt.textContent = label;
+        sel.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — dropdown stays with "None" */
+    });
+}
+
 function loadAdminSchedules() {
   authFetch("/v1/api/admin/schedules")
     .then(function (r) {
@@ -662,6 +687,7 @@ function showCreateScheduleModal() {
   document.getElementById("cs-node").value = "";
   document.getElementById("cs-model").value = "";
   document.getElementById("cs-template").value = "";
+  _populateWsTemplateSelect("cs-ws-template");
   document.getElementById("cs-message").value = "";
   document.getElementById("cs-autoapprove").checked = false;
   toggleScheduleTypeFields();
@@ -695,6 +721,7 @@ function submitCreateSchedule() {
   var model = (document.getElementById("cs-model").value || "").trim();
   var message = (document.getElementById("cs-message").value || "").trim();
   var template = (document.getElementById("cs-template").value || "").trim();
+  var wsTemplate = document.getElementById("cs-ws-template").value;
   var autoApprove = document.getElementById("cs-autoapprove").checked;
   var errEl = document.getElementById("create-schedule-error");
 
@@ -732,6 +759,7 @@ function submitCreateSchedule() {
       initial_message: message,
       auto_approve: autoApprove,
       template: template,
+      ws_template: wsTemplate,
     }),
   })
     .then(function (r) {
@@ -799,6 +827,11 @@ function showEditScheduleModal(taskId) {
         : "";
       document.getElementById("es-model").value = s.model || "";
       document.getElementById("es-template").value = s.template || "";
+      _populateWsTemplateSelect("es-ws-template");
+      var _wsTemplateVal = s.ws_template || "";
+      setTimeout(function () {
+        document.getElementById("es-ws-template").value = _wsTemplateVal;
+      }, 200);
       document.getElementById("es-message").value = s.initial_message || "";
       document.getElementById("es-autoapprove").checked = !!s.auto_approve;
       document.getElementById("es-enabled").checked = !!s.enabled;
@@ -872,6 +905,7 @@ function submitEditSchedule() {
       target_mode: targetMode,
       model: (document.getElementById("es-model").value || "").trim(),
       template: (document.getElementById("es-template").value || "").trim(),
+      ws_template: document.getElementById("es-ws-template").value,
       initial_message: (
         document.getElementById("es-message").value || ""
       ).trim(),
@@ -1450,6 +1484,10 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "create-template-overlay")
           hideCreateTemplateModal();
         else if (overlayId === "edit-template-overlay") hideEditTemplateModal();
+        else if (overlayId === "create-wst-overlay")
+          hideCreateWsTemplateModal();
+        else if (overlayId === "edit-wst-overlay") hideEditWsTemplateModal();
+        else if (overlayId === "wst-history-overlay") hideWstHistoryModal();
       }
     };
   }
@@ -1525,6 +1563,9 @@ document.addEventListener("keydown", function (e) {
     ["edit-policy-overlay", hideEditPolicyModal],
     ["create-template-overlay", hideCreateTemplateModal],
     ["edit-template-overlay", hideEditTemplateModal],
+    ["create-wst-overlay", hideCreateWsTemplateModal],
+    ["edit-wst-overlay", hideEditWsTemplateModal],
+    ["wst-history-overlay", hideWstHistoryModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);

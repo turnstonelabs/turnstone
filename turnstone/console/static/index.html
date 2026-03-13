@@ -86,6 +86,7 @@
       <button id="tab-roles" class="admin-tab" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
       <button id="tab-policies" class="admin-tab" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
       <button id="tab-templates" class="admin-tab" data-tab="templates" role="tab" aria-selected="false" aria-controls="admin-templates" tabindex="-1" onclick="switchAdminTab('templates')">Templates</button>
+      <button id="tab-ws-templates" class="admin-tab" data-tab="ws-templates" role="tab" aria-selected="false" aria-controls="admin-ws-templates" tabindex="-1" onclick="switchAdminTab('ws-templates')">WS Templates</button>
       <button id="tab-usage" class="admin-tab" data-tab="usage" role="tab" aria-selected="false" aria-controls="admin-usage" tabindex="-1" onclick="switchAdminTab('usage')">Usage</button>
       <button id="tab-audit" class="admin-tab" data-tab="audit" role="tab" aria-selected="false" aria-controls="admin-audit" tabindex="-1" onclick="switchAdminTab('audit')">Audit</button>
     </div>
@@ -247,6 +248,23 @@
       </div>
     </div>
 
+    <!-- WS Templates Tab -->
+    <div id="admin-ws-templates" class="admin-panel" role="tabpanel" aria-labelledby="tab-ws-templates" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">WS TEMPLATES</span>
+        <button class="admin-action-btn" onclick="showCreateWsTemplateModal()">+ Create</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-tmname">NAME</span>
+        <span class="admin-col admin-col-tmcat">MODEL</span>
+        <span class="admin-col admin-col-tmvars">APPROVAL / BUDGET</span>
+        <span class="admin-col admin-col-actions">VER / ACTIONS</span>
+      </div>
+      <div id="admin-ws-templates-table" role="list" aria-label="Workstream templates" aria-live="polite">
+        <div class="dashboard-empty">Loading WS templates...</div>
+      </div>
+    </div>
+
     <!-- Usage Tab -->
     <div id="admin-usage" class="admin-panel" role="tabpanel" aria-labelledby="tab-usage" style="display:none">
       <div class="admin-toolbar">
@@ -352,6 +370,10 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <label for="new-ws-template">Template <span class="label-hint">optional</span></label>
     <select id="new-ws-template">
       <option value="">Use defaults</option>
+    </select>
+    <label for="new-ws-profile">Profile <span class="label-hint">optional &mdash; workstream template</span></label>
+    <select id="new-ws-profile">
+      <option value="">None</option>
     </select>
     <label for="new-ws-task">Task <span class="label-hint">optional &mdash; sent as first message</span></label>
     <textarea id="new-ws-task" rows="3" placeholder="What should this workstream work on?"></textarea>
@@ -490,6 +512,8 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <input id="cs-model" type="text" placeholder="Default model" autocomplete="off">
     <label for="cs-template">Template <span class="label-hint">optional</span></label>
     <input id="cs-template" type="text" placeholder="Prompt template name" autocomplete="off">
+    <label for="cs-ws-template">WS Template <span class="label-hint">optional &mdash; workstream profile</span></label>
+    <select id="cs-ws-template"><option value="">None</option></select>
     <label for="cs-message">Initial message</label>
     <textarea id="cs-message" rows="3" placeholder="What should the workstream do?"></textarea>
     <label class="admin-checkbox"><input id="cs-autoapprove" type="checkbox"> Auto-approve tool calls</label>
@@ -538,6 +562,8 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <input id="es-model" type="text" autocomplete="off">
     <label for="es-template">Template <span class="label-hint">optional</span></label>
     <input id="es-template" type="text" autocomplete="off">
+    <label for="es-ws-template">WS Template <span class="label-hint">optional</span></label>
+    <select id="es-ws-template"><option value="">None</option></select>
     <label for="es-message">Initial message</label>
     <textarea id="es-message" rows="3"></textarea>
     <label class="admin-checkbox"><input id="es-autoapprove" type="checkbox"> Auto-approve tool calls</label>
@@ -710,6 +736,124 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditTemplateModal()">Cancel</button>
       <button id="etm-submit" class="modal-submit" onclick="submitEditTemplate()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create WS Template Modal -->
+<div id="create-wst-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-wst-title">
+  <div id="create-wst-box" class="admin-modal admin-modal-wide">
+    <h2 id="create-wst-title">Create Workstream Template</h2>
+    <div id="create-wst-error" role="alert" aria-live="assertive"></div>
+    <label for="cwst-name">Name</label>
+    <input id="cwst-name" type="text" placeholder="e.g. Code Review Agent" autocomplete="off">
+    <label for="cwst-description">Description <span class="label-hint">optional</span></label>
+    <input id="cwst-description" type="text" placeholder="Brief description" autocomplete="off">
+    <label>System Prompt Source</label>
+    <div style="display:flex;gap:12px;margin-bottom:8px">
+      <label class="admin-checkbox"><input id="cwst-src-inline" type="radio" name="cwst-src" value="inline" checked onchange="toggleWstPromptSource()"> Inline</label>
+      <label class="admin-checkbox"><input id="cwst-src-ref" type="radio" name="cwst-src" value="ref" onchange="toggleWstPromptSource()"> Prompt Template</label>
+    </div>
+    <div id="cwst-inline-section">
+      <label for="cwst-system-prompt">System Prompt <span class="label-hint">inline text</span></label>
+      <textarea id="cwst-system-prompt" rows="4" placeholder="You are a..."></textarea>
+    </div>
+    <div id="cwst-ref-section" style="display:none">
+      <label for="cwst-prompt-template">Prompt Template <span class="label-hint">reference by name</span></label>
+      <select id="cwst-prompt-template"><option value="">None</option></select>
+    </div>
+    <label for="cwst-model">Model <span class="label-hint">optional — server default if empty</span></label>
+    <input id="cwst-model" type="text" placeholder="Default model" autocomplete="off">
+    <label class="admin-checkbox"><input id="cwst-auto-approve" type="checkbox"> Auto-approve all tools</label>
+    <label for="cwst-auto-approve-tools">Auto-approve tools <span class="label-hint">comma-separated tool names</span></label>
+    <input id="cwst-auto-approve-tools" type="text" placeholder="e.g. read_file, list_directory" autocomplete="off">
+    <label for="cwst-token-budget">Token budget <span class="label-hint">0 = unlimited</span></label>
+    <input id="cwst-token-budget" type="number" value="0" min="0">
+    <label for="cwst-temperature">Temperature <span class="label-hint">optional — 0.0-2.0, empty = server default</span></label>
+    <input id="cwst-temperature" type="number" step="0.1" min="0" max="2" placeholder="Server default" autocomplete="off">
+    <label for="cwst-reasoning-effort">Reasoning effort <span class="label-hint">optional</span></label>
+    <select id="cwst-reasoning-effort">
+      <option value="">Server default</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+      <option value="none">None</option>
+      <option value="max">Max</option>
+    </select>
+    <label for="cwst-max-tokens">Max tokens <span class="label-hint">optional — 0 = server default</span></label>
+    <input id="cwst-max-tokens" type="number" min="0" placeholder="Server default" autocomplete="off">
+    <label for="cwst-agent-max-turns">Agent max turns <span class="label-hint">optional — 0 = server default</span></label>
+    <input id="cwst-agent-max-turns" type="number" min="0" placeholder="Server default" autocomplete="off">
+    <label class="admin-checkbox"><input id="cwst-enabled" type="checkbox" checked> Enabled</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateWsTemplateModal()">Cancel</button>
+      <button id="cwst-submit" class="modal-submit" onclick="submitCreateWsTemplate()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit WS Template Modal -->
+<div id="edit-wst-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-wst-title">
+  <div id="edit-wst-box" class="admin-modal admin-modal-wide">
+    <h2 id="edit-wst-title">Edit Workstream Template</h2>
+    <div id="edit-wst-error" role="alert" aria-live="assertive"></div>
+    <input id="ewst-id" type="hidden">
+    <label for="ewst-name">Name</label>
+    <input id="ewst-name" type="text" autocomplete="off">
+    <label for="ewst-description">Description</label>
+    <input id="ewst-description" type="text" autocomplete="off">
+    <label>System Prompt Source</label>
+    <div style="display:flex;gap:12px;margin-bottom:8px">
+      <label class="admin-checkbox"><input id="ewst-src-inline" type="radio" name="ewst-src" value="inline" checked onchange="toggleEditWstPromptSource()"> Inline</label>
+      <label class="admin-checkbox"><input id="ewst-src-ref" type="radio" name="ewst-src" value="ref" onchange="toggleEditWstPromptSource()"> Prompt Template</label>
+    </div>
+    <div id="ewst-inline-section">
+      <label for="ewst-system-prompt">System Prompt</label>
+      <textarea id="ewst-system-prompt" rows="4"></textarea>
+    </div>
+    <div id="ewst-ref-section" style="display:none">
+      <label for="ewst-prompt-template">Prompt Template</label>
+      <select id="ewst-prompt-template"><option value="">None</option></select>
+    </div>
+    <label for="ewst-model">Model</label>
+    <input id="ewst-model" type="text" autocomplete="off">
+    <label class="admin-checkbox"><input id="ewst-auto-approve" type="checkbox"> Auto-approve all tools</label>
+    <label for="ewst-auto-approve-tools">Auto-approve tools</label>
+    <input id="ewst-auto-approve-tools" type="text" autocomplete="off">
+    <label for="ewst-token-budget">Token budget</label>
+    <input id="ewst-token-budget" type="number" value="0" min="0">
+    <label for="ewst-temperature">Temperature <span class="label-hint">optional — 0.0-2.0, empty = server default</span></label>
+    <input id="ewst-temperature" type="number" step="0.1" min="0" max="2" placeholder="Server default" autocomplete="off">
+    <label for="ewst-reasoning-effort">Reasoning effort <span class="label-hint">optional</span></label>
+    <select id="ewst-reasoning-effort">
+      <option value="">Server default</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+      <option value="none">None</option>
+      <option value="max">Max</option>
+    </select>
+    <label for="ewst-max-tokens">Max tokens <span class="label-hint">optional</span></label>
+    <input id="ewst-max-tokens" type="number" min="0" placeholder="Server default" autocomplete="off">
+    <label for="ewst-agent-max-turns">Agent max turns <span class="label-hint">optional</span></label>
+    <input id="ewst-agent-max-turns" type="number" min="0" placeholder="Server default" autocomplete="off">
+    <label class="admin-checkbox"><input id="ewst-enabled" type="checkbox" checked> Enabled</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideEditWsTemplateModal()">Cancel</button>
+      <button id="ewst-submit" class="modal-submit" onclick="submitEditWsTemplate()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- WS Template Version History Modal -->
+<div id="wst-history-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="wst-history-title">
+  <div id="wst-history-box" class="admin-modal admin-modal-wide">
+    <h2 id="wst-history-title">Version History</h2>
+    <div id="wst-history-content">
+      <div class="dashboard-empty">Loading...</div>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideWstHistoryModal()">Close</button>
     </div>
   </div>
 </div>

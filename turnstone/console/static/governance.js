@@ -6,6 +6,7 @@
 var _govRoles = [];
 var _govPolicies = [];
 var _govTemplates = [];
+var _govWsTemplates = [];
 var _govUsageRange = "7d";
 var _govUsageGroupBy = "day";
 var _govAuditEvents = [];
@@ -20,6 +21,8 @@ var _cpTrapHandler = null; // create policy
 var _epTrapHandler = null; // edit policy
 var _ctmTrapHandler = null; // create template
 var _etmTrapHandler = null; // edit template
+var _cwstTrapHandler = null; // create ws template
+var _ewstTrapHandler = null; // edit ws template
 
 // Trigger element refs for focus restoration
 var _crTriggerEl = null;
@@ -29,6 +32,8 @@ var _cpTriggerEl = null;
 var _epTriggerEl = null;
 var _ctmTriggerEl = null;
 var _etmTriggerEl = null;
+var _cwstTriggerEl = null;
+var _ewstTriggerEl = null;
 
 // ---------------------------------------------------------------------------
 // Roles
@@ -926,6 +931,445 @@ function submitEditTemplate() {
     .finally(function () {
       document.getElementById("etm-submit").disabled = false;
     });
+}
+
+// ---------------------------------------------------------------------------
+// WS Templates
+// ---------------------------------------------------------------------------
+
+function loadGovWsTemplates() {
+  authFetch("/v1/api/admin/ws-templates")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _govWsTemplates = data.ws_templates || [];
+      _renderGovWsTemplates(_govWsTemplates);
+    })
+    .catch(function () {
+      document.getElementById("admin-ws-templates-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load WS templates</div>';
+    });
+}
+
+function _renderGovWsTemplates(items) {
+  var el = document.getElementById("admin-ws-templates-table");
+  if (!items.length) {
+    el.innerHTML =
+      '<div class="dashboard-empty">No workstream templates defined</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < items.length; i++) {
+    var t = items[i];
+    var modelBadge = t.model
+      ? '<span class="scope-badge">' + escapeHtml(t.model) + "</span>"
+      : '<span class="scope-badge">default</span>';
+    var approveBadge = t.auto_approve
+      ? '<span class="scope-badge scope-approve">auto</span>'
+      : "";
+    var budgetBadge =
+      t.token_budget > 0
+        ? '<span class="scope-badge scope-deny">' +
+          t.token_budget.toLocaleString() +
+          "</span>"
+        : "";
+    var enabledBadge = !t.enabled
+      ? ' <span class="scope-badge scope-deny">disabled</span>'
+      : "";
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-tmname">' +
+      escapeHtml(t.name) +
+      enabledBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-tmcat">' +
+      modelBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-tmvars">' +
+      approveBadge +
+      " " +
+      budgetBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      "v" +
+      t.version +
+      " " +
+      '<button class="admin-btn-action" data-history-wst="' +
+      escapeHtml(t.ws_template_id) +
+      '">history</button> ' +
+      '<button class="admin-btn-action" data-edit-wst="' +
+      escapeHtml(t.ws_template_id) +
+      '">edit</button>' +
+      '<button class="admin-btn-danger" data-delete-wst="' +
+      escapeHtml(t.ws_template_id) +
+      '" data-wst-name="' +
+      escapeHtml(t.name) +
+      '">delete</button>' +
+      "</span></div>";
+  }
+  el.innerHTML = html;
+  el.querySelectorAll("[data-edit-wst]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditWsTemplateModal(this.getAttribute("data-edit-wst"));
+    });
+  });
+  el.querySelectorAll("[data-delete-wst]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var tid = this.getAttribute("data-delete-wst");
+      var tname = this.getAttribute("data-wst-name");
+      showConfirmModal(
+        "Delete WS Template",
+        'Delete workstream template "' + tname + '"?',
+        "Delete",
+        function () {
+          authFetch("/v1/api/admin/ws-templates/" + tid, {
+            method: "DELETE",
+          })
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function () {
+              showToast("WS template deleted");
+              loadGovWsTemplates();
+            })
+            .catch(function () {
+              showToast("Failed to delete WS template");
+            });
+        },
+      );
+    });
+  });
+  el.querySelectorAll("[data-history-wst]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showWstHistoryModal(this.getAttribute("data-history-wst"));
+    });
+  });
+}
+
+function toggleWstPromptSource() {
+  var inline = document.getElementById("cwst-src-inline").checked;
+  document.getElementById("cwst-inline-section").style.display = inline
+    ? ""
+    : "none";
+  document.getElementById("cwst-ref-section").style.display = inline
+    ? "none"
+    : "";
+}
+
+function toggleEditWstPromptSource() {
+  var inline = document.getElementById("ewst-src-inline").checked;
+  document.getElementById("ewst-inline-section").style.display = inline
+    ? ""
+    : "none";
+  document.getElementById("ewst-ref-section").style.display = inline
+    ? "none"
+    : "";
+}
+
+function _populateWstPromptTemplates(selectId) {
+  var sel = document.getElementById(selectId);
+  sel.innerHTML = '<option value="">None</option>';
+  return authFetch("/v1/api/admin/templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        opt.textContent = t.name;
+        sel.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore */
+    });
+}
+
+function showCreateWsTemplateModal() {
+  _cwstTriggerEl = document.activeElement;
+  var ov = document.getElementById("create-wst-overlay");
+  ov.style.display = "flex";
+  document.getElementById("cwst-name").value = "";
+  document.getElementById("cwst-description").value = "";
+  document.getElementById("cwst-system-prompt").value = "";
+  document.getElementById("cwst-src-inline").checked = true;
+  toggleWstPromptSource();
+  _populateWstPromptTemplates("cwst-prompt-template");
+  document.getElementById("cwst-model").value = "";
+  document.getElementById("cwst-auto-approve").checked = false;
+  document.getElementById("cwst-auto-approve-tools").value = "";
+  document.getElementById("cwst-token-budget").value = "0";
+  document.getElementById("cwst-temperature").value = "";
+  document.getElementById("cwst-reasoning-effort").value = "";
+  document.getElementById("cwst-max-tokens").value = "";
+  document.getElementById("cwst-agent-max-turns").value = "";
+  document.getElementById("cwst-enabled").checked = true;
+  document.getElementById("create-wst-error").style.display = "none";
+  document.getElementById("cwst-name").focus();
+  _cwstTrapHandler = _installTrap("create-wst-overlay", "create-wst-box");
+}
+
+function hideCreateWsTemplateModal() {
+  document.getElementById("create-wst-overlay").style.display = "none";
+  _cwstTrapHandler = _removeTrap(_cwstTrapHandler);
+  if (_cwstTriggerEl && _cwstTriggerEl.focus) _cwstTriggerEl.focus();
+  _cwstTriggerEl = null;
+}
+
+function submitCreateWsTemplate() {
+  var name = document.getElementById("cwst-name").value.trim();
+  if (!name) {
+    var e = document.getElementById("create-wst-error");
+    e.textContent = "Name is required";
+    e.style.display = "";
+    return;
+  }
+  var isInline = document.getElementById("cwst-src-inline").checked;
+  document.getElementById("cwst-submit").disabled = true;
+  authFetch("/v1/api/admin/ws-templates", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name,
+      description: document.getElementById("cwst-description").value,
+      system_prompt: isInline
+        ? document.getElementById("cwst-system-prompt").value
+        : "",
+      prompt_template: isInline
+        ? ""
+        : document.getElementById("cwst-prompt-template").value,
+      model: document.getElementById("cwst-model").value.trim(),
+      auto_approve: document.getElementById("cwst-auto-approve").checked,
+      auto_approve_tools: document
+        .getElementById("cwst-auto-approve-tools")
+        .value.trim(),
+      token_budget: parseInt(
+        document.getElementById("cwst-token-budget").value || "0",
+        10,
+      ),
+      temperature: document.getElementById("cwst-temperature").value
+        ? parseFloat(document.getElementById("cwst-temperature").value)
+        : null,
+      reasoning_effort: document.getElementById("cwst-reasoning-effort").value,
+      max_tokens: document.getElementById("cwst-max-tokens").value
+        ? parseInt(document.getElementById("cwst-max-tokens").value, 10)
+        : null,
+      agent_max_turns: document.getElementById("cwst-agent-max-turns").value
+        ? parseInt(document.getElementById("cwst-agent-max-turns").value, 10)
+        : null,
+      enabled: document.getElementById("cwst-enabled").checked,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreateWsTemplateModal();
+      showToast("WS template created");
+      loadGovWsTemplates();
+    })
+    .catch(function (e) {
+      var el = document.getElementById("create-wst-error");
+      el.textContent = e.message;
+      el.style.display = "";
+    })
+    .finally(function () {
+      document.getElementById("cwst-submit").disabled = false;
+    });
+}
+
+function showEditWsTemplateModal(wstId) {
+  _ewstTriggerEl = document.activeElement;
+  var tpl = null;
+  for (var i = 0; i < _govWsTemplates.length; i++) {
+    if (_govWsTemplates[i].ws_template_id === wstId) {
+      tpl = _govWsTemplates[i];
+      break;
+    }
+  }
+  if (!tpl) return;
+  var ov = document.getElementById("edit-wst-overlay");
+  ov.style.display = "flex";
+  document.getElementById("ewst-id").value = wstId;
+  document.getElementById("ewst-name").value = tpl.name;
+  document.getElementById("ewst-description").value = tpl.description || "";
+  document.getElementById("ewst-system-prompt").value = tpl.system_prompt || "";
+  // Set radio based on which field has content
+  if (tpl.prompt_template && !tpl.system_prompt) {
+    document.getElementById("ewst-src-ref").checked = true;
+  } else {
+    document.getElementById("ewst-src-inline").checked = true;
+  }
+  toggleEditWstPromptSource();
+  _populateWstPromptTemplates("ewst-prompt-template").then(function () {
+    if (tpl.prompt_template) {
+      document.getElementById("ewst-prompt-template").value =
+        tpl.prompt_template;
+    }
+  });
+  document.getElementById("ewst-model").value = tpl.model || "";
+  document.getElementById("ewst-auto-approve").checked = tpl.auto_approve;
+  document.getElementById("ewst-auto-approve-tools").value =
+    tpl.auto_approve_tools || "";
+  document.getElementById("ewst-token-budget").value = tpl.token_budget || 0;
+  document.getElementById("ewst-temperature").value =
+    tpl.temperature != null ? tpl.temperature : "";
+  document.getElementById("ewst-reasoning-effort").value =
+    tpl.reasoning_effort || "";
+  document.getElementById("ewst-max-tokens").value =
+    tpl.max_tokens != null ? tpl.max_tokens : "";
+  document.getElementById("ewst-agent-max-turns").value =
+    tpl.agent_max_turns != null ? tpl.agent_max_turns : "";
+  document.getElementById("ewst-enabled").checked = tpl.enabled;
+  document.getElementById("edit-wst-error").style.display = "none";
+  _ewstTrapHandler = _installTrap("edit-wst-overlay", "edit-wst-box");
+}
+
+function hideEditWsTemplateModal() {
+  document.getElementById("edit-wst-overlay").style.display = "none";
+  _ewstTrapHandler = _removeTrap(_ewstTrapHandler);
+  if (_ewstTriggerEl && _ewstTriggerEl.focus) _ewstTriggerEl.focus();
+  _ewstTriggerEl = null;
+}
+
+function submitEditWsTemplate() {
+  var id = document.getElementById("ewst-id").value;
+  var name = document.getElementById("ewst-name").value.trim();
+  if (!name) {
+    var e = document.getElementById("edit-wst-error");
+    e.textContent = "Name is required";
+    e.style.display = "";
+    return;
+  }
+  var isInline = document.getElementById("ewst-src-inline").checked;
+  document.getElementById("ewst-submit").disabled = true;
+  authFetch("/v1/api/admin/ws-templates/" + id, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: document.getElementById("ewst-name").value.trim(),
+      description: document.getElementById("ewst-description").value,
+      system_prompt: isInline
+        ? document.getElementById("ewst-system-prompt").value
+        : "",
+      prompt_template: isInline
+        ? ""
+        : document.getElementById("ewst-prompt-template").value,
+      model: document.getElementById("ewst-model").value.trim(),
+      auto_approve: document.getElementById("ewst-auto-approve").checked,
+      auto_approve_tools: document
+        .getElementById("ewst-auto-approve-tools")
+        .value.trim(),
+      token_budget: parseInt(
+        document.getElementById("ewst-token-budget").value || "0",
+        10,
+      ),
+      temperature: document.getElementById("ewst-temperature").value
+        ? parseFloat(document.getElementById("ewst-temperature").value)
+        : null,
+      reasoning_effort: document.getElementById("ewst-reasoning-effort").value,
+      max_tokens: document.getElementById("ewst-max-tokens").value
+        ? parseInt(document.getElementById("ewst-max-tokens").value, 10)
+        : null,
+      agent_max_turns: document.getElementById("ewst-agent-max-turns").value
+        ? parseInt(document.getElementById("ewst-agent-max-turns").value, 10)
+        : null,
+      enabled: document.getElementById("ewst-enabled").checked,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideEditWsTemplateModal();
+      showToast("WS template updated");
+      loadGovWsTemplates();
+    })
+    .catch(function (e) {
+      var el = document.getElementById("edit-wst-error");
+      el.textContent = e.message;
+      el.style.display = "";
+    })
+    .finally(function () {
+      document.getElementById("ewst-submit").disabled = false;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// WS Template Version History
+// ---------------------------------------------------------------------------
+
+var _whTrapHandler = null;
+var _whTriggerEl = null;
+
+function showWstHistoryModal(wstId) {
+  _whTriggerEl = document.activeElement;
+  var ov = document.getElementById("wst-history-overlay");
+  ov.style.display = "flex";
+  document.getElementById("wst-history-content").innerHTML =
+    '<div class="dashboard-empty">Loading...</div>';
+  _whTrapHandler = _installTrap("wst-history-overlay", "wst-history-box");
+  authFetch("/v1/api/admin/ws-templates/" + wstId + "/versions")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      var versions = data.versions || [];
+      if (!versions.length) {
+        document.getElementById("wst-history-content").innerHTML =
+          '<div class="dashboard-empty">No version history yet</div>';
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < versions.length; i++) {
+        var v = versions[i];
+        var snapshot = "{}";
+        try {
+          snapshot = JSON.stringify(JSON.parse(v.snapshot), null, 2);
+        } catch (e) {
+          snapshot = v.snapshot;
+        }
+        html +=
+          '<div class="admin-row" style="flex-direction:column;align-items:stretch">' +
+          '<div style="display:flex;justify-content:space-between;margin-bottom:4px">' +
+          "<strong>v" +
+          v.version +
+          "</strong>" +
+          '<span class="label-hint">' +
+          escapeHtml(v.changed_by || "unknown") +
+          " &mdash; " +
+          escapeHtml(v.created) +
+          "</span></div>" +
+          '<pre style="margin:0;padding:8px;background:var(--bg-elevated,#1a1a2e);border-radius:4px;overflow-x:auto;font-size:0.85em;max-height:200px;overflow-y:auto">' +
+          escapeHtml(snapshot) +
+          "</pre></div>";
+      }
+      document.getElementById("wst-history-content").innerHTML = html;
+    })
+    .catch(function () {
+      document.getElementById("wst-history-content").innerHTML =
+        '<div class="dashboard-empty">Failed to load version history</div>';
+    });
+}
+
+function hideWstHistoryModal() {
+  document.getElementById("wst-history-overlay").style.display = "none";
+  _whTrapHandler = _removeTrap(_whTrapHandler);
+  if (_whTriggerEl && _whTriggerEl.focus) _whTriggerEl.focus();
+  _whTriggerEl = null;
 }
 
 // ---------------------------------------------------------------------------

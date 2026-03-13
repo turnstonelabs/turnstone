@@ -71,6 +71,12 @@ def update_workstream_name(ws_id: str, name: str) -> None:
         get_storage().update_workstream_name(ws_id, name)
 
 
+def update_workstream_template(ws_id: str, ws_template_id: str, ws_template_version: int) -> None:
+    """Set ws_template_id and ws_template_version on the workstreams row."""
+    with contextlib.suppress(Exception):
+        get_storage().update_workstream_template(ws_id, ws_template_id, ws_template_version)
+
+
 def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
     """List workstreams, optionally filtered by node_id."""
     try:
@@ -160,6 +166,25 @@ def get_prompt_template_by_name(name: str) -> dict[str, Any] | None:
         return get_storage().get_prompt_template_by_name(name)
     except Exception:
         return None
+
+
+# -- Workstream templates -----------------------------------------------------
+
+
+def get_ws_template_by_name(name: str) -> dict[str, Any] | None:
+    """Lookup workstream template by name."""
+    try:
+        return get_storage().get_ws_template_by_name(name)
+    except Exception:
+        return None
+
+
+def list_ws_templates(enabled_only: bool = False) -> list[dict[str, Any]]:
+    """Return all workstream templates, optionally enabled only."""
+    try:
+        return get_storage().list_ws_templates(enabled_only=enabled_only)
+    except Exception:
+        return []
 
 
 # -- Workstream metadata ------------------------------------------------------

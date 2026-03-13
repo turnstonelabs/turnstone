@@ -127,6 +127,7 @@ class TurnstoneClient:
         target_node: str = "",
         initial_message: str = "",
         template: str = "",
+        ws_template: str = "",
     ) -> str:
         """Create a workstream.  Returns correlation_id."""
         msg = CreateWorkstreamMessage(
@@ -136,6 +137,7 @@ class TurnstoneClient:
             target_node=target_node,
             initial_message=initial_message,
             template=template,
+            ws_template=ws_template,
         )
         self._broker.push_inbound(msg.to_json(), node_id=target_node)
         return msg.correlation_id

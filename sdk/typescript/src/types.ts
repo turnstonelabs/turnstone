@@ -73,6 +73,7 @@ export interface CreateWorkstreamRequest {
   auto_approve?: boolean;
   resume_ws?: string;
   template?: string;
+  ws_template?: string;
 }
 
 export interface CreateWorkstreamResponse {
@@ -275,6 +276,7 @@ export interface ConsoleCreateWsRequest {
   model?: string;
   initial_message?: string;
   template?: string;
+  ws_template?: string;
 }
 
 export interface ConsoleCreateWsResponse {
@@ -481,6 +483,78 @@ export interface UpdateTemplateOptions {
   category?: string;
   variables?: string;
   is_default?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Console API — Governance: Workstream Templates
+// ---------------------------------------------------------------------------
+
+export interface WsTemplateInfo {
+  ws_template_id: string;
+  name: string;
+  description: string;
+  system_prompt: string;
+  prompt_template: string;
+  prompt_template_hash: string;
+  model: string;
+  auto_approve: boolean;
+  auto_approve_tools: string;
+  temperature: number | null;
+  reasoning_effort: string;
+  max_tokens: number | null;
+  token_budget: number;
+  agent_max_turns: number | null;
+  notify_on_complete: string;
+  org_id: string;
+  created_by: string;
+  enabled: boolean;
+  version: number;
+  created: string;
+  updated: string;
+}
+
+export interface CreateWsTemplateOptions {
+  name: string;
+  description?: string;
+  system_prompt?: string;
+  prompt_template?: string;
+  model?: string;
+  auto_approve?: boolean;
+  auto_approve_tools?: string;
+  temperature?: number | null;
+  reasoning_effort?: string;
+  max_tokens?: number | null;
+  token_budget?: number;
+  agent_max_turns?: number | null;
+  notify_on_complete?: string;
+  org_id?: string;
+  enabled?: boolean;
+}
+
+export interface UpdateWsTemplateOptions {
+  name?: string;
+  description?: string;
+  system_prompt?: string;
+  prompt_template?: string;
+  model?: string;
+  auto_approve?: boolean;
+  auto_approve_tools?: string;
+  temperature?: number | null;
+  reasoning_effort?: string;
+  max_tokens?: number | null;
+  token_budget?: number;
+  agent_max_turns?: number | null;
+  notify_on_complete?: string;
+  enabled?: boolean;
+}
+
+export interface WsTemplateVersionInfo {
+  id: number;
+  ws_template_id: string;
+  version: number;
+  snapshot: string;
+  changed_by: string;
+  created: string;
 }
 
 // ---------------------------------------------------------------------------

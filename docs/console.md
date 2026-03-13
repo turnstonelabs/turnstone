@@ -306,6 +306,18 @@ Revoke a specific API token.
 
 These endpoints manage the `channel_users` table mappings that connect external platform identities (e.g. Discord user IDs) to turnstone users. See [Channel Integrations](channels.md) for details on the linking flow.
 
+### Workstream Templates
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/api/admin/ws-templates` | List all workstream templates |
+| POST | `/v1/api/admin/ws-templates` | Create a workstream template |
+| GET | `/v1/api/admin/ws-templates/{id}` | Get a single workstream template |
+| PUT | `/v1/api/admin/ws-templates/{id}` | Update (auto-versions, audit logged) |
+| DELETE | `/v1/api/admin/ws-templates/{id}` | Delete + cascade versions (audit logged) |
+| GET | `/v1/api/admin/ws-templates/{id}/versions` | Version history |
+| GET | `/v1/api/ws-templates` | Enabled templates summary (name, description, model) — requires write scope, not admin |
+
 #### `GET /v1/api/auth/status`
 
 Public endpoint for login UI state detection. Returns auth configuration, not
@@ -395,6 +407,7 @@ Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated
 Triggered by the "+ new" header button. A modal dialog with:
 
 - **Node selector** — dropdown with three targeting modes: "Auto (best available)" picks the node with the most headroom, "General pool (any node)" pushes to the shared queue for any bridge to pick up, or a specific node from the list (showing capacity).
+- **Profile** — optional dropdown listing enabled workstream templates. Applies the template's model, auto-approve policy, token budget, and other behavioral settings at creation time.
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional text input for a model alias from the target node's registry.
 
@@ -407,8 +420,9 @@ The browser maintains a local `clusterState` object that mirrors the cluster sna
 ### 5. Admin Panel
 
 Accessed via the "admin" button in the header (visible when authenticated
-with `approve` scope). Provides user, API token, and channel link management
-with three tabs:
+with `approve` scope). Provides user, API token, channel link, and workstream
+template management with 11 tabs (see also [Governance](governance.md) for
+the Roles, Policies, Templates, WS Templates, Usage, and Audit tabs):
 
 **Users tab:**
 

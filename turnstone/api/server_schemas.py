@@ -50,6 +50,9 @@ class CreateWorkstreamRequest(BaseModel):
     template: str = Field(
         default="", description="Prompt template name (replaces default templates)"
     )
+    ws_template: str = Field(
+        default="", description="Workstream template name to apply defaults from"
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):

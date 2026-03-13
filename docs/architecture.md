@@ -663,7 +663,8 @@ supports_vision = true
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
 `"model"` field. The bridge `CreateWorkstreamMessage` carries the same field
-through the MQ protocol.
+through the MQ protocol, along with `ws_template` (workstream template name)
+which can override the model before workstream creation.
 
 ### Tool Output Truncation
 
@@ -1237,7 +1238,11 @@ The console has two write-path capabilities:
 1. **Workstream creation** — pushes `CreateWorkstreamMessage` to Redis inbound
    queues targeting specific nodes. The bridge on each node picks up the message
    and creates the workstream on the local server. Auto-selects the node with
-   the most available capacity if no target is specified.
+   the most available capacity if no target is specified. When a `ws_template`
+   field is present, the server resolves the template BEFORE `mgr.create()`
+   (applying the model override to the creation request) and snapshot-applies
+   remaining settings (auto-approve, token budget, temperature, etc.) to the
+   workstream config AFTER creation.
 
 2. **Reverse proxy** — serves each node's server UI through the console port at
    `/node/{node_id}/`. Uses `httpx.AsyncClient` to proxy HTTP and SSE traffic.
@@ -1374,6 +1379,17 @@ Prompt templates provide reusable system messages with `{{variable}}`
 substitution. Usage events are recorded per-LLM-request for token
 accounting. An append-only audit log captures all admin mutations.
 
-The console admin panel adds 5 governance tabs (Roles, Policies, Templates,
-Usage, Audit) for a total of 10 tabs, all permission-gated. Both Python
-and TypeScript SDKs expose governance methods on the console client.
+Workstream templates build on top of prompt templates as complete behavioral
+profiles applied at workstream creation. While prompt templates inject system
+message text, workstream templates define model, temperature, reasoning effort,
+max tokens, auto-approve policy, token budget, and agent max turns. Templates
+are snapshot-applied once at creation — not a live binding. The
+`workstream_templates` table (migration 011) supports auto-versioning, and
+workstreams record which template and version spawned them. Token budget
+enforcement tracks consumption in `session.send()` with 80% warning and
+100% approval gate via the `__budget_override__` synthetic tool name.
+
+The console admin panel adds 6 governance tabs (Roles, Policies, Templates,
+WS Templates, Usage, Audit) for a total of 11 tabs, all permission-gated.
+Both Python and TypeScript SDKs expose governance methods on the console
+client.

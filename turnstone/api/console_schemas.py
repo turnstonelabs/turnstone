@@ -139,6 +139,9 @@ class ConsoleCreateWsRequest(BaseModel):
     template: str = Field(
         default="", description="Prompt template name (replaces default templates)"
     )
+    ws_template: str = Field(
+        default="", description="Workstream template name (behavioral profile)"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):
@@ -315,6 +318,97 @@ class UpdatePromptTemplateRequest(BaseModel):
 
 class ListPromptTemplatesResponse(BaseModel):
     templates: list[PromptTemplateInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Workstream Templates
+# ---------------------------------------------------------------------------
+
+
+class WsTemplateInfo(BaseModel):
+    ws_template_id: str
+    name: str
+    description: str
+    system_prompt: str
+    prompt_template: str
+    prompt_template_hash: str = ""
+    model: str
+    auto_approve: bool
+    auto_approve_tools: str
+    temperature: float | None = None
+    reasoning_effort: str
+    max_tokens: int | None = None
+    token_budget: int
+    agent_max_turns: int | None = None
+    notify_on_complete: str
+    org_id: str
+    created_by: str
+    enabled: bool
+    version: int
+    created: str
+    updated: str
+
+
+class CreateWsTemplateRequest(BaseModel):
+    name: str
+    description: str = ""
+    system_prompt: str = ""
+    prompt_template: str = ""
+    model: str = ""
+    auto_approve: bool = False
+    auto_approve_tools: str = ""
+    temperature: float | None = None
+    reasoning_effort: str = ""
+    max_tokens: int | None = None
+    token_budget: int = 0
+    agent_max_turns: int | None = None
+    notify_on_complete: str = "{}"
+    org_id: str = ""
+    enabled: bool = True
+
+
+class UpdateWsTemplateRequest(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    system_prompt: str | None = None
+    prompt_template: str | None = None
+    model: str | None = None
+    auto_approve: bool | None = None
+    auto_approve_tools: str | None = None
+    temperature: float | None = None
+    reasoning_effort: str | None = None
+    max_tokens: int | None = None
+    token_budget: int | None = None
+    agent_max_turns: int | None = None
+    notify_on_complete: str | None = None
+    enabled: bool | None = None
+
+
+class ListWsTemplatesResponse(BaseModel):
+    ws_templates: list[WsTemplateInfo]
+
+
+class WsTemplateVersionInfo(BaseModel):
+    id: int
+    ws_template_id: str
+    version: int
+    snapshot: str
+    changed_by: str
+    created: str
+
+
+class ListWsTemplateVersionsResponse(BaseModel):
+    versions: list[WsTemplateVersionInfo]
+
+
+class WsTemplateSummary(BaseModel):
+    name: str
+    description: str
+    model: str
+
+
+class ListWsTemplateSummaryResponse(BaseModel):
+    ws_templates: list[WsTemplateSummary]
 
 
 # ---------------------------------------------------------------------------

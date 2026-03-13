@@ -916,7 +916,8 @@
   cursor: pointer;
   margin-top: 14px;
 }
-.admin-modal label.admin-checkbox input[type="checkbox"] {
+.admin-modal label.admin-checkbox input[type="checkbox"],
+.admin-modal label.admin-checkbox input[type="radio"] {
   width: auto;
   margin: 0;
 }
@@ -1133,6 +1134,10 @@
 #admin-templates .admin-row {
   grid-template-columns: 1.5fr 100px 1fr 140px;
 }
+#admin-ws-templates .admin-colheaders,
+#admin-ws-templates .admin-row {
+  grid-template-columns: 1.5fr 100px 1fr 180px;
+}
 
 /* ==========================================================================
    Governance: Audit grid
@@ -1321,6 +1326,9 @@
     grid-template-columns: 1fr 100px;
   }
   .admin-col-tmcat, .admin-col-tmvars { display: none; }
+  #admin-ws-templates .admin-colheaders, #admin-ws-templates .admin-row {
+    grid-template-columns: 1fr 140px;
+  }
   #admin-audit .admin-colheaders, #admin-audit .admin-row {
     grid-template-columns: 60px 1fr 100px;
   }

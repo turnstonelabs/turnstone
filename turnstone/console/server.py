@@ -350,6 +350,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_model = body.get("model", "")
     raw_initial_message = body.get("initial_message", "")
     raw_template = body.get("template", "")
+    raw_ws_template = body.get("ws_template", "")
     if not isinstance(raw_node_id, str):
         raw_node_id = "" if raw_node_id is None else None
     if not isinstance(raw_name, str):
@@ -360,15 +361,20 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_initial_message = "" if raw_initial_message is None else None
     if not isinstance(raw_template, str):
         raw_template = "" if raw_template is None else None
+    if not isinstance(raw_ws_template, str):
+        raw_ws_template = "" if raw_ws_template is None else None
     if (
         raw_node_id is None
         or raw_name is None
         or raw_model is None
         or raw_initial_message is None
         or raw_template is None
+        or raw_ws_template is None
     ):
         return JSONResponse(
-            {"error": "node_id, name, model, initial_message, and template must be strings"},
+            {
+                "error": "node_id, name, model, initial_message, template, and ws_template must be strings"
+            },
             status_code=400,
         )
     node_id = raw_node_id
@@ -376,13 +382,18 @@ async def create_workstream(request: Request) -> JSONResponse:
     model = raw_model[:128]
     initial_message = raw_initial_message[:4096]
     template = raw_template[:256]
+    ws_template = raw_ws_template[:256]
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
     # General pool — push to shared queue, any bridge picks it up
     if node_id == "pool":
         msg = CreateWorkstreamMessage(
-            name=name, model=model, initial_message=initial_message, template=template
+            name=name,
+            model=model,
+            initial_message=initial_message,
+            template=template,
+            ws_template=ws_template,
         )
         broker.push_inbound(msg.to_json())
         log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
@@ -411,6 +422,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         target_node=node_id,
         initial_message=initial_message,
         template=template,
+        ws_template=ws_template,
     )
     broker.push_inbound(msg.to_json(), node_id=node_id)
 
@@ -1145,6 +1157,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     raw_tools = body.get("auto_approve_tools", [])
     auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
     template = str(body.get("template", "")).strip()[:256]
+    ws_template = str(body.get("ws_template", "")).strip()[:256]
     enabled = bool(body.get("enabled", True))
 
     if not name:
@@ -1153,6 +1166,10 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         return JSONResponse({"error": "initial_message is required"}, status_code=400)
     if template and not storage.get_prompt_template_by_name(template):
         return JSONResponse({"error": f"Template not found: {template}"}, status_code=400)
+    if ws_template and not storage.get_ws_template_by_name(ws_template):
+        return JSONResponse(
+            {"error": f"Workstream template not found: {ws_template}"}, status_code=400
+        )
 
     validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
     if validation_err:
@@ -1188,6 +1205,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         created_by=created_by,
         next_run=next_run if enabled else "",
         template=template,
+        ws_template=ws_template,
     )
 
     if not enabled:
@@ -1267,6 +1285,13 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         if tpl_name and not storage.get_prompt_template_by_name(tpl_name):
             return JSONResponse({"error": f"Template not found: {tpl_name}"}, status_code=400)
         updates["template"] = tpl_name
+    if "ws_template" in body:
+        ws_tpl_name = str(body["ws_template"]).strip()[:256]
+        if ws_tpl_name and not storage.get_ws_template_by_name(ws_tpl_name):
+            return JSONResponse(
+                {"error": f"Workstream template not found: {ws_tpl_name}"}, status_code=400
+            )
+        updates["ws_template"] = ws_tpl_name
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -1440,6 +1465,13 @@ async def admin_cancel_watch(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
+def _hash_content(content: str) -> str:
+    """SHA-256 hash of content for drift detection."""
+    import hashlib
+
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
 def _audit_context(request: Request) -> tuple[str, str]:
     """Extract (user_id, ip_address) from request for audit logging.
 
@@ -1477,6 +1509,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.usage",
         "admin.schedules",
         "admin.watches",
+        "admin.ws_templates",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2174,6 +2207,262 @@ async def admin_delete_template(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+# ---------------------------------------------------------------------------
+# Admin: Workstream Templates
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_ws_templates(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/ws-templates — list all workstream templates."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    return JSONResponse({"ws_templates": storage.list_ws_templates()})
+
+
+async def admin_create_ws_template(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/ws-templates — create a workstream template."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:256]
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if storage.get_ws_template_by_name(name) is not None:
+        return JSONResponse({"error": "Name already exists"}, status_code=409)
+
+    prompt_template_ref = str(body.get("prompt_template", ""))[:256]
+    prompt_template_hash = ""
+    if prompt_template_ref:
+        pt = storage.get_prompt_template_by_name(prompt_template_ref)
+        if not pt:
+            return JSONResponse(
+                {"error": f"Prompt template not found: {prompt_template_ref}"}, status_code=400
+            )
+        prompt_template_hash = _hash_content(pt.get("content", ""))
+
+    ws_template_id = uuid.uuid4().hex
+    storage.create_ws_template(
+        ws_template_id=ws_template_id,
+        name=name,
+        description=str(body.get("description", ""))[:1024],
+        system_prompt=str(body.get("system_prompt", ""))[:32768],
+        prompt_template=prompt_template_ref,
+        prompt_template_hash=prompt_template_hash,
+        model=str(body.get("model", ""))[:128],
+        auto_approve=bool(body.get("auto_approve", False)),
+        auto_approve_tools=str(body.get("auto_approve_tools", ""))[:2048],
+        temperature=float(body["temperature"]) if body.get("temperature") is not None else None,
+        reasoning_effort=str(body.get("reasoning_effort", ""))[:32],
+        max_tokens=int(body["max_tokens"]) if body.get("max_tokens") is not None else None,
+        token_budget=int(body.get("token_budget", 0)),
+        agent_max_turns=int(body["agent_max_turns"])
+        if body.get("agent_max_turns") is not None
+        else None,
+        notify_on_complete=str(body.get("notify_on_complete", "{}"))[:4096],
+        org_id=str(body.get("org_id", ""))[:128],
+        created_by=getattr(getattr(request.state, "auth_result", None), "user_id", ""),
+        enabled=bool(body.get("enabled", True)),
+    )
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "ws_template.create",
+        "ws_template",
+        ws_template_id,
+        {"name": name},
+        ip,
+    )
+
+    tpl = storage.get_ws_template(ws_template_id)
+    return JSONResponse(tpl)
+
+
+async def admin_get_ws_template(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/ws-templates/{ws_template_id} — get a single workstream template."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    ws_template_id = request.path_params["ws_template_id"]
+    tpl = storage.get_ws_template(ws_template_id)
+    if not tpl:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(tpl)
+
+
+async def admin_update_ws_template(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/ws-templates/{ws_template_id} — update a workstream template."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    ws_template_id = request.path_params["ws_template_id"]
+    existing = storage.get_ws_template(ws_template_id)
+    if not existing:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        new_name = str(body["name"]).strip()[:256]
+        if new_name != existing["name"] and storage.get_ws_template_by_name(new_name) is not None:
+            return JSONResponse({"error": "Name already exists"}, status_code=409)
+        updates["name"] = new_name
+    if "description" in body:
+        updates["description"] = str(body["description"])[:1024]
+    if "system_prompt" in body:
+        updates["system_prompt"] = str(body["system_prompt"])[:32768]
+    if "prompt_template" in body:
+        pt_ref = str(body["prompt_template"])[:256]
+        pt_obj = storage.get_prompt_template_by_name(pt_ref) if pt_ref else None
+        if pt_ref and not pt_obj:
+            return JSONResponse({"error": f"Prompt template not found: {pt_ref}"}, status_code=400)
+        updates["prompt_template"] = pt_ref
+        updates["prompt_template_hash"] = _hash_content(pt_obj.get("content", "")) if pt_obj else ""
+    if "model" in body:
+        updates["model"] = str(body["model"])[:128]
+    if "auto_approve" in body:
+        updates["auto_approve"] = bool(body["auto_approve"])
+    if "auto_approve_tools" in body:
+        updates["auto_approve_tools"] = str(body["auto_approve_tools"])[:2048]
+    if "temperature" in body:
+        updates["temperature"] = (
+            float(body["temperature"]) if body["temperature"] is not None else None
+        )
+    if "reasoning_effort" in body:
+        updates["reasoning_effort"] = str(body["reasoning_effort"])[:32]
+    if "max_tokens" in body:
+        updates["max_tokens"] = int(body["max_tokens"]) if body["max_tokens"] is not None else None
+    if "token_budget" in body:
+        updates["token_budget"] = int(body["token_budget"])
+    if "agent_max_turns" in body:
+        updates["agent_max_turns"] = (
+            int(body["agent_max_turns"]) if body["agent_max_turns"] is not None else None
+        )
+    if "notify_on_complete" in body:
+        updates["notify_on_complete"] = str(body["notify_on_complete"])[:4096]
+    if "enabled" in body:
+        updates["enabled"] = bool(body["enabled"])
+
+    changed_by = getattr(getattr(request.state, "auth_result", None), "user_id", "")
+    storage.update_ws_template(ws_template_id, changed_by=changed_by, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "ws_template.update",
+        "ws_template",
+        ws_template_id,
+        updates,
+        ip,
+    )
+
+    tpl = storage.get_ws_template(ws_template_id)
+    return JSONResponse(tpl)
+
+
+async def admin_delete_ws_template(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/ws-templates/{ws_template_id} — delete a workstream template."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    ws_template_id = request.path_params["ws_template_id"]
+    existing = storage.get_ws_template(ws_template_id)
+    if not existing:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    storage.delete_ws_template(ws_template_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "ws_template.delete",
+        "ws_template",
+        ws_template_id,
+        {"name": existing["name"]},
+        ip,
+    )
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_list_ws_template_versions(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/ws-templates/{ws_template_id}/versions — version history."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.ws_templates")
+    if err:
+        return err
+    ws_template_id = request.path_params["ws_template_id"]
+    if not storage.get_ws_template(ws_template_id):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    versions = storage.list_ws_template_versions(ws_template_id)
+    return JSONResponse({"versions": versions})
+
+
+async def list_ws_templates_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/ws-templates — enabled workstream templates summary."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    templates = storage.list_ws_templates(enabled_only=True)
+    summary = [
+        {"name": t["name"], "description": t.get("description", ""), "model": t.get("model", "")}
+        for t in templates
+    ]
+    return JSONResponse({"ws_templates": summary})
+
+
 async def admin_usage(request: Request) -> JSONResponse:
     """GET /v1/api/admin/usage — query usage data."""
     from datetime import UTC, datetime, timedelta
@@ -2294,6 +2583,7 @@ def create_app(
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
+                    Route("/api/ws-templates", list_ws_templates_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
@@ -2381,6 +2671,24 @@ def create_app(
                         "/api/admin/templates/{template_id}",
                         admin_delete_template,
                         methods=["DELETE"],
+                    ),
+                    # Governance: Workstream templates
+                    Route("/api/admin/ws-templates", admin_list_ws_templates),
+                    Route("/api/admin/ws-templates", admin_create_ws_template, methods=["POST"]),
+                    Route("/api/admin/ws-templates/{ws_template_id}", admin_get_ws_template),
+                    Route(
+                        "/api/admin/ws-templates/{ws_template_id}",
+                        admin_update_ws_template,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/ws-templates/{ws_template_id}",
+                        admin_delete_ws_template,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/admin/ws-templates/{ws_template_id}/versions",
+                        admin_list_ws_template_versions,
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

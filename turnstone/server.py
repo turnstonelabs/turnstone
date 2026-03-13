@@ -91,6 +91,7 @@ class WebUI:
         self._plan_event = threading.Event()
         self._plan_result: str = ""
         self.auto_approve = False
+        self.auto_approve_tools: set[str] = set()
         # Per-workstream metrics accumulators (written by worker thread, read by metrics handler)
         self._ws_lock = threading.Lock()
         self._ws_prompt_tokens: int = 0
@@ -252,6 +253,12 @@ class WebUI:
             except Exception:
                 log.debug("Tool policy evaluation failed", exc_info=True)
         # -- End tool policy evaluation -------------------------------------------
+
+        # Per-tool auto-approve check (server-side, from workstream template)
+        if pending and self.auto_approve_tools:
+            pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+            if pending_names and pending_names.issubset(self.auto_approve_tools):
+                pending = []
 
         if not pending or self.auto_approve:
             # Track auto-approved tool activity
@@ -1014,11 +1021,26 @@ async def create_workstream(request: Request) -> JSONResponse:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
     body_template = body.get("template", "")
+    # Resolve workstream template before creation (model override flows through)
+    ws_template_name = body.get("ws_template", "")
+    ws_tpl: dict[str, Any] | None = None
+    if ws_template_name:
+        from turnstone.core.memory import get_ws_template_by_name
+
+        ws_tpl = get_ws_template_by_name(ws_template_name)
+        if not ws_tpl or not ws_tpl.get("enabled"):
+            return JSONResponse(
+                {"error": f"Workstream template not found or disabled: {ws_template_name}"},
+                status_code=400,
+            )
+    resolved_model = body.get("model") or None
+    if ws_tpl and ws_tpl.get("model"):
+        resolved_model = ws_tpl["model"]
     try:
         ws = mgr.create(
             name=body.get("name", ""),
             ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
-            model=body.get("model") or None,
+            model=resolved_model,
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -1073,6 +1095,60 @@ async def create_workstream(request: Request) -> JSONResponse:
                     {"error": f"Template not found: {body_template}"}, status_code=400
                 )
             ws.session.set_template(body_template)
+
+        # Apply workstream template settings (only for new workstreams)
+        if ws_tpl and not resumed and ws.session:
+            sess = ws.session
+            # System prompt: inline takes precedence over prompt_template ref
+            if ws_tpl["system_prompt"]:
+                sess._template_content = ws_tpl["system_prompt"]
+                sess._template_name = None
+                sess._init_system_messages()
+            elif ws_tpl["prompt_template"]:
+                sess.set_template(ws_tpl["prompt_template"])
+                # Check for prompt template content drift
+                if ws_tpl.get("prompt_template_hash"):
+                    import hashlib
+
+                    from turnstone.core.memory import get_prompt_template_by_name
+
+                    pt = get_prompt_template_by_name(ws_tpl["prompt_template"])
+                    if pt:
+                        current_hash = hashlib.sha256(pt.get("content", "").encode()).hexdigest()
+                        if current_hash != ws_tpl["prompt_template_hash"]:
+                            log.warning(
+                                "Prompt template '%s' content has changed since "
+                                "WS template '%s' was last updated",
+                                ws_tpl["prompt_template"],
+                                ws_tpl["name"],
+                            )
+            # Session settings
+            if ws_tpl.get("temperature") is not None:
+                sess.temperature = ws_tpl["temperature"]
+            if ws_tpl["reasoning_effort"]:
+                sess.reasoning_effort = ws_tpl["reasoning_effort"]
+            if ws_tpl.get("max_tokens") is not None:
+                sess.max_tokens = ws_tpl["max_tokens"]
+            if ws_tpl["token_budget"] > 0:
+                sess._token_budget = ws_tpl["token_budget"]
+            if ws_tpl.get("agent_max_turns") is not None:
+                sess.agent_max_turns = ws_tpl["agent_max_turns"]
+            # Approval policy
+            if ws_tpl["auto_approve"]:
+                ws.ui.auto_approve = True
+            if ws_tpl["auto_approve_tools"]:
+                ws.ui.auto_approve_tools = {
+                    t.strip() for t in ws_tpl["auto_approve_tools"].split(",") if t.strip()
+                }
+            # Metadata
+            sess._notify_on_complete = ws_tpl.get("notify_on_complete", "{}")
+            sess._ws_template_id = ws_tpl["ws_template_id"]
+            sess._ws_template_version = ws_tpl["version"]
+            sess._save_config()
+            # Persist template lineage on the workstreams row
+            from turnstone.core.memory import update_workstream_template
+
+            update_workstream_template(ws.id, ws_tpl["ws_template_id"], ws_tpl["version"])
 
         return JSONResponse(
             {

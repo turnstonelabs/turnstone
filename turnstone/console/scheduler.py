@@ -209,6 +209,7 @@ class TaskScheduler:
             auto_approve_tools=self._parse_tools(task),
             user_id=task.get("created_by", ""),
             template=task.get("template", ""),
+            ws_template=task.get("ws_template", ""),
         )
         self._broker.push_inbound(msg.to_json(), node_id=node_id)
 
@@ -235,6 +236,7 @@ class TaskScheduler:
             auto_approve_tools=self._parse_tools(task),
             user_id=task.get("created_by", ""),
             template=task.get("template", ""),
+            ws_template=task.get("ws_template", ""),
         )
         self._broker.push_inbound(msg.to_json())
 

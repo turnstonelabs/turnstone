@@ -79,6 +79,32 @@ Admin-curated system message templates injected at workstream startup:
   prevent compromised servers from injecting defaults. Admin UI shows origin badge
   and disables edit/delete for MCP-sourced templates.
 
+### Workstream Templates
+
+Workstream templates are behavioral profiles applied at workstream creation — the next level beyond prompt templates. While prompt templates inject system message text, workstream templates define the complete workstream configuration.
+
+**What they define:**
+- System prompt (inline text OR reference to a prompt template by name)
+- Model override (empty = server default)
+- Temperature, reasoning effort, max tokens, agent max turns
+- Auto-approve policy (blanket and/or per-tool list)
+- Token budget (0 = unlimited; warns at 80%, requires approval at 100%)
+- Completion notification config (stored for v2 dispatch)
+
+**Storage:** `workstream_templates` table (migration 011) with auto-versioning. Edits snapshot the pre-update state into `workstream_template_versions`. Workstreams record which template and version spawned them via `ws_template_id` + `ws_template_version` columns.
+
+**Applied once at creation:** Template settings are snapshot-applied to the workstream's config. Not a live binding — template updates don't affect running workstreams.
+
+**Prompt template drift detection:** When a workstream template references a prompt template, a SHA-256 hash of the prompt content is stored at ws_template create/update time. At workstream creation, the server compares the stored hash against current content and logs a warning on mismatch.
+
+**Admin API:** 7 endpoints under `/v1/api/admin/ws-templates` (list, create, get, update, delete, version history) plus a read-only summary at `/v1/api/ws-templates`. Permission: `admin.ws_templates`.
+
+**Console UI:** "WS Templates" tab (11th admin tab) with CRUD table, create/edit modals (name, description, system prompt source toggle, model, auto-approve, per-tool auto-approve, temperature, reasoning effort, max tokens, agent max turns, token budget, enabled), and version history modal. "Profile" dropdown on workstream creation modal. "WS Template" dropdown on scheduler create/edit modals.
+
+**Token budget enforcement:** Tracked in `session.send()`. At 80% consumption, emits an info message. At 100%, the next turn requires explicit approval via the `__budget_override__` synthetic tool name (reuses existing approval UI — inline in browser, Discord buttons, bridge auto-approve). The synthetic name can be targeted by tool policies (e.g. `__budget_override__` → `allow` for admins).
+
+**SDK:** Python (`list_ws_templates`, `create_ws_template`, `get_ws_template`, `update_ws_template`, `delete_ws_template`, `list_ws_template_versions`) and TypeScript (`listWsTemplates`, `createWsTemplate`, etc.) on both sync and async console clients. `ws_template` parameter on `create_workstream()` for both server and console SDKs.
+
 ### Usage Tracking
 
 Per-LLM-request token and tool call metrics:
@@ -99,7 +125,8 @@ Append-only trail of admin actions:
 - **Events captured**: user.create, user.delete, token.create, token.revoke,
   channel.link, channel.unlink, role.create, role.update, role.delete,
   role.assign, role.unassign, policy.create, policy.update, policy.delete,
-  template.create, template.update, template.delete, org.update
+  template.create, template.update, template.delete,
+  ws_template.create, ws_template.update, ws_template.delete, org.update
 - **Querying**: `GET /v1/api/admin/audit` with action/user/time filters + pagination
 
 ## Database Schema
@@ -130,6 +157,7 @@ All under `/v1/api/admin/` (requires `approve` scope + granular permission).
 | Tool Policies | 4 (CRUD) | `admin.policies` |
 | Prompt Templates | 4 (CRUD) | `admin.templates` |
 | Schedules | 6 (CRUD + runs) | `admin.schedules` |
+| WS Templates | 7 (CRUD + versions + summary) | `admin.ws_templates` |
 | Watches | 3 (list, create, cancel) | `admin.watches` |
 | Usage | 1 (aggregated query) | `admin.usage` |
 | Audit | 1 (paginated, filtered) | `admin.audit` |
@@ -138,11 +166,12 @@ Full OpenAPI spec at `/openapi.json` and Swagger UI at `/docs`.
 
 ## Admin Console UI
 
-5 new tabs added to the admin panel (10 total):
+6 new tabs added to the admin panel (11 total):
 
 - **Roles** — CRUD roles, permission checkbox grid, user role assignment modal
 - **Policies** — CRUD tool policies with colored action badges (green/red/amber)
 - **Templates** — CRUD prompt templates with wide modal, textarea editor
+- **WS Templates** — CRUD workstream templates with create/edit modals, version history
 - **Usage** — Summary readouts + CSS bar chart, time range + group-by selectors
 - **Audit** — Filterable log with relative timestamps, load-more pagination
 
@@ -158,6 +187,7 @@ Both Python and TypeScript console SDKs expose governance methods:
 - `list_orgs()`, `get_org()`, `update_org()`
 - `list_policies()`, `create_policy()`, `update_policy()`, `delete_policy()`
 - `list_templates()`, `create_template()`, `update_template()`, `delete_template()`
+- `list_ws_templates()`, `create_ws_template()`, `get_ws_template()`, `update_ws_template()`, `delete_ws_template()`, `list_ws_template_versions()`
 - `get_usage(since, group_by=...)`, `get_audit(action=..., limit=...)`
 
 **TypeScript** (`TurnstoneConsole`):

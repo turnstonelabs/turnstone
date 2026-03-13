@@ -64,11 +64,14 @@ class "_schema.py" as Schema <<schema>> {
     +metadata: MetaData
     +memories: Table
     +conversations: Table
-    +workstreams: Table (node_id, alias, title, state)
+    +workstreams: Table (node_id, alias, title,\n    state, ws_template_id, ws_template_version)
     +workstream_config: Table
     +users: Table (username, password_hash)
     +api_tokens: Table (token_hash, scopes)
     +channel_users: Table (channel_type)
+    +workstream_templates: Table (name, model,\n    system_prompt, token_budget, version)
+    +workstream_template_versions: Table\n    (template_id, version, snapshot)
+    +scheduled_tasks: Table (..., ws_template)
     --
     SQLAlchemy Core
     Single source of truth

@@ -257,6 +257,13 @@ class ChatSession:
         self._last_usage: dict[str, int] | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
+        # Workstream template metadata
+        self._token_budget: int = 0
+        self._budget_warned: bool = False
+        self._budget_exhausted: bool = False
+        self._notify_on_complete: str = "{}"
+        self._ws_template_id: str = ""
+        self._ws_template_version: int = 0
         self._assistant_pending_tokens = 0
         self.creative_mode = False
         self._notify_count = 0
@@ -342,6 +349,10 @@ class ChatSession:
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
                 "template": self._template_name or "",
+                "token_budget": str(self._token_budget),
+                "ws_template_id": self._ws_template_id,
+                "ws_template_version": str(self._ws_template_version),
+                "notify_on_complete": self._notify_on_complete,
             },
         )
 
@@ -603,6 +614,14 @@ class ChatSession:
             if "template" in config:
                 self._template_name = config["template"] or None
                 self._load_templates()
+            if "token_budget" in config:
+                self._token_budget = int(config["token_budget"] or "0")
+            if "ws_template_id" in config:
+                self._ws_template_id = config["ws_template_id"]
+            if "ws_template_version" in config:
+                self._ws_template_version = int(config["ws_template_version"] or "0")
+            if "notify_on_complete" in config:
+                self._notify_on_complete = config["notify_on_complete"]
             self._init_system_messages()
         return True
 
@@ -896,6 +915,24 @@ class ChatSession:
 
     def send(self, user_input: str) -> None:
         """Send user input and handle the response loop (including tool calls)."""
+        # Token budget approval gate
+        if self._budget_exhausted:
+            approved, _ = self.ui.approve_tools(
+                [
+                    {
+                        "func_name": "__budget_override__",
+                        "preview": (
+                            f"Token budget ({self._token_budget:,}) exhausted. Approve to continue."
+                        ),
+                        "needs_approval": True,
+                    }
+                ]
+            )
+            if not approved:
+                self.ui.on_error("Token budget exhausted. Approval required to continue.")
+                return
+            self._budget_exhausted = False
+            self._budget_warned = False
         self._notify_count = 0
         self._cancel_event.clear()
         self._cancelled_partial_msg = None
@@ -1440,6 +1477,15 @@ class ChatSession:
 
         # Stash completion_tokens for the assistant message about to be appended
         self._assistant_pending_tokens = compl_tok
+
+        # Token budget tracking
+        if self._token_budget > 0:
+            total = prompt_tok + compl_tok
+            if not self._budget_warned and total >= self._token_budget * 0.8:
+                self._budget_warned = True
+                self.ui.on_info(f"Token budget 80% consumed ({total:,}/{self._token_budget:,})")
+            if total >= self._token_budget:
+                self._budget_exhausted = True
 
     def _print_status_line(self) -> None:
         """Emit status info via the UI."""

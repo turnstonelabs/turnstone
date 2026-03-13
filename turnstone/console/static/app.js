@@ -1261,6 +1261,26 @@ function showNewWsModal() {
     .catch(function () {
       /* ignore — defaults still work */
     });
+  // Populate profile (WS template) dropdown
+  var profSelect = document.getElementById("new-ws-profile");
+  profSelect.innerHTML = '<option value="">None</option>';
+  authFetch("/v1/api/ws-templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.ws_templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        var label = t.name;
+        if (t.model) label += " (" + t.model + ")";
+        opt.textContent = label;
+        profSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — profiles optional */
+    });
   document.getElementById("new-ws-name").value = "";
   document.getElementById("new-ws-model").value = "";
   document.getElementById("new-ws-task").value = "";
@@ -1330,6 +1350,8 @@ function submitNewWs() {
   if (model) body.model = model;
   if (task) body.initial_message = task;
   if (template) body.template = template;
+  var profile = document.getElementById("new-ws-profile").value;
+  if (profile) body.ws_template = profile;
 
   authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",

@@ -103,6 +103,8 @@ class StorageBackend(Protocol):
         user_id: str | None = None,
         alias: str | None = None,
         title: str | None = None,
+        ws_template_id: str = "",
+        ws_template_version: int = 0,
     ) -> None:
         """Create a workstreams row (no-op if already exists)."""
         ...
@@ -113,6 +115,12 @@ class StorageBackend(Protocol):
 
     def update_workstream_name(self, ws_id: str, name: str) -> None:
         """Update a workstream's display name."""
+        ...
+
+    def update_workstream_template(
+        self, ws_id: str, ws_template_id: str, ws_template_version: int
+    ) -> None:
+        """Set the ws_template_id and ws_template_version on a workstream row."""
         ...
 
     def delete_workstream(self, ws_id: str) -> bool:
@@ -248,6 +256,7 @@ class StorageBackend(Protocol):
         created_by: str,
         next_run: str,
         template: str = "",
+        ws_template: str = "",
     ) -> None:
         """Create a scheduled task. No-op if task_id already exists."""
         ...
@@ -505,6 +514,68 @@ class StorageBackend(Protocol):
 
     def delete_prompt_template(self, template_id: str) -> bool:
         """Delete a prompt template. Returns True if found."""
+        ...
+
+    # -- Workstream templates --------------------------------------------------
+
+    def create_ws_template(
+        self,
+        ws_template_id: str,
+        name: str,
+        description: str = "",
+        system_prompt: str = "",
+        prompt_template: str = "",
+        prompt_template_hash: str = "",
+        model: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        temperature: float | None = None,
+        reasoning_effort: str = "",
+        max_tokens: int | None = None,
+        token_budget: int = 0,
+        agent_max_turns: int | None = None,
+        notify_on_complete: str = "{}",
+        org_id: str = "",
+        created_by: str = "",
+        enabled: bool = True,
+    ) -> None:
+        """Create a workstream template."""
+        ...
+
+    def get_ws_template(self, ws_template_id: str) -> dict[str, Any] | None:
+        """Return workstream template dict or None."""
+        ...
+
+    def get_ws_template_by_name(self, name: str) -> dict[str, Any] | None:
+        """Lookup workstream template by name. Returns same dict or None."""
+        ...
+
+    def list_ws_templates(
+        self, org_id: str = "", enabled_only: bool = False
+    ) -> list[dict[str, Any]]:
+        """Return all workstream templates ordered by name."""
+        ...
+
+    def update_ws_template(self, ws_template_id: str, changed_by: str = "", **fields: Any) -> bool:
+        """Update fields on a workstream template. Auto-snapshots version. Returns True if found."""
+        ...
+
+    def delete_ws_template(self, ws_template_id: str) -> bool:
+        """Delete a workstream template and cascade-delete versions. Returns True if found."""
+        ...
+
+    def create_ws_template_version(
+        self,
+        ws_template_id: str,
+        version: int,
+        snapshot: str,
+        changed_by: str = "",
+    ) -> None:
+        """Create a version snapshot for a workstream template."""
+        ...
+
+    def list_ws_template_versions(self, ws_template_id: str) -> list[dict[str, Any]]:
+        """List version history for a workstream template, ordered by version DESC."""
         ...
 
     # -- Usage events ----------------------------------------------------------
