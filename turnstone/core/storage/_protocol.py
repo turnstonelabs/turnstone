@@ -650,6 +650,58 @@ class StorageBackend(Protocol):
         """Delete audit events older than retention_days. Returns count deleted."""
         ...
 
+    # -- Intent verdicts -------------------------------------------------------
+
+    def create_intent_verdict(
+        self,
+        verdict_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        func_args: str,
+        intent_summary: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        reasoning: str,
+        evidence: str,
+        tier: str,
+        judge_model: str,
+        latency_ms: int,
+    ) -> None:
+        """Record an intent validation verdict."""
+        ...
+
+    def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:
+        """Return intent verdict dict or None."""
+        ...
+
+    def list_intent_verdicts(
+        self,
+        ws_id: str = "",
+        since: str = "",
+        until: str = "",
+        risk_level: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List intent verdicts with optional filters, ordered by created DESC."""
+        ...
+
+    def update_intent_verdict(self, verdict_id: str, **fields: Any) -> bool:
+        """Update fields on an intent verdict (e.g. user_decision). Returns True if found."""
+        ...
+
+    def count_intent_verdicts(
+        self,
+        ws_id: str = "",
+        since: str = "",
+        until: str = "",
+        risk_level: str = "",
+    ) -> int:
+        """Count intent verdicts matching the filters."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

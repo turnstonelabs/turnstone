@@ -1,0 +1,160 @@
+@startuml
+!theme plain
+title Turnstone — Intent Validation (Judge) Architecture
+
+skinparam participant {
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<judge>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<ui>> #E8EAF6
+    BackgroundColor<<fs>> #F5F5F5
+}
+
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "IntentJudge\n(judge.py)" as Judge <<judge>>
+participant "LLM Provider\n(provider)" as LLM <<judge>>
+participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "WebUI / SSE\n(server.py)" as UI <<ui>>
+participant "Filesystem" as FS <<fs>>
+
+== Tool Call Requires Approval ==
+
+Session -> Session : _prepare_tool_calls()
+note right
+  Tool calls parsed from
+  LLM response. Auto-approved
+  tools dispatched immediately.
+  Remaining items need approval.
+end note
+
+Session -> Session : _evaluate_intent(pending_items)
+
+== Tier 1: Heuristic (synchronous, sub-ms) ==
+
+Session -> Judge : evaluate(items, messages, callback)
+
+Judge -> Judge : evaluate_heuristic()\nfor each item
+note right
+  **Rule table (first match wins):**
+  Critical (0.90, deny): rm /, mkfs,
+    dd, pipe-to-shell, chmod 777 /,
+    write/edit /etc/ .ssh/
+  High (0.80, review): sudo, kill -9,
+    destructive git, DROP TABLE,
+    secrets, HTTP mutations, ssh/scp
+  Medium (0.70, review): pip/npm install,
+    write_file, MCP tools, docker ops
+  Low (0.85, approve): read_file,
+    list_directory, search, recall,
+    read-only bash (ls, cat, grep...)
+  Default: medium, 0.50, review
+end note
+
+Judge --> Session : heuristic_verdicts[]
+
+Session -> Session : attach _heuristic_verdict\nto each pending item
+
+Session -> UI : SSE: approve_request\n{items: [{verdict: ...}],\n judge_pending: true}
+note right
+  Heuristic verdict displayed
+  immediately as risk badge.
+  Spinner shown while LLM
+  judge evaluates.
+end note
+
+Session -> Storage : create_intent_verdict()\nfor each heuristic verdict
+
+== Tier 2: LLM Judge (daemon thread, async) ==
+
+Judge -> Judge : spawn daemon thread\n"intent-judge"
+
+note over Judge, LLM
+  **Context preparation:**
+  1. FIFO-truncate conversation history
+     to max_context_ratio of context window
+  2. Append tool call details as user message
+  3. System prompt defines judge role + JSON schema
+end note
+
+loop up to 3 turns (timeout budget)
+
+    Judge -> LLM : create_completion(\nmodel, judge_messages,\ntools=[read_file, list_directory])
+    LLM --> Judge : CompletionResult
+
+    alt tool_calls present (turn < 3)
+        Judge -> Judge : _exec_read_only_tool()
+        note right
+          **Security hardening:**
+          Blocked: /etc/, /root/,
+          /proc/, /sys/, /dev/,
+          .ssh, .gnupg, .aws,
+          *.pem, *.key, *.p12
+          File cap: 32KB
+          Dir cap: 200 entries
+        end note
+        Judge -> FS : read_file / list_directory
+        FS --> Judge : file contents
+        Judge -> Judge : append tool result\nto judge_messages
+    else text response (final verdict)
+        Judge -> Judge : _parse_verdict()
+        note right
+          **4-stage JSON parsing:**
+          1. Direct JSON.loads
+          2. Markdown code block
+          3. Brace-counting
+          4. Regex field extraction
+        end note
+    end
+
+end
+
+== Tier 3: Arbitration ==
+
+Judge -> Judge : compare confidence:\nLLM vs heuristic
+note right
+  Only deliver LLM verdict
+  if confidence > heuristic.
+  Otherwise heuristic stands.
+end note
+
+alt LLM confidence > heuristic confidence
+    Judge -> Session : callback(llm_verdict)
+    Session -> UI : SSE: intent_verdict\n{tier: "llm", ...}
+    note right
+      UI replaces heuristic badge
+      with LLM verdict. Spinner
+      resolves to final assessment.
+    end note
+    Session -> Storage : create_intent_verdict()\nfor LLM verdict
+end
+
+== User Decision ==
+
+UI -> Session : resolve_approval(\napproved, feedback)
+
+Session -> Storage : update_intent_verdict(\nverdict_id, user_decision)
+note right
+  All tracked verdicts
+  (heuristic + LLM) updated
+  with "approved" or "denied".
+  Swap-and-clear avoids racing
+  with daemon judge thread.
+end note
+
+== Lifecycle ==
+
+note over Session, Judge
+  **Lazy initialization:**
+  IntentJudge created on first approval if judge_config.enabled.
+  Re-uses session's provider/client by default (self-consistency).
+  Cross-model: separate provider/client from [judge] config.
+
+  **Sub-agent exemption:**
+  Plan agent and task agent skip intent validation entirely.
+
+  **Storage:**
+  intent_verdicts table (migration 012). Verdicts queryable via
+  GET /v1/api/admin/verdicts (requires admin.judge permission).
+end note
+
+@enduml

@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from turnstone.core.healthcheck import BackendHealthMonitor
+    from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.providers import (
@@ -147,6 +148,9 @@ class SessionUI(Protocol):
     def on_error(self, message: str) -> None: ...
     def on_state_change(self, state: str) -> None: ...
     def on_rename(self, name: str) -> None: ...
+    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Called when the LLM judge produces a verdict for a pending approval."""
+        ...
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +221,7 @@ class ChatSession:
         tool_search_threshold: int = 20,
         tool_search_max_results: int = 5,
         template: str | None = None,
+        judge_config: JudgeConfig | None = None,
     ):
         self.client = client
         self.model = model
@@ -275,6 +280,9 @@ class ChatSession:
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg: dict[str, Any] | None = None
+        # Intent validation judge (lazy-initialized)
+        self._judge_config: JudgeConfig | None = judge_config
+        self._judge: IntentJudge | None = None
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -1707,6 +1715,76 @@ class ChatSession:
         lines.append(separator)
         self.ui.on_info("\n".join(lines))
 
+    # -- Intent validation --------------------------------------------------------
+
+    def _ensure_judge(self) -> IntentJudge | None:
+        """Lazily initialize the intent judge if configured."""
+        if self._judge is not None:
+            return self._judge
+        if not self._judge_config or not self._judge_config.enabled:
+            return None
+        try:
+            from turnstone.core.judge import IntentJudge
+
+            caps = self._get_capabilities()
+            self._judge = IntentJudge(
+                config=self._judge_config,
+                session_provider=self._provider,
+                session_client=self.client,
+                session_model=self.model,
+                context_window=caps.context_window,
+            )
+        except Exception:
+            log.warning("judge.init_failed", exc_info=True)
+        return self._judge
+
+    def _evaluate_intent(
+        self,
+        items: list[dict[str, Any]],
+    ) -> None:
+        """Run intent validation on pending approval items.
+
+        Attaches heuristic verdicts to items immediately.  Spawns the
+        async LLM judge that delivers final verdicts via UI callback.
+        """
+        judge = self._ensure_judge()
+        if not judge:
+            return
+
+        # Only evaluate items that need approval and aren't errors
+        pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
+        if not pending:
+            return
+
+        # Build func_args from tool-specific item keys so the heuristic
+        # engine can pattern-match on argument content.
+        for it in pending:
+            name = it.get("func_name", "")
+            if name == "bash":
+                it["func_args"] = {"command": it.get("command", "")}
+            elif name in ("write_file", "edit_file", "read_file"):
+                it["func_args"] = {"path": it.get("path", "")}
+            elif it.get("mcp_args"):
+                it["func_args"] = it["mcp_args"]
+            # Other tools: func_args stays absent → judge defaults to {}
+
+        def _on_verdict(verdict: object) -> None:
+            """Callback from the daemon judge thread."""
+            try:
+                self.ui.on_intent_verdict(verdict.to_dict())  # type: ignore[attr-defined]
+            except Exception:
+                log.debug("judge.verdict_delivery_failed", exc_info=True)
+
+        heuristic_verdicts = judge.evaluate(
+            pending,
+            list(self.messages),  # snapshot — daemon thread must not see mutations
+            callback=_on_verdict,
+        )
+
+        # Attach heuristic verdicts to items for the approval UI
+        for item, verdict in zip(pending, heuristic_verdicts, strict=True):
+            item["_heuristic_verdict"] = verdict.to_dict()
+
     # -- Two-phase tool execution -----------------------------------------------
     #
     # Phase 1 — prepare: parse args, validate, build preview text (serial)
@@ -1723,6 +1801,9 @@ class ChatSession:
         """
         # Phase 1: prepare all tool calls
         items = [self._prepare_tool(tc) for tc in tool_calls]
+
+        # Intent validation (advisory, non-blocking)
+        self._evaluate_intent(items)
 
         # Phase 2: approve via UI
         self._emit_state("attention")

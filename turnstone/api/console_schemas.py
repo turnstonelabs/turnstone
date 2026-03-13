@@ -450,6 +450,39 @@ class ListAuditEventsResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Governance: Intent Verdicts
+# ---------------------------------------------------------------------------
+
+
+class VerdictInfo(BaseModel):
+    """Intent validation verdict."""
+
+    verdict_id: str
+    ws_id: str
+    call_id: str
+    func_name: str
+    func_args: str = ""
+    intent_summary: str
+    risk_level: str
+    confidence: float
+    recommendation: str
+    reasoning: str
+    evidence: str = "[]"
+    tier: str
+    judge_model: str = ""
+    user_decision: str = ""
+    latency_ms: int = 0
+    created: str
+
+
+class ListVerdictsResponse(BaseModel):
+    """Response for verdict listing."""
+
+    verdicts: list[VerdictInfo]
+    total: int
+
+
+# ---------------------------------------------------------------------------
 # Channels
 # ---------------------------------------------------------------------------
 

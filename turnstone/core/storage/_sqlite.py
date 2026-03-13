@@ -14,6 +14,7 @@ from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
     conversations,
+    intent_verdicts,
     memories,
     metadata,
     orgs,
@@ -79,6 +80,20 @@ _WS_TEMPLATE_MUTABLE = frozenset(
         "agent_max_turns",
         "notify_on_complete",
         "enabled",
+    }
+)
+_VERDICT_MUTABLE = frozenset(
+    {
+        "user_decision",
+        "intent_summary",
+        "risk_level",
+        "confidence",
+        "recommendation",
+        "reasoning",
+        "evidence",
+        "tier",
+        "judge_model",
+        "latency_ms",
     }
 )
 
@@ -2075,6 +2090,116 @@ class SQLiteBackend:
             result = conn.execute(sa.delete(audit_events).where(audit_events.c.timestamp < cutoff))
             conn.commit()
             return result.rowcount
+
+    # -- Intent verdicts -------------------------------------------------------
+
+    def create_intent_verdict(
+        self,
+        verdict_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        func_args: str,
+        intent_summary: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        reasoning: str,
+        evidence: str,
+        tier: str,
+        judge_model: str,
+        latency_ms: int,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(intent_verdicts),
+                {
+                    "verdict_id": verdict_id,
+                    "ws_id": ws_id,
+                    "call_id": call_id,
+                    "func_name": func_name,
+                    "func_args": func_args,
+                    "intent_summary": intent_summary,
+                    "risk_level": risk_level,
+                    "confidence": confidence,
+                    "recommendation": recommendation,
+                    "reasoning": reasoning,
+                    "evidence": evidence,
+                    "tier": tier,
+                    "judge_model": judge_model,
+                    "latency_ms": latency_ms,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(intent_verdicts).where(intent_verdicts.c.verdict_id == verdict_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return dict(row._mapping)
+
+    def list_intent_verdicts(
+        self,
+        ws_id: str = "",
+        since: str = "",
+        until: str = "",
+        risk_level: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(intent_verdicts).order_by(
+                intent_verdicts.c.created.desc(), intent_verdicts.c.verdict_id.desc()
+            )
+            if ws_id:
+                q = q.where(intent_verdicts.c.ws_id == ws_id)
+            if since:
+                q = q.where(intent_verdicts.c.created >= since)
+            if until:
+                q = q.where(intent_verdicts.c.created <= until)
+            if risk_level:
+                q = q.where(intent_verdicts.c.risk_level == risk_level)
+            q = q.limit(limit).offset(offset)
+            rows = conn.execute(q).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def update_intent_verdict(self, verdict_id: str, **fields: Any) -> bool:
+        fields = {k: v for k, v in fields.items() if k in _VERDICT_MUTABLE}
+        if not fields:
+            return False
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(intent_verdicts)
+                .where(intent_verdicts.c.verdict_id == verdict_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def count_intent_verdicts(
+        self,
+        ws_id: str = "",
+        since: str = "",
+        until: str = "",
+        risk_level: str = "",
+    ) -> int:
+        with self._engine.connect() as conn:
+            q = sa.select(sa.func.count()).select_from(intent_verdicts)
+            if ws_id:
+                q = q.where(intent_verdicts.c.ws_id == ws_id)
+            if since:
+                q = q.where(intent_verdicts.c.created >= since)
+            if until:
+                q = q.where(intent_verdicts.c.created <= until)
+            if risk_level:
+                q = q.where(intent_verdicts.c.risk_level == risk_level)
+            row = conn.execute(q).fetchone()
+            return row[0] if row else 0
 
     # -- Lifecycle -------------------------------------------------------------
 

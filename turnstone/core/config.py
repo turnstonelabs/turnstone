@@ -125,6 +125,17 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "path": "db_path",
         "pool_size": "db_pool_size",
     },
+    "judge": {
+        "enabled": "judge_enabled",
+        "model": "judge_model",
+        "provider": "judge_provider",
+        "base_url": "judge_base_url",
+        "api_key": "judge_api_key",
+        "confidence_threshold": "judge_confidence",
+        "max_context_ratio": "judge_context_ratio",
+        "timeout": "judge_timeout",
+        "read_only_tools": "judge_read_only_tools",
+    },
 }
 
 # -- Tavily API key (cached) --------------------------------------------------

@@ -6,6 +6,7 @@ from turnstone.channels._formatter import (
     chunk_message,
     format_approval_request,
     format_plan_review,
+    format_verdict,
     truncate,
 )
 from turnstone.channels._protocol import ChannelEvent
@@ -181,6 +182,81 @@ class TestFormatPlanReview:
         result = format_plan_review("Step 1: do stuff")
         assert result.startswith("**Plan review requested:**")
         assert "Step 1: do stuff" in result
+
+
+# ---------------------------------------------------------------------------
+# format_verdict
+# ---------------------------------------------------------------------------
+
+
+class TestFormatVerdict:
+    def test_low_risk(self) -> None:
+        verdict = {
+            "risk_level": "low",
+            "recommendation": "allow",
+            "confidence": 0.95,
+            "intent_summary": "Reading a config file",
+            "tier": "heuristic",
+        }
+        result = format_verdict(verdict)
+        assert "HEURISTIC" in result
+        assert "LOW" in result
+        assert "95%" in result
+        assert "allow" in result
+        assert "_Reading a config file_" in result
+        # Green circle emoji
+        assert "\U0001f7e2" in result
+
+    def test_high_risk(self) -> None:
+        verdict = {
+            "risk_level": "high",
+            "recommendation": "deny",
+            "confidence": 0.8,
+        }
+        result = format_verdict(verdict)
+        assert "HIGH" in result
+        assert "80%" in result
+        assert "deny" in result
+        # Red circle emoji
+        assert "\U0001f534" in result
+
+    def test_critical_risk(self) -> None:
+        verdict = {"risk_level": "critical", "confidence": 0.99}
+        result = format_verdict(verdict)
+        assert "CRITICAL" in result
+        assert "\u26d4" in result
+
+    def test_medium_risk_default(self) -> None:
+        """Empty risk_level defaults to MEDIUM."""
+        result = format_verdict({})
+        assert "MEDIUM" in result
+        assert "50%" in result
+        assert "review" in result
+
+    def test_no_summary_omits_line(self) -> None:
+        verdict = {"risk_level": "low", "confidence": 0.7}
+        result = format_verdict(verdict)
+        # Should be a single line (no summary italic line).
+        assert "\n" not in result
+
+    def test_with_summary(self) -> None:
+        verdict = {"risk_level": "low", "intent_summary": "Safe operation"}
+        result = format_verdict(verdict)
+        lines = result.split("\n")
+        assert len(lines) == 2
+        assert "_Safe operation_" in lines[1]
+
+    def test_tier_label(self) -> None:
+        verdict = {"tier": "llm", "risk_level": "medium"}
+        result = format_verdict(verdict)
+        assert "LLM " in result
+
+    def test_no_tier_no_label(self) -> None:
+        verdict = {"risk_level": "low"}
+        result = format_verdict(verdict)
+        assert "Risk: LOW" in result
+        # No double space or extra label prefix.
+        assert "** " not in result or "**Risk:" in result
 
 
 # ---------------------------------------------------------------------------

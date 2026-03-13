@@ -30,6 +30,7 @@ from turnstone.mq.protocol import (
     HealthResponseEvent,
     InboundMessage,
     InfoEvent,
+    IntentVerdictEvent,
     NodeListEvent,
     OutboundEvent,
     PlanReviewEvent,
@@ -631,6 +632,25 @@ class Bridge:
             self._publish_ws(ws_id, ErrorEvent(ws_id=ws_id, message=data.get("message", "")))
         elif etype == "info":
             self._publish_ws(ws_id, InfoEvent(ws_id=ws_id, message=data.get("message", "")))
+        elif etype == "intent_verdict":
+            self._publish_ws(
+                ws_id,
+                IntentVerdictEvent(
+                    ws_id=ws_id,
+                    call_id=data.get("call_id", ""),
+                    func_name=data.get("func_name", ""),
+                    intent_summary=data.get("intent_summary", ""),
+                    risk_level=data.get("risk_level", ""),
+                    confidence=float(data.get("confidence", 0.0)),
+                    recommendation=data.get("recommendation", ""),
+                    reasoning=data.get("reasoning", ""),
+                    evidence=json.dumps(data.get("evidence", [])),
+                    tier=data.get("tier", ""),
+                    judge_model=data.get("judge_model", ""),
+                    verdict_id=data.get("verdict_id", ""),
+                    latency_ms=int(data.get("latency_ms", 0)),
+                ),
+            )
         elif etype == "stream_end":
             self._publish_ws(ws_id, StreamEndEvent(ws_id=ws_id))
 

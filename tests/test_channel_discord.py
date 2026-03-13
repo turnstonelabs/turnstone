@@ -327,6 +327,7 @@ class TestWsEventFinalization:
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
         bot._streaming = {}
+        bot._pending_approval_msgs = {}
 
         # Use the real _on_ws_event method
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
@@ -354,6 +355,7 @@ class TestWsEventFinalization:
 
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
+        bot._pending_approval_msgs = {}
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
 
         thread = AsyncMock()
@@ -363,6 +365,152 @@ class TestWsEventFinalization:
 
         # No error, no streaming message
         assert "ws-1" not in bot._streaming
+
+
+# ---------------------------------------------------------------------------
+# Verdict display in approval embeds
+# ---------------------------------------------------------------------------
+
+
+class TestApprovalVerdictDisplay:
+    """Approval requests should include verdict fields in the Discord embed."""
+
+    def _make_bot(self):
+        """Build a mock TurnstoneBot with _on_ws_event bound."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot.config.streaming_edit_interval = 1.5
+        bot.config.auto_approve = False
+        bot.config.auto_approve_tools = []
+        bot._streaming = {}
+        bot._pending_approval_msgs = {}
+        bot._should_auto_approve = MagicMock(return_value=False)
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        return bot
+
+    def test_approval_with_heuristic_verdict(self):
+        """ApprovalRequestEvent items with verdict dicts add embed fields."""
+        from turnstone.mq.protocol import ApprovalRequestEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+        sent_msg = MagicMock()
+        thread.send = AsyncMock(return_value=sent_msg)
+
+        items = [
+            {
+                "func_name": "bash",
+                "preview": "rm -rf /tmp",
+                "needs_approval": True,
+                "verdict": {
+                    "risk_level": "high",
+                    "recommendation": "deny",
+                    "confidence": 0.85,
+                    "intent_summary": "Deleting temp files",
+                    "tier": "heuristic",
+                },
+            }
+        ]
+        raw = ApprovalRequestEvent(ws_id="ws-1", correlation_id="corr-1", items=items).to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        # thread.send was called with an embed containing a verdict field
+        thread.send.assert_awaited_once()
+        call_kwargs = thread.send.call_args[1]
+        embed = call_kwargs["embed"]
+        # discord.Embed.fields is a list of EmbedProxy objects
+        assert len(embed.fields) == 1
+        field = embed.fields[0]
+        assert field.name == "Verdict: bash"
+        assert "HIGH" in field.value
+        assert "85%" in field.value
+
+        # Pending approval message tracked
+        assert "ws-1" in bot._pending_approval_msgs
+
+    def test_approval_without_verdict(self):
+        """ApprovalRequestEvent items without verdict still work normally."""
+        from turnstone.mq.protocol import ApprovalRequestEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+        sent_msg = MagicMock()
+        thread.send = AsyncMock(return_value=sent_msg)
+
+        items = [{"func_name": "read_file", "preview": "/etc/hosts", "needs_approval": True}]
+        raw = ApprovalRequestEvent(ws_id="ws-1", correlation_id="corr-1", items=items).to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        thread.send.assert_awaited_once()
+        call_kwargs = thread.send.call_args[1]
+        embed = call_kwargs["embed"]
+        # No verdict field added
+        assert len(embed.fields) == 0
+
+    def test_intent_verdict_event_updates_embed(self):
+        """IntentVerdictEvent should update the pending approval embed."""
+        from turnstone.mq.protocol import IntentVerdictEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        # Set up a pending approval message with a mock embed
+        msg = MagicMock()
+        embed = MagicMock()
+        msg.embeds = [embed]
+        msg.edit = AsyncMock()
+        bot._pending_approval_msgs["ws-1"] = msg
+
+        raw = IntentVerdictEvent(
+            ws_id="ws-1",
+            func_name="bash",
+            risk_level="high",
+            recommendation="deny",
+            confidence=0.9,
+            intent_summary="Dangerous operation",
+            tier="llm",
+        ).to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        # Embed should be updated with the judge verdict field
+        embed.add_field.assert_called_once()
+        field_kwargs = embed.add_field.call_args[1]
+        assert field_kwargs["name"] == "Judge Verdict: bash"
+        assert "HIGH" in field_kwargs["value"]
+        assert "90%" in field_kwargs["value"]
+
+        # Message should be edited
+        msg.edit.assert_awaited_once()
+
+    def test_intent_verdict_without_pending_approval_is_noop(self):
+        """IntentVerdictEvent without a pending approval message should not error."""
+        from turnstone.mq.protocol import IntentVerdictEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        raw = IntentVerdictEvent(ws_id="ws-1", func_name="bash", risk_level="low").to_json()
+        # Should not raise
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+    def test_turn_complete_clears_pending_approval(self):
+        """TurnCompleteEvent should clean up the pending approval message tracking."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot._streaming = {}
+        bot._pending_approval_msgs = {"ws-1": MagicMock()}
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+
+        thread = AsyncMock()
+        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        assert "ws-1" not in bot._pending_approval_msgs
 
 
 class TestChannelCLI:

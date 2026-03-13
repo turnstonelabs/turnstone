@@ -19,6 +19,7 @@ from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamS
 from turnstone.ui.colors import (
     BOLD,
     DIM,
+    GREEN,
     RED,
     RESET,
     YELLOW,
@@ -31,6 +32,14 @@ from turnstone.ui.colors import (
 )
 from turnstone.ui.markdown import MarkdownRenderer
 from turnstone.ui.spinner import Spinner
+
+# ANSI colors for intent verdict risk levels
+_VERDICT_COLORS: dict[str, str] = {
+    "low": GREEN,
+    "medium": YELLOW,
+    "high": RED,
+    "critical": f"{BOLD}{RED}",
+}
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -125,7 +134,7 @@ class TerminalUI(SessionUI):
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         with self._print_lock:
-            # Print all headers and previews
+            # Print all headers, previews, and heuristic verdicts
             for item in items:
                 if item.get("error"):
                     sys.stdout.write(f"  {red(item['header'])}\n")
@@ -133,6 +142,18 @@ class TerminalUI(SessionUI):
                     sys.stdout.write(f"  {yellow(item['header'])}\n")
                 if item.get("preview"):
                     sys.stdout.write(item["preview"] + "\n")
+                verdict = item.get("_heuristic_verdict")
+                if verdict:
+                    risk = verdict.get("risk_level", "medium")
+                    rec = verdict.get("recommendation", "review")
+                    conf = int(verdict.get("confidence", 0.5) * 100)
+                    summary = verdict.get("intent_summary", "")
+                    color = _VERDICT_COLORS.get(risk, "")
+                    sys.stdout.write(
+                        f"  {color}RISK: {risk} (confidence: {conf}%) \u2014 {rec}{RESET}\n"
+                    )
+                    if summary:
+                        sys.stdout.write(f"  Intent: {summary}\n")
             sys.stdout.flush()
 
             if not pending or self.auto_approve:
@@ -223,6 +244,21 @@ class TerminalUI(SessionUI):
 
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
+
+    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Display LLM judge verdict — called from daemon thread while approval is pending."""
+        risk = verdict.get("risk_level", "medium")
+        rec = verdict.get("recommendation", "review")
+        summary = verdict.get("intent_summary", "")
+        conf = int(verdict.get("confidence", 0.5) * 100)
+        tier = verdict.get("tier", "llm")
+
+        color = _VERDICT_COLORS.get(risk, "")
+        print(
+            f"\n  {color}\u25b8 {tier.upper()} VERDICT: {risk.upper()} ({conf}%) \u2014 {rec}{RESET}"
+        )
+        if summary:
+            print(f"    {summary}")
 
     def on_rename(self, name: str) -> None:
         pass  # base TerminalUI ignores renames
@@ -857,9 +893,52 @@ def main() -> None:
         metavar="SECONDS",
         help="Periodic MCP tool refresh interval for servers without push notifications (default: 14400 = 4h, 0 to disable)",
     )
+    judge_group = parser.add_argument_group("Judge options")
+    judge_group.add_argument(
+        "--judge",
+        dest="judge_enabled",
+        action="store_true",
+        default=True,
+        help="Enable intent validation judge for tool approvals (default)",
+    )
+    judge_group.add_argument(
+        "--no-judge",
+        dest="judge_enabled",
+        action="store_false",
+        help="Disable intent validation judge",
+    )
+    judge_group.add_argument(
+        "--judge-model",
+        dest="judge_model",
+        default="",
+        help="Model for judge (default: same as session model)",
+    )
+    judge_group.add_argument(
+        "--judge-provider",
+        dest="judge_provider",
+        default="",
+        help="Provider for judge (default: same as session provider)",
+    )
+    judge_group.add_argument(
+        "--judge-timeout",
+        dest="judge_timeout",
+        type=float,
+        default=60.0,
+        help="LLM judge timeout in seconds (default: 60)",
+    )
+    judge_group.add_argument(
+        "--judge-confidence",
+        dest="judge_confidence",
+        type=float,
+        default=0.7,
+        help="Confidence threshold for judge (default: 0.7)",
+    )
     from turnstone.core.config import apply_config
 
-    apply_config(parser, ["api", "model", "session", "tools", "console", "auth", "mcp", "database"])
+    apply_config(
+        parser,
+        ["api", "model", "session", "tools", "console", "auth", "mcp", "database", "judge"],
+    )
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging

@@ -45,6 +45,7 @@ turnstone/
     mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh, async-sync bridge
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
+    judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         Persistence facade (delegates to storage backend)
     storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
@@ -1393,3 +1394,33 @@ The console admin panel adds 6 governance tabs (Roles, Policies, Templates,
 WS Templates, Usage, Audit) for a total of 11 tabs, all permission-gated.
 Both Python and TypeScript SDKs expose governance methods on the console
 client.
+
+## Intent Validation
+
+> See also: [Intent Validation guide](judge.md) | [Judge Architecture diagram](diagrams/png/22-judge-architecture.png)
+
+Intent validation provides advisory risk assessments for tool calls that
+require human approval. The system runs a two-tier evaluation pipeline
+implemented in `turnstone/core/judge.py`:
+
+1. **Heuristic tier** (synchronous, sub-millisecond) -- A priority-ordered
+   rule table using fnmatch tool patterns and regex argument patterns. Four
+   severity levels: critical (deny), high (review), medium (review), low
+   (approve). First match wins. The heuristic verdict is attached to the
+   `approve_request` SSE event immediately.
+
+2. **LLM judge tier** (asynchronous, daemon thread) -- A multi-turn evaluation
+   where the judge LLM receives conversation context and tool call details,
+   optionally uses `read_file`/`list_directory` to gather evidence (with
+   security-hardened path blocking), and produces a structured JSON verdict.
+   If the LLM verdict has higher confidence than the heuristic, it replaces
+   it via an `intent_verdict` SSE event.
+
+The judge is session-scoped (`IntentJudge`), lazy-initialized on first
+approval, and configured via the `[judge]` config section or `--judge` CLI
+flags. By default it uses self-consistency (same model), but supports
+cross-model and cross-provider configurations. Sub-agents (plan, task)
+are exempt. All verdicts are persisted to the `intent_verdicts` table
+(migration 012) with the user's final decision, enabling future calibration.
+The console exposes `GET /v1/api/admin/verdicts` for audit queries
+(requires `admin.judge` permission).

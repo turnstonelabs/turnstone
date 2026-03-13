@@ -179,3 +179,53 @@ def test_tavily_key_fallback_to_env(tmp_path, monkeypatch):
 
     key = config_mod.get_tavily_key()
     assert key == "tvly-from-env"
+
+
+def test_apply_config_judge_section(tmp_path, monkeypatch):
+    """apply_config() loads [judge] section and maps to argparse dests."""
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[judge]\n"
+        "enabled = true\n"
+        'model = "gpt-5"\n'
+        "confidence_threshold = 0.85\n"
+        "timeout = 30.0\n"
+        "read_only_tools = false\n"
+    )
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--judge", dest="judge_enabled", action="store_true", default=False)
+    parser.add_argument("--judge-model", dest="judge_model", default="")
+    parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
+    parser.add_argument("--judge-timeout", dest="judge_timeout", type=float, default=60.0)
+    parser.add_argument("--judge-read-only-tools", dest="judge_read_only_tools", default=True)
+
+    apply_config(parser, ["judge"])
+    args = parser.parse_args([])
+
+    assert args.judge_enabled is True
+    assert args.judge_model == "gpt-5"
+    assert args.judge_confidence == 0.85
+    assert args.judge_timeout == 30.0
+    assert args.judge_read_only_tools is False
+
+
+def test_apply_config_judge_cli_overrides(tmp_path, monkeypatch):
+    """CLI flags override config.toml [judge] values."""
+    _reset_cache()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[judge]\nenabled = true\nconfidence_threshold = 0.85\n")
+    monkeypatch.setattr(config_mod, "CONFIG_PATH", cfg)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--judge", dest="judge_enabled", action="store_true", default=False)
+    parser.add_argument("--no-judge", dest="judge_enabled", action="store_false")
+    parser.add_argument("--judge-confidence", dest="judge_confidence", type=float, default=0.7)
+
+    apply_config(parser, ["judge"])
+    args = parser.parse_args(["--no-judge"])
+
+    assert args.judge_enabled is False  # CLI wins
+    assert args.judge_confidence == 0.85  # config wins (no CLI override)

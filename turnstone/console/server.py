@@ -1510,6 +1510,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.schedules",
         "admin.watches",
         "admin.ws_templates",
+        "admin.judge",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2562,6 +2563,50 @@ async def admin_audit(request: Request) -> JSONResponse:
     return JSONResponse({"events": events, "total": total})
 
 
+async def admin_list_verdicts(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/verdicts — list intent verdicts."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    params = dict(request.query_params)
+    ws_id = params.get("ws_id", "")
+    since = params.get("since", "")
+    until = params.get("until", "")
+    risk_level = params.get("risk_level", "")
+    try:
+        limit = min(int(params.get("limit", "100")), 500)
+    except (ValueError, TypeError):
+        limit = 100
+    try:
+        offset = max(int(params.get("offset", "0")), 0)
+    except (ValueError, TypeError):
+        offset = 0
+
+    verdicts = storage.list_intent_verdicts(
+        ws_id=ws_id,
+        since=since,
+        until=until,
+        risk_level=risk_level,
+        limit=limit,
+        offset=offset,
+    )
+
+    total = storage.count_intent_verdicts(
+        ws_id=ws_id,
+        since=since,
+        until=until,
+        risk_level=risk_level,
+    )
+    return JSONResponse({"verdicts": verdicts, "total": total})
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -2706,6 +2751,8 @@ def create_app(
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),
                     Route("/api/admin/audit", admin_audit),
+                    # Governance: Intent Verdicts
+                    Route("/api/admin/verdicts", admin_list_verdicts),
                 ],
             ),
             Route("/health", health),

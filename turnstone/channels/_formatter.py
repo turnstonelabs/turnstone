@@ -104,6 +104,35 @@ def format_approval_request(items: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def format_verdict(verdict: dict[str, Any]) -> str:
+    """Format an intent verdict for display in a channel message.
+
+    Accepts either a raw heuristic verdict dict (from ``_heuristic_verdict``
+    in approval items) or an :class:`IntentVerdictEvent`-like dict with the
+    same field names.  Returns Markdown text suitable for a Discord embed
+    field.
+    """
+    risk = (verdict.get("risk_level") or "medium").upper()
+    rec = verdict.get("recommendation", "review")
+    conf = int((verdict.get("confidence") or 0.5) * 100)
+    summary = verdict.get("intent_summary", "")
+    tier = verdict.get("tier", "")
+
+    emoji_map = {
+        "LOW": "\U0001f7e2",
+        "MEDIUM": "\U0001f7e1",
+        "HIGH": "\U0001f534",
+        "CRITICAL": "\u26d4",
+    }
+    emoji = emoji_map.get(risk, "\u2753")
+
+    label = f"{tier.upper()} " if tier else ""
+    parts = [f"{emoji} **{label}Risk: {risk}** ({conf}%) \u2014 {rec}"]
+    if summary:
+        parts.append(f"_{summary}_")
+    return "\n".join(parts)
+
+
 def format_plan_review(content: str) -> str:
     """Format a plan-review prompt with a header."""
     return f"**Plan review requested:**\n\n{content}"

@@ -694,6 +694,82 @@
 }
 
 /* ==========================================================================
+   Verdict badges (intent judge)
+   ========================================================================== */
+.verdict-badge {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+}
+.verdict-low      { color: var(--green);  border-left: 3px solid var(--green);  }
+.verdict-medium   { color: var(--yellow); border-left: 3px solid var(--yellow); }
+.verdict-high     { color: var(--red);    border-left: 3px solid var(--red);    }
+.verdict-critical { color: var(--red);    border-left: 3px solid var(--red);
+                    background: rgba(255, 80, 80, 0.05); }
+
+.verdict-detail {
+  padding: 6px 12px;
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+  line-height: 1.5;
+}
+.verdict-detail .verdict-summary   { margin-bottom: 4px; font-weight: 600; }
+.verdict-detail .verdict-reasoning { color: var(--fg-dim); margin-bottom: 4px; }
+.verdict-detail .verdict-evidence  { color: var(--fg-dim); font-style: italic; margin-bottom: 4px; }
+.verdict-detail .verdict-tier      { color: var(--fg-dim); font-size: 10px; }
+
+.verdict-expand {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 10px;
+  text-decoration: underline;
+  padding: 0;
+}
+.verdict-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.verdict-judge-spinner {
+  font-size: 10px;
+  color: var(--fg-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 400;
+}
+.judge-spinner-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: judge-pulse 1.2s ease-in-out infinite;
+}
+@keyframes judge-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+/* Verdict glow on approval action buttons */
+.approval-prompt.verdict-glow-approve .btn-approve {
+  box-shadow: 0 0 8px var(--green-glow);
+  border-color: var(--green);
+}
+.approval-prompt.verdict-glow-deny .btn-deny {
+  box-shadow: 0 0 8px var(--red-glow);
+  border-color: var(--red);
+}
+.approval-prompt.verdict-glow-review .btn-approve,
+.approval-prompt.verdict-glow-review .btn-deny {
+  box-shadow: 0 0 6px var(--yellow-glow);
+  border-color: var(--yellow);
+}
+
+/* ==========================================================================
    Reduced motion — page-specific
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
@@ -701,6 +777,7 @@
   .ws-tab .tab-indicator[data-state="running"],
   .ws-tab .tab-indicator[data-state="attention"] { animation: none; opacity: 1; }
   .tool-output-stream { animation: none; border-left-color: var(--accent); }
+  .judge-spinner-dot { animation: none; opacity: 1; }
   .thinking-indicator::after { animation: none; content: '...'; }
   .ws-tab, .ws-tab .tab-close, #new-tab-btn,
   .hmenu-item, .dashboard-card,

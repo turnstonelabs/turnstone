@@ -388,3 +388,32 @@ audit_events = sa.Table(
 sa.Index("idx_audit_timestamp", audit_events.c.timestamp)
 sa.Index("idx_audit_action", audit_events.c.action)
 sa.Index("idx_audit_user", audit_events.c.user_id)
+
+# ---------------------------------------------------------------------------
+# Intent verdicts — LLM judge verdicts for tool call validation
+# ---------------------------------------------------------------------------
+
+intent_verdicts = sa.Table(
+    "intent_verdicts",
+    metadata,
+    sa.Column("verdict_id", sa.Text, primary_key=True),
+    sa.Column("ws_id", sa.Text, nullable=False),
+    sa.Column("call_id", sa.Text, nullable=False),
+    sa.Column("func_name", sa.Text, nullable=False),
+    sa.Column("func_args", sa.Text, nullable=False, server_default=""),
+    sa.Column("intent_summary", sa.Text, nullable=False),
+    sa.Column("risk_level", sa.Text, nullable=False),
+    sa.Column("confidence", sa.Float, nullable=False),
+    sa.Column("recommendation", sa.Text, nullable=False),
+    sa.Column("reasoning", sa.Text, nullable=False),
+    sa.Column("evidence", sa.Text, nullable=False, server_default="[]"),
+    sa.Column("tier", sa.Text, nullable=False),
+    sa.Column("judge_model", sa.Text, nullable=False, server_default=""),
+    sa.Column("user_decision", sa.Text, nullable=False, server_default=""),
+    sa.Column("latency_ms", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_intent_verdicts_ws", intent_verdicts.c.ws_id)
+sa.Index("idx_intent_verdicts_created", intent_verdicts.c.created)
+sa.Index("idx_intent_verdicts_risk", intent_verdicts.c.risk_level)

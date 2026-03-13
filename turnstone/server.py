@@ -103,6 +103,8 @@ class WebUI:
         # Activity tracking for dashboard (current tool / thinking / approval)
         self._ws_current_activity: str = ""
         self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
+        # Verdicts awaiting user_decision update on approval resolution
+        self._pending_verdicts: list[dict[str, Any]] = []
 
     def _enqueue(self, data: dict[str, Any]) -> None:
         with self._listeners_lock:
@@ -189,17 +191,18 @@ class WebUI:
         # Always send tool info to the browser
         serialized = []
         for item in items:
-            serialized.append(
-                {
-                    "call_id": item.get("call_id", ""),
-                    "header": item.get("header", ""),
-                    "preview": item.get("preview", ""),
-                    "func_name": item.get("func_name", ""),
-                    "approval_label": item.get("approval_label", item.get("func_name", "")),
-                    "needs_approval": item.get("needs_approval", False),
-                    "error": item.get("error"),
-                }
-            )
+            entry: dict[str, Any] = {
+                "call_id": item.get("call_id", ""),
+                "header": item.get("header", ""),
+                "preview": item.get("preview", ""),
+                "func_name": item.get("func_name", ""),
+                "approval_label": item.get("approval_label", item.get("func_name", "")),
+                "needs_approval": item.get("needs_approval", False),
+                "error": item.get("error"),
+            }
+            if "_heuristic_verdict" in item:
+                entry["verdict"] = item["_heuristic_verdict"]
+            serialized.append(entry)
 
         # -- Tool policy evaluation -----------------------------------------------
         # Check admin-defined tool policies before the auto_approve check.
@@ -231,8 +234,9 @@ class WebUI:
                             else:
                                 still_pending.append(it)
                         # Rebuild serialized to reflect policy verdicts
-                        serialized = [
-                            {
+                        serialized = []
+                        for it in items:
+                            rebuilt: dict[str, Any] = {
                                 "call_id": it.get("call_id", ""),
                                 "header": it.get("header", ""),
                                 "preview": it.get("preview", ""),
@@ -241,8 +245,9 @@ class WebUI:
                                 "needs_approval": it.get("needs_approval", False),
                                 "error": it.get("denial_msg") if it.get("denied") else None,
                             }
-                            for it in items
-                        ]
+                            if "_heuristic_verdict" in it:
+                                rebuilt["verdict"] = it["_heuristic_verdict"]
+                            serialized.append(rebuilt)
                         # If all were resolved by policy, check if any were denied
                         if not still_pending:
                             any_denied = any(it.get("denied") for it in items)
@@ -288,9 +293,49 @@ class WebUI:
             self._ws_activity_state = "approval"
         self._broadcast_activity()
 
+        # Persist heuristic verdicts and track for user_decision update
+        self._pending_verdicts = []
+        for item in items:
+            hv = item.get("_heuristic_verdict")
+            if hv:
+                self._pending_verdicts.append(hv)
+                try:
+                    from turnstone.core.storage._registry import get_storage
+
+                    storage = get_storage()
+                    if storage is not None:
+                        storage.create_intent_verdict(
+                            verdict_id=hv.get("verdict_id", ""),
+                            ws_id=self.ws_id,
+                            call_id=hv.get("call_id", ""),
+                            func_name=hv.get("func_name", ""),
+                            func_args=json.dumps(item.get("func_args", {})),
+                            intent_summary=hv.get("intent_summary", ""),
+                            risk_level=hv.get("risk_level", "medium"),
+                            confidence=hv.get("confidence", 0.5),
+                            recommendation=hv.get("recommendation", "review"),
+                            reasoning=hv.get("reasoning", ""),
+                            evidence=json.dumps(hv.get("evidence", [])),
+                            tier=hv.get("tier", "heuristic"),
+                            judge_model=hv.get("judge_model", ""),
+                            latency_ms=hv.get("latency_ms", 0),
+                        )
+                except Exception:
+                    log.debug("Failed to persist heuristic verdict", exc_info=True)
+                _metrics.record_judge_verdict(
+                    hv.get("tier", "heuristic"),
+                    hv.get("risk_level", "medium"),
+                    hv.get("latency_ms", 0),
+                )
+
         # Send approval request and block
+        judge_pending = bool(any(it.get("_heuristic_verdict") for it in items))
         self._approval_event.clear()
-        self._pending_approval = {"type": "approve_request", "items": serialized}
+        self._pending_approval = {
+            "type": "approve_request",
+            "items": serialized,
+            "judge_pending": judge_pending,
+        }
         self._enqueue(self._pending_approval)
         self._approval_event.wait()
         self._pending_approval = None
@@ -391,6 +436,40 @@ class WebUI:
         if WebUI._global_queue is not None:
             WebUI._global_queue.put({"type": "ws_rename", "ws_id": self.ws_id, "name": name})
 
+    def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
+        """Deliver LLM judge verdict to frontend via SSE."""
+        self._enqueue({"type": "intent_verdict", **verdict})
+        # Persist the LLM verdict (fire-and-forget)
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is not None:
+                storage.create_intent_verdict(
+                    verdict_id=verdict.get("verdict_id", ""),
+                    ws_id=self.ws_id,
+                    call_id=verdict.get("call_id", ""),
+                    func_name=verdict.get("func_name", ""),
+                    func_args=json.dumps(verdict.get("func_args", {})),
+                    intent_summary=verdict.get("intent_summary", ""),
+                    risk_level=verdict.get("risk_level", "medium"),
+                    confidence=verdict.get("confidence", 0.5),
+                    recommendation=verdict.get("recommendation", "review"),
+                    reasoning=verdict.get("reasoning", ""),
+                    evidence=json.dumps(verdict.get("evidence", [])),
+                    tier=verdict.get("tier", "llm"),
+                    judge_model=verdict.get("judge_model", ""),
+                    latency_ms=verdict.get("latency_ms", 0),
+                )
+        except Exception:
+            log.debug("Failed to persist LLM verdict", exc_info=True)
+        _metrics.record_judge_verdict(
+            verdict.get("tier", "llm"),
+            verdict.get("risk_level", "medium"),
+            verdict.get("latency_ms", 0),
+        )
+        self._pending_verdicts.append(verdict)
+
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Resolve a pending approval, whether triggered by the HTTP handler
         (user approves/denies in the browser) or by server-initiated flows
@@ -403,6 +482,23 @@ class WebUI:
                 "feedback": feedback or "",
             }
         )
+        # Update user_decision on all tracked verdicts (fire-and-forget).
+        # Swap-and-clear to avoid racing with the daemon judge thread.
+        pending = self._pending_verdicts
+        self._pending_verdicts = []
+        if pending:
+            try:
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    decision_str = "approved" if approved else "denied"
+                    for v in pending:
+                        vid = v.get("verdict_id", "")
+                        if vid:
+                            storage.update_intent_verdict(vid, user_decision=decision_str)
+            except Exception:
+                log.debug("Failed to update verdict user_decision", exc_info=True)
         self._approval_event.set()
 
     def resolve_plan(self, feedback: str) -> None:
@@ -1382,6 +1478,7 @@ def create_app(
     node_id: str = "",
     cors_origins: list[str] | None = None,
     watch_runner: Any = None,
+    judge_config: Any = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1439,6 +1536,7 @@ def create_app(
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
     app.state.watch_runner = watch_runner
+    app.state.judge_config = judge_config
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -1671,6 +1769,46 @@ def main() -> None:
         default=60.0,
         help="Circuit breaker cooldown in seconds (default: 60)",
     )
+    judge_group = parser.add_argument_group("Judge options")
+    judge_group.add_argument(
+        "--judge",
+        dest="judge_enabled",
+        action="store_true",
+        default=True,
+        help="Enable intent validation judge for tool approvals (default)",
+    )
+    judge_group.add_argument(
+        "--no-judge",
+        dest="judge_enabled",
+        action="store_false",
+        help="Disable intent validation judge",
+    )
+    judge_group.add_argument(
+        "--judge-model",
+        dest="judge_model",
+        default="",
+        help="Model for judge (default: same as session model)",
+    )
+    judge_group.add_argument(
+        "--judge-provider",
+        dest="judge_provider",
+        default="",
+        help="Provider for judge (default: same as session provider)",
+    )
+    judge_group.add_argument(
+        "--judge-timeout",
+        dest="judge_timeout",
+        type=float,
+        default=60.0,
+        help="LLM judge timeout in seconds (default: 60)",
+    )
+    judge_group.add_argument(
+        "--judge-confidence",
+        dest="judge_confidence",
+        type=float,
+        default=0.7,
+        help="Confidence threshold for judge (default: 0.7)",
+    )
     from turnstone.core.log import add_log_args
 
     add_log_args(parser)
@@ -1678,7 +1816,18 @@ def main() -> None:
 
     apply_config(
         parser,
-        ["api", "model", "session", "tools", "server", "mcp", "ratelimit", "health", "database"],
+        [
+            "api",
+            "model",
+            "session",
+            "tools",
+            "server",
+            "mcp",
+            "ratelimit",
+            "health",
+            "database",
+            "judge",
+        ],
     )
     args = parser.parse_args()
 
@@ -1796,6 +1945,27 @@ def main() -> None:
 
     ctx_node_id.set(_node_id)
 
+    # Intent validation judge config
+    from turnstone.core.judge import JudgeConfig
+
+    judge_config = JudgeConfig(
+        enabled=getattr(args, "judge_enabled", True),
+        model=getattr(args, "judge_model", ""),
+        provider=getattr(args, "judge_provider", ""),
+        base_url=getattr(args, "judge_base_url", ""),
+        api_key=getattr(args, "judge_api_key", ""),
+        confidence_threshold=getattr(args, "judge_confidence", 0.7),
+        max_context_ratio=getattr(args, "judge_context_ratio", 0.5),
+        timeout=getattr(args, "judge_timeout", 60.0),
+        read_only_tools=getattr(args, "judge_read_only_tools", True),
+    )
+    if judge_config.enabled:
+        log.info(
+            "Judge: enabled (model=%s, threshold=%.2f)",
+            judge_config.model or model,
+            judge_config.confidence_threshold,
+        )
+
     # Session factory — captures shared config
     def session_factory(
         ui: SessionUI | None,
@@ -1828,6 +1998,7 @@ def main() -> None:
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
             template=args.template,
+            judge_config=judge_config,
         )
 
     # Create WatchRunner (periodic command polling, server-level)
@@ -1896,8 +2067,9 @@ def main() -> None:
             sys.exit(1)
         log.info("Resumed workstream %s (%d messages)", target_id, len(ws.session.messages))
 
-    # Record detected model in metrics
+    # Record detected model and judge status in metrics
     _metrics.model = model
+    _metrics.set_judge_enabled(judge_config.enabled if judge_config else False)
 
     # Auth config
     from turnstone.core.auth import load_auth_config, load_jwt_secret
@@ -1930,6 +2102,7 @@ def main() -> None:
         node_id=_node_id,
         cors_origins=cors_origins,
         watch_runner=_watch_runner,
+        judge_config=judge_config,
     )
 
     log.info("Server starting on http://%s:%s", args.host, args.port)

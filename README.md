@@ -11,14 +11,17 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 
 ## What it does
 
-Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. Native deferred tool loading for Anthropic and OpenAI APIs reduces token overhead and improves tool selection accuracy when MCP servers expose many tools; local models (vLLM, llama.cpp) get a transparent client-side BM25 fallback. It runs as:
+Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. It runs as:
 
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
 - **Queue-driven agents** — trigger workstreams via message queue, stream progress, approve or auto-approve tool use
 - **Multi-node clusters** — generic work load-balances across nodes, directed work routes to a specific server
-- **Cluster dashboard** — real-time view of all nodes and workstreams, workstream creation with node targeting, reverse proxy for server UIs (only the console port needs network access)
-- **Governance & compliance** — role-based access control, tool policies, usage tracking, and append-only audit logs
+- **Cluster dashboard** — real-time view of all nodes and workstreams, reverse proxy for server UIs
+- **Intent validation** — an LLM judge evaluates every tool call before approval, presenting risk assessments and evidence-based recommendations so users can make informed decisions instead of blindly approving raw tool calls
+- **Governance & compliance** — RBAC, tool policies, prompt templates, workstream templates, usage tracking, and append-only audit logs
 - **Cluster simulator** — test the stack at scale (up to 1000 nodes) without an LLM backend
+
+Works with any OpenAI-compatible API (vLLM, llama.cpp, NVIDIA NIM) or Anthropic's native Messages API. Supports [MCP](https://modelcontextprotocol.io/) for external tool servers with native deferred tool loading on Anthropic and OpenAI APIs (BM25 fallback for local models).
 
 <p align="center">
   <img src="docs/diagrams/architecture-overview.svg" alt="Turnstone system architecture — data flow from clients through gateways, Redis MQ, cluster nodes, to LLM providers" width="960"/>
@@ -104,8 +107,6 @@ turnstone-sim --nodes 100 --scenario steady --duration 60 --mps 10
 
 See [docs/simulator.md](docs/simulator.md) for scenarios, CLI reference, and metrics.
 
-All frontends connect to any OpenAI-compatible API (vLLM, NVIDIA NIM/NGC, llama.cpp, OpenAI, etc.) or Anthropic's native Messages API, and auto-detect the model.
-
 ## Architecture
 
 ### Diagrams
@@ -133,6 +134,8 @@ Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
 | [Notify Flow](docs/diagrams/png/17-notify-flow.png) | Channel notification dispatch |
 | [Watch Architecture](docs/diagrams/png/18-watch-architecture.png) | Periodic command polling daemon |
 | [Governance Architecture](docs/diagrams/png/19-governance-architecture.png) | RBAC, policies, audit, usage enforcement flow |
+| [WS Template Architecture](docs/diagrams/png/21-ws-template-architecture.png) | Workstream template application and lifecycle |
+| [Judge Architecture](docs/diagrams/png/22-judge-architecture.png) | Intent validation two-tier evaluation pipeline |
 
 ### Governance
 
@@ -145,6 +148,27 @@ Turnstone includes a built-in governance layer for enterprise deployments — ma
 - **Audit logging** — append-only event trail for all admin mutations, IP-aware, 365-day retention
 
 All governance features are managed through the console admin panel (10 tabs) and the full REST API. See [docs/governance.md](docs/governance.md) for setup and configuration.
+
+### Intent Validation (LLM Judge)
+
+Every tool call that requires human approval is evaluated by an intent validation judge that provides a structured risk assessment alongside the approval prompt — so instead of "approve this bash command?", users see a verdict with risk level, confidence, recommendation, and reasoning.
+
+The system uses a two-tier evaluation pipeline:
+
+1. **Heuristic tier** (instant, free) — 23 pattern-based rules classify tool calls by severity. Catches destructive commands (`rm -rf /`, `DROP TABLE`), privilege escalation (`sudo`), credential access, and more. Results appear immediately.
+2. **LLM judge tier** (async) — A full LLM evaluation runs in the background with access to `read_file` and `list_directory` for evidence gathering. The judge can inspect files that a write would overwrite, check directory contents before a delete, and cite specific evidence in its reasoning. Results update the UI progressively when ready.
+
+The judge defaults to the same model as the session (self-consistency) but can be configured to use a separate model — useful when running a small local model for tasks but wanting a commercial model for safety evaluation.
+
+```toml
+[judge]
+enabled = true           # on by default
+model = ""               # empty = same as session model
+provider = ""            # empty = same as session provider
+timeout = 60.0           # generous for local models
+```
+
+Verdicts are persisted for audit and exposed via Prometheus metrics (`turnstone_judge_verdicts_total`, `turnstone_judge_llm_latency_seconds`). See [docs/judge.md](docs/judge.md) for the full guide.
 
 ## Multi-node routing
 
@@ -311,6 +335,13 @@ path = ".turnstone.db" # SQLite file path (relative to working directory)
 # url = "postgresql+psycopg://user:pass@host:5432/turnstone"  # PostgreSQL
 # pool_size = 5        # PostgreSQL connection pool size
 
+[judge]
+enabled = true         # intent validation for tool approvals (--no-judge to disable)
+model = ""             # empty = same as session model (self-consistency)
+provider = ""          # empty = same as session provider
+timeout = 60.0         # LLM judge timeout in seconds
+confidence_threshold = 0.7
+
 [mcp]
 config_path = ""       # path to MCP JSON config file (alternative to TOML sections)
 refresh_interval = 14400  # periodic refresh for servers without push notifications (seconds, 0 to disable)
@@ -352,6 +383,9 @@ Idle workstreams are automatically cleaned up after 2 hours (configurable). In m
 - `turnstone_backend_up` — LLM backend reachability (0/1)
 - `turnstone_circuit_state` — circuit breaker state (0=closed, 1=open, 2=half_open)
 - `turnstone_workstreams_evicted_total` — workstreams auto-evicted at capacity
+- `turnstone_judge_verdicts_total{tier,risk_level}` — intent validation verdicts by tier and risk
+- `turnstone_judge_llm_latency_seconds` — LLM judge evaluation latency histogram
+- `turnstone_judge_enabled` — whether the intent validation judge is active (0/1)
 
 Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
 

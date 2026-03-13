@@ -369,6 +369,25 @@ class ClusterStateEvent(OutboundEvent):
     activity_state: str = ""
 
 
+@dataclass
+class IntentVerdictEvent(OutboundEvent):
+    """Intent validation verdict for a pending tool approval."""
+
+    type: str = "intent_verdict"
+    call_id: str = ""
+    func_name: str = ""
+    intent_summary: str = ""
+    risk_level: str = ""
+    confidence: float = 0.0
+    recommendation: str = ""
+    reasoning: str = ""
+    evidence: str = "[]"  # JSON array string
+    tier: str = ""
+    judge_model: str = ""
+    verdict_id: str = ""
+    latency_ms: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Type registries (built after all classes are defined)
 # ---------------------------------------------------------------------------
@@ -423,5 +442,6 @@ _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
         NodeListEvent,
         WorkstreamResumedEvent,
         ClusterStateEvent,
+        IntentVerdictEvent,
     ]
 }

@@ -33,6 +33,14 @@ class MetricsCollector:
         # counters (continued)
         self._ratelimit_rejects: int = 0  # counter: total 429 responses
         self._evictions: int = 0  # counter: workstreams evicted
+        # judge metrics
+        self._judge_verdicts: dict[tuple[str, str], int] = defaultdict(int)
+        self._judge_latency: dict[str, Any] = {
+            "buckets": [0] * len(self.BUCKETS),
+            "sum": 0.0,
+            "count": 0,
+        }
+        self._judge_enabled: bool = False
 
     def record_request(self, method: str, endpoint: str, status: int, duration: float) -> None:
         with self._lock:
@@ -97,6 +105,23 @@ class MetricsCollector:
         with self._lock:
             self._evictions += 1
 
+    def set_judge_enabled(self, enabled: bool) -> None:
+        with self._lock:
+            self._judge_enabled = enabled
+
+    def record_judge_verdict(self, tier: str, risk_level: str, latency_ms: int) -> None:
+        """Record an intent validation verdict."""
+        with self._lock:
+            self._judge_verdicts[(tier, risk_level)] += 1
+            # Track LLM latency separately (heuristic is sub-ms, not interesting)
+            if tier == "llm":
+                seconds = latency_ms / 1000.0
+                for i, b in enumerate(self.BUCKETS):
+                    if seconds <= b:
+                        self._judge_latency["buckets"][i] += 1
+                self._judge_latency["sum"] += seconds
+                self._judge_latency["count"] += 1
+
     def generate_text(
         self,
         workstream_states: dict[str, int],
@@ -144,6 +169,9 @@ class MetricsCollector:
             backend_up = self._backend_up
             circuit_state = self._circuit_state
             evictions = self._evictions
+            judge_verdicts = dict(self._judge_verdicts)
+            judge_latency = dict(self._judge_latency)
+            judge_enabled = self._judge_enabled
 
         # turnstone_build_info
         lines.append("# HELP turnstone_build_info Server version and model info")
@@ -257,6 +285,40 @@ class MetricsCollector:
             "Total workstreams evicted to make room for new ones",
             evictions,
         )
+
+        # turnstone_judge_enabled
+        gauge(
+            "turnstone_judge_enabled",
+            "Whether intent validation judge is enabled (1=on, 0=off)",
+            1 if judge_enabled else 0,
+        )
+
+        # turnstone_judge_verdicts_total
+        if judge_verdicts:
+            lines.append("# HELP turnstone_judge_verdicts_total Total intent validation verdicts")
+            lines.append("# TYPE turnstone_judge_verdicts_total counter")
+            for (tier, risk), cnt in sorted(judge_verdicts.items()):
+                lines.append(
+                    f'turnstone_judge_verdicts_total{{tier="{tier}",risk_level="{risk}"}} {cnt}'
+                )
+
+        # turnstone_judge_llm_latency_seconds (histogram)
+        if judge_latency["count"] > 0:
+            lines.append(
+                "# HELP turnstone_judge_llm_latency_seconds LLM judge evaluation latency in seconds"
+            )
+            lines.append("# TYPE turnstone_judge_llm_latency_seconds histogram")
+            for i, b in enumerate(self.BUCKETS):
+                lines.append(
+                    f'turnstone_judge_llm_latency_seconds{{le="{b}"}} {judge_latency["buckets"][i]}'
+                )
+            lines.append(
+                f'turnstone_judge_llm_latency_seconds{{le="+Inf"}} {judge_latency["count"]}'
+            )
+            lines.append(
+                f"turnstone_judge_llm_latency_seconds_sum {_fmt_value(judge_latency['sum'])}"
+            )
+            lines.append(f"turnstone_judge_llm_latency_seconds_count {judge_latency['count']}")
 
         # Per-workstream metrics (only when data is provided)
         if workstream_metrics:

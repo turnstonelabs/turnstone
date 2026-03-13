@@ -30,6 +30,7 @@ from turnstone.api.console_schemas import (
     ListRolesResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
+    ListVerdictsResponse,
     ListWsTemplatesResponse,
     ListWsTemplateSummaryResponse,
     ListWsTemplateVersionsResponse,
@@ -46,6 +47,7 @@ from turnstone.api.console_schemas import (
     UsageBreakdownItem,
     UsageResponse,
     UserRoleInfo,
+    VerdictInfo,
     WsTemplateInfo,
 )
 from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
@@ -550,6 +552,26 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ],
         tags=["Admin"],
     ),
+    # --- Governance: Intent Verdicts ---
+    EndpointSpec(
+        "/v1/api/admin/verdicts",
+        "GET",
+        "Paginated intent verdicts",
+        response_model=ListVerdictsResponse,
+        query_params=[
+            QueryParam("ws_id", "Filter by workstream"),
+            QueryParam("since", "Start timestamp (ISO8601)"),
+            QueryParam("until", "End timestamp (ISO8601)"),
+            QueryParam(
+                "risk_level",
+                "Filter by risk level",
+                enum=["low", "medium", "high", "critical"],
+            ),
+            QueryParam("limit", "Page size (max 500)", schema_type="integer", default=100),
+            QueryParam("offset", "Pagination offset", schema_type="integer", default=0),
+        ],
+        tags=["Admin"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -612,6 +634,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     UsageResponse,
     AuditEventInfo,
     ListAuditEventsResponse,
+    VerdictInfo,
+    ListVerdictsResponse,
 ]
 
 

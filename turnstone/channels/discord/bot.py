@@ -19,6 +19,7 @@ from turnstone.mq.protocol import (
     ApprovalRequestEvent,
     ContentEvent,
     ErrorEvent,
+    IntentVerdictEvent,
     OutboundEvent,
     PlanReviewEvent,
     TurnCompleteEvent,
@@ -146,6 +147,10 @@ class TurnstoneBot:
 
         self._subscribed_ws: set[str] = set()
         self._streaming: dict[str, StreamingMessage] = {}
+        # Track the Discord message containing the pending approval embed per
+        # workstream so that IntentVerdictEvent can update it with LLM judge
+        # results.
+        self._pending_approval_msgs: dict[str, discord.Message] = {}
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -250,6 +255,7 @@ class TurnstoneBot:
         await self.broker.unsubscribe(channel)
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
+        self._pending_approval_msgs.pop(ws_id, None)
         log.info("discord.unsubscribed", ws_id=ws_id)
 
     # -- event dispatch ------------------------------------------------------
@@ -263,7 +269,11 @@ class TurnstoneBot:
         """Handle an outbound event for a subscribed workstream."""
         import discord
 
-        from turnstone.channels._formatter import format_approval_request, format_plan_review
+        from turnstone.channels._formatter import (
+            format_approval_request,
+            format_plan_review,
+            format_verdict,
+        )
         from turnstone.channels.discord.views import ApprovalView, PlanReviewView
 
         event = OutboundEvent.from_json(raw)
@@ -290,8 +300,19 @@ class TurnstoneBot:
                     description=text,
                     color=discord.Color.orange(),
                 )
+                # Include heuristic verdicts from approval items.
+                for item in event.items:
+                    verdict = item.get("verdict")
+                    if verdict:
+                        name = item.get("func_name") or item.get("approval_label") or "tool"
+                        embed.add_field(
+                            name=f"Verdict: {name}",
+                            value=format_verdict(verdict),
+                            inline=False,
+                        )
                 embed.set_footer(text=f"{ws_id}|{event.correlation_id}")
-                await thread.send(embed=embed, view=ApprovalView(self)._view)
+                msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
+                self._pending_approval_msgs[ws_id] = msg
 
         elif isinstance(event, PlanReviewEvent):
             text = format_plan_review(event.content)
@@ -303,10 +324,44 @@ class TurnstoneBot:
             embed.set_footer(text=f"{ws_id}|{event.correlation_id}")
             await thread.send(embed=embed, view=PlanReviewView(self)._view)
 
+        elif isinstance(event, IntentVerdictEvent):
+            # LLM judge verdict arrived — update the pending approval embed.
+            approval_msg = self._pending_approval_msgs.get(ws_id)
+            if approval_msg and approval_msg.embeds:
+                embed = approval_msg.embeds[0]
+                verdict_data = {
+                    "risk_level": event.risk_level,
+                    "recommendation": event.recommendation,
+                    "confidence": event.confidence,
+                    "intent_summary": event.intent_summary,
+                    "tier": event.tier,
+                }
+                name = event.func_name or "tool"
+                # Update embed color based on LLM judge risk level.
+                risk = (event.risk_level or "medium").upper()
+                color_map = {
+                    "LOW": discord.Color.green(),
+                    "MEDIUM": discord.Color.orange(),
+                    "HIGH": discord.Color.red(),
+                    "CRITICAL": discord.Color.dark_red(),
+                }
+                embed.color = color_map.get(risk, discord.Color.orange())
+                embed.add_field(
+                    name=f"Judge Verdict: {name}",
+                    value=format_verdict(verdict_data),
+                    inline=False,
+                )
+                try:
+                    await approval_msg.edit(embed=embed)
+                except Exception:
+                    log.debug("discord.verdict_embed_edit_failed", ws_id=ws_id)
+
         elif isinstance(event, TurnCompleteEvent):
             sm = self._streaming.pop(ws_id, None)
             if sm is not None:
                 await sm.finalize()
+            # Clean up pending approval message tracking.
+            self._pending_approval_msgs.pop(ws_id, None)
 
         elif isinstance(event, WorkstreamResumedEvent):
             name = event.name or "previous workstream"

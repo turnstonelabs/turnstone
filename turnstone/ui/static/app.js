@@ -1088,7 +1088,11 @@ function handleEvent(evt) {
       break;
 
     case "approve_request":
-      showInlineToolBlock(evt.items, false);
+      showInlineToolBlock(evt.items, false, evt.judge_pending);
+      break;
+
+    case "intent_verdict":
+      updateVerdictBadge(evt);
       break;
 
     case "approval_resolved":
@@ -1353,7 +1357,151 @@ function getFeedback() {
   return inp && inp.value.trim() ? inp.value.trim() : null;
 }
 
-function showInlineToolBlock(items, autoApproved) {
+// --- Verdict badge helpers ---
+
+function renderVerdictBadge(verdict, judgePending) {
+  if (!verdict) return "";
+  var risk = verdict.risk_level || "medium";
+  var rec = verdict.recommendation || "review";
+  var conf = Math.round((verdict.confidence || 0) * 100);
+  var summary = verdict.intent_summary || "";
+  var spinnerHtml = "";
+  if (judgePending) {
+    spinnerHtml =
+      '<span class="verdict-judge-spinner">' +
+      '<span class="judge-spinner-dot"></span> judge analyzing\u2026</span>';
+  }
+  var callId = escapeHtml(verdict.call_id || "");
+  return (
+    '<div class="verdict-badge verdict-' +
+    escapeHtml(risk) +
+    '" data-call-id="' +
+    callId +
+    '">' +
+    '<span class="verdict-risk">' +
+    escapeHtml(risk.toUpperCase()) +
+    "</span>" +
+    '<span class="verdict-rec">' +
+    escapeHtml(rec) +
+    "</span>" +
+    '<span class="verdict-conf">' +
+    conf +
+    "%</span>" +
+    spinnerHtml +
+    '<button class="verdict-expand" onclick="toggleVerdictDetail(this)">details</button>' +
+    "</div>" +
+    '<div class="verdict-detail" style="display:none">' +
+    '<div class="verdict-summary">' +
+    escapeHtml(summary) +
+    "</div>" +
+    '<div class="verdict-reasoning">' +
+    escapeHtml(verdict.reasoning || "") +
+    "</div>" +
+    ((verdict.evidence || []).length
+      ? '<div class="verdict-evidence">' +
+        (verdict.evidence || [])
+          .map(function (e) {
+            return "<div>\u2022 " + escapeHtml(e) + "</div>";
+          })
+          .join("") +
+        "</div>"
+      : "") +
+    '<div class="verdict-tier">' +
+    escapeHtml(verdict.tier || "heuristic") +
+    " tier" +
+    (verdict.judge_model ? " | " + escapeHtml(verdict.judge_model) : "") +
+    "</div>" +
+    "</div>"
+  );
+}
+
+function toggleVerdictDetail(btn) {
+  var badge = btn.closest(".verdict-badge");
+  var detail = badge ? badge.nextElementSibling : null;
+  if (detail && detail.classList.contains("verdict-detail")) {
+    var isHidden = detail.style.display === "none";
+    detail.style.display = isHidden ? "block" : "none";
+    btn.textContent = isHidden ? "hide" : "details";
+  }
+}
+
+function updateVerdictBadge(verdict) {
+  if (!verdict || !verdict.call_id) return;
+  var escapedId = CSS.escape(verdict.call_id);
+  var badge = document.querySelector(
+    '.verdict-badge[data-call-id="' + escapedId + '"]',
+  );
+  if (!badge) return;
+
+  // Update risk level class
+  var risk = verdict.risk_level || "medium";
+  badge.className = "verdict-badge verdict-" + risk;
+
+  // Update content spans
+  var riskEl = badge.querySelector(".verdict-risk");
+  var recEl = badge.querySelector(".verdict-rec");
+  var confEl = badge.querySelector(".verdict-conf");
+  if (riskEl) riskEl.textContent = risk.toUpperCase();
+  if (recEl) recEl.textContent = verdict.recommendation || "review";
+  if (confEl)
+    confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
+
+  // Remove spinner
+  var spinner = badge.querySelector(".verdict-judge-spinner");
+  if (spinner) spinner.remove();
+
+  // Update detail section
+  var detail = badge.nextElementSibling;
+  if (detail && detail.classList.contains("verdict-detail")) {
+    var summaryEl = detail.querySelector(".verdict-summary");
+    var reasonEl = detail.querySelector(".verdict-reasoning");
+    var tierEl = detail.querySelector(".verdict-tier");
+    if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
+    if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
+    if (tierEl)
+      tierEl.textContent =
+        (verdict.tier || "llm") +
+        " tier" +
+        (verdict.judge_model ? " | " + verdict.judge_model : "");
+    // Update evidence
+    var evidenceEl = detail.querySelector(".verdict-evidence");
+    if (verdict.evidence && verdict.evidence.length) {
+      if (!evidenceEl) {
+        evidenceEl = document.createElement("div");
+        evidenceEl.className = "verdict-evidence";
+        var tierDiv = detail.querySelector(".verdict-tier");
+        if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
+        else detail.appendChild(evidenceEl);
+      }
+      evidenceEl.innerHTML = verdict.evidence
+        .map(function (e) {
+          return "<div>\u2022 " + escapeHtml(e) + "</div>";
+        })
+        .join("");
+    } else if (evidenceEl) {
+      evidenceEl.remove();
+    }
+  }
+
+  // Update glow on approval buttons
+  updateVerdictGlow(verdict.recommendation);
+}
+
+function updateVerdictGlow(recommendation) {
+  var prompt = document.querySelector(".approval-prompt");
+  if (!prompt) return;
+  prompt.classList.remove(
+    "verdict-glow-approve",
+    "verdict-glow-deny",
+    "verdict-glow-review",
+  );
+  if (recommendation === "approve")
+    prompt.classList.add("verdict-glow-approve");
+  else if (recommendation === "deny") prompt.classList.add("verdict-glow-deny");
+  else prompt.classList.add("verdict-glow-review");
+}
+
+function showInlineToolBlock(items, autoApproved, judgePending) {
   const block = document.createElement("div");
   block.className = "msg approval-block" + (autoApproved ? " approved" : "");
   if (!autoApproved) {
@@ -1361,8 +1509,27 @@ function showInlineToolBlock(items, autoApproved) {
     block.setAttribute("aria-label", "Tool approval required");
   }
 
+  // Track the highest-priority recommendation for glow
+  var glowRec = null;
+
   items.forEach(function (item) {
     block.appendChild(buildToolDiv(item));
+    // Render verdict badge if present
+    if (item.verdict) {
+      block.insertAdjacentHTML(
+        "beforeend",
+        renderVerdictBadge(item.verdict, judgePending),
+      );
+      // Track recommendation for glow (deny > review > approve)
+      var rec = item.verdict.recommendation || "review";
+      if (
+        !glowRec ||
+        rec === "deny" ||
+        (rec === "review" && glowRec === "approve")
+      ) {
+        glowRec = rec;
+      }
+    }
   });
 
   if (autoApproved) {
@@ -1373,6 +1540,13 @@ function showInlineToolBlock(items, autoApproved) {
   } else {
     const prompt = document.createElement("div");
     prompt.className = "approval-prompt";
+
+    // Apply verdict glow on initial heuristic verdict
+    if (glowRec) {
+      if (glowRec === "approve") prompt.classList.add("verdict-glow-approve");
+      else if (glowRec === "deny") prompt.classList.add("verdict-glow-deny");
+      else prompt.classList.add("verdict-glow-review");
+    }
 
     const actions = document.createElement("div");
     actions.className = "approval-actions";
@@ -1852,6 +2026,19 @@ document.addEventListener("keydown", function (e) {
       resolveInlineApproval(false, false, getFeedback());
     } else if (e.key === "a") {
       resolveInlineApproval(true, true, getFeedback());
+    } else if (e.key === "d") {
+      // Toggle verdict details panel
+      var details = approvalBlockEl
+        ? approvalBlockEl.querySelectorAll(".verdict-detail")
+        : [];
+      details.forEach(function (d) {
+        var isHidden = d.style.display === "none";
+        d.style.display = isHidden ? "block" : "none";
+        var btn = d.previousElementSibling
+          ? d.previousElementSibling.querySelector(".verdict-expand")
+          : null;
+        if (btn) btn.textContent = isHidden ? "hide" : "details";
+      });
     }
     return;
   }

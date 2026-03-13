@@ -456,6 +456,50 @@ assistant message with whatever partial content was streamed.
 {"type": "cancelled"}
 ```
 
+**`intent_verdict`** -- delivered asynchronously when the LLM judge completes
+its evaluation of a pending tool call. Only sent when intent validation is
+enabled (`--judge` or `[judge] enabled = true`). The `call_id` correlates with
+the item in the preceding `approve_request` event.
+
+```json
+{
+  "type": "intent_verdict",
+  "verdict_id": "f7e8d9c0b1a2",
+  "call_id": "call_abc123",
+  "func_name": "bash",
+  "intent_summary": "Install Express.js web framework via npm",
+  "risk_level": "medium",
+  "confidence": 0.85,
+  "recommendation": "review",
+  "reasoning": "The command installs express from npm. This is a well-known package but will modify node_modules and package.json.",
+  "evidence": ["Checked package.json -- express is not currently a dependency"],
+  "tier": "llm",
+  "judge_model": "gpt-5",
+  "latency_ms": 2340
+}
+```
+
+| Field            | Type       | Description                                            |
+|------------------|------------|--------------------------------------------------------|
+| `verdict_id`     | string     | Unique verdict identifier                              |
+| `call_id`        | string     | Tool call ID (matches `approve_request` item)          |
+| `func_name`      | string     | Tool function name                                     |
+| `intent_summary` | string     | One-sentence description of the tool call's intent     |
+| `risk_level`     | string     | `"low"`, `"medium"`, `"high"`, or `"critical"`         |
+| `confidence`     | float      | 0.0--1.0 confidence in the assessment                  |
+| `recommendation` | string     | `"approve"`, `"review"`, or `"deny"`                   |
+| `reasoning`      | string     | Evidence-based explanation                             |
+| `evidence`       | list       | Supporting evidence (file excerpts, rule names)        |
+| `tier`           | string     | Always `"llm"` for this event                          |
+| `judge_model`    | string     | Model that produced the verdict                        |
+| `latency_ms`     | int        | Evaluation time in milliseconds                        |
+
+When intent validation is active, the `approve_request` event is also extended:
+each item in `items` gains a `verdict` field containing the heuristic verdict
+(same schema as above but with `tier: "heuristic"`), and the event gains a
+top-level `judge_pending` boolean indicating whether an LLM verdict is in
+flight.
+
 #### Keepalive
 
 The server sends an SSE comment every 5 seconds when no events are pending:
@@ -893,6 +937,52 @@ Status code: `404`
 ```
 
 Status code: `403`
+
+---
+
+### `GET /v1/api/admin/verdicts` (Console)
+
+List intent validation verdicts from the `intent_verdicts` table. This endpoint
+is on the **console** server and requires the `admin.judge` permission.
+
+**Query parameters:**
+
+| Parameter    | Type   | Required | Description                                        |
+|--------------|--------|----------|----------------------------------------------------|
+| `ws_id`      | string | no       | Filter by workstream ID                            |
+| `since`      | string | no       | ISO timestamp lower bound                          |
+| `until`      | string | no       | ISO timestamp upper bound                          |
+| `risk_level` | string | no       | Filter by risk level (`low`/`medium`/`high`/`critical`) |
+| `limit`      | int    | no       | Max results (default 100, max 500)                 |
+| `offset`     | int    | no       | Pagination offset (default 0)                      |
+
+**Response:**
+
+```json
+{
+  "verdicts": [
+    {
+      "verdict_id": "a1b2c3d4e5f6",
+      "ws_id": "ws-1",
+      "call_id": "call_abc123",
+      "func_name": "bash",
+      "func_args": "{\"command\": \"npm install express\"}",
+      "intent_summary": "Package installation: npm install express",
+      "risk_level": "medium",
+      "confidence": 0.70,
+      "recommendation": "review",
+      "reasoning": "Command installs a software package which may modify the environment.",
+      "evidence": "[\"Matched rule: package-install\"]",
+      "tier": "heuristic",
+      "judge_model": "",
+      "latency_ms": 0,
+      "user_decision": "approved",
+      "created": "2026-03-13T10:00:00"
+    }
+  ],
+  "total": 42
+}
+```
 
 ---
 
