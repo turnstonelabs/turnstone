@@ -26,7 +26,7 @@ note right
   max_tokens, agent_max_turns,
   auto_approve, auto_approve_tools,
   token_budget, prompt_template,
-  tool_search, tool_search_threshold
+  prompt_template_hash, notify_on_complete
 end note
 
 Server -> Storage : create_ws_template()

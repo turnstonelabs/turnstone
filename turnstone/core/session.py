@@ -264,6 +264,7 @@ class ChatSession:
         self._notify_on_complete: str = "{}"
         self._ws_template_id: str = ""
         self._ws_template_version: int = 0
+        self._ws_template_system_prompt: str = ""  # inline prompt from ws_template
         self._assistant_pending_tokens = 0
         self.creative_mode = False
         self._notify_count = 0
@@ -352,6 +353,7 @@ class ChatSession:
                 "token_budget": str(self._token_budget),
                 "ws_template_id": self._ws_template_id,
                 "ws_template_version": str(self._ws_template_version),
+                "ws_template_system_prompt": self._ws_template_system_prompt,
                 "notify_on_complete": self._notify_on_complete,
             },
         )
@@ -620,6 +622,11 @@ class ChatSession:
                 self._ws_template_id = config["ws_template_id"]
             if "ws_template_version" in config:
                 self._ws_template_version = int(config["ws_template_version"] or "0")
+            if "ws_template_system_prompt" in config:
+                self._ws_template_system_prompt = config["ws_template_system_prompt"]
+                if self._ws_template_system_prompt:
+                    self._template_content = self._ws_template_system_prompt
+                    self._template_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
             self._init_system_messages()

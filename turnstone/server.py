@@ -256,11 +256,18 @@ class WebUI:
 
         # Per-tool auto-approve check (server-side, from workstream template)
         if pending and self.auto_approve_tools:
-            pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+            pending_names = {
+                it.get("approval_label", "") or it.get("func_name", "")
+                for it in pending
+                if it.get("func_name")
+            }
             if pending_names and pending_names.issubset(self.auto_approve_tools):
                 pending = []
 
-        if not pending or self.auto_approve:
+        # Budget override requires explicit approval — never auto-approved by
+        # blanket auto_approve (tool policies can still allow it explicitly).
+        has_budget_override = any(it.get("func_name") == "__budget_override__" for it in pending)
+        if not pending or (self.auto_approve and not has_budget_override):
             # Track auto-approved tool activity
             first = items[0] if items else {}
             label = first.get("func_name", "")
@@ -1103,6 +1110,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             if ws_tpl["system_prompt"]:
                 sess._template_content = ws_tpl["system_prompt"]
                 sess._template_name = None
+                sess._ws_template_system_prompt = ws_tpl["system_prompt"]
                 sess._init_system_messages()
             elif ws_tpl["prompt_template"]:
                 sess.set_template(ws_tpl["prompt_template"])
