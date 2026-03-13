@@ -1755,6 +1755,14 @@ class PostgreSQLBackend:
                 return False
             cur = _row_to_dict(current, "auto_approve", "enabled")
 
+            # Filter to allowed fields — skip snapshot if no effective changes
+            dropped = set(fields) - _WS_TEMPLATE_MUTABLE
+            if dropped:
+                log.warning("update_ws_template: ignoring unknown fields: %s", dropped)
+            fields = {k: v for k, v in fields.items() if k in _WS_TEMPLATE_MUTABLE}
+            if not fields:
+                return True  # Nothing to update
+
             # Create version snapshot
             now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
             conn.execute(
@@ -1768,11 +1776,6 @@ class PostgreSQLBackend:
                 },
             )
 
-            # Filter to allowed fields
-            dropped = set(fields) - _WS_TEMPLATE_MUTABLE
-            if dropped:
-                log.warning("update_ws_template: ignoring unknown fields: %s", dropped)
-            fields = {k: v for k, v in fields.items() if k in _WS_TEMPLATE_MUTABLE}
             fields["updated"] = now
             fields["version"] = cur["version"] + 1
             if "auto_approve" in fields:

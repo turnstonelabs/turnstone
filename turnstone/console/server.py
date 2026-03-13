@@ -2260,6 +2260,16 @@ async def admin_create_ws_template(request: Request) -> JSONResponse:
             )
         prompt_template_hash = _hash_content(pt.get("content", ""))
 
+    try:
+        temperature = float(body["temperature"]) if body.get("temperature") is not None else None
+        max_tokens = int(body["max_tokens"]) if body.get("max_tokens") is not None else None
+        token_budget = int(body.get("token_budget", 0))
+        agent_max_turns = (
+            int(body["agent_max_turns"]) if body.get("agent_max_turns") is not None else None
+        )
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": f"Invalid numeric field: {exc}"}, status_code=400)
+
     ws_template_id = uuid.uuid4().hex
     storage.create_ws_template(
         ws_template_id=ws_template_id,
@@ -2271,13 +2281,11 @@ async def admin_create_ws_template(request: Request) -> JSONResponse:
         model=str(body.get("model", ""))[:128],
         auto_approve=bool(body.get("auto_approve", False)),
         auto_approve_tools=str(body.get("auto_approve_tools", ""))[:2048],
-        temperature=float(body["temperature"]) if body.get("temperature") is not None else None,
+        temperature=temperature,
         reasoning_effort=str(body.get("reasoning_effort", ""))[:32],
-        max_tokens=int(body["max_tokens"]) if body.get("max_tokens") is not None else None,
-        token_budget=int(body.get("token_budget", 0)),
-        agent_max_turns=int(body["agent_max_turns"])
-        if body.get("agent_max_turns") is not None
-        else None,
+        max_tokens=max_tokens,
+        token_budget=token_budget,
+        agent_max_turns=agent_max_turns,
         notify_on_complete=str(body.get("notify_on_complete", "{}"))[:4096],
         org_id=str(body.get("org_id", ""))[:128],
         created_by=getattr(getattr(request.state, "auth_result", None), "user_id", ""),
@@ -2361,20 +2369,25 @@ async def admin_update_ws_template(request: Request) -> JSONResponse:
         updates["auto_approve"] = bool(body["auto_approve"])
     if "auto_approve_tools" in body:
         updates["auto_approve_tools"] = str(body["auto_approve_tools"])[:2048]
-    if "temperature" in body:
-        updates["temperature"] = (
-            float(body["temperature"]) if body["temperature"] is not None else None
-        )
+    try:
+        if "temperature" in body:
+            updates["temperature"] = (
+                float(body["temperature"]) if body["temperature"] is not None else None
+            )
+        if "max_tokens" in body:
+            updates["max_tokens"] = (
+                int(body["max_tokens"]) if body["max_tokens"] is not None else None
+            )
+        if "token_budget" in body:
+            updates["token_budget"] = int(body["token_budget"])
+        if "agent_max_turns" in body:
+            updates["agent_max_turns"] = (
+                int(body["agent_max_turns"]) if body["agent_max_turns"] is not None else None
+            )
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": f"Invalid numeric field: {exc}"}, status_code=400)
     if "reasoning_effort" in body:
         updates["reasoning_effort"] = str(body["reasoning_effort"])[:32]
-    if "max_tokens" in body:
-        updates["max_tokens"] = int(body["max_tokens"]) if body["max_tokens"] is not None else None
-    if "token_budget" in body:
-        updates["token_budget"] = int(body["token_budget"])
-    if "agent_max_turns" in body:
-        updates["agent_max_turns"] = (
-            int(body["agent_max_turns"]) if body["agent_max_turns"] is not None else None
-        )
     if "notify_on_complete" in body:
         updates["notify_on_complete"] = str(body["notify_on_complete"])[:4096]
     if "enabled" in body:

@@ -1092,7 +1092,11 @@ async def create_workstream(request: Request) -> JSONResponse:
 
         # Per-workstream template override — only when not resumed (resumed
         # workstreams restore their own template from workstream_config).
-        if body_template and not resumed and ws.session:
+        # Skip validation when the ws_template will override the prompt anyway.
+        ws_tpl_overrides_prompt = bool(
+            ws_tpl and (ws_tpl["system_prompt"] or ws_tpl["prompt_template"])
+        )
+        if body_template and not resumed and ws.session and not ws_tpl_overrides_prompt:
             from turnstone.core.memory import get_prompt_template_by_name
 
             if not get_prompt_template_by_name(body_template):

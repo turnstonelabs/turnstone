@@ -1020,7 +1020,8 @@
 #create-schedule-overlay, #edit-schedule-overlay, #schedule-runs-overlay,
 #create-role-overlay, #edit-role-overlay, #user-roles-overlay,
 #create-policy-overlay, #edit-policy-overlay,
-#create-template-overlay, #edit-template-overlay {
+#create-template-overlay, #edit-template-overlay,
+#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);

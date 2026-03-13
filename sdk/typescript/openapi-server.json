@@ -883,6 +883,12 @@
             "description": "Prompt template name (replaces default templates)",
             "title": "Template",
             "type": "string"
+          },
+          "ws_template": {
+            "default": "",
+            "description": "Workstream template name (behavioral profile applied at creation)",
+            "title": "Ws Template",
+            "type": "string"
           }
         },
         "title": "CreateWorkstreamRequest",

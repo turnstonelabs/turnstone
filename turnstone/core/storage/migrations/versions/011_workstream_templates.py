@@ -70,6 +70,16 @@ def upgrade() -> None:
     with op.batch_alter_table("scheduled_tasks") as batch_op:
         batch_op.add_column(sa.Column("ws_template", sa.Text, nullable=False, server_default=""))
 
+    # Grant admin.ws_templates permission to the built-in admin role
+    conn = op.get_bind()
+    conn.execute(
+        sa.text(
+            "UPDATE roles SET permissions = permissions || ',admin.ws_templates' "
+            "WHERE role_id = 'builtin-admin' "
+            "AND permissions NOT LIKE '%admin.ws_templates%'"
+        )
+    )
+
 
 def downgrade() -> None:
     with op.batch_alter_table("scheduled_tasks") as batch_op:

@@ -471,7 +471,7 @@ var _runsScheduleTriggerEl = null;
 function _populateWsTemplateSelect(selectId) {
   var sel = document.getElementById(selectId);
   sel.innerHTML = '<option value="">None</option>';
-  authFetch("/v1/api/ws-templates")
+  return authFetch("/v1/api/ws-templates")
     .then(function (r) {
       return r.json();
     })
@@ -827,11 +827,10 @@ function showEditScheduleModal(taskId) {
         : "";
       document.getElementById("es-model").value = s.model || "";
       document.getElementById("es-template").value = s.template || "";
-      _populateWsTemplateSelect("es-ws-template");
       var _wsTemplateVal = s.ws_template || "";
-      setTimeout(function () {
+      _populateWsTemplateSelect("es-ws-template").then(function () {
         document.getElementById("es-ws-template").value = _wsTemplateVal;
-      }, 200);
+      });
       document.getElementById("es-message").value = s.initial_message || "";
       document.getElementById("es-autoapprove").checked = !!s.auto_approve;
       document.getElementById("es-enabled").checked = !!s.enabled;
