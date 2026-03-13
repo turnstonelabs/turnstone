@@ -475,6 +475,8 @@ class ChatSession:
 
     def close(self) -> None:
         """Release resources (listener registrations, etc.)."""
+        if self._judge is not None:
+            self._judge.shutdown()
         if self._mcp_client and self._mcp_refresh_cb:
             self._mcp_client.remove_listener(self._mcp_refresh_cb)
             self._mcp_refresh_cb = None

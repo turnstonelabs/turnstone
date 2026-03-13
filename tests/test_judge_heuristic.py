@@ -206,6 +206,24 @@ class TestHighRules:
         v = evaluate_heuristic("bash", {"command": "scp file.txt user@remote:/tmp/"}, "bash")
         _assert_verdict(v, risk_level="high", recommendation="review")
 
+    def test_cat_etc_passwd(self):
+        v = evaluate_heuristic("bash", {"command": "cat /etc/passwd"}, "bash")
+        _assert_verdict(v, risk_level="high", recommendation="review")
+        assert "credential-recon" in v.evidence[0]
+
+    def test_cat_etc_shadow(self):
+        v = evaluate_heuristic("bash", {"command": "cat /etc/shadow"}, "bash")
+        _assert_verdict(v, risk_level="high", recommendation="review")
+
+    def test_python_etc_passwd(self):
+        """Python one-liner accessing /etc/passwd should also trigger."""
+        v = evaluate_heuristic(
+            "bash",
+            {"command": "python3 -c \"import os; os.system('cat /etc/passwd')\""},
+            "bash",
+        )
+        _assert_verdict(v, risk_level="high", recommendation="review")
+
 
 # ---------------------------------------------------------------------------
 # Medium rules

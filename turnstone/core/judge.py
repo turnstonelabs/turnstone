@@ -15,6 +15,7 @@ import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -255,6 +256,24 @@ _HIGH_RULES: list[_HeuristicRule] = [
         arg_patterns=[r"\bssh\s", r"\bscp\s"],
         intent_template="Remote access command: {arg_snippet}",
         reasoning_template="Command initiates a remote SSH or SCP connection.",
+    ),
+    _HeuristicRule(
+        name="credential-recon",
+        risk_level="high",
+        confidence=0.80,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"/etc/passwd\b",
+            r"/etc/shadow\b",
+            r"/etc/master\.passwd\b",
+            r"/etc/security/passwd\b",
+        ],
+        intent_template="Credential file access: {arg_snippet}",
+        reasoning_template=(
+            "Command accesses system credential files. Even read-only access "
+            "to /etc/passwd or /etc/shadow is a reconnaissance pattern."
+        ),
     ),
 ]
 
@@ -741,6 +760,13 @@ class IntentJudge:
             self._model = session_model
             self._judge_context_window = context_window
 
+        # Executor for timeout-guarded API calls (1 thread — judge is serial)
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
+
+    def shutdown(self) -> None:
+        """Release the executor thread pool."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
     def evaluate(
         self,
         items: list[dict[str, Any]],
@@ -861,8 +887,13 @@ class IntentJudge:
                     }
                 )
 
+            # Per-call timeout: cap each API call to the remaining budget.
+            # create_completion() is blocking and the SDK default timeout is
+            # 10 minutes — far too long for an advisory judge on local models.
+            per_call_timeout = max(timeout_budget, 5.0)  # at least 5s
             try:
-                result = self._provider.create_completion(
+                future = self._executor.submit(
+                    self._provider.create_completion,
                     client=self._client,
                     model=self._model,
                     messages=judge_messages,
@@ -871,6 +902,17 @@ class IntentJudge:
                     temperature=0.0,
                     reasoning_effort="medium",
                 )
+                result = future.result(timeout=per_call_timeout)
+            except TimeoutError:
+                log.warning("Judge LLM call timed out on turn %d (%.0fs)", turn, per_call_timeout)
+                # Abandon the lingering API call and replace the executor so
+                # subsequent items in the batch don't queue behind it.
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="judge-api",
+                )
+                return None
             except Exception:
                 log.exception("Judge LLM call failed on turn %d", turn)
                 return None
