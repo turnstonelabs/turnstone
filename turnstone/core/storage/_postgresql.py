@@ -28,59 +28,32 @@ from turnstone.core.storage._schema import (
     workstream_templates,
     workstreams,
 )
-from turnstone.core.storage._sqlite import _reconstruct_messages
+from turnstone.core.storage._utils import (
+    ORG_MUTABLE as _ORG_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    POLICY_MUTABLE as _POLICY_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    ROLE_MUTABLE as _ROLE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    TEMPLATE_MUTABLE as _TEMPLATE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    VERDICT_MUTABLE as _VERDICT_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    WS_TEMPLATE_MUTABLE as _WS_TEMPLATE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    reconstruct_messages as _reconstruct_messages,
+)
+from turnstone.core.storage._utils import (
+    row_to_dict as _row_to_dict,
+)
 
 log = logging.getLogger(__name__)
-
-
-def _row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
-    """Convert a SQLAlchemy row to a dict, casting named fields to bool."""
-    d = dict(row._mapping)
-    for key in bool_fields:
-        if key in d:
-            d[key] = bool(d[key])
-    return d
-
-
-# -- Field allowlists for governance update methods ---------------------------
-
-_ROLE_MUTABLE = frozenset({"display_name", "permissions"})
-_ORG_MUTABLE = frozenset({"display_name", "settings"})
-_POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
-_TEMPLATE_MUTABLE = frozenset({"name", "content", "category", "variables", "is_default"})
-_WS_TEMPLATE_MUTABLE = frozenset(
-    {
-        "name",
-        "description",
-        "system_prompt",
-        "prompt_template",
-        "prompt_template_hash",
-        "model",
-        "auto_approve",
-        "auto_approve_tools",
-        "temperature",
-        "reasoning_effort",
-        "max_tokens",
-        "token_budget",
-        "agent_max_turns",
-        "notify_on_complete",
-        "enabled",
-    }
-)
-_VERDICT_MUTABLE = frozenset(
-    {
-        "user_decision",
-        "intent_summary",
-        "risk_level",
-        "confidence",
-        "recommendation",
-        "reasoning",
-        "evidence",
-        "tier",
-        "judge_model",
-        "latency_ms",
-    }
-)
 
 
 class PostgreSQLBackend:
@@ -109,6 +82,7 @@ class PostgreSQLBackend:
         tool_args: str | None = None,
         tool_call_id: str | None = None,
         provider_data: str | None = None,
+        tool_calls: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -123,6 +97,7 @@ class PostgreSQLBackend:
                     "tool_args": tool_args,
                     "tool_call_id": tool_call_id,
                     "provider_data": provider_data,
+                    "tool_calls": tool_calls,
                 },
             )
             conn.execute(
@@ -140,6 +115,7 @@ class PostgreSQLBackend:
                     conversations.c.tool_args,
                     conversations.c.tool_call_id,
                     conversations.c.provider_data,
+                    conversations.c.tool_calls,
                 )
                 .where(conversations.c.ws_id == ws_id)
                 .order_by(conversations.c.id)

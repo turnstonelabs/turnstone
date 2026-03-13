@@ -155,13 +155,23 @@ class TestLoadMessages:
         assert msgs[1] == {"role": "assistant", "content": "hi there"}
 
     def test_tool_calls_with_ids(self, tmp_db):
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                }
+            ]
+        )
         save_message("s1", "user", "run ls")
-        save_message("s1", "assistant", "Let me check.")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', tool_call_id="call_abc")
-        save_message("s1", "tool_result", "file1.txt\nfile2.txt", "bash", tool_call_id="call_abc")
+        save_message("s1", "assistant", "Let me check.", tool_calls=tc_json)
+        save_message("s1", "tool", "file1.txt\nfile2.txt", "bash", tool_call_id="call_abc")
         msgs = load_messages("s1")
         assert len(msgs) == 3  # user, assistant+tool_calls, tool
-        # Assistant should have content merged with tool_calls
+        # Assistant should have content and tool_calls
         assert msgs[1]["role"] == "assistant"
         assert msgs[1]["content"] == "Let me check."
         assert len(msgs[1]["tool_calls"]) == 1
@@ -172,23 +182,27 @@ class TestLoadMessages:
         assert msgs[2]["tool_call_id"] == "call_abc"
         assert msgs[2]["content"] == "file1.txt\nfile2.txt"
 
-    def test_tool_calls_without_ids_positional(self, tmp_db):
-        """Legacy data without tool_call_id uses positional matching."""
-        save_message("s1", "user", "do stuff")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}')
-        save_message("s1", "tool_result", "output", "bash")
-        msgs = load_messages("s1")
-        assert len(msgs) == 3
-        # Synthetic IDs should match
-        tc_id = msgs[1]["tool_calls"][0]["id"]
-        assert msgs[2]["tool_call_id"] == tc_id
-
     def test_parallel_tool_calls(self, tmp_db):
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"query":"a"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": '{"query":"b"}'},
+                },
+            ]
+        )
         save_message("s1", "user", "search two things")
-        save_message("s1", "tool_call", None, "search", '{"query":"a"}', tool_call_id="call_1")
-        save_message("s1", "tool_call", None, "search", '{"query":"b"}', tool_call_id="call_2")
-        save_message("s1", "tool_result", "result a", "search", tool_call_id="call_1")
-        save_message("s1", "tool_result", "result b", "search", tool_call_id="call_2")
+        save_message("s1", "assistant", None, tool_calls=tc_json)
+        save_message("s1", "tool", "result a", "search", tool_call_id="call_1")
+        save_message("s1", "tool", "result b", "search", tool_call_id="call_2")
         msgs = load_messages("s1")
         assert len(msgs) == 4  # user, assistant+2 tool_calls, 2 tool results
         assert len(msgs[1]["tool_calls"]) == 2
@@ -197,12 +211,6 @@ class TestLoadMessages:
 
     def test_empty_workstream(self, tmp_db):
         assert load_messages("nonexistent") == []
-
-    def test_orphaned_tool_result_skipped(self, tmp_db):
-        save_message("s1", "user", "hello")
-        save_message("s1", "tool_result", "orphan", "bash")
-        msgs = load_messages("s1")
-        assert len(msgs) == 1  # only the user message
 
 
 # ── Delete workstream ─────────────────────────────────────────────────
@@ -226,7 +234,7 @@ class TestDeleteWorkstream:
 
 class TestSaveMessageToolCallId:
     def test_tool_call_id_stored(self, tmp_db):
-        save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="call_xyz")
+        save_message("s1", "tool", "output", "bash", tool_call_id="call_xyz")
         engine = get_storage()._engine  # noqa: SLF001
         with engine.connect() as conn:
             row = conn.execute(
@@ -349,42 +357,96 @@ class TestInterruptedWorkstreamRepair:
     """load_messages() should strip trailing incomplete tool call turns."""
 
     def test_complete_tool_turn_preserved(self, tmp_db):
-        """2 tool_calls + 2 tool_results = complete, no stripping."""
+        """2 tool_calls + 2 tool results = complete, no stripping."""
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                },
+            ]
+        )
         save_message("s1", "user", "hello")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
-        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
-        save_message("s1", "tool_result", "file.txt", tool_call_id="call_1")
-        save_message("s1", "tool_result", "/home", tool_call_id="call_2")
+        save_message("s1", "assistant", None, tool_calls=tc_json)
+        save_message("s1", "tool", "file.txt", tool_call_id="call_1")
+        save_message("s1", "tool", "/home", tool_call_id="call_2")
         msgs = load_messages("s1")
         assert len(msgs) == 4  # user + assistant(2 calls) + 2 tool results
 
     def test_partial_tool_results_stripped(self, tmp_db):
-        """2 tool_calls + 1 tool_result = incomplete, strip the turn."""
+        """2 tool_calls + 1 tool result = incomplete, strip the turn."""
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                },
+            ]
+        )
         save_message("s1", "user", "hello")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
-        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
-        save_message("s1", "tool_result", "file.txt", tool_call_id="call_1")
+        save_message("s1", "assistant", None, tool_calls=tc_json)
+        save_message("s1", "tool", "file.txt", tool_call_id="call_1")
         msgs = load_messages("s1")
         assert len(msgs) == 1  # only user message remains
         assert msgs[0]["role"] == "user"
 
     def test_zero_tool_results_stripped(self, tmp_db):
-        """2 tool_calls + 0 tool_results = incomplete, strip the turn."""
+        """Assistant with tool_calls + 0 results = incomplete, strip the turn."""
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                },
+            ]
+        )
         save_message("s1", "user", "hello")
-        save_message("s1", "assistant", "Let me check")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
-        save_message("s1", "tool_call", None, "bash", '{"command":"pwd"}', "call_2")
+        save_message("s1", "assistant", "Let me check", tool_calls=tc_json)
         msgs = load_messages("s1")
-        # assistant with content was merged into tool_call assistant, so stripped
         assert len(msgs) == 1
         assert msgs[0]["role"] == "user"
 
     def test_complete_turn_before_incomplete_preserved(self, tmp_db):
         """Complete turn followed by incomplete turn: keep complete, strip incomplete."""
+        import json
+
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                },
+            ]
+        )
         save_message("s1", "user", "first")
         save_message("s1", "assistant", "response")
         save_message("s1", "user", "second")
-        save_message("s1", "tool_call", None, "bash", '{"command":"ls"}', "call_1")
+        save_message("s1", "assistant", None, tool_calls=tc_json)
         msgs = load_messages("s1")
         assert len(msgs) == 3  # user + assistant + user (incomplete turn stripped)
         assert msgs[0]["role"] == "user"

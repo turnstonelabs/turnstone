@@ -24,6 +24,7 @@ class StorageBackend(Protocol):
         tool_args: str | None = None,
         tool_call_id: str | None = None,
         provider_data: str | None = None,
+        tool_calls: str | None = None,
     ) -> None:
         """Log a message to the conversations table."""
         ...

@@ -43,10 +43,21 @@ class TestSaveAndLoadMessages:
         assert msgs[1]["content"] == "world"
 
     def test_tool_call_grouping(self, backend):
+        import json
+
         backend.register_workstream("s1")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                }
+            ]
+        )
         backend.save_message("s1", "user", "do something")
-        backend.save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="c1")
-        backend.save_message("s1", "tool_result", "file.txt", tool_call_id="c1")
+        backend.save_message("s1", "assistant", None, tool_calls=tc_json)
+        backend.save_message("s1", "tool", "file.txt", tool_call_id="c1")
         backend.save_message("s1", "assistant", "done")
         msgs = backend.load_messages("s1")
         assert len(msgs) == 4
@@ -57,12 +68,27 @@ class TestSaveAndLoadMessages:
         assert msgs[2]["content"] == "file.txt"
 
     def test_incomplete_turn_repair(self, backend):
+        import json
+
         backend.register_workstream("s1")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"path":"a"}'},
+                },
+            ]
+        )
         backend.save_message("s1", "user", "do something")
-        backend.save_message("s1", "tool_call", None, "bash", '{"cmd":"ls"}', tool_call_id="c1")
-        backend.save_message("s1", "tool_call", None, "read", '{"path":"a"}', tool_call_id="c2")
+        backend.save_message("s1", "assistant", None, tool_calls=tc_json)
         # Only 1 result for 2 calls — incomplete turn
-        backend.save_message("s1", "tool_result", "ok", tool_call_id="c1")
+        backend.save_message("s1", "tool", "ok", tool_call_id="c1")
         msgs = backend.load_messages("s1")
         # Incomplete turn should be stripped
         assert len(msgs) == 1  # only the user message remains

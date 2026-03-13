@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -29,6 +28,30 @@ from turnstone.core.storage._schema import (
     workstream_templates,
     workstreams,
 )
+from turnstone.core.storage._utils import (
+    ORG_MUTABLE as _ORG_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    POLICY_MUTABLE as _POLICY_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    ROLE_MUTABLE as _ROLE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    TEMPLATE_MUTABLE as _TEMPLATE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    VERDICT_MUTABLE as _VERDICT_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    WS_TEMPLATE_MUTABLE as _WS_TEMPLATE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    reconstruct_messages as _reconstruct_messages,
+)
+from turnstone.core.storage._utils import (
+    row_to_dict as _row_to_dict,
+)
 
 log = logging.getLogger(__name__)
 
@@ -46,56 +69,6 @@ def _fts5_query(query: str) -> str:
         if t:
             safe.append(f'"{t.replace(chr(34), chr(34) + chr(34))}"')
     return " ".join(safe)
-
-
-def _row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
-    """Convert a SQLAlchemy row to a dict, casting named fields to bool."""
-    d = dict(row._mapping)
-    for key in bool_fields:
-        if key in d:
-            d[key] = bool(d[key])
-    return d
-
-
-# -- Field allowlists for governance update methods ---------------------------
-
-_ROLE_MUTABLE = frozenset({"display_name", "permissions"})
-_ORG_MUTABLE = frozenset({"display_name", "settings"})
-_POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
-_TEMPLATE_MUTABLE = frozenset({"name", "content", "category", "variables", "is_default"})
-_WS_TEMPLATE_MUTABLE = frozenset(
-    {
-        "name",
-        "description",
-        "system_prompt",
-        "prompt_template",
-        "prompt_template_hash",
-        "model",
-        "auto_approve",
-        "auto_approve_tools",
-        "temperature",
-        "reasoning_effort",
-        "max_tokens",
-        "token_budget",
-        "agent_max_turns",
-        "notify_on_complete",
-        "enabled",
-    }
-)
-_VERDICT_MUTABLE = frozenset(
-    {
-        "user_decision",
-        "intent_summary",
-        "risk_level",
-        "confidence",
-        "recommendation",
-        "reasoning",
-        "evidence",
-        "tier",
-        "judge_model",
-        "latency_ms",
-    }
-)
 
 
 class SQLiteBackend:
@@ -152,6 +125,7 @@ class SQLiteBackend:
         tool_args: str | None = None,
         tool_call_id: str | None = None,
         provider_data: str | None = None,
+        tool_calls: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -166,6 +140,7 @@ class SQLiteBackend:
                     "tool_args": tool_args,
                     "tool_call_id": tool_call_id,
                     "provider_data": provider_data,
+                    "tool_calls": tool_calls,
                 },
             )
             # FTS5 indexing
@@ -196,6 +171,7 @@ class SQLiteBackend:
                     conversations.c.tool_args,
                     conversations.c.tool_call_id,
                     conversations.c.provider_data,
+                    conversations.c.tool_calls,
                 )
                 .where(conversations.c.ws_id == ws_id)
                 .order_by(conversations.c.id)
@@ -2205,99 +2181,3 @@ class SQLiteBackend:
 
     def close(self) -> None:
         self._engine.dispose()
-
-
-def _reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
-    """Reconstruct OpenAI message format from stored conversation rows.
-
-    Handles tool_call / tool_result grouping and incomplete turn repair.
-    """
-    messages: list[dict[str, Any]] = []
-    i = 0
-    while i < len(rows):
-        role, content, tool_name, tool_args, tc_id, provider_data = rows[i]
-
-        if role == "user":
-            messages.append({"role": "user", "content": content or ""})
-            i += 1
-
-        elif role == "assistant":
-            msg: dict[str, Any] = {"role": "assistant", "content": content}
-            if provider_data:
-                with contextlib.suppress(json.JSONDecodeError, TypeError):
-                    msg["_provider_content"] = json.loads(provider_data)
-            messages.append(msg)
-            i += 1
-
-        elif role == "tool_call":
-            assistant_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [],
-            }
-            if (
-                messages
-                and messages[-1]["role"] == "assistant"
-                and not messages[-1].get("tool_calls")
-            ):
-                assistant_msg = messages.pop()
-                assistant_msg["tool_calls"] = []
-
-            while i < len(rows) and rows[i][0] == "tool_call":
-                _, _, tn, ta, stored_tc_id, _ = rows[i]
-                call_id = stored_tc_id or f"call_{ws_id}_{i}"
-                assistant_msg["tool_calls"].append(
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": tn or "", "arguments": ta or ""},
-                    }
-                )
-                i += 1
-            messages.append(assistant_msg)
-
-            # Consume matching tool_result rows
-            result_idx = 0
-            while i < len(rows) and rows[i][0] == "tool_result":
-                _, result_content, _, _, result_tc_id, _ = rows[i]
-                if result_tc_id:
-                    tc_id_to_use = result_tc_id
-                elif result_idx < len(assistant_msg["tool_calls"]):
-                    tc_id_to_use = assistant_msg["tool_calls"][result_idx]["id"]
-                else:
-                    tc_id_to_use = f"call_orphan_{i}"
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc_id_to_use,
-                        "content": result_content or "",
-                    }
-                )
-                result_idx += 1
-                i += 1
-
-        elif role == "tool_result":
-            # Orphaned tool_result (no preceding tool_call) — skip
-            i += 1
-        else:
-            i += 1
-
-    # Repair: strip trailing incomplete tool call turns
-    while messages:
-        tail_tools = 0
-        for j in range(len(messages) - 1, -1, -1):
-            if messages[j].get("role") == "tool":
-                tail_tools += 1
-            else:
-                break
-        asst_idx = len(messages) - 1 - tail_tools
-        if asst_idx < 0:
-            break
-        asst = messages[asst_idx]
-        if asst.get("role") != "assistant" or not asst.get("tool_calls"):
-            break
-        if tail_tools >= len(asst["tool_calls"]):
-            break
-        del messages[asst_idx:]
-
-    return messages

@@ -988,28 +988,29 @@ class ChatSession:
                 tc = assistant_msg.get("tool_calls")
                 provider_data = None
                 if assistant_msg.get("_provider_content"):
-                    import json as _json
+                    provider_data = json.dumps(assistant_msg["_provider_content"])
 
-                    provider_data = _json.dumps(assistant_msg["_provider_content"])
-                if content or provider_data is not None:
-                    save_message(self._ws_id, "assistant", content, provider_data=provider_data)
+                # Build tool_calls JSON (excluding memory tools)
+                tool_calls_json: str | None = None
                 if tc:
-                    for call in tc:
-                        fn = call.get("function", {})
-                        name = fn.get("name", "")
-                        if name not in (
-                            "remember",
-                            "forget",
-                            "recall",
-                        ):
-                            save_message(
-                                self._ws_id,
-                                "tool_call",
-                                None,
-                                name,
-                                fn.get("arguments", ""),
-                                tool_call_id=call.get("id"),
-                            )
+                    filtered_tc = [
+                        call
+                        for call in tc
+                        if call.get("function", {}).get("name", "")
+                        not in ("remember", "forget", "recall")
+                    ]
+                    if filtered_tc:
+                        tool_calls_json = json.dumps(filtered_tc)
+
+                # Save assistant message atomically (content + tool_calls in one row)
+                if content or provider_data is not None or tool_calls_json:
+                    save_message(
+                        self._ws_id,
+                        "assistant",
+                        content,
+                        provider_data=provider_data,
+                        tool_calls=tool_calls_json,
+                    )
 
                 tool_calls = assistant_msg.get("tool_calls")
                 if not tool_calls:
@@ -1078,7 +1079,7 @@ class ChatSession:
                             store_text = output[:2000]
                         save_message(
                             self._ws_id,
-                            "tool_result",
+                            "tool",
                             store_text,
                             _tname,
                             tool_call_id=tc_id,

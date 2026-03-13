@@ -30,6 +30,7 @@ conversations = sa.Table(
     sa.Column("tool_args", sa.Text),
     sa.Column("tool_call_id", sa.Text),
     sa.Column("provider_data", sa.Text),
+    sa.Column("tool_calls", sa.Text),
 )
 
 workstreams = sa.Table(

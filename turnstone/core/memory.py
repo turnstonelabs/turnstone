@@ -32,11 +32,19 @@ def save_message(
     tool_args: str | None = None,
     tool_call_id: str | None = None,
     provider_data: str | None = None,
+    tool_calls: str | None = None,
 ) -> None:
     """Log a message to the conversations table."""
     with contextlib.suppress(Exception):
         get_storage().save_message(
-            ws_id, role, content, tool_name, tool_args, tool_call_id, provider_data
+            ws_id,
+            role,
+            content,
+            tool_name,
+            tool_args,
+            tool_call_id,
+            provider_data,
+            tool_calls=tool_calls,
         )
 
 
