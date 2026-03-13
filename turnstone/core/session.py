@@ -1816,7 +1816,9 @@ class ChatSession:
             for item in items:
                 if item.get("needs_approval") and not item.get("error"):
                     item["denied"] = True
-                    item["denial_msg"] = user_feedback or "Denied by user"
+                    item["denial_msg"] = (
+                        f"Denied by user: {user_feedback}" if user_feedback else "Denied by user"
+                    )
             user_feedback = None  # feedback is in the denial_msg
 
         # Phase 3: execute (check cancellation before starting)

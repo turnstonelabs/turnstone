@@ -538,6 +538,11 @@ def _build_history(
     When ``has_pending_approval`` is True, the last assistant entry's
     tool_calls are marked ``"pending": True`` so the client renders them
     as awaiting approval rather than as already-approved.
+
+    Tool results whose content starts with "Denied by user" are marked
+    ``"denied": True``, and the corresponding assistant entry that
+    issued the tool calls is also marked ``"denied": True`` so the
+    client can render the correct badge.
     """
     history = []
     for msg in session.messages:
@@ -551,7 +556,23 @@ def _build_history(
                 }
                 for tc in msg["tool_calls"]
             ]
+        # Detect denied/blocked tool results by their content prefix.
+        if msg.get("role") == "tool":
+            content = msg.get("content", "")
+            if isinstance(content, str) and (
+                content.startswith("Denied by user") or content.startswith("Blocked")
+            ):
+                entry["denied"] = True
         history.append(entry)
+
+    # Propagate denial from tool results to their parent assistant entry.
+    last_assistant_idx: int | None = None
+    for idx, entry in enumerate(history):
+        if entry.get("tool_calls"):
+            last_assistant_idx = idx
+        elif entry.get("role") == "tool" and entry.get("denied") and last_assistant_idx is not None:
+            history[last_assistant_idx]["denied"] = True
+
     # Mark last assistant tool call as pending if approval is outstanding.
     if has_pending_approval:
         for entry in reversed(history):

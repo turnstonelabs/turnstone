@@ -1209,8 +1209,10 @@ function replayHistory(messages) {
           // will create the live approval UI.
           lastToolBlock = null;
         } else {
+          var wasDenied = !!msg.denied;
           var block = document.createElement("div");
-          block.className = "msg approval-block approved";
+          block.className =
+            "msg approval-block " + (wasDenied ? "denied" : "approved");
           msg.tool_calls.forEach(function (tc) {
             var div = document.createElement("div");
             div.className = "approval-tool";
@@ -1239,8 +1241,14 @@ function replayHistory(messages) {
             block.appendChild(div);
           });
           var badge = document.createElement("div");
-          badge.className = "approval-badge badge-approved";
-          badge.textContent = "\u2713 approved";
+          badge.setAttribute("role", "status");
+          if (wasDenied) {
+            badge.className = "approval-badge badge-denied";
+            badge.textContent = "\u2717 denied";
+          } else {
+            badge.className = "approval-badge badge-approved";
+            badge.textContent = "\u2713 approved";
+          }
           block.appendChild(badge);
           messagesEl.appendChild(block);
           lastToolBlock = block;
@@ -1256,7 +1264,12 @@ function replayHistory(messages) {
     } else if (msg.role === "tool") {
       if (lastToolBlock) {
         var stripped = stripAnsi(msg.content || "").trim();
-        if (stripped) {
+        // Skip displaying denied/blocked messages as tool output
+        var isDenied =
+          msg.denied ||
+          /^Denied by user/.test(stripped) ||
+          /^Blocked/.test(stripped);
+        if (stripped && !isDenied) {
           var out = document.createElement("div");
           out.className = "tool-output";
           out.textContent = stripped;
@@ -1534,6 +1547,7 @@ function showInlineToolBlock(items, autoApproved, judgePending) {
 
   if (autoApproved) {
     const badge = document.createElement("div");
+    badge.setAttribute("role", "status");
     badge.className = "approval-badge badge-approved";
     badge.textContent = "\u2713 auto-approved";
     block.appendChild(badge);
@@ -1586,6 +1600,7 @@ function resolveInlineApproval(approved, always, feedback, skipPost) {
 
   // Add badge
   const badge = document.createElement("div");
+  badge.setAttribute("role", "status");
   if (approved) {
     badge.className = "approval-badge badge-approved";
     var label = always ? "\u2713 always approve" : "\u2713 approved";

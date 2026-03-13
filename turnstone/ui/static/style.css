@@ -330,6 +330,8 @@
 }
 .approval-block.approved { border-left-color: var(--green); }
 .approval-block.denied { border-left-color: var(--red); }
+.approval-block.denied .approval-tool { opacity: 0.55; }
+.approval-block.denied .approval-tool .tool-name { color: var(--muted); }
 .approval-tool { padding: 8px 12px; border-bottom: 1px solid var(--border); }
 .approval-tool:last-of-type { border-bottom: none; }
 .approval-tool .tool-name { color: var(--yellow); font-weight: 600; font-size: 11px; margin-bottom: 3px; }
