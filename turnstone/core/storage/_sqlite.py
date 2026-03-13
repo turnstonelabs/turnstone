@@ -2110,7 +2110,7 @@ class SQLiteBackend:
         judge_model: str,
         latency_ms: int,
     ) -> None:
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
                 sa.insert(intent_verdicts),

@@ -114,7 +114,8 @@ def format_verdict(verdict: dict[str, Any]) -> str:
     """
     risk = (verdict.get("risk_level") or "medium").upper()
     rec = verdict.get("recommendation", "review")
-    conf = int((verdict.get("confidence") or 0.5) * 100)
+    raw_conf = verdict.get("confidence")
+    conf = int((raw_conf if raw_conf is not None else 0.5) * 100)
     summary = verdict.get("intent_summary", "")
     tier = verdict.get("tier", "")
 

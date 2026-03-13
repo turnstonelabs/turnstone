@@ -37,19 +37,19 @@ model = ""                    # empty = same as session model
 provider = ""                 # empty = same as session provider
 base_url = ""
 api_key = ""
-confidence_threshold = 0.7
+confidence_threshold = 0.7   # reserved for v2 smart approvals (not used in v1)
 max_context_ratio = 0.5       # max % of judge context window for history
 timeout = 60.0                # seconds (generous for local models)
 read_only_tools = true        # judge can use read_file/list_directory
 ```
 
-All fields are optional. The only required action is setting `enabled = true`
-(or passing `--judge` on the command line).
+All fields are optional. The judge is enabled by default; use `enabled = false`
+(or `--no-judge` on the command line) to disable it.
 
 ### CLI flags
 
 ```
---judge / --no-judge           Enable/disable (default: disabled)
+--judge / --no-judge           Enable/disable (default: enabled)
 --judge-model MODEL            Model for judge
 --judge-provider PROVIDER      Provider for judge
 --judge-timeout SECONDS        LLM judge timeout (default: 60)

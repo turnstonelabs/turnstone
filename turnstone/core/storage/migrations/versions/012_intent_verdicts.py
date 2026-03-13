@@ -50,4 +50,12 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Remove admin.judge permission from builtin-admin role
+    conn = op.get_bind()
+    conn.execute(
+        sa.text(
+            "UPDATE roles SET permissions = REPLACE(permissions, ',admin.judge', '') "
+            "WHERE role_id = 'builtin-admin'"
+        )
+    )
     op.drop_table("intent_verdicts")

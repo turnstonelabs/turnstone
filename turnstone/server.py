@@ -105,6 +105,8 @@ class WebUI:
         self._ws_activity_state: str = ""  # "tool" | "approval" | "thinking" | ""
         # Verdicts awaiting user_decision update on approval resolution
         self._pending_verdicts: list[dict[str, Any]] = []
+        # Last user decision for late-arriving verdicts (set in resolve_approval)
+        self._last_verdict_decision: str = ""
 
     def _enqueue(self, data: dict[str, Any]) -> None:
         with self._listeners_lock:
@@ -186,6 +188,7 @@ class WebUI:
         self._enqueue({"type": "stream_end"})
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
+        self._last_verdict_decision = ""  # reset for new approval cycle
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Always send tool info to the browser
@@ -309,7 +312,7 @@ class WebUI:
                             ws_id=self.ws_id,
                             call_id=hv.get("call_id", ""),
                             func_name=hv.get("func_name", ""),
-                            func_args=json.dumps(item.get("func_args", {})),
+                            func_args=hv.get("func_args", ""),
                             intent_summary=hv.get("intent_summary", ""),
                             risk_level=hv.get("risk_level", "medium"),
                             confidence=hv.get("confidence", 0.5),
@@ -450,7 +453,7 @@ class WebUI:
                     ws_id=self.ws_id,
                     call_id=verdict.get("call_id", ""),
                     func_name=verdict.get("func_name", ""),
-                    func_args=json.dumps(verdict.get("func_args", {})),
+                    func_args=verdict.get("func_args", ""),
                     intent_summary=verdict.get("intent_summary", ""),
                     risk_level=verdict.get("risk_level", "medium"),
                     confidence=verdict.get("confidence", 0.5),
@@ -468,7 +471,21 @@ class WebUI:
             verdict.get("risk_level", "medium"),
             verdict.get("latency_ms", 0),
         )
-        self._pending_verdicts.append(verdict)
+        # If approval already resolved, update user_decision immediately
+        decision = self._last_verdict_decision
+        if decision:
+            try:
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    storage.update_intent_verdict(
+                        verdict.get("verdict_id", ""), user_decision=decision
+                    )
+            except Exception:
+                log.debug("Failed to update late verdict user_decision", exc_info=True)
+        else:
+            self._pending_verdicts.append(verdict)
 
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Resolve a pending approval, whether triggered by the HTTP handler
@@ -486,13 +503,14 @@ class WebUI:
         # Swap-and-clear to avoid racing with the daemon judge thread.
         pending = self._pending_verdicts
         self._pending_verdicts = []
+        decision_str = "approved" if approved else "denied"
+        self._last_verdict_decision = decision_str
         if pending:
             try:
                 from turnstone.core.storage._registry import get_storage
 
                 storage = get_storage()
                 if storage is not None:
-                    decision_str = "approved" if approved else "denied"
                     for v in pending:
                         vid = v.get("verdict_id", "")
                         if vid:
