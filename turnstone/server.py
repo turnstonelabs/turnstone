@@ -1387,6 +1387,20 @@ async def auth_setup(request: Request) -> Response:
     return await handle_auth_setup(request, JWT_AUD_SERVER)
 
 
+async def auth_oidc_login(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/login — redirect to OIDC provider."""
+    from turnstone.core.auth_oidc import handle_oidc_login
+
+    return await handle_oidc_login(request)
+
+
+async def auth_oidc_callback(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/callback — exchange code, create session."""
+    from turnstone.core.auth_oidc import handle_oidc_callback
+
+    return await handle_oidc_callback(request)
+
+
 # ---------------------------------------------------------------------------
 # Global SSE fan-out
 # ---------------------------------------------------------------------------
@@ -1548,6 +1562,8 @@ def create_app(
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
+                    Route("/api/auth/oidc/login", auth_oidc_login),
+                    Route("/api/auth/oidc/callback", auth_oidc_callback),
                 ],
             ),
             Route("/health", health),
@@ -1568,6 +1584,14 @@ def create_app(
     app.state.auth_config = auth_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
+
+    # OIDC configuration (loaded from environment)
+    from turnstone.core.auth_oidc import OIDCConfig
+
+    oidc_config = OIDCConfig.from_env()
+    app.state.oidc_config = oidc_config
+    if oidc_config.enabled:
+        log.info("OIDC: enabled (provider=%s, client_id=%s)", oidc_config.provider_url, oidc_config.client_id)
     app.state.health_monitor = health_monitor
     app.state.rate_limiter = rate_limiter
     app.state.mcp_client = mcp_client

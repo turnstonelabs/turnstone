@@ -150,6 +150,8 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/api/auth/logout",
         "/api/auth/status",
         "/api/auth/setup",
+        "/api/auth/oidc/login",
+        "/api/auth/oidc/callback",
     }
 )
 PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
@@ -984,11 +986,17 @@ async def handle_auth_status(request: Request) -> Response:
         except Exception:
             pass
 
+    # Check OIDC availability
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_enabled = bool(oidc_config and oidc_config.enabled)
+
     return JSONResponse(
         {
             "auth_enabled": auth_config.enabled,
             "has_users": has_users,
             "setup_required": auth_config.enabled and not has_users,
+            "oidc_enabled": oidc_enabled,
+            "oidc_login_url": "/api/auth/oidc/login" if oidc_enabled else None,
         }
     )
 
