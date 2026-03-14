@@ -47,7 +47,7 @@ turnstone/
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
-    memory.py         Persistence facade (delegates to storage backend)
+    memory.py         Persistence facade + structured memory API (delegates to storage backend)
     storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker

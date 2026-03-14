@@ -1,0 +1,159 @@
+@startuml
+!theme plain
+title Turnstone — Structured Memory Architecture
+
+skinparam participant {
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<facade>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<api>> #E8EAF6
+    BackgroundColor<<sdk>> #F5F5F5
+}
+
+participant "ChatSession\n(session.py)" as Session <<session>>
+participant "MemoryFacade\n(memory.py)" as Facade <<facade>>
+participant "MemoryRelevance\n(memory_relevance.py)" as Relevance <<facade>>
+participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "Server API\n(server.py)" as API <<api>>
+participant "Console Admin\n(console/server.py)" as Admin <<api>>
+participant "SDK Client\n(sdk/)" as SDK <<sdk>>
+
+== Phase 1: Tool Path (session.send) ==
+
+Session -> Session : _prepare_tool_calls()\nparse memory(action=...)
+note right
+  Tool schema: 4 actions
+  save, search, delete, list
+  Auto-approved (no approval needed)
+end note
+
+Session -> Session : _exec_memory(item)
+
+alt action = save
+    Session -> Facade : save_structured_memory(\nname, content, description,\nmem_type, scope, scope_id)
+    Facade -> Facade : normalize_key(name)
+    Facade -> Storage : create_structured_memory()
+    alt unique constraint violation
+        Storage --> Facade : IntegrityError
+        Facade -> Storage : get_structured_memory_by_name()
+        Storage --> Facade : existing row
+        Facade -> Storage : update_structured_memory()
+    end
+    Storage --> Facade : memory_id
+    Facade --> Session : (memory_id, old_content)
+    Session -> Session : _init_system_messages()\nrefresh BM25 context
+end
+
+alt action = search
+    Session -> Facade : search_structured_memories(\nquery, mem_type, scope,\nscope_id, limit)
+    Facade -> Storage : search_structured_memories()
+    Storage --> Session : matched rows
+end
+
+alt action = delete
+    Session -> Facade : delete_structured_memory(\nname, scope, scope_id)
+    Facade -> Storage : delete_structured_memory()
+    Storage --> Session : bool (existed)
+    Session -> Session : _init_system_messages()\nrefresh BM25 context
+end
+
+== Phase 2: BM25 Relevance Injection ==
+
+Session -> Session : _init_system_messages()\nevery conversation turn
+
+Session -> Session : _get_visible_memories(\nlimit=fetch_limit)
+note right
+  **Scope resolution:**
+  1. global scope (always)
+  2. workstream scope (ws_id)
+  3. user scope (user_id, if auth)
+  Combined and deduplicated.
+end note
+
+Session -> Facade : list_structured_memories()\nper scope
+Facade -> Storage : list_structured_memories()
+Storage --> Session : up to fetch_limit rows
+
+Session -> Relevance : extract_recent_context(\nmessages, max_messages=3)
+Relevance --> Session : user text context
+
+Session -> Relevance : score_memories(\nmemories, context,\nk=relevance_k)
+note right
+  **BM25 scoring:**
+  Index over name + description
+  + content[:200] for each memory.
+  Returns top-k by relevance.
+  Empty query returns most recent k.
+end note
+Relevance --> Session : top-k memories
+
+Session -> Relevance : build_memory_context(\nrelevant_memories)
+note right
+  Formats as XML block:
+  <memories>
+    <memory name="..." type="..."
+     scope="..." description="...">
+      content (max 500 chars)
+    </memory>
+  </memories>
+end note
+Relevance --> Session : XML string
+
+Session -> Session : inject into\nsystem message
+
+== Phase 3: Server API Path ==
+
+SDK -> API : GET /v1/api/memories\n?type=project&limit=20
+API -> Facade : list_structured_memories()
+Facade -> Storage : list_structured_memories()
+Storage --> API : rows
+API --> SDK : {"memories": [...], "total": N}
+
+SDK -> API : POST /v1/api/memories\n{name, content, ...}
+API -> API : validate type, scope,\nname length, content length
+API -> Facade : save_structured_memory()
+Facade -> Storage : create / update
+Storage --> API : memory row
+API --> SDK : 201 (created) / 200 (updated)
+
+SDK -> API : POST /v1/api/memories/search\n{query, type, ...}
+API -> Facade : search_structured_memories()
+Facade -> Storage : search_structured_memories()
+Storage --> API : matched rows
+API --> SDK : {"memories": [...], "total": N}
+
+SDK -> API : DELETE /v1/api/memories/{name}\n?scope=global
+API -> Facade : delete_structured_memory()
+Facade -> Storage : delete row
+API --> SDK : {"status": "ok"}
+
+== Phase 4: Console Admin Path ==
+
+SDK -> Admin : GET /v1/api/admin/memories\n?type=&scope=&limit=
+Admin -> Admin : require_permission(\n"admin.memories")
+Admin -> Storage : list_structured_memories()
+Storage --> Admin : rows
+Admin --> SDK : {"memories": [...], "total": N}
+
+SDK -> Admin : GET /v1/api/admin/memories/{id}
+Admin -> Storage : get_structured_memory(id)
+Storage --> Admin : memory row
+Admin --> SDK : memory JSON
+
+SDK -> Admin : DELETE /v1/api/admin/memories/{id}
+Admin -> Storage : delete_structured_memory_by_id()
+Admin -> Admin : record_audit(\n"memory.delete")
+Admin --> SDK : {"status": "ok"}
+
+== Configuration ==
+
+note over Session, Relevance
+  **MemoryConfig** (from [memory] in config.toml):
+  relevance_k = 5       -- top-k memories per turn
+  fetch_limit = 50       -- max memories fetched for scoring
+  max_content = 32768    -- max content length per memory
+  nudge_cooldown = 300   -- seconds between metacognitive nudges
+  nudges = true          -- enable/disable memory nudges
+end note
+
+@enduml

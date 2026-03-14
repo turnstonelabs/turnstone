@@ -163,6 +163,7 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/workstreams/new",
         "/api/workstreams/close",
         "/api/cluster/workstreams/new",
+        "/api/memories",
     }
 )
 
@@ -464,6 +465,9 @@ def required_scope(method: str, path: str) -> str:
         and normalized.startswith("/api/watches/")
         and normalized.endswith("/cancel")
     ):
+        return "write"
+    # Memory delete: /api/memories/{name}
+    if method == "DELETE" and normalized.startswith("/api/memories/"):
         return "write"
 
     # Console proxy routes: /node/{node_id}/api/{tail} or /node/{node_id}/v1/api/{tail}

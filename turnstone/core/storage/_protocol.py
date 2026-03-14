@@ -106,6 +106,10 @@ class StorageBackend(Protocol):
         """Delete a structured memory by (name, scope, scope_id). Returns True if existed."""
         ...
 
+    def delete_structured_memory_by_id(self, memory_id: str) -> bool:
+        """Delete a structured memory by its primary key. Returns True if existed."""
+        ...
+
     def list_structured_memories(
         self,
         mem_type: str = "",
@@ -127,7 +131,9 @@ class StorageBackend(Protocol):
         """Search structured memories by query. Returns matching memory dicts."""
         ...
 
-    def count_structured_memories(self, scope: str = "", scope_id: str = "") -> int:
+    def count_structured_memories(
+        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+    ) -> int:
         """Count structured memories with optional scope filter."""
         ...
 

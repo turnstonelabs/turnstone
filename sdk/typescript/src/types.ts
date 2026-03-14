@@ -644,5 +644,89 @@ export interface WorkstreamsOptions {
   per_page?: number;
 }
 
+// -- Server API: Memories ---------------------------------------------------
+
+export interface SaveMemoryRequest {
+  name: string;
+  content: string;
+  description?: string;
+  type?: "user" | "project" | "feedback" | "reference";
+  scope?: "global" | "workstream" | "user";
+  scope_id?: string;
+}
+
+export interface MemoryInfo {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  content: string;
+  created: string;
+  updated: string;
+}
+
+export interface ListMemoriesResponse {
+  memories: MemoryInfo[];
+  total: number;
+}
+
+export interface SearchMemoriesRequest {
+  query: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface ListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface DeleteMemoryOptions {
+  scope?: string;
+  scope_id?: string;
+}
+
+// -- Console API: Admin Memories --------------------------------------------
+
+export interface AdminMemoryInfo {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  content: string;
+  created: string;
+  updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface ListAdminMemoriesResponse {
+  memories: AdminMemoryInfo[];
+  total: number;
+}
+
+export interface AdminListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface AdminSearchMemoriesOptions {
+  q: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
 // Re-export event types for convenience
 export type { ServerEvent, ClusterEvent } from "./events.js";

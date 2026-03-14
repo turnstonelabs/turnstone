@@ -26,8 +26,10 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
+    ListMemoriesResponse,
     ListSavedWorkstreamsResponse,
     ListWorkstreamsResponse,
+    MemoryInfo,
     SendResponse,
 )
 from turnstone.sdk._base import _BaseClient
@@ -235,6 +237,91 @@ class AsyncTurnstoneServer(_BaseClient):
             "GET", "/v1/api/workstreams/saved", response_model=ListSavedWorkstreamsResponse
         )
 
+    # -- memories ------------------------------------------------------------
+
+    async def list_memories(
+        self,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 100,
+    ) -> ListMemoriesResponse:
+        params: dict[str, Any] = {"limit": limit}
+        if mem_type:
+            params["type"] = mem_type
+        if scope:
+            params["scope"] = scope
+        if scope_id:
+            params["scope_id"] = scope_id
+        return await self._request(
+            "GET", "/v1/api/memories", params=params, response_model=ListMemoriesResponse
+        )
+
+    async def save_memory(
+        self,
+        name: str,
+        content: str,
+        *,
+        description: str = "",
+        mem_type: str = "project",
+        scope: str = "global",
+        scope_id: str = "",
+    ) -> MemoryInfo:
+        body: dict[str, Any] = {
+            "name": name,
+            "content": content,
+            "type": mem_type,
+            "scope": scope,
+        }
+        if description:
+            body["description"] = description
+        if scope_id:
+            body["scope_id"] = scope_id
+        return await self._request(
+            "POST", "/v1/api/memories", json_body=body, response_model=MemoryInfo
+        )
+
+    async def search_memories(
+        self,
+        query: str,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> ListMemoriesResponse:
+        body: dict[str, Any] = {"query": query, "limit": limit}
+        if mem_type:
+            body["type"] = mem_type
+        if scope:
+            body["scope"] = scope
+        if scope_id:
+            body["scope_id"] = scope_id
+        return await self._request(
+            "POST",
+            "/v1/api/memories/search",
+            json_body=body,
+            response_model=ListMemoriesResponse,
+        )
+
+    async def delete_memory(
+        self,
+        name: str,
+        *,
+        scope: str = "global",
+        scope_id: str = "",
+    ) -> StatusResponse:
+        params: dict[str, Any] = {"scope": scope}
+        if scope_id:
+            params["scope_id"] = scope_id
+        return await self._request(
+            "DELETE",
+            f"/v1/api/memories/{name}",
+            params=params,
+            response_model=StatusResponse,
+        )
+
     # -- auth ----------------------------------------------------------------
 
     async def login(
@@ -393,6 +480,58 @@ class TurnstoneServer:
 
     def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
         return self._runner.run(self._async.list_saved_workstreams())
+
+    # -- memories ------------------------------------------------------------
+
+    def list_memories(
+        self, *, mem_type: str = "", scope: str = "", scope_id: str = "", limit: int = 100
+    ) -> ListMemoriesResponse:
+        return self._runner.run(
+            self._async.list_memories(
+                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
+        )
+
+    def save_memory(
+        self,
+        name: str,
+        content: str,
+        *,
+        description: str = "",
+        mem_type: str = "project",
+        scope: str = "global",
+        scope_id: str = "",
+    ) -> MemoryInfo:
+        return self._runner.run(
+            self._async.save_memory(
+                name,
+                content,
+                description=description,
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+            )
+        )
+
+    def search_memories(
+        self,
+        query: str,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> ListMemoriesResponse:
+        return self._runner.run(
+            self._async.search_memories(
+                query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
+        )
+
+    def delete_memory(
+        self, name: str, *, scope: str = "global", scope_id: str = ""
+    ) -> StatusResponse:
+        return self._runner.run(self._async.delete_memory(name, scope=scope, scope_id=scope_id))
 
     # -- auth ----------------------------------------------------------------
 

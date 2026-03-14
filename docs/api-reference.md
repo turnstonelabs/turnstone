@@ -940,6 +940,270 @@ Status code: `403`
 
 ---
 
+### `GET /v1/api/memories`
+
+List structured memories with optional filters. Requires `read` scope.
+
+**Query parameters:**
+
+| Parameter  | Type   | Required | Default | Description                  |
+|------------|--------|----------|---------|------------------------------|
+| `type`     | string | no       | `""`    | Filter by memory type (user, project, feedback, reference) |
+| `scope`    | string | no       | `""`    | Filter by scope (global, workstream, user) |
+| `scope_id` | string | no       | `""`    | Scope qualifier. Auto-resolved for `scope=user` when auth is active. |
+| `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
+
+**Response:**
+
+```json
+{
+  "memories": [
+    {
+      "memory_id": "a1b2c3d4-e5f6-...",
+      "name": "project_architecture",
+      "description": "Core architecture patterns",
+      "type": "project",
+      "scope": "global",
+      "scope_id": "",
+      "content": "The project uses a hexagonal architecture...",
+      "created": "2026-03-10T10:00:00",
+      "updated": "2026-03-12T14:30:00"
+    }
+  ],
+  "total": 1
+}
+```
+
+---
+
+### `POST /v1/api/memories`
+
+Save or upsert a structured memory. Requires `write` scope. Returns `201` on
+create, `200` on update.
+
+**Request body:**
+
+```json
+{
+  "name": "deployment_process",
+  "content": "Deploy via GitHub Actions. Staging auto-deploys on push to main.",
+  "description": "CI/CD deployment workflow",
+  "type": "project",
+  "scope": "global",
+  "scope_id": ""
+}
+```
+
+| Field        | Type   | Required | Default     | Description                          |
+|--------------|--------|----------|-------------|--------------------------------------|
+| `name`       | string | yes      | --          | Memory name (max 256 chars)          |
+| `content`    | string | yes      | --          | Memory content (max 65536 chars)     |
+| `description`| string | no       | `""`        | Short description for search ranking |
+| `type`       | string | no       | `"project"` | One of: user, project, feedback, reference |
+| `scope`      | string | no       | `"global"`  | One of: global, workstream, user     |
+| `scope_id`   | string | no       | `""`        | Scope qualifier (auto-resolved for user scope) |
+
+**Response (created):** `201`
+
+```json
+{
+  "memory_id": "a1b2c3d4-e5f6-...",
+  "name": "deployment_process",
+  "description": "CI/CD deployment workflow",
+  "type": "project",
+  "scope": "global",
+  "scope_id": "",
+  "content": "Deploy via GitHub Actions...",
+  "created": "2026-03-14T10:00:00",
+  "updated": "2026-03-14T10:00:00"
+}
+```
+
+**Error responses:**
+
+| Status | Condition                                              |
+|--------|--------------------------------------------------------|
+| 400    | Missing name, empty content, invalid type/scope, name too long, content too long |
+
+---
+
+### `POST /v1/api/memories/search`
+
+Search memories by query. Uses POST for the request body but is non-mutating
+(requires only `read` scope).
+
+**Request body:**
+
+```json
+{
+  "query": "authentication",
+  "type": "project",
+  "scope": "",
+  "limit": 20
+}
+```
+
+| Field      | Type   | Required | Default | Description                    |
+|------------|--------|----------|---------|--------------------------------|
+| `query`    | string | yes      | --      | Search query                   |
+| `type`     | string | no       | `""`    | Filter by type                 |
+| `scope`    | string | no       | `""`    | Filter by scope                |
+| `scope_id` | string | no       | `""`    | Filter by scope ID             |
+| `limit`    | int    | no       | `20`    | Max results (capped at 50)     |
+
+**Response:**
+
+```json
+{
+  "memories": [
+    {
+      "memory_id": "a1b2c3d4-e5f6-...",
+      "name": "auth_patterns",
+      "description": "Authentication architecture",
+      "type": "project",
+      "scope": "global",
+      "scope_id": "",
+      "content": "JWT tokens with HS256...",
+      "created": "2026-03-10T10:00:00",
+      "updated": "2026-03-12T14:30:00"
+    }
+  ],
+  "total": 1
+}
+```
+
+**Error:** `400` with `{"error": "query is required"}` if `query` is empty.
+
+---
+
+### `DELETE /v1/api/memories/{name}`
+
+Delete a memory by name and scope. Requires `write` scope.
+
+**Path parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `name`    | string | Memory name          |
+
+**Query parameters:**
+
+| Parameter  | Type   | Required | Default    | Description         |
+|------------|--------|----------|------------|---------------------|
+| `scope`    | string | no       | `"global"` | Scope of the memory |
+| `scope_id` | string | no       | `""`       | Scope qualifier     |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok", "name": "deployment_process"}
+```
+
+**Error (not found):** `404`
+
+```json
+{"error": "Memory 'deployment_process' not found"}
+```
+
+---
+
+### `GET /v1/api/admin/memories` (Console)
+
+List structured memories across all scopes. Requires `admin.memories`
+permission.
+
+**Query parameters:**
+
+| Parameter  | Type   | Required | Default | Description                  |
+|------------|--------|----------|---------|------------------------------|
+| `type`     | string | no       | `""`    | Filter by type               |
+| `scope`    | string | no       | `""`    | Filter by scope              |
+| `scope_id` | string | no       | `""`    | Filter by scope ID           |
+| `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
+
+**Response:** `200` -- same schema as `GET /v1/api/memories`.
+
+---
+
+### `GET /v1/api/admin/memories/search` (Console)
+
+Search memories by query. Requires `admin.memories` permission.
+
+**Query parameters:**
+
+| Parameter  | Type   | Required | Default | Description                   |
+|------------|--------|----------|---------|-------------------------------|
+| `q`        | string | yes      | --      | Search query                  |
+| `type`     | string | no       | `""`    | Filter by type                |
+| `scope`    | string | no       | `""`    | Filter by scope               |
+| `scope_id` | string | no       | `""`    | Filter by scope ID            |
+| `limit`    | int    | no       | `20`    | Max results (capped at 50)    |
+
+**Response:** `200` -- same schema as `GET /v1/api/memories`.
+
+**Error:** `400` with `{"error": "q is required"}` if `q` is empty.
+
+---
+
+### `GET /v1/api/admin/memories/{memory_id}` (Console)
+
+Get a single memory by ID. Requires `admin.memories` permission.
+
+**Path parameters:**
+
+| Parameter   | Type   | Description            |
+|-------------|--------|------------------------|
+| `memory_id` | string | Memory UUID            |
+
+**Response (success):** `200`
+
+```json
+{
+  "memory_id": "a1b2c3d4-e5f6-...",
+  "name": "project_architecture",
+  "description": "Core architecture patterns",
+  "type": "project",
+  "scope": "global",
+  "scope_id": "",
+  "content": "The project uses...",
+  "created": "2026-03-10T10:00:00",
+  "updated": "2026-03-12T14:30:00"
+}
+```
+
+**Error (not found):** `404`
+
+```json
+{"error": "Memory not found"}
+```
+
+---
+
+### `DELETE /v1/api/admin/memories/{memory_id}` (Console)
+
+Delete a memory by ID. Records an audit event (`memory.delete`). Requires
+`admin.memories` permission.
+
+**Path parameters:**
+
+| Parameter   | Type   | Description            |
+|-------------|--------|------------------------|
+| `memory_id` | string | Memory UUID            |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok"}
+```
+
+**Error (not found):** `404`
+
+```json
+{"error": "Memory not found"}
+```
+
+---
+
 ### `GET /v1/api/admin/verdicts` (Console)
 
 List intent validation verdicts from the `intent_verdicts` table. This endpoint

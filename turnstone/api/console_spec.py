@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from pydantic import BaseModel
 
 from turnstone.api.console_schemas import (
+    AdminMemoryInfo,
     AssignRoleRequest,
     AuditEventInfo,
     ChannelUserInfo,
@@ -23,6 +24,7 @@ from turnstone.api.console_schemas import (
     CreateRoleRequest,
     CreateToolPolicyRequest,
     CreateWsTemplateRequest,
+    ListAdminMemoriesResponse,
     ListAuditEventsResponse,
     ListChannelUsersResponse,
     ListOrgsResponse,
@@ -572,6 +574,50 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ],
         tags=["Admin"],
     ),
+    # --- Admin: Memories ---
+    EndpointSpec(
+        "/v1/api/admin/memories",
+        "GET",
+        "List structured memories",
+        response_model=ListAdminMemoriesResponse,
+        query_params=[
+            QueryParam("type", "Filter by memory type"),
+            QueryParam("scope", "Filter by scope"),
+            QueryParam("scope_id", "Filter by scope identifier"),
+            QueryParam("limit", "Page size (max 200)", schema_type="integer", default=100),
+        ],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/memories/search",
+        "GET",
+        "Search memories by query",
+        response_model=ListAdminMemoriesResponse,
+        query_params=[
+            QueryParam("q", "Search query", required=True),
+            QueryParam("type", "Filter by memory type"),
+            QueryParam("scope", "Filter by scope"),
+            QueryParam("scope_id", "Filter by scope identifier"),
+            QueryParam("limit", "Max results", schema_type="integer", default=20),
+        ],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/memories/{memory_id}",
+        "GET",
+        "Get a single memory by ID",
+        response_model=AdminMemoryInfo,
+        error_codes=[404],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/memories/{memory_id}",
+        "DELETE",
+        "Delete a memory by ID",
+        response_model=StatusResponse,
+        error_codes=[404],
+        tags=["Admin"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -636,6 +682,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListAuditEventsResponse,
     VerdictInfo,
     ListVerdictsResponse,
+    AdminMemoryInfo,
+    ListAdminMemoriesResponse,
 ]
 
 

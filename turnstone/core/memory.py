@@ -295,6 +295,14 @@ def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "
         return False
 
 
+def delete_structured_memory_by_id(memory_id: str) -> bool:
+    """Delete a structured memory by its primary key. Returns True if existed."""
+    try:
+        return get_storage().delete_structured_memory_by_id(memory_id)
+    except Exception:
+        return False
+
+
 def list_structured_memories(
     mem_type: str = "",
     scope: str = "",
@@ -326,9 +334,11 @@ def search_structured_memories(
         return []
 
 
-def count_structured_memories(scope: str = "", scope_id: str = "") -> int:
-    """Count structured memories with optional scope filter."""
+def count_structured_memories(mem_type: str = "", scope: str = "", scope_id: str = "") -> int:
+    """Count structured memories with optional type/scope filter."""
     try:
-        return get_storage().count_structured_memories(scope=scope, scope_id=scope_id)
+        return get_storage().count_structured_memories(
+            mem_type=mem_type, scope=scope, scope_id=scope_id
+        )
     except Exception:
         return 0

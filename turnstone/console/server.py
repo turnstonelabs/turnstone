@@ -1511,6 +1511,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.watches",
         "admin.ws_templates",
         "admin.judge",
+        "admin.memories",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2608,6 +2609,120 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Memories
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories — list structured memories with filters."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "100")), 200)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+
+    rows = storage.list_structured_memories(
+        mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+    )
+    total = storage.count_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id)
+    return JSONResponse({"memories": rows, "total": total})
+
+
+async def admin_search_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories/search — search memories by query."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    query = request.query_params.get("q", "").strip()
+    if not query:
+        return JSONResponse({"error": "q is required"}, status_code=400)
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "20")), 50)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+
+    rows = storage.search_structured_memories(
+        query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+    )
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def admin_get_memory(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories/{memory_id} — get a single memory."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    memory_id = request.path_params["memory_id"]
+    mem = storage.get_structured_memory(memory_id)
+    if not mem:
+        return JSONResponse({"error": "Memory not found"}, status_code=404)
+    return JSONResponse(mem)
+
+
+async def admin_delete_memory(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/memories/{memory_id} — delete a memory by ID."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    memory_id = request.path_params["memory_id"]
+    existing = storage.get_structured_memory(memory_id)
+    if not existing:
+        return JSONResponse({"error": "Memory not found"}, status_code=404)
+
+    storage.delete_structured_memory_by_id(memory_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "memory.delete",
+        "memory",
+        memory_id,
+        {"name": existing.get("name", ""), "scope": existing.get("scope", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -2747,6 +2862,15 @@ def create_app(
                     Route(
                         "/api/admin/ws-templates/{ws_template_id}/versions",
                         admin_list_ws_template_versions,
+                    ),
+                    # Governance: Memories
+                    Route("/api/admin/memories", admin_list_memories),
+                    Route("/api/admin/memories/search", admin_search_memories),
+                    Route("/api/admin/memories/{memory_id}", admin_get_memory),
+                    Route(
+                        "/api/admin/memories/{memory_id}",
+                        admin_delete_memory,
+                        methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

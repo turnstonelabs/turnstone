@@ -2204,6 +2204,14 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
+    def delete_structured_memory_by_id(self, memory_id: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(structured_memories).where(structured_memories.c.memory_id == memory_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
     def list_structured_memories(
         self,
         mem_type: str = "",
@@ -2268,9 +2276,13 @@ class SQLiteBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
-    def count_structured_memories(self, scope: str = "", scope_id: str = "") -> int:
+    def count_structured_memories(
+        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+    ) -> int:
         with self._engine.connect() as conn:
             q = sa.select(sa.func.count()).select_from(structured_memories)
+            if mem_type:
+                q = q.where(structured_memories.c.type == mem_type)
             if scope:
                 q = q.where(structured_memories.c.scope == scope)
             if scope_id:

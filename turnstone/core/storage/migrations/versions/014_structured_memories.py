@@ -56,6 +56,15 @@ def upgrade() -> None:
     )
     op.drop_table("memories")
 
+    # Grant admin.memories permission to the built-in admin role
+    conn.execute(
+        sa.text(
+            "UPDATE roles SET permissions = permissions || ',admin.memories' "
+            "WHERE role_id = 'builtin-admin' "
+            "AND permissions NOT LIKE '%admin.memories%'"
+        )
+    )
+
 
 def downgrade() -> None:
     op.create_table(

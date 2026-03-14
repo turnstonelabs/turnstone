@@ -7,9 +7,15 @@ import type {
   CreateWorkstreamRequest,
   CreateWorkstreamResponse,
   DashboardResponse,
+  DeleteMemoryOptions,
   HealthResponse,
+  ListMemoriesOptions,
+  ListMemoriesResponse,
   ListSavedWorkstreamsResponse,
   ListWorkstreamsResponse,
+  MemoryInfo,
+  SaveMemoryRequest,
+  SearchMemoriesRequest,
   SendAndWaitOptions,
   SendResponse,
   StatusResponse,
@@ -188,6 +194,39 @@ export class TurnstoneServer extends BaseClient {
 
   async listSavedWorkstreams(): Promise<ListSavedWorkstreamsResponse> {
     return this.request("GET", "/v1/api/workstreams/saved");
+  }
+
+  // -- Memories -------------------------------------------------------------
+
+  async listMemories(
+    opts?: ListMemoriesOptions,
+  ): Promise<ListMemoriesResponse> {
+    const params: Record<string, string | number> = {};
+    if (opts?.type) params.type = opts.type;
+    if (opts?.scope) params.scope = opts.scope;
+    if (opts?.scope_id) params.scope_id = opts.scope_id;
+    if (opts?.limit !== undefined) params.limit = opts.limit;
+    return this.request("GET", "/v1/api/memories", { params });
+  }
+
+  async saveMemory(opts: SaveMemoryRequest): Promise<MemoryInfo> {
+    return this.request("POST", "/v1/api/memories", { json: opts });
+  }
+
+  async searchMemories(
+    opts: SearchMemoriesRequest,
+  ): Promise<ListMemoriesResponse> {
+    return this.request("POST", "/v1/api/memories/search", { json: opts });
+  }
+
+  async deleteMemory(
+    name: string,
+    opts?: DeleteMemoryOptions,
+  ): Promise<StatusResponse> {
+    const params: Record<string, string> = {};
+    if (opts?.scope) params.scope = opts.scope;
+    if (opts?.scope_id) params.scope_id = opts.scope_id;
+    return this.request("DELETE", `/v1/api/memories/${name}`, { params });
   }
 
   // -- Auth -----------------------------------------------------------------

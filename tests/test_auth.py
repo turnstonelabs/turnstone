@@ -143,6 +143,32 @@ class TestRequiredScope:
     def test_proxy_v1_read_endpoint_needs_read(self):
         assert required_scope("GET", "/node/node-a/v1/api/workstreams") == "read"
 
+    # Memory endpoints
+    def test_get_memories_needs_read(self):
+        assert required_scope("GET", "/api/memories") == "read"
+
+    def test_post_memories_needs_write(self):
+        assert required_scope("POST", "/api/memories") == "write"
+
+    def test_post_memories_search_needs_read(self):
+        """Search via POST is non-mutating — requires only read scope."""
+        assert required_scope("POST", "/api/memories/search") == "read"
+
+    def test_delete_memory_needs_write(self):
+        assert required_scope("DELETE", "/api/memories/my_key") == "write"
+
+    def test_v1_post_memories_needs_write(self):
+        assert required_scope("POST", "/v1/api/memories") == "write"
+
+    def test_v1_delete_memory_needs_write(self):
+        assert required_scope("DELETE", "/v1/api/memories/test_key") == "write"
+
+    def test_admin_memories_needs_approve(self):
+        assert required_scope("GET", "/api/admin/memories") == "approve"
+
+    def test_admin_memory_delete_needs_approve(self):
+        assert required_scope("DELETE", "/api/admin/memories/some-id") == "approve"
+
 
 # ---------------------------------------------------------------------------
 # TestAuthConfig

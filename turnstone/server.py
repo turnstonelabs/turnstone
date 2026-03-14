@@ -1359,6 +1359,151 @@ async def cancel_watch(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "watch_id": watch_id})
 
 
+# ---------------------------------------------------------------------------
+# Memory endpoints
+# ---------------------------------------------------------------------------
+
+_VALID_MEMORY_TYPES = frozenset({"user", "project", "feedback", "reference"})
+_VALID_MEMORY_SCOPES = frozenset({"global", "workstream", "user"})
+_MAX_MEMORY_CONTENT = 65536  # hard upper bound; server may enforce lower via config
+
+
+def _resolve_user_scope_id(request: Request) -> tuple[str, JSONResponse | None]:
+    """Resolve scope_id for user-scoped memory from auth. Returns (scope_id, error)."""
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = getattr(auth, "user_id", "") or ""
+    if not uid:
+        return "", JSONResponse(
+            {"error": "User scope requires authentication with a user identity"},
+            status_code=400,
+        )
+    return uid, None
+
+
+async def list_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/memories — list memories with optional filters."""
+    from turnstone.core.memory import list_structured_memories
+
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "100")), 200)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    if scope == "user" and not scope_id:
+        scope_id, err = _resolve_user_scope_id(request)
+        if err:
+            return err
+    rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def save_memory(request: Request) -> JSONResponse:
+    """POST /v1/api/memories — save (upsert) a structured memory."""
+    from turnstone.core.memory import save_structured_memory
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    name = str(body.get("name", "")).strip()
+    content = str(body.get("content", "")).strip()
+    if not name or len(name) > 256:
+        return JSONResponse({"error": "name is required (max 256 characters)"}, status_code=400)
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+    if len(content) > _MAX_MEMORY_CONTENT:
+        return JSONResponse(
+            {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
+            status_code=400,
+        )
+    description = str(body.get("description", ""))
+    mem_type = str(body.get("type", "project"))
+    scope = str(body.get("scope", "global"))
+    scope_id = str(body.get("scope_id", ""))
+    if mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse(
+            {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
+            status_code=400,
+        )
+    if scope not in _VALID_MEMORY_SCOPES:
+        return JSONResponse(
+            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
+            status_code=400,
+        )
+    if scope == "user" and not scope_id:
+        scope_id, err = _resolve_user_scope_id(request)
+        if err:
+            return err
+    # save_structured_memory normalises the name internally
+    memory_id, old_content = save_structured_memory(
+        name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
+    )
+    if not memory_id:
+        return JSONResponse({"error": "Failed to save memory"}, status_code=500)
+    from turnstone.core.storage._registry import get_storage
+
+    storage = get_storage()
+    mem = storage.get_structured_memory(memory_id) if storage else None
+    if not mem:
+        return JSONResponse(
+            {"memory_id": memory_id, "name": name, "status": "saved"}, status_code=201
+        )
+    status_code = 200 if old_content is not None else 201
+    return JSONResponse(mem, status_code=status_code)
+
+
+async def search_memories(request: Request) -> JSONResponse:
+    """POST /v1/api/memories/search — search memories by query.
+
+    Uses POST for the request body but requires only read scope (non-mutating).
+    """
+    from turnstone.core.memory import search_structured_memories as search_fn
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    query = str(body.get("query", "")).strip()
+    if not query:
+        return JSONResponse({"error": "query is required"}, status_code=400)
+    mem_type = str(body.get("type", ""))
+    scope = str(body.get("scope", ""))
+    scope_id = str(body.get("scope_id", ""))
+    try:
+        limit = min(int(body.get("limit", 20)), 50)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    if scope == "user" and not scope_id:
+        scope_id, err = _resolve_user_scope_id(request)
+        if err:
+            return err
+    rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def delete_memory_endpoint(request: Request) -> JSONResponse:
+    """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
+    from turnstone.core.memory import delete_structured_memory, normalize_key
+
+    name = normalize_key(request.path_params["name"])
+    scope = request.query_params.get("scope", "global")
+    if scope not in _VALID_MEMORY_SCOPES:
+        return JSONResponse(
+            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
+            status_code=400,
+        )
+    scope_id = request.query_params.get("scope_id", "")
+    if scope == "user" and not scope_id:
+        scope_id, err = _resolve_user_scope_id(request)
+        if err:
+            return err
+    if delete_structured_memory(name, scope, scope_id):
+        return JSONResponse({"status": "ok", "name": name})
+    return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+
+
 async def auth_login(request: Request) -> Response:
     """POST /v1/api/auth/login — authenticate and return JWT."""
     from turnstone.core.auth import handle_auth_login
@@ -1544,6 +1689,10 @@ def create_app(
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
+                    Route("/api/memories", list_memories),
+                    Route("/api/memories", save_memory, methods=["POST"]),
+                    Route("/api/memories/search", search_memories, methods=["POST"]),
+                    Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
