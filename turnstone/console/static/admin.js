@@ -1789,13 +1789,474 @@ function _confirmCallback() {
 }
 
 // ---------------------------------------------------------------------------
-// Settings (stub — full implementation is a separate project)
+// Settings — form-based editor grouped by section
 // ---------------------------------------------------------------------------
+
+var _settingsOriginal = {}; // original values for dirty detection
+
+// Section display order
+var _settingsSectionOrder = [
+  "model",
+  "session",
+  "tools",
+  "server",
+  "mcp",
+  "ratelimit",
+  "health",
+  "judge",
+  "memory",
+];
+
+function _settingsSectionLabel(section) {
+  var labels = {
+    model: "Model",
+    session: "Session",
+    tools: "Tools",
+    server: "Server",
+    mcp: "MCP",
+    ratelimit: "Rate Limiting",
+    health: "Health",
+    judge: "Judge",
+    memory: "Memory",
+  };
+  return labels[section] || section;
+}
 
 function loadSettings() {
   var el = document.getElementById("admin-settings-content");
-  if (el)
-    el.innerHTML = '<div class="dashboard-empty">Settings coming soon</div>';
+  if (!el) return;
+
+  Promise.all([
+    authFetch("/v1/api/admin/settings").then(function (r) {
+      if (!r.ok) throw new Error("Failed to load settings");
+      return r.json();
+    }),
+    authFetch("/v1/api/admin/settings/schema").then(function (r) {
+      if (!r.ok) throw new Error("Failed to load schema");
+      return r.json();
+    }),
+  ])
+    .then(function (results) {
+      var valuesArr = results[0].settings || [];
+      var schemaArr = results[1].schema || [];
+
+      // Build schema lookup
+      var schemaMap = {};
+      for (var i = 0; i < schemaArr.length; i++) {
+        schemaMap[schemaArr[i].key] = schemaArr[i];
+      }
+
+      // Merge values + schema
+      var merged = {};
+      for (var j = 0; j < valuesArr.length; j++) {
+        var v = valuesArr[j];
+        var s = schemaMap[v.key] || {};
+        merged[v.key] = {
+          key: v.key,
+          value: v.value,
+          source: v.source,
+          type: v.type || s.type || "str",
+          default_value: s.default !== undefined ? s.default : "",
+          description: v.description || s.description || "",
+          section: v.section || s.section || "",
+          is_secret: v.is_secret || false,
+          min_value: s.min_value,
+          max_value: s.max_value,
+          choices: s.choices || null,
+          restart_required: v.restart_required || false,
+          changed_by: v.changed_by || "",
+          updated: v.updated || "",
+        };
+      }
+
+      _settingsOriginal = {};
+
+      // Group by section
+      var grouped = {};
+      var keys = Object.keys(merged);
+      for (var k = 0; k < keys.length; k++) {
+        var item = merged[keys[k]];
+        var sec = item.section || "other";
+        if (!grouped[sec]) grouped[sec] = [];
+        grouped[sec].push(item);
+      }
+
+      _renderSettings(el, grouped);
+    })
+    .catch(function (err) {
+      el.innerHTML =
+        '<div class="dashboard-empty">Failed to load settings: ' +
+        escapeHtml(err.message || String(err)) +
+        "</div>";
+    });
+}
+
+function _renderSettings(container, grouped) {
+  var html = "";
+
+  for (var i = 0; i < _settingsSectionOrder.length; i++) {
+    var sec = _settingsSectionOrder[i];
+    var items = grouped[sec];
+    if (!items || items.length === 0) continue;
+
+    html += '<div class="settings-section" data-section="' + sec + '">';
+    html +=
+      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="true" aria-controls="settings-body-' +
+      sec +
+      '">';
+    html += "<span>" + _settingsSectionLabel(sec) + "</span>";
+    html += '<span class="settings-section-count">' + items.length + "</span>";
+    html += "</div>";
+    html +=
+      '<div class="settings-section-body" id="settings-body-' + sec + '">';
+
+    for (var j = 0; j < items.length; j++) {
+      html += _renderSettingRow(items[j]);
+    }
+
+    html += "</div></div>";
+  }
+
+  // Render any sections not in the explicit order
+  var allSections = Object.keys(grouped);
+  for (var s = 0; s < allSections.length; s++) {
+    if (_settingsSectionOrder.indexOf(allSections[s]) === -1) {
+      var extra = grouped[allSections[s]];
+      html +=
+        '<div class="settings-section" data-section="' + allSections[s] + '">';
+      html +=
+        '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="true" aria-controls="settings-body-' +
+        allSections[s] +
+        '">';
+      html += "<span>" + _settingsSectionLabel(allSections[s]) + "</span>";
+      html +=
+        '<span class="settings-section-count">' + extra.length + "</span>";
+      html += "</div>";
+      html +=
+        '<div class="settings-section-body" id="settings-body-' +
+        allSections[s] +
+        '">';
+      for (var x = 0; x < extra.length; x++) {
+        html += _renderSettingRow(extra[x]);
+      }
+      html += "</div></div>";
+    }
+  }
+
+  container.innerHTML = html;
+
+  // Store original values for dirty detection
+  var inputs = container.querySelectorAll("[data-setting-key]");
+  for (var n = 0; n < inputs.length; n++) {
+    var inp = inputs[n];
+    var key = inp.getAttribute("data-setting-key");
+    if (inp.type === "checkbox") {
+      _settingsOriginal[key] = inp.checked;
+    } else {
+      _settingsOriginal[key] = inp.value;
+    }
+  }
+}
+
+function _renderSettingRow(item) {
+  var shortKey =
+    item.key.indexOf(".") !== -1
+      ? item.key.substring(item.key.indexOf(".") + 1)
+      : item.key;
+  var escapedKey = escapeHtml(item.key);
+  var escapedDesc = escapeHtml(item.description);
+
+  var html = '<div class="settings-row" data-row-key="' + escapedKey + '">';
+
+  // Label column
+  html += '<div class="settings-label-col">';
+  html += '<div class="settings-label">' + escapeHtml(shortKey) + "</div>";
+  if (item.description) {
+    html += '<div class="settings-desc">' + escapedDesc + "</div>";
+  }
+  html += "</div>";
+
+  // Input column
+  html += '<div class="settings-input">';
+  var escapedShort = escapeHtml(shortKey);
+  if (item.is_secret) {
+    html +=
+      '<span class="settings-secret" role="note" aria-label="' +
+      escapedShort +
+      ': managed via config file or environment variable">(managed via config file / env)</span>';
+  } else if (item.type === "bool") {
+    var checked =
+      item.value === true || item.value === "true" ? " checked" : "";
+    html +=
+      '<label class="settings-toggle"><input type="checkbox" data-setting-key="' +
+      escapedKey +
+      '" aria-label="' +
+      escapedShort +
+      '"' +
+      checked +
+      " onchange=\"_onSettingChange('" +
+      escapedKey +
+      '\')"><span class="settings-toggle-slider"></span></label>';
+  } else if (item.choices && item.choices.length > 0) {
+    html +=
+      '<select data-setting-key="' +
+      escapedKey +
+      '" aria-label="' +
+      escapedShort +
+      '" onchange="_onSettingChange(\'' +
+      escapedKey +
+      "')\">";
+    for (var c = 0; c < item.choices.length; c++) {
+      var sel = item.choices[c] === String(item.value) ? " selected" : "";
+      var label =
+        item.choices[c] === "" ? "(none)" : escapeHtml(item.choices[c]);
+      html +=
+        '<option value="' +
+        escapeHtml(item.choices[c]) +
+        '"' +
+        sel +
+        ">" +
+        label +
+        "</option>";
+    }
+    html += "</select>";
+  } else if (item.type === "int" || item.type === "float") {
+    var step = item.type === "float" ? "0.01" : "1";
+    var minAttr =
+      item.min_value !== null && item.min_value !== undefined
+        ? ' min="' + item.min_value + '"'
+        : "";
+    var maxAttr =
+      item.max_value !== null && item.max_value !== undefined
+        ? ' max="' + item.max_value + '"'
+        : "";
+    html +=
+      '<input type="number" data-setting-key="' +
+      escapedKey +
+      '" aria-label="' +
+      escapedShort +
+      '" value="' +
+      escapeHtml(String(item.value != null ? item.value : "")) +
+      '" step="' +
+      step +
+      '"' +
+      minAttr +
+      maxAttr +
+      " oninput=\"_onSettingChange('" +
+      escapedKey +
+      "')\">";
+  } else {
+    // str
+    html +=
+      '<input type="text" data-setting-key="' +
+      escapedKey +
+      '" aria-label="' +
+      escapedShort +
+      '" value="' +
+      escapeHtml(String(item.value != null ? item.value : "")) +
+      '" oninput="_onSettingChange(\'' +
+      escapedKey +
+      "')\">";
+  }
+  html += "</div>";
+
+  // Actions column
+  html += '<div class="settings-actions">';
+
+  // Source badge
+  if (item.source === "storage") {
+    html += '<span class="scope-badge scope-write">storage</span>';
+  } else {
+    html += '<span class="scope-badge settings-badge-default">default</span>';
+  }
+
+  // Restart badge
+  if (item.restart_required) {
+    html += '<span class="settings-restart-badge">restart</span>';
+  }
+
+  // Save button (hidden until value changes)
+  if (!item.is_secret) {
+    html +=
+      '<button class="settings-save-btn" data-save-key="' +
+      escapedKey +
+      '" onclick="_saveSettingValue(\'' +
+      escapedKey +
+      "')\">save</button>";
+  }
+
+  // Reset link (only when stored)
+  if (item.source === "storage" && !item.is_secret) {
+    html +=
+      '<button class="settings-reset-btn" data-reset-key="' +
+      escapedKey +
+      '" onclick="_resetSetting(\'' +
+      escapedKey +
+      "')\">reset</button>";
+  }
+
+  html += "</div>";
+  html += "</div>";
+  return html;
+}
+
+function _onSettingsHeaderKey(e, el) {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    _toggleSettingsSection(el);
+  }
+}
+
+function _toggleSettingsSection(headerEl) {
+  var section = headerEl.parentElement;
+  if (section.hasAttribute("data-collapsed")) {
+    section.removeAttribute("data-collapsed");
+    headerEl.setAttribute("aria-expanded", "true");
+  } else {
+    section.setAttribute("data-collapsed", "");
+    headerEl.setAttribute("aria-expanded", "false");
+  }
+}
+
+function _onSettingChange(key) {
+  var inp = document.querySelector('[data-setting-key="' + key + '"]');
+  var saveBtn = document.querySelector('[data-save-key="' + key + '"]');
+  if (!inp || !saveBtn) return;
+
+  var current;
+  if (inp.type === "checkbox") {
+    current = inp.checked;
+  } else {
+    current = inp.value;
+  }
+
+  var orig = _settingsOriginal[key];
+  // Compare as strings for non-booleans
+  var dirty;
+  if (inp.type === "checkbox") {
+    dirty = current !== orig;
+  } else {
+    dirty = String(current) !== String(orig);
+  }
+
+  if (dirty) {
+    saveBtn.classList.add("visible");
+  } else {
+    saveBtn.classList.remove("visible");
+  }
+}
+
+function _saveSettingValue(key) {
+  var inp = document.querySelector('[data-setting-key="' + key + '"]');
+  var saveBtn = document.querySelector('[data-save-key="' + key + '"]');
+  if (!inp) return;
+
+  var value;
+  if (inp.type === "checkbox") {
+    value = inp.checked;
+  } else if (inp.type === "number") {
+    value = inp.value === "" ? "" : Number(inp.value);
+  } else {
+    value = inp.value;
+  }
+
+  if (saveBtn) {
+    saveBtn.textContent = "saving\u2026";
+    saveBtn.disabled = true;
+  }
+
+  authFetch("/v1/api/admin/settings/" + encodeURIComponent(key), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: value }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Save failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      // Update original so dirty detection resets
+      if (inp.type === "checkbox") {
+        _settingsOriginal[key] = inp.checked;
+      } else {
+        _settingsOriginal[key] = inp.value;
+      }
+      if (saveBtn) {
+        saveBtn.textContent = "save";
+        saveBtn.disabled = false;
+        saveBtn.classList.remove("visible");
+      }
+
+      // Update source badge to "storage"
+      var row = document.querySelector('[data-row-key="' + key + '"]');
+      if (row) {
+        var badge = row.querySelector(".scope-badge");
+        if (badge) {
+          badge.className = "scope-badge scope-write";
+          badge.textContent = "storage";
+        }
+        // Add reset button if not present
+        if (!row.querySelector('[data-reset-key="' + key + '"]')) {
+          var actions = row.querySelector(".settings-actions");
+          if (actions) {
+            var resetBtn = document.createElement("button");
+            resetBtn.className = "settings-reset-btn";
+            resetBtn.setAttribute("data-reset-key", key);
+            resetBtn.textContent = "reset";
+            resetBtn.onclick = function () {
+              _resetSetting(key);
+            };
+            actions.appendChild(resetBtn);
+          }
+        }
+      }
+
+      // Brief row flash for visual feedback
+      if (row) {
+        row.style.background = "var(--accent-glow)";
+        setTimeout(function () {
+          row.style.background = "";
+        }, 600);
+      }
+
+      showToast("Saved " + key);
+    })
+    .catch(function (err) {
+      if (saveBtn) {
+        saveBtn.textContent = "save";
+        saveBtn.disabled = false;
+      }
+      showToast("Error: " + (err.message || err));
+    });
+}
+
+function _resetSetting(key) {
+  showConfirmModal(
+    "Reset Setting",
+    "Reset \u2018" +
+      key +
+      "\u2019 to its default value? The stored override will be removed.",
+    "Reset",
+    function () {
+      authFetch("/v1/api/admin/settings/" + encodeURIComponent(key), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok)
+            return r.json().then(function (d) {
+              throw new Error(d.error || "Reset failed");
+            });
+          showToast("Reset " + key + " to default");
+          loadSettings();
+        })
+        .catch(function (err) {
+          showToast("Error: " + (err.message || err));
+        });
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
