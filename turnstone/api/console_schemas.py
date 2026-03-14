@@ -570,3 +570,79 @@ class ListSettingSchemaResponse(BaseModel):
 class UpdateSettingRequest(BaseModel):
     value: Any
     node_id: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Admin: MCP Servers
+# ---------------------------------------------------------------------------
+
+
+class McpServerInfo(BaseModel):
+    server_id: str
+    name: str
+    transport: str
+    command: str = ""
+    args: str = "[]"
+    url: str = ""
+    headers: str = "{}"
+    env: str = "{}"
+    auto_approve: bool = False
+    enabled: bool = True
+    created_by: str = ""
+    created: str
+    updated: str
+
+
+class McpServerStatus(BaseModel):
+    connected: bool = False
+    tools: int = 0
+    resources: int = 0
+    prompts: int = 0
+    error: str = ""
+
+
+class McpServerDetail(McpServerInfo):
+    status: dict[str, McpServerStatus] = Field(default_factory=dict)
+
+
+class CreateMcpServerRequest(BaseModel):
+    name: str
+    transport: str  # "stdio" | "streamable-http"
+    command: str = ""
+    args: list[str] = []
+    url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    auto_approve: bool = False
+    enabled: bool = True
+
+
+class UpdateMcpServerRequest(BaseModel):
+    name: str | None = None
+    transport: str | None = None
+    command: str | None = None
+    args: list[str] | None = None
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    env: dict[str, str] | None = None
+    auto_approve: bool | None = None
+    enabled: bool | None = None
+
+
+class ListMcpServersResponse(BaseModel):
+    servers: list[McpServerDetail]
+
+
+class ImportMcpConfigRequest(BaseModel):
+    config: dict[str, Any] = Field(..., description="JSON config object with mcpServers key")
+
+
+class ImportMcpConfigResponse(BaseModel):
+    imported: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+
+
+class McpReloadResponse(BaseModel):
+    status: str = "ok"
+    results: dict[str, Any] = Field(default_factory=dict)

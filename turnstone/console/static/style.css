@@ -1173,7 +1173,8 @@
 #create-policy-overlay, #edit-policy-overlay,
 #create-template-overlay, #edit-template-overlay,
 #create-wst-overlay, #edit-wst-overlay, #wst-history-overlay,
-#memory-detail-overlay {
+#memory-detail-overlay,
+#mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1851,6 +1852,45 @@
   .settings-input select { max-width: 100%; }
 }
 
+/* -- MCP Servers grid ----------------------------------------------------- */
+.admin-col-mname a{color:var(--fg);text-decoration:none;transition:color .15s}
+.admin-col-mname a:hover{color:var(--magenta)}
+.admin-col-mname a:focus-visible{outline:2px solid var(--magenta);outline-offset:2px}
+.mcp-grid{grid-template-columns:1.5fr 80px 55px 45px 80px 95px 120px;gap:0 6px}
+@media(max-width:700px){
+  .mcp-grid{grid-template-columns:1fr 100px 130px}
+  .admin-col-mtransport,.admin-col-mtools,.admin-col-mres,.admin-col-mprompts{display:none}
+}
+
+.mcp-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle;margin-right:6px}
+.mcp-status-dot.connected{background:var(--magenta);box-shadow:0 0 6px var(--magenta-glow, rgba(192,132,252,.45))}
+.mcp-status-dot.error{background:var(--red);box-shadow:0 0 6px var(--red-glow);border-radius:1px}
+.mcp-status-dot.disabled{background:var(--fg-dim);opacity:.35}
+.mcp-status-dot.connecting{background:var(--magenta);animation:mcp-pulse 1.2s ease-in-out infinite}
+@keyframes mcp-pulse{0%,100%{opacity:.3}50%{opacity:1}}
+
+.mcp-row-connected{border-left:3px solid var(--magenta)}
+.mcp-row-error{border-left:3px solid var(--red)}
+.mcp-row-disabled{border-left:3px solid transparent}
+
+.mcp-transport-badge{display:inline-block;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:1px 6px;border-radius:2px;background:var(--bg-highlight);border:1px solid var(--border)}
+.mcp-transport-stdio{color:var(--cyan);border-color:rgba(103,232,249,.2)}
+.mcp-transport-http{color:var(--magenta);border-color:rgba(192,132,252,.25)}
+
+.admin-col-mtools,.admin-col-mres,.admin-col-mprompts{text-align:right;font-variant-numeric:tabular-nums}
+.mcp-count-dim{opacity:.4}
+
+.mcp-detail-modal::before{background:linear-gradient(90deg,transparent,var(--magenta),transparent)!important}
+.mcp-detail-modal h2{color:var(--magenta)!important}
+.mcp-detail-section{margin-top:16px}
+.mcp-detail-section h3{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--magenta);margin-bottom:8px}
+.mcp-detail-list{list-style:none;padding:0;margin:0}
+.mcp-detail-list li{font-size:12px;padding:3px 0;border-bottom:1px solid var(--border);color:var(--fg-dim)}
+.mcp-detail-list li:last-child{border-bottom:none}
+
+.admin-action-btn-ghost{background:transparent;color:var(--fg-dim);border:1px solid var(--border-strong)}
+.admin-action-btn-ghost:hover{color:var(--fg);background:var(--bg-highlight)}
+
 /* ==========================================================================
    Reduced motion — console-specific
    ========================================================================== */
@@ -1868,4 +1908,5 @@
   #view-admin { animation: none; }
   .admin-action-btn, .modal-cancel, .modal-submit { transition: none; }
   .admin-modal input, .admin-modal select { transition: none; }
+  .mcp-status-dot.connecting { animation: none; }
 }

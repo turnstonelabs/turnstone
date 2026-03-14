@@ -1556,6 +1556,36 @@ def config_reload(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+# -- internal MCP management -----------------------------------------------
+
+
+def internal_mcp_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/mcp-reload — re-read mcp_servers table and reconcile."""
+    from turnstone.core.storage._registry import get_storage
+
+    storage = get_storage()
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        # Create a new manager if none exists
+        from turnstone.core.mcp_client import MCPClientManager
+
+        mcp_mgr = MCPClientManager({})
+        mcp_mgr.start()
+        request.app.state.mcp_client = mcp_mgr
+
+    result = mcp_mgr.reconcile_sync(storage)
+    return JSONResponse({"status": "ok", **result})
+
+
+def internal_mcp_status(request: Request) -> JSONResponse:
+    """GET /v1/api/_internal/mcp-status — return MCP server status."""
+    mcp_mgr = getattr(request.app.state, "mcp_client", None)
+    if mcp_mgr is None:
+        return JSONResponse({"servers": {}})
+
+    return JSONResponse({"servers": mcp_mgr.get_all_server_status()})
+
+
 # ---------------------------------------------------------------------------
 # Global SSE fan-out
 # ---------------------------------------------------------------------------
@@ -1723,6 +1753,8 @@ def create_app(
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/_internal/config-reload", config_reload, methods=["POST"]),
+                    Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
+                    Route("/api/_internal/mcp-status", internal_mcp_status),
                 ],
             ),
             Route("/health", health),
@@ -1936,11 +1968,13 @@ def main() -> None:
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
+    from turnstone.core.storage._registry import get_storage as _get_storage
 
     mcp_config_cli = args.mcp_config  # CLI-only (no config.toml for this)
     mcp_client = create_mcp_client(
         mcp_config_cli or config_store.get("mcp.config_path") or None,
         refresh_interval=config_store.get("mcp.refresh_interval"),
+        storage=_get_storage(),
     )
 
     # Backend health monitor with circuit breaker

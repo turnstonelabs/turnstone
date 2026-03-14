@@ -14,6 +14,7 @@ from turnstone.core.storage._schema import (
     audit_events,
     conversations,
     intent_verdicts,
+    mcp_servers,
     metadata,
     orgs,
     prompt_templates,
@@ -28,6 +29,9 @@ from turnstone.core.storage._schema import (
     workstream_template_versions,
     workstream_templates,
     workstreams,
+)
+from turnstone.core.storage._utils import (
+    MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     ORG_MUTABLE as _ORG_MUTABLE,
@@ -2363,6 +2367,98 @@ class PostgreSQLBackend:
                 .order_by(system_settings.c.node_id)
             ).fetchall()
             return {r.key: r.value for r in rows}
+
+    # -- MCP server definitions ------------------------------------------------
+
+    def create_mcp_server(
+        self,
+        server_id: str,
+        name: str,
+        transport: str,
+        command: str = "",
+        args: str = "[]",
+        url: str = "",
+        headers: str = "{}",
+        env: str = "{}",
+        auto_approve: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                postgresql.insert(mcp_servers)
+                .values(
+                    server_id=server_id,
+                    name=name,
+                    transport=transport,
+                    command=command,
+                    args=args,
+                    url=url,
+                    headers=headers,
+                    env=env,
+                    auto_approve=1 if auto_approve else 0,
+                    enabled=1 if enabled else 0,
+                    created_by=created_by,
+                    created=now,
+                    updated=now,
+                )
+                .on_conflict_do_nothing()
+            )
+            conn.commit()
+
+    def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "auto_approve", "enabled")
+
+    def get_mcp_server_by_name(self, name: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(mcp_servers).where(mcp_servers.c.name == name)).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "auto_approve", "enabled")
+
+    def list_mcp_servers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+
+        with self._engine.connect() as conn:
+            q = sa.select(mcp_servers).order_by(mcp_servers.c.name)
+            if enabled_only:
+                q = q.where(mcp_servers.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "auto_approve", "enabled") for r in rows]
+
+    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
+
+        fields = {k: v for k, v in fields.items() if k in _MCP_SERVER_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "auto_approve" in fields:
+            fields["auto_approve"] = 1 if fields["auto_approve"] else 0
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(mcp_servers).where(mcp_servers.c.server_id == server_id).values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_mcp_server(self, server_id: str) -> bool:
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
 
     # -- Lifecycle -------------------------------------------------------------
 

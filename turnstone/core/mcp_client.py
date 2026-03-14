@@ -97,6 +97,7 @@ class MCPClientManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._exit_stack: AsyncExitStack | None = None
+        self._per_server_stacks: dict[str, AsyncExitStack] = {}
 
         self._sessions: dict[str, Any] = {}
         self._tools: list[dict[str, Any]] = []
@@ -104,6 +105,10 @@ class MCPClientManager:
         self._tool_map: dict[str, tuple[str, str]] = {}
         self._connected = threading.Event()
         self._error: str | None = None
+        # Names managed by the DB (added via reconcile_sync / add_server_sync).
+        # Config-file servers loaded at startup are NOT in this set and
+        # will never be removed by reconcile_sync.
+        self._db_managed: set[str] = set()
 
         # Per-server tool storage for surgical refresh
         self._per_server_tools: dict[str, list[dict[str, Any]]] = {}
@@ -189,30 +194,37 @@ class MCPClientManager:
 
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a single MCP server and discover its tools."""
-        assert self._exit_stack is not None
-
         if "__" in name:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
 
+        # Per-server exit stack for clean per-server lifecycle management
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+
         transport = cfg.get("type", "stdio")
-        if transport in ("http", "streamable-http") or "url" in cfg:
-            read, write, _ = await self._exit_stack.enter_async_context(
-                streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
-            )
-        else:
-            # Default: stdio transport
-            command = cfg.get("command", "")
-            if not command:
-                log.warning("MCP server '%s' has no command configured", name)
-                return
-            env = {**os.environ, **cfg.get("env", {})}
-            params = StdioServerParameters(
-                command=command,
-                args=cfg.get("args", []),
-                env=env,
-            )
-            read, write = await self._exit_stack.enter_async_context(stdio_client(params))
+        try:
+            if transport in ("http", "streamable-http") or "url" in cfg:
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
+                )
+            else:
+                # Default: stdio transport
+                command = cfg.get("command", "")
+                if not command:
+                    log.warning("MCP server '%s' has no command configured", name)
+                    await stack.aclose()
+                    return
+                env = {**os.environ, **cfg.get("env", {})}
+                params = StdioServerParameters(
+                    command=command,
+                    args=cfg.get("args", []),
+                    env=env,
+                )
+                read, write = await stack.enter_async_context(stdio_client(params))
+        except Exception:
+            await stack.aclose()
+            raise
 
         # Register notification handler — dispatches tool, resource, and
         # prompt list-change notifications to the appropriate refresh method.
@@ -235,10 +247,22 @@ class MCPClientManager:
             except Exception:
                 log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
 
-        session = await self._exit_stack.enter_async_context(
-            ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
-        )
-        await session.initialize()
+        try:
+            session = await stack.enter_async_context(
+                ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
+            )
+        except Exception:
+            await stack.aclose()
+            raise
+
+        self._per_server_stacks[name] = stack
+        try:
+            await session.initialize()
+        except Exception:
+            self._per_server_stacks.pop(name, None)
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            raise
         self._sessions[name] = session
 
         # Check push notification support for each capability
@@ -807,12 +831,27 @@ class MCPClientManager:
         if self._refresh_task and self._loop:
             self._loop.call_soon_threadsafe(self._refresh_task.cancel)
 
+        # Close all per-server stacks (transports + sessions)
+        if self._loop and self._per_server_stacks:
+
+            async def _close_all_stacks() -> None:
+                for stack in self._per_server_stacks.values():
+                    with contextlib.suppress(Exception):
+                        await stack.aclose()
+
+            future = asyncio.run_coroutine_threadsafe(_close_all_stacks(), self._loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                log.debug("Error closing MCP sessions", exc_info=True)
+
+        # Close legacy shared stack (if any resources were registered on it)
         if self._loop and self._exit_stack:
             future = asyncio.run_coroutine_threadsafe(self._exit_stack.aclose(), self._loop)
             try:
                 future.result(timeout=10)
             except Exception:
-                log.debug("Error closing MCP sessions", exc_info=True)
+                log.debug("Error closing MCP exit stack", exc_info=True)
 
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -821,6 +860,8 @@ class MCPClientManager:
 
         # Clear all state
         self._sessions.clear()
+        self._per_server_stacks.clear()
+        self._db_managed.clear()
         self._tools = []
         self._tool_map = {}
         self._per_server_tools.clear()
@@ -842,6 +883,195 @@ class MCPClientManager:
         self._prompt_listeners.clear()
 
         log.info("MCP client shut down")
+
+    # -- hot-reload (add/remove servers) ------------------------------------
+
+    def add_server_sync(self, name: str, cfg: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+        """Connect a new MCP server at runtime (blocks the calling thread).
+
+        Returns status dict with keys: connected, tools, resources, prompts, error.
+        """
+        if "__" in name:
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": f"Server name '{name}' contains '__' (reserved delimiter)",
+            }
+        if self._loop is None:
+            return {
+                "connected": False,
+                "tools": 0,
+                "resources": 0,
+                "prompts": 0,
+                "error": "MCP event loop not running",
+            }
+
+        # Add to config so _refresh_all can reconnect on failure
+        self._server_configs[name] = cfg
+
+        future = asyncio.run_coroutine_threadsafe(self._connect_one(name, cfg), self._loop)
+        try:
+            future.result(timeout=timeout)
+        except Exception as exc:
+            # Remove from configs on failure
+            self._server_configs.pop(name, None)
+            return {"connected": False, "tools": 0, "resources": 0, "prompts": 0, "error": str(exc)}
+
+        return {
+            "connected": name in self._sessions,
+            "tools": len(self._per_server_tools.get(name, [])),
+            "resources": len(self._per_server_resources.get(name, [])),
+            "prompts": len(self._per_server_prompts.get(name, [])),
+            "error": "",
+        }
+
+    def remove_server_sync(self, name: str, timeout: int = 15) -> bool:
+        """Disconnect and remove an MCP server at runtime (blocks the calling thread).
+
+        Returns True if the server was connected and successfully removed.
+        """
+        was_connected = name in self._sessions
+
+        # Remove from config to prevent reconnection
+        self._server_configs.pop(name, None)
+
+        if was_connected and self._loop is not None:
+
+            async def _disconnect() -> None:
+                self._sessions.pop(name, None)
+                stack = self._per_server_stacks.pop(name, None)
+                if stack is not None:
+                    with contextlib.suppress(Exception):
+                        await stack.aclose()
+
+            future = asyncio.run_coroutine_threadsafe(_disconnect(), self._loop)
+            try:
+                future.result(timeout=timeout)
+            except Exception:
+                log.warning("Error disconnecting MCP server '%s'", name, exc_info=True)
+        else:
+            self._sessions.pop(name, None)
+
+        # Clean up per-server state
+        self._per_server_tools.pop(name, None)
+        self._per_server_resources.pop(name, None)
+        self._per_server_prompts.pop(name, None)
+        self._supports_list_changed.pop(name, None)
+        self._supports_resources.pop(name, None)
+        self._supports_resource_list_changed.pop(name, None)
+        self._supports_prompts.pop(name, None)
+        self._supports_prompt_list_changed.pop(name, None)
+
+        # Rebuild merged state
+        self._rebuild_tools()
+        self._rebuild_resources()
+        self._rebuild_prompts()
+
+        # Clean up governance templates from this server
+        try:
+            self.sync_prompts_to_storage()
+        except Exception:
+            log.warning("Prompt sync after remove failed for '%s'", name, exc_info=True)
+
+        log.info("Removed MCP server '%s'", name)
+        return was_connected
+
+    def get_server_status(self, name: str) -> dict[str, Any]:
+        """Return live status for a single server, including config details."""
+        connected = name in self._sessions
+        cfg = self._server_configs.get(name, {})
+        transport = cfg.get("type", "stdio")
+        return {
+            "connected": connected,
+            "tools": len(self._per_server_tools.get(name, [])) if connected else 0,
+            "resources": len(self._per_server_resources.get(name, [])) if connected else 0,
+            "prompts": len(self._per_server_prompts.get(name, [])) if connected else 0,
+            "error": "",
+            "transport": transport,
+            "command": cfg.get("command", "") if transport == "stdio" else "",
+            "url": cfg.get("url", "") if transport != "stdio" else "",
+        }
+
+    def get_all_server_status(self) -> dict[str, dict[str, Any]]:
+        """Return live status for all configured servers."""
+        result: dict[str, dict[str, Any]] = {}
+        for name in list(self._server_configs):
+            result[name] = self.get_server_status(name)
+        return result
+
+    def reconcile_sync(self, storage: Any, timeout: int = 30) -> dict[str, Any]:
+        """Reconcile DB-managed servers against DB state.
+
+        Reads enabled ``mcp_servers`` rows from *storage*, then:
+        - Connects servers in DB but not currently running.
+        - Disconnects DB-managed servers no longer in DB (or disabled).
+        - Reconnects DB-managed servers whose config has changed.
+
+        Config-file servers (loaded at startup, not in ``_db_managed``)
+        are never touched — only servers previously added via DB are
+        eligible for removal.
+
+        Returns ``{"added": [...], "removed": [...], "updated": [...]}``.
+        """
+        try:
+            rows = storage.list_mcp_servers(enabled_only=True)
+        except Exception:
+            log.warning("reconcile_sync: failed to read mcp_servers table", exc_info=True)
+            return {"added": [], "removed": [], "updated": []}
+
+        desired = _db_servers_to_config(rows)
+        desired_names = set(desired)
+
+        added: list[str] = []
+        removed: list[str] = []
+        updated: list[str] = []
+
+        # Remove DB-managed servers no longer in DB (or disabled).
+        # Config-file servers (not in _db_managed) are left untouched.
+        for name in list(self._db_managed - desired_names):
+            self.remove_server_sync(name, timeout=timeout)
+            self._db_managed.discard(name)
+            removed.append(name)
+
+        # Add servers in DB but not running
+        for name in desired_names - set(self._server_configs):
+            result = self.add_server_sync(name, desired[name], timeout=timeout)
+            if result.get("connected"):
+                added.append(name)
+                self._db_managed.add(name)
+            else:
+                log.warning("reconcile_sync: failed to add '%s': %s", name, result.get("error", ""))
+
+        # Update DB-managed servers whose config has changed (cycle: remove + add).
+        # Config-file servers with the same name as a DB server are left untouched.
+        for name in desired_names & set(self._server_configs):
+            if name not in self._db_managed:
+                continue  # config-file server — DB doesn't own it
+            if desired[name] != self._server_configs.get(name):
+                log.info("Config changed for MCP server '%s', reconnecting", name)
+                self.remove_server_sync(name, timeout=timeout)
+                result = self.add_server_sync(name, desired[name], timeout=timeout)
+                if result.get("connected"):
+                    updated.append(name)
+                    self._db_managed.add(name)
+                else:
+                    self._db_managed.discard(name)
+                    log.warning(
+                        "reconcile_sync: failed to reconnect '%s': %s",
+                        name,
+                        result.get("error", ""),
+                    )
+
+        if added or removed or updated:
+            log.info(
+                "MCP reconcile: +%d added, -%d removed, ~%d updated",
+                len(added),
+                len(removed),
+                len(updated),
+            )
+        return {"added": added, "removed": removed, "updated": updated}
 
     # -- query methods -------------------------------------------------------
 
@@ -1024,23 +1254,64 @@ class MCPClientManager:
 # ---------------------------------------------------------------------------
 
 
-def load_mcp_config(config_path: str | None = None) -> dict[str, dict[str, Any]]:
+def _db_servers_to_config(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Convert mcp_servers DB rows to the config dict format."""
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = row["name"]
+        cfg: dict[str, Any] = {"type": row["transport"]}
+        if row["transport"] == "stdio":
+            cfg["command"] = row.get("command", "")
+            try:
+                cfg["args"] = json.loads(row.get("args", "[]"))
+            except (json.JSONDecodeError, TypeError):
+                cfg["args"] = []
+            try:
+                cfg["env"] = json.loads(row.get("env", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                cfg["env"] = {}
+        else:
+            cfg["url"] = row.get("url", "")
+            try:
+                cfg["headers"] = json.loads(row.get("headers", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                cfg["headers"] = {}
+        result[name] = cfg
+    return result
+
+
+def load_mcp_config(
+    config_path: str | None = None,
+    storage: Any = None,
+) -> dict[str, dict[str, Any]]:
     """Load MCP server configurations.
 
     Sources (first match wins):
 
-    1. Explicit *config_path* (standard MCP JSON format).
-    2. ``[mcp.servers.*]`` sections in ``config.toml``.
+    1. DB ``mcp_servers`` table (if *storage* provided and has enabled rows).
+    2. Explicit *config_path* (standard MCP JSON format).
+    3. ``[mcp.servers.*]`` sections in ``config.toml``.
 
     Returns an empty dict if nothing is configured.
     """
-    # 1. Explicit JSON file
+    # 1. Database
+    if storage is not None:
+        try:
+            rows = storage.list_mcp_servers(enabled_only=True)
+            if rows:
+                servers = _db_servers_to_config(rows)
+                log.info("Loaded MCP config from database (%d server(s))", len(servers))
+                return servers
+        except Exception:
+            log.debug("DB MCP config lookup failed (table may not exist yet)", exc_info=True)
+
+    # 2. Explicit JSON file
     if config_path:
         path = Path(config_path).expanduser()
         if path.is_file():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                servers: dict[str, Any] = data.get("mcpServers", {})
+                servers = data.get("mcpServers", {})
                 if isinstance(servers, dict) and servers:
                     log.info("Loaded MCP config from %s (%d server(s))", path, len(servers))
                     return servers
@@ -1049,7 +1320,7 @@ def load_mcp_config(config_path: str | None = None) -> dict[str, dict[str, Any]]
         else:
             log.warning("MCP config file not found: %s", path)
 
-    # 2. TOML config
+    # 3. TOML config
     mcp_section = load_config("mcp")
     servers_section = mcp_section.get("servers", {})
 
@@ -1069,15 +1340,28 @@ def create_mcp_client(
     config_path: str | None = None,
     *,
     refresh_interval: float = _DEFAULT_REFRESH_INTERVAL,
+    storage: Any = None,
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
     Returns *None* if no servers are configured.
     """
-    servers = load_mcp_config(config_path)
+    # Check DB first to know which servers are DB-managed
+    db_names: set[str] = set()
+    if storage is not None:
+        try:
+            rows = storage.list_mcp_servers(enabled_only=True)
+            if rows:
+                db_names = {r["name"] for r in rows}
+        except Exception:
+            pass
+
+    servers = load_mcp_config(config_path, storage=storage)
     if not servers:
         return None
 
     mgr = MCPClientManager(servers, refresh_interval=refresh_interval)
+    # Mark DB-sourced servers so reconcile_sync won't remove config-file servers
+    mgr._db_managed = {name for name in servers if name in db_names}
     mgr.start()
     return mgr

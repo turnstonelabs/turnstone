@@ -64,7 +64,8 @@ function showAdmin() {
     usage: "admin.usage",
     audit: "admin.audit",
     memories: "admin.memories",
-    settings: "admin.users",
+    settings: "admin.settings",
+    mcp: "admin.mcp",
   };
   if (perms) {
     var permSet = perms.split(",");
@@ -194,6 +195,7 @@ function switchAdminTab(tab) {
     "audit",
     "memories",
     "settings",
+    "mcp",
   ];
   for (var p = 0; p < panels.length; p++) {
     var el = document.getElementById("admin-" + panels[p]);
@@ -216,6 +218,7 @@ function switchAdminTab(tab) {
   }
   if (tab === "memories") loadAdminMemories();
   if (tab === "settings") loadSettings();
+  if (tab === "mcp") loadAdminMcp();
 
   // Update breadcrumb with active tab label
   var activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
@@ -1593,6 +1596,9 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "edit-wst-overlay") hideEditWsTemplateModal();
         else if (overlayId === "wst-history-overlay") hideWstHistoryModal();
         else if (overlayId === "memory-detail-overlay") hideMemoryDetailModal();
+        else if (overlayId === "mcp-create-overlay") hideCreateMcpModal();
+        else if (overlayId === "mcp-import-overlay") hideImportMcpModal();
+        else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
       }
     };
   }
@@ -1679,6 +1685,9 @@ document.addEventListener("keydown", function (e) {
     ["edit-wst-overlay", hideEditWsTemplateModal],
     ["wst-history-overlay", hideWstHistoryModal],
     ["memory-detail-overlay", hideMemoryDetailModal],
+    ["mcp-detail-overlay", hideMcpDetailModal],
+    ["mcp-import-overlay", hideImportMcpModal],
+    ["mcp-create-overlay", hideCreateMcpModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);
@@ -2353,4 +2362,566 @@ function _resetSetting(key) {
 function _showModalError(el, msg) {
   el.textContent = msg;
   el.style.display = "block";
+}
+
+/* ── MCP Servers tab ─────────────────────────────────────────────────────── */
+
+var _mcpServers = [];
+var _mcpCreateTrap = null;
+var _mcpCreateTrigger = null;
+var _mcpImportTrap = null;
+var _mcpImportTrigger = null;
+var _mcpDetailTrap = null;
+var _mcpDetailTrigger = null;
+
+function loadAdminMcp() {
+  authFetch("/v1/api/admin/mcp-servers")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _mcpServers = data.servers || [];
+      _renderMcpServers(_mcpServers);
+    })
+    .catch(function () {
+      document.getElementById("admin-mcp-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load MCP servers</div>';
+    });
+}
+
+function _renderMcpServers(items) {
+  var el = document.getElementById("admin-mcp-table");
+  if (!items.length) {
+    el.innerHTML =
+      '<div class="dashboard-empty">No MCP servers configured</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < items.length; i++) {
+    var s = items[i];
+    var statusEntries = s.status || {};
+    var nodeIds = Object.keys(statusEntries);
+    var anyConnected = false;
+    var anyError = false;
+    var totalTools = 0,
+      totalRes = 0,
+      totalPrompts = 0;
+    for (var j = 0; j < nodeIds.length; j++) {
+      var ns = statusEntries[nodeIds[j]];
+      if (ns.connected) {
+        anyConnected = true;
+        totalTools += ns.tools || 0;
+        totalRes += ns.resources || 0;
+        totalPrompts += ns.prompts || 0;
+      }
+      if (ns.error) anyError = true;
+    }
+
+    var dotClass = "mcp-status-dot disabled";
+    var rowClass = "mcp-row-disabled";
+    var statusText = "disabled";
+    if (!s.enabled) {
+      statusText = "disabled";
+    } else if (anyConnected) {
+      dotClass = "mcp-status-dot connected";
+      rowClass = "mcp-row-connected";
+      statusText = "connected";
+    } else if (anyError) {
+      dotClass = "mcp-status-dot error";
+      rowClass = "mcp-row-error";
+      statusText = "error";
+    } else {
+      dotClass = "mcp-status-dot disabled";
+      rowClass = "mcp-row-disabled";
+      statusText = "idle";
+    }
+
+    var transportCls =
+      s.transport === "stdio" ? "mcp-transport-stdio" : "mcp-transport-http";
+    var toolsVal = anyConnected
+      ? totalTools
+      : '<span class="mcp-count-dim">--</span>';
+    var resVal = anyConnected
+      ? totalRes
+      : '<span class="mcp-count-dim">--</span>';
+    var promptsVal = anyConnected
+      ? totalPrompts
+      : '<span class="mcp-count-dim">--</span>';
+
+    var isConfig = s.source === "config";
+    var nameBadge = isConfig
+      ? ' <span class="scope-badge scope-channel">config</span>'
+      : "";
+    var detailAttr = isConfig
+      ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
+      : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
+    var actions = isConfig
+      ? ""
+      : '<button class="admin-btn-action" data-mcp-edit="' +
+        escapeHtml(s.server_id) +
+        '">edit</button>' +
+        '<button class="admin-btn-danger" data-mcp-delete="' +
+        escapeHtml(s.server_id) +
+        '" data-mcp-name="' +
+        escapeHtml(s.name) +
+        '">del</button>';
+
+    html +=
+      '<div class="admin-row mcp-grid ' +
+      rowClass +
+      '" role="listitem">' +
+      '<span class="admin-col admin-col-mname"><a href="#" ' +
+      detailAttr +
+      ">" +
+      escapeHtml(s.name) +
+      "</a>" +
+      nameBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-mtransport"><span class="mcp-transport-badge ' +
+      transportCls +
+      '">' +
+      escapeHtml(s.transport) +
+      "</span></span>" +
+      '<span class="admin-col admin-col-mtools">' +
+      toolsVal +
+      "</span>" +
+      '<span class="admin-col admin-col-mres">' +
+      resVal +
+      "</span>" +
+      '<span class="admin-col admin-col-mprompts">' +
+      promptsVal +
+      "</span>" +
+      '<span class="admin-col admin-col-mstatus"><span class="' +
+      dotClass +
+      '" aria-hidden="true"></span>' +
+      escapeHtml(statusText) +
+      "</span>" +
+      '<span class="admin-col admin-col-mactions">' +
+      actions +
+      "</span></div>";
+  }
+  el.innerHTML = html;
+
+  // Bind event handlers
+  el.querySelectorAll("[data-mcp-detail]").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      e.preventDefault();
+      showMcpDetailModal(this.getAttribute("data-mcp-detail"));
+    });
+  });
+  el.querySelectorAll("[data-mcp-detail-name]").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      e.preventDefault();
+      showMcpDetailByName(this.getAttribute("data-mcp-detail-name"));
+    });
+  });
+  el.querySelectorAll("[data-mcp-edit]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditMcpModal(this.getAttribute("data-mcp-edit"));
+    });
+  });
+  el.querySelectorAll("[data-mcp-delete]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var sid = this.getAttribute("data-mcp-delete");
+      var sname = this.getAttribute("data-mcp-name");
+      showConfirmModal(
+        "Delete MCP Server",
+        'Delete server "' + sname + '"?',
+        "Delete",
+        function () {
+          authFetch("/v1/api/admin/mcp-servers/" + sid, { method: "DELETE" })
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function () {
+              showToast("Server deleted");
+              loadAdminMcp();
+            })
+            .catch(function () {
+              showToast("Failed to delete server");
+            });
+        },
+      );
+    });
+  });
+}
+
+function toggleMcpTransport() {
+  var v = document.getElementById("mcp-transport").value;
+  document.getElementById("mcp-stdio-fields").style.display =
+    v === "stdio" ? "" : "none";
+  document.getElementById("mcp-http-fields").style.display =
+    v === "streamable-http" ? "" : "none";
+}
+
+function showCreateMcpModal() {
+  _mcpCreateTrigger = document.activeElement;
+  var ov = document.getElementById("mcp-create-overlay");
+  ov.style.display = "flex";
+  document.getElementById("mcp-edit-id").value = "";
+  document.getElementById("mcp-create-title").textContent = "Add MCP Server";
+  document.getElementById("mcp-create-submit").textContent = "Create";
+  document.getElementById("mcp-name").value = "";
+  document.getElementById("mcp-transport").value = "stdio";
+  document.getElementById("mcp-command").value = "";
+  document.getElementById("mcp-args").value = "";
+  document.getElementById("mcp-env").value = "";
+  document.getElementById("mcp-url").value = "";
+  document.getElementById("mcp-headers").value = "";
+  document.getElementById("mcp-auto-approve").checked = false;
+  document.getElementById("mcp-enabled").checked = true;
+  document.getElementById("mcp-create-error").style.display = "none";
+  toggleMcpTransport();
+  document.getElementById("mcp-name").focus();
+  _mcpCreateTrap = _installTrap("mcp-create-overlay", "mcp-create-box");
+}
+
+function showEditMcpModal(serverId) {
+  // Fetch with reveal=true to get actual secret values for editing
+  authFetch("/v1/api/admin/mcp-servers/" + serverId + "?reveal=true")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load server");
+      return r.json();
+    })
+    .then(function (s) {
+      showCreateMcpModal();
+      document.getElementById("mcp-edit-id").value = serverId;
+      document.getElementById("mcp-create-title").textContent =
+        "Edit MCP Server";
+      document.getElementById("mcp-create-submit").textContent = "Save";
+      document.getElementById("mcp-name").value = s.name;
+      document.getElementById("mcp-transport").value = s.transport;
+      document.getElementById("mcp-command").value = s.command || "";
+      try {
+        var argsList = JSON.parse(s.args || "[]");
+        document.getElementById("mcp-args").value = argsList.join("\n");
+      } catch (e) {
+        document.getElementById("mcp-args").value = "";
+      }
+      try {
+        var envObj = JSON.parse(s.env || "{}");
+        document.getElementById("mcp-env").value = Object.keys(envObj)
+          .map(function (k) {
+            return k + "=" + envObj[k];
+          })
+          .join("\n");
+      } catch (e) {
+        document.getElementById("mcp-env").value = "";
+      }
+      document.getElementById("mcp-url").value = s.url || "";
+      try {
+        var hdrObj = JSON.parse(s.headers || "{}");
+        document.getElementById("mcp-headers").value = Object.keys(hdrObj)
+          .map(function (k) {
+            return k + ": " + hdrObj[k];
+          })
+          .join("\n");
+      } catch (e) {
+        document.getElementById("mcp-headers").value = "";
+      }
+      document.getElementById("mcp-auto-approve").checked =
+        s.auto_approve || false;
+      document.getElementById("mcp-enabled").checked = s.enabled !== false;
+      toggleMcpTransport();
+    })
+    .catch(function () {
+      showToast("Failed to load server details");
+    });
+}
+
+function hideCreateMcpModal() {
+  document.getElementById("mcp-create-overlay").style.display = "none";
+  _mcpCreateTrap = _removeTrap(_mcpCreateTrap);
+  if (_mcpCreateTrigger && _mcpCreateTrigger.focus) _mcpCreateTrigger.focus();
+  _mcpCreateTrigger = null;
+}
+
+function _parseMcpForm() {
+  var name = document.getElementById("mcp-name").value.trim();
+  var transport = document.getElementById("mcp-transport").value;
+  if (!name) return { error: "Name is required" };
+  if (!/^[a-zA-Z0-9._-]+$/.test(name))
+    return { error: "Name must match [a-zA-Z0-9._-]+" };
+  if (name.indexOf("__") >= 0) return { error: "Name must not contain '__'" };
+
+  var payload = {
+    name: name,
+    transport: transport,
+    auto_approve: document.getElementById("mcp-auto-approve").checked,
+    enabled: document.getElementById("mcp-enabled").checked,
+  };
+
+  if (transport === "stdio") {
+    payload.command = document.getElementById("mcp-command").value.trim();
+    var argsText = document.getElementById("mcp-args").value.trim();
+    payload.args = argsText
+      ? argsText
+          .split("\n")
+          .map(function (l) {
+            return l.trim();
+          })
+          .filter(Boolean)
+      : [];
+    var envText = document.getElementById("mcp-env").value.trim();
+    var envObj = {};
+    if (envText) {
+      envText.split("\n").forEach(function (line) {
+        var eq = line.indexOf("=");
+        if (eq > 0)
+          envObj[line.substring(0, eq).trim()] = line.substring(eq + 1).trim();
+      });
+    }
+    payload.env = envObj;
+  } else {
+    payload.url = document.getElementById("mcp-url").value.trim();
+    var hdrText = document.getElementById("mcp-headers").value.trim();
+    var hdrObj = {};
+    if (hdrText) {
+      hdrText.split("\n").forEach(function (line) {
+        var colon = line.indexOf(":");
+        if (colon > 0)
+          hdrObj[line.substring(0, colon).trim()] = line
+            .substring(colon + 1)
+            .trim();
+      });
+    }
+    payload.headers = hdrObj;
+  }
+  return payload;
+}
+
+function submitCreateMcp() {
+  var form = _parseMcpForm();
+  if (form.error) {
+    var e = document.getElementById("mcp-create-error");
+    e.textContent = form.error;
+    e.style.display = "";
+    return;
+  }
+  var editId = document.getElementById("mcp-edit-id").value;
+  var method = editId ? "PUT" : "POST";
+  var url = editId
+    ? "/v1/api/admin/mcp-servers/" + editId
+    : "/v1/api/admin/mcp-servers";
+
+  document.getElementById("mcp-create-submit").disabled = true;
+  authFetch(url, {
+    method: method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(form),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreateMcpModal();
+      showToast(editId ? "Server updated" : "Server created");
+      loadAdminMcp();
+    })
+    .catch(function (e) {
+      var el = document.getElementById("mcp-create-error");
+      el.textContent = e.message;
+      el.style.display = "";
+    })
+    .finally(function () {
+      document.getElementById("mcp-create-submit").disabled = false;
+    });
+}
+
+function reloadMcpNodes() {
+  authFetch("/v1/api/admin/mcp-servers/reload", { method: "POST" })
+    .then(function (r) {
+      if (!r.ok) throw new Error();
+      return r.json();
+    })
+    .then(function (data) {
+      var results = data.results || {};
+      var nodeIds = Object.keys(results);
+      var totalAdded = 0,
+        totalRemoved = 0;
+      for (var i = 0; i < nodeIds.length; i++) {
+        var nr = results[nodeIds[i]];
+        totalAdded += (nr.added || []).length;
+        totalRemoved += (nr.removed || []).length;
+      }
+      var msg = "Reload sent to " + nodeIds.length + " node(s)";
+      if (totalAdded) msg += ", +" + totalAdded + " added";
+      if (totalRemoved) msg += ", -" + totalRemoved + " removed";
+      showToast(msg);
+      setTimeout(loadAdminMcp, 1500);
+    })
+    .catch(function () {
+      showToast("Failed to reload nodes");
+    });
+}
+
+function showMcpDetailByName(name) {
+  for (var i = 0; i < _mcpServers.length; i++) {
+    if (_mcpServers[i].name === name) {
+      return _openMcpDetail(_mcpServers[i]);
+    }
+  }
+}
+
+function showMcpDetailModal(serverId) {
+  for (var i = 0; i < _mcpServers.length; i++) {
+    if (_mcpServers[i].server_id === serverId) {
+      return _openMcpDetail(_mcpServers[i]);
+    }
+  }
+}
+
+function _openMcpDetail(s) {
+  if (!s) return;
+  _mcpDetailTrigger = document.activeElement;
+
+  var html = '<div class="modal-columns">';
+  html += '<div class="modal-col">';
+  html += '<div class="mcp-detail-section"><h3>Configuration</h3>';
+  html +=
+    '<p style="font-size:12px;color:var(--fg-dim)">Transport: <span class="mcp-transport-badge ' +
+    (s.transport === "stdio" ? "mcp-transport-stdio" : "mcp-transport-http") +
+    '">' +
+    escapeHtml(s.transport) +
+    "</span></p>";
+  if (s.transport === "stdio") {
+    html +=
+      '<p style="font-size:12px;color:var(--fg-dim)">Command: <code>' +
+      escapeHtml(s.command || "") +
+      "</code></p>";
+    try {
+      var a = JSON.parse(s.args || "[]");
+      if (a.length)
+        html +=
+          '<p style="font-size:12px;color:var(--fg-dim)">Args: <code>' +
+          escapeHtml(a.join(" ")) +
+          "</code></p>";
+    } catch (e) {}
+  } else {
+    html +=
+      '<p style="font-size:12px;color:var(--fg-dim)">URL: <code>' +
+      escapeHtml(s.url || "") +
+      "</code></p>";
+  }
+  html += "</div></div>";
+
+  html += '<div class="modal-col">';
+  var statusEntries = s.status || {};
+  var nodeIds = Object.keys(statusEntries);
+  html += '<div class="mcp-detail-section"><h3>Node Status</h3>';
+  if (nodeIds.length === 0) {
+    html +=
+      '<p style="font-size:12px;color:var(--fg-dim)">Not connected on any node</p>';
+  } else {
+    html += '<ul class="mcp-detail-list">';
+    for (var j = 0; j < nodeIds.length; j++) {
+      var ns = statusEntries[nodeIds[j]];
+      var dot = ns.connected
+        ? '<span class="mcp-status-dot connected"></span>'
+        : '<span class="mcp-status-dot error"></span>';
+      html +=
+        "<li>" +
+        dot +
+        escapeHtml(nodeIds[j]) +
+        " — " +
+        (ns.tools || 0) +
+        " tools, " +
+        (ns.resources || 0) +
+        " resources, " +
+        (ns.prompts || 0) +
+        " prompts</li>";
+    }
+    html += "</ul>";
+  }
+  html += "</div></div></div>";
+
+  document.getElementById("mcp-detail-title").textContent = s.name;
+  document.getElementById("mcp-detail-content").innerHTML = html;
+  document.getElementById("mcp-detail-overlay").style.display = "flex";
+  _mcpDetailTrap = _installTrap("mcp-detail-overlay", "mcp-detail-box");
+}
+
+function hideMcpDetailModal() {
+  document.getElementById("mcp-detail-overlay").style.display = "none";
+  _mcpDetailTrap = _removeTrap(_mcpDetailTrap);
+  if (_mcpDetailTrigger && _mcpDetailTrigger.focus) _mcpDetailTrigger.focus();
+  _mcpDetailTrigger = null;
+}
+
+function showImportMcpModal() {
+  _mcpImportTrigger = document.activeElement;
+  document.getElementById("mcp-import-overlay").style.display = "flex";
+  document.getElementById("mcp-import-json").value = "";
+  document.getElementById("mcp-import-error").style.display = "none";
+  document.getElementById("mcp-import-json").focus();
+  _mcpImportTrap = _installTrap("mcp-import-overlay", "mcp-import-box");
+}
+
+function hideImportMcpModal() {
+  document.getElementById("mcp-import-overlay").style.display = "none";
+  _mcpImportTrap = _removeTrap(_mcpImportTrap);
+  if (_mcpImportTrigger && _mcpImportTrigger.focus) _mcpImportTrigger.focus();
+  _mcpImportTrigger = null;
+}
+
+function submitImportMcp() {
+  var raw = document.getElementById("mcp-import-json").value.trim();
+  if (!raw) {
+    var e = document.getElementById("mcp-import-error");
+    e.textContent = "Paste a JSON config";
+    e.style.display = "";
+    return;
+  }
+  var parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (ex) {
+    var e2 = document.getElementById("mcp-import-error");
+    e2.textContent = "Invalid JSON: " + ex.message;
+    e2.style.display = "";
+    return;
+  }
+  if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
+    var e3 = document.getElementById("mcp-import-error");
+    e3.textContent = 'No "mcpServers" key found in JSON';
+    e3.style.display = "";
+    return;
+  }
+  document.getElementById("mcp-import-submit").disabled = true;
+  authFetch("/v1/api/admin/mcp-servers/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ config: parsed }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      hideImportMcpModal();
+      var msg = "Imported " + (data.imported || []).length;
+      if ((data.skipped || []).length)
+        msg += ", skipped " + data.skipped.length;
+      if ((data.errors || []).length)
+        msg += ", " + data.errors.length + " error(s)";
+      showToast(msg);
+      loadAdminMcp();
+    })
+    .catch(function (e) {
+      var el = document.getElementById("mcp-import-error");
+      el.textContent = e.message;
+      el.style.display = "";
+    })
+    .finally(function () {
+      document.getElementById("mcp-import-submit").disabled = false;
+    });
 }

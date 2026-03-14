@@ -16,16 +16,20 @@ import type {
   ConsoleCreateWsRequest,
   ConsoleCreateWsResponse,
   ConsoleHealthResponse,
+  CreateMcpServerRequest,
   CreatePolicyOptions,
   CreateRoleOptions,
   CreateScheduleRequest,
   CreateTemplateOptions,
   CreateWsTemplateOptions,
+  ImportMcpConfigResponse,
   ListAdminMemoriesResponse,
+  ListMcpServersResponse,
   ListScheduleRunsResponse,
   ListSchedulesResponse,
   ListSettingSchemaResponse,
   ListSettingsResponse,
+  McpServerDetail,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
@@ -35,6 +39,7 @@ import type {
   SettingInfo,
   StatusResponse,
   ToolPolicyInfo,
+  UpdateMcpServerRequest,
   UpdateOrgOptions,
   UpdatePolicyOptions,
   UpdateRoleOptions,
@@ -408,6 +413,51 @@ export class TurnstoneConsole extends BaseClient {
     if (nodeId) params.node_id = nodeId;
     return this.request("DELETE", `/v1/api/admin/settings/${key}`, {
       params,
+    });
+  }
+
+  // -- MCP servers ----------------------------------------------------------
+
+  async listMcpServers(opts?: {
+    reveal?: boolean;
+  }): Promise<ListMcpServersResponse> {
+    const params: Record<string, string> = {};
+    if (opts?.reveal) params.reveal = "true";
+    return this.request("GET", "/v1/api/admin/mcp-servers", { params });
+  }
+
+  async createMcpServer(
+    body: CreateMcpServerRequest,
+  ): Promise<McpServerDetail> {
+    return this.request("POST", "/v1/api/admin/mcp-servers", { json: body });
+  }
+
+  async getMcpServer(serverId: string): Promise<McpServerDetail> {
+    return this.request("GET", `/v1/api/admin/mcp-servers/${serverId}`);
+  }
+
+  async updateMcpServer(
+    serverId: string,
+    body: UpdateMcpServerRequest,
+  ): Promise<McpServerDetail> {
+    return this.request("PUT", `/v1/api/admin/mcp-servers/${serverId}`, {
+      json: body,
+    });
+  }
+
+  async deleteMcpServer(serverId: string): Promise<StatusResponse> {
+    return this.request("DELETE", `/v1/api/admin/mcp-servers/${serverId}`);
+  }
+
+  async reloadMcpServers(): Promise<StatusResponse> {
+    return this.request("POST", "/v1/api/admin/mcp-servers/reload");
+  }
+
+  async importMcpConfig(
+    config: Record<string, unknown>,
+  ): Promise<ImportMcpConfigResponse> {
+    return this.request("POST", "/v1/api/admin/mcp-servers/import", {
+      json: { config },
     });
   }
 }

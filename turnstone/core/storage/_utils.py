@@ -48,6 +48,19 @@ WS_TEMPLATE_MUTABLE = frozenset(
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})
+MCP_SERVER_MUTABLE = frozenset(
+    {
+        "name",
+        "transport",
+        "command",
+        "args",
+        "url",
+        "headers",
+        "env",
+        "auto_approve",
+        "enabled",
+    }
+)
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",

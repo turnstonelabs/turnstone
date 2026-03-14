@@ -1006,10 +1006,12 @@ def main() -> None:
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
+    from turnstone.core.storage._registry import get_storage as _get_storage
 
     mcp_client = create_mcp_client(
         getattr(args, "mcp_config", None),
         refresh_interval=getattr(args, "mcp_refresh_interval", 14400),
+        storage=_get_storage(),
     )
 
     # ChatSession factory — captures shared config for creating workstreams

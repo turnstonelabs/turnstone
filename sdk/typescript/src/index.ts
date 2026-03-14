@@ -160,6 +160,13 @@ export type {
   SettingSchemaInfo,
   ListSettingSchemaResponse,
   UpdateSettingOptions,
+  // MCP server types
+  McpServerStatus,
+  McpServerDetail,
+  ListMcpServersResponse,
+  CreateMcpServerRequest,
+  UpdateMcpServerRequest,
+  ImportMcpConfigResponse,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

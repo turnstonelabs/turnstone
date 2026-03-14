@@ -21,8 +21,10 @@ from turnstone.api.console_schemas import (
     ClusterWorkstreamsResponse,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    ImportMcpConfigResponse,
     ListAdminMemoriesResponse,
     ListAuditEventsResponse,
+    ListMcpServersResponse,
     ListOrgsResponse,
     ListPromptTemplatesResponse,
     ListRolesResponse,
@@ -32,6 +34,7 @@ from turnstone.api.console_schemas import (
     ListUserRolesResponse,
     ListWsTemplatesResponse,
     ListWsTemplateVersionsResponse,
+    McpServerDetail,
     NodeDetailResponse,
     OrgInfo,
     PromptTemplateInfo,
@@ -666,6 +669,98 @@ class AsyncTurnstoneConsole(_BaseClient):
             "DELETE", f"/v1/api/admin/settings/{key}", params=params, response_model=StatusResponse
         )
 
+    # -- MCP servers -------------------------------------------------------
+
+    async def list_mcp_servers(self, reveal: bool = False) -> ListMcpServersResponse:
+        """List MCP server definitions with live status."""
+        params: dict[str, str] = {}
+        if reveal:
+            params["reveal"] = "true"
+        return await self._request(
+            "GET",
+            "/v1/api/admin/mcp-servers",
+            params=params,
+            response_model=ListMcpServersResponse,
+        )
+
+    async def create_mcp_server(
+        self,
+        name: str,
+        transport: str,
+        *,
+        command: str = "",
+        args: list[str] | None = None,
+        url: str = "",
+        headers: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        auto_approve: bool = False,
+        enabled: bool = True,
+    ) -> McpServerDetail:
+        """Create an MCP server definition."""
+        body: dict[str, Any] = {"name": name, "transport": transport}
+        if command:
+            body["command"] = command
+        if args:
+            body["args"] = args
+        if url:
+            body["url"] = url
+        if headers:
+            body["headers"] = headers
+        if env:
+            body["env"] = env
+        if auto_approve:
+            body["auto_approve"] = True
+        if not enabled:
+            body["enabled"] = False
+        return await self._request(
+            "POST",
+            "/v1/api/admin/mcp-servers",
+            json_body=body,
+            response_model=McpServerDetail,
+        )
+
+    async def get_mcp_server(self, server_id: str) -> McpServerDetail:
+        """Get a single MCP server with status."""
+        return await self._request(
+            "GET",
+            f"/v1/api/admin/mcp-servers/{server_id}",
+            response_model=McpServerDetail,
+        )
+
+    async def update_mcp_server(self, server_id: str, **fields: Any) -> McpServerDetail:
+        """Update an MCP server definition."""
+        return await self._request(
+            "PUT",
+            f"/v1/api/admin/mcp-servers/{server_id}",
+            json_body=fields,
+            response_model=McpServerDetail,
+        )
+
+    async def delete_mcp_server(self, server_id: str) -> StatusResponse:
+        """Delete an MCP server definition."""
+        return await self._request(
+            "DELETE",
+            f"/v1/api/admin/mcp-servers/{server_id}",
+            response_model=StatusResponse,
+        )
+
+    async def reload_mcp_servers(self) -> StatusResponse:
+        """Tell all nodes to re-read MCP server config from DB."""
+        return await self._request(
+            "POST",
+            "/v1/api/admin/mcp-servers/reload",
+            response_model=StatusResponse,
+        )
+
+    async def import_mcp_config(self, config: dict[str, Any]) -> ImportMcpConfigResponse:
+        """Import MCP servers from a config dict with mcpServers key."""
+        return await self._request(
+            "POST",
+            "/v1/api/admin/mcp-servers/import",
+            json_body={"config": config},
+            response_model=ImportMcpConfigResponse,
+        )
+
 
 class TurnstoneConsole:
     """Synchronous client for the turnstone console API.
@@ -1040,6 +1135,53 @@ class TurnstoneConsole:
 
     def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
         return self._runner.run(self._async.delete_setting(key, node_id=node_id))
+
+    # -- MCP servers -------------------------------------------------------
+
+    def list_mcp_servers(self, reveal: bool = False) -> ListMcpServersResponse:
+        return self._runner.run(self._async.list_mcp_servers(reveal=reveal))
+
+    def create_mcp_server(
+        self,
+        name: str,
+        transport: str,
+        *,
+        command: str = "",
+        args: list[str] | None = None,
+        url: str = "",
+        headers: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        auto_approve: bool = False,
+        enabled: bool = True,
+    ) -> McpServerDetail:
+        return self._runner.run(
+            self._async.create_mcp_server(
+                name,
+                transport,
+                command=command,
+                args=args,
+                url=url,
+                headers=headers,
+                env=env,
+                auto_approve=auto_approve,
+                enabled=enabled,
+            )
+        )
+
+    def get_mcp_server(self, server_id: str) -> McpServerDetail:
+        return self._runner.run(self._async.get_mcp_server(server_id))
+
+    def update_mcp_server(self, server_id: str, **fields: Any) -> McpServerDetail:
+        return self._runner.run(self._async.update_mcp_server(server_id, **fields))
+
+    def delete_mcp_server(self, server_id: str) -> StatusResponse:
+        return self._runner.run(self._async.delete_mcp_server(server_id))
+
+    def reload_mcp_servers(self) -> StatusResponse:
+        return self._runner.run(self._async.reload_mcp_servers())
+
+    def import_mcp_config(self, config: dict[str, Any]) -> ImportMcpConfigResponse:
+        return self._runner.run(self._async.import_mcp_config(config))
 
     # -- lifecycle -----------------------------------------------------------
 

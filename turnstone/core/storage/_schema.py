@@ -445,3 +445,27 @@ system_settings = sa.Table(
 )
 
 sa.Index("idx_system_settings_node", system_settings.c.node_id)
+
+# ---------------------------------------------------------------------------
+# MCP server definitions — database-backed MCP configuration
+# ---------------------------------------------------------------------------
+
+mcp_servers = sa.Table(
+    "mcp_servers",
+    metadata,
+    sa.Column("server_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("transport", sa.Text, nullable=False),  # "stdio" | "streamable-http"
+    sa.Column("command", sa.Text, nullable=False, server_default=""),
+    sa.Column("args", sa.Text, nullable=False, server_default="[]"),  # JSON array
+    sa.Column("url", sa.Text, nullable=False, server_default=""),
+    sa.Column("headers", sa.Text, nullable=False, server_default="{}"),  # JSON object
+    sa.Column("env", sa.Text, nullable=False, server_default="{}"),  # JSON object
+    sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_mcp_servers_enabled", mcp_servers.c.enabled)

@@ -229,7 +229,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "mcp",
             restart_required=True,
             help="Model Context Protocol (MCP) lets the AI connect to external tool servers. "
-            "This points to a JSON file listing which MCP servers to connect to on startup.",
+            "This points to a JSON file listing which MCP servers to connect to on startup. "
+            "Tip: use the MCP Servers tab to manage servers via the database instead.",
             reference_url="https://modelcontextprotocol.io",
         ),
         SettingDef(

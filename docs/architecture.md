@@ -506,8 +506,17 @@ independently, then returns the final content as the tool result.
 and exposes their tools alongside built-in tools. The MCP SDK is fully async; turnstone
 bridges this with a background asyncio event loop in a daemon thread.
 
+**Configuration sources:** MCP servers can be defined in config files (TOML/JSON)
+or in the database via the admin UI. Database-backed definitions are managed
+through the console admin panel's MCP Servers tab and stored in the
+`mcp_servers` table. On startup, `load_mcp_config(storage=)` merges both
+sources. The console can trigger a cluster-wide reload (`POST
+/_internal/mcp-reload`) that causes each node to call `reconcile_sync()`,
+which diffs the running MCP connections against the current DB state and
+adds, removes, or reconnects servers as needed.
+
 **Lifecycle:**
-1. `create_mcp_client()` reads server configs from TOML or JSON
+1. `create_mcp_client()` reads server configs from TOML/JSON and database
 2. `MCPClientManager.start()` launches the background event loop thread
 3. `_connect_all()` connects to each server (stdio subprocess or HTTP), runs
    `initialize()` + `list_tools()`, converts schemas to OpenAI format, detects
@@ -1018,8 +1027,8 @@ Three hierarchical scopes control endpoint access:
 - **Console** is the auth management hub — it hosts the admin endpoints for
   creating users, issuing API tokens, and managing channel mappings. User
   records and token hashes live in the shared storage backend. The console
-  dashboard includes an **admin panel** (13 tabs) for managing
-  credentials, governance, and runtime settings through the browser.
+  dashboard includes an **admin panel** (14 tabs) for managing
+  credentials, governance, MCP servers, and runtime settings through the browser.
 - **Server** is a JWT validator only — it validates tokens on each request but
   never creates users or tokens. Both processes share the same `jwt_secret`
   (via `TURNSTONE_JWT_SECRET` env var or `[auth].jwt_secret` config).
@@ -1393,8 +1402,10 @@ enforcement tracks consumption in `session.send()` with 80% warning and
 100% approval gate via the `__budget_override__` synthetic tool name.
 
 The console admin panel adds 6 governance tabs (Roles, Policies, Templates,
-WS Templates, Usage, Audit), a Memories tab, and a Settings tab (form-based
-editor for all ConfigStore settings) for a total of 13 tabs, all permission-gated.
+WS Templates, Usage, Audit), a Memories tab, a Settings tab (form-based
+editor for all ConfigStore settings), and an MCP Servers tab (database-backed
+server definitions with live connection status and cluster-wide reload) for a
+total of 14 tabs, all permission-gated.
 Both Python and TypeScript SDKs expose governance methods on the console
 client.
 

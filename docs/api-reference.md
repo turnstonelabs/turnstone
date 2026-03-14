@@ -1391,6 +1391,24 @@ the `admin.settings` permission.
 
 ---
 
+### MCP Servers
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/v1/api/admin/mcp-servers` | List all MCP server definitions with live node status. Query: `?reveal=true` to show env/header secrets. |
+| POST | `/v1/api/admin/mcp-servers` | Create an MCP server definition. Body: `{name, transport, command?, args?, url?, headers?, env?, auto_approve?, enabled?}` |
+| GET | `/v1/api/admin/mcp-servers/{server_id}` | Get a single MCP server with per-node connection status. |
+| PUT | `/v1/api/admin/mcp-servers/{server_id}` | Update an MCP server definition. Partial updates supported. |
+| DELETE | `/v1/api/admin/mcp-servers/{server_id}` | Delete an MCP server definition. |
+| POST | `/v1/api/admin/mcp-servers/reload` | Tell all cluster nodes to re-read the `mcp_servers` DB table and reconcile (add new, remove stale, reconnect changed). |
+| POST | `/v1/api/admin/mcp-servers/import` | Import servers from a pasted JSON config. Body: `{config: {mcpServers: {...}}}`. Skips existing names. |
+
+Permission: `admin.mcp`
+
+Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal=true` on GET endpoints to see actual values.
+
+---
+
 ### `OPTIONS` (any path)
 
 Handles CORS preflight requests.

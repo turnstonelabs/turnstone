@@ -784,6 +784,45 @@ class StorageBackend(Protocol):
         """
         ...
 
+    # -- MCP server definitions ------------------------------------------------
+
+    def create_mcp_server(
+        self,
+        server_id: str,
+        name: str,
+        transport: str,
+        command: str = "",
+        args: str = "[]",
+        url: str = "",
+        headers: str = "{}",
+        env: str = "{}",
+        auto_approve: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        """Create an MCP server definition. No-op if server_id already exists."""
+        ...
+
+    def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
+        """Return MCP server dict or None."""
+        ...
+
+    def get_mcp_server_by_name(self, name: str) -> dict[str, Any] | None:
+        """Return MCP server dict by name or None."""
+        ...
+
+    def list_mcp_servers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """Return MCP servers ordered by name."""
+        ...
+
+    def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
+        """Update specified fields on an MCP server. Returns True if found."""
+        ...
+
+    def delete_mcp_server(self, server_id: str) -> bool:
+        """Delete an MCP server definition. Returns True if existed."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

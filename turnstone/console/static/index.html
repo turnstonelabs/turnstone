@@ -107,6 +107,7 @@
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
           <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
+          <button id="tab-mcp" class="admin-nav" data-tab="mcp" role="tab" aria-selected="false" aria-controls="admin-mcp" tabindex="-1" onclick="switchAdminTab('mcp')">MCP Servers</button>
         </div>
       </nav>
       <div id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" aria-hidden="true"></div>
@@ -390,6 +391,27 @@
       </div>
       <div id="admin-settings-content">
         <div class="dashboard-empty">Loading&hellip;</div>
+      </div>
+    </div>
+
+    <div id="admin-mcp" class="admin-panel" role="tabpanel" aria-labelledby="tab-mcp" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header">MCP SERVERS</span>
+        <button class="admin-action-btn admin-action-btn-ghost" onclick="reloadMcpNodes()" title="Push MCP server config to all cluster nodes and reconnect">Sync to Nodes</button>
+        <button class="admin-action-btn admin-action-btn-ghost" onclick="showImportMcpModal()">Import JSON</button>
+        <button class="admin-action-btn" onclick="showCreateMcpModal()">+ Add Server</button>
+      </div>
+      <div class="admin-colheaders mcp-grid" aria-hidden="true">
+        <span class="admin-col admin-col-mname">NAME</span>
+        <span class="admin-col admin-col-mtransport">TRANSPORT</span>
+        <span class="admin-col admin-col-mtools">TOOLS</span>
+        <span class="admin-col admin-col-mres">RES</span>
+        <span class="admin-col admin-col-mprompts">PROMPTS</span>
+        <span class="admin-col admin-col-mstatus">STATUS</span>
+        <span class="admin-col admin-col-mactions">ACTIONS</span>
+      </div>
+      <div id="admin-mcp-table" role="list" aria-label="MCP servers">
+        <div class="dashboard-empty">Loading...</div>
       </div>
     </div>
 
@@ -968,6 +990,67 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideMemoryDetailModal()">Close</button>
       <button id="mem-detail-delete" class="modal-submit admin-btn-danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="mcp-create-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="mcp-create-title">
+  <div id="mcp-create-box" class="admin-modal">
+    <h2 id="mcp-create-title">Add MCP Server</h2>
+    <div id="mcp-create-error" role="alert" aria-live="assertive" style="display:none"></div>
+    <input type="hidden" id="mcp-edit-id" value="">
+    <label for="mcp-name">Server Name</label>
+    <input type="text" id="mcp-name" placeholder="e.g. filesystem" maxlength="64" pattern="[a-zA-Z0-9._-]+">
+    <label for="mcp-transport">Transport</label>
+    <select id="mcp-transport" onchange="toggleMcpTransport()">
+      <option value="stdio">stdio</option>
+      <option value="streamable-http">streamable-http</option>
+    </select>
+    <div id="mcp-stdio-fields">
+      <label for="mcp-command">Command</label>
+      <input type="text" id="mcp-command" placeholder="e.g. npx">
+      <label for="mcp-args">Arguments <span style="font-weight:400;text-transform:none">(one per line)</span></label>
+      <textarea id="mcp-args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/tmp"></textarea>
+      <label for="mcp-env">Environment Variables <span style="font-weight:400;text-transform:none">(KEY=VALUE, one per line)</span></label>
+      <textarea id="mcp-env" rows="2" placeholder="API_KEY=..."></textarea>
+    </div>
+    <div id="mcp-http-fields" style="display:none">
+      <label for="mcp-url">URL</label>
+      <input type="text" id="mcp-url" placeholder="https://...">
+      <label for="mcp-headers">Headers <span style="font-weight:400;text-transform:none">(KEY: VALUE, one per line)</span></label>
+      <textarea id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea>
+    </div>
+    <div style="display:flex;gap:20px;margin-top:14px">
+      <label style="margin:0;font-size:12px;color:var(--fg-dim)"><input type="checkbox" id="mcp-auto-approve" style="margin-right:5px">Auto-approve tools</label>
+      <label style="margin:0;font-size:12px;color:var(--fg-dim)"><input type="checkbox" id="mcp-enabled" checked style="margin-right:5px">Enabled</label>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateMcpModal()">Cancel</button>
+      <button id="mcp-create-submit" class="modal-submit" onclick="submitCreateMcp()">Create</button>
+    </div>
+  </div>
+</div>
+
+<div id="mcp-import-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="mcp-import-title">
+  <div id="mcp-import-box" class="admin-modal">
+    <h2 id="mcp-import-title">Import MCP Config</h2>
+    <div id="mcp-import-error" role="alert" aria-live="assertive" style="display:none"></div>
+    <label for="mcp-import-json">Paste JSON</label>
+    <textarea id="mcp-import-json" rows="10" placeholder='{"mcpServers":{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}}}'  style="font-family:var(--font-mono);font-size:11px"></textarea>
+    <p style="font-size:11px;color:var(--fg-dim);margin-top:8px">Paste a JSON object with a <code>mcpServers</code> key (Claude Desktop / VS Code / Cursor format). Existing servers with the same name will be skipped.</p>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideImportMcpModal()">Cancel</button>
+      <button id="mcp-import-submit" class="modal-submit" onclick="submitImportMcp()">Import</button>
+    </div>
+  </div>
+</div>
+
+<div id="mcp-detail-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="mcp-detail-title">
+  <div id="mcp-detail-box" class="admin-modal admin-modal-wide mcp-detail-modal">
+    <h2 id="mcp-detail-title">MCP Server Detail</h2>
+    <div id="mcp-detail-content"></div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideMcpDetailModal()">Close</button>
     </div>
   </div>
 </div>

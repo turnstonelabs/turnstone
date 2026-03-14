@@ -16,7 +16,26 @@ participant "ChatSession\n(session.py)" as Session <<session>>
 participant "StorageBackend\n(governance)" as Storage <<storage>>
 participant "Server / Console\n(health + UI)" as UI <<server>>
 
+participant "Console Admin UI\n(admin panel)" as Admin <<ui>>
+participant "Database\n(mcp_servers table)" as DB <<storage>>
+
+== Admin-Driven Configuration ==
+
+Admin -> DB : CRUD MCP server definitions\n(POST/PUT/DELETE /v1/api/admin/mcp-servers)
+
+Admin -> UI : POST /v1/api/admin/mcp-servers/reload
+UI -> MCPMgr : POST /_internal/mcp-reload\n(forwarded to each node)
+MCPMgr -> MCPMgr : reconcile_sync()
+note right
+  Diffs running servers against DB:
+  - New entries → connect
+  - Removed entries → disconnect
+  - Changed entries → reconnect
+end note
+
 == Startup: Connection & Discovery ==
+
+MCPMgr -> DB : load_mcp_config(storage=)\n(merge config file + DB)
 
 MCPMgr -> MCPSrv : initialize (stdio or HTTP)
 MCPSrv --> MCPMgr : capabilities\n(tools, resources, prompts)

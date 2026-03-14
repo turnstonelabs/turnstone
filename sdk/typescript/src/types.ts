@@ -728,6 +728,67 @@ export interface AdminSearchMemoriesOptions {
   limit?: number;
 }
 
+// -- Console API: MCP Servers -----------------------------------------------
+
+export interface McpServerStatus {
+  connected: boolean;
+  tools: number;
+  resources: number;
+  prompts: number;
+  error: string;
+}
+
+export interface McpServerDetail {
+  server_id: string;
+  name: string;
+  transport: string;
+  command: string;
+  args: string;
+  url: string;
+  headers: string;
+  env: string;
+  auto_approve: boolean;
+  enabled: boolean;
+  created_by: string;
+  created: string;
+  updated: string;
+  status: Record<string, McpServerStatus>;
+}
+
+export interface ListMcpServersResponse {
+  servers: McpServerDetail[];
+}
+
+export interface CreateMcpServerRequest {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auto_approve?: boolean;
+  enabled?: boolean;
+}
+
+export interface UpdateMcpServerRequest {
+  name?: string;
+  transport?: string;
+  command?: string;
+  args?: string[];
+  url?: string;
+  headers?: Record<string, string>;
+  env?: Record<string, string>;
+  auto_approve?: boolean;
+  enabled?: boolean;
+}
+
+export interface ImportMcpConfigResponse {
+  imported: string[];
+  skipped: string[];
+  errors: string[];
+}
+
 // -- Console API: System Settings -------------------------------------------
 
 export interface SettingInfo {

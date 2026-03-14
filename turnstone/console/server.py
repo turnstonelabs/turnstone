@@ -1513,6 +1513,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.judge",
         "admin.memories",
         "admin.settings",
+        "admin.mcp",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2969,6 +2970,514 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: MCP Servers
+# ---------------------------------------------------------------------------
+
+_MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_MCP_MAX_SERVERS = 50
+
+
+def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
+    """Replace env/headers values with '***' unless reveal is True."""
+    if reveal:
+        return server
+    s = dict(server)
+    if s.get("env") and s["env"] != "{}":
+        try:
+            env_dict = json.loads(s["env"]) if isinstance(s["env"], str) else s["env"]
+            s["env"] = json.dumps({k: "***" for k in env_dict})
+        except (json.JSONDecodeError, TypeError):
+            s["env"] = "{}"
+    if s.get("headers") and s["headers"] != "{}":
+        try:
+            hdr_dict = json.loads(s["headers"]) if isinstance(s["headers"], str) else s["headers"]
+            s["headers"] = json.dumps({k: "***" for k in hdr_dict})
+        except (json.JSONDecodeError, TypeError):
+            s["headers"] = "{}"
+    return s
+
+
+def _mcp_server_to_detail(
+    server: dict[str, Any],
+    node_statuses: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Convert a storage dict to a McpServerDetail-shaped dict."""
+    d = dict(server)
+    d["status"] = node_statuses or {}
+    return d
+
+
+async def _collect_mcp_status(
+    request: Request,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
+    collector: ClusterCollector = request.app.state.collector
+    nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
+    result: dict[str, dict[str, dict[str, Any]]] = {}
+    for node in nodes:
+        node_id = node.get("node_id", "")
+        url = node.get("server_url", "")
+        if not url:
+            continue
+        try:
+            headers = _proxy_auth_headers(request)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
+                resp = await client.get(
+                    f"{url.rstrip('/')}/v1/api/_internal/mcp-status",
+                    headers=headers,
+                )
+                if resp.status_code == 200:
+                    result[node_id] = resp.json().get("servers", {})
+        except Exception:
+            pass
+    return result
+
+
+async def admin_list_mcp_servers(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/mcp-servers — list all MCP server definitions."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    reveal = str(request.query_params.get("reveal", "")).lower() in ("true", "1")
+    servers = storage.list_mcp_servers()
+
+    # Collect live status from all nodes
+    node_statuses = await _collect_mcp_status(request)
+
+    db_names: set[str] = set()
+    result = []
+    for s in servers:
+        db_names.add(s["name"])
+        # Build per-node status for this server
+        per_node: dict[str, dict[str, Any]] = {}
+        for node_id, node_servers in node_statuses.items():
+            status = node_servers.get(s["name"])
+            if status:
+                per_node[node_id] = status
+        s = _mask_mcp_secrets(s, reveal)
+        result.append(_mcp_server_to_detail(s, per_node))
+
+    # Merge config-sourced servers visible on nodes but not in DB
+    config_names: set[str] = set()
+    for node_servers in node_statuses.values():
+        for name in node_servers:
+            if name not in db_names:
+                config_names.add(name)
+    for name in sorted(config_names):
+        # Build a synthetic read-only entry from node-reported data
+        per_node = {}
+        transport = "stdio"
+        command = ""
+        url = ""
+        for node_id, node_servers in node_statuses.items():
+            ns = node_servers.get(name)
+            if ns:
+                per_node[node_id] = ns
+                transport = ns.get("transport", "stdio")
+                command = ns.get("command", "")
+                url = ns.get("url", "")
+        result.append(
+            {
+                "server_id": "",
+                "name": name,
+                "transport": transport,
+                "command": command,
+                "args": "[]",
+                "url": url,
+                "headers": "{}",
+                "env": "{}",
+                "auto_approve": False,
+                "enabled": True,
+                "created_by": "",
+                "created": "",
+                "updated": "",
+                "source": "config",
+                "status": per_node,
+            }
+        )
+
+    return JSONResponse({"servers": result})
+
+
+async def admin_create_mcp_server(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers — create an MCP server definition."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:64]
+    transport = str(body.get("transport", "")).strip()
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if not _MCP_NAME_RE.match(name):
+        return JSONResponse(
+            {"error": "name must match [a-zA-Z0-9._-]+"},
+            status_code=400,
+        )
+    if "__" in name:
+        return JSONResponse(
+            {"error": "name must not contain '__' (reserved delimiter)"},
+            status_code=400,
+        )
+    if transport not in ("stdio", "streamable-http"):
+        return JSONResponse(
+            {"error": "transport must be 'stdio' or 'streamable-http'"},
+            status_code=400,
+        )
+
+    # Check max servers
+    existing = storage.list_mcp_servers()
+    if len(existing) >= _MCP_MAX_SERVERS:
+        return JSONResponse(
+            {"error": f"Maximum {_MCP_MAX_SERVERS} servers"},
+            status_code=400,
+        )
+
+    # Check name uniqueness
+    if storage.get_mcp_server_by_name(name):
+        return JSONResponse(
+            {"error": f"Server '{name}' already exists"},
+            status_code=409,
+        )
+
+    server_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    args_list = body.get("args", [])
+    headers_dict = body.get("headers", {})
+    env_dict = body.get("env", {})
+
+    storage.create_mcp_server(
+        server_id=server_id,
+        name=name,
+        transport=transport,
+        command=str(body.get("command", "")).strip(),
+        args=json.dumps(args_list) if isinstance(args_list, list) else "[]",
+        url=str(body.get("url", "")).strip(),
+        headers=json.dumps(headers_dict) if isinstance(headers_dict, dict) else "{}",
+        env=json.dumps(env_dict) if isinstance(env_dict, dict) else "{}",
+        auto_approve=bool(body.get("auto_approve", False)),
+        enabled=bool(body.get("enabled", True)),
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "mcp_server.create",
+        "mcp_server",
+        server_id,
+        {"name": name},
+        ip,
+    )
+
+    server = storage.get_mcp_server(server_id)
+    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+
+
+async def admin_get_mcp_server(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/mcp-servers/{server_id} — get single MCP server."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    server_id = request.path_params["server_id"]
+    server = storage.get_mcp_server(server_id)
+    if server is None:
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
+
+    node_statuses = await _collect_mcp_status(request)
+    per_node: dict[str, dict[str, Any]] = {}
+    for node_id, node_servers in node_statuses.items():
+        status = node_servers.get(server["name"])
+        if status:
+            per_node[node_id] = status
+
+    reveal = str(request.query_params.get("reveal", "")).lower() in ("true", "1")
+    server = _mask_mcp_secrets(server, reveal)
+    return JSONResponse(_mcp_server_to_detail(server, per_node))
+
+
+async def admin_update_mcp_server(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/mcp-servers/{server_id} — update an MCP server."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    server_id = request.path_params["server_id"]
+    existing = storage.get_mcp_server(server_id)
+    if existing is None:
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "name" in body:
+        name = str(body["name"]).strip()[:64]
+        if not name:
+            return JSONResponse({"error": "name cannot be empty"}, status_code=400)
+        if not _MCP_NAME_RE.match(name):
+            return JSONResponse(
+                {"error": "name must match [a-zA-Z0-9._-]+"},
+                status_code=400,
+            )
+        if "__" in name:
+            return JSONResponse(
+                {"error": "name must not contain '__'"},
+                status_code=400,
+            )
+        if name != existing["name"] and storage.get_mcp_server_by_name(name):
+            return JSONResponse(
+                {"error": f"Server '{name}' already exists"},
+                status_code=409,
+            )
+        updates["name"] = name
+    if "transport" in body:
+        transport = str(body["transport"]).strip()
+        if transport not in ("stdio", "streamable-http"):
+            return JSONResponse(
+                {"error": "transport must be 'stdio' or 'streamable-http'"},
+                status_code=400,
+            )
+        updates["transport"] = transport
+    if "command" in body:
+        updates["command"] = str(body["command"]).strip()
+    if "args" in body:
+        updates["args"] = json.dumps(body["args"]) if isinstance(body["args"], list) else "[]"
+    if "url" in body:
+        updates["url"] = str(body["url"]).strip()
+    if "headers" in body:
+        updates["headers"] = (
+            json.dumps(body["headers"]) if isinstance(body["headers"], dict) else "{}"
+        )
+    if "env" in body:
+        updates["env"] = json.dumps(body["env"]) if isinstance(body["env"], dict) else "{}"
+    if "auto_approve" in body:
+        updates["auto_approve"] = bool(body["auto_approve"])
+    if "enabled" in body:
+        updates["enabled"] = bool(body["enabled"])
+
+    if updates:
+        storage.update_mcp_server(server_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    audit_detail = dict(updates)
+    for _secret_key in ("env", "headers"):
+        if _secret_key in audit_detail:
+            audit_detail[_secret_key] = "(updated)"
+    record_audit(
+        storage,
+        audit_uid,
+        "mcp_server.update",
+        "mcp_server",
+        server_id,
+        audit_detail,
+        ip,
+    )
+
+    server = storage.get_mcp_server(server_id)
+    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server or {})))
+
+
+async def admin_delete_mcp_server(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/mcp-servers/{server_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    server_id = request.path_params["server_id"]
+    existing = storage.get_mcp_server(server_id)
+    if existing is None:
+        return JSONResponse({"error": "MCP server not found"}, status_code=404)
+
+    storage.delete_mcp_server(server_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "mcp_server.delete",
+        "mcp_server",
+        server_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
+    """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
+    collector: ClusterCollector = request.app.state.collector
+    nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
+    results: dict[str, Any] = {}
+
+    for node in nodes:
+        node_id = node.get("node_id", "")
+        url = node.get("server_url", "")
+        if not url:
+            continue
+        try:
+            headers = _proxy_auth_headers(request)
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+                resp = await client.post(
+                    f"{url.rstrip('/')}/v1/api/_internal/mcp-reload",
+                    headers=headers,
+                )
+                results[node_id] = resp.json()
+        except Exception as exc:
+            results[node_id] = {"error": str(exc)}
+
+    return results
+
+
+async def admin_mcp_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/reload — tell nodes to re-read DB."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    results = await _notify_nodes_mcp_reload(request)
+    return JSONResponse({"status": "ok", "results": results})
+
+
+async def admin_import_mcp_config(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-servers/import — import from pasted JSON config."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    data = body.get("config")
+    if not isinstance(data, dict):
+        return JSONResponse(
+            {"error": "config is required (JSON object with mcpServers key)"}, status_code=400
+        )
+
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict) or not servers:
+        return JSONResponse(
+            {"error": "No mcpServers found in config"},
+            status_code=400,
+        )
+
+    imported: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    audit_uid, ip = _audit_context(request)
+    current_count = len(storage.list_mcp_servers())
+
+    for srv_name, cfg in servers.items():
+        srv_name = str(srv_name).strip()[:64]
+        if not srv_name or not _MCP_NAME_RE.match(srv_name) or "__" in srv_name:
+            errors.append(f"{srv_name}: invalid server name")
+            continue
+        if storage.get_mcp_server_by_name(srv_name):
+            skipped.append(srv_name)
+            continue
+        if current_count >= _MCP_MAX_SERVERS:
+            errors.append(f"{srv_name}: max servers reached")
+            break
+
+        transport = "stdio"
+        if "url" in cfg or cfg.get("type") in ("http", "streamable-http"):
+            transport = "streamable-http"
+
+        server_id = uuid.uuid4().hex
+        try:
+            storage.create_mcp_server(
+                server_id=server_id,
+                name=srv_name,
+                transport=transport,
+                command=str(cfg.get("command", "")),
+                args=json.dumps(cfg.get("args", [])),
+                url=str(cfg.get("url", "")),
+                headers=json.dumps(cfg.get("headers", {})),
+                env=json.dumps(cfg.get("env", {})),
+                auto_approve=False,
+                enabled=True,
+                created_by=audit_uid,
+            )
+            imported.append(srv_name)
+            current_count += 1
+        except Exception as exc:
+            errors.append(f"{srv_name}: {exc}")
+
+    if imported:
+        record_audit(
+            storage,
+            audit_uid,
+            "mcp_server.import",
+            "mcp_server",
+            "",
+            {"imported": imported, "skipped": skipped},
+            ip,
+        )
+
+    return JSONResponse({"imported": imported, "skipped": skipped, "errors": errors})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -3129,6 +3638,37 @@ def create_app(
                     Route(
                         "/api/admin/settings/{key:path}",
                         admin_delete_setting,
+                        methods=["DELETE"],
+                    ),
+                    # System: MCP Servers
+                    Route("/api/admin/mcp-servers", admin_list_mcp_servers),
+                    Route(
+                        "/api/admin/mcp-servers",
+                        admin_create_mcp_server,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/import",
+                        admin_import_mcp_config,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/reload",
+                        admin_mcp_reload,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{server_id}",
+                        admin_get_mcp_server,
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{server_id}",
+                        admin_update_mcp_server,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/mcp-servers/{server_id}",
+                        admin_delete_mcp_server,
                         methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit
