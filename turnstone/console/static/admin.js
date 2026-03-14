@@ -63,6 +63,7 @@ function showAdmin() {
     "ws-templates": "admin.ws_templates",
     usage: "admin.usage",
     audit: "admin.audit",
+    settings: "admin.users",
   };
   if (perms) {
     var permSet = perms.split(",");
@@ -87,15 +88,17 @@ function showAdmin() {
     groups[g].style.display = visibleInGroup.length > 0 ? "" : "none";
   }
 
-  // Mobile: ensure sidebar starts hidden; desktop: ensure it's accessible
+  // Mobile: ensure sidebar starts hidden + inert; desktop: ensure it's accessible
   var sidebar = document.getElementById("admin-sidebar");
   if (window.innerWidth <= 700) {
     _mobileSidebarOpen = false;
     sidebar.classList.add("collapsed");
     sidebar.classList.remove("open");
     sidebar.setAttribute("aria-hidden", "true");
+    sidebar.setAttribute("inert", "");
   } else {
     sidebar.removeAttribute("aria-hidden");
+    sidebar.removeAttribute("inert");
   }
 
   // Mobile backdrop listener (idempotent)
@@ -158,6 +161,8 @@ function _toggleMobileSidebar() {
   sidebar.classList.toggle("open", _mobileSidebarOpen);
   sidebar.classList.toggle("collapsed", !_mobileSidebarOpen);
   sidebar.setAttribute("aria-hidden", _mobileSidebarOpen ? "false" : "true");
+  if (_mobileSidebarOpen) sidebar.removeAttribute("inert");
+  else sidebar.setAttribute("inert", "");
   var backdrop = document.getElementById("admin-sidebar-backdrop");
   if (backdrop) backdrop.classList.toggle("visible", _mobileSidebarOpen);
 }
@@ -1704,6 +1709,34 @@ document.addEventListener("keydown", function (e) {
       '.admin-nav[data-tab="' + navOrder[idx] + '"]',
     );
     if (btn) btn.focus();
+  });
+})();
+
+// Sync sidebar aria-hidden/inert when crossing mobile/desktop breakpoint
+(function () {
+  var resizeTimer;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function () {
+      if (typeof currentView === "undefined" || currentView !== "admin") return;
+      var sidebar = document.getElementById("admin-sidebar");
+      if (!sidebar) return;
+      var isMobile = window.innerWidth <= 700;
+      var backdrop = document.getElementById("admin-sidebar-backdrop");
+      if (isMobile && !_mobileSidebarOpen) {
+        sidebar.setAttribute("aria-hidden", "true");
+        sidebar.setAttribute("inert", "");
+        sidebar.classList.add("collapsed");
+        sidebar.classList.remove("open");
+        if (backdrop) backdrop.classList.remove("visible");
+      } else if (!isMobile) {
+        sidebar.removeAttribute("aria-hidden");
+        sidebar.removeAttribute("inert");
+        sidebar.classList.remove("collapsed", "open");
+        if (backdrop) backdrop.classList.remove("visible");
+        _mobileSidebarOpen = false;
+      }
+    }, 150);
   });
 })();
 
