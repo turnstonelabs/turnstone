@@ -1547,7 +1547,7 @@ async def auth_setup(request: Request) -> Response:
     return await handle_auth_setup(request, JWT_AUD_SERVER)
 
 
-async def config_reload(request: Request) -> JSONResponse:
+def config_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/config-reload — invalidate config cache."""
     cs = getattr(request.app.state, "config_store", None)
     if not cs:
@@ -1959,7 +1959,7 @@ def main() -> None:
         enabled=config_store.get("ratelimit.enabled"),
         rate=config_store.get("ratelimit.requests_per_second"),
         burst=config_store.get("ratelimit.burst"),
-        trusted_proxies="",  # configured via network policy, not ConfigStore
+        trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
 
     # Set up global event queue for state-change broadcasts
@@ -2025,7 +2025,7 @@ def main() -> None:
             temperature=config_store.get("model.temperature"),
             max_tokens=config_store.get("model.max_tokens"),
             tool_timeout=config_store.get("tools.timeout"),
-            reasoning_effort=config_store.get("model.reasoning_effort") or "medium",
+            reasoning_effort=config_store.get("model.reasoning_effort"),
             context_window=r_cfg.context_window,
             compact_max_tokens=config_store.get("session.compact_max_tokens"),
             auto_compact_pct=config_store.get("session.auto_compact_pct"),

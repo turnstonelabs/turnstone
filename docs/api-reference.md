@@ -1263,21 +1263,17 @@ the `admin.settings` permission.
     {
       "key": "model.temperature",
       "value": 0.7,
-      "default": 0.5,
+      "source": "storage",
       "type": "float",
       "description": "Sampling temperature",
       "section": "model",
       "is_secret": false,
-      "is_stored": true,
-      "restart_required": false,
-      "min_value": 0.0,
-      "max_value": 2.0,
-      "choices": null,
+      "node_id": "",
       "changed_by": "admin",
-      "updated": "2026-03-14T10:00:00"
+      "updated": "2026-03-14T10:00:00",
+      "restart_required": false
     }
-  ],
-  "total": 40
+  ]
 }
 ```
 
@@ -1292,7 +1288,7 @@ the `admin.settings` permission. Useful for building dynamic admin UIs.
 
 ```json
 {
-  "settings": [
+  "schema": [
     {
       "key": "model.temperature",
       "type": "float",
@@ -1300,13 +1296,12 @@ the `admin.settings` permission. Useful for building dynamic admin UIs.
       "description": "Sampling temperature",
       "section": "model",
       "is_secret": false,
-      "restart_required": false,
       "min_value": 0.0,
       "max_value": 2.0,
-      "choices": null
+      "choices": null,
+      "restart_required": false
     }
-  ],
-  "total": 40
+  ]
 }
 ```
 
@@ -1344,7 +1339,15 @@ Secret settings (`is_secret=true`) return `403`.
 {
   "key": "model.temperature",
   "value": 0.7,
-  "previous": 0.5
+  "source": "storage",
+  "type": "float",
+  "description": "Sampling temperature",
+  "section": "model",
+  "is_secret": false,
+  "node_id": "",
+  "changed_by": "admin",
+  "updated": "",
+  "restart_required": false
 }
 ```
 
@@ -1352,7 +1355,7 @@ Secret settings (`is_secret=true`) return `403`.
 
 | Status | Condition |
 |--------|-----------|
-| 400    | Unknown key, invalid value, type mismatch, out of range |
+| 400    | Unknown key, invalid value, type mismatch, out of range, missing `value` field |
 | 403    | Secret setting (must use config.toml or env) |
 
 ---

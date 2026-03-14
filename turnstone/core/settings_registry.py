@@ -73,9 +73,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "session.retention_days",
             "int",
             90,
-            "Days to retain conversation history",
+            "Days to retain conversation history (0 = disabled)",
             "session",
-            min_value=1,
+            min_value=0,
         ),
         SettingDef(
             "session.compact_max_tokens",
@@ -194,11 +194,11 @@ def _build_registry() -> dict[str, SettingDef]:
         ),
         SettingDef(
             "ratelimit.requests_per_second",
-            "int",
-            10,
+            "float",
+            10.0,
             "Max requests per second per IP",
             "ratelimit",
-            min_value=1,
+            min_value=1.0,
             restart_required=True,
         ),
         SettingDef(
@@ -208,6 +208,14 @@ def _build_registry() -> dict[str, SettingDef]:
             "Burst allowance above rate limit",
             "ratelimit",
             min_value=1,
+            restart_required=True,
+        ),
+        SettingDef(
+            "ratelimit.trusted_proxies",
+            "str",
+            "",
+            "Trusted proxy CIDRs for X-Forwarded-For parsing (comma-separated)",
+            "ratelimit",
             restart_required=True,
         ),
         # -- health ---------------------------------------------------------

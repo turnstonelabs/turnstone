@@ -2728,6 +2728,33 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _publish_config_change(request: Request, *, key: str, node_id: str, action: str) -> None:
+    """Fan out config-reload to all known server nodes (best-effort).
+
+    Uses the collector's node registry and the existing proxy auth
+    mechanism — no MQ dependency.
+    """
+    import contextlib
+
+    import httpx
+
+    collector = getattr(request.app.state, "collector", None)
+    if not collector:
+        return
+    headers = _proxy_auth_headers(request)
+    with contextlib.suppress(Exception):
+        nodes = collector.get_nodes()
+        for node in nodes.get("nodes", []):
+            url = node.get("url", "")
+            if url:
+                with contextlib.suppress(Exception):
+                    httpx.post(
+                        f"{url}/v1/api/_internal/config-reload",
+                        headers=headers,
+                        timeout=5.0,
+                    )
+
+
 async def admin_list_settings(request: Request) -> JSONResponse:
     """GET /v1/api/admin/settings — list all settings with effective values."""
     from turnstone.core.auth import require_permission
@@ -2742,7 +2769,7 @@ async def admin_list_settings(request: Request) -> JSONResponse:
         return err
 
     reveal = request.query_params.get("reveal") == "true"
-    stored = {r["key"]: r for r in storage.list_system_settings()}
+    stored = {r["key"]: r for r in storage.list_system_settings() if r.get("node_id", "") == ""}
 
     settings: list[dict[str, Any]] = []
     for key, defn in sorted(SETTINGS.items()):
@@ -2849,6 +2876,9 @@ async def admin_update_setting(request: Request) -> JSONResponse:
             status_code=403,
         )
 
+    if "value" not in body:
+        return JSONResponse({"error": "value is required"}, status_code=400)
+
     raw_value = body.get("value")
     try:
         typed_value = validate_value(key, raw_value)
@@ -2875,6 +2905,8 @@ async def admin_update_setting(request: Request) -> JSONResponse:
         {"value": "***" if defn.is_secret else typed_value, "node_id": node_id},
         ip,
     )
+
+    _publish_config_change(request, key=key, node_id=node_id, action="set")
 
     return JSONResponse(
         {
@@ -2928,6 +2960,8 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
         {"node_id": node_id},
         ip,
     )
+
+    _publish_config_change(request, key=key, node_id=node_id, action="delete")
 
     return JSONResponse({"status": "ok", "key": key})
 

@@ -109,21 +109,17 @@ List all settings with their effective values, defaults, and metadata.
     {
       "key": "model.temperature",
       "value": 0.7,
-      "default": 0.5,
+      "source": "storage",
       "type": "float",
       "description": "Sampling temperature",
       "section": "model",
       "is_secret": false,
-      "is_stored": true,
-      "restart_required": false,
-      "min_value": 0.0,
-      "max_value": 2.0,
-      "choices": null,
+      "node_id": "",
       "changed_by": "admin",
-      "updated": "2026-03-14T10:00:00"
+      "updated": "2026-03-14T10:00:00",
+      "restart_required": false
     }
-  ],
-  "total": 40
+  ]
 }
 ```
 
@@ -138,7 +134,7 @@ for building dynamic admin UIs.
 
 ```json
 {
-  "settings": [
+  "schema": [
     {
       "key": "model.temperature",
       "type": "float",
@@ -146,13 +142,12 @@ for building dynamic admin UIs.
       "description": "Sampling temperature",
       "section": "model",
       "is_secret": false,
-      "restart_required": false,
       "min_value": 0.0,
       "max_value": 2.0,
-      "choices": null
+      "choices": null,
+      "restart_required": false
     }
-  ],
-  "total": 40
+  ]
 }
 ```
 
@@ -190,7 +185,15 @@ API -- they must be configured via config.toml or environment variables.
 {
   "key": "model.temperature",
   "value": 0.7,
-  "previous": 0.5
+  "source": "storage",
+  "type": "float",
+  "description": "Sampling temperature",
+  "section": "model",
+  "is_secret": false,
+  "node_id": "",
+  "changed_by": "admin",
+  "updated": "",
+  "restart_required": false
 }
 ```
 
@@ -240,7 +243,7 @@ from the write API with a `403` response. This prevents accidental exposure
 through the admin UI or audit logs. Secret settings must be configured via
 `config.toml` or environment variables.
 
-The list endpoint masks secret values: stored secrets appear as `"********"`
+The list endpoint masks secret values: stored secrets appear as `"***"`
 rather than their actual value.
 
 ---
@@ -300,7 +303,7 @@ with TurnstoneConsole("http://localhost:9090", token="tok_xxx") as admin:
     # List all settings with effective values
     result = admin.list_settings()
     for s in result["settings"]:
-        print(f"{s['key']} = {s['value']} (default: {s['default']})")
+        print(f"{s['key']} = {s['value']} (source: {s['source']})")
 
     # Get the schema catalog
     schema = admin.get_settings_schema()
@@ -328,7 +331,7 @@ const admin = new TurnstoneConsole({
 // List all settings
 const result = await admin.listSettings();
 for (const s of result.settings) {
-  console.log(`${s.key} = ${s.value} (default: ${s.default})`);
+  console.log(`${s.key} = ${s.value} (source: ${s.source})`);
 }
 
 // Get schema catalog

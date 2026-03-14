@@ -164,11 +164,10 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/workstreams/close",
         "/api/cluster/workstreams/new",
         "/api/memories",
-        "/api/_internal/config-reload",
     }
 )
 
-APPROVE_PATHS: frozenset[str] = frozenset({"/api/approve"})
+APPROVE_PATHS: frozenset[str] = frozenset({"/api/approve", "/api/_internal/config-reload"})
 ADMIN_PREFIX = "/api/admin/"
 
 
