@@ -9,8 +9,8 @@ from typing import Any, Protocol, runtime_checkable
 class StorageBackend(Protocol):
     """Protocol that every storage backend adapter must implement.
 
-    Provides workstream management, conversation persistence, key-value storage
-    (for memories), and full-text search.
+    Provides workstream management, conversation persistence, structured
+    memories, and full-text search.
     """
 
     # -- Core conversation operations ------------------------------------------
@@ -71,26 +71,64 @@ class StorageBackend(Protocol):
         """Set or update the auto-generated title for a workstream."""
         ...
 
-    # -- Generic key-value store (backs memories table) ------------------------
+    # -- Structured memories ---------------------------------------------------
 
-    def kv_get(self, key: str) -> str | None:
-        """Get a value by key. Returns None if not found."""
+    def create_structured_memory(
+        self,
+        memory_id: str,
+        name: str,
+        description: str,
+        mem_type: str,
+        scope: str,
+        scope_id: str,
+        content: str,
+    ) -> None:
+        """Create a structured memory record."""
         ...
 
-    def kv_set(self, key: str, value: str) -> str | None:
-        """Set a key-value pair. Returns the previous value if it existed."""
+    def get_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        """Return structured memory dict or None."""
         ...
 
-    def kv_delete(self, key: str) -> bool:
-        """Delete a key. Returns True if the key existed."""
+    def get_structured_memory_by_name(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> dict[str, str] | None:
+        """Lookup structured memory by (name, scope, scope_id). Returns dict or None."""
         ...
 
-    def kv_list(self) -> list[tuple[str, str]]:
-        """Return all (key, value) pairs sorted by key."""
+    def update_structured_memory(self, memory_id: str, **fields: str) -> bool:
+        """Update specified fields on a structured memory. Returns True if found."""
         ...
 
-    def kv_search(self, query: str) -> list[tuple[str, str]]:
-        """Search key-value pairs by query. Returns matching (key, value) pairs."""
+    def delete_structured_memory(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> bool:
+        """Delete a structured memory by (name, scope, scope_id). Returns True if existed."""
+        ...
+
+    def list_structured_memories(
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        """Return structured memories with optional filters, ordered by updated DESC."""
+        ...
+
+    def search_structured_memories(
+        self,
+        query: str,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        """Search structured memories by query. Returns matching memory dicts."""
+        ...
+
+    def count_structured_memories(self, scope: str = "", scope_id: str = "") -> int:
+        """Count structured memories with optional scope filter."""
         ...
 
     # -- Workstream operations -------------------------------------------------

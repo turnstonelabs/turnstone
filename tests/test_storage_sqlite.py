@@ -215,46 +215,6 @@ class TestWorkstreamMetadata:
         assert backend.get_workstream_display_name("s1") == "Alias"
 
 
-# -- Key-value store -----------------------------------------------------------
-
-
-class TestKVStore:
-    def test_set_and_get(self, backend):
-        assert backend.kv_set("key1", "value1") is None  # no previous
-        assert backend.kv_get("key1") == "value1"
-
-    def test_set_returns_old_value(self, backend):
-        backend.kv_set("key1", "v1")
-        old = backend.kv_set("key1", "v2")
-        assert old == "v1"
-        assert backend.kv_get("key1") == "v2"
-
-    def test_delete(self, backend):
-        backend.kv_set("key1", "v1")
-        assert backend.kv_delete("key1")
-        assert backend.kv_get("key1") is None
-
-    def test_delete_nonexistent(self, backend):
-        assert not backend.kv_delete("nope")
-
-    def test_list(self, backend):
-        backend.kv_set("b", "2")
-        backend.kv_set("a", "1")
-        assert backend.kv_list() == [("a", "1"), ("b", "2")]
-
-    def test_search(self, backend):
-        backend.kv_set("project_name", "turnstone")
-        backend.kv_set("version", "0.3")
-        results = backend.kv_search("turnstone")
-        assert len(results) == 1
-        assert results[0] == ("project_name", "turnstone")
-
-    def test_search_empty_lists_all(self, backend):
-        backend.kv_set("a", "1")
-        backend.kv_set("b", "2")
-        assert len(backend.kv_search("")) == 2
-
-
 # -- Conversation search -------------------------------------------------------
 
 

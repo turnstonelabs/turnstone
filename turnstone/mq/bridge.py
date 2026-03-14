@@ -55,7 +55,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("turnstone.mq.bridge")
 
 # Server's default safe tools (auto-approved without user confirmation)
-DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "remember", "recall", "forget"])
+DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "memory", "recall"])
 
 
 class Bridge:

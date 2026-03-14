@@ -14,11 +14,11 @@ from turnstone.core.storage._schema import (
     audit_events,
     conversations,
     intent_verdicts,
-    memories,
     metadata,
     orgs,
     prompt_templates,
     roles,
+    structured_memories,
     tool_policies,
     usage_events,
     user_roles,
@@ -38,6 +38,9 @@ from turnstone.core.storage._utils import (
     ROLE_MUTABLE as _ROLE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    STRUCTURED_MEMORY_MUTABLE as _SMEM_MUTABLE,
+)
+from turnstone.core.storage._utils import (
     TEMPLATE_MUTABLE as _TEMPLATE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -54,6 +57,11 @@ from turnstone.core.storage._utils import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _escape_ilike(s: str) -> str:
+    """Escape ILIKE metacharacters for use with ESCAPE '\\\\'."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class PostgreSQLBackend:
@@ -273,64 +281,6 @@ class PostgreSQLBackend:
                 sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(title=title)
             )
             conn.commit()
-
-    # -- Generic key-value store -----------------------------------------------
-
-    def kv_get(self, key: str) -> str | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(sa.select(memories.c.value).where(memories.c.key == key)).fetchone()
-            return str(row[0]) if row else None
-
-    def kv_set(self, key: str, value: str) -> str | None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
-            existing = conn.execute(
-                sa.select(memories.c.value, memories.c.created).where(memories.c.key == key)
-            ).fetchone()
-            old_value = str(existing[0]) if existing else None
-            created = str(existing[1]) if existing else now
-            # Delete + insert for cross-dialect upsert
-            conn.execute(sa.delete(memories).where(memories.c.key == key))
-            conn.execute(
-                sa.insert(memories),
-                {"key": key, "value": value, "created": created, "updated": now},
-            )
-            conn.commit()
-            return old_value
-
-    def kv_delete(self, key: str) -> bool:
-        with self._engine.connect() as conn:
-            result = conn.execute(sa.delete(memories).where(memories.c.key == key))
-            conn.commit()
-            return result.rowcount > 0
-
-    def kv_list(self) -> list[tuple[str, str]]:
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(memories.c.key, memories.c.value).order_by(memories.c.key)
-            ).fetchall()
-            return [(str(r[0]), str(r[1])) for r in rows]
-
-    def kv_search(self, query: str) -> list[tuple[str, str]]:
-        if not query or not query.strip():
-            return self.kv_list()
-        terms = query.split()
-        with self._engine.connect() as conn:
-            clauses = []
-            params: dict[str, str] = {}
-            for i, t in enumerate(terms):
-                clauses.append(f"(key ILIKE :k{i} OR value ILIKE :v{i})")
-                params[f"k{i}"] = f"%{t}%"
-                params[f"v{i}"] = f"%{t}%"
-            rows = conn.execute(
-                sa.text(
-                    "SELECT key, value FROM memories WHERE "
-                    + " AND ".join(clauses)
-                    + " ORDER BY key"
-                ),
-                params,
-            ).fetchall()
-            return [(str(r[0]), str(r[1])) for r in rows]
 
     # -- Workstream operations -------------------------------------------------
 
@@ -2143,6 +2093,166 @@ class PostgreSQLBackend:
                 q = q.where(intent_verdicts.c.risk_level == risk_level)
             row = conn.execute(q).fetchone()
             return row[0] if row else 0
+
+    # -- Structured memories ---------------------------------------------------
+
+    def create_structured_memory(
+        self,
+        memory_id: str,
+        name: str,
+        description: str,
+        mem_type: str,
+        scope: str,
+        scope_id: str,
+        content: str,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(structured_memories),
+                {
+                    "memory_id": memory_id,
+                    "name": name,
+                    "description": description,
+                    "type": mem_type,
+                    "scope": scope,
+                    "scope_id": scope_id,
+                    "content": content,
+                    "created": now,
+                    "updated": now,
+                    "last_accessed": now,
+                    "access_count": 0,
+                },
+            )
+            conn.commit()
+
+    def get_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(structured_memories).where(structured_memories.c.memory_id == memory_id)
+            ).fetchone()
+            return dict(row._mapping) if row else None
+
+    def get_structured_memory_by_name(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> dict[str, str] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(structured_memories).where(
+                    sa.and_(
+                        structured_memories.c.name == name,
+                        structured_memories.c.scope == scope,
+                        structured_memories.c.scope_id == scope_id,
+                    )
+                )
+            ).fetchone()
+            return dict(row._mapping) if row else None
+
+    def update_structured_memory(self, memory_id: str, **fields: str) -> bool:
+        fields = {k: v for k, v in fields.items() if k in _SMEM_MUTABLE}
+        if not fields:
+            return False
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        fields["updated"] = now
+        fields["last_accessed"] = now
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_structured_memory(
+        self, name: str, scope: str = "global", scope_id: str = ""
+    ) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(structured_memories).where(
+                    sa.and_(
+                        structured_memories.c.name == name,
+                        structured_memories.c.scope == scope,
+                        structured_memories.c.scope_id == scope_id,
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_structured_memories(
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        with self._engine.connect() as conn:
+            q = sa.select(structured_memories).order_by(structured_memories.c.updated.desc())
+            if mem_type:
+                q = q.where(structured_memories.c.type == mem_type)
+            if scope:
+                q = q.where(structured_memories.c.scope == scope)
+            if scope_id:
+                q = q.where(structured_memories.c.scope_id == scope_id)
+            q = q.limit(limit)
+            rows = conn.execute(q).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def search_structured_memories(
+        self,
+        query: str,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> list[dict[str, str]]:
+        if not query or not query.strip():
+            return self.list_structured_memories(
+                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
+        terms = query.split()
+        with self._engine.connect() as conn:
+            clauses = []
+            params: dict[str, str] = {}
+            for i, t in enumerate(terms):
+                escaped = _escape_ilike(t)
+                clauses.append(
+                    f"(name ILIKE :n{i} ESCAPE '\\' "
+                    f"OR description ILIKE :d{i} ESCAPE '\\' "
+                    f"OR content ILIKE :c{i} ESCAPE '\\')"
+                )
+                params[f"n{i}"] = f"%{escaped}%"
+                params[f"d{i}"] = f"%{escaped}%"
+                params[f"c{i}"] = f"%{escaped}%"
+            where = " AND ".join(clauses)
+            if mem_type:
+                where += " AND type = :type_filter"
+                params["type_filter"] = mem_type
+            if scope:
+                where += " AND scope = :scope_filter"
+                params["scope_filter"] = scope
+            if scope_id:
+                where += " AND scope_id = :scope_id_filter"
+                params["scope_id_filter"] = scope_id
+            rows = conn.execute(
+                sa.text(
+                    f"SELECT * FROM structured_memories WHERE {where} "
+                    f"ORDER BY updated DESC LIMIT :lim"
+                ),
+                {**params, "lim": limit},
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def count_structured_memories(self, scope: str = "", scope_id: str = "") -> int:
+        with self._engine.connect() as conn:
+            q = sa.select(sa.func.count()).select_from(structured_memories)
+            if scope:
+                q = q.where(structured_memories.c.scope == scope)
+            if scope_id:
+                q = q.where(structured_memories.c.scope_id == scope_id)
+            result = conn.execute(q).scalar()
+            return int(result or 0)
 
     # -- Lifecycle -------------------------------------------------------------
 

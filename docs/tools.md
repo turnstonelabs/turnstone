@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 18 built-in tools plus any number of external MCP tools to the
+turnstone exposes 17 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 18 tool definitions (sent to the model). |
+| `TOOLS`             | All 17 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 18 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 17 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 18
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -114,9 +114,8 @@ Each item's `execute` callable is invoked:
 - `read_file` -- reads files, no side effects
 - `search` -- grep-style search, no side effects
 - `man` -- reads man pages, no side effects
-- `remember` -- writes to persistent memory database (lightweight, always auto-approved)
-- `recall` -- reads from persistent memory database
-- `forget` -- deletes from persistent memory database (lightweight, always auto-approved)
+- `memory` -- structured persistent memory (save/search/delete/list)
+- `recall` -- searches conversation history
 - `notify` -- sends notifications to linked channels (time-sensitive, auto-approved for urgency)
 
 **Requires user confirmation** (write operations, network access, side effects):
@@ -164,9 +163,8 @@ Every tool defines a `primary_key`. The mapping is:
 | `web_search` | `query`     |
 | `task`       | `prompt`    |
 | `plan`       | `prompt`    |
-| `remember`   | `key`       |
+| `memory`     | `name`      |
 | `recall`     | `query`     |
-| `forget`     | `key`       |
 | `notify`     | `message`   |
 | `read_resource` | `uri`    |
 | `use_prompt` | `name`     |
@@ -353,16 +351,22 @@ Plan before implementing -- an autonomous agent explores the codebase and writes
 
 ## Memory
 
-### remember
+### memory
 
-Save a persistent memory that persists across sessions.
+Structured persistent memory across sessions with typed, scoped entries.
 
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `key`     | string | yes      | Short identifier (e.g. `user_name`). |
-| `value`   | string | yes      | Content to remember. |
+| Parameter     | Type    | Required | Description |
+|---------------|---------|----------|-------------|
+| `action`      | string  | yes      | `save`, `search`, `delete`, or `list`. |
+| `name`        | string  | save/delete | Short snake_case identifier for the memory. |
+| `content`     | string  | save     | Memory content to store. |
+| `description` | string  | no       | Short description for relevance matching (recommended for `save`). |
+| `type`        | string  | no       | Memory type: `user`, `project`, `feedback`, or `reference`. Default: `project`. |
+| `scope`       | string  | no       | Memory scope: `global`, `workstream`, or `user`. Default: `global`. |
+| `query`       | string  | search   | Search query for finding memories. |
+| `limit`       | integer | no       | Max results for `search` or `list`. Default: 20. |
 
-- **What it does**: Stores a key-value pair in the SQLite memory database. Memories persist across sessions and are included in the system prompt on startup.
+- **What it does**: Manages structured persistent memories in the database. Memories persist across sessions, have a type classification (user preferences, project knowledge, feedback, reference material) and a scope (global across all workstreams, private to a workstream, or following a user). Relevant memories are included in the system prompt on startup.
 - **Auto-approve**: Yes.
 - **Agent availability**: Not available to sub-agents (top-level only).
 
@@ -370,28 +374,14 @@ Save a persistent memory that persists across sessions.
 
 ### recall
 
-Search memories and past conversations.
+Search conversation history for past messages and tool results.
 
 | Parameter | Type    | Required | Description |
 |-----------|---------|----------|-------------|
-| `query`   | string  | no       | Search term or phrase. Omit to list all memories. |
-| `limit`   | integer | no       | Max conversation results to return (default 20). |
+| `query`   | string  | yes      | Search term or phrase to find in conversation history. |
+| `limit`   | integer | no       | Max results to return (default 20). |
 
-- **What it does**: With no query, lists all saved memories. With a query, searches both the memory store and conversation history using FTS5 full-text search.
-- **Auto-approve**: Yes.
-- **Agent availability**: Not available to sub-agents (top-level only).
-
----
-
-### forget
-
-Remove a persistent memory by key.
-
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| `key`     | string | yes      | The memory key to remove (e.g. `user_name`). |
-
-- **What it does**: Deletes the memory entry with the given key from the SQLite database.
+- **What it does**: Searches conversation history across sessions using FTS5 full-text search. Returns matching messages, tool calls, and tool results with timestamps and workstream context.
 - **Auto-approve**: Yes.
 - **Agent availability**: Not available to sub-agents (top-level only).
 
@@ -514,9 +504,8 @@ data.get("mergedAt") is not None
 | `web_search` | Info       | No           | Yes   | Yes        | `query`     |
 | `task`       | Agent      | No           | No    | No         | `prompt`    |
 | `plan`       | Agent      | No           | No    | No         | `prompt`    |
-| `remember`   | Memory     | Yes          | No    | No         | `key`       |
+| `memory`     | Memory     | Yes          | No    | No         | `name`      |
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
-| `forget`     | Memory     | Yes          | No    | No         | `key`       |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
 | `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
@@ -573,7 +562,7 @@ CLI flags override the config file:
    search stays off and all tools are sent to the model directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 18 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+   - **Always-on** -- the 17 built-in tools (members of `BUILTIN_TOOL_NAMES`).
      These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
@@ -616,7 +605,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 18 built-in tools via
+4. **Merging**: MCP tools are appended after the 17 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see

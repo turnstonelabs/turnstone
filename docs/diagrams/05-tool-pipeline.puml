@@ -24,7 +24,7 @@ partition "Phase 1: Prepare" #E8F5E9 {
         :Dispatch to _prepare_{func_name}();
 
         note right
-            **Dispatch table (18 tools):**
+            **Dispatch table (17 tools):**
             ┌───────────────┬──────────────────┐
             │ Tool          │ Needs Approval?  │
             ├───────────────┼──────────────────┤
@@ -40,9 +40,8 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ tool_search   │ ✗ Auto-approve   │
             │ task          │ ✓ Yes            │
             │ plan          │ ✓ Yes            │
-            │ remember      │ ✗ Auto-approve   │
+            │ memory        │ ✗ Auto-approve   │
             │ recall        │ ✗ Auto-approve   │
-            │ forget        │ ✗ Auto-approve   │
             │ notify        │ ✗ Auto-approve   │
             │ read_resource │ ✓ Yes            │
             │ use_prompt    │ ✓ Yes            │
@@ -116,9 +115,8 @@ partition "Phase 3: Execute" #E3F2FD {
           ├─ _exec_task: _run_agent(TASK_AGENT_TOOLS)
           ├─ _exec_plan: _run_agent(AGENT_TOOLS, read-only)
           ├─ _exec_notify: HTTP POST to channel gateway
-          ├─ _exec_remember: SQLite INSERT OR REPLACE
-          ├─ _exec_recall: SQLite FTS5/LIKE search
-          ├─ _exec_forget: SQLite DELETE
+          ├─ _exec_memory: structured memory save/search/delete/list
+          ├─ _exec_recall: conversation history FTS5 search
           ├─ _exec_read_resource: MCPClientManager.read_resource_sync()
           ├─ _exec_use_prompt: MCPClientManager.get_prompt_sync()
           └─ _exec_mcp_tool: MCPClientManager.call_tool_sync()

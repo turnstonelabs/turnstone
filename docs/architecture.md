@@ -3,7 +3,7 @@
 Turnstone is an AI orchestration platform with tool use, parallel workstreams, and persistent
 memory. It connects to any OpenAI-compatible API (local vLLM, OpenAI, etc.) or
 Anthropic's native Messages API via pluggable provider adapters, and gives the
-model 18 built-in tools plus external tools via MCP (Model Context Protocol) for
+model 17 built-in tools plus external tools via MCP (Model Context Protocol) for
 reading, writing, searching, planning, and executing code.
 
 The core design principle is a **UI-agnostic engine with pluggable frontends**.
@@ -436,13 +436,13 @@ from each schema and builds:
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
 - `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 
-### 14 Tools by Category
+### 13 Tools by Category
 
 **Read-only (auto-approve)**:
 - `read_file` -- read file contents with optional offset/limit
 - `search` -- ripgrep-based codebase search
 - `man` -- read man pages
-- `recall` -- retrieve stored memories
+- `recall` -- search conversation history
 
 **Write (requires approval)**:
 - `bash` -- execute shell commands (with safety checks via `turnstone.core.safety`)
@@ -456,9 +456,8 @@ from each schema and builds:
 - `task` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
 - `plan` -- explore codebase and write a structured plan (`AGENT_TOOLS`)
 
-**Memory (persistent key-value store)**:
-- `remember` -- save a fact
-- `forget` -- delete a fact
+**Memory (structured persistent store)**:
+- `memory` -- save, search, delete, or list memories (typed and scoped)
 
 ### Prepare / Execute Pattern
 
