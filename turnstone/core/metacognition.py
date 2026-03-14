@@ -118,8 +118,8 @@ def should_nudge(
         return False
     # Rate limit: one nudge per type per cooldown window
     now = time.monotonic()
-    last = state.get(nudge_type, 0.0)
-    if now - last < _COOLDOWN_SECS:
+    last = state.get(nudge_type)
+    if last is not None and now - last < _COOLDOWN_SECS:
         return False
     state[nudge_type] = now
     return True

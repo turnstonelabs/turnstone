@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING, Any
 
+import sqlalchemy as sa
+
 from turnstone.core.storage import get_storage
 
 if TYPE_CHECKING:
@@ -267,17 +269,17 @@ def save_structured_memory(
                 memory_id, name, description, mem_type, scope, scope_id, content
             )
             return memory_id, None
-        except Exception:
+        except sa.exc.IntegrityError:
             # Unique constraint violation — row already exists, update it
             existing = storage.get_structured_memory_by_name(name, scope, scope_id)
             if existing:
                 old_content = existing["content"]
-                storage.update_structured_memory(
-                    existing["memory_id"],
-                    content=content,
-                    description=description,
-                    type=mem_type,
-                )
+                updates: dict[str, str] = {"content": content}
+                if description:
+                    updates["description"] = description
+                if mem_type != "project":
+                    updates["type"] = mem_type
+                storage.update_structured_memory(existing["memory_id"], **updates)
                 return existing["memory_id"], old_content
             return "", None
     except Exception:
