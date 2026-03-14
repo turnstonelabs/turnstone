@@ -1347,8 +1347,8 @@
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 4px 8px;
-  font-size: 12px;
   font: inherit;
+  font-size: 12px;
 }
 .admin-toolbar-filters select {
   min-width: 0;

@@ -1779,6 +1779,15 @@ function showMemoryDetailModal(memoryId) {
   document.getElementById("memory-detail-body").innerHTML =
     '<div class="dashboard-empty">Loading…</div>';
 
+  // Disable delete button and clear stale handler while loading
+  var delBtn = document.getElementById("mem-detail-delete");
+  delBtn.disabled = true;
+  delBtn.onclick = null;
+
+  // Focus close button for keyboard accessibility
+  var closeBtn = ov.querySelector(".modal-cancel");
+  if (closeBtn) closeBtn.focus();
+
   authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId))
     .then(function (r) {
       if (!r.ok) throw new Error("Not found");
@@ -1826,8 +1835,8 @@ function showMemoryDetailModal(memoryId) {
 
       document.getElementById("memory-detail-body").innerHTML = html;
 
-      // Wire delete button
-      var delBtn = document.getElementById("mem-detail-delete");
+      // Wire delete button now that data is loaded
+      delBtn.disabled = false;
       delBtn.onclick = function () {
         deleteAdminMemory(m.memory_id, m.name);
       };
