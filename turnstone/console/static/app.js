@@ -383,6 +383,11 @@ function showOverview() {
   document.getElementById("view-filtered").style.display = "none";
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
   document.getElementById("breadcrumb").style.display = "none";
   document.getElementById("main").scrollTop = 0;
   if (clusterState) renderFromState();
@@ -924,6 +929,11 @@ function drillDownToNode(nodeId, serverUrl) {
   document.getElementById("view-filtered").style.display = "none";
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
   var link = document.getElementById("node-link");
@@ -973,6 +983,11 @@ function drillDownByState(state) {
   document.getElementById("view-filtered").style.display = "";
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
   document.getElementById("breadcrumb").style.display = "";
   var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
   document.getElementById("breadcrumb-label").textContent =
@@ -995,6 +1010,11 @@ function drillDownByNode(nodeId) {
   document.getElementById("view-filtered").style.display = "";
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = nodeId;
   document.getElementById("filtered-title").textContent =

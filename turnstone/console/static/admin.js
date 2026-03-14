@@ -13,13 +13,25 @@ var _cfTrapHandler = null;
 var _adminWatches = [];
 var _confirmCallbackFn = null;
 var _confirmTriggerEl = null;
+var _mobileSidebarOpen = false;
 
 // ---------------------------------------------------------------------------
 // View switching (called from app.js showOverview/drillDown pattern)
 // ---------------------------------------------------------------------------
 
 function showAdmin() {
-  /* global currentView */
+  /* global currentView, showOverview */
+  // Toggle: if already in admin view, go back to overview
+  if (currentView === "admin") {
+    var adminBtn = document.getElementById("admin-btn");
+    if (adminBtn) {
+      adminBtn.classList.remove("active");
+      adminBtn.setAttribute("aria-expanded", "false");
+    }
+    showOverview();
+    return;
+  }
+
   currentView = "admin";
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "none";
@@ -28,9 +40,16 @@ function showAdmin() {
   document.getElementById("breadcrumb").style.display = "";
   document.getElementById("breadcrumb-label").textContent = "Admin";
   document.getElementById("main").scrollTop = 0;
+
+  // Highlight admin button as active
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.add("active");
+    adminBtn.setAttribute("aria-expanded", "true");
+  }
   history.pushState({ view: "admin" }, "");
 
-  // Permission gating: hide tabs the user cannot access
+  // Permission gating: hide nav items the user cannot access
   var perms = sessionStorage.getItem("turnstone_permissions") || "";
   var tabPerms = {
     users: "admin.users",
@@ -47,26 +66,59 @@ function showAdmin() {
   };
   if (perms) {
     var permSet = perms.split(",");
-    var tabs = document.querySelectorAll(".admin-tab");
-    for (var i = 0; i < tabs.length; i++) {
-      var tabName = tabs[i].getAttribute("data-tab");
+    var navItems = document.querySelectorAll(".admin-nav");
+    for (var i = 0; i < navItems.length; i++) {
+      var tabName = navItems[i].getAttribute("data-tab");
       var needed = tabPerms[tabName];
       if (needed && permSet.indexOf(needed) < 0) {
-        tabs[i].style.display = "none";
+        navItems[i].style.display = "none";
       } else {
-        tabs[i].style.display = "";
+        navItems[i].style.display = "";
       }
     }
   }
 
-  // Switch to the first visible tab
-  var visibleTabs = document.querySelectorAll(
-    '.admin-tab:not([style*="display: none"])',
-  );
-  if (visibleTabs.length > 0) {
-    switchAdminTab(visibleTabs[0].getAttribute("data-tab"));
+  // Hide groups where all children are permission-hidden
+  var groups = document.querySelectorAll(".admin-sidebar-group");
+  for (var g = 0; g < groups.length; g++) {
+    var visibleInGroup = groups[g].querySelectorAll(
+      '.admin-nav:not([style*="display: none"])',
+    );
+    groups[g].style.display = visibleInGroup.length > 0 ? "" : "none";
+  }
+
+  // Mobile: ensure sidebar starts hidden; desktop: ensure it's accessible
+  var sidebar = document.getElementById("admin-sidebar");
+  if (window.innerWidth <= 700) {
+    _mobileSidebarOpen = false;
+    sidebar.classList.add("collapsed");
+    sidebar.classList.remove("open");
+    sidebar.setAttribute("aria-hidden", "true");
   } else {
-    // No tabs visible — show empty state instead of loading an inaccessible tab
+    sidebar.removeAttribute("aria-hidden");
+  }
+
+  // Mobile backdrop listener (idempotent)
+  var backdrop = document.getElementById("admin-sidebar-backdrop");
+  if (backdrop && !backdrop._listenerAttached) {
+    backdrop.addEventListener("click", function () {
+      if (_mobileSidebarOpen) {
+        _toggleMobileSidebar();
+        var mt = document.getElementById("admin-mobile-toggle");
+        if (mt) mt.focus();
+      }
+    });
+    backdrop._listenerAttached = true;
+  }
+
+  // Switch to the first visible nav item
+  var visibleNavs = document.querySelectorAll(
+    '.admin-nav:not([style*="display: none"])',
+  );
+  if (visibleNavs.length > 0) {
+    switchAdminTab(visibleNavs[0].getAttribute("data-tab"));
+  } else {
+    // No tabs visible — show empty state
     var panels = document.querySelectorAll(".admin-panel");
     for (var j = 0; j < panels.length; j++) panels[j].style.display = "none";
     var empty = document.getElementById("admin-no-permissions");
@@ -75,10 +127,39 @@ function showAdmin() {
       empty.id = "admin-no-permissions";
       empty.className = "dashboard-empty";
       empty.textContent = "You do not have permissions to view any admin tabs.";
-      document.getElementById("view-admin").appendChild(empty);
+      document.getElementById("admin-content").appendChild(empty);
     }
     empty.style.display = "";
   }
+}
+
+function _injectMobileToggle(tab) {
+  var toggle = document.getElementById("admin-mobile-toggle");
+  if (!toggle) {
+    toggle = document.createElement("button");
+    toggle.id = "admin-mobile-toggle";
+    toggle.className = "admin-mobile-toggle";
+    toggle.setAttribute("aria-label", "Open navigation");
+    toggle.onclick = function () {
+      _mobileSidebarOpen = false;
+      _toggleMobileSidebar();
+    };
+  }
+  var panel = document.getElementById("admin-" + tab);
+  if (panel) {
+    var toolbar = panel.querySelector(".admin-toolbar");
+    if (toolbar) toolbar.insertBefore(toggle, toolbar.firstChild);
+  }
+}
+
+function _toggleMobileSidebar() {
+  _mobileSidebarOpen = !_mobileSidebarOpen;
+  var sidebar = document.getElementById("admin-sidebar");
+  sidebar.classList.toggle("open", _mobileSidebarOpen);
+  sidebar.classList.toggle("collapsed", !_mobileSidebarOpen);
+  sidebar.setAttribute("aria-hidden", _mobileSidebarOpen ? "false" : "true");
+  var backdrop = document.getElementById("admin-sidebar-backdrop");
+  if (backdrop) backdrop.classList.toggle("visible", _mobileSidebarOpen);
 }
 
 function switchAdminTab(tab) {
@@ -86,12 +167,12 @@ function switchAdminTab(tab) {
   // Hide no-permissions empty state if it was showing
   var noPerms = document.getElementById("admin-no-permissions");
   if (noPerms) noPerms.style.display = "none";
-  var tabs = document.querySelectorAll(".admin-tab");
-  for (var i = 0; i < tabs.length; i++) {
-    var isActive = tabs[i].getAttribute("data-tab") === tab;
-    tabs[i].classList.toggle("active", isActive);
-    tabs[i].setAttribute("aria-selected", isActive ? "true" : "false");
-    tabs[i].setAttribute("tabindex", isActive ? "0" : "-1");
+  var navItems = document.querySelectorAll(".admin-nav");
+  for (var i = 0; i < navItems.length; i++) {
+    var isActive = navItems[i].getAttribute("data-tab") === tab;
+    navItems[i].classList.toggle("active", isActive);
+    navItems[i].setAttribute("aria-selected", isActive ? "true" : "false");
+    navItems[i].setAttribute("tabindex", isActive ? "0" : "-1");
   }
   var panels = [
     "users",
@@ -105,6 +186,7 @@ function switchAdminTab(tab) {
     "ws-templates",
     "usage",
     "audit",
+    "settings",
   ];
   for (var p = 0; p < panels.length; p++) {
     var el = document.getElementById("admin-" + panels[p]);
@@ -124,6 +206,21 @@ function switchAdminTab(tab) {
   if (tab === "audit") {
     _populateAuditUserFilter();
     loadGovAudit();
+  }
+  if (tab === "settings") loadSettings();
+
+  // Update breadcrumb with active tab label
+  var activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
+  var label = activeNav ? activeNav.textContent : tab;
+  var bcLabel = document.getElementById("breadcrumb-label");
+  if (bcLabel) bcLabel.textContent = "Admin / " + label;
+
+  // Inject mobile hamburger toggle into active panel's toolbar
+  _injectMobileToggle(tab);
+
+  // On mobile, auto-close sidebar after tab selection
+  if (window.innerWidth <= 700 && _mobileSidebarOpen) {
+    _toggleMobileSidebar();
   }
 }
 
@@ -1574,28 +1671,37 @@ document.addEventListener("keydown", function (e) {
       return;
     }
   }
+  // Close mobile sidebar drawer on Escape
+  if (_mobileSidebarOpen && window.innerWidth <= 700) {
+    e.preventDefault();
+    _toggleMobileSidebar();
+    var mt = document.getElementById("admin-mobile-toggle");
+    if (mt) mt.focus();
+    return;
+  }
 });
 
-// Tab arrow key navigation
+// Sidebar arrow key navigation (vertical)
 (function () {
-  var tablist = document.querySelector(".admin-tabs");
-  if (!tablist) return;
-  tablist.addEventListener("keydown", function (e) {
-    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
-    var allTabs = document.querySelectorAll(
-      '.admin-tab:not([style*="display: none"])',
+  var sidebar = document.getElementById("admin-sidebar");
+  if (!sidebar) return;
+  sidebar.addEventListener("keydown", function (e) {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    var allNavs = document.querySelectorAll(
+      '.admin-nav:not([style*="display: none"])',
     );
-    var tabOrder = [];
-    for (var ti = 0; ti < allTabs.length; ti++) {
-      tabOrder.push(allTabs[ti].getAttribute("data-tab"));
+    var navOrder = [];
+    for (var ni = 0; ni < allNavs.length; ni++) {
+      navOrder.push(allNavs[ni].getAttribute("data-tab"));
     }
-    if (tabOrder.length === 0) return;
-    var idx = tabOrder.indexOf(_adminTab);
-    if (e.key === "ArrowRight") idx = (idx + 1) % tabOrder.length;
-    else idx = (idx - 1 + tabOrder.length) % tabOrder.length;
-    switchAdminTab(tabOrder[idx]);
+    if (navOrder.length === 0) return;
+    var idx = navOrder.indexOf(_adminTab);
+    if (e.key === "ArrowDown") idx = (idx + 1) % navOrder.length;
+    else idx = (idx - 1 + navOrder.length) % navOrder.length;
+    switchAdminTab(navOrder[idx]);
     var btn = document.querySelector(
-      '.admin-tab[data-tab="' + tabOrder[idx] + '"]',
+      '.admin-nav[data-tab="' + navOrder[idx] + '"]',
     );
     if (btn) btn.focus();
   });
@@ -1642,6 +1748,16 @@ function _confirmCallback() {
   if (btn) btn.disabled = true;
   if (fn) fn();
   hideConfirmModal();
+}
+
+// ---------------------------------------------------------------------------
+// Settings (stub — full implementation is a separate project)
+// ---------------------------------------------------------------------------
+
+function loadSettings() {
+  var el = document.getElementById("admin-settings-content");
+  if (el)
+    el.innerHTML = '<div class="dashboard-empty">Settings coming soon</div>';
 }
 
 // ---------------------------------------------------------------------------

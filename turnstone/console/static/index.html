@@ -16,7 +16,7 @@
   <span id="cluster-summary" aria-live="polite"></span>
   <span id="status-bar" role="status" aria-live="polite"></span>
   <button id="new-ws-btn" class="header-btn header-btn-accent" onclick="showNewWsModal()" title="Create workstream">+ new</button>
-  <button id="admin-btn" class="header-btn" onclick="showAdmin()" title="User &amp; token administration">admin</button>
+  <button id="admin-btn" class="header-btn" onclick="showAdmin()" title="User &amp; token administration" aria-expanded="false" aria-controls="view-admin">admin</button>
   <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
 </div>
@@ -77,19 +77,41 @@
 
   <!-- ADMIN PANEL -->
   <div id="view-admin" style="display:none">
-    <div class="admin-tabs" role="tablist">
-      <button id="tab-users" class="admin-tab active" data-tab="users" role="tab" aria-selected="true" aria-controls="admin-users" tabindex="0" onclick="switchAdminTab('users')">Users</button>
-      <button id="tab-tokens" class="admin-tab" data-tab="tokens" role="tab" aria-selected="false" aria-controls="admin-tokens" tabindex="-1" onclick="switchAdminTab('tokens')">Tokens</button>
-      <button id="tab-channels" class="admin-tab" data-tab="channels" role="tab" aria-selected="false" aria-controls="admin-channels" tabindex="-1" onclick="switchAdminTab('channels')">Channels</button>
-      <button id="tab-schedules" class="admin-tab" data-tab="schedules" role="tab" aria-selected="false" aria-controls="admin-schedules" tabindex="-1" onclick="switchAdminTab('schedules')">Schedules</button>
-      <button id="tab-watches" class="admin-tab" data-tab="watches" role="tab" aria-selected="false" aria-controls="admin-watches" tabindex="-1" onclick="switchAdminTab('watches')">Watches</button>
-      <button id="tab-roles" class="admin-tab" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
-      <button id="tab-policies" class="admin-tab" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
-      <button id="tab-templates" class="admin-tab" data-tab="templates" role="tab" aria-selected="false" aria-controls="admin-templates" tabindex="-1" onclick="switchAdminTab('templates')">Templates</button>
-      <button id="tab-ws-templates" class="admin-tab" data-tab="ws-templates" role="tab" aria-selected="false" aria-controls="admin-ws-templates" tabindex="-1" onclick="switchAdminTab('ws-templates')">WS Templates</button>
-      <button id="tab-usage" class="admin-tab" data-tab="usage" role="tab" aria-selected="false" aria-controls="admin-usage" tabindex="-1" onclick="switchAdminTab('usage')">Usage</button>
-      <button id="tab-audit" class="admin-tab" data-tab="audit" role="tab" aria-selected="false" aria-controls="admin-audit" tabindex="-1" onclick="switchAdminTab('audit')">Audit</button>
-    </div>
+    <div id="admin-layout" class="admin-layout">
+      <!-- Sidebar navigation -->
+      <nav id="admin-sidebar" class="admin-sidebar" role="tablist" aria-label="Admin navigation">
+        <div class="admin-sidebar-group" data-group="identity" role="group" aria-label="Identity">
+          <div class="admin-sidebar-group-label" aria-hidden="true">Identity</div>
+          <button id="tab-users" class="admin-nav active" data-tab="users" role="tab" aria-selected="true" aria-controls="admin-users" tabindex="0" onclick="switchAdminTab('users')">Users</button>
+          <button id="tab-tokens" class="admin-nav" data-tab="tokens" role="tab" aria-selected="false" aria-controls="admin-tokens" tabindex="-1" onclick="switchAdminTab('tokens')">API Tokens</button>
+          <button id="tab-channels" class="admin-nav" data-tab="channels" role="tab" aria-selected="false" aria-controls="admin-channels" tabindex="-1" onclick="switchAdminTab('channels')">Channels</button>
+        </div>
+        <div class="admin-sidebar-group" data-group="automation" role="group" aria-label="Automation">
+          <div class="admin-sidebar-group-label" aria-hidden="true">Automation</div>
+          <button id="tab-schedules" class="admin-nav" data-tab="schedules" role="tab" aria-selected="false" aria-controls="admin-schedules" tabindex="-1" onclick="switchAdminTab('schedules')">Schedules</button>
+          <button id="tab-watches" class="admin-nav" data-tab="watches" role="tab" aria-selected="false" aria-controls="admin-watches" tabindex="-1" onclick="switchAdminTab('watches')">Watches</button>
+        </div>
+        <div class="admin-sidebar-group" data-group="governance" role="group" aria-label="Governance">
+          <div class="admin-sidebar-group-label" aria-hidden="true">Governance</div>
+          <button id="tab-roles" class="admin-nav" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
+          <button id="tab-policies" class="admin-nav" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
+          <button id="tab-templates" class="admin-nav" data-tab="templates" role="tab" aria-selected="false" aria-controls="admin-templates" tabindex="-1" onclick="switchAdminTab('templates')">Templates</button>
+          <button id="tab-ws-templates" class="admin-nav" data-tab="ws-templates" role="tab" aria-selected="false" aria-controls="admin-ws-templates" tabindex="-1" onclick="switchAdminTab('ws-templates')">WS Templates</button>
+        </div>
+        <div class="admin-sidebar-group" data-group="observe" role="group" aria-label="Observe">
+          <div class="admin-sidebar-group-label" aria-hidden="true">Observe</div>
+          <button id="tab-usage" class="admin-nav" data-tab="usage" role="tab" aria-selected="false" aria-controls="admin-usage" tabindex="-1" onclick="switchAdminTab('usage')">Usage</button>
+          <button id="tab-audit" class="admin-nav" data-tab="audit" role="tab" aria-selected="false" aria-controls="admin-audit" tabindex="-1" onclick="switchAdminTab('audit')">Audit</button>
+        </div>
+        <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
+          <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
+          <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
+        </div>
+      </nav>
+      <div id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" aria-hidden="true"></div>
+
+      <!-- Content area -->
+      <div id="admin-content" class="admin-content">
 
     <!-- Users Tab -->
     <div id="admin-users" class="admin-panel" role="tabpanel" aria-labelledby="tab-users">
@@ -111,7 +133,7 @@
     <!-- Tokens Tab -->
     <div id="admin-tokens" class="admin-panel" role="tabpanel" aria-labelledby="tab-tokens" style="display:none">
       <div class="admin-toolbar">
-        <span class="section-header" style="margin:0">TOKENS</span>
+        <span class="section-header" style="margin:0">API TOKENS</span>
         <label for="admin-token-user" class="sr-only">Filter tokens by user</label>
         <select id="admin-token-user" onchange="loadAdminTokens()">
           <option value="">Select user...</option>
@@ -324,6 +346,19 @@
         <div class="dashboard-empty">Loading audit log...</div>
       </div>
     </div>
+
+    <!-- Settings Tab -->
+    <div id="admin-settings" class="admin-panel" role="tabpanel" aria-labelledby="tab-settings" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">SETTINGS</span>
+      </div>
+      <div id="admin-settings-content">
+        <div class="dashboard-empty">Settings coming soon</div>
+      </div>
+    </div>
+
+      </div><!-- /admin-content -->
+    </div><!-- /admin-layout -->
   </div>
 </div>
 
@@ -479,44 +514,52 @@ window.TURNSTONE_KB_SHORTCUTS = [
   <div id="create-schedule-box" class="admin-modal admin-modal-wide">
     <h2 id="create-schedule-title">New Schedule</h2>
     <div id="create-schedule-error" role="alert" aria-live="assertive"></div>
-    <label for="cs-name">Name</label>
-    <input id="cs-name" type="text" placeholder="Daily health check" autocomplete="off">
-    <label for="cs-desc">Description <span class="label-hint">optional</span></label>
-    <input id="cs-desc" type="text" placeholder="" autocomplete="off">
-    <label for="cs-type">Schedule type</label>
-    <select id="cs-type" onchange="toggleScheduleTypeFields()">
-      <option value="cron">Cron (recurring)</option>
-      <option value="at">At (one-shot)</option>
-    </select>
-    <div id="cs-cron-group">
-      <label for="cs-cron">Cron expression</label>
-      <input id="cs-cron" type="text" placeholder="0 9 * * MON-FRI" autocomplete="off" spellcheck="false" aria-describedby="cs-cron-hint">
-      <span id="cs-cron-hint" class="label-hint" style="display:block;margin-top:3px">min hour day month weekday</span>
+    <div class="modal-columns">
+      <div class="modal-col">
+        <div class="modal-col-heading">Schedule</div>
+        <label for="cs-name">Name</label>
+        <input id="cs-name" type="text" placeholder="Daily health check" autocomplete="off">
+        <label for="cs-desc">Description <span class="label-hint">optional</span></label>
+        <input id="cs-desc" type="text" placeholder="" autocomplete="off">
+        <label for="cs-type">Schedule type</label>
+        <select id="cs-type" onchange="toggleScheduleTypeFields()">
+          <option value="cron">Cron (recurring)</option>
+          <option value="at">At (one-shot)</option>
+        </select>
+        <div id="cs-cron-group">
+          <label for="cs-cron">Cron expression</label>
+          <input id="cs-cron" type="text" placeholder="0 9 * * MON-FRI" autocomplete="off" spellcheck="false" aria-describedby="cs-cron-hint">
+          <span id="cs-cron-hint" class="label-hint" style="display:block;margin-top:3px">min hour day month weekday</span>
+        </div>
+        <div id="cs-at-group" style="display:none">
+          <label for="cs-at">Run at</label>
+          <input id="cs-at" type="datetime-local">
+        </div>
+        <label for="cs-target">Target</label>
+        <select id="cs-target" onchange="toggleScheduleNodeField()">
+          <option value="auto">Auto (best available)</option>
+          <option value="pool">Pool (any bridge)</option>
+          <option value="all">All nodes</option>
+          <option value="node">Specific node...</option>
+        </select>
+        <div id="cs-node-group" style="display:none">
+          <label for="cs-node">Node ID</label>
+          <input id="cs-node" type="text" placeholder="node-001" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <div class="modal-col">
+        <div class="modal-col-heading">Execution</div>
+        <label for="cs-model">Model <span class="label-hint">optional</span></label>
+        <input id="cs-model" type="text" placeholder="Default model" autocomplete="off">
+        <label for="cs-template">Template <span class="label-hint">optional</span></label>
+        <input id="cs-template" type="text" placeholder="Prompt template name" autocomplete="off">
+        <label for="cs-ws-template">WS Template <span class="label-hint">optional</span></label>
+        <select id="cs-ws-template"><option value="">None</option></select>
+        <label for="cs-message">Initial message</label>
+        <textarea id="cs-message" rows="3" placeholder="What should the workstream do?"></textarea>
+        <label class="admin-checkbox"><input id="cs-autoapprove" type="checkbox"> Auto-approve tool calls</label>
+      </div>
     </div>
-    <div id="cs-at-group" style="display:none">
-      <label for="cs-at">Run at</label>
-      <input id="cs-at" type="datetime-local">
-    </div>
-    <label for="cs-target">Target</label>
-    <select id="cs-target" onchange="toggleScheduleNodeField()">
-      <option value="auto">Auto (best available)</option>
-      <option value="pool">Pool (any bridge)</option>
-      <option value="all">All nodes</option>
-      <option value="node">Specific node...</option>
-    </select>
-    <div id="cs-node-group" style="display:none">
-      <label for="cs-node">Node ID</label>
-      <input id="cs-node" type="text" placeholder="node-001" autocomplete="off" spellcheck="false">
-    </div>
-    <label for="cs-model">Model <span class="label-hint">optional</span></label>
-    <input id="cs-model" type="text" placeholder="Default model" autocomplete="off">
-    <label for="cs-template">Template <span class="label-hint">optional</span></label>
-    <input id="cs-template" type="text" placeholder="Prompt template name" autocomplete="off">
-    <label for="cs-ws-template">WS Template <span class="label-hint">optional &mdash; workstream profile</span></label>
-    <select id="cs-ws-template"><option value="">None</option></select>
-    <label for="cs-message">Initial message</label>
-    <textarea id="cs-message" rows="3" placeholder="What should the workstream do?"></textarea>
-    <label class="admin-checkbox"><input id="cs-autoapprove" type="checkbox"> Auto-approve tool calls</label>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideCreateScheduleModal()">Cancel</button>
       <button id="cs-submit" class="modal-submit" onclick="submitCreateSchedule()">Create</button>
@@ -530,44 +573,52 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <h2 id="edit-schedule-title">Edit Schedule</h2>
     <div id="edit-schedule-error" role="alert" aria-live="assertive"></div>
     <input id="es-id" type="hidden">
-    <label for="es-name">Name</label>
-    <input id="es-name" type="text" autocomplete="off">
-    <label for="es-desc">Description</label>
-    <input id="es-desc" type="text" autocomplete="off">
-    <label for="es-type">Schedule type</label>
-    <select id="es-type" onchange="toggleEditScheduleTypeFields()">
-      <option value="cron">Cron (recurring)</option>
-      <option value="at">At (one-shot)</option>
-    </select>
-    <div id="es-cron-group">
-      <label for="es-cron">Cron expression</label>
-      <input id="es-cron" type="text" autocomplete="off" spellcheck="false">
+    <div class="modal-columns">
+      <div class="modal-col">
+        <div class="modal-col-heading">Schedule</div>
+        <label for="es-name">Name</label>
+        <input id="es-name" type="text" autocomplete="off">
+        <label for="es-desc">Description</label>
+        <input id="es-desc" type="text" autocomplete="off">
+        <label for="es-type">Schedule type</label>
+        <select id="es-type" onchange="toggleEditScheduleTypeFields()">
+          <option value="cron">Cron (recurring)</option>
+          <option value="at">At (one-shot)</option>
+        </select>
+        <div id="es-cron-group">
+          <label for="es-cron">Cron expression</label>
+          <input id="es-cron" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="es-at-group" style="display:none">
+          <label for="es-at">Run at</label>
+          <input id="es-at" type="datetime-local">
+        </div>
+        <label for="es-target">Target</label>
+        <select id="es-target" onchange="toggleEditScheduleNodeField()">
+          <option value="auto">Auto (best available)</option>
+          <option value="pool">Pool (any bridge)</option>
+          <option value="all">All nodes</option>
+          <option value="node">Specific node...</option>
+        </select>
+        <div id="es-node-group" style="display:none">
+          <label for="es-node">Node ID</label>
+          <input id="es-node" type="text" autocomplete="off" spellcheck="false">
+        </div>
+      </div>
+      <div class="modal-col">
+        <div class="modal-col-heading">Execution</div>
+        <label for="es-model">Model</label>
+        <input id="es-model" type="text" autocomplete="off">
+        <label for="es-template">Template <span class="label-hint">optional</span></label>
+        <input id="es-template" type="text" autocomplete="off">
+        <label for="es-ws-template">WS Template <span class="label-hint">optional</span></label>
+        <select id="es-ws-template"><option value="">None</option></select>
+        <label for="es-message">Initial message</label>
+        <textarea id="es-message" rows="3"></textarea>
+        <label class="admin-checkbox"><input id="es-autoapprove" type="checkbox"> Auto-approve tool calls</label>
+        <label class="admin-checkbox"><input id="es-enabled" type="checkbox"> Enabled</label>
+      </div>
     </div>
-    <div id="es-at-group" style="display:none">
-      <label for="es-at">Run at</label>
-      <input id="es-at" type="datetime-local">
-    </div>
-    <label for="es-target">Target</label>
-    <select id="es-target" onchange="toggleEditScheduleNodeField()">
-      <option value="auto">Auto (best available)</option>
-      <option value="pool">Pool (any bridge)</option>
-      <option value="all">All nodes</option>
-      <option value="node">Specific node...</option>
-    </select>
-    <div id="es-node-group" style="display:none">
-      <label for="es-node">Node ID</label>
-      <input id="es-node" type="text" autocomplete="off" spellcheck="false">
-    </div>
-    <label for="es-model">Model</label>
-    <input id="es-model" type="text" autocomplete="off">
-    <label for="es-template">Template <span class="label-hint">optional</span></label>
-    <input id="es-template" type="text" autocomplete="off">
-    <label for="es-ws-template">WS Template <span class="label-hint">optional</span></label>
-    <select id="es-ws-template"><option value="">None</option></select>
-    <label for="es-message">Initial message</label>
-    <textarea id="es-message" rows="3"></textarea>
-    <label class="admin-checkbox"><input id="es-autoapprove" type="checkbox"> Auto-approve tool calls</label>
-    <label class="admin-checkbox"><input id="es-enabled" type="checkbox"> Enabled</label>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditScheduleModal()">Cancel</button>
       <button id="es-submit" class="modal-submit" onclick="submitEditSchedule()">Save</button>
@@ -745,46 +796,54 @@ window.TURNSTONE_KB_SHORTCUTS = [
   <div id="create-wst-box" class="admin-modal admin-modal-wide">
     <h2 id="create-wst-title">Create Workstream Template</h2>
     <div id="create-wst-error" role="alert" aria-live="assertive"></div>
-    <label for="cwst-name">Name</label>
-    <input id="cwst-name" type="text" placeholder="e.g. Code Review Agent" autocomplete="off">
-    <label for="cwst-description">Description <span class="label-hint">optional</span></label>
-    <input id="cwst-description" type="text" placeholder="Brief description" autocomplete="off">
-    <label>System Prompt Source</label>
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-      <label class="admin-checkbox" style="margin-top:0"><input id="cwst-src-inline" type="radio" name="cwst-src" value="inline" checked onchange="toggleWstPromptSource()"> Inline</label>
-      <label class="admin-checkbox" style="margin-top:0"><input id="cwst-src-ref" type="radio" name="cwst-src" value="ref" onchange="toggleWstPromptSource()"> Prompt Template</label>
+    <div class="modal-columns">
+      <div class="modal-col">
+        <div class="modal-col-heading">Identity</div>
+        <label for="cwst-name">Name</label>
+        <input id="cwst-name" type="text" placeholder="e.g. Code Review Agent" autocomplete="off">
+        <label for="cwst-description">Description <span class="label-hint">optional</span></label>
+        <input id="cwst-description" type="text" placeholder="Brief description" autocomplete="off">
+        <label>System Prompt Source</label>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <label class="admin-checkbox" style="margin-top:0"><input id="cwst-src-inline" type="radio" name="cwst-src" value="inline" checked onchange="toggleWstPromptSource()"> Inline</label>
+          <label class="admin-checkbox" style="margin-top:0"><input id="cwst-src-ref" type="radio" name="cwst-src" value="ref" onchange="toggleWstPromptSource()"> Prompt Template</label>
+        </div>
+        <div id="cwst-inline-section">
+          <label for="cwst-system-prompt">System Prompt <span class="label-hint">inline text</span></label>
+          <textarea id="cwst-system-prompt" rows="4" placeholder="You are a..."></textarea>
+        </div>
+        <div id="cwst-ref-section" style="display:none">
+          <label for="cwst-prompt-template">Prompt Template <span class="label-hint">reference by name</span></label>
+          <select id="cwst-prompt-template"><option value="">None</option></select>
+        </div>
+        <label class="admin-checkbox"><input id="cwst-auto-approve" type="checkbox"> Auto-approve all tools</label>
+        <label for="cwst-auto-approve-tools">Auto-approve tools <span class="label-hint">comma-separated</span></label>
+        <input id="cwst-auto-approve-tools" type="text" placeholder="e.g. read_file, list_directory" autocomplete="off">
+      </div>
+      <div class="modal-col">
+        <div class="modal-col-heading">Model Config</div>
+        <label for="cwst-model">Model</label>
+        <input id="cwst-model" type="text" autocomplete="off">
+        <label for="cwst-temperature">Temperature <span class="label-hint">0.0–2.0</span></label>
+        <input id="cwst-temperature" type="number" step="0.1" min="0" max="2" autocomplete="off">
+        <label for="cwst-reasoning-effort">Reasoning effort</label>
+        <select id="cwst-reasoning-effort">
+          <option value="">Default</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="none">None</option>
+          <option value="max">Max</option>
+        </select>
+        <label for="cwst-max-tokens">Max tokens <span class="label-hint">0 = default</span></label>
+        <input id="cwst-max-tokens" type="number" min="0" autocomplete="off">
+        <label for="cwst-agent-max-turns">Agent max turns <span class="label-hint">0 = default</span></label>
+        <input id="cwst-agent-max-turns" type="number" min="0" autocomplete="off">
+        <label for="cwst-token-budget">Token budget <span class="label-hint">0 = unlimited</span></label>
+        <input id="cwst-token-budget" type="number" value="0" min="0">
+        <label class="admin-checkbox"><input id="cwst-enabled" type="checkbox" checked> Enabled</label>
+      </div>
     </div>
-    <div id="cwst-inline-section">
-      <label for="cwst-system-prompt">System Prompt <span class="label-hint">inline text</span></label>
-      <textarea id="cwst-system-prompt" rows="4" placeholder="You are a..."></textarea>
-    </div>
-    <div id="cwst-ref-section" style="display:none">
-      <label for="cwst-prompt-template">Prompt Template <span class="label-hint">reference by name</span></label>
-      <select id="cwst-prompt-template"><option value="">None</option></select>
-    </div>
-    <label for="cwst-model">Model <span class="label-hint">optional — server default if empty</span></label>
-    <input id="cwst-model" type="text" placeholder="Default model" autocomplete="off">
-    <label class="admin-checkbox"><input id="cwst-auto-approve" type="checkbox"> Auto-approve all tools</label>
-    <label for="cwst-auto-approve-tools">Auto-approve tools <span class="label-hint">comma-separated tool names</span></label>
-    <input id="cwst-auto-approve-tools" type="text" placeholder="e.g. read_file, list_directory" autocomplete="off">
-    <label for="cwst-token-budget">Token budget <span class="label-hint">0 = unlimited</span></label>
-    <input id="cwst-token-budget" type="number" value="0" min="0">
-    <label for="cwst-temperature">Temperature <span class="label-hint">optional — 0.0-2.0, empty = server default</span></label>
-    <input id="cwst-temperature" type="number" step="0.1" min="0" max="2" placeholder="Server default" autocomplete="off">
-    <label for="cwst-reasoning-effort">Reasoning effort <span class="label-hint">optional</span></label>
-    <select id="cwst-reasoning-effort">
-      <option value="">Server default</option>
-      <option value="low">Low</option>
-      <option value="medium">Medium</option>
-      <option value="high">High</option>
-      <option value="none">None</option>
-      <option value="max">Max</option>
-    </select>
-    <label for="cwst-max-tokens">Max tokens <span class="label-hint">optional — 0 = server default</span></label>
-    <input id="cwst-max-tokens" type="number" min="0" placeholder="Server default" autocomplete="off">
-    <label for="cwst-agent-max-turns">Agent max turns <span class="label-hint">optional — 0 = server default</span></label>
-    <input id="cwst-agent-max-turns" type="number" min="0" placeholder="Server default" autocomplete="off">
-    <label class="admin-checkbox"><input id="cwst-enabled" type="checkbox" checked> Enabled</label>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideCreateWsTemplateModal()">Cancel</button>
       <button id="cwst-submit" class="modal-submit" onclick="submitCreateWsTemplate()">Create</button>
@@ -798,46 +857,54 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <h2 id="edit-wst-title">Edit Workstream Template</h2>
     <div id="edit-wst-error" role="alert" aria-live="assertive"></div>
     <input id="ewst-id" type="hidden">
-    <label for="ewst-name">Name</label>
-    <input id="ewst-name" type="text" autocomplete="off">
-    <label for="ewst-description">Description</label>
-    <input id="ewst-description" type="text" autocomplete="off">
-    <label>System Prompt Source</label>
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
-      <label class="admin-checkbox" style="margin-top:0"><input id="ewst-src-inline" type="radio" name="ewst-src" value="inline" checked onchange="toggleEditWstPromptSource()"> Inline</label>
-      <label class="admin-checkbox" style="margin-top:0"><input id="ewst-src-ref" type="radio" name="ewst-src" value="ref" onchange="toggleEditWstPromptSource()"> Prompt Template</label>
+    <div class="modal-columns">
+      <div class="modal-col">
+        <div class="modal-col-heading">Identity</div>
+        <label for="ewst-name">Name</label>
+        <input id="ewst-name" type="text" autocomplete="off">
+        <label for="ewst-description">Description</label>
+        <input id="ewst-description" type="text" autocomplete="off">
+        <label>System Prompt Source</label>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+          <label class="admin-checkbox" style="margin-top:0"><input id="ewst-src-inline" type="radio" name="ewst-src" value="inline" checked onchange="toggleEditWstPromptSource()"> Inline</label>
+          <label class="admin-checkbox" style="margin-top:0"><input id="ewst-src-ref" type="radio" name="ewst-src" value="ref" onchange="toggleEditWstPromptSource()"> Prompt Template</label>
+        </div>
+        <div id="ewst-inline-section">
+          <label for="ewst-system-prompt">System Prompt</label>
+          <textarea id="ewst-system-prompt" rows="4"></textarea>
+        </div>
+        <div id="ewst-ref-section" style="display:none">
+          <label for="ewst-prompt-template">Prompt Template</label>
+          <select id="ewst-prompt-template"><option value="">None</option></select>
+        </div>
+        <label class="admin-checkbox"><input id="ewst-auto-approve" type="checkbox"> Auto-approve all tools</label>
+        <label for="ewst-auto-approve-tools">Auto-approve tools</label>
+        <input id="ewst-auto-approve-tools" type="text" autocomplete="off">
+      </div>
+      <div class="modal-col">
+        <div class="modal-col-heading">Model Config</div>
+        <label for="ewst-model">Model</label>
+        <input id="ewst-model" type="text" autocomplete="off">
+        <label for="ewst-temperature">Temperature <span class="label-hint">0.0–2.0</span></label>
+        <input id="ewst-temperature" type="number" step="0.1" min="0" max="2" autocomplete="off">
+        <label for="ewst-reasoning-effort">Reasoning effort</label>
+        <select id="ewst-reasoning-effort">
+          <option value="">Default</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="none">None</option>
+          <option value="max">Max</option>
+        </select>
+        <label for="ewst-max-tokens">Max tokens <span class="label-hint">0 = default</span></label>
+        <input id="ewst-max-tokens" type="number" min="0" autocomplete="off">
+        <label for="ewst-agent-max-turns">Agent max turns <span class="label-hint">0 = default</span></label>
+        <input id="ewst-agent-max-turns" type="number" min="0" autocomplete="off">
+        <label for="ewst-token-budget">Token budget <span class="label-hint">0 = unlimited</span></label>
+        <input id="ewst-token-budget" type="number" value="0" min="0">
+        <label class="admin-checkbox"><input id="ewst-enabled" type="checkbox" checked> Enabled</label>
+      </div>
     </div>
-    <div id="ewst-inline-section">
-      <label for="ewst-system-prompt">System Prompt</label>
-      <textarea id="ewst-system-prompt" rows="4"></textarea>
-    </div>
-    <div id="ewst-ref-section" style="display:none">
-      <label for="ewst-prompt-template">Prompt Template</label>
-      <select id="ewst-prompt-template"><option value="">None</option></select>
-    </div>
-    <label for="ewst-model">Model</label>
-    <input id="ewst-model" type="text" autocomplete="off">
-    <label class="admin-checkbox"><input id="ewst-auto-approve" type="checkbox"> Auto-approve all tools</label>
-    <label for="ewst-auto-approve-tools">Auto-approve tools</label>
-    <input id="ewst-auto-approve-tools" type="text" autocomplete="off">
-    <label for="ewst-token-budget">Token budget</label>
-    <input id="ewst-token-budget" type="number" value="0" min="0">
-    <label for="ewst-temperature">Temperature <span class="label-hint">optional — 0.0-2.0, empty = server default</span></label>
-    <input id="ewst-temperature" type="number" step="0.1" min="0" max="2" placeholder="Server default" autocomplete="off">
-    <label for="ewst-reasoning-effort">Reasoning effort <span class="label-hint">optional</span></label>
-    <select id="ewst-reasoning-effort">
-      <option value="">Server default</option>
-      <option value="low">Low</option>
-      <option value="medium">Medium</option>
-      <option value="high">High</option>
-      <option value="none">None</option>
-      <option value="max">Max</option>
-    </select>
-    <label for="ewst-max-tokens">Max tokens <span class="label-hint">optional</span></label>
-    <input id="ewst-max-tokens" type="number" min="0" placeholder="Server default" autocomplete="off">
-    <label for="ewst-agent-max-turns">Agent max turns <span class="label-hint">optional</span></label>
-    <input id="ewst-agent-max-turns" type="number" min="0" placeholder="Server default" autocomplete="off">
-    <label class="admin-checkbox"><input id="ewst-enabled" type="checkbox" checked> Enabled</label>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditWsTemplateModal()">Cancel</button>
       <button id="ewst-submit" class="modal-submit" onclick="submitEditWsTemplate()">Save</button>

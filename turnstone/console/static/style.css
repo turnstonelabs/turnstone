@@ -543,6 +543,30 @@
   outline-offset: 2px;
 }
 
+/* Admin button — top accent line + active state */
+#admin-btn {
+  position: relative;
+  overflow: visible;
+}
+#admin-btn::before {
+  content: '';
+  position: absolute;
+  top: -2px;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 0 0 1px 1px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+#admin-btn.active::before { opacity: 1; }
+#admin-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
 /* ==========================================================================
    New Workstream Modal
    ========================================================================== */
@@ -702,39 +726,124 @@
 }
 
 /* ==========================================================================
-   Admin panel
+   Admin panel — sidebar layout
    ========================================================================== */
 
-.admin-tabs {
+#view-admin { animation: admin-fadein 0.15s ease-out; }
+@keyframes admin-fadein { from { opacity: 0; } to { opacity: 1; } }
+
+.admin-layout {
   display: flex;
-  gap: 2px;
-  margin-bottom: 16px;
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 0;
+  min-height: 0;
+  flex: 1;
 }
-.admin-tab {
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--fg-dim);
+
+/* Sidebar — right-aligned to match header admin button position */
+.admin-sidebar {
+  width: 180px;
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-strong);
+  padding: 4px 0;
+  overflow-y: auto;
+  order: 1;
+}
+
+/* Group labels */
+.admin-sidebar-group { margin-bottom: 2px; }
+.admin-sidebar-group-label {
   font-family: var(--font-display);
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  padding: 8px 16px 10px;
+  letter-spacing: 0.12em;
+  color: var(--fg-dim);
+  padding: 12px 16px 4px;
+}
+.admin-sidebar-group:first-child .admin-sidebar-group-label {
+  padding-top: 4px;
+}
+
+/* Nav items */
+.admin-nav {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  border-right: 2px solid transparent;
+  color: var(--fg-dim);
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 14px 6px 16px;
   cursor: pointer;
-  transition: color 0.15s, border-color 0.15s;
+  text-align: left;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.admin-tab:hover { color: var(--fg); }
-.admin-tab.active {
+.admin-nav:hover { color: var(--fg); background: var(--bg-highlight); border-right-color: var(--border-strong); }
+.admin-nav.active {
   color: var(--accent);
-  border-bottom-color: var(--accent);
+  border-right-color: var(--accent);
+  background: var(--accent-dim);
 }
-.admin-tab:focus-visible {
+.admin-nav:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
   border-radius: var(--radius-sm);
+}
+
+/* Content area */
+.admin-content {
+  flex: 1;
+  min-width: 0;
+  padding-right: 20px;
+}
+
+/* Mobile backdrop */
+.admin-sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 499;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+.admin-sidebar-backdrop.visible {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Mobile menu toggle — visible only on mobile, lives in toolbars */
+.admin-mobile-toggle {
+  display: none;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  margin-right: 8px;
+  flex-shrink: 0;
+  padding: 0;
+}
+.admin-mobile-toggle::before {
+  content: '';
+  display: block;
+  width: 14px;
+  height: 2px;
+  background: currentColor;
+  box-shadow: 0 4px 0 currentColor, 0 8px 0 currentColor;
+}
+.admin-mobile-toggle:hover { color: var(--fg); }
+@media (max-width: 700px) {
+  .admin-mobile-toggle { display: flex; }
 }
 
 .admin-toolbar {
@@ -900,8 +1009,30 @@
 .watch-active { color: var(--green); font-weight: 500; }
 .watch-completed { color: var(--accent); }
 
-/* Wide modal variant for schedule forms */
-.admin-modal-wide { width: 480px; }
+/* Two-column form layout for wide modals */
+.modal-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+}
+.modal-col > label:first-child,
+.modal-col > .modal-col-heading + label { margin-top: 0; }
+.modal-col-heading {
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+.modal-columns > .modal-col:first-child {
+  border-right: 1px solid var(--border);
+  padding-right: 12px;
+}
+.modal-columns > .modal-col:last-child {
+  padding-left: 12px;
+}
 
 /* Checkbox labels inside admin modals */
 .admin-modal label.admin-checkbox {
@@ -930,16 +1061,32 @@
   padding: 32px;
   width: 380px;
   max-width: 90vw;
+  max-height: 85vh;
+  overflow-y: auto;
   box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.5), 0 0 80px -20px var(--accent-dim);
   position: relative;
+}
+.admin-modal.admin-modal-wide { width: 820px; }
+@media (max-width: 700px) {
+  .admin-modal.admin-modal-wide { width: auto; }
+  .modal-columns { grid-template-columns: 1fr; gap: 20px 0; }
+  .modal-columns > .modal-col:first-child {
+    border-right: none;
+    padding-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+  }
+  .modal-columns > .modal-col:last-child { padding-left: 0; }
 }
 .admin-modal::before {
   content: '';
   position: absolute;
-  top: -1px; left: 20%; right: 20%;
+  top: 0; left: 20%; right: 20%;
   height: 2px;
   background: linear-gradient(90deg, transparent, var(--accent), transparent);
   border-radius: 1px;
+  z-index: 1;
+  pointer-events: none;
 }
 .admin-modal h2 {
   font-family: var(--font-display);
@@ -1030,7 +1177,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 500;
+  z-index: 600;
 }
 
 /* Token display (show-once) */
@@ -1076,13 +1223,27 @@
 }
 
 /* ==========================================================================
-   Admin tabs — horizontal scroll for 10+ tabs
+   Admin sidebar — mobile off-canvas drawer
    ========================================================================== */
-.admin-tabs {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
-  flex-wrap: nowrap;
-  scrollbar-width: thin;
+@media (max-width: 700px) {
+  .admin-sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: auto;
+    width: 220px;
+    z-index: 500;
+    background: var(--bg-surface);
+    border-left: 1px solid var(--border-strong);
+    border-right: none;
+    transform: translateX(100%);
+    transition: transform 0.25s ease;
+    padding-top: 48px;
+  }
+  .admin-sidebar.open { transform: translateX(0); }
+  .admin-sidebar.collapsed { transform: translateX(100%); width: 220px; }
+  .admin-content { padding-right: 0; }
 }
 
 /* ==========================================================================
@@ -1349,7 +1510,9 @@
   .node-link, .dash-cell-node, .pagination button { transition: none; }
   .dash-row.has-link::after, .node-group-header::before { transition: none; }
   #new-ws-box select, #new-ws-box input, #new-ws-buttons button { transition: none; }
-  .admin-tab, .admin-row, .admin-btn-danger, .admin-btn-action { transition: none; }
+  .admin-nav, .admin-row, .admin-btn-danger, .admin-btn-action { transition: none; }
+  .admin-sidebar, .admin-sidebar-backdrop { transition: none; }
+  #view-admin { animation: none; }
   .admin-action-btn, .modal-cancel, .modal-submit { transition: none; }
   .admin-modal input, .admin-modal select { transition: none; }
 }
