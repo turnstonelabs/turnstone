@@ -81,6 +81,11 @@ function _buildLoginHTML() {
     '<input id="login-token" name="token" type="password" placeholder="Enter auth token" autocomplete="off">' +
     "</div>" +
     '<button id="login-submit" type="submit">Sign in</button>' +
+    // --- OIDC login ---
+    '<div id="oidc-login" style="display:none">' +
+    '<div class="login-divider"><span>or</span></div>' +
+    '<button id="oidc-btn" class="login-oidc-btn" type="button">Sign in with SSO</button>' +
+    "</div>" +
     // --- Mode toggle ---
     '<div id="login-toggle" class="login-toggle">' +
     '<button id="toggle-token" class="login-link" type="button">Use token instead</button>' +
@@ -193,6 +198,17 @@ function showLogin() {
         _switchMode("setup");
       } else {
         _switchMode("login");
+      }
+      // Show OIDC button if available
+      if (data.oidc_enabled && data.oidc_login_url) {
+        var oidcDiv = document.getElementById("oidc-login");
+        var oidcBtn = document.getElementById("oidc-btn");
+        if (oidcDiv) oidcDiv.style.display = "";
+        if (oidcBtn) {
+          oidcBtn.onclick = function () {
+            window.location.href = "/v1" + data.oidc_login_url;
+          };
+        }
       }
     })
     .catch(function () {
