@@ -16,7 +16,10 @@ class TestSchemaCreation:
         engine = get_storage()._engine  # noqa: SLF001
         with engine.connect() as conn:
             rows = conn.execute(
-                sa.text("SELECT name FROM sqlite_master WHERE type='table' AND name='memories'")
+                sa.text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='structured_memories'"
+                )
             ).fetchall()
             assert len(rows) == 1
             rows = conn.execute(

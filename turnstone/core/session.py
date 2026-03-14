@@ -33,25 +33,37 @@ from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
-    delete_memory,
+    count_structured_memories,
+    delete_structured_memory,
     delete_workstream,
     get_prompt_template_by_name,
     get_workstream_display_name,
     list_default_templates,
+    list_structured_memories,
     list_workstreams_with_history,
-    load_memories,
     load_messages,
     load_workstream_config,
     normalize_key,
     resolve_workstream,
-    save_memory,
     save_message,
+    save_structured_memory,
     save_workstream_config,
     search_history,
     search_history_recent,
-    search_memories,
+    search_structured_memories,
     set_workstream_alias,
     update_workstream_title,
+)
+from turnstone.core.memory_relevance import (
+    build_memory_context,
+    extract_recent_context,
+    score_memories,
+)
+from turnstone.core.metacognition import (
+    detect_completion,
+    detect_correction,
+    format_nudge,
+    should_nudge,
 )
 from turnstone.core.providers import create_provider
 from turnstone.core.safety import is_command_blocked, sanitize_command
@@ -110,6 +122,7 @@ _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 
 # Upper bound on total prompt template content injected into system messages
 _MAX_TEMPLATE_CONTENT: int = 32768
+_MAX_MEMORY_CONTENT: int = 32768
 
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -222,6 +235,7 @@ class ChatSession:
         tool_search_max_results: int = 5,
         template: str | None = None,
         judge_config: JudgeConfig | None = None,
+        user_id: str = "",
     ):
         self.client = client
         self.model = model
@@ -255,6 +269,7 @@ class ChatSession:
         self.debug = False
         self.auto_approve = False
         self._node_id = node_id
+        self._user_id = user_id
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
@@ -277,6 +292,9 @@ class ChatSession:
         self._watch_runner: Any = None  # WatchRunner | None
         self._watch_pending: queue.Queue[dict[str, Any]] = queue.Queue()
         self._watch_dispatch_depth = 0
+        # Metacognitive nudges: ephemeral prompts for proactive memory use
+        self._metacog_state: dict[str, float] = {}
+        self._pending_nudge: str | None = None
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg: dict[str, Any] | None = None
@@ -639,7 +657,14 @@ class ChatSession:
                     self._template_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
-            self._init_system_messages()
+        if should_nudge(
+            "resume",
+            self._metacog_state,
+            message_count=len(self.messages),
+            memory_count=self._visible_memory_count(),
+        ):
+            self._pending_nudge = format_nudge("resume")
+        self._init_system_messages()
         return True
 
     def _init_system_messages(self) -> None:
@@ -766,13 +791,22 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        memories = load_memories()
-        if memories:
+        visible_mems = self._get_visible_memories(limit=50)
+        if visible_mems:
+            context = extract_recent_context(self.messages)
+            relevant = score_memories(visible_mems, context, k=5)
+            if relevant:
+                dev_parts.append("")
+                dev_parts.append(build_memory_context(relevant))
             dev_parts.append("")
             dev_parts.append(
-                f"REMINDER: You currently have {len(memories)} memories stored. "
-                "Use recall to see them."
+                f"You have {len(visible_mems)} memories in scope. "
+                "Use memory(action='search') or memory(action='list') for more."
             )
+        if self._pending_nudge:
+            dev_parts.append("")
+            dev_parts.append(self._pending_nudge)
+            self._pending_nudge = None
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Atomic swap — readers see either old or new, never partial
         self.system_messages = new_system_messages
@@ -957,6 +991,12 @@ class ChatSession:
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
         save_message(self._ws_id, "user", user_input)
 
+        # Metacognitive nudge: check for correction/completion signals
+        nudge = self._check_metacognitive_nudge(user_input)
+        if nudge:
+            self._pending_nudge = nudge
+            self._init_system_messages()
+
         try:
             while True:
                 self._check_cancelled()
@@ -996,8 +1036,7 @@ class ChatSession:
                     filtered_tc = [
                         call
                         for call in tc
-                        if call.get("function", {}).get("name", "")
-                        not in ("remember", "forget", "recall")
+                        if call.get("function", {}).get("name", "") not in ("memory", "recall")
                     ]
                     if filtered_tc:
                         tool_calls_json = json.dumps(filtered_tc)
@@ -1066,8 +1105,7 @@ class ChatSession:
                     # Log tool result (skip memory tools to avoid noise)
                     _tname = _tc_names.get(tc_id, "")
                     if _tname not in (
-                        "remember",
-                        "forget",
+                        "memory",
                         "recall",
                     ):
                         # For image content, store text description only
@@ -1626,7 +1664,11 @@ class ChatSession:
                     "   - **## Open tasks**: What the user asked for that is not yet done, "
                     "with enough context to continue.\n"
                     "   - **## User preferences**: Workflow preferences, constraints, or "
-                    "instructions the user stated.\n\n"
+                    "instructions the user stated.\n"
+                    "   - **## Memories to save**: Corrections, preferences, or learnings "
+                    "the user expressed that should be persisted across sessions. "
+                    "Format each as: `name: description — content`. "
+                    "Only include items the user explicitly stated, not inferences.\n\n"
                     "2. **Density rules:**\n"
                     "   - Every token should carry information.\n"
                     "   - Preserve exact paths, identifiers, and numbers — never paraphrase these.\n"
@@ -1821,6 +1863,14 @@ class ChatSession:
                         f"Denied by user: {user_feedback}" if user_feedback else "Denied by user"
                     )
             user_feedback = None  # feedback is in the denial_msg
+            if should_nudge(
+                "denial",
+                self._metacog_state,
+                message_count=len(self.messages),
+                memory_count=self._visible_memory_count(),
+            ):
+                self._pending_nudge = format_nudge("denial")
+                self._init_system_messages()
 
         # Phase 3: execute (check cancellation before starting)
         self._check_cancelled()
@@ -1972,9 +2022,8 @@ class ChatSession:
             "tool_search": self._prepare_tool_search,
             "task": self._prepare_task,
             "create_plan": self._prepare_plan,
-            "remember": self._prepare_remember,
+            "memory": self._prepare_memory,
             "recall": self._prepare_recall,
-            "forget": self._prepare_forget,
             "notify": self._prepare_notify,
             "watch": self._prepare_watch,
             "read_resource": self._prepare_read_resource,
@@ -2545,55 +2594,232 @@ class ChatSession:
             "prompt": goal,
         }
 
-    def _prepare_remember(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a remember (save memory) action."""
-        key = normalize_key((args.get("key") or "").strip())
-        value = (args.get("value") or "").strip()
-        if not key or not value:
-            return {
-                "call_id": call_id,
-                "func_name": "remember",
-                "header": "\u2717 remember: requires key and value",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: both 'key' and 'value' are required",
-            }
-        return {
-            "call_id": call_id,
-            "func_name": "remember",
-            "header": f"\u2699 remember: {key}",
-            "preview": "",
-            "needs_approval": False,
-            "execute": self._exec_remember,
-            "key": key,
-            "value": value,
-        }
+    def _resolve_scope_id(self, scope: str) -> str:
+        """Map a scope name to its scope_id."""
+        if scope == "workstream":
+            return self._ws_id
+        if scope == "user":
+            return self._user_id
+        return ""
 
-    def _prepare_forget(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a forget (delete memory) action."""
-        key = normalize_key((args.get("key") or "").strip())
-        if not key:
+    def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
+        """Return an error dict if scope is invalid, None if OK."""
+        if scope == "user" and not self._user_id:
             return {
                 "call_id": call_id,
-                "func_name": "forget",
-                "header": "\u2717 forget: empty key",
+                "func_name": "memory",
+                "header": "\u2717 memory: user scope requires authentication",
                 "preview": "",
                 "needs_approval": False,
-                "error": "Error: key is required",
+                "error": "Error: 'user' scope requires authenticated user identity",
             }
+        return None
+
+    def _get_visible_memories(self, limit: int = 50) -> list[dict[str, str]]:
+        """Return memories visible to this session (scope-filtered)."""
+        global_mems = list_structured_memories(scope="global", limit=limit)
+        ws_mems = list_structured_memories(scope="workstream", scope_id=self._ws_id, limit=limit)
+        user_mems: list[dict[str, str]] = []
+        if self._user_id:
+            user_mems = list_structured_memories(scope="user", scope_id=self._user_id, limit=limit)
+        combined = global_mems + ws_mems + user_mems
+        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
+        return combined[:limit]
+
+    def _visible_memory_count(self) -> int:
+        """Count memories visible to this session (cheap — counts only)."""
+        n = count_structured_memories(scope="global")
+        n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
+        if self._user_id:
+            n += count_structured_memories(scope="user", scope_id=self._user_id)
+        return n
+
+    def _check_metacognitive_nudge(self, user_message: str) -> str | None:
+        """Check if a metacognitive nudge should be injected."""
+        mem_count = self._visible_memory_count()
+        msg_count = len(self.messages)
+
+        # First message in a new workstream — nudge to check existing memories
+        if should_nudge(
+            "start", self._metacog_state, message_count=msg_count, memory_count=mem_count
+        ):
+            return format_nudge("start")
+
+        if detect_correction(user_message) and should_nudge(
+            "correction", self._metacog_state, message_count=msg_count, memory_count=mem_count
+        ):
+            return format_nudge("correction")
+
+        if detect_completion(user_message) and should_nudge(
+            "completion", self._metacog_state, message_count=msg_count, memory_count=mem_count
+        ):
+            return format_nudge("completion")
+
+        return None
+
+    def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a memory tool action (save/search/delete/list)."""
+        action = (args.get("action") or "").strip().lower()
+
+        if action == "save":
+            name = (args.get("name") or args.get("key") or "").strip()
+            content = (args.get("content") or args.get("value") or "").strip()
+            name = normalize_key(name)
+            if not name or not content:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory save: requires name and content",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: both 'name' and 'content' are required for save",
+                }
+            if len(content) > _MAX_MEMORY_CONTENT:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory save: content too large",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": f"Error: content exceeds {_MAX_MEMORY_CONTENT} byte limit",
+                }
+            description = (args.get("description") or "").strip()
+            mem_type = (args.get("type") or "project").strip().lower()
+            if mem_type not in ("user", "project", "feedback", "reference"):
+                mem_type = "project"
+            scope = (args.get("scope") or "global").strip().lower()
+            if scope not in ("global", "workstream", "user"):
+                scope = "global"
+            scope_err = self._validate_scope(scope, call_id)
+            if scope_err:
+                return scope_err
+            scope_id = self._resolve_scope_id(scope)
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2699 memory save: {name}",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_memory,
+                "action": "save",
+                "name": name,
+                "content": content,
+                "description": description,
+                "mem_type": mem_type,
+                "scope": scope,
+                "scope_id": scope_id,
+            }
+
+        if action == "delete":
+            name = normalize_key((args.get("name") or args.get("key") or "").strip())
+            if not name:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory delete: empty name",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: name is required for delete",
+                }
+            scope = (args.get("scope") or "global").strip().lower()
+            if scope not in ("global", "workstream", "user"):
+                scope = "global"
+            scope_err = self._validate_scope(scope, call_id)
+            if scope_err:
+                return scope_err
+            scope_id = self._resolve_scope_id(scope)
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2699 memory delete: {name}",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_memory,
+                "action": "delete",
+                "name": name,
+                "scope": scope,
+                "scope_id": scope_id,
+            }
+
+        if action == "search":
+            query = (args.get("query") or "").strip()
+            mem_type = (args.get("type") or "").strip().lower()
+            if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
+                mem_type = ""
+            scope = (args.get("scope") or "").strip().lower()
+            if scope and scope not in ("global", "workstream", "user"):
+                scope = ""
+            scope_id = self._resolve_scope_id(scope) if scope else ""
+            limit = args.get("limit", 20)
+            if isinstance(limit, str):
+                try:
+                    limit = int(limit)
+                except ValueError:
+                    limit = 20
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2699 memory search{': ' + query[:80] if query else ''}",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_memory,
+                "action": "search",
+                "query": query,
+                "mem_type": mem_type,
+                "scope": scope,
+                "scope_id": scope_id,
+                "limit": max(1, min(limit, 50)),
+            }
+
+        if action == "list":
+            mem_type = (args.get("type") or "").strip().lower()
+            if mem_type and mem_type not in ("user", "project", "feedback", "reference"):
+                mem_type = ""
+            scope = (args.get("scope") or "").strip().lower()
+            if scope and scope not in ("global", "workstream", "user"):
+                scope = ""
+            scope_id = self._resolve_scope_id(scope) if scope else ""
+            limit = args.get("limit", 20)
+            if isinstance(limit, str):
+                try:
+                    limit = int(limit)
+                except ValueError:
+                    limit = 20
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": "\u2699 memory list",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_memory,
+                "action": "list",
+                "mem_type": mem_type,
+                "scope": scope,
+                "scope_id": scope_id,
+                "limit": max(1, min(limit, 50)),
+            }
+
         return {
             "call_id": call_id,
-            "func_name": "forget",
-            "header": f"\u2699 forget: {key}",
+            "func_name": "memory",
+            "header": "\u2717 memory: invalid action",
             "preview": "",
             "needs_approval": False,
-            "execute": self._exec_forget,
-            "key": key,
+            "error": f"Error: action must be save/search/delete/list, got '{action}'",
         }
 
     def _prepare_recall(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a recall action."""
+        """Prepare a conversation history search."""
         query = (args.get("query") or "").strip()
+        if not query:
+            return {
+                "call_id": call_id,
+                "func_name": "recall",
+                "header": "\u2717 recall: requires query",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: query is required",
+            }
         limit = args.get("limit", 20)
         if isinstance(limit, str):
             try:
@@ -2603,12 +2829,12 @@ class ChatSession:
         return {
             "call_id": call_id,
             "func_name": "recall",
-            "header": f"\u2699 recall{': ' + query[:80] if query else ''}",
+            "header": f"\u2699 recall: {query[:80]}",
             "preview": "",
             "needs_approval": False,
             "execute": self._exec_recall,
             "query": query,
-            "limit": min(limit, 50),
+            "limit": max(1, min(limit, 50)),
         }
 
     # -- MCP tool prepare/execute ----------------------------------------------
@@ -3500,66 +3726,113 @@ class ChatSession:
 
         return content
 
-    def _exec_remember(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Save a persistent memory."""
-        call_id, key, value = item["call_id"], item["key"], item["value"]
+    def _exec_memory(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Execute a memory tool action."""
+        call_id = item["call_id"]
+        action = item["action"]
+
         try:
-            old_value = save_memory(key, value)
-            self._init_system_messages()
-            if old_value is not None:
-                msg = f"Updated memory: {key} = {value} (was: {old_value})"
-            else:
-                msg = f"Saved memory: {key} = {value}"
-            self.ui.on_tool_result(call_id, "remember", msg)
-            return call_id, msg
+            if action == "save":
+                memory_id, old = save_structured_memory(
+                    item["name"],
+                    item["content"],
+                    description=item["description"],
+                    mem_type=item["mem_type"],
+                    scope=item["scope"],
+                    scope_id=item["scope_id"],
+                )
+                if not memory_id:
+                    msg = f"Error: failed to save memory '{item['name']}'"
+                    self.ui.on_tool_result(call_id, "memory", msg)
+                    return call_id, msg
+                self._init_system_messages()
+                if old is not None:
+                    msg = f"Updated memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
+                else:
+                    msg = f"Saved memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
+                self.ui.on_tool_result(call_id, "memory", msg)
+                return call_id, msg
+
+            if action == "delete":
+                deleted = delete_structured_memory(item["name"], item["scope"], item["scope_id"])
+                if not deleted:
+                    msg = f"Error: memory '{item['name']}' not found (scope={item['scope']})"
+                else:
+                    self._init_system_messages()
+                    msg = f"Deleted memory '{item['name']}'"
+                self.ui.on_tool_result(call_id, "memory", msg)
+                return call_id, msg
+
+            if action == "search":
+                rows = search_structured_memories(
+                    item["query"],
+                    mem_type=item.get("mem_type", ""),
+                    scope=item.get("scope", ""),
+                    scope_id=item.get("scope_id", ""),
+                    limit=item["limit"],
+                )
+                if rows:
+                    lines = []
+                    for m in rows:
+                        desc = f" — {m['description']}" if m.get("description") else ""
+                        lines.append(
+                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n"
+                            f"    {m['content'][:500]}"
+                        )
+                    msg = f"Memories ({len(rows)} results):\n" + "\n".join(lines)
+                else:
+                    msg = (
+                        f"No memories found for '{item['query']}'."
+                        if item["query"]
+                        else "No memories stored."
+                    )
+                self.ui.on_tool_result(call_id, "memory", msg)
+                return call_id, msg
+
+            if action == "list":
+                rows = list_structured_memories(
+                    mem_type=item.get("mem_type", ""),
+                    scope=item.get("scope", ""),
+                    scope_id=item.get("scope_id", ""),
+                    limit=item["limit"],
+                )
+                if rows:
+                    lines = []
+                    for m in rows:
+                        desc = f" — {m['description']}" if m.get("description") else ""
+                        lines.append(
+                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n"
+                            f"    {m['content'][:500]}"
+                        )
+                    msg = f"Memories ({len(rows)}):\n" + "\n".join(lines)
+                else:
+                    msg = "No memories stored."
+                self.ui.on_tool_result(call_id, "memory", msg)
+                return call_id, msg
+
         except Exception as e:
             return call_id, f"Error: {e}"
 
-    def _exec_forget(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Remove a persistent memory by key."""
-        call_id, key = item["call_id"], item["key"]
-        try:
-            deleted = delete_memory(key)
-            if not deleted:
-                msg = f"Error: memory '{key}' not found"
-            else:
-                self._init_system_messages()
-                msg = f"Forgot: {key}"
-            self.ui.on_tool_result(call_id, "forget", msg)
-            return call_id, msg
-        except Exception as e:
-            return call_id, f"Error: {e}"
+        return call_id, "Error: unexpected action"
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search memories and conversation history."""
+        """Search conversation history."""
         call_id = item["call_id"]
         query, limit = item["query"], item["limit"]
-        parts: list[str] = []
 
-        # Memories: list all (no query) or search (with query)
-        try:
-            rows = search_memories(query) if query else load_memories()
-            if rows:
-                parts.append("Memories:\n" + "\n".join(f"  {k}={v}" for k, v in rows))
-            elif not query:
-                parts.append("No memories stored.")
-        except Exception:
-            pass
+        conv_rows = search_history(query, limit)
+        if conv_rows:
+            lines = []
+            for ts, sid, role, content, tool_name in conv_rows:
+                label = f"{role}({tool_name})" if tool_name else role
+                text = (content or "")[:500]
+                if content and len(content) > 500:
+                    text += "..."
+                lines.append(f"[{ts} {sid}] {label}: {text}")
+            output = f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines)
+        else:
+            output = f"No conversation history found for '{query}'."
 
-        # Conversations: only when a query is provided
-        if query:
-            conv_rows = search_history(query, limit)
-            if conv_rows:
-                lines = []
-                for ts, sid, role, content, tool_name in conv_rows:
-                    label = f"{role}({tool_name})" if tool_name else role
-                    text = (content or "")[:500]
-                    if content and len(content) > 500:
-                        text += "..."
-                    lines.append(f"[{ts} {sid}] {label}: {text}")
-                parts.append(f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines))
-
-        output = "\n\n".join(parts) if parts else f"No results for '{query}'."
         self.ui.on_tool_result(call_id, "recall", output)
         return call_id, output
 

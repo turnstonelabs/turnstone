@@ -9,13 +9,21 @@ import sqlalchemy as sa
 
 metadata = sa.MetaData()
 
-memories = sa.Table(
-    "memories",
+structured_memories = sa.Table(
+    "structured_memories",
     metadata,
-    sa.Column("key", sa.Text, primary_key=True),
-    sa.Column("value", sa.Text, nullable=False),
+    sa.Column("memory_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False),
+    sa.Column("description", sa.Text, nullable=False, server_default=""),
+    sa.Column("type", sa.Text, nullable=False, server_default="project"),
+    sa.Column("scope", sa.Text, nullable=False, server_default="global"),
+    sa.Column("scope_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("content", sa.Text, nullable=False),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
+    sa.Column("last_accessed", sa.Text, nullable=False, server_default=""),
+    sa.Column("access_count", sa.Integer, nullable=False, server_default="0"),
+    sa.UniqueConstraint("name", "scope", "scope_id", name="uq_smem_name_scope"),
 )
 
 conversations = sa.Table(

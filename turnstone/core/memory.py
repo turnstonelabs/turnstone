@@ -220,41 +220,6 @@ def update_workstream_title(ws_id: str, title: str) -> None:
         get_storage().update_workstream_title(ws_id, title)
 
 
-# -- Key-value store (memories) ------------------------------------------------
-
-
-def save_memory(key: str, value: str) -> str | None:
-    """Save a memory. Returns the previous value if it existed."""
-    try:
-        return get_storage().kv_set(key, value)
-    except Exception:
-        return None
-
-
-def delete_memory(key: str) -> bool:
-    """Delete a memory by key. Returns True if the key existed."""
-    try:
-        return get_storage().kv_delete(key)
-    except Exception:
-        return False
-
-
-def load_memories() -> list[tuple[str, str]]:
-    """Return all (key, value) memory pairs sorted by key."""
-    try:
-        return get_storage().kv_list()
-    except Exception:
-        return []
-
-
-def search_memories(query: str) -> list[tuple[str, str]]:
-    """Search memories by query. Returns matching (key, value) pairs."""
-    try:
-        return get_storage().kv_search(query)
-    except Exception:
-        return []
-
-
 # -- Conversation search -------------------------------------------------------
 
 
@@ -272,3 +237,96 @@ def search_history_recent(limit: int = 20) -> list[Any]:
         return get_storage().search_history_recent(limit)
     except Exception:
         return []
+
+
+# -- Structured memories -------------------------------------------------------
+
+
+def save_structured_memory(
+    name: str,
+    content: str,
+    description: str = "",
+    mem_type: str = "project",
+    scope: str = "global",
+    scope_id: str = "",
+) -> tuple[str, str | None]:
+    """Save a structured memory (upsert by name+scope+scope_id).
+
+    Returns (memory_id, old_content_or_None).  Uses create-first to
+    avoid TOCTOU races under concurrent access.
+    """
+    import uuid
+
+    name = normalize_key(name)
+    try:
+        storage = get_storage()
+        # Try create first — if it hits the unique constraint, fall back to update
+        memory_id = str(uuid.uuid4())
+        try:
+            storage.create_structured_memory(
+                memory_id, name, description, mem_type, scope, scope_id, content
+            )
+            return memory_id, None
+        except Exception:
+            # Unique constraint violation — row already exists, update it
+            existing = storage.get_structured_memory_by_name(name, scope, scope_id)
+            if existing:
+                old_content = existing["content"]
+                storage.update_structured_memory(
+                    existing["memory_id"],
+                    content=content,
+                    description=description,
+                    type=mem_type,
+                )
+                return existing["memory_id"], old_content
+            return "", None
+    except Exception:
+        return "", None
+
+
+def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "") -> bool:
+    """Delete a structured memory by name+scope. Returns True if existed."""
+    name = normalize_key(name)
+    try:
+        return get_storage().delete_structured_memory(name, scope, scope_id)
+    except Exception:
+        return False
+
+
+def list_structured_memories(
+    mem_type: str = "",
+    scope: str = "",
+    scope_id: str = "",
+    limit: int = 100,
+) -> list[dict[str, str]]:
+    """List structured memories with optional filters."""
+    try:
+        return get_storage().list_structured_memories(
+            mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+        )
+    except Exception:
+        return []
+
+
+def search_structured_memories(
+    query: str,
+    mem_type: str = "",
+    scope: str = "",
+    scope_id: str = "",
+    limit: int = 20,
+) -> list[dict[str, str]]:
+    """Search structured memories by query."""
+    try:
+        return get_storage().search_structured_memories(
+            query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+        )
+    except Exception:
+        return []
+
+
+def count_structured_memories(scope: str = "", scope_id: str = "") -> int:
+    """Count structured memories with optional scope filter."""
+    try:
+        return get_storage().count_structured_memories(scope=scope, scope_id=scope_id)
+    except Exception:
+        return 0

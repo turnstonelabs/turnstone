@@ -79,7 +79,7 @@ note right of BridgeA
   1. _ws_auto_approve[ws_id]? → auto
   2. All tools in safe set? → auto
      (read_file, search, man,
-      remember, recall, forget)
+      memory, recall)
   3. Otherwise → manual approval
 end note
 

@@ -1,0 +1,46 @@
+{
+  "name": "memory",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["save", "search", "delete", "list"],
+        "description": "Action to perform."
+      },
+      "name": {
+        "type": "string",
+        "description": "Memory identifier (required for 'save' and 'delete'). Short snake_case key."
+      },
+      "content": {
+        "type": "string",
+        "description": "Memory content (required for 'save')."
+      },
+      "description": {
+        "type": "string",
+        "description": "Short description for relevance matching (recommended for 'save')."
+      },
+      "type": {
+        "type": "string",
+        "enum": ["user", "project", "feedback", "reference"],
+        "description": "Memory type. Default: 'project'."
+      },
+      "scope": {
+        "type": "string",
+        "enum": ["global", "workstream", "user"],
+        "description": "Memory scope. Default: 'global'. Use 'workstream' for context private to this workstream, 'user' for context that follows the user across workstreams."
+      },
+      "query": {
+        "type": "string",
+        "description": "Search query (for 'search' action)."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max results for 'search' or 'list'. Default: 20."
+      }
+    },
+    "required": ["action"]
+  },
+  "primary_key": "name"
+}

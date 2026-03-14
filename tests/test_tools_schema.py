@@ -72,7 +72,7 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 18
+        assert len(TOOLS) == 17
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 9
@@ -106,9 +106,8 @@ class TestToolsMetadata:
             "web_search": "query",
             "task": "prompt",
             "create_plan": "goal",
-            "remember": "key",
+            "memory": "name",
             "recall": "query",
-            "forget": "key",
             "notify": "message",
             "watch": "command",
             "read_resource": "uri",

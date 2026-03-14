@@ -193,7 +193,7 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 
 ## Tools
 
-16 built-in tools, 2 agent tools, plus external tools via MCP:
+15 built-in tools, 2 agent tools, plus external tools via MCP:
 
 | Tool | Description | Auto-approved |
 |------|-------------|:---:|
@@ -206,9 +206,8 @@ Bridges BLPOP from their per-node queue (priority) then the shared queue. Direct
 | `man` | Read man pages | yes |
 | `web_fetch` | Fetch URL content | |
 | `web_search` | Web search (provider-native or Tavily) | |
-| `remember` | Save persistent facts | yes |
-| `recall` | Search memories and history | yes |
-| `forget` | Remove a memory | yes |
+| `memory` | Structured persistent memory (save/search/delete/list) | yes |
+| `recall` | Search conversation history | yes |
 | `notify` | Send notifications to linked channels | yes |
 | `watch` | Periodic command polling with conditions | |
 | `task` | Spawn autonomous sub-agent | |

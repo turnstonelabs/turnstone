@@ -47,6 +47,7 @@ WS_TEMPLATE_MUTABLE = frozenset(
         "enabled",
     }
 )
+STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",

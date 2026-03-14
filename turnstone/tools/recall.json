@@ -1,18 +1,19 @@
 {
   "name": "recall",
-  "description": "Search memories and past conversations. With no query, lists all saved memories. With a query, searches both memories and conversation history.",
+  "description": "Search conversation history for past messages, tool results, and interactions across sessions.",
   "parameters": {
     "type": "object",
     "properties": {
       "query": {
         "type": "string",
-        "description": "Search term or phrase. Omit to list all memories."
+        "description": "Search term or phrase to find in conversation history."
       },
       "limit": {
         "type": "integer",
-        "description": "Max conversation results to return (default 20)."
+        "description": "Max results to return (default 20)."
       }
-    }
+    },
+    "required": ["query"]
   },
   "primary_key": "query"
 }

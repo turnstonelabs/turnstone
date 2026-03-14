@@ -2013,6 +2013,7 @@ def main() -> None:
     ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
+        uid = getattr(ui, "_user_id", "") or ""
         return ChatSession(
             client=r_client,
             model=r_model,
@@ -2038,6 +2039,7 @@ def main() -> None:
             tool_search_max_results=args.tool_search_max_results,
             template=args.template,
             judge_config=judge_config,
+            user_id=uid,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

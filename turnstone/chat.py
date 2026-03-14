@@ -7,7 +7,7 @@ All functionality has been moved to submodules:
   - turnstone.core.sandbox: validate_math_code, execute_math_sandboxed
   - turnstone.core.safety: is_command_blocked, sanitize_command
   - turnstone.core.web: strip_html, check_ssrf
-  - turnstone.core.memory: open_db, load_memories, save_message, etc.
+  - turnstone.core.memory: save_message, structured memory facade, etc.
   - turnstone.ui.colors: ANSI constants and helpers
   - turnstone.ui.markdown: MarkdownRenderer
   - turnstone.ui.spinner: Spinner
