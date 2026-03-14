@@ -1866,6 +1866,7 @@ def main() -> None:
             "health",
             "database",
             "judge",
+            "memory",
         ],
     )
     args = parser.parse_args()

@@ -2699,7 +2699,7 @@ class ChatSession:
                     "header": "\u2717 memory save: content too large",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: content exceeds {self._memory_config.max_content} byte limit",
+                    "error": f"Error: content exceeds {self._memory_config.max_content} character limit",
                 }
             description = (args.get("description") or "").strip()
             mem_type = (args.get("type") or "project").strip().lower()
