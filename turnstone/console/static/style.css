@@ -1168,7 +1168,8 @@
 #create-role-overlay, #edit-role-overlay, #user-roles-overlay,
 #create-policy-overlay, #edit-policy-overlay,
 #create-template-overlay, #edit-template-overlay,
-#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay {
+#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay,
+#memory-detail-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1325,6 +1326,91 @@
 }
 .audit-danger { color: var(--red); border-color: var(--red-glow); }
 .audit-success { color: var(--green); border-color: var(--green-glow); }
+
+/* ==========================================================================
+   Memories tab
+   ========================================================================== */
+#admin-memories .admin-colheaders,
+#admin-memories .admin-row {
+  grid-template-columns: 1.5fr 80px 110px 1fr 100px 80px;
+}
+
+/* Filter toolbar */
+.admin-toolbar-filters {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+}
+.admin-toolbar-filters select,
+.admin-toolbar-filters input[type="search"] {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font: inherit;
+}
+.admin-toolbar-filters select {
+  min-width: 0;
+}
+.admin-toolbar-filters input[type="search"] {
+  width: 180px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.admin-toolbar-filters input[type="search"]::placeholder {
+  color: var(--fg-dim);
+}
+
+/* Memory type badges */
+.mem-type-project { background: var(--bg-highlight); color: var(--cyan); border-color: var(--cyan-glow, var(--border)); }
+.mem-type-user { background: var(--bg-highlight); color: var(--green); border-color: var(--green-glow, var(--border)); }
+.mem-type-feedback { background: var(--bg-highlight); color: var(--yellow); border-color: var(--yellow-glow, var(--border)); }
+.mem-type-reference { background: var(--bg-highlight); color: var(--magenta); border-color: var(--magenta-glow, var(--border)); }
+
+/* Memory scope badges */
+.mem-scope-global { background: var(--bg-highlight); color: var(--fg-dim); }
+.mem-scope-workstream { background: var(--bg-highlight); color: var(--cyan); border-color: var(--cyan-glow, var(--border)); }
+.mem-scope-user { background: var(--bg-highlight); color: var(--green); border-color: var(--green-glow, var(--border)); }
+
+/* Memory detail modal */
+.mem-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px 16px;
+}
+.mem-detail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mem-detail-label {
+  font-size: 10px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.mem-detail-desc {
+  color: var(--fg);
+  font-size: 13px;
+  padding: 4px 0;
+}
+.memory-content-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg);
+  margin: 4px 0 0;
+}
 
 /* ==========================================================================
    Governance: Usage dashboard
@@ -1495,6 +1581,13 @@
     grid-template-columns: 60px 1fr 100px;
   }
   .admin-col-auser, .admin-col-adetail { display: none; }
+  #admin-memories .admin-colheaders, #admin-memories .admin-row {
+    grid-template-columns: 1fr 70px 90px 80px;
+  }
+  .admin-col-mdesc, .admin-col-mupdated { display: none; }
+  .admin-toolbar-filters { flex-wrap: wrap; }
+  .admin-toolbar-filters input[type="search"] { width: 120px; }
+  .mem-detail-grid { grid-template-columns: 1fr 1fr; }
   .usage-readout-value { font-size: 18px; }
   .usage-bar-row { grid-template-columns: 70px 1fr 50px; }
   .perm-grid { grid-template-columns: 1fr; }

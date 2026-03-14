@@ -63,6 +63,7 @@ function showAdmin() {
     "ws-templates": "admin.ws_templates",
     usage: "admin.usage",
     audit: "admin.audit",
+    memories: "admin.memories",
     settings: "admin.users",
   };
   if (perms) {
@@ -191,6 +192,7 @@ function switchAdminTab(tab) {
     "ws-templates",
     "usage",
     "audit",
+    "memories",
     "settings",
   ];
   for (var p = 0; p < panels.length; p++) {
@@ -212,6 +214,7 @@ function switchAdminTab(tab) {
     _populateAuditUserFilter();
     loadGovAudit();
   }
+  if (tab === "memories") loadAdminMemories();
   if (tab === "settings") loadSettings();
 
   // Update breadcrumb with active tab label
@@ -1589,6 +1592,7 @@ function _installTrap(overlayId, boxId, trapRef) {
           hideCreateWsTemplateModal();
         else if (overlayId === "edit-wst-overlay") hideEditWsTemplateModal();
         else if (overlayId === "wst-history-overlay") hideWstHistoryModal();
+        else if (overlayId === "memory-detail-overlay") hideMemoryDetailModal();
       }
     };
   }
@@ -1667,6 +1671,7 @@ document.addEventListener("keydown", function (e) {
     ["create-wst-overlay", hideCreateWsTemplateModal],
     ["edit-wst-overlay", hideEditWsTemplateModal],
     ["wst-history-overlay", hideWstHistoryModal],
+    ["memory-detail-overlay", hideMemoryDetailModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);

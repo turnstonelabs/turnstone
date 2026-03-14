@@ -102,6 +102,7 @@
           <div class="admin-sidebar-group-label" aria-hidden="true">Observe</div>
           <button id="tab-usage" class="admin-nav" data-tab="usage" role="tab" aria-selected="false" aria-controls="admin-usage" tabindex="-1" onclick="switchAdminTab('usage')">Usage</button>
           <button id="tab-audit" class="admin-nav" data-tab="audit" role="tab" aria-selected="false" aria-controls="admin-audit" tabindex="-1" onclick="switchAdminTab('audit')">Audit</button>
+          <button id="tab-memories" class="admin-nav" data-tab="memories" role="tab" aria-selected="false" aria-controls="admin-memories" tabindex="-1" onclick="switchAdminTab('memories')">Memories</button>
         </div>
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
@@ -344,6 +345,40 @@
       </div>
       <div id="admin-audit-table" role="list" aria-label="Audit events" aria-live="polite">
         <div class="dashboard-empty">Loading audit log...</div>
+      </div>
+    </div>
+
+    <!-- Memories Tab -->
+    <div id="admin-memories" class="admin-panel" role="tabpanel" aria-labelledby="tab-memories" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">MEMORIES</span>
+        <div class="admin-toolbar-filters">
+          <select id="mem-filter-type" onchange="loadAdminMemories()" aria-label="Filter by type">
+            <option value="">All types</option>
+            <option value="user">user</option>
+            <option value="project">project</option>
+            <option value="feedback">feedback</option>
+            <option value="reference">reference</option>
+          </select>
+          <select id="mem-filter-scope" onchange="loadAdminMemories()" aria-label="Filter by scope">
+            <option value="">All scopes</option>
+            <option value="global">global</option>
+            <option value="workstream">workstream</option>
+            <option value="user">user</option>
+          </select>
+          <input id="mem-search" type="search" placeholder="Search memories…" aria-label="Search memories" autocomplete="off">
+        </div>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-mname">NAME</span>
+        <span class="admin-col admin-col-mtype">TYPE</span>
+        <span class="admin-col admin-col-mscope">SCOPE</span>
+        <span class="admin-col admin-col-mdesc">DESCRIPTION</span>
+        <span class="admin-col admin-col-mupdated">UPDATED</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-memories-table" role="list" aria-label="Memories" aria-live="polite">
+        <div class="dashboard-empty">Loading…</div>
       </div>
     </div>
 
@@ -921,6 +956,17 @@ window.TURNSTONE_KB_SHORTCUTS = [
     </div>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideWstHistoryModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="memory-detail-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="memory-detail-title">
+  <div id="memory-detail-box" class="admin-modal admin-modal-wide">
+    <h2 id="memory-detail-title">Memory Detail</h2>
+    <div id="memory-detail-body"></div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideMemoryDetailModal()">Close</button>
+      <button id="mem-detail-delete" class="modal-submit admin-btn-danger">Delete</button>
     </div>
   </div>
 </div>
