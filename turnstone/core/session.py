@@ -55,6 +55,7 @@ from turnstone.core.memory import (
     update_workstream_title,
 )
 from turnstone.core.memory_relevance import (
+    MemoryConfig,
     build_memory_context,
     extract_recent_context,
     score_memories,
@@ -122,7 +123,6 @@ _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 
 # Upper bound on total prompt template content injected into system messages
 _MAX_TEMPLATE_CONTENT: int = 32768
-_MAX_MEMORY_CONTENT: int = 32768
 
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -236,6 +236,7 @@ class ChatSession:
         template: str | None = None,
         judge_config: JudgeConfig | None = None,
         user_id: str = "",
+        memory_config: MemoryConfig | None = None,
     ):
         self.client = client
         self.model = model
@@ -270,6 +271,7 @@ class ChatSession:
         self.auto_approve = False
         self._node_id = node_id
         self._user_id = user_id
+        self._memory_config = memory_config or MemoryConfig()
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
         self._read_files: set[str] = set()
@@ -657,11 +659,12 @@ class ChatSession:
                     self._template_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
-        if should_nudge(
+        if self._memory_config.nudges and should_nudge(
             "resume",
             self._metacog_state,
             message_count=len(self.messages),
             memory_count=self._visible_memory_count(),
+            cooldown_secs=self._memory_config.nudge_cooldown,
         ):
             self._pending_nudge = format_nudge("resume")
         self._init_system_messages()
@@ -791,10 +794,10 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        visible_mems = self._get_visible_memories(limit=50)
+        visible_mems = self._get_visible_memories(limit=self._memory_config.fetch_limit)
         if visible_mems:
             context = extract_recent_context(self.messages)
-            relevant = score_memories(visible_mems, context, k=5)
+            relevant = score_memories(visible_mems, context, k=self._memory_config.relevance_k)
             if relevant:
                 dev_parts.append("")
                 dev_parts.append(build_memory_context(relevant))
@@ -1863,11 +1866,12 @@ class ChatSession:
                         f"Denied by user: {user_feedback}" if user_feedback else "Denied by user"
                     )
             user_feedback = None  # feedback is in the denial_msg
-            if should_nudge(
+            if self._memory_config.nudges and should_nudge(
                 "denial",
                 self._metacog_state,
                 message_count=len(self.messages),
                 memory_count=self._visible_memory_count(),
+                cooldown_secs=self._memory_config.nudge_cooldown,
             ):
                 self._pending_nudge = format_nudge("denial")
                 self._init_system_messages()
@@ -2636,22 +2640,36 @@ class ChatSession:
 
     def _check_metacognitive_nudge(self, user_message: str) -> str | None:
         """Check if a metacognitive nudge should be injected."""
+        if not self._memory_config.nudges:
+            return None
         mem_count = self._visible_memory_count()
         msg_count = len(self.messages)
+        cd = self._memory_config.nudge_cooldown
 
-        # First message in a new workstream — nudge to check existing memories
         if should_nudge(
-            "start", self._metacog_state, message_count=msg_count, memory_count=mem_count
+            "start",
+            self._metacog_state,
+            message_count=msg_count,
+            memory_count=mem_count,
+            cooldown_secs=cd,
         ):
             return format_nudge("start")
 
         if detect_correction(user_message) and should_nudge(
-            "correction", self._metacog_state, message_count=msg_count, memory_count=mem_count
+            "correction",
+            self._metacog_state,
+            message_count=msg_count,
+            memory_count=mem_count,
+            cooldown_secs=cd,
         ):
             return format_nudge("correction")
 
         if detect_completion(user_message) and should_nudge(
-            "completion", self._metacog_state, message_count=msg_count, memory_count=mem_count
+            "completion",
+            self._metacog_state,
+            message_count=msg_count,
+            memory_count=mem_count,
+            cooldown_secs=cd,
         ):
             return format_nudge("completion")
 
@@ -2674,14 +2692,14 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: both 'name' and 'content' are required for save",
                 }
-            if len(content) > _MAX_MEMORY_CONTENT:
+            if len(content) > self._memory_config.max_content:
                 return {
                     "call_id": call_id,
                     "func_name": "memory",
                     "header": "\u2717 memory save: content too large",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: content exceeds {_MAX_MEMORY_CONTENT} byte limit",
+                    "error": f"Error: content exceeds {self._memory_config.max_content} byte limit",
                 }
             description = (args.get("description") or "").strip()
             mem_type = (args.get("type") or "project").strip().lower()

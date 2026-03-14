@@ -103,6 +103,7 @@ def should_nudge(
     *,
     message_count: int = 0,
     memory_count: int = 0,
+    cooldown_secs: int = _COOLDOWN_SECS,
 ) -> bool:
     """Check whether a nudge should fire, respecting cooldowns and context."""
     if nudge_type not in _NUDGE_MAP:
@@ -119,7 +120,7 @@ def should_nudge(
     # Rate limit: one nudge per type per cooldown window
     now = time.monotonic()
     last = state.get(nudge_type)
-    if last is not None and now - last < _COOLDOWN_SECS:
+    if last is not None and now - last < cooldown_secs:
         return False
     state[nudge_type] = now
     return True

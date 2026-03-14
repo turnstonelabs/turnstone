@@ -136,6 +136,13 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "timeout": "judge_timeout",
         "read_only_tools": "judge_read_only_tools",
     },
+    "memory": {
+        "relevance_k": "memory_relevance_k",
+        "fetch_limit": "memory_fetch_limit",
+        "max_content": "memory_max_content",
+        "nudge_cooldown": "memory_nudge_cooldown",
+        "nudges": "memory_nudges",
+    },
 }
 
 # -- Tavily API key (cached) --------------------------------------------------

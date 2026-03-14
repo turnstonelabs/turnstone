@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from html import escape as _html_escape
 from typing import Any
 
 from turnstone.core.bm25 import BM25Index
+
+
+@dataclass
+class MemoryConfig:
+    """Configuration for the structured memory system."""
+
+    relevance_k: int = 5
+    fetch_limit: int = 50
+    max_content: int = 32768
+    nudge_cooldown: int = 300
+    nudges: bool = True
 
 
 def score_memories(

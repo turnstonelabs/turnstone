@@ -2005,6 +2005,17 @@ def main() -> None:
             judge_config.confidence_threshold,
         )
 
+    # Memory config
+    from turnstone.core.memory_relevance import MemoryConfig
+
+    memory_config = MemoryConfig(
+        relevance_k=getattr(args, "memory_relevance_k", 5),
+        fetch_limit=getattr(args, "memory_fetch_limit", 50),
+        max_content=getattr(args, "memory_max_content", 32768),
+        nudge_cooldown=getattr(args, "memory_nudge_cooldown", 300),
+        nudges=getattr(args, "memory_nudges", True),
+    )
+
     # Session factory — captures shared config
     def session_factory(
         ui: SessionUI | None,
@@ -2040,6 +2051,7 @@ def main() -> None:
             template=args.template,
             judge_config=judge_config,
             user_id=uid,
+            memory_config=memory_config,
         )
 
     # Create WatchRunner (periodic command polling, server-level)
