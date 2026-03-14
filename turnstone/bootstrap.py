@@ -122,6 +122,15 @@ This is a one-time endpoint that only works when zero users exist.
 Subsequent governance setup (roles, policies, templates) uses the console admin API \
 with the JWT returned from setup.
 
+## Runtime Settings (ConfigStore)
+After the stack is running, ~40 runtime settings (model, temperature, max_tokens, \
+reasoning_effort, tool timeout, rate limiting, health probes, judge config, memory \
+config, etc.) are configurable via the admin Settings tab in the console — no \
+config.toml edits or restarts needed for most changes. These settings are stored in \
+the database and apply cluster-wide. The `.env` file only needs bootstrap-critical \
+settings (database, Redis, auth, ports, API keys). Tell users they can fine-tune \
+model and behavioral settings after deployment through the admin panel.
+
 ## Built-in Roles
 - **Admin** (`builtin-admin`): Full access — read, write, approve, all admin.* permissions
 - **Operator** (`builtin-operator`): read, write, workstreams.create, workstreams.close

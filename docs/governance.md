@@ -99,7 +99,7 @@ Workstream templates are behavioral profiles applied at workstream creation — 
 
 **Admin API:** 7 endpoints under `/v1/api/admin/ws-templates` (list, create, get, update, delete, version history) plus a read-only summary at `/v1/api/ws-templates`. Permission: `admin.ws_templates`.
 
-**Console UI:** "WS Templates" tab (11th admin tab) with CRUD table, create/edit modals (name, description, system prompt source toggle, model, auto-approve, per-tool auto-approve, temperature, reasoning effort, max tokens, agent max turns, token budget, enabled), and version history modal. "Profile" dropdown on workstream creation modal. "WS Template" dropdown on scheduler create/edit modals.
+**Console UI:** "WS Templates" tab with CRUD table, create/edit modals (name, description, system prompt source toggle, model, auto-approve, per-tool auto-approve, temperature, reasoning effort, max tokens, agent max turns, token budget, enabled), and version history modal. "Profile" dropdown on workstream creation modal. "WS Template" dropdown on scheduler create/edit modals.
 
 **Token budget enforcement:** Tracked in `session.send()`. At 80% consumption, emits an info message. At 100%, the next turn requires explicit approval via the `__budget_override__` synthetic tool name (reuses existing approval UI — inline in browser, Discord buttons, bridge auto-approve). The synthetic name can be targeted by tool policies (e.g. `__budget_override__` → `allow` for admins).
 

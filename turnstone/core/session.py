@@ -219,7 +219,7 @@ class ChatSession:
         max_tokens: int,
         tool_timeout: int,
         reasoning_effort: str = "medium",
-        context_window: int = 131072,
+        context_window: int = 32768,
         compact_max_tokens: int = 32768,
         auto_compact_pct: float = 0.8,
         agent_max_turns: int = -1,
@@ -255,7 +255,7 @@ class ChatSession:
         self.max_tokens = max_tokens
         self.tool_timeout = tool_timeout
         self.reasoning_effort = reasoning_effort
-        self.context_window = context_window
+        self.context_window = context_window if context_window > 0 else 32768
         self.compact_max_tokens = compact_max_tokens
         self.auto_compact_pct = auto_compact_pct
         self.agent_max_turns = agent_max_turns

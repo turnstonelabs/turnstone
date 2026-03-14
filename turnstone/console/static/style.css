@@ -747,6 +747,10 @@
   padding: 4px 0;
   overflow-y: auto;
   order: 1;
+  align-self: flex-start;
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
 }
 
 /* Group labels */
@@ -1616,13 +1620,6 @@
 .settings-section-header::after { content: "\25BE"; margin-left: 8px; font-size: 11px; }
 .settings-section[data-collapsed] .settings-section-body { display: none; }
 .settings-section[data-collapsed] .settings-section-header::after { content: "\25B8"; }
-.settings-section-count {
-  font-size: 9px;
-  color: var(--fg-dim);
-  margin-right: auto;
-  margin-left: 8px;
-}
-
 /* Setting row — 3-column grid */
 .settings-row {
   display: grid;
@@ -1654,6 +1651,11 @@
   max-width: 300px;
   box-sizing: border-box;
 }
+/* Hide number spin buttons (Firefox + WebKit) */
+.settings-input input[type="number"] { -moz-appearance: textfield; }
+.settings-input input[type="number"]::-webkit-inner-spin-button,
+.settings-input input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
 .settings-input input:focus,
 .settings-input select:focus {
   border-color: var(--accent);
@@ -1751,6 +1753,7 @@
 /* Badges */
 .settings-badge-default { color: var(--fg-dim); border-color: var(--border); }
 .settings-restart-badge {
+  display: none;
   font-family: var(--font-display);
   font-size: 9px;
   font-weight: 600;
@@ -1758,15 +1761,86 @@
   letter-spacing: 0.06em;
   color: var(--yellow);
   padding: 1px 4px;
+  border: 1px solid var(--yellow-glow);
+  border-radius: 2px;
 }
+.settings-restart-badge.visible { display: inline-block; }
+.settings-restart-badge.saved { background: var(--yellow-glow); }
 
-/* Secret field */
+/* Help tooltip */
+.settings-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-display);
+  cursor: pointer;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 0;
+  line-height: 1;
+  position: relative;
+  transition: background 0.15s, color 0.15s;
+}
+/* Expand tap target to ~26px without changing visual size */
+.settings-help-btn::before { content: ""; position: absolute; inset: -5px; }
+.settings-help-btn:hover { background: var(--accent); color: var(--bg); }
+.settings-help-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.settings-help-popover {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg);
+}
+.settings-help-text { color: var(--fg); }
+.settings-help-ref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-family: var(--font-display);
+  white-space: nowrap;
+}
+.settings-help-ref:hover { text-decoration: underline; }
+
+/* Secret field — match input box height for grid alignment */
 .settings-secret {
   color: var(--fg-dim);
   font-style: italic;
   font-size: 11px;
   cursor: not-allowed;
+  display: inline-block;
+  padding: 4px 0;
+  border: 1px solid transparent; /* invisible border matches input's 1px border */
 }
+
+/* Docs link in toolbar */
+.settings-docs-link {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  margin-left: auto;
+  transition: color 0.15s, border-color 0.15s;
+}
+.settings-docs-link:hover { color: var(--accent); border-color: var(--accent-dim); }
+.settings-docs-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* Settings mobile */
 @media (max-width: 700px) {
@@ -1789,7 +1863,7 @@
   #new-ws-box select, #new-ws-box input, #new-ws-buttons button { transition: none; }
   .admin-nav, .admin-row, .admin-btn-danger, .admin-btn-action { transition: none; }
   .settings-toggle-slider, .settings-toggle-slider::before { transition: none; }
-  .settings-save-btn, .settings-reset-btn { transition: none; }
+  .settings-save-btn, .settings-reset-btn, .settings-docs-link, .settings-help-btn { transition: none; }
   .admin-sidebar, .admin-sidebar-backdrop { transition: none; }
   #view-admin { animation: none; }
   .admin-action-btn, .modal-cancel, .modal-submit { transition: none; }

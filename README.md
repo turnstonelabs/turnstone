@@ -147,7 +147,7 @@ Turnstone includes a built-in governance layer for enterprise deployments — ma
 - **Usage tracking** — per-request token and tool metrics, aggregation by day / model / user, automatic 90-day pruning
 - **Audit logging** — append-only event trail for all admin mutations, IP-aware, 365-day retention
 
-All governance features are managed through the console admin panel (10 tabs) and the full REST API. See [docs/governance.md](docs/governance.md) for setup and configuration.
+All governance features are managed through the console admin panel (13 tabs) and the full REST API. Runtime settings (model, tools, rate limiting, health, judge, memory) are configurable via the admin Settings tab — no config file edits or restarts needed for most changes. See [docs/governance.md](docs/governance.md) for setup and [docs/settings.md](docs/settings.md) for the settings reference.
 
 ### Intent Validation (LLM Judge)
 

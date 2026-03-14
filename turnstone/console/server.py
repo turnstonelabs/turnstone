@@ -2834,6 +2834,8 @@ async def admin_settings_schema(request: Request) -> JSONResponse:
                 "max_value": defn.max_value,
                 "choices": defn.choices,
                 "restart_required": defn.restart_required,
+                "help": defn.help,
+                "reference_url": defn.reference_url,
             }
         )
 

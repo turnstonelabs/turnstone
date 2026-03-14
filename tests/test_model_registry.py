@@ -28,7 +28,7 @@ class TestModelConfig:
         )
         assert cfg.alias == "local"
         assert cfg.model == "qwen3-32b"
-        assert cfg.context_window == 131072  # default
+        assert cfg.context_window == 32768  # default
 
     def test_custom_context_window(self) -> None:
         cfg = ModelConfig(

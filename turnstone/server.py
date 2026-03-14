@@ -1913,12 +1913,15 @@ def main() -> None:
 
         model, detected_ctx = detect_model(client, provider=provider_name)
 
-    # Use detected context window, fall back to ConfigStore default
+    # Use detected context window, fall back to ConfigStore override or 32768
+    cfg_ctx = config_store.get("model.context_window")
     if detected_ctx:
         context_window = detected_ctx
         log.info("Context window: %s (detected from backend)", f"{context_window:,}")
+    elif cfg_ctx:  # 0 = auto-detect (no override)
+        context_window = cfg_ctx
     else:
-        context_window = config_store.get("model.context_window")
+        context_window = 32768
 
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry

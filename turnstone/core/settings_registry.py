@@ -27,48 +27,76 @@ class SettingDef:
     max_value: float | None = None
     choices: list[str] | None = field(default=None, hash=False)
     restart_required: bool = False
+    help: str = ""  # plain-English explanation for non-experts
+    reference_url: str = ""  # link to arXiv, docs, or provider reference
 
 
 def _build_registry() -> dict[str, SettingDef]:
     """Build the settings registry from declarative definitions."""
     defs: list[SettingDef] = [
         # -- model ----------------------------------------------------------
-        SettingDef("model.name", "str", "", "Default model name", "model"),
+        SettingDef(
+            "model.name",
+            "str",
+            "",
+            "Default model name (empty = use provider default)",
+            "model",
+            help="Which AI model to use for conversations. Leave empty to use the provider's default.",
+        ),
         SettingDef(
             "model.temperature",
             "float",
             0.5,
-            "Sampling temperature",
+            "Sampling temperature (ignored by models that don't support it, e.g. o-series)",
             "model",
             min_value=0.0,
             max_value=2.0,
+            help="Controls randomness in responses. Lower values (0.0\u20130.3) give focused, "
+            "deterministic output; higher values (0.7\u20131.5) make responses more creative and varied.",
+            reference_url="https://arxiv.org/abs/1904.09751",
         ),
         SettingDef(
             "model.max_tokens",
             "int",
             32768,
-            "Max output tokens",
+            "Max output tokens per response",
             "model",
             min_value=1,
+            help="Upper limit on how long each response can be. One token is roughly 4 characters "
+            "of English text. Higher values allow longer responses but cost more.",
         ),
         SettingDef(
             "model.reasoning_effort",
             "str",
             "medium",
-            "Reasoning effort level",
+            "Reasoning effort level (only applies to models with reasoning support)",
             "model",
             choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="How much internal \u2018thinking\u2019 the model does before responding. Higher effort "
+            "improves quality on complex tasks but is slower and uses more tokens. Not all models "
+            "support this \u2014 it is silently ignored when unsupported.",
         ),
         SettingDef(
             "model.context_window",
             "int",
-            131072,
-            "Context window size in tokens",
+            0,
+            "Context window size in tokens (0 = auto-detect from model)",
             "model",
-            min_value=1024,
+            min_value=0,
+            help="How much conversation history the model can see at once, measured in tokens "
+            "(~4 characters each). Set to 0 to auto-detect from the model. Only override this "
+            "if auto-detection fails (common with local models).",
         ),
         # -- session --------------------------------------------------------
-        SettingDef("session.instructions", "str", "", "Default system instructions", "session"),
+        SettingDef(
+            "session.instructions",
+            "str",
+            "",
+            "Default system instructions (applied before prompt templates)",
+            "session",
+            help="Text that tells the model how to behave (e.g. \u2018You are a helpful coding assistant\u2019). "
+            "Applied to every conversation before any prompt templates.",
+        ),
         SettingDef(
             "session.retention_days",
             "int",
@@ -84,6 +112,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "Max tokens for compaction summary",
             "session",
             min_value=0,
+            help="When conversation history is compacted (summarized to save space), this limits "
+            "how long the summary can be.",
         ),
         SettingDef(
             "session.auto_compact_pct",
@@ -93,6 +123,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "session",
             min_value=0.0,
             max_value=1.0,
+            help="Automatically summarize older messages when the conversation fills this percentage "
+            "of the context window. For example, 0.8 means compact when 80% full. This prevents "
+            "conversations from hitting the context limit and losing information.",
         ),
         # -- tools ----------------------------------------------------------
         SettingDef(
@@ -111,6 +144,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "Tool output truncation limit in chars (0 = auto, 50% of context window)",
             "tools",
             min_value=0,
+            help="Limits how much output from a tool (e.g. a long command result) gets sent back "
+            "to the model. Prevents large outputs from consuming the entire context window.",
         ),
         SettingDef(
             "tools.agent_max_turns",
@@ -120,21 +155,35 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools",
             min_value=-1,
             max_value=200,
+            help="Limits how many back-and-forth steps a sub-agent can take when executing a plan "
+            "or task. Prevents runaway agents from consuming excessive tokens.",
         ),
-        SettingDef("tools.skip_permissions", "bool", False, "Skip tool approval prompts", "tools"),
+        SettingDef(
+            "tools.skip_permissions",
+            "bool",
+            False,
+            "Skip tool approval prompts",
+            "tools",
+            help="When enabled, all tool calls are auto-approved without asking the user. "
+            "Use with caution \u2014 the model will be able to run commands, write files, "
+            "and take actions without human review.",
+        ),
         SettingDef(
             "tools.search",
             "str",
             "auto",
-            "Tool search mode",
+            "Tool search mode (auto = enable when tool count exceeds threshold)",
             "tools",
             choices=["auto", "on", "off"],
+            help="When many tools are available (e.g. from MCP servers), the model sees only "
+            "a subset and searches for the right tool when needed. This reduces cost and "
+            "improves accuracy by avoiding information overload.",
         ),
         SettingDef(
             "tools.search_threshold",
             "int",
             20,
-            "Min tool count to enable search",
+            "Min tool count to activate search in auto mode",
             "tools",
             min_value=1,
         ),
@@ -156,6 +205,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "server",
             min_value=0,
             restart_required=True,
+            help="A workstream is an independent conversation thread. Idle workstreams are "
+            "evicted (paused and saved) after this timeout to free up resources. They can "
+            "be resumed later.",
         ),
         SettingDef(
             "server.max_workstreams",
@@ -165,6 +217,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "server",
             min_value=1,
             restart_required=True,
+            help="Maximum number of active conversation threads on this server node. "
+            "When the limit is reached, the oldest idle workstream is evicted to make room.",
         ),
         # -- mcp ------------------------------------------------------------
         SettingDef(
@@ -174,6 +228,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "Path to MCP server configuration file",
             "mcp",
             restart_required=True,
+            help="Model Context Protocol (MCP) lets the AI connect to external tool servers. "
+            "This points to a JSON file listing which MCP servers to connect to on startup.",
+            reference_url="https://modelcontextprotocol.io",
         ),
         SettingDef(
             "mcp.refresh_interval",
@@ -191,6 +248,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "Enable per-IP rate limiting",
             "ratelimit",
             restart_required=True,
+            help="Limits how fast any single user can make requests, preventing abuse or "
+            "accidental overload. Uses a token bucket algorithm.",
         ),
         SettingDef(
             "ratelimit.requests_per_second",
@@ -209,6 +268,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "ratelimit",
             min_value=1,
             restart_required=True,
+            help="Allows short bursts of requests above the rate limit. For example, a user "
+            "can send 20 rapid requests before being throttled, then must stay under the "
+            "per-second limit.",
         ),
         SettingDef(
             "ratelimit.trusted_proxies",
@@ -217,6 +279,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "Trusted proxy CIDRs for X-Forwarded-For parsing (comma-separated)",
             "ratelimit",
             restart_required=True,
+            help="If your server is behind a load balancer or reverse proxy, list its IP "
+            "ranges here so rate limiting applies to the real client IP, not the proxy.",
         ),
         # -- health ---------------------------------------------------------
         SettingDef(
@@ -226,6 +290,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "Backend health probe interval in seconds",
             "health",
             min_value=5,
+            help="How often to check whether the AI model backend (e.g. OpenAI API) is reachable.",
         ),
         SettingDef(
             "health.backend_probe_timeout",
@@ -242,6 +307,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "Consecutive failures before circuit opens",
             "health",
             min_value=1,
+            help="If the AI backend fails this many times in a row, the circuit breaker trips "
+            "and stops sending requests for a cooldown period. This prevents cascading failures "
+            "and wasted API calls when the backend is down.",
+            reference_url="https://martinfowler.com/bliki/CircuitBreaker.html",
         ),
         SettingDef(
             "health.circuit_breaker_cooldown",
@@ -250,15 +319,29 @@ def _build_registry() -> dict[str, SettingDef]:
             "Seconds before half-open retry",
             "health",
             min_value=5,
+            help="After the circuit breaker trips, wait this long before sending a single test "
+            "request to see if the backend has recovered.",
         ),
         # -- judge ----------------------------------------------------------
-        SettingDef("judge.enabled", "bool", True, "Enable intent validation judge", "judge"),
+        SettingDef(
+            "judge.enabled",
+            "bool",
+            True,
+            "Enable intent validation judge",
+            "judge",
+            help="Before the AI runs a tool (shell command, file write, etc.), a second evaluation "
+            "assesses whether the action is safe. This shows a risk verdict alongside the "
+            "approval prompt so you can make informed decisions.",
+        ),
         SettingDef(
             "judge.model",
             "str",
             "",
             "Model for LLM judge (empty = same as session)",
             "judge",
+            help="The judge can use a different AI model than the main conversation. Leave empty "
+            "to use the same model (self-consistency), or specify a different model for "
+            "cross-model evaluation.",
         ),
         SettingDef("judge.provider", "str", "", "Provider for judge model", "judge"),
         SettingDef("judge.base_url", "str", "", "Base URL for judge model API", "judge"),
@@ -278,6 +361,9 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge",
             min_value=0.0,
             max_value=1.0,
+            help="The judge reports how confident it is in its safety assessment (0\u20131). "
+            "Verdicts below this threshold are flagged as low-confidence. Future versions "
+            "can use this for auto-approval of high-confidence safe verdicts.",
         ),
         SettingDef(
             "judge.max_context_ratio",
@@ -287,6 +373,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "judge",
             min_value=0.1,
             max_value=1.0,
+            help="How much of the conversation history to show the judge. Lower values are cheaper "
+            "and faster but give the judge less context to evaluate intent.",
         ),
         SettingDef(
             "judge.timeout",
@@ -297,17 +385,26 @@ def _build_registry() -> dict[str, SettingDef]:
             min_value=5.0,
         ),
         SettingDef(
-            "judge.read_only_tools", "bool", True, "Restrict judge to read-only tools", "judge"
+            "judge.read_only_tools",
+            "bool",
+            True,
+            "Restrict judge to read-only tools",
+            "judge",
+            help="The judge can inspect files and directories to gather evidence for its verdict. "
+            "When enabled, it can only read \u2014 not modify \u2014 the filesystem.",
         ),
         # -- memory ---------------------------------------------------------
         SettingDef(
             "memory.relevance_k",
             "int",
             5,
-            "Top-K memories for BM25 injection",
+            "Top-K memories for relevance injection",
             "memory",
             min_value=1,
             max_value=50,
+            help="How many saved memories to automatically include in each conversation. "
+            "Memories are ranked by text relevance and the top K are injected into the "
+            "model's context so it can recall past information.",
         ),
         SettingDef(
             "memory.fetch_limit",
@@ -317,6 +414,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory",
             min_value=1,
             max_value=500,
+            help="How many memories to load from the database for ranking. The top relevance_k "
+            "are selected from this pool. Higher values find better matches but cost more.",
         ),
         SettingDef(
             "memory.max_content",
@@ -334,8 +433,20 @@ def _build_registry() -> dict[str, SettingDef]:
             "Seconds between metacognitive nudges",
             "memory",
             min_value=0,
+            help="Metacognitive nudges are gentle reminders to the AI to save useful information "
+            "from the conversation (e.g. user preferences, project decisions). This controls "
+            "the minimum time between nudges to avoid being repetitive.",
         ),
-        SettingDef("memory.nudges", "bool", True, "Enable metacognitive nudges", "memory"),
+        SettingDef(
+            "memory.nudges",
+            "bool",
+            True,
+            "Enable metacognitive nudges",
+            "memory",
+            help="When enabled, the system periodically reminds the AI to save important "
+            "information from conversations into long-term memory. This helps the AI "
+            "remember context across separate conversations.",
+        ),
     ]
     return {d.key: d for d in defs}
 

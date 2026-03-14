@@ -31,7 +31,7 @@ class ModelConfig:
     base_url: str
     api_key: str = field(repr=False)
     model: str
-    context_window: int = 131072
+    context_window: int = 32768
     provider: str = "openai"
     capabilities: dict[str, Any] = field(default_factory=dict)
 
@@ -150,7 +150,7 @@ def load_model_registry(
     base_url: str,
     api_key: str,
     model: str,
-    context_window: int = 131072,
+    context_window: int = 32768,
     provider: str = "openai",
 ) -> ModelRegistry:
     """Build a ModelRegistry from CLI args and ``config.toml``.

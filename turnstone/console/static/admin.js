@@ -1611,6 +1611,13 @@ function _removeTrap(handler) {
 // Global Escape key for admin modals
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Escape") return;
+  // Close any open settings help popover first
+  var openHelp = document.querySelector('.settings-help-popover[style=""]');
+  if (openHelp) {
+    e.preventDefault();
+    _closeAllSettingsHelp();
+    return;
+  }
   var cu = document.getElementById("create-user-overlay");
   if (cu && cu.style.display !== "none") {
     e.preventDefault();
@@ -1866,6 +1873,8 @@ function loadSettings() {
           restart_required: v.restart_required || false,
           changed_by: v.changed_by || "",
           updated: v.updated || "",
+          help: s.help || "",
+          reference_url: s.reference_url || "",
         };
       }
 
@@ -1899,13 +1908,15 @@ function _renderSettings(container, grouped) {
     var items = grouped[sec];
     if (!items || items.length === 0) continue;
 
-    html += '<div class="settings-section" data-section="' + sec + '">';
     html +=
-      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="true" aria-controls="settings-body-' +
+      '<div class="settings-section" data-section="' +
+      sec +
+      '" data-collapsed>';
+    html +=
+      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
       sec +
       '">';
     html += "<span>" + _settingsSectionLabel(sec) + "</span>";
-    html += '<span class="settings-section-count">' + items.length + "</span>";
     html += "</div>";
     html +=
       '<div class="settings-section-body" id="settings-body-' + sec + '">';
@@ -1923,14 +1934,14 @@ function _renderSettings(container, grouped) {
     if (_settingsSectionOrder.indexOf(allSections[s]) === -1) {
       var extra = grouped[allSections[s]];
       html +=
-        '<div class="settings-section" data-section="' + allSections[s] + '">';
+        '<div class="settings-section" data-section="' +
+        allSections[s] +
+        '" data-collapsed>';
       html +=
-        '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="true" aria-controls="settings-body-' +
+        '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" onkeydown="_onSettingsHeaderKey(event,this)" role="button" tabindex="0" aria-expanded="false" aria-controls="settings-body-' +
         allSections[s] +
         '">';
       html += "<span>" + _settingsSectionLabel(allSections[s]) + "</span>";
-      html +=
-        '<span class="settings-section-count">' + extra.length + "</span>";
       html += "</div>";
       html +=
         '<div class="settings-section-body" id="settings-body-' +
@@ -1964,21 +1975,42 @@ function _renderSettingRow(item) {
       ? item.key.substring(item.key.indexOf(".") + 1)
       : item.key;
   var escapedKey = escapeHtml(item.key);
+  var escapedShort = escapeHtml(shortKey);
   var escapedDesc = escapeHtml(item.description);
 
   var html = '<div class="settings-row" data-row-key="' + escapedKey + '">';
 
   // Label column
   html += '<div class="settings-label-col">';
-  html += '<div class="settings-label">' + escapeHtml(shortKey) + "</div>";
+  html += '<div class="settings-label">';
+  html += escapeHtml(shortKey);
+  if (item.help) {
+    html +=
+      ' <button class="settings-help-btn" onclick="_toggleSettingsHelp(event, this)" ' +
+      'aria-label="Help for ' +
+      escapedShort +
+      '" aria-expanded="false" title="More info">?</button>';
+  }
+  html += "</div>";
   if (item.description) {
     html += '<div class="settings-desc">' + escapedDesc + "</div>";
+  }
+  if (item.help) {
+    html += '<div class="settings-help-popover" style="display:none">';
+    html +=
+      '<span class="settings-help-text">' + escapeHtml(item.help) + "</span>";
+    if (item.reference_url) {
+      html +=
+        ' <a href="' +
+        escapeHtml(item.reference_url) +
+        '" target="_blank" rel="noopener" class="settings-help-ref">learn more</a>';
+    }
+    html += "</div>";
   }
   html += "</div>";
 
   // Input column
   html += '<div class="settings-input">';
-  var escapedShort = escapeHtml(shortKey);
   if (item.is_secret) {
     html +=
       '<span class="settings-secret" role="note" aria-label="' +
@@ -2063,16 +2095,19 @@ function _renderSettingRow(item) {
   // Actions column
   html += '<div class="settings-actions">';
 
+  // Restart badge (left of source badge, hidden until dirty or post-save)
+  if (item.restart_required) {
+    html +=
+      '<span class="settings-restart-badge" data-restart-key="' +
+      escapedKey +
+      '">restart</span>';
+  }
+
   // Source badge
   if (item.source === "storage") {
     html += '<span class="scope-badge scope-write">storage</span>';
   } else {
     html += '<span class="scope-badge settings-badge-default">default</span>';
-  }
-
-  // Restart badge
-  if (item.restart_required) {
-    html += '<span class="settings-restart-badge">restart</span>';
   }
 
   // Save button (hidden until value changes)
@@ -2085,8 +2120,8 @@ function _renderSettingRow(item) {
       "')\">save</button>";
   }
 
-  // Reset link (only when stored)
-  if (item.source === "storage" && !item.is_secret) {
+  // Reset link (when stored — including secrets, to clear legacy overrides)
+  if (item.source === "storage") {
     html +=
       '<button class="settings-reset-btn" data-reset-key="' +
       escapedKey +
@@ -2100,8 +2135,35 @@ function _renderSettingRow(item) {
   return html;
 }
 
+function _toggleSettingsHelp(e, btn) {
+  e.stopPropagation();
+  var popover = btn
+    .closest(".settings-label-col")
+    .querySelector(".settings-help-popover");
+  if (!popover) return;
+  var isVisible = popover.style.display !== "none";
+  // Close any other open popovers and reset their buttons
+  _closeAllSettingsHelp(popover);
+  popover.style.display = isVisible ? "none" : "";
+  btn.setAttribute("aria-expanded", isVisible ? "false" : "true");
+}
+
+function _closeAllSettingsHelp(except) {
+  var allOpen = document.querySelectorAll('.settings-help-popover[style=""]');
+  for (var i = 0; i < allOpen.length; i++) {
+    if (allOpen[i] !== except) {
+      allOpen[i].style.display = "none";
+      var col = allOpen[i].closest(".settings-label-col");
+      if (col) {
+        var helpBtn = col.querySelector(".settings-help-btn");
+        if (helpBtn) helpBtn.setAttribute("aria-expanded", "false");
+      }
+    }
+  }
+}
+
 function _onSettingsHeaderKey(e, el) {
-  if (e.key === "Enter" || e.key === " ") {
+  if ((e.key === "Enter" || e.key === " ") && !e.repeat) {
     e.preventDefault();
     _toggleSettingsSection(el);
   }
@@ -2131,18 +2193,28 @@ function _onSettingChange(key) {
   }
 
   var orig = _settingsOriginal[key];
-  // Compare as strings for non-booleans
   var dirty;
   if (inp.type === "checkbox") {
     dirty = current !== orig;
+  } else if (inp.type === "number" && current !== "" && orig !== "") {
+    // Compare numerically to avoid false positives (0.1 vs 0.10)
+    dirty = Number(current) !== Number(orig);
   } else {
     dirty = String(current) !== String(orig);
   }
 
-  if (dirty) {
+  // Disable save for empty number fields (server will reject)
+  var emptyNumber = inp.type === "number" && current === "";
+  if (dirty && !emptyNumber) {
     saveBtn.classList.add("visible");
   } else {
     saveBtn.classList.remove("visible");
+  }
+
+  // Show/hide restart badge alongside dirty state (but keep it if already saved)
+  var restartBadge = document.querySelector('[data-restart-key="' + key + '"]');
+  if (restartBadge && !restartBadge.classList.contains("saved")) {
+    restartBadge.classList.toggle("visible", dirty);
   }
 }
 
@@ -2155,7 +2227,11 @@ function _saveSettingValue(key) {
   if (inp.type === "checkbox") {
     value = inp.checked;
   } else if (inp.type === "number") {
-    value = inp.value === "" ? "" : Number(inp.value);
+    if (inp.value === "") {
+      showToast("Value is required");
+      return;
+    }
+    value = Number(inp.value);
   } else {
     value = inp.value;
   }
@@ -2214,6 +2290,15 @@ function _saveSettingValue(key) {
         }
       }
 
+      // Show restart badge post-save (stays until page reload = restart)
+      var restartBadge = document.querySelector(
+        '[data-restart-key="' + key + '"]',
+      );
+      if (restartBadge) {
+        restartBadge.classList.add("visible");
+        restartBadge.classList.add("saved");
+      }
+
       // Brief row flash for visual feedback
       if (row) {
         row.style.background = "var(--accent-glow)";
@@ -2222,7 +2307,9 @@ function _saveSettingValue(key) {
         }, 600);
       }
 
-      showToast("Saved " + key);
+      showToast(
+        "Saved " + key + (restartBadge ? " \u2014 restart required" : ""),
+      );
     })
     .catch(function (err) {
       if (saveBtn) {

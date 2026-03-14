@@ -1018,8 +1018,8 @@ Three hierarchical scopes control endpoint access:
 - **Console** is the auth management hub — it hosts the admin endpoints for
   creating users, issuing API tokens, and managing channel mappings. User
   records and token hashes live in the shared storage backend. The console
-  dashboard includes an **admin panel** (Users and Tokens tabs) for managing
-  credentials through the browser.
+  dashboard includes an **admin panel** (13 tabs) for managing
+  credentials, governance, and runtime settings through the browser.
 - **Server** is a JWT validator only — it validates tokens on each request but
   never creates users or tokens. Both processes share the same `jwt_secret`
   (via `TURNSTONE_JWT_SECRET` env var or `[auth].jwt_secret` config).
@@ -1393,7 +1393,8 @@ enforcement tracks consumption in `session.send()` with 80% warning and
 100% approval gate via the `__budget_override__` synthetic tool name.
 
 The console admin panel adds 6 governance tabs (Roles, Policies, Templates,
-WS Templates, Usage, Audit) for a total of 11 tabs, all permission-gated.
+WS Templates, Usage, Audit), a Memories tab, and a Settings tab (form-based
+editor for all ConfigStore settings) for a total of 13 tabs, all permission-gated.
 Both Python and TypeScript SDKs expose governance methods on the console
 client.
 
