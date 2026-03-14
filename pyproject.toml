@@ -51,7 +51,7 @@ sim = ["redis>=7.2"]
 anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
 discord = ["discord.py>=2.4", "redis>=7.2"]
-
+all = ["turnstone[mq,console,sim,anthropic,postgres,discord]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
