@@ -1368,14 +1368,25 @@ _VALID_MEMORY_SCOPES = frozenset({"global", "workstream", "user"})
 _MAX_MEMORY_CONTENT = 65536  # hard upper bound; server may enforce lower via config
 
 
-def _resolve_user_scope_id(request: Request) -> tuple[str, JSONResponse | None]:
-    """Resolve scope_id for user-scoped memory from auth. Returns (scope_id, error)."""
+def _resolve_user_scope_id(
+    request: Request, provided_scope_id: str = ""
+) -> tuple[str, JSONResponse | None]:
+    """Resolve and validate scope_id for user-scoped memory.
+
+    Always binds to the authenticated user's identity.  If a scope_id is
+    provided and doesn't match, returns 403 to prevent cross-user access.
+    """
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
     if not uid:
         return "", JSONResponse(
             {"error": "User scope requires authentication with a user identity"},
             status_code=400,
+        )
+    if provided_scope_id and provided_scope_id != uid:
+        return "", JSONResponse(
+            {"error": "Cannot access another user's memories"},
+            status_code=403,
         )
     return uid, None
 
@@ -1391,8 +1402,8 @@ async def list_memories(request: Request) -> JSONResponse:
         limit = min(int(request.query_params.get("limit", "100")), 200)
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    if scope == "user" and not scope_id:
-        scope_id, err = _resolve_user_scope_id(request)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
     rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
@@ -1432,11 +1443,14 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
             status_code=400,
         )
-    if scope == "user" and not scope_id:
-        scope_id, err = _resolve_user_scope_id(request)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
     # save_structured_memory normalises the name internally
+    from turnstone.core.memory import normalize_key
+
+    normalized_name = normalize_key(name)
     memory_id, old_content = save_structured_memory(
         name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
     )
@@ -1448,7 +1462,8 @@ async def save_memory(request: Request) -> JSONResponse:
     mem = storage.get_structured_memory(memory_id) if storage else None
     if not mem:
         return JSONResponse(
-            {"memory_id": memory_id, "name": name, "status": "saved"}, status_code=201
+            {"memory_id": memory_id, "name": normalized_name, "status": "saved"},
+            status_code=201,
         )
     status_code = 200 if old_content is not None else 201
     return JSONResponse(mem, status_code=status_code)
@@ -1475,8 +1490,8 @@ async def search_memories(request: Request) -> JSONResponse:
         limit = min(int(body.get("limit", 20)), 50)
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    if scope == "user" and not scope_id:
-        scope_id, err = _resolve_user_scope_id(request)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
     rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
@@ -1495,8 +1510,8 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
             status_code=400,
         )
     scope_id = request.query_params.get("scope_id", "")
-    if scope == "user" and not scope_id:
-        scope_id, err = _resolve_user_scope_id(request)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
     if delete_structured_memory(name, scope, scope_id):

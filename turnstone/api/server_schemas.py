@@ -191,8 +191,8 @@ class MemoryInfo(BaseModel):
     memory_id: str
     name: str
     description: str = ""
-    type: str
-    scope: str
+    type: MemoryType
+    scope: MemoryScope
     scope_id: str = ""
     content: str
     created: str
@@ -204,9 +204,13 @@ class ListMemoriesResponse(BaseModel):
     total: int = 0
 
 
+MemoryTypeFilter = Literal["", "user", "project", "feedback", "reference"]
+MemoryScopeFilter = Literal["", "global", "workstream", "user"]
+
+
 class SearchMemoriesRequest(BaseModel):
     query: str = Field(description="Search query text")
-    type: str = Field(default="", description="Filter by memory type")
-    scope: str = Field(default="", description="Filter by scope")
+    type: MemoryTypeFilter = Field(default="", description="Filter by memory type")
+    scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
     scope_id: str = Field(default="", description="Filter by scope_id")
     limit: int = Field(default=20, description="Max results (1-50)", ge=1, le=50)

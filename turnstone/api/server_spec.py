@@ -187,7 +187,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
             QueryParam("type", "Filter by memory type"),
             QueryParam("scope", "Filter by scope"),
             QueryParam("scope_id", "Filter by scope identifier"),
-            QueryParam("limit", "Max results (default 100, max 200)"),
+            QueryParam(
+                "limit", "Max results (default 100, max 200)", schema_type="integer", default=100
+            ),
         ],
         tags=["Memories"],
     ),

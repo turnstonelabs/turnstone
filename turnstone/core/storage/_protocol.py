@@ -134,7 +134,7 @@ class StorageBackend(Protocol):
     def count_structured_memories(
         self, mem_type: str = "", scope: str = "", scope_id: str = ""
     ) -> int:
-        """Count structured memories with optional scope filter."""
+        """Count structured memories with optional type and scope filters."""
         ...
 
     # -- Workstream operations -------------------------------------------------

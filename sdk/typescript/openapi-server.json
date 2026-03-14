@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.4.2",
+    "version": "0.6.0",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -10,7 +10,9 @@
       "get": {
         "summary": "List active workstreams",
         "operationId": "v1_api_workstreams_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -29,7 +31,9 @@
       "get": {
         "summary": "Dashboard with workstream details and aggregates",
         "operationId": "v1_api_dashboard_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -48,7 +52,9 @@
       "post": {
         "summary": "Create a new workstream",
         "operationId": "v1_api_workstreams_new_post",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -87,7 +93,9 @@
       "post": {
         "summary": "Close a workstream",
         "operationId": "v1_api_workstreams_close_post",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -126,7 +134,9 @@
       "post": {
         "summary": "Send a user message",
         "operationId": "v1_api_send_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -175,7 +185,9 @@
       "post": {
         "summary": "Approve or deny a tool call",
         "operationId": "v1_api_approve_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -214,7 +226,9 @@
       "post": {
         "summary": "Respond to a plan review",
         "operationId": "v1_api_plan_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -253,7 +267,9 @@
       "post": {
         "summary": "Execute a slash command",
         "operationId": "v1_api_command_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -302,7 +318,9 @@
       "post": {
         "summary": "Cancel the active generation in a workstream",
         "operationId": "v1_api_cancel_post",
-        "tags": ["Chat"],
+        "tags": [
+          "Chat"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -351,7 +369,9 @@
       "get": {
         "summary": "Per-workstream SSE event stream",
         "operationId": "v1_api_events_get",
-        "tags": ["Streaming"],
+        "tags": [
+          "Streaming"
+        ],
         "description": "Opens a Server-Sent Events stream scoped to a single workstream. Returns text/event-stream. See API reference for event types.",
         "parameters": [
           {
@@ -385,7 +405,9 @@
       "get": {
         "summary": "Global SSE event stream",
         "operationId": "v1_api_events_global_get",
-        "tags": ["Streaming"],
+        "tags": [
+          "Streaming"
+        ],
         "description": "Global Server-Sent Events stream for state-change broadcasts across all workstreams. Returns text/event-stream.",
         "responses": {
           "200": {
@@ -398,7 +420,9 @@
       "get": {
         "summary": "List saved workstreams",
         "operationId": "v1_api_workstreams_saved_get",
-        "tags": ["Workstreams"],
+        "tags": [
+          "Workstreams"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -417,7 +441,9 @@
       "post": {
         "summary": "Authenticate with a token",
         "operationId": "v1_api_auth_login_post",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -456,7 +482,9 @@
       "post": {
         "summary": "Create first admin user",
         "operationId": "v1_api_auth_setup_post",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "requestBody": {
           "required": true,
           "content": {
@@ -515,7 +543,9 @@
       "get": {
         "summary": "Return auth state",
         "operationId": "v1_api_auth_status_get",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -534,7 +564,9 @@
       "post": {
         "summary": "Clear auth cookie",
         "operationId": "v1_api_auth_logout_post",
-        "tags": ["Auth"],
+        "tags": [
+          "Auth"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -549,11 +581,202 @@
         }
       }
     },
+    "/v1/api/memories": {
+      "get": {
+        "summary": "List structured memories",
+        "operationId": "v1_api_memories_get",
+        "tags": [
+          "Memories"
+        ],
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by memory type"
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by scope"
+          },
+          {
+            "name": "scope_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by scope identifier"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100
+            },
+            "description": "Max results (default 100, max 200)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListMemoriesResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Save (upsert) a structured memory",
+        "operationId": "v1_api_memories_post",
+        "tags": [
+          "Memories"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveMemoryRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/memories/search": {
+      "post": {
+        "summary": "Search structured memories by query",
+        "operationId": "v1_api_memories_search_post",
+        "tags": [
+          "Memories"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchMemoriesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListMemoriesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/memories/{name}": {
+      "delete": {
+        "summary": "Delete a structured memory by name and scope",
+        "operationId": "v1_api_memories_{name}_delete",
+        "tags": [
+          "Memories"
+        ],
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope (default: global)"
+          },
+          {
+            "name": "scope_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Scope identifier"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Server health check",
         "operationId": "health_get",
-        "tags": ["Observability"],
+        "tags": [
+          "Observability"
+        ],
         "responses": {
           "200": {
             "description": "Success",
@@ -580,7 +803,9 @@
             "type": "string"
           }
         },
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "title": "ErrorResponse",
         "type": "object"
       },
@@ -589,7 +814,9 @@
         "properties": {
           "status": {
             "default": "ok",
-            "examples": ["ok"],
+            "examples": [
+              "ok"
+            ],
             "title": "Status",
             "type": "string"
           }
@@ -638,14 +865,19 @@
           },
           "role": {
             "description": "Legacy role",
-            "examples": ["full", "read"],
+            "examples": [
+              "full",
+              "read"
+            ],
             "title": "Role",
             "type": "string"
           },
           "scopes": {
             "default": "",
             "description": "Comma-separated scopes",
-            "examples": ["read,write,approve"],
+            "examples": [
+              "read,write,approve"
+            ],
             "title": "Scopes",
             "type": "string"
           },
@@ -656,7 +888,9 @@
             "type": "string"
           }
         },
-        "required": ["role"],
+        "required": [
+          "role"
+        ],
         "title": "AuthLoginResponse",
         "type": "object"
       },
@@ -679,7 +913,11 @@
             "type": "string"
           }
         },
-        "required": ["username", "display_name", "password"],
+        "required": [
+          "username",
+          "display_name",
+          "password"
+        ],
         "title": "AuthSetupRequest",
         "type": "object"
       },
@@ -716,7 +954,10 @@
             "type": "string"
           }
         },
-        "required": ["user_id", "username"],
+        "required": [
+          "user_id",
+          "username"
+        ],
         "title": "AuthSetupResponse",
         "type": "object"
       },
@@ -736,7 +977,11 @@
             "type": "boolean"
           }
         },
-        "required": ["auth_enabled", "has_users", "setup_required"],
+        "required": [
+          "auth_enabled",
+          "has_users",
+          "setup_required"
+        ],
         "title": "AuthStatusResponse",
         "type": "object"
       },
@@ -753,7 +998,10 @@
             "type": "string"
           }
         },
-        "required": ["message", "ws_id"],
+        "required": [
+          "message",
+          "ws_id"
+        ],
         "title": "SendRequest",
         "type": "object"
       },
@@ -761,12 +1009,17 @@
         "properties": {
           "status": {
             "description": "'ok' or 'busy'",
-            "examples": ["ok", "busy"],
+            "examples": [
+              "ok",
+              "busy"
+            ],
             "title": "Status",
             "type": "string"
           }
         },
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "title": "SendResponse",
         "type": "object"
       },
@@ -802,7 +1055,10 @@
             "type": "string"
           }
         },
-        "required": ["approved", "ws_id"],
+        "required": [
+          "approved",
+          "ws_id"
+        ],
         "title": "ApproveRequest",
         "type": "object"
       },
@@ -819,7 +1075,10 @@
             "type": "string"
           }
         },
-        "required": ["feedback", "ws_id"],
+        "required": [
+          "feedback",
+          "ws_id"
+        ],
         "title": "PlanFeedbackRequest",
         "type": "object"
       },
@@ -836,7 +1095,10 @@
             "type": "string"
           }
         },
-        "required": ["command", "ws_id"],
+        "required": [
+          "command",
+          "ws_id"
+        ],
         "title": "CommandRequest",
         "type": "object"
       },
@@ -848,7 +1110,9 @@
             "type": "string"
           }
         },
-        "required": ["ws_id"],
+        "required": [
+          "ws_id"
+        ],
         "title": "CancelRequest",
         "type": "object"
       },
@@ -886,7 +1150,7 @@
           },
           "ws_template": {
             "default": "",
-            "description": "Workstream template name (behavioral profile applied at creation)",
+            "description": "Workstream template name to apply defaults from",
             "title": "Ws Template",
             "type": "string"
           }
@@ -919,7 +1183,10 @@
             "type": "integer"
           }
         },
-        "required": ["ws_id", "name"],
+        "required": [
+          "ws_id",
+          "name"
+        ],
         "title": "CreateWorkstreamResponse",
         "type": "object"
       },
@@ -931,7 +1198,9 @@
             "type": "string"
           }
         },
-        "required": ["ws_id"],
+        "required": [
+          "ws_id"
+        ],
         "title": "CloseWorkstreamRequest",
         "type": "object"
       },
@@ -945,7 +1214,9 @@
             "type": "array"
           }
         },
-        "required": ["workstreams"],
+        "required": [
+          "workstreams"
+        ],
         "title": "ListWorkstreamsResponse",
         "type": "object"
       },
@@ -964,7 +1235,11 @@
             "type": "string"
           }
         },
-        "required": ["id", "name", "state"],
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
         "title": "WorkstreamInfo",
         "type": "object"
       },
@@ -981,7 +1256,10 @@
             "$ref": "#/components/schemas/DashboardAggregate"
           }
         },
-        "required": ["workstreams", "aggregate"],
+        "required": [
+          "workstreams",
+          "aggregate"
+        ],
         "title": "DashboardResponse",
         "type": "object"
       },
@@ -1081,7 +1359,11 @@
             "type": "string"
           }
         },
-        "required": ["id", "name", "state"],
+        "required": [
+          "id",
+          "name",
+          "state"
+        ],
         "title": "DashboardWorkstream",
         "type": "object"
       },
@@ -1095,7 +1377,9 @@
             "type": "array"
           }
         },
-        "required": ["workstreams"],
+        "required": [
+          "workstreams"
+        ],
         "title": "ListSavedWorkstreamsResponse",
         "type": "object"
       },
@@ -1142,14 +1426,22 @@
             "type": "integer"
           }
         },
-        "required": ["ws_id", "created", "updated", "message_count"],
+        "required": [
+          "ws_id",
+          "created",
+          "updated",
+          "message_count"
+        ],
         "title": "SavedWorkstreamInfo",
         "type": "object"
       },
       "HealthResponse": {
         "properties": {
           "status": {
-            "examples": ["ok", "degraded"],
+            "examples": [
+              "ok",
+              "degraded"
+            ],
             "title": "Status",
             "type": "string"
           },
@@ -1202,8 +1494,37 @@
             "default": null
           }
         },
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "BackendStatus": {
+        "properties": {
+          "status": {
+            "examples": [
+              "up",
+              "down"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "circuit_state": {
+            "examples": [
+              "closed",
+              "open",
+              "half_open"
+            ],
+            "title": "Circuit State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "circuit_state"
+        ],
+        "title": "BackendStatus",
         "type": "object"
       },
       "McpStatus": {
@@ -1225,23 +1546,6 @@
           }
         },
         "title": "McpStatus",
-        "type": "object"
-      },
-      "BackendStatus": {
-        "properties": {
-          "status": {
-            "examples": ["up", "down"],
-            "title": "Status",
-            "type": "string"
-          },
-          "circuit_state": {
-            "examples": ["closed", "open", "half_open"],
-            "title": "Circuit State",
-            "type": "string"
-          }
-        },
-        "required": ["status", "circuit_state"],
-        "title": "BackendStatus",
         "type": "object"
       },
       "WorkstreamCounts": {
@@ -1278,6 +1582,200 @@
           }
         },
         "title": "WorkstreamCounts",
+        "type": "object"
+      },
+      "SaveMemoryRequest": {
+        "properties": {
+          "name": {
+            "description": "Memory identifier (normalized to snake_case)",
+            "title": "Name",
+            "type": "string"
+          },
+          "content": {
+            "description": "Memory content",
+            "maxLength": 65536,
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "description": "Short description for relevance matching",
+            "title": "Description",
+            "type": "string"
+          },
+          "type": {
+            "default": "project",
+            "description": "Memory type",
+            "enum": [
+              "user",
+              "project",
+              "feedback",
+              "reference"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "default": "global",
+            "description": "Memory scope",
+            "enum": [
+              "global",
+              "workstream",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "description": "Scope identifier (ws_id for workstream, user_id for user scope)",
+            "title": "Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "content"
+        ],
+        "title": "SaveMemoryRequest",
+        "type": "object"
+      },
+      "MemoryInfo": {
+        "properties": {
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "user",
+              "project",
+              "feedback",
+              "reference"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "enum": [
+              "global",
+              "workstream",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "name",
+          "type",
+          "scope",
+          "content",
+          "created",
+          "updated"
+        ],
+        "title": "MemoryInfo",
+        "type": "object"
+      },
+      "ListMemoriesResponse": {
+        "properties": {
+          "memories": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryInfo"
+            },
+            "title": "Memories",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "memories"
+        ],
+        "title": "ListMemoriesResponse",
+        "type": "object"
+      },
+      "SearchMemoriesRequest": {
+        "properties": {
+          "query": {
+            "description": "Search query text",
+            "title": "Query",
+            "type": "string"
+          },
+          "type": {
+            "default": "",
+            "description": "Filter by memory type",
+            "enum": [
+              "",
+              "user",
+              "project",
+              "feedback",
+              "reference"
+            ],
+            "title": "Type",
+            "type": "string"
+          },
+          "scope": {
+            "default": "",
+            "description": "Filter by scope",
+            "enum": [
+              "",
+              "global",
+              "workstream",
+              "user"
+            ],
+            "title": "Scope",
+            "type": "string"
+          },
+          "scope_id": {
+            "default": "",
+            "description": "Filter by scope_id",
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "Max results (1-50)",
+            "maximum": 50,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchMemoriesRequest",
         "type": "object"
       }
     }

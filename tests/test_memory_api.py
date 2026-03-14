@@ -256,6 +256,42 @@ class TestServerSaveMemory:
         assert r.json()["name"] == "my_key_name"
 
 
+class TestServerUserScopeSecurity:
+    def test_user_scope_binds_to_auth(self, server_client):
+        """User scope auto-resolves scope_id from authenticated user."""
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "priv", "content": "secret", "scope": "user"},
+        )
+        assert r.status_code == 201
+        assert r.json()["scope_id"] == "test-user"
+
+    def test_user_scope_rejects_cross_user(self, server_client):
+        """Cannot access another user's memories via scope_id."""
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "x", "content": "y", "scope": "user", "scope_id": "other-user"},
+        )
+        assert r.status_code == 403
+
+    def test_user_scope_allows_own_scope_id(self, server_client):
+        """Passing own user_id as scope_id is allowed."""
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "x", "content": "y", "scope": "user", "scope_id": "test-user"},
+        )
+        assert r.status_code == 201
+
+    def test_list_rejects_cross_user(self, server_client):
+        r = server_client.get("/v1/api/memories?scope=user&scope_id=other-user")
+        assert r.status_code == 403
+
+    def test_delete_rejects_cross_user(self, server_client, storage):
+        _seed_memory(storage, "k", "v", scope="user", scope_id="other-user")
+        r = server_client.delete("/v1/api/memories/k?scope=user&scope_id=other-user")
+        assert r.status_code == 403
+
+
 class TestServerSearchMemories:
     def test_search(self, server_client, storage):
         _seed_memory(storage, "db_config", "postgresql host", description="database")
