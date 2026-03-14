@@ -1,3 +1,4 @@
 from mcp_cluster_ops.server import main
 
-main()
+if __name__ == "__main__":
+    main()

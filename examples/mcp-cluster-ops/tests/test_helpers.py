@@ -37,8 +37,8 @@ class TestTruncate:
         assert "150 bytes omitted" in result
 
     def test_unicode_boundary(self):
-        # Multi-byte: each char is 3 bytes in UTF-8
-        text = "\u00e9\u00e9\u00e9\u00e9\u00e9"  # 5 x 2-byte chars = 10 bytes
+        # U+00E9 (é) is 2 bytes in UTF-8 (0xC3 0xA9), so 5 chars = 10 bytes
+        text = "\u00e9\u00e9\u00e9\u00e9\u00e9"
         result = _truncate(text, 5)
         # Should not crash, should truncate cleanly
         assert "truncated" in result

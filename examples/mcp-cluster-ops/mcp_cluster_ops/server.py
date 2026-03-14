@@ -81,8 +81,6 @@ def _redis_kwargs() -> dict[str, Any]:
     password = os.environ.get("REDIS_PASSWORD")
     if password:
         kwargs["password"] = password
-    if os.environ.get("REDIS_SSL", "").lower() in ("1", "true", "yes"):
-        kwargs["ssl"] = True
     return kwargs
 
 
@@ -132,7 +130,7 @@ def _truncate(text: str, max_bytes: int) -> str:
     if len(encoded) <= max_bytes:
         return text
     truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
-    omitted = len(encoded) - max_bytes
+    omitted = len(encoded) - len(truncated.encode("utf-8"))
     return truncated + f"\n... [truncated: {omitted} bytes omitted]"
 
 
@@ -212,8 +210,6 @@ async def _dispatch_parallel(
 
     Total wall time is bounded by the slowest node.
     """
-    if len(node_ids) > _MAX_CONCURRENT_NODES:
-        return [{"error": (f"Too many nodes ({len(node_ids)}), max is {_MAX_CONCURRENT_NODES}")}]
     tasks = [
         asyncio.to_thread(_exec_on_node_sync, redis_kw, nid, command, timeout) for nid in node_ids
     ]
@@ -222,6 +218,8 @@ async def _dispatch_parallel(
     results: list[dict[str, Any]] = []
     for nid, outcome in zip(node_ids, outcomes, strict=True):
         if isinstance(outcome, BaseException):
+            if not isinstance(outcome, Exception):
+                raise outcome  # propagate KeyboardInterrupt, SystemExit, etc.
             results.append({"node": nid, "ok": False, "error": str(outcome)})
         else:
             _, turn_result = outcome
@@ -338,6 +336,10 @@ async def run_on_nodes(
     clean_ids = list(dict.fromkeys(nid.strip() for nid in node_ids if nid.strip()))
     if not clean_ids:
         return json.dumps({"error": "node_ids must be a non-empty list"})
+    if len(clean_ids) > _MAX_CONCURRENT_NODES:
+        return json.dumps(
+            {"error": f"Too many nodes ({len(clean_ids)}), max is {_MAX_CONCURRENT_NODES}"}
+        )
 
     log.info("run_on_nodes nodes=%s cmd=%r", clean_ids, command)
     results = await _dispatch_parallel(
@@ -373,9 +375,17 @@ async def run_on_all_nodes(
     if not nodes:
         return json.dumps({"error": "No active nodes found in cluster"})
 
-    node_ids = [nid for n in nodes if (nid := n.get("node_id") or n.get("id"))]
+    node_ids = list(
+        dict.fromkeys(
+            nid.strip() for n in nodes if (nid := n.get("node_id") or n.get("id")) and nid.strip()
+        )
+    )
     if not node_ids:
         return json.dumps({"error": "No nodes with identifiable IDs found"})
+    if len(node_ids) > _MAX_CONCURRENT_NODES:
+        return json.dumps(
+            {"error": f"Too many nodes ({len(node_ids)}), max is {_MAX_CONCURRENT_NODES}"}
+        )
     log.info("run_on_all_nodes nodes=%s cmd=%r", node_ids, command)
     results = await _dispatch_parallel(
         redis_kw, node_ids, command, _clamp_timeout(timeout), max_output

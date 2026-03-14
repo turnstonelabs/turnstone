@@ -43,7 +43,6 @@ pip install -e ./examples/mcp-cluster-ops
 | `REDIS_HOST` | `localhost` | Redis host |
 | `REDIS_PORT` | `6379` | Redis port |
 | `REDIS_PASSWORD` | _(none)_ | Redis password (use env vars, not config files) |
-| `REDIS_SSL` | _(off)_ | Set to `1` or `true` to enable TLS |
 | `MCP_CLUSTER_OPS_TIMEOUT` | `120` | Default command timeout (seconds, clamped 5-3600) |
 | `MCP_CLUSTER_OPS_MAX_OUTPUT` | `8192` | Max output bytes per node (0 = unlimited) |
 | `MCP_CLUSTER_OPS_MAX_NODES` | `32` | Max concurrent node dispatches |
@@ -105,8 +104,7 @@ The HTTP SDK (`TurnstoneServer`) talks to a single server instance. The MQ clien
   is returned through the MCP tool result and becomes part of the LLM context.
 - The security boundary is at the MCP host layer -- use Turnstone's tool
   policy system to restrict which agents can invoke these tools.
-- Redis connections should use TLS in production (`REDIS_SSL=1`). Set
-  `REDIS_PASSWORD` via your environment or a secrets manager -- avoid
+- Set `REDIS_PASSWORD` via your environment or a secrets manager -- avoid
   hardcoding passwords in config files.
 
 ## Development
