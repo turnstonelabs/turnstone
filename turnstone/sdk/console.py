@@ -14,16 +14,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from turnstone.api.console_schemas import (
+    AdminMemoryInfo,
     ClusterNodesResponse,
     ClusterOverviewResponse,
     ClusterSnapshotResponse,
     ClusterWorkstreamsResponse,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    ListAdminMemoriesResponse,
     ListAuditEventsResponse,
     ListOrgsResponse,
     ListPromptTemplatesResponse,
     ListRolesResponse,
+    ListSettingSchemaResponse,
+    ListSettingsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     ListWsTemplatesResponse,
@@ -32,6 +36,7 @@ from turnstone.api.console_schemas import (
     OrgInfo,
     PromptTemplateInfo,
     RoleInfo,
+    SettingInfo,
     ToolPolicyInfo,
     UsageResponse,
     WsTemplateInfo,
@@ -568,6 +573,99 @@ class AsyncTurnstoneConsole(_BaseClient):
             "GET", "/v1/api/admin/audit", params=params, response_model=ListAuditEventsResponse
         )
 
+    # -- governance: memories ------------------------------------------------
+
+    async def list_memories(
+        self,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 100,
+    ) -> ListAdminMemoriesResponse:
+        params: dict[str, Any] = {"limit": limit}
+        if mem_type:
+            params["type"] = mem_type
+        if scope:
+            params["scope"] = scope
+        if scope_id:
+            params["scope_id"] = scope_id
+        return await self._request(
+            "GET",
+            "/v1/api/admin/memories",
+            params=params,
+            response_model=ListAdminMemoriesResponse,
+        )
+
+    async def search_memories(
+        self,
+        query: str,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> ListAdminMemoriesResponse:
+        params: dict[str, Any] = {"q": query, "limit": limit}
+        if mem_type:
+            params["type"] = mem_type
+        if scope:
+            params["scope"] = scope
+        if scope_id:
+            params["scope_id"] = scope_id
+        return await self._request(
+            "GET",
+            "/v1/api/admin/memories/search",
+            params=params,
+            response_model=ListAdminMemoriesResponse,
+        )
+
+    async def get_memory(self, memory_id: str) -> AdminMemoryInfo:
+        return await self._request(
+            "GET",
+            f"/v1/api/admin/memories/{memory_id}",
+            response_model=AdminMemoryInfo,
+        )
+
+    async def delete_memory(self, memory_id: str) -> StatusResponse:
+        return await self._request(
+            "DELETE",
+            f"/v1/api/admin/memories/{memory_id}",
+            response_model=StatusResponse,
+        )
+
+    # -- system: settings ----------------------------------------------------
+
+    async def list_settings(self) -> ListSettingsResponse:
+        """List all settings with effective values."""
+        return await self._request(
+            "GET", "/v1/api/admin/settings", response_model=ListSettingsResponse
+        )
+
+    async def get_settings_schema(self) -> ListSettingSchemaResponse:
+        """Return the full settings registry schema."""
+        return await self._request(
+            "GET", "/v1/api/admin/settings/schema", response_model=ListSettingSchemaResponse
+        )
+
+    async def update_setting(self, key: str, value: Any, *, node_id: str = "") -> SettingInfo:
+        """Set a configuration setting value."""
+        body: dict[str, Any] = {"value": value}
+        if node_id:
+            body["node_id"] = node_id
+        return await self._request(
+            "PUT", f"/v1/api/admin/settings/{key}", json_body=body, response_model=SettingInfo
+        )
+
+    async def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+        """Reset a setting to its default value."""
+        params: dict[str, Any] = {}
+        if node_id:
+            params["node_id"] = node_id
+        return await self._request(
+            "DELETE", f"/v1/api/admin/settings/{key}", params=params, response_model=StatusResponse
+        )
+
 
 class TurnstoneConsole:
     """Synchronous client for the turnstone console API.
@@ -896,6 +994,52 @@ class TurnstoneConsole:
                 offset=offset,
             )
         )
+
+    # -- governance: memories ------------------------------------------------
+
+    def list_memories(
+        self, *, mem_type: str = "", scope: str = "", scope_id: str = "", limit: int = 100
+    ) -> ListAdminMemoriesResponse:
+        return self._runner.run(
+            self._async.list_memories(
+                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
+        )
+
+    def search_memories(
+        self,
+        query: str,
+        *,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        limit: int = 20,
+    ) -> ListAdminMemoriesResponse:
+        return self._runner.run(
+            self._async.search_memories(
+                query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+            )
+        )
+
+    def get_memory(self, memory_id: str) -> AdminMemoryInfo:
+        return self._runner.run(self._async.get_memory(memory_id))
+
+    def delete_memory(self, memory_id: str) -> StatusResponse:
+        return self._runner.run(self._async.delete_memory(memory_id))
+
+    # -- system: settings ----------------------------------------------------
+
+    def list_settings(self) -> ListSettingsResponse:
+        return self._runner.run(self._async.list_settings())
+
+    def get_settings_schema(self) -> ListSettingSchemaResponse:
+        return self._runner.run(self._async.get_settings_schema())
+
+    def update_setting(self, key: str, value: Any, *, node_id: str = "") -> SettingInfo:
+        return self._runner.run(self._async.update_setting(key, value, node_id=node_id))
+
+    def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+        return self._runner.run(self._async.delete_setting(key, node_id=node_id))
 
     # -- lifecycle -----------------------------------------------------------
 

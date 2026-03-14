@@ -1359,6 +1359,166 @@ async def cancel_watch(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "watch_id": watch_id})
 
 
+# ---------------------------------------------------------------------------
+# Memory endpoints
+# ---------------------------------------------------------------------------
+
+_VALID_MEMORY_TYPES = frozenset({"user", "project", "feedback", "reference"})
+_VALID_MEMORY_SCOPES = frozenset({"global", "workstream", "user"})
+_MAX_MEMORY_CONTENT = 65536  # hard upper bound; server may enforce lower via config
+
+
+def _resolve_user_scope_id(
+    request: Request, provided_scope_id: str = ""
+) -> tuple[str, JSONResponse | None]:
+    """Resolve and validate scope_id for user-scoped memory.
+
+    Always binds to the authenticated user's identity.  If a scope_id is
+    provided and doesn't match, returns 403 to prevent cross-user access.
+    """
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = getattr(auth, "user_id", "") or ""
+    if not uid:
+        return "", JSONResponse(
+            {"error": "User scope requires authentication with a user identity"},
+            status_code=400,
+        )
+    if provided_scope_id and provided_scope_id != uid:
+        return "", JSONResponse(
+            {"error": "Cannot access another user's memories"},
+            status_code=403,
+        )
+    return uid, None
+
+
+async def list_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/memories — list memories with optional filters."""
+    from turnstone.core.memory import list_structured_memories
+
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "100")), 200)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
+        if err:
+            return err
+    rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def save_memory(request: Request) -> JSONResponse:
+    """POST /v1/api/memories — save (upsert) a structured memory."""
+    from turnstone.core.memory import save_structured_memory
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    name = str(body.get("name", "")).strip()
+    content = str(body.get("content", "")).strip()
+    if not name or len(name) > 256:
+        return JSONResponse({"error": "name is required (max 256 characters)"}, status_code=400)
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+    if len(content) > _MAX_MEMORY_CONTENT:
+        return JSONResponse(
+            {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
+            status_code=400,
+        )
+    description = str(body.get("description", ""))
+    mem_type = str(body.get("type", "project"))
+    scope = str(body.get("scope", "global"))
+    scope_id = str(body.get("scope_id", ""))
+    if mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse(
+            {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
+            status_code=400,
+        )
+    if scope not in _VALID_MEMORY_SCOPES:
+        return JSONResponse(
+            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
+            status_code=400,
+        )
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
+        if err:
+            return err
+    # save_structured_memory normalises the name internally
+    from turnstone.core.memory import normalize_key
+
+    normalized_name = normalize_key(name)
+    memory_id, old_content = save_structured_memory(
+        name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
+    )
+    if not memory_id:
+        return JSONResponse({"error": "Failed to save memory"}, status_code=500)
+    from turnstone.core.storage._registry import get_storage
+
+    storage = get_storage()
+    mem = storage.get_structured_memory(memory_id) if storage else None
+    if not mem:
+        return JSONResponse(
+            {"memory_id": memory_id, "name": normalized_name, "status": "saved"},
+            status_code=201,
+        )
+    status_code = 200 if old_content is not None else 201
+    return JSONResponse(mem, status_code=status_code)
+
+
+async def search_memories(request: Request) -> JSONResponse:
+    """POST /v1/api/memories/search — search memories by query.
+
+    Uses POST for the request body but requires only read scope (non-mutating).
+    """
+    from turnstone.core.memory import search_structured_memories as search_fn
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    query = str(body.get("query", "")).strip()
+    if not query:
+        return JSONResponse({"error": "query is required"}, status_code=400)
+    mem_type = str(body.get("type", ""))
+    scope = str(body.get("scope", ""))
+    scope_id = str(body.get("scope_id", ""))
+    try:
+        limit = min(int(body.get("limit", 20)), 50)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
+        if err:
+            return err
+    rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def delete_memory_endpoint(request: Request) -> JSONResponse:
+    """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
+    from turnstone.core.memory import delete_structured_memory, normalize_key
+
+    name = normalize_key(request.path_params["name"])
+    scope = request.query_params.get("scope", "global")
+    if scope not in _VALID_MEMORY_SCOPES:
+        return JSONResponse(
+            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
+            status_code=400,
+        )
+    scope_id = request.query_params.get("scope_id", "")
+    if scope == "user":
+        scope_id, err = _resolve_user_scope_id(request, scope_id)
+        if err:
+            return err
+    if delete_structured_memory(name, scope, scope_id):
+        return JSONResponse({"status": "ok", "name": name})
+    return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+
+
 async def auth_login(request: Request) -> Response:
     """POST /v1/api/auth/login — authenticate and return JWT."""
     from turnstone.core.auth import handle_auth_login
@@ -1399,6 +1559,15 @@ async def auth_oidc_callback(request: Request) -> Response:
     from turnstone.core.auth_oidc import handle_oidc_callback
 
     return await handle_oidc_callback(request)
+
+
+def config_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/config-reload — invalidate config cache."""
+    cs = getattr(request.app.state, "config_store", None)
+    if not cs:
+        return JSONResponse({"status": "noop"})
+    cs.reload()
+    return JSONResponse({"status": "ok"})
 
 
 # ---------------------------------------------------------------------------
@@ -1532,6 +1701,7 @@ def create_app(
     cors_origins: list[str] | None = None,
     watch_runner: Any = None,
     judge_config: Any = None,
+    config_store: Any = None,
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -1558,12 +1728,17 @@ def create_app(
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
                     Route("/api/watches", list_watches),
                     Route("/api/watches/{watch_id}/cancel", cancel_watch, methods=["POST"]),
+                    Route("/api/memories", list_memories),
+                    Route("/api/memories", save_memory, methods=["POST"]),
+                    Route("/api/memories/search", search_memories, methods=["POST"]),
+                    Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
                     Route("/api/auth/oidc/login", auth_oidc_login),
                     Route("/api/auth/oidc/callback", auth_oidc_callback),
+                    Route("/api/_internal/config-reload", config_reload, methods=["POST"]),
                 ],
             ),
             Route("/health", health),
@@ -1600,6 +1775,7 @@ def create_app(
     app.state.node_id = node_id
     app.state.watch_runner = watch_runner
     app.state.judge_config = judge_config
+    app.state.config_store = config_store
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -1635,38 +1811,9 @@ def main() -> None:
         help="Model name (default: auto-detect from server)",
     )
     parser.add_argument(
-        "--instructions",
-        default=None,
-        help="Developer instructions injected as developer message",
-    )
-    parser.add_argument(
         "--template",
         default=None,
         help="Prompt template name (replaces default templates)",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.5,
-        help="Sampling temperature (default: 0.5)",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        type=int,
-        default=32768,
-        help="Max completion tokens (default: 32768)",
-    )
-    parser.add_argument(
-        "--tool-timeout",
-        type=int,
-        default=30,
-        help="Bash command timeout in seconds (default: 30)",
-    )
-    parser.add_argument(
-        "--reasoning-effort",
-        default="medium",
-        choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        help="Reasoning effort level (default: medium)",
     )
     parser.add_argument(
         "--provider",
@@ -1675,63 +1822,10 @@ def main() -> None:
         help="LLM provider for the default model (default: openai)",
     )
     parser.add_argument(
-        "--context-window",
-        type=int,
-        default=131072,
-        help="Context window size in tokens (default: 131072)",
-    )
-    parser.add_argument(
-        "--compact-max-tokens",
-        type=int,
-        default=32768,
-        help="Max tokens for compaction summary (default: 32768)",
-    )
-    parser.add_argument(
-        "--auto-compact-pct",
-        type=float,
-        default=0.8,
-        help="Auto-compact when prompt exceeds this fraction of context window (default: 0.8)",
-    )
-    parser.add_argument(
-        "--agent-max-turns",
-        type=int,
-        default=-1,
-        help="Max tool turns for agent sub-sessions, -1 for unlimited (default: -1)",
-    )
-    parser.add_argument(
-        "--tool-truncation",
-        type=int,
-        default=0,
-        help="Tool output truncation limit in chars, 0 for auto (50%% of context window) (default: 0)",
-    )
-    parser.add_argument(
-        "--tool-search",
-        choices=["auto", "on", "off"],
-        default="auto",
-        help="Dynamic tool search: auto (enable when tool count exceeds threshold), on, off (default: auto)",
-    )
-    parser.add_argument(
-        "--tool-search-threshold",
-        type=int,
-        default=20,
-        help="Min tools before tool search activates (default: 20)",
-    )
-    parser.add_argument(
-        "--tool-search-max-results",
-        type=int,
-        default=5,
-        help="Max tools returned per tool search query (default: 5)",
-    )
-    parser.add_argument(
         "--resume",
         default=None,
         metavar="WS",
         help="Resume a previous workstream by alias or ws_id",
-    )
-    parser.add_argument(
-        "--skip-permissions",
-        action="store_true",
-        help="Auto-approve all tool calls (no confirmation prompts)",
     )
     parser.add_argument(
         "--api-key",
@@ -1749,149 +1843,21 @@ def main() -> None:
         default=8080,
         help="Port to listen on (default: 8080)",
     )
-    parser.add_argument(
-        "--retention-days",
-        type=int,
-        default=90,
-        metavar="DAYS",
-        help="Delete unnamed workstreams older than DAYS days on startup, 0 to disable (default: 90)",
-    )
-    parser.add_argument(
-        "--workstream-idle-timeout",
-        type=int,
-        default=120,
-        metavar="MINUTES",
-        help="Close IDLE workstreams after MINUTES of inactivity, 0 to disable (default: 120)",
-    )
+    # MCP config path is bootstrap-critical (needed before ConfigStore for tool loading)
     parser.add_argument(
         "--mcp-config",
         default=None,
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
-
-    from turnstone.core.config import nonneg_float
-
-    parser.add_argument(
-        "--mcp-refresh-interval",
-        type=nonneg_float,
-        default=14400,
-        metavar="SECONDS",
-        help="Periodic MCP tool refresh interval for servers without push notifications (default: 14400 = 4h, 0 to disable)",
-    )
-    parser.add_argument(
-        "--max-workstreams",
-        type=int,
-        default=10,
-        help="Maximum concurrent workstreams, auto-evicts idle when full (default: 10)",
-    )
-    parser.add_argument(
-        "--ratelimit-enabled",
-        action="store_true",
-        default=False,
-        help="Enable per-IP rate limiting",
-    )
-    parser.add_argument(
-        "--ratelimit-rps",
-        type=float,
-        default=10.0,
-        help="Rate limit: requests per second per client IP (default: 10.0)",
-    )
-    parser.add_argument(
-        "--ratelimit-burst",
-        type=int,
-        default=20,
-        help="Rate limit: burst size (default: 20)",
-    )
-    parser.add_argument(
-        "--ratelimit-trusted-proxies",
-        default="",
-        help="Trusted proxy CIDRs for X-Forwarded-For parsing (comma-separated, e.g. '10.0.0.0/8,172.16.0.0/12')",
-    )
-    parser.add_argument(
-        "--health-probe-interval",
-        type=float,
-        default=30.0,
-        help="Backend health probe interval in seconds (default: 30)",
-    )
-    parser.add_argument(
-        "--health-probe-timeout",
-        type=float,
-        default=5.0,
-        help="Backend health probe timeout in seconds (default: 5)",
-    )
-    parser.add_argument(
-        "--circuit-breaker-threshold",
-        type=int,
-        default=5,
-        help="Consecutive failures to open circuit breaker (default: 5)",
-    )
-    parser.add_argument(
-        "--circuit-breaker-cooldown",
-        type=float,
-        default=60.0,
-        help="Circuit breaker cooldown in seconds (default: 60)",
-    )
-    judge_group = parser.add_argument_group("Judge options")
-    judge_group.add_argument(
-        "--judge",
-        dest="judge_enabled",
-        action="store_true",
-        default=True,
-        help="Enable intent validation judge for tool approvals (default)",
-    )
-    judge_group.add_argument(
-        "--no-judge",
-        dest="judge_enabled",
-        action="store_false",
-        help="Disable intent validation judge",
-    )
-    judge_group.add_argument(
-        "--judge-model",
-        dest="judge_model",
-        default="",
-        help="Model for judge (default: same as session model)",
-    )
-    judge_group.add_argument(
-        "--judge-provider",
-        dest="judge_provider",
-        default="",
-        help="Provider for judge (default: same as session provider)",
-    )
-    judge_group.add_argument(
-        "--judge-timeout",
-        dest="judge_timeout",
-        type=float,
-        default=60.0,
-        help="LLM judge timeout in seconds (default: 60)",
-    )
-    judge_group.add_argument(
-        "--judge-confidence",
-        dest="judge_confidence",
-        type=float,
-        default=0.7,
-        help="Confidence threshold for judge (default: 0.7)",
-    )
     from turnstone.core.log import add_log_args
 
     add_log_args(parser)
     from turnstone.core.config import apply_config
 
-    apply_config(
-        parser,
-        [
-            "api",
-            "model",
-            "session",
-            "tools",
-            "server",
-            "mcp",
-            "ratelimit",
-            "health",
-            "database",
-            "judge",
-        ],
-    )
+    # Only load bootstrap sections from config.toml — all other settings
+    # are managed by ConfigStore (database-backed) after storage init.
+    apply_config(parser, ["api", "server", "database"])
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging_from_args
@@ -1911,86 +1877,7 @@ def main() -> None:
     )
     init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
 
-    # Prune stale / empty workstreams on startup
-    from turnstone.core.memory import prune_workstreams
-
-    prune_workstreams(retention_days=args.retention_days, log_fn=print)
-
-    # Create client and detect model
-    provider_name = args.provider
-    api_key = (
-        args.api_key
-        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
-        or "dummy"
-    )
-    base_url = args.base_url
-    if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
-        base_url = "https://api.anthropic.com"
-    from turnstone.core.providers import create_client
-
-    client = create_client(provider_name, base_url=base_url, api_key=api_key)
-    if args.model:
-        model = args.model
-        detected_ctx = None
-    else:
-        from turnstone.core.model_registry import detect_model
-
-        model, detected_ctx = detect_model(client, provider=provider_name)
-
-    # Use detected context window when the user hasn't explicitly set one
-    context_window = args.context_window
-    if detected_ctx and context_window == 131072:  # default unchanged
-        context_window = detected_ctx
-        log.info("Context window: %s (detected from backend)", f"{context_window:,}")
-
-    # Build model registry (reads [models.*] sections from config.toml)
-    from turnstone.core.model_registry import load_model_registry
-
-    registry = load_model_registry(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        context_window=context_window,
-        provider=provider_name,
-    )
-
-    # Initialize MCP client (connects to configured MCP servers, if any)
-    from turnstone.core.mcp_client import create_mcp_client
-
-    mcp_client = create_mcp_client(
-        getattr(args, "mcp_config", None),
-        refresh_interval=getattr(args, "mcp_refresh_interval", 14400),
-    )
-
-    # Backend health monitor with circuit breaker
-    from turnstone.core.healthcheck import BackendHealthMonitor
-
-    health_monitor = BackendHealthMonitor(
-        client=client,
-        probe_interval=args.health_probe_interval,
-        probe_timeout=args.health_probe_timeout,
-        failure_threshold=args.circuit_breaker_threshold,
-        cooldown=args.circuit_breaker_cooldown,
-    )
-    health_monitor.start()
-
-    # Per-IP rate limiter
-    from turnstone.core.ratelimit import RateLimiter
-
-    rate_limiter = RateLimiter(
-        enabled=args.ratelimit_enabled,
-        rate=args.ratelimit_rps,
-        burst=args.ratelimit_burst,
-        trusted_proxies=args.ratelimit_trusted_proxies,
-    )
-
-    # Set up global event queue for state-change broadcasts
-    global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
-    global_listeners: list[queue.Queue[dict[str, Any]]] = []
-    global_listeners_lock = threading.Lock()
-    WebUI._global_queue = global_queue
-
-    # Server-owned node identity
+    # Server-owned node identity (needed before ConfigStore for node_id scoping)
     def _default_node_id() -> str:
         """Generate a node_id: ``{hostname}_{4hex}``, or a UUID on failure."""
         suffix = uuid.uuid4().hex[:4]
@@ -2008,20 +1895,134 @@ def main() -> None:
 
     ctx_node_id.set(_node_id)
 
-    # Intent validation judge config
-    from turnstone.core.judge import JudgeConfig
+    # Database-backed config store — single source of truth for non-bootstrap
+    # settings.  Created early so all subsequent init code can read from it.
+    from turnstone.core.config_store import ConfigStore
+    from turnstone.core.storage import get_storage as _get_cs_storage
 
-    judge_config = JudgeConfig(
-        enabled=getattr(args, "judge_enabled", True),
-        model=getattr(args, "judge_model", ""),
-        provider=getattr(args, "judge_provider", ""),
-        base_url=getattr(args, "judge_base_url", ""),
-        api_key=getattr(args, "judge_api_key", ""),
-        confidence_threshold=getattr(args, "judge_confidence", 0.7),
-        max_context_ratio=getattr(args, "judge_context_ratio", 0.5),
-        timeout=getattr(args, "judge_timeout", 60.0),
-        read_only_tools=getattr(args, "judge_read_only_tools", True),
+    config_store = ConfigStore(storage=_get_cs_storage(), node_id=_node_id)
+
+    # Warn about config.toml keys that are now managed by ConfigStore
+    from turnstone.core.config import warn_migrated_settings
+
+    warn_migrated_settings()
+
+    # Prune stale / empty workstreams on startup
+    from turnstone.core.memory import prune_workstreams
+
+    prune_workstreams(retention_days=config_store.get("session.retention_days"), log_fn=print)
+
+    # Create client and detect model
+    provider_name = args.provider
+    api_key = (
+        args.api_key
+        or os.environ.get("ANTHROPIC_API_KEY" if provider_name == "anthropic" else "OPENAI_API_KEY")
+        or "dummy"
     )
+    base_url = args.base_url
+    if provider_name == "anthropic" and base_url == "http://localhost:8000/v1":
+        base_url = "https://api.anthropic.com"
+    from turnstone.core.providers import create_client
+
+    client = create_client(provider_name, base_url=base_url, api_key=api_key)
+
+    cs_model = config_store.get("model.name")
+    cli_model = args.model
+    effective_model = cli_model or cs_model or None
+    if effective_model:
+        model = effective_model
+        detected_ctx = None
+    else:
+        from turnstone.core.model_registry import detect_model
+
+        model, detected_ctx = detect_model(client, provider=provider_name)
+
+    # Use detected context window, fall back to ConfigStore override or 32768
+    cfg_ctx = config_store.get("model.context_window")
+    if detected_ctx:
+        context_window = detected_ctx
+        log.info("Context window: %s (detected from backend)", f"{context_window:,}")
+    elif cfg_ctx:  # 0 = auto-detect (no override)
+        context_window = cfg_ctx
+    else:
+        context_window = 32768
+
+    # Build model registry (reads [models.*] sections from config.toml)
+    from turnstone.core.model_registry import load_model_registry
+
+    registry = load_model_registry(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        context_window=context_window,
+        provider=provider_name,
+    )
+
+    # Initialize MCP client (connects to configured MCP servers, if any)
+    from turnstone.core.mcp_client import create_mcp_client
+
+    mcp_config_cli = args.mcp_config  # CLI-only (no config.toml for this)
+    mcp_client = create_mcp_client(
+        mcp_config_cli or config_store.get("mcp.config_path") or None,
+        refresh_interval=config_store.get("mcp.refresh_interval"),
+    )
+
+    # Backend health monitor with circuit breaker
+    from turnstone.core.healthcheck import BackendHealthMonitor
+
+    health_monitor = BackendHealthMonitor(
+        client=client,
+        probe_interval=config_store.get("health.backend_probe_interval"),
+        probe_timeout=config_store.get("health.backend_probe_timeout"),
+        failure_threshold=config_store.get("health.circuit_breaker_threshold"),
+        cooldown=config_store.get("health.circuit_breaker_cooldown"),
+    )
+    health_monitor.start()
+
+    # Per-IP rate limiter
+    from turnstone.core.ratelimit import RateLimiter
+
+    rate_limiter = RateLimiter(
+        enabled=config_store.get("ratelimit.enabled"),
+        rate=config_store.get("ratelimit.requests_per_second"),
+        burst=config_store.get("ratelimit.burst"),
+        trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
+    )
+
+    # Set up global event queue for state-change broadcasts
+    global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    global_listeners: list[queue.Queue[dict[str, Any]]] = []
+    global_listeners_lock = threading.Lock()
+    WebUI._global_queue = global_queue
+
+    # Config builders — shared between startup logging and session factory.
+    # Re-read from ConfigStore each call so hot-reload works.
+    from turnstone.core.judge import JudgeConfig
+    from turnstone.core.memory_relevance import MemoryConfig
+
+    def _build_judge_config() -> JudgeConfig:
+        return JudgeConfig(
+            enabled=config_store.get("judge.enabled"),
+            model=config_store.get("judge.model"),
+            provider=config_store.get("judge.provider"),
+            base_url=config_store.get("judge.base_url"),
+            api_key=config_store.get("judge.api_key"),
+            confidence_threshold=config_store.get("judge.confidence_threshold"),
+            max_context_ratio=config_store.get("judge.max_context_ratio"),
+            timeout=config_store.get("judge.timeout"),
+            read_only_tools=config_store.get("judge.read_only_tools"),
+        )
+
+    def _build_memory_config() -> MemoryConfig:
+        return MemoryConfig(
+            relevance_k=config_store.get("memory.relevance_k"),
+            fetch_limit=config_store.get("memory.fetch_limit"),
+            max_content=config_store.get("memory.max_content"),
+            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
+            nudges=config_store.get("memory.nudges"),
+        )
+
+    judge_config = _build_judge_config()
     if judge_config.enabled:
         log.info(
             "Judge: enabled (model=%s, threshold=%.2f)",
@@ -2029,7 +2030,7 @@ def main() -> None:
             judge_config.confidence_threshold,
         )
 
-    # Session factory — captures shared config
+    # Session factory — captures shared config (including config_store for hot-reload)
     def session_factory(
         ui: SessionUI | None,
         model_alias: str | None = None,
@@ -2038,32 +2039,38 @@ def main() -> None:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         uid = getattr(ui, "_user_id", "") or ""
+
+        # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
+        live_memory_config = _build_memory_config()
+        live_judge_config = _build_judge_config()
+
         return ChatSession(
             client=r_client,
             model=r_model,
             ui=ui,
-            instructions=args.instructions,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            tool_timeout=args.tool_timeout,
-            reasoning_effort=args.reasoning_effort,
+            instructions=config_store.get("session.instructions") or None,
+            temperature=config_store.get("model.temperature"),
+            max_tokens=config_store.get("model.max_tokens"),
+            tool_timeout=config_store.get("tools.timeout"),
+            reasoning_effort=config_store.get("model.reasoning_effort"),
             context_window=r_cfg.context_window,
-            compact_max_tokens=args.compact_max_tokens,
-            auto_compact_pct=args.auto_compact_pct,
-            agent_max_turns=args.agent_max_turns,
-            tool_truncation=args.tool_truncation,
+            compact_max_tokens=config_store.get("session.compact_max_tokens"),
+            auto_compact_pct=config_store.get("session.auto_compact_pct"),
+            agent_max_turns=config_store.get("tools.agent_max_turns"),
+            tool_truncation=config_store.get("tools.truncation"),
             mcp_client=mcp_client,
             registry=registry,
             model_alias=model_alias or registry.default,
             health_monitor=health_monitor,
             node_id=_node_id,
             ws_id=ws_id,
-            tool_search=args.tool_search,
-            tool_search_threshold=args.tool_search_threshold,
-            tool_search_max_results=args.tool_search_max_results,
+            tool_search=config_store.get("tools.search"),
+            tool_search_threshold=config_store.get("tools.search_threshold"),
+            tool_search_max_results=config_store.get("tools.search_max_results"),
             template=args.template,
-            judge_config=judge_config,
+            judge_config=live_judge_config,
             user_id=uid,
+            memory_config=live_memory_config,
         )
 
     # Create WatchRunner (periodic command polling, server-level)
@@ -2072,7 +2079,9 @@ def main() -> None:
 
     # Create workstream manager first (watch restore_fn captures it)
     manager = WorkstreamManager(
-        session_factory, max_workstreams=args.max_workstreams, node_id=_node_id
+        session_factory,
+        max_workstreams=config_store.get("server.max_workstreams"),
+        node_id=_node_id,
     )
     WebUI._workstream_mgr = manager
 
@@ -2104,7 +2113,7 @@ def main() -> None:
     _watch_runner = WatchRunner(
         storage=_get_storage(),
         node_id=_node_id,
-        tool_timeout=args.tool_timeout,
+        tool_timeout=config_store.get("tools.timeout"),
         restore_fn=_watch_restore_fn,
     )
     ws = manager.create(
@@ -2112,7 +2121,7 @@ def main() -> None:
         ui_factory=lambda wid: WebUI(ws_id=wid),
     )
     assert isinstance(ws.ui, WebUI)
-    if args.skip_permissions:
+    if config_store.get("tools.skip_permissions"):
         ws.ui.auto_approve = True
 
     # Handle --resume
@@ -2150,12 +2159,13 @@ def main() -> None:
 
     cors_origins = parse_cors_origins()
 
+    _skip_perms = config_store.get("tools.skip_permissions")
     app = create_app(
         workstreams=manager,
         global_queue=global_queue,
         global_listeners=global_listeners,
         global_listeners_lock=global_listeners_lock,
-        skip_permissions=args.skip_permissions,
+        skip_permissions=_skip_perms,
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=get_storage(),
@@ -2163,11 +2173,12 @@ def main() -> None:
         rate_limiter=rate_limiter,
         mcp_client=mcp_client,
         registry=registry,
-        idle_timeout=args.workstream_idle_timeout,
+        idle_timeout=config_store.get("server.workstream_idle_timeout"),
         node_id=_node_id,
         cors_origins=cors_origins,
         watch_runner=_watch_runner,
         judge_config=judge_config,
+        config_store=config_store,
     )
 
     log.info("Server starting on http://%s:%s", args.host, args.port)
@@ -2182,22 +2193,16 @@ def main() -> None:
         mcp_client.set_storage(get_storage())
     log.info(
         "Health monitor: probe every %ss, circuit breaker threshold=%s",
-        args.health_probe_interval,
-        args.circuit_breaker_threshold,
+        config_store.get("health.backend_probe_interval"),
+        config_store.get("health.circuit_breaker_threshold"),
     )
     if rate_limiter.enabled:
-        proxy_info = (
-            f", trusted proxies: {args.ratelimit_trusted_proxies}"
-            if args.ratelimit_trusted_proxies
-            else ""
-        )
         log.info(
-            "Rate limiter: %s req/s, burst=%s%s",
-            args.ratelimit_rps,
-            args.ratelimit_burst,
-            proxy_info,
+            "Rate limiter: %s req/s, burst=%s",
+            config_store.get("ratelimit.requests_per_second"),
+            config_store.get("ratelimit.burst"),
         )
-    log.info("Max workstreams: %s", args.max_workstreams)
+    log.info("Max workstreams: %s", config_store.get("server.max_workstreams"))
     log.info("Node ID: %s", _node_id)
     print("Press Ctrl+C to stop.")
 

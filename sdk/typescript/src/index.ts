@@ -143,6 +143,23 @@ export type {
   SendAndWaitOptions,
   NodesOptions,
   WorkstreamsOptions,
+  // Memory types
+  SaveMemoryRequest,
+  MemoryInfo,
+  ListMemoriesResponse,
+  SearchMemoriesRequest,
+  ListMemoriesOptions,
+  DeleteMemoryOptions,
+  AdminMemoryInfo,
+  ListAdminMemoriesResponse,
+  AdminListMemoriesOptions,
+  AdminSearchMemoriesOptions,
+  // Settings types
+  SettingInfo,
+  ListSettingsResponse,
+  SettingSchemaInfo,
+  ListSettingSchemaResponse,
+  UpdateSettingOptions,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

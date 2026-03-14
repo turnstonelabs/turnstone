@@ -1636,3 +1636,251 @@ function _populateAuditUserFilter() {
   }
   sel.innerHTML = html;
 }
+
+// ---------------------------------------------------------------------------
+// Memories tab
+// ---------------------------------------------------------------------------
+
+var _adminMemories = [];
+var _memDetailTrap = null;
+var _memDetailTrigger = null;
+var _memSearchTimer = null;
+var _memSearchBound = false;
+
+function loadAdminMemories() {
+  clearTimeout(_memSearchTimer);
+  // Bind search debounce on first load
+  if (!_memSearchBound) {
+    var searchEl = document.getElementById("mem-search");
+    if (searchEl) {
+      searchEl.addEventListener("input", function () {
+        clearTimeout(_memSearchTimer);
+        _memSearchTimer = setTimeout(loadAdminMemories, 300);
+      });
+    }
+    _memSearchBound = true;
+  }
+
+  var memType = document.getElementById("mem-filter-type").value;
+  var scope = document.getElementById("mem-filter-scope").value;
+  var query = (document.getElementById("mem-search").value || "").trim();
+
+  var url;
+  if (query) {
+    url =
+      "/v1/api/admin/memories/search?q=" +
+      encodeURIComponent(query) +
+      (memType ? "&type=" + encodeURIComponent(memType) : "") +
+      (scope ? "&scope=" + encodeURIComponent(scope) : "");
+  } else {
+    url =
+      "/v1/api/admin/memories?limit=200" +
+      (memType ? "&type=" + encodeURIComponent(memType) : "") +
+      (scope ? "&scope=" + encodeURIComponent(scope) : "");
+  }
+
+  authFetch(url)
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed to load memories");
+      return r.json();
+    })
+    .then(function (data) {
+      _adminMemories = data.memories || [];
+      _renderAdminMemories(_adminMemories, data.total || _adminMemories.length);
+    })
+    .catch(function () {
+      document.getElementById("admin-memories-table").innerHTML =
+        '<div class="dashboard-empty">Failed to load memories</div>';
+    });
+}
+
+function _renderAdminMemories(items, total) {
+  var el = document.getElementById("admin-memories-table");
+  if (!items.length) {
+    el.innerHTML = '<div class="dashboard-empty">No memories found</div>';
+    return;
+  }
+
+  var html = "";
+  for (var i = 0; i < items.length; i++) {
+    var m = items[i];
+
+    // Type badge
+    var typeCls = "scope-badge mem-type-" + escapeHtml(m.type);
+    var typeBadge =
+      '<span class="' + typeCls + '">' + escapeHtml(m.type) + "</span>";
+
+    // Scope badge
+    var scopeLabel = m.scope;
+    if (m.scope_id) scopeLabel += ":" + m.scope_id;
+    var scopeCls = "scope-badge mem-scope-" + escapeHtml(m.scope);
+    var scopeBadge =
+      '<span class="' + scopeCls + '">' + escapeHtml(scopeLabel) + "</span>";
+
+    // Description (truncated)
+    var desc = m.description || "";
+    if (desc.length > 60) desc = desc.substring(0, 57) + "…";
+
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-mname">' +
+      escapeHtml(m.name) +
+      "</span>" +
+      '<span class="admin-col admin-col-mtype">' +
+      typeBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-mscope">' +
+      scopeBadge +
+      "</span>" +
+      '<span class="admin-col admin-col-mdesc">' +
+      escapeHtml(desc) +
+      "</span>" +
+      '<span class="admin-col admin-col-mupdated">' +
+      _relativeTime(m.updated) +
+      "</span>" +
+      '<span class="admin-col admin-col-actions">' +
+      '<button class="admin-btn-action" data-view-memory="' +
+      escapeHtml(m.memory_id) +
+      '">view</button>' +
+      '<button class="admin-btn-danger" data-delete-memory="' +
+      escapeHtml(m.memory_id) +
+      '" data-delete-name="' +
+      escapeHtml(m.name) +
+      '">delete</button>' +
+      "</span>" +
+      "</div>";
+  }
+
+  el.innerHTML = html;
+
+  // Bind view buttons
+  var viewBtns = el.querySelectorAll("[data-view-memory]");
+  for (var v = 0; v < viewBtns.length; v++) {
+    viewBtns[v].addEventListener("click", function () {
+      showMemoryDetailModal(this.getAttribute("data-view-memory"));
+    });
+  }
+
+  // Bind delete buttons
+  var delBtns = el.querySelectorAll("[data-delete-memory]");
+  for (var d = 0; d < delBtns.length; d++) {
+    delBtns[d].addEventListener("click", function () {
+      var mid = this.getAttribute("data-delete-memory");
+      var mname = this.getAttribute("data-delete-name");
+      deleteAdminMemory(mid, mname);
+    });
+  }
+}
+
+function showMemoryDetailModal(memoryId) {
+  _memDetailTrigger = document.activeElement;
+  var ov = document.getElementById("memory-detail-overlay");
+  ov.style.display = "flex";
+  document.getElementById("memory-detail-body").innerHTML =
+    '<div class="dashboard-empty">Loading…</div>';
+
+  // Disable delete button and clear stale handler while loading
+  var delBtn = document.getElementById("mem-detail-delete");
+  delBtn.disabled = true;
+  delBtn.onclick = null;
+
+  // Focus close button for keyboard accessibility
+  var closeBtn = ov.querySelector(".modal-cancel");
+  if (closeBtn) closeBtn.focus();
+
+  authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId))
+    .then(function (r) {
+      if (!r.ok) throw new Error("Not found");
+      return r.json();
+    })
+    .then(function (m) {
+      var scopeLabel = m.scope;
+      if (m.scope_id) scopeLabel += ":" + m.scope_id;
+
+      var html =
+        '<div class="mem-detail-grid">' +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Name</span>' +
+        escapeHtml(m.name) +
+        "</div>" +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Type</span>' +
+        '<span class="scope-badge mem-type-' +
+        escapeHtml(m.type) +
+        '">' +
+        escapeHtml(m.type) +
+        "</span></div>" +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Scope</span>' +
+        '<span class="scope-badge mem-scope-' +
+        escapeHtml(m.scope) +
+        '">' +
+        escapeHtml(scopeLabel) +
+        "</span></div>" +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Created</span>' +
+        _relativeTime(m.created) +
+        "</div>" +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Updated</span>' +
+        _relativeTime(m.updated) +
+        "</div>" +
+        '<div class="mem-detail-field"><span class="mem-detail-label">Accessed</span>' +
+        (m.access_count || 0) +
+        " times</div>" +
+        "</div>" +
+        '<div class="mem-detail-label" style="margin-top:12px">Description</div>' +
+        '<div class="mem-detail-desc">' +
+        escapeHtml(m.description || "(none)") +
+        "</div>" +
+        '<div class="mem-detail-label" style="margin-top:12px">Content</div>' +
+        '<pre class="memory-content-block">' +
+        escapeHtml(m.content) +
+        "</pre>";
+
+      document.getElementById("memory-detail-body").innerHTML = html;
+
+      // Wire delete button now that data is loaded
+      delBtn.disabled = false;
+      delBtn.onclick = function () {
+        deleteAdminMemory(m.memory_id, m.name);
+      };
+    })
+    .catch(function () {
+      document.getElementById("memory-detail-body").innerHTML =
+        '<div class="dashboard-empty">Failed to load memory</div>';
+    });
+
+  _memDetailTrap = _installTrap("memory-detail-overlay", "memory-detail-box");
+}
+
+function hideMemoryDetailModal() {
+  document.getElementById("memory-detail-overlay").style.display = "none";
+  _memDetailTrap = _removeTrap(_memDetailTrap);
+  if (_memDetailTrigger && _memDetailTrigger.focus) _memDetailTrigger.focus();
+  _memDetailTrigger = null;
+}
+
+function deleteAdminMemory(memoryId, memoryName) {
+  if (!confirm("Delete memory '" + memoryName + "'?")) return;
+
+  authFetch("/v1/api/admin/memories/" + encodeURIComponent(memoryId), {
+    method: "DELETE",
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      showToast("Memory deleted");
+      // Close detail modal if open
+      if (
+        document.getElementById("memory-detail-overlay").style.display !==
+        "none"
+      ) {
+        hideMemoryDetailModal();
+      }
+      loadAdminMemories();
+    })
+    .catch(function (e) {
+      showToast("Error: " + e.message);
+    });
+}

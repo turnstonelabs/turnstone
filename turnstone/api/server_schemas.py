@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -163,3 +165,52 @@ class HealthResponse(BaseModel):
     workstreams: WorkstreamCounts = WorkstreamCounts()
     backend: BackendStatus | None = None
     mcp: McpStatus | None = None
+
+
+# ---------------------------------------------------------------------------
+# Memories
+# ---------------------------------------------------------------------------
+
+MemoryType = Literal["user", "project", "feedback", "reference"]
+MemoryScope = Literal["global", "workstream", "user"]
+
+
+class SaveMemoryRequest(BaseModel):
+    name: str = Field(description="Memory identifier (normalized to snake_case)")
+    content: str = Field(description="Memory content", max_length=65536)
+    description: str = Field(default="", description="Short description for relevance matching")
+    type: MemoryType = Field(default="project", description="Memory type")
+    scope: MemoryScope = Field(default="global", description="Memory scope")
+    scope_id: str = Field(
+        default="",
+        description="Scope identifier (ws_id for workstream, user_id for user scope)",
+    )
+
+
+class MemoryInfo(BaseModel):
+    memory_id: str
+    name: str
+    description: str = ""
+    type: MemoryType
+    scope: MemoryScope
+    scope_id: str = ""
+    content: str
+    created: str
+    updated: str
+
+
+class ListMemoriesResponse(BaseModel):
+    memories: list[MemoryInfo]
+    total: int = 0
+
+
+MemoryTypeFilter = Literal["", "user", "project", "feedback", "reference"]
+MemoryScopeFilter = Literal["", "global", "workstream", "user"]
+
+
+class SearchMemoriesRequest(BaseModel):
+    query: str = Field(description="Search query text")
+    type: MemoryTypeFilter = Field(default="", description="Filter by memory type")
+    scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
+    scope_id: str = Field(default="", description="Filter by scope_id")
+    limit: int = Field(default=20, description="Max results (1-50)", ge=1, le=50)

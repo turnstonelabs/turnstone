@@ -644,5 +644,131 @@ export interface WorkstreamsOptions {
   per_page?: number;
 }
 
+// -- Server API: Memories ---------------------------------------------------
+
+export interface SaveMemoryRequest {
+  name: string;
+  content: string;
+  description?: string;
+  type?: "user" | "project" | "feedback" | "reference";
+  scope?: "global" | "workstream" | "user";
+  scope_id?: string;
+}
+
+export interface MemoryInfo {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  content: string;
+  created: string;
+  updated: string;
+}
+
+export interface ListMemoriesResponse {
+  memories: MemoryInfo[];
+  total: number;
+}
+
+export interface SearchMemoriesRequest {
+  query: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface ListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface DeleteMemoryOptions {
+  scope?: string;
+  scope_id?: string;
+}
+
+// -- Console API: Admin Memories --------------------------------------------
+
+export interface AdminMemoryInfo {
+  memory_id: string;
+  name: string;
+  description: string;
+  type: string;
+  scope: string;
+  scope_id: string;
+  content: string;
+  created: string;
+  updated: string;
+  last_accessed: string;
+  access_count: number;
+}
+
+export interface ListAdminMemoriesResponse {
+  memories: AdminMemoryInfo[];
+  total: number;
+}
+
+export interface AdminListMemoriesOptions {
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+export interface AdminSearchMemoriesOptions {
+  q: string;
+  type?: string;
+  scope?: string;
+  scope_id?: string;
+  limit?: number;
+}
+
+// -- Console API: System Settings -------------------------------------------
+
+export interface SettingInfo {
+  key: string;
+  value: unknown;
+  source: string;
+  type: string;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  node_id: string;
+  changed_by: string;
+  updated: string;
+  restart_required: boolean;
+}
+
+export interface ListSettingsResponse {
+  settings: SettingInfo[];
+}
+
+export interface SettingSchemaInfo {
+  key: string;
+  type: string;
+  default: unknown;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  min_value: number | null;
+  max_value: number | null;
+  choices: string[] | null;
+  restart_required: boolean;
+}
+
+export interface ListSettingSchemaResponse {
+  schema: SettingSchemaInfo[];
+}
+
+export interface UpdateSettingOptions {
+  value: unknown;
+  node_id?: string;
+}
+
 // Re-export event types for convenience
 export type { ServerEvent, ClusterEvent } from "./events.js";

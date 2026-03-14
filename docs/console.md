@@ -421,8 +421,9 @@ The browser maintains a local `clusterState` object that mirrors the cluster sna
 
 Accessed via the "admin" button in the header (visible when authenticated
 with `approve` scope). Provides user, API token, channel link, and workstream
-template management with 11 tabs (see also [Governance](governance.md) for
-the Roles, Policies, Templates, WS Templates, Usage, and Audit tabs):
+template management with 13 tabs (see also [Governance](governance.md) for
+the Roles, Policies, Templates, WS Templates, Usage, and Audit tabs, and
+[Settings](settings.md) for the database-backed configuration editor):
 
 **Users tab:**
 

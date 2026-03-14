@@ -1,6 +1,9 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ClusterEvent } from "./events.js";
 import type {
+  AdminListMemoriesOptions,
+  AdminMemoryInfo,
+  AdminSearchMemoriesOptions,
   AuditQueryOptions,
   AuditResponse,
   AuthLoginResponse,
@@ -18,20 +21,25 @@ import type {
   CreateScheduleRequest,
   CreateTemplateOptions,
   CreateWsTemplateOptions,
+  ListAdminMemoriesResponse,
   ListScheduleRunsResponse,
   ListSchedulesResponse,
+  ListSettingSchemaResponse,
+  ListSettingsResponse,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
   PromptTemplateInfo,
   RoleInfo,
   ScheduleInfo,
+  SettingInfo,
   StatusResponse,
   ToolPolicyInfo,
   UpdateOrgOptions,
   UpdatePolicyOptions,
   UpdateRoleOptions,
   UpdateScheduleRequest,
+  UpdateSettingOptions,
   UpdateTemplateOptions,
   UpdateWsTemplateOptions,
   UsageQueryOptions,
@@ -342,5 +350,64 @@ export class TurnstoneConsole extends BaseClient {
     if (opts?.limit !== undefined) params.limit = String(opts.limit);
     if (opts?.offset !== undefined) params.offset = String(opts.offset);
     return this.request("GET", "/v1/api/admin/audit", { params });
+  }
+
+  // -- Admin: Memories ------------------------------------------------------
+
+  async listMemories(
+    opts?: AdminListMemoriesOptions,
+  ): Promise<ListAdminMemoriesResponse> {
+    const params: Record<string, string | number> = {};
+    if (opts?.type) params.type = opts.type;
+    if (opts?.scope) params.scope = opts.scope;
+    if (opts?.scope_id) params.scope_id = opts.scope_id;
+    if (opts?.limit !== undefined) params.limit = opts.limit;
+    return this.request("GET", "/v1/api/admin/memories", { params });
+  }
+
+  async searchMemories(
+    opts: AdminSearchMemoriesOptions,
+  ): Promise<ListAdminMemoriesResponse> {
+    const params: Record<string, string | number> = { q: opts.q };
+    if (opts.type) params.type = opts.type;
+    if (opts.scope) params.scope = opts.scope;
+    if (opts.scope_id) params.scope_id = opts.scope_id;
+    if (opts.limit !== undefined) params.limit = opts.limit;
+    return this.request("GET", "/v1/api/admin/memories/search", { params });
+  }
+
+  async getMemory(memoryId: string): Promise<AdminMemoryInfo> {
+    return this.request("GET", `/v1/api/admin/memories/${memoryId}`);
+  }
+
+  async deleteMemory(memoryId: string): Promise<StatusResponse> {
+    return this.request("DELETE", `/v1/api/admin/memories/${memoryId}`);
+  }
+
+  // -- System: Settings -------------------------------------------------------
+
+  async listSettings(): Promise<ListSettingsResponse> {
+    return this.request("GET", "/v1/api/admin/settings");
+  }
+
+  async getSettingsSchema(): Promise<ListSettingSchemaResponse> {
+    return this.request("GET", "/v1/api/admin/settings/schema");
+  }
+
+  async updateSetting(
+    key: string,
+    opts: UpdateSettingOptions,
+  ): Promise<SettingInfo> {
+    return this.request("PUT", `/v1/api/admin/settings/${key}`, {
+      json: opts,
+    });
+  }
+
+  async deleteSetting(key: string, nodeId?: string): Promise<StatusResponse> {
+    const params: Record<string, string> = {};
+    if (nodeId) params.node_id = nodeId;
+    return this.request("DELETE", `/v1/api/admin/settings/${key}`, {
+      params,
+    });
   }
 }

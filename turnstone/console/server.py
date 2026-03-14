@@ -1511,6 +1511,8 @@ _VALID_PERMISSIONS = frozenset(
         "admin.watches",
         "admin.ws_templates",
         "admin.judge",
+        "admin.memories",
+        "admin.settings",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2608,6 +2610,365 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Memories
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories — list structured memories with filters."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "100")), 200)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+
+    rows = storage.list_structured_memories(
+        mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+    )
+    total = storage.count_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id)
+    return JSONResponse({"memories": rows, "total": total})
+
+
+async def admin_search_memories(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories/search — search memories by query."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    query = request.query_params.get("q", "").strip()
+    if not query:
+        return JSONResponse({"error": "q is required"}, status_code=400)
+    mem_type = request.query_params.get("type", "")
+    scope = request.query_params.get("scope", "")
+    scope_id = request.query_params.get("scope_id", "")
+    try:
+        limit = min(int(request.query_params.get("limit", "20")), 50)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+
+    rows = storage.search_structured_memories(
+        query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+    )
+    return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def admin_get_memory(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/memories/{memory_id} — get a single memory."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    memory_id = request.path_params["memory_id"]
+    mem = storage.get_structured_memory(memory_id)
+    if not mem:
+        return JSONResponse({"error": "Memory not found"}, status_code=404)
+    return JSONResponse(mem)
+
+
+async def admin_delete_memory(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/memories/{memory_id} — delete a memory by ID."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.memories")
+    if err:
+        return err
+
+    memory_id = request.path_params["memory_id"]
+    existing = storage.get_structured_memory(memory_id)
+    if not existing:
+        return JSONResponse({"error": "Memory not found"}, status_code=404)
+
+    storage.delete_structured_memory_by_id(memory_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "memory.delete",
+        "memory",
+        memory_id,
+        {"name": existing.get("name", ""), "scope": existing.get("scope", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# Admin: System Settings
+# ---------------------------------------------------------------------------
+
+
+def _publish_config_change(request: Request, *, key: str, node_id: str, action: str) -> None:
+    """Fan out config-reload to all known server nodes (best-effort).
+
+    Uses the collector's node registry and the existing proxy auth
+    mechanism — no MQ dependency.
+    """
+    import contextlib
+
+    import httpx
+
+    collector = getattr(request.app.state, "collector", None)
+    if not collector:
+        return
+    headers = _proxy_auth_headers(request)
+    with contextlib.suppress(Exception):
+        nodes = collector.get_nodes()
+        for node in nodes.get("nodes", []):
+            url = node.get("url", "")
+            if url:
+                with contextlib.suppress(Exception):
+                    httpx.post(
+                        f"{url}/v1/api/_internal/config-reload",
+                        headers=headers,
+                        timeout=5.0,
+                    )
+
+
+async def admin_list_settings(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/settings — list all settings with effective values."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS, deserialize_value
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    reveal = request.query_params.get("reveal") == "true"
+    stored = {r["key"]: r for r in storage.list_system_settings() if r.get("node_id", "") == ""}
+
+    settings: list[dict[str, Any]] = []
+    for key, defn in sorted(SETTINGS.items()):
+        row = stored.get(key)
+        if row:
+            try:
+                val = deserialize_value(key, row["value"])
+            except (ValueError, KeyError):
+                val = row["value"]
+            info = {
+                "key": key,
+                "value": "***" if defn.is_secret and not reveal else val,
+                "source": "storage",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "node_id": row.get("node_id", ""),
+                "changed_by": row.get("changed_by", ""),
+                "updated": row.get("updated", ""),
+                "restart_required": defn.restart_required,
+            }
+        else:
+            info = {
+                "key": key,
+                "value": "(managed via config file / env)" if defn.is_secret else defn.default,
+                "source": "default",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "node_id": "",
+                "changed_by": "",
+                "updated": "",
+                "restart_required": defn.restart_required,
+            }
+        settings.append(info)
+
+    return JSONResponse({"settings": settings})
+
+
+async def admin_settings_schema(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/settings/schema — return the full settings registry."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    schema: list[dict[str, Any]] = []
+    for key, defn in sorted(SETTINGS.items()):
+        schema.append(
+            {
+                "key": key,
+                "type": defn.type,
+                "default": defn.default,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "min_value": defn.min_value,
+                "max_value": defn.max_value,
+                "choices": defn.choices,
+                "restart_required": defn.restart_required,
+                "help": defn.help,
+                "reference_url": defn.reference_url,
+            }
+        )
+
+    return JSONResponse({"schema": schema})
+
+
+async def admin_update_setting(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/settings/{key} — set a setting value."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import (
+        serialize_value,
+        validate_key,
+        validate_value,
+    )
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    try:
+        defn = validate_key(key)
+    except ValueError:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
+
+    if defn.is_secret:
+        return JSONResponse(
+            {
+                "error": "Secret settings cannot be modified via API — use config.toml or environment variables"
+            },
+            status_code=403,
+        )
+
+    if "value" not in body:
+        return JSONResponse({"error": "value is required"}, status_code=400)
+
+    raw_value = body.get("value")
+    try:
+        typed_value = validate_value(key, raw_value)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    node_id = str(body.get("node_id", ""))
+    audit_uid, ip = _audit_context(request)
+
+    storage.upsert_system_setting(
+        key=key,
+        value=serialize_value(typed_value),
+        node_id=node_id,
+        is_secret=defn.is_secret,
+        changed_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.update",
+        "setting",
+        key,
+        {"value": "***" if defn.is_secret else typed_value, "node_id": node_id},
+        ip,
+    )
+
+    _publish_config_change(request, key=key, node_id=node_id, action="set")
+
+    return JSONResponse(
+        {
+            "key": key,
+            "value": "***" if defn.is_secret else typed_value,
+            "source": "storage",
+            "type": defn.type,
+            "description": defn.description,
+            "section": defn.section,
+            "is_secret": defn.is_secret,
+            "node_id": node_id,
+            "changed_by": audit_uid,
+            "updated": "",
+            "restart_required": defn.restart_required,
+        }
+    )
+
+
+async def admin_delete_setting(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/settings/{key} — reset a setting to default."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import validate_key
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    try:
+        validate_key(key)
+    except ValueError:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
+
+    node_id = request.query_params.get("node_id", "")
+    deleted = storage.delete_system_setting(key, node_id=node_id)
+    if not deleted:
+        return JSONResponse({"error": f"Setting '{key}' not found in storage"}, status_code=404)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.delete",
+        "setting",
+        key,
+        {"node_id": node_id},
+        ip,
+    )
+
+    _publish_config_change(request, key=key, node_id=node_id, action="delete")
+
+    return JSONResponse({"status": "ok", "key": key})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -2747,6 +3108,28 @@ def create_app(
                     Route(
                         "/api/admin/ws-templates/{ws_template_id}/versions",
                         admin_list_ws_template_versions,
+                    ),
+                    # Governance: Memories
+                    Route("/api/admin/memories", admin_list_memories),
+                    Route("/api/admin/memories/search", admin_search_memories),
+                    Route("/api/admin/memories/{memory_id}", admin_get_memory),
+                    Route(
+                        "/api/admin/memories/{memory_id}",
+                        admin_delete_memory,
+                        methods=["DELETE"],
+                    ),
+                    # System: Settings
+                    Route("/api/admin/settings", admin_list_settings),
+                    Route("/api/admin/settings/schema", admin_settings_schema),
+                    Route(
+                        "/api/admin/settings/{key:path}",
+                        admin_update_setting,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/settings/{key:path}",
+                        admin_delete_setting,
+                        methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

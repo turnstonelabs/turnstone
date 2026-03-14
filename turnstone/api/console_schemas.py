@@ -501,4 +501,72 @@ class ListChannelUsersResponse(BaseModel):
 class CreateChannelUserRequest(BaseModel):
     channel_type: str = Field(..., description="Channel type (e.g. discord, slack)")
     channel_user_id: str = Field(..., description="External channel user identifier")
-    total: int
+
+
+# ---------------------------------------------------------------------------
+# Admin: Memories
+# ---------------------------------------------------------------------------
+
+
+class AdminMemoryInfo(BaseModel):
+    memory_id: str
+    name: str
+    description: str = ""
+    type: str
+    scope: str
+    scope_id: str = ""
+    content: str
+    created: str
+    updated: str
+    last_accessed: str = ""
+    access_count: int = 0
+
+
+class ListAdminMemoriesResponse(BaseModel):
+    memories: list[AdminMemoryInfo]
+    total: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Admin: System Settings
+# ---------------------------------------------------------------------------
+
+
+class SettingInfo(BaseModel):
+    key: str
+    value: Any = None
+    source: str = "default"  # "storage" | "default"
+    type: str = "str"
+    description: str = ""
+    section: str = ""
+    is_secret: bool = False
+    node_id: str = ""
+    changed_by: str = ""
+    updated: str = ""
+    restart_required: bool = False
+
+
+class ListSettingsResponse(BaseModel):
+    settings: list[SettingInfo]
+
+
+class SettingSchemaInfo(BaseModel):
+    key: str
+    type: str
+    default: Any = None
+    description: str = ""
+    section: str = ""
+    is_secret: bool = False
+    min_value: float | None = None
+    max_value: float | None = None
+    choices: list[str] | None = None
+    restart_required: bool = False
+
+
+class ListSettingSchemaResponse(BaseModel):
+    settings_schema: list[SettingSchemaInfo] = Field(alias="schema")
+
+
+class UpdateSettingRequest(BaseModel):
+    value: Any
+    node_id: str = ""

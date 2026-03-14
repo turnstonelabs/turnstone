@@ -747,6 +747,10 @@
   padding: 4px 0;
   overflow-y: auto;
   order: 1;
+  align-self: flex-start;
+  position: sticky;
+  top: 0;
+  max-height: 100vh;
 }
 
 /* Group labels */
@@ -1168,7 +1172,8 @@
 #create-role-overlay, #edit-role-overlay, #user-roles-overlay,
 #create-policy-overlay, #edit-policy-overlay,
 #create-template-overlay, #edit-template-overlay,
-#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay {
+#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay,
+#memory-detail-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1325,6 +1330,91 @@
 }
 .audit-danger { color: var(--red); border-color: var(--red-glow); }
 .audit-success { color: var(--green); border-color: var(--green-glow); }
+
+/* ==========================================================================
+   Memories tab
+   ========================================================================== */
+#admin-memories .admin-colheaders,
+#admin-memories .admin-row {
+  grid-template-columns: 1.5fr 80px 110px 1fr 100px 80px;
+}
+
+/* Filter toolbar */
+.admin-toolbar-filters {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+}
+.admin-toolbar-filters select,
+.admin-toolbar-filters input[type="search"] {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+}
+.admin-toolbar-filters select {
+  min-width: 0;
+}
+.admin-toolbar-filters input[type="search"] {
+  width: 180px;
+  background: var(--bg);
+  color: var(--fg);
+}
+.admin-toolbar-filters input[type="search"]::placeholder {
+  color: var(--fg-dim);
+}
+
+/* Memory type badges */
+.mem-type-project { background: var(--bg-highlight); color: var(--cyan); border-color: var(--cyan-glow, var(--border)); }
+.mem-type-user { background: var(--bg-highlight); color: var(--green); border-color: var(--green-glow, var(--border)); }
+.mem-type-feedback { background: var(--bg-highlight); color: var(--yellow); border-color: var(--yellow-glow, var(--border)); }
+.mem-type-reference { background: var(--bg-highlight); color: var(--magenta); border-color: var(--magenta-glow, var(--border)); }
+
+/* Memory scope badges */
+.mem-scope-global { background: var(--bg-highlight); color: var(--fg-dim); }
+.mem-scope-workstream { background: var(--bg-highlight); color: var(--cyan); border-color: var(--cyan-glow, var(--border)); }
+.mem-scope-user { background: var(--bg-highlight); color: var(--green); border-color: var(--green-glow, var(--border)); }
+
+/* Memory detail modal */
+.mem-detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px 16px;
+}
+.mem-detail-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.mem-detail-label {
+  font-size: 10px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+}
+.mem-detail-desc {
+  color: var(--fg);
+  font-size: 13px;
+  padding: 4px 0;
+}
+.memory-content-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px;
+  max-height: 400px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg);
+  margin: 4px 0 0;
+}
 
 /* ==========================================================================
    Governance: Usage dashboard
@@ -1495,9 +1585,270 @@
     grid-template-columns: 60px 1fr 100px;
   }
   .admin-col-auser, .admin-col-adetail { display: none; }
+  #admin-memories .admin-colheaders, #admin-memories .admin-row {
+    grid-template-columns: 1fr 70px 90px 80px;
+  }
+  .admin-col-mdesc, .admin-col-mupdated { display: none; }
+  .admin-toolbar-filters { flex-wrap: wrap; }
+  .admin-toolbar-filters input[type="search"] { width: 120px; }
+  .mem-detail-grid { grid-template-columns: 1fr 1fr; }
   .usage-readout-value { font-size: 18px; }
   .usage-bar-row { grid-template-columns: 70px 1fr 50px; }
   .perm-grid { grid-template-columns: 1fr; }
+}
+
+/* ==========================================================================
+   Settings tab — form editor
+   ========================================================================== */
+.settings-section { margin-bottom: 12px; }
+.settings-section-header {
+  cursor: pointer;
+  padding: 8px 12px;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+}
+.settings-section-header:hover { color: var(--fg); }
+.settings-section-header::after { content: "\25BE"; margin-left: 8px; font-size: 11px; }
+.settings-section[data-collapsed] .settings-section-body { display: none; }
+.settings-section[data-collapsed] .settings-section-header::after { content: "\25B8"; }
+/* Setting row — 3-column grid */
+.settings-row {
+  display: grid;
+  grid-template-columns: 200px 1fr auto;
+  gap: 8px 16px;
+  padding: 8px 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+.settings-row:hover { background: var(--row-alt, rgba(255,255,255,0.015)); }
+
+/* Label column */
+.settings-label-col { min-width: 0; }
+.settings-label { font-size: 12px; color: var(--fg); font-family: var(--font-mono); }
+.settings-desc { font-size: 10px; color: var(--fg-dim); margin-top: 2px; line-height: 1.3; }
+
+/* Input column */
+.settings-input input[type="text"],
+.settings-input input[type="number"],
+.settings-input select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  width: 100%;
+  max-width: 300px;
+  box-sizing: border-box;
+}
+/* Hide number spin buttons (Firefox + WebKit) */
+.settings-input input[type="number"] { -moz-appearance: textfield; }
+.settings-input input[type="number"]::-webkit-inner-spin-button,
+.settings-input input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+
+.settings-input input:focus,
+.settings-input select:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.settings-input select {
+  appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+}
+
+/* Bool toggle */
+.settings-toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+  cursor: pointer;
+}
+.settings-toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.settings-toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-highlight);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+.settings-toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 2px;
+  bottom: 2px;
+  background: var(--fg-dim);
+  border-radius: 50%;
+  transition: transform 0.2s, background 0.2s;
+}
+.settings-toggle input:checked + .settings-toggle-slider {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+.settings-toggle input:checked + .settings-toggle-slider::before {
+  transform: translateX(16px);
+  background: var(--accent);
+}
+.settings-toggle input:focus-visible + .settings-toggle-slider {
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* Actions column */
+.settings-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+
+/* Save button */
+.settings-save-btn {
+  visibility: hidden;
+  opacity: 0;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: none;
+  transition: opacity 0.15s, visibility 0s 0.15s;
+}
+.settings-save-btn.visible { visibility: visible; opacity: 0.8; transition: opacity 0.15s, visibility 0s; }
+.settings-save-btn.visible:hover { opacity: 1; background: var(--accent-dim); }
+.settings-save-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.settings-save-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Reset button */
+.settings-reset-btn {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  background: none;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+.settings-reset-btn:hover { opacity: 1; color: var(--red); border-color: var(--red); }
+.settings-reset-btn:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+
+/* Badges */
+.settings-badge-default { color: var(--fg-dim); border-color: var(--border); }
+.settings-restart-badge {
+  display: none;
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--yellow);
+  padding: 1px 4px;
+  border: 1px solid var(--yellow-glow);
+  border-radius: 2px;
+}
+.settings-restart-badge.visible { display: inline-block; }
+.settings-restart-badge.saved { background: var(--yellow-glow); }
+
+/* Help tooltip */
+.settings-help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  font-family: var(--font-display);
+  cursor: pointer;
+  vertical-align: middle;
+  margin-left: 4px;
+  padding: 0;
+  line-height: 1;
+  position: relative;
+  transition: background 0.15s, color 0.15s;
+}
+/* Expand tap target to ~26px without changing visual size */
+.settings-help-btn::before { content: ""; position: absolute; inset: -5px; }
+.settings-help-btn:hover { background: var(--accent); color: var(--bg); }
+.settings-help-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.settings-help-popover {
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--fg);
+}
+.settings-help-text { color: var(--fg); }
+.settings-help-ref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-family: var(--font-display);
+  white-space: nowrap;
+}
+.settings-help-ref:hover { text-decoration: underline; }
+
+/* Secret field — match input box height for grid alignment */
+.settings-secret {
+  color: var(--fg-dim);
+  font-style: italic;
+  font-size: 11px;
+  cursor: not-allowed;
+  display: inline-block;
+  padding: 4px 0;
+  border: 1px solid transparent; /* invisible border matches input's 1px border */
+}
+
+/* Docs link in toolbar */
+.settings-docs-link {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--fg-dim);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  margin-left: auto;
+  transition: color 0.15s, border-color 0.15s;
+}
+.settings-docs-link:hover { color: var(--accent); border-color: var(--accent-dim); }
+.settings-docs-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Settings mobile */
+@media (max-width: 700px) {
+  .settings-row { grid-template-columns: 1fr; gap: 4px; }
+  .settings-desc { display: none; }
+  .settings-input input[type="text"],
+  .settings-input input[type="number"],
+  .settings-input select { max-width: 100%; }
 }
 
 /* ==========================================================================
@@ -1511,6 +1862,8 @@
   .dash-row.has-link::after, .node-group-header::before { transition: none; }
   #new-ws-box select, #new-ws-box input, #new-ws-buttons button { transition: none; }
   .admin-nav, .admin-row, .admin-btn-danger, .admin-btn-action { transition: none; }
+  .settings-toggle-slider, .settings-toggle-slider::before { transition: none; }
+  .settings-save-btn, .settings-reset-btn, .settings-docs-link, .settings-help-btn { transition: none; }
   .admin-sidebar, .admin-sidebar-backdrop { transition: none; }
   #view-admin { animation: none; }
   .admin-action-btn, .modal-cancel, .modal-submit { transition: none; }

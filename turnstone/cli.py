@@ -799,8 +799,8 @@ def main() -> None:
     parser.add_argument(
         "--context-window",
         type=int,
-        default=131072,
-        help="Context window size in tokens (default: 131072)",
+        default=0,
+        help="Context window size in tokens (0 = auto-detect from model)",
     )
     parser.add_argument(
         "--compact-max-tokens",
@@ -986,10 +986,12 @@ def main() -> None:
     else:
         model, detected_ctx = detect_model(client, provider=provider_name)
 
-    # Use detected context window when the user hasn't explicitly set one
+    # Use detected context window, fall back to CLI override or 32768
     context_window = args.context_window
-    if detected_ctx and context_window == 131072:  # default unchanged
+    if detected_ctx and not context_window:  # 0 = auto-detect
         context_window = detected_ctx
+    elif not context_window:
+        context_window = 32768
 
     # Build model registry (reads [models.*] sections from config.toml)
     from turnstone.core.model_registry import load_model_registry

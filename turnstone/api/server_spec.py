@@ -26,9 +26,13 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
+    ListMemoriesResponse,
     ListSavedWorkstreamsResponse,
     ListWorkstreamsResponse,
+    MemoryInfo,
     PlanFeedbackRequest,
+    SaveMemoryRequest,
+    SearchMemoriesRequest,
     SendRequest,
     SendResponse,
 )
@@ -173,6 +177,51 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=StatusResponse,
         tags=["Auth"],
     ),
+    # --- Memories ---
+    EndpointSpec(
+        "/v1/api/memories",
+        "GET",
+        "List structured memories",
+        response_model=ListMemoriesResponse,
+        query_params=[
+            QueryParam("type", "Filter by memory type"),
+            QueryParam("scope", "Filter by scope"),
+            QueryParam("scope_id", "Filter by scope identifier"),
+            QueryParam(
+                "limit", "Max results (default 100, max 200)", schema_type="integer", default=100
+            ),
+        ],
+        tags=["Memories"],
+    ),
+    EndpointSpec(
+        "/v1/api/memories",
+        "POST",
+        "Save (upsert) a structured memory",
+        request_model=SaveMemoryRequest,
+        response_model=MemoryInfo,
+        error_codes=[400],
+        tags=["Memories"],
+    ),
+    EndpointSpec(
+        "/v1/api/memories/search",
+        "POST",
+        "Search structured memories by query",
+        request_model=SearchMemoriesRequest,
+        response_model=ListMemoriesResponse,
+        tags=["Memories"],
+    ),
+    EndpointSpec(
+        "/v1/api/memories/{name}",
+        "DELETE",
+        "Delete a structured memory by name and scope",
+        response_model=StatusResponse,
+        query_params=[
+            QueryParam("scope", "Scope (default: global)"),
+            QueryParam("scope_id", "Scope identifier"),
+        ],
+        error_codes=[404],
+        tags=["Memories"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -204,6 +253,10 @@ _ALL_MODELS: list[type[BaseModel]] = [
     DashboardResponse,
     ListSavedWorkstreamsResponse,
     HealthResponse,
+    SaveMemoryRequest,
+    MemoryInfo,
+    ListMemoriesResponse,
+    SearchMemoriesRequest,
 ]
 
 

@@ -426,3 +426,22 @@ intent_verdicts = sa.Table(
 sa.Index("idx_intent_verdicts_ws", intent_verdicts.c.ws_id)
 sa.Index("idx_intent_verdicts_created", intent_verdicts.c.created)
 sa.Index("idx_intent_verdicts_risk", intent_verdicts.c.risk_level)
+
+# ---------------------------------------------------------------------------
+# System settings — database-backed configuration
+# ---------------------------------------------------------------------------
+
+system_settings = sa.Table(
+    "system_settings",
+    metadata,
+    sa.Column("key", sa.Text, nullable=False),
+    sa.Column("value", sa.Text, nullable=False),
+    sa.Column("node_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("is_secret", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("changed_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("key", "node_id"),
+)
+
+sa.Index("idx_system_settings_node", system_settings.c.node_id)
