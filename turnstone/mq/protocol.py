@@ -388,6 +388,16 @@ class IntentVerdictEvent(OutboundEvent):
     latency_ms: int = 0
 
 
+@dataclass
+class ConfigChangeEvent(OutboundEvent):
+    """System setting changed — nodes should invalidate config cache."""
+
+    type: str = "config_change"
+    key: str = ""
+    node_id: str = ""
+    action: str = ""  # "set" | "delete"
+
+
 # ---------------------------------------------------------------------------
 # Type registries (built after all classes are defined)
 # ---------------------------------------------------------------------------
@@ -443,5 +453,6 @@ _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
         WorkstreamResumedEvent,
         ClusterStateEvent,
         IntentVerdictEvent,
+        ConfigChangeEvent,
     ]
 }

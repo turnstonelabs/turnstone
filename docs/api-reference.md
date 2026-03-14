@@ -1250,6 +1250,144 @@ is on the **console** server and requires the `admin.judge` permission.
 
 ---
 
+### `GET /v1/api/admin/settings` (Console)
+
+List all settings with their effective values, defaults, and metadata. Requires
+the `admin.settings` permission.
+
+**Response:** `200`
+
+```json
+{
+  "settings": [
+    {
+      "key": "model.temperature",
+      "value": 0.7,
+      "default": 0.5,
+      "type": "float",
+      "description": "Sampling temperature",
+      "section": "model",
+      "is_secret": false,
+      "is_stored": true,
+      "restart_required": false,
+      "min_value": 0.0,
+      "max_value": 2.0,
+      "choices": null,
+      "changed_by": "admin",
+      "updated": "2026-03-14T10:00:00"
+    }
+  ],
+  "total": 40
+}
+```
+
+---
+
+### `GET /v1/api/admin/settings/schema` (Console)
+
+Return the full registry catalog (all defined settings with metadata). Requires
+the `admin.settings` permission. Useful for building dynamic admin UIs.
+
+**Response:** `200`
+
+```json
+{
+  "settings": [
+    {
+      "key": "model.temperature",
+      "type": "float",
+      "default": 0.5,
+      "description": "Sampling temperature",
+      "section": "model",
+      "is_secret": false,
+      "restart_required": false,
+      "min_value": 0.0,
+      "max_value": 2.0,
+      "choices": null
+    }
+  ],
+  "total": 40
+}
+```
+
+---
+
+### `PUT /v1/api/admin/settings/{key}` (Console)
+
+Update a setting. Requires the `admin.settings` permission. The value is
+validated against the registry definition (type coercion, range checks, choices).
+Secret settings (`is_secret=true`) return `403`.
+
+**Path parameters:**
+
+| Parameter | Type   | Description |
+|-----------|--------|-------------|
+| `key`     | string | Dotted setting key (e.g. `model.temperature`) |
+
+**Request body:**
+
+```json
+{
+  "value": 0.7,
+  "node_id": ""
+}
+```
+
+| Field     | Type   | Required | Default | Description |
+|-----------|--------|----------|---------|-------------|
+| `value`   | any    | yes      | --      | New value (type-coerced against registry) |
+| `node_id` | string | no       | `""`    | Node ID for per-node override |
+
+**Response (success):** `200`
+
+```json
+{
+  "key": "model.temperature",
+  "value": 0.7,
+  "previous": 0.5
+}
+```
+
+**Errors:**
+
+| Status | Condition |
+|--------|-----------|
+| 400    | Unknown key, invalid value, type mismatch, out of range |
+| 403    | Secret setting (must use config.toml or env) |
+
+---
+
+### `DELETE /v1/api/admin/settings/{key}` (Console)
+
+Reset a setting to its registry default by removing it from storage. Requires
+the `admin.settings` permission.
+
+**Path parameters:**
+
+| Parameter | Type   | Description |
+|-----------|--------|-------------|
+| `key`     | string | Dotted setting key |
+
+**Query parameters:**
+
+| Parameter | Type   | Required | Default | Description |
+|-----------|--------|----------|---------|-------------|
+| `node_id` | string | no       | `""`    | Node ID (empty = global) |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok", "key": "model.temperature", "default": 0.5}
+```
+
+**Response (not found):** `404`
+
+```json
+{"error": "Setting 'model.temperature' has no stored value"}
+```
+
+---
+
 ### `OPTIONS` (any path)
 
 Handles CORS preflight requests.

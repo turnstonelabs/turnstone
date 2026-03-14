@@ -1,0 +1,151 @@
+@startuml
+!theme plain
+title Turnstone — Settings Architecture
+
+skinparam participant {
+    BackgroundColor<<session>> #C8E6C9
+    BackgroundColor<<config>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<api>> #E8EAF6
+    BackgroundColor<<sdk>> #F5F5F5
+}
+
+participant "Server\n(main)" as Server <<session>>
+participant "ConfigStore\n(config_store.py)" as Store <<config>>
+participant "SettingsRegistry\n(settings_registry.py)" as Registry <<config>>
+participant "StorageBackend\n(SQLite)" as Storage <<storage>>
+participant "Console Admin\n(console/server.py)" as Admin <<api>>
+participant "SDK Client\n(sdk/)" as SDK <<sdk>>
+participant "ChatSession\n(session.py)" as Session <<session>>
+
+== Phase 1: Server Startup ==
+
+Server -> Server : parse_args()\nCLI flags override defaults
+Server -> Server : init_storage()\nSQLite / PostgreSQL
+
+Server -> Store ** : ConfigStore(storage, node_id)
+Store -> Storage : get_system_settings_bulk(node_id)
+note right
+  1. Load global settings (node_id="")
+  2. Overlay per-node settings
+  Returns {key: json_value} dict
+end note
+Storage --> Store : raw settings
+Store -> Registry : deserialize_value(key, json)\nper entry
+Registry --> Store : typed values
+Store -> Store : swap _cache atomically\nincrement _version
+
+Server -> Server : warn_migrated_settings()
+note right
+  Scans config.toml for keys
+  now managed by ConfigStore.
+  Logs warning for each overlap.
+end note
+
+Server -> Server : session_factory captures\nConfigStore reference
+
+== Phase 2: Settings Read (session creation) ==
+
+Server -> Session : session_factory(ws_id)
+Session -> Store : get("model.temperature")
+Store -> Store : cache[key] lookup\n(lock-free)
+alt key in cache
+    Store --> Session : stored value
+else key not in cache
+    Store -> Registry : SETTINGS[key].default
+    Registry --> Store : default value
+    Store --> Session : default value
+end
+note right of Session
+  Settings are captured once
+  at workstream creation.
+  Not re-read on every turn.
+end note
+
+== Phase 3: Admin API — List / Schema ==
+
+SDK -> Admin : GET /v1/api/admin/settings
+Admin -> Admin : require_permission(\n"admin.settings")
+Admin -> Store : all_effective()
+Store -> Store : merge cache with\nregistry defaults
+Store --> Admin : {key: effective_value}
+Admin -> Registry : SETTINGS (metadata)
+note right
+  Annotates each setting with:
+  type, default, description,
+  is_stored, is_secret, constraints,
+  changed_by, updated
+end note
+Admin --> SDK : {"settings": [...], "total": N}
+
+SDK -> Admin : GET /v1/api/admin/settings/schema
+Admin -> Admin : require_permission(\n"admin.settings")
+Admin -> Registry : SETTINGS catalog
+Admin --> SDK : {"settings": [...], "total": N}
+
+== Phase 4: Admin API — Update ==
+
+SDK -> Admin : PUT /v1/api/admin/settings/\nmodel.temperature\n{"value": 0.7}
+Admin -> Admin : require_permission(\n"admin.settings")
+Admin -> Registry : validate_key("model.temperature")
+Registry --> Admin : SettingDef
+alt is_secret == true
+    Admin --> SDK : 403 Forbidden
+else
+    Admin -> Registry : validate_value(key, 0.7)
+    note right
+      Type coercion: float(0.7)
+      Range check: 0.0 <= 0.7 <= 2.0
+      Choices check: (none for this key)
+    end note
+    Registry --> Admin : typed value
+    Admin -> Store : set(key, 0.7, changed_by="admin")
+    Store -> Registry : serialize_value(0.7)\n=> "0.7"
+    Store -> Storage : upsert_system_setting(\nkey, "0.7", node_id, ...)
+    Storage --> Store : ok
+    Store -> Store : swap _cache atomically
+    Admin -> Admin : record_audit(\n"setting.update")
+    Admin --> SDK : {"key": "...", "value": 0.7,\n"previous": 0.5}
+end
+
+== Phase 5: Admin API — Delete (reset to default) ==
+
+SDK -> Admin : DELETE /v1/api/admin/settings/\nmodel.temperature
+Admin -> Admin : require_permission(\n"admin.settings")
+Admin -> Store : delete("model.temperature")
+Store -> Registry : validate_key(key)
+Store -> Storage : delete_system_setting(key, node_id)
+Storage --> Store : bool (existed)
+Store -> Store : remove from cache,\nswap atomically
+Admin -> Admin : record_audit(\n"setting.delete")
+Admin --> SDK : {"status": "ok",\n"key": "...", "default": 0.5}
+
+== Phase 6: Hot Reload ==
+
+SDK -> Admin : POST /v1/api/_internal/\nconfig-reload
+Admin -> Store : reload()
+Store -> Storage : get_system_settings_bulk(node_id)
+Storage --> Store : all settings
+Store -> Store : rebuild cache,\nswap atomically,\nincrement _version
+note right
+  Existing sessions: unchanged
+  (frozen at creation time).
+  New sessions: pick up
+  updated values immediately.
+end note
+Admin --> SDK : {"status": "ok"}
+
+== Precedence Summary ==
+
+note over Server, Registry
+  **Server entry point:**
+  CLI flag  >  ConfigStore (database)  >  registry default
+
+  **CLI entry point:**
+  CLI flag  >  config.toml  >  argparse default
+
+  **Bootstrap settings** (database, Redis, auth, server bind):
+  Always from config.toml / env vars — never in ConfigStore.
+end note
+
+@enduml

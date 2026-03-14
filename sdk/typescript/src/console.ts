@@ -24,18 +24,22 @@ import type {
   ListAdminMemoriesResponse,
   ListScheduleRunsResponse,
   ListSchedulesResponse,
+  ListSettingSchemaResponse,
+  ListSettingsResponse,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
   PromptTemplateInfo,
   RoleInfo,
   ScheduleInfo,
+  SettingInfo,
   StatusResponse,
   ToolPolicyInfo,
   UpdateOrgOptions,
   UpdatePolicyOptions,
   UpdateRoleOptions,
   UpdateScheduleRequest,
+  UpdateSettingOptions,
   UpdateTemplateOptions,
   UpdateWsTemplateOptions,
   UsageQueryOptions,
@@ -378,5 +382,32 @@ export class TurnstoneConsole extends BaseClient {
 
   async deleteMemory(memoryId: string): Promise<StatusResponse> {
     return this.request("DELETE", `/v1/api/admin/memories/${memoryId}`);
+  }
+
+  // -- System: Settings -------------------------------------------------------
+
+  async listSettings(): Promise<ListSettingsResponse> {
+    return this.request("GET", "/v1/api/admin/settings");
+  }
+
+  async getSettingsSchema(): Promise<ListSettingSchemaResponse> {
+    return this.request("GET", "/v1/api/admin/settings/schema");
+  }
+
+  async updateSetting(
+    key: string,
+    opts: UpdateSettingOptions,
+  ): Promise<SettingInfo> {
+    return this.request("PUT", `/v1/api/admin/settings/${key}`, {
+      json: opts,
+    });
+  }
+
+  async deleteSetting(key: string, nodeId?: string): Promise<StatusResponse> {
+    const params: Record<string, string> = {};
+    if (nodeId) params.node_id = nodeId;
+    return this.request("DELETE", `/v1/api/admin/settings/${key}`, {
+      params,
+    });
   }
 }

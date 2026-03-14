@@ -2499,6 +2499,168 @@
         }
       }
     },
+    "/v1/api/admin/settings": {
+      "get": {
+        "summary": "List all settings with effective values",
+        "operationId": "v1_api_admin_settings_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "reveal",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "description": "Show secret values in plaintext"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSettingsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/settings/schema": {
+      "get": {
+        "summary": "Return the full settings registry schema",
+        "operationId": "v1_api_admin_settings_schema_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSettingSchemaResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/settings/{key}": {
+      "put": {
+        "summary": "Set a configuration setting value",
+        "operationId": "v1_api_admin_settings_{key}_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSettingRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Reset a setting to its default value",
+        "operationId": "v1_api_admin_settings_{key}_delete",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "node_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Node ID for node-scoped settings"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Console health check",
@@ -4909,6 +5071,198 @@
           "memories"
         ],
         "title": "ListAdminMemoriesResponse",
+        "type": "object"
+      },
+      "SettingInfo": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "default": null,
+            "title": "Value"
+          },
+          "source": {
+            "default": "default",
+            "title": "Source",
+            "type": "string"
+          },
+          "type": {
+            "default": "str",
+            "title": "Type",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "section": {
+            "default": "",
+            "title": "Section",
+            "type": "string"
+          },
+          "is_secret": {
+            "default": false,
+            "title": "Is Secret",
+            "type": "boolean"
+          },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          },
+          "changed_by": {
+            "default": "",
+            "title": "Changed By",
+            "type": "string"
+          },
+          "updated": {
+            "default": "",
+            "title": "Updated",
+            "type": "string"
+          },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "SettingInfo",
+        "type": "object"
+      },
+      "ListSettingsResponse": {
+        "properties": {
+          "settings": {
+            "items": {
+              "$ref": "#/components/schemas/SettingInfo"
+            },
+            "title": "Settings",
+            "type": "array"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "title": "ListSettingsResponse",
+        "type": "object"
+      },
+      "SettingSchemaInfo": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "type": {
+            "title": "Type",
+            "type": "string"
+          },
+          "default": {
+            "default": null,
+            "title": "Default"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "section": {
+            "default": "",
+            "title": "Section",
+            "type": "string"
+          },
+          "is_secret": {
+            "default": false,
+            "title": "Is Secret",
+            "type": "boolean"
+          },
+          "min_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Min Value"
+          },
+          "max_value": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Value"
+          },
+          "choices": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Choices"
+          },
+          "restart_required": {
+            "default": false,
+            "title": "Restart Required",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "title": "SettingSchemaInfo",
+        "type": "object"
+      },
+      "ListSettingSchemaResponse": {
+        "properties": {
+          "schema": {
+            "items": {
+              "$ref": "#/components/schemas/SettingSchemaInfo"
+            },
+            "title": "Schema",
+            "type": "array"
+          }
+        },
+        "required": [
+          "schema"
+        ],
+        "title": "ListSettingSchemaResponse",
+        "type": "object"
+      },
+      "UpdateSettingRequest": {
+        "properties": {
+          "value": {
+            "title": "Value"
+          },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "UpdateSettingRequest",
         "type": "object"
       }
     }

@@ -26,6 +26,8 @@ from turnstone.api.console_schemas import (
     ListOrgsResponse,
     ListPromptTemplatesResponse,
     ListRolesResponse,
+    ListSettingSchemaResponse,
+    ListSettingsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     ListWsTemplatesResponse,
@@ -34,6 +36,7 @@ from turnstone.api.console_schemas import (
     OrgInfo,
     PromptTemplateInfo,
     RoleInfo,
+    SettingInfo,
     ToolPolicyInfo,
     UsageResponse,
     WsTemplateInfo,
@@ -631,6 +634,38 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=StatusResponse,
         )
 
+    # -- system: settings ----------------------------------------------------
+
+    async def list_settings(self) -> ListSettingsResponse:
+        """List all settings with effective values."""
+        return await self._request(
+            "GET", "/v1/api/admin/settings", response_model=ListSettingsResponse
+        )
+
+    async def get_settings_schema(self) -> ListSettingSchemaResponse:
+        """Return the full settings registry schema."""
+        return await self._request(
+            "GET", "/v1/api/admin/settings/schema", response_model=ListSettingSchemaResponse
+        )
+
+    async def update_setting(self, key: str, value: Any, *, node_id: str = "") -> SettingInfo:
+        """Set a configuration setting value."""
+        body: dict[str, Any] = {"value": value}
+        if node_id:
+            body["node_id"] = node_id
+        return await self._request(
+            "PUT", f"/v1/api/admin/settings/{key}", json_body=body, response_model=SettingInfo
+        )
+
+    async def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+        """Reset a setting to its default value."""
+        params: dict[str, Any] = {}
+        if node_id:
+            params["node_id"] = node_id
+        return await self._request(
+            "DELETE", f"/v1/api/admin/settings/{key}", params=params, response_model=StatusResponse
+        )
+
 
 class TurnstoneConsole:
     """Synchronous client for the turnstone console API.
@@ -991,6 +1026,20 @@ class TurnstoneConsole:
 
     def delete_memory(self, memory_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_memory(memory_id))
+
+    # -- system: settings ----------------------------------------------------
+
+    def list_settings(self) -> ListSettingsResponse:
+        return self._runner.run(self._async.list_settings())
+
+    def get_settings_schema(self) -> ListSettingSchemaResponse:
+        return self._runner.run(self._async.get_settings_schema())
+
+    def update_setting(self, key: str, value: Any, *, node_id: str = "") -> SettingInfo:
+        return self._runner.run(self._async.update_setting(key, value, node_id=node_id))
+
+    def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+        return self._runner.run(self._async.delete_setting(key, node_id=node_id))
 
     # -- lifecycle -----------------------------------------------------------
 

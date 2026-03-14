@@ -48,6 +48,9 @@ turnstone/
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
     model_registry.py ModelRegistry — named model configs, lazy client creation, fallback routing
     memory.py         Persistence facade + structured memory API (delegates to storage backend)
+    config.py         Config file loader (config.toml), apply_config(), warn_migrated_settings()
+    config_store.py   ConfigStore — database-backed settings with in-memory cache, thread-safe get/set
+    settings_registry.py  SettingDef catalog (~40 settings), validation, type coercion, serialization
     storage/          Pluggable storage: StorageBackend protocol, SQLite + PostgreSQL
     metrics.py        Prometheus-compatible metrics collector (MetricsCollector)
     healthcheck.py    BackendHealthMonitor — periodic probe + circuit breaker

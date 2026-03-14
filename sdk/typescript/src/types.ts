@@ -728,5 +728,47 @@ export interface AdminSearchMemoriesOptions {
   limit?: number;
 }
 
+// -- Console API: System Settings -------------------------------------------
+
+export interface SettingInfo {
+  key: string;
+  value: unknown;
+  source: string;
+  type: string;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  node_id: string;
+  changed_by: string;
+  updated: string;
+  restart_required: boolean;
+}
+
+export interface ListSettingsResponse {
+  settings: SettingInfo[];
+}
+
+export interface SettingSchemaInfo {
+  key: string;
+  type: string;
+  default: unknown;
+  description: string;
+  section: string;
+  is_secret: boolean;
+  min_value: number | null;
+  max_value: number | null;
+  choices: string[] | null;
+  restart_required: boolean;
+}
+
+export interface ListSettingSchemaResponse {
+  schema: SettingSchemaInfo[];
+}
+
+export interface UpdateSettingOptions {
+  value: unknown;
+  node_id?: string;
+}
+
 // Re-export event types for convenience
 export type { ServerEvent, ClusterEvent } from "./events.js";

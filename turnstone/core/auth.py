@@ -164,6 +164,7 @@ WRITE_PATHS: frozenset[str] = frozenset(
         "/api/workstreams/close",
         "/api/cluster/workstreams/new",
         "/api/memories",
+        "/api/_internal/config-reload",
     }
 )
 

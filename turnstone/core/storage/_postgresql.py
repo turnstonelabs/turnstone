@@ -19,6 +19,7 @@ from turnstone.core.storage._schema import (
     prompt_templates,
     roles,
     structured_memories,
+    system_settings,
     tool_policies,
     usage_events,
     user_roles,
@@ -2265,6 +2266,103 @@ class PostgreSQLBackend:
                 q = q.where(structured_memories.c.scope_id == scope_id)
             result = conn.execute(q).scalar()
             return int(result or 0)
+
+    # -- System settings -------------------------------------------------------
+
+    def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(system_settings).where(
+                    sa.and_(
+                        system_settings.c.key == key,
+                        system_settings.c.node_id == node_id,
+                    )
+                )
+            ).fetchone()
+            return dict(row._mapping) if row else None
+
+    def list_system_settings(self, node_id: str = "") -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(system_settings).order_by(system_settings.c.key)
+            if node_id:
+                # Return both global and node-specific
+                q = q.where(
+                    sa.or_(
+                        system_settings.c.node_id == "",
+                        system_settings.c.node_id == node_id,
+                    )
+                )
+            return [dict(r._mapping) for r in conn.execute(q).fetchall()]
+
+    def upsert_system_setting(
+        self,
+        key: str,
+        value: str,
+        node_id: str = "",
+        is_secret: bool = False,
+        changed_by: str = "",
+    ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        secret_val = 1 if is_secret else 0
+        stmt = pg_insert(system_settings).values(
+            key=key,
+            value=value,
+            node_id=node_id,
+            is_secret=secret_val,
+            changed_by=changed_by,
+            created=now,
+            updated=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["key", "node_id"],
+            set_={
+                "value": value,
+                "is_secret": secret_val,
+                "changed_by": changed_by,
+                "updated": now,
+            },
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def delete_system_setting(self, key: str, node_id: str = "") -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(system_settings).where(
+                    sa.and_(
+                        system_settings.c.key == key,
+                        system_settings.c.node_id == node_id,
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def get_system_settings_bulk(self, node_id: str = "") -> dict[str, str]:
+        with self._engine.connect() as conn:
+            if not node_id:
+                rows = conn.execute(
+                    sa.select(system_settings.c.key, system_settings.c.value).where(
+                        system_settings.c.node_id == ""
+                    )
+                ).fetchall()
+                return {r.key: r.value for r in rows}
+            # Global + node overrides in one query; node_id sorts after ""
+            # so node-specific values overwrite globals in the dict
+            rows = conn.execute(
+                sa.select(system_settings.c.key, system_settings.c.value)
+                .where(
+                    sa.or_(
+                        system_settings.c.node_id == "",
+                        system_settings.c.node_id == node_id,
+                    )
+                )
+                .order_by(system_settings.c.node_id)
+            ).fetchall()
+            return {r.key: r.value for r in rows}
 
     # -- Lifecycle -------------------------------------------------------------
 

@@ -154,6 +154,12 @@ export type {
   ListAdminMemoriesResponse,
   AdminListMemoriesOptions,
   AdminSearchMemoriesOptions,
+  // Settings types
+  SettingInfo,
+  ListSettingsResponse,
+  SettingSchemaInfo,
+  ListSettingSchemaResponse,
+  UpdateSettingOptions,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

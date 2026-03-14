@@ -747,6 +747,43 @@ class StorageBackend(Protocol):
         """Count intent verdicts matching the filters."""
         ...
 
+    # -- System settings -------------------------------------------------------
+
+    def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
+        """Return setting dict or None."""
+        ...
+
+    def list_system_settings(self, node_id: str = "") -> list[dict[str, Any]]:
+        """Return settings ordered by key.
+
+        When *node_id* is provided, returns both global (node_id="")
+        and node-specific settings.  When empty, returns all settings.
+        """
+        ...
+
+    def upsert_system_setting(
+        self,
+        key: str,
+        value: str,
+        node_id: str = "",
+        is_secret: bool = False,
+        changed_by: str = "",
+    ) -> None:
+        """Create or update a system setting. Value is JSON-encoded."""
+        ...
+
+    def delete_system_setting(self, key: str, node_id: str = "") -> bool:
+        """Delete a setting by (key, node_id). Returns True if existed."""
+        ...
+
+    def get_system_settings_bulk(self, node_id: str = "") -> dict[str, str]:
+        """Return all settings as {key: json_value} dict.
+
+        Loads global settings (node_id="") first, then overlays per-node
+        overrides if node_id is provided.
+        """
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

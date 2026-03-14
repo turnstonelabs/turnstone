@@ -30,6 +30,8 @@ from turnstone.api.console_schemas import (
     ListOrgsResponse,
     ListPromptTemplatesResponse,
     ListRolesResponse,
+    ListSettingSchemaResponse,
+    ListSettingsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     ListVerdictsResponse,
@@ -40,10 +42,13 @@ from turnstone.api.console_schemas import (
     OrgInfo,
     PromptTemplateInfo,
     RoleInfo,
+    SettingInfo,
+    SettingSchemaInfo,
     ToolPolicyInfo,
     UpdateOrgRequest,
     UpdatePromptTemplateRequest,
     UpdateRoleRequest,
+    UpdateSettingRequest,
     UpdateToolPolicyRequest,
     UpdateWsTemplateRequest,
     UsageBreakdownItem,
@@ -618,6 +623,44 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[404],
         tags=["Admin"],
     ),
+    # --- Admin: System Settings ---
+    EndpointSpec(
+        "/v1/api/admin/settings",
+        "GET",
+        "List all settings with effective values",
+        response_model=ListSettingsResponse,
+        query_params=[
+            QueryParam("reveal", "Show secret values in plaintext", schema_type="boolean"),
+        ],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/settings/schema",
+        "GET",
+        "Return the full settings registry schema",
+        response_model=ListSettingSchemaResponse,
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/settings/{key}",
+        "PUT",
+        "Set a configuration setting value",
+        request_model=UpdateSettingRequest,
+        response_model=SettingInfo,
+        error_codes=[400],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/settings/{key}",
+        "DELETE",
+        "Reset a setting to its default value",
+        response_model=StatusResponse,
+        query_params=[
+            QueryParam("node_id", "Node ID for node-scoped settings"),
+        ],
+        error_codes=[400, 404],
+        tags=["Admin"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -684,6 +727,11 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListVerdictsResponse,
     AdminMemoryInfo,
     ListAdminMemoriesResponse,
+    SettingInfo,
+    ListSettingsResponse,
+    SettingSchemaInfo,
+    ListSettingSchemaResponse,
+    UpdateSettingRequest,
 ]
 
 

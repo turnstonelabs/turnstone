@@ -1512,6 +1512,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.ws_templates",
         "admin.judge",
         "admin.memories",
+        "admin.settings",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -2723,6 +2724,215 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: System Settings
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_settings(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/settings — list all settings with effective values."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS, deserialize_value
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    reveal = request.query_params.get("reveal") == "true"
+    stored = {r["key"]: r for r in storage.list_system_settings()}
+
+    settings: list[dict[str, Any]] = []
+    for key, defn in sorted(SETTINGS.items()):
+        row = stored.get(key)
+        if row:
+            try:
+                val = deserialize_value(key, row["value"])
+            except (ValueError, KeyError):
+                val = row["value"]
+            info = {
+                "key": key,
+                "value": "***" if defn.is_secret and not reveal else val,
+                "source": "storage",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "node_id": row.get("node_id", ""),
+                "changed_by": row.get("changed_by", ""),
+                "updated": row.get("updated", ""),
+                "restart_required": defn.restart_required,
+            }
+        else:
+            info = {
+                "key": key,
+                "value": "(managed via config file / env)" if defn.is_secret else defn.default,
+                "source": "default",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "node_id": "",
+                "changed_by": "",
+                "updated": "",
+                "restart_required": defn.restart_required,
+            }
+        settings.append(info)
+
+    return JSONResponse({"settings": settings})
+
+
+async def admin_settings_schema(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/settings/schema — return the full settings registry."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    schema: list[dict[str, Any]] = []
+    for key, defn in sorted(SETTINGS.items()):
+        schema.append(
+            {
+                "key": key,
+                "type": defn.type,
+                "default": defn.default,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": defn.is_secret,
+                "min_value": defn.min_value,
+                "max_value": defn.max_value,
+                "choices": defn.choices,
+                "restart_required": defn.restart_required,
+            }
+        )
+
+    return JSONResponse({"schema": schema})
+
+
+async def admin_update_setting(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/settings/{key} — set a setting value."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import (
+        serialize_value,
+        validate_key,
+        validate_value,
+    )
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    try:
+        defn = validate_key(key)
+    except ValueError:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
+
+    if defn.is_secret:
+        return JSONResponse(
+            {
+                "error": "Secret settings cannot be modified via API — use config.toml or environment variables"
+            },
+            status_code=403,
+        )
+
+    raw_value = body.get("value")
+    try:
+        typed_value = validate_value(key, raw_value)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    node_id = str(body.get("node_id", ""))
+    audit_uid, ip = _audit_context(request)
+
+    storage.upsert_system_setting(
+        key=key,
+        value=serialize_value(typed_value),
+        node_id=node_id,
+        is_secret=defn.is_secret,
+        changed_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.update",
+        "setting",
+        key,
+        {"value": "***" if defn.is_secret else typed_value, "node_id": node_id},
+        ip,
+    )
+
+    return JSONResponse(
+        {
+            "key": key,
+            "value": "***" if defn.is_secret else typed_value,
+            "source": "storage",
+            "type": defn.type,
+            "description": defn.description,
+            "section": defn.section,
+            "is_secret": defn.is_secret,
+            "node_id": node_id,
+            "changed_by": audit_uid,
+            "updated": "",
+            "restart_required": defn.restart_required,
+        }
+    )
+
+
+async def admin_delete_setting(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/settings/{key} — reset a setting to default."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import validate_key
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    try:
+        validate_key(key)
+    except ValueError:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
+
+    node_id = request.query_params.get("node_id", "")
+    deleted = storage.delete_system_setting(key, node_id=node_id)
+    if not deleted:
+        return JSONResponse({"error": f"Setting '{key}' not found in storage"}, status_code=404)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.delete",
+        "setting",
+        key,
+        {"node_id": node_id},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok", "key": key})
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -2870,6 +3080,19 @@ def create_app(
                     Route(
                         "/api/admin/memories/{memory_id}",
                         admin_delete_memory,
+                        methods=["DELETE"],
+                    ),
+                    # System: Settings
+                    Route("/api/admin/settings", admin_list_settings),
+                    Route("/api/admin/settings/schema", admin_settings_schema),
+                    Route(
+                        "/api/admin/settings/{key:path}",
+                        admin_update_setting,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/settings/{key:path}",
+                        admin_delete_setting,
                         methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit

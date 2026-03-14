@@ -200,3 +200,31 @@ def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:
                 defaults[argparse_dest] = section_data[config_key]
     if defaults:
         parser.set_defaults(**defaults)
+
+
+def warn_migrated_settings() -> None:
+    """Log warnings for config.toml keys that are now managed by ConfigStore.
+
+    Called after storage is initialized so the warning can direct users
+    to the Settings API.  Only relevant for server/console entry points
+    that use ConfigStore — the CLI still reads config.toml directly.
+    """
+    from turnstone.core.settings_registry import SETTINGS
+
+    cfg = load_config()
+    if not cfg:
+        return
+
+    for key, defn in SETTINGS.items():
+        section = defn.section
+        config_key = key.split(".", 1)[1]
+        section_data = cfg.get(section, {})
+        if isinstance(section_data, dict) and config_key in section_data:
+            log.warning(
+                "config.toml [%s] %s is now managed via Settings API — "
+                "this value will be ignored. Use the admin Settings tab "
+                "or PUT /v1/api/admin/settings/%s to configure.",
+                section,
+                config_key,
+                key,
+            )
