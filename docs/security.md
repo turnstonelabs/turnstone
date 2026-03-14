@@ -54,7 +54,7 @@ Claims:
 |-------|-------------|
 | `sub` | User ID |
 | `scopes` | Comma-separated scope list (`read,write,approve`) |
-| `src` | Token source (`password`, `api_token`, `config`) |
+| `src` | Token source (`password`, `api_token`, `config`, `oidc`) |
 | `iss` | Issuer — always `turnstone` |
 | `aud` | Audience — `turnstone-server` or `turnstone-console` |
 | `iat` | Issued-at timestamp |
@@ -90,7 +90,8 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 
 Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
-`/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`.
+`/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`,
+`/api/auth/oidc/login`, `/api/auth/oidc/callback`.
 
 ### RBAC (Granular Permissions)
 
@@ -156,6 +157,61 @@ login exchange is needed — include the token as a `Bearer` header:
 ```
 Authorization: Bearer tok_legacy
 ```
+
+### OpenID Connect (OIDC)
+
+Turnstone supports single sign-on via any OIDC-compliant identity provider
+(Hydra, Keycloak, Okta, Auth0, etc.) using the authorization code flow.
+
+```
+GET /v1/api/auth/oidc/login
+→ 302 redirect to OIDC provider's authorization endpoint
+
+GET /v1/api/auth/oidc/callback?code=...&state=...
+→ Exchange code for tokens, auto-provision user, issue JWT
+→ 302 redirect to / with session cookie set
+```
+
+**Flow:**
+
+1. User visits `/v1/api/auth/oidc/login` (or clicks "Sign in with SSO")
+2. Turnstone generates a cryptographic `state` parameter (CSRF protection)
+   and redirects the browser to the OIDC provider's authorization endpoint
+3. User authenticates with the identity provider
+4. Provider redirects back to `/v1/api/auth/oidc/callback` with an
+   authorization code and the `state` parameter
+5. Turnstone validates the `state`, exchanges the code for tokens using
+   HTTP Basic Auth (`client_secret_basic`), and extracts the user identity
+   from the ID token claims (or the userinfo endpoint as fallback)
+6. If the user does not exist in the database, a new account is created
+   with the email local part as username, the `name` claim as display name,
+   and a configurable default role (`builtin-operator` by default)
+7. A Turnstone JWT is issued and set as a session cookie
+8. The browser is redirected to `/`
+
+**User auto-provisioning:**
+
+| OIDC claim | Turnstone field | Example |
+|------------|----------------|---------|
+| `email` | `username` (local part, lowercased) | `john.doe@example.com` → `john.doe` |
+| `name` or `preferred_username` | `display_name` | `John Doe` |
+
+Special characters in the email local part (other than `.`, `_`, `-`) are
+replaced with `_`. If the username already exists, the existing account is
+used — no duplicate is created.
+
+**OIDC discovery:** The provider's configuration is fetched from the
+well-known endpoint and cached for 1 hour. The discovery document provides
+the authorization, token, and userinfo endpoint URLs.
+
+**State management:** Each login request generates a unique state parameter
+stored in memory with a 10-minute TTL. States are consumed on validation
+(single-use) and expired entries are pruned automatically.
+
+**UI integration:** When OIDC is configured, `GET /v1/api/auth/status`
+returns `oidc_enabled: true` and `oidc_login_url: "/api/auth/oidc/login"`.
+The login page displays a "Sign in with SSO" button that redirects to the
+OIDC login endpoint. The button is hidden when OIDC is not configured.
 
 ### First-time setup
 
@@ -424,6 +480,12 @@ role = "full"
 | `TURNSTONE_AUTH_TOKEN=tok_xxx` | Register a config-file token with `full` access |
 | `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (must match across nodes) |
 | `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |
+| `TURNSTONE_OIDC_PROVIDER_URL` | OIDC discovery URL (enables OIDC when set with client_id and redirect_uri) |
+| `TURNSTONE_OIDC_CLIENT_ID` | OAuth2 client ID registered with the OIDC provider |
+| `TURNSTONE_OIDC_CLIENT_SECRET` | OAuth2 client secret |
+| `TURNSTONE_OIDC_REDIRECT_URI` | Callback URL (e.g., `https://turnstone.example.com/v1/api/auth/oidc/callback`) |
+| `TURNSTONE_OIDC_SCOPES` | Requested scopes (default: `openid email profile`) |
+| `TURNSTONE_OIDC_DEFAULT_ROLE` | Role assigned to auto-provisioned OIDC users (default: `builtin-operator`) |
 
 ---
 
@@ -483,3 +545,13 @@ and browsers enforce same-origin policy.
   refresh, eliminating long-lived static tokens for inter-service auth.
 - **Secret strength validation** — warning logged when JWT secret is
   shorter than 32 characters.
+- **OIDC state parameter** — cryptographic `state` for CSRF protection
+  with 10-minute TTL and single-use consumption.
+- **OIDC token exchange via Basic Auth** — client credentials sent as
+  HTTP Basic Auth (`client_secret_basic`), not in the request body.
+- **OIDC identity extraction** — ID token claims decoded without
+  signature verification only when received directly from the token
+  endpoint over TLS (not from untrusted sources).
+- **OIDC user auto-provisioning** — new users receive a random password
+  hash (OIDC users never authenticate via password). Role assignment is
+  configurable via `TURNSTONE_OIDC_DEFAULT_ROLE`.
