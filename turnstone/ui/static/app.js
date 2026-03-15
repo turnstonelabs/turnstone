@@ -172,6 +172,7 @@ function updateThemeMenuItem() {
 }
 window.onThemeChange = function () {
   updateThemeMenuItem();
+  reRenderAllMermaid();
 };
 updateThemeMenuItem();
 

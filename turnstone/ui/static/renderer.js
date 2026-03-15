@@ -603,6 +603,7 @@ var _NO_HIGHLIGHT_LANGS = {
   plaintext: true,
   plain: true,
   nohighlight: true,
+  mermaid: true,
 };
 var _TERMINAL_LANGS = {
   bash: true,
@@ -644,4 +645,156 @@ function postRenderMarkdown(containerEl) {
       el.closest("pre").classList.add("code-terminal");
     }
   }
+  // Render mermaid diagrams (lazy-loads mermaid.js on first use)
+  postRenderMermaid(containerEl);
+}
+
+// ---------------------------------------------------------------------------
+//  Mermaid diagram rendering (lazy-loaded)
+// ---------------------------------------------------------------------------
+var _mermaidState = "idle"; // idle | loading | ready
+var _mermaidQueue = []; // callbacks queued while loading
+var _mermaidIdCounter = 0;
+
+function _initMermaid() {
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "base",
+    themeVariables: _getMermaidTheme(),
+  });
+}
+
+function _loadMermaid(callback) {
+  if (_mermaidState === "ready") {
+    callback();
+    return;
+  }
+  _mermaidQueue.push(callback);
+  if (_mermaidState === "loading") return;
+  _mermaidState = "loading";
+  var script = document.createElement("script");
+  script.src = "/shared/mermaid-11.13.0/mermaid.min.js";
+  script.onload = function () {
+    _initMermaid();
+    _mermaidState = "ready";
+    var q = _mermaidQueue;
+    _mermaidQueue = [];
+    for (var i = 0; i < q.length; i++) q[i]();
+  };
+  script.onerror = function () {
+    _mermaidState = "idle";
+    _mermaidQueue = [];
+    var els = document.querySelectorAll(".mermaid-loading");
+    for (var i = 0; i < els.length; i++) {
+      els[i].classList.remove("mermaid-loading");
+      els[i].classList.add("mermaid-error");
+      els[i].textContent = "Failed to load diagram renderer";
+    }
+  };
+  document.head.appendChild(script);
+}
+
+function _getMermaidTheme() {
+  var s = getComputedStyle(document.documentElement);
+  return {
+    primaryColor: s.getPropertyValue("--bg-surface").trim(),
+    primaryTextColor: s.getPropertyValue("--fg").trim(),
+    primaryBorderColor:
+      s.getPropertyValue("--border-strong").trim() || "rgba(255,255,255,0.1)",
+    lineColor: s.getPropertyValue("--fg-dim").trim(),
+    secondaryColor: s.getPropertyValue("--bg-highlight").trim(),
+    tertiaryColor: s.getPropertyValue("--bg").trim(),
+    noteBkgColor: s.getPropertyValue("--bg-surface").trim(),
+    noteTextColor: s.getPropertyValue("--fg").trim(),
+    noteBorderColor: s.getPropertyValue("--accent").trim(),
+    actorTextColor: s.getPropertyValue("--fg-bright").trim(),
+    actorBkg: s.getPropertyValue("--bg-surface").trim(),
+    actorBorder: s.getPropertyValue("--accent").trim(),
+    signalColor: s.getPropertyValue("--fg").trim(),
+    signalTextColor: s.getPropertyValue("--fg").trim(),
+  };
+}
+
+// Render a single mermaid block, then call callback (serialized to avoid
+// concurrent mermaid.render() calls which corrupt shared internal state)
+function _renderMermaidBlock(container, callback) {
+  var source = container.getAttribute("data-mermaid-source");
+  if (!source) {
+    if (callback) callback();
+    return;
+  }
+  var id = "mermaid-" + ++_mermaidIdCounter;
+  function _onError(err) {
+    // Clean up orphaned temp SVG element mermaid may have left
+    var orphan = document.getElementById(id);
+    if (orphan) orphan.remove();
+    container.classList.remove("mermaid-loading");
+    container.classList.add("mermaid-error");
+    container.innerHTML =
+      '<div class="mermaid-error-msg">' +
+      escapeHtml(err.message || "Diagram error") +
+      "</div>" +
+      "<pre><code>" +
+      escapeHtml(source) +
+      "</code></pre>";
+    if (callback) callback();
+  }
+  try {
+    mermaid
+      .render(id, source)
+      .then(function (result) {
+        container.innerHTML = result.svg;
+        container.classList.remove("mermaid-loading");
+        container.classList.add("mermaid-rendered");
+        if (callback) callback();
+      })
+      .catch(_onError);
+  } catch (err) {
+    _onError(err);
+  }
+}
+
+// Render mermaid blocks sequentially (mermaid uses shared state internally)
+function _renderMermaidSequence(containers, idx) {
+  if (idx >= containers.length) return;
+  _renderMermaidBlock(containers[idx], function () {
+    _renderMermaidSequence(containers, idx + 1);
+  });
+}
+
+function postRenderMermaid(containerEl) {
+  var codeEls = containerEl.querySelectorAll("pre code.language-mermaid");
+  if (codeEls.length === 0) return;
+  var containers = [];
+  for (var i = 0; i < codeEls.length; i++) {
+    var pre = codeEls[i].closest("pre");
+    if (!pre) continue;
+    var source = codeEls[i].textContent;
+    var div = document.createElement("div");
+    div.className = "mermaid-container mermaid-loading";
+    div.setAttribute("data-mermaid-source", source);
+    div.textContent = "Loading diagram\u2026";
+    pre.replaceWith(div);
+    containers.push(div);
+  }
+  if (containers.length === 0) return;
+  _loadMermaid(function () {
+    _renderMermaidSequence(containers, 0);
+  });
+}
+
+function reRenderAllMermaid() {
+  if (_mermaidState !== "ready") return;
+  _initMermaid();
+  var els = document.querySelectorAll(
+    ".mermaid-container[data-mermaid-source]",
+  );
+  var arr = [];
+  for (var i = 0; i < els.length; i++) {
+    els[i].classList.add("mermaid-loading");
+    els[i].classList.remove("mermaid-rendered");
+    arr.push(els[i]);
+  }
+  _renderMermaidSequence(arr, 0);
 }

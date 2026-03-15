@@ -330,6 +330,34 @@ body { position: static; }
 [data-theme="light"] .hljs-addition { background: rgba(4, 120, 87, 0.06); }
 [data-theme="light"] .hljs-deletion { background: rgba(220, 38, 38, 0.06); }
 
+/* Mermaid diagrams */
+.msg-assistant .mermaid-container {
+  margin: 8px 0;
+  text-align: center;
+  border-radius: var(--radius);
+  overflow-x: auto;
+  min-height: 40px;
+}
+.msg-assistant .mermaid-container svg { max-width: 100%; height: auto; }
+.msg-assistant .mermaid-loading {
+  padding: 16px;
+  color: var(--fg-dim);
+  font-size: 12px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+}
+.msg-assistant .mermaid-error { text-align: left; }
+.msg-assistant .mermaid-error-msg {
+  padding: 8px 12px;
+  color: var(--red);
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-assistant .mermaid-container svg * { animation: none !important; }
+}
+
 /* GFM Callouts / Alerts */
 .msg-assistant .callout {
   border-left: 3px solid var(--border-strong);
