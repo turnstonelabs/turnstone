@@ -39,16 +39,15 @@ update_refs() {
     local old_pattern="$1"  # e.g. katex-0.16.38
     local new_pattern="$2"  # e.g. katex-0.16.39
 
-    local files=(
-        pyproject.toml
-        turnstone/ui/static/index.html
-        turnstone/ui/static/renderer.js
-    )
-    for f in "${files[@]}"; do
-        if grep -q "$old_pattern" "$f" 2>/dev/null; then
-            sed -i "s|${old_pattern}|${new_pattern}|g" "$f"
-            echo "  Updated $f"
-        fi
+    # Find all files with version references (excludes vendored JS and worktrees)
+    local files
+    files=$(grep -rl --include='*.toml' --include='*.html' --include='*.js' --include='*.md' \
+        -F "$old_pattern" . \
+        --exclude-dir='.claude' --exclude-dir='node_modules' --exclude-dir='shared_static' \
+        2>/dev/null || true)
+    for f in $files; do
+        sed -i "s|${old_pattern}|${new_pattern}|g" "$f"
+        echo "  Updated $f"
     done
 }
 
@@ -76,7 +75,7 @@ case "$LIB" in
             fi
         done
 
-        # Copy LICENSE from old dir if present, else download
+        # Copy LICENSE from old dir if present
         if [[ -f "${OLD_DIR}/LICENSE" ]]; then
             cp "${OLD_DIR}/LICENSE" "${NEW_DIR}/LICENSE"
         fi

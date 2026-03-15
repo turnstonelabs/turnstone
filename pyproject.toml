@@ -93,6 +93,7 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
 ignore = ["E501"]
+per-file-ignores = { "turnstone/core/sandbox.py" = ["N802"] }
 
 [tool.ruff.format]
 quote-style = "double"

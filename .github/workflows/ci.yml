@@ -52,6 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          uv-version: "0.9.18"
       - run: uv lock --check
 
   security:
@@ -59,10 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
+        with:
+          uv-version: "0.9.18"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - run: uv sync --frozen --all-extras
+      - run: uv pip install pip-audit
       - run: uv run pip-audit --strict --desc
 
   security-ts:
