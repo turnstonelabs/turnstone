@@ -179,6 +179,15 @@ class TestRequiredScope:
     def test_internal_config_reload_needs_approve(self):
         assert required_scope("POST", "/api/_internal/config-reload") == "approve"
 
+    def test_v1_internal_config_reload_needs_approve(self):
+        assert required_scope("POST", "/v1/api/_internal/config-reload") == "approve"
+
+    def test_proxy_internal_config_reload_needs_approve(self):
+        assert required_scope("POST", "/node/n1/v1/api/_internal/config-reload") == "approve"
+
+    def test_proxy_no_v1_internal_config_reload_needs_approve(self):
+        assert required_scope("POST", "/node/n1/api/_internal/config-reload") == "approve"
+
     def test_proxy_internal_mcp_reload_needs_approve(self):
         assert required_scope("POST", "/node/n1/v1/api/_internal/mcp-reload") == "approve"
 
