@@ -3144,6 +3144,12 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
             {"error": "transport must be 'stdio' or 'streamable-http'"},
             status_code=400,
         )
+    if transport == "stdio" and not str(body.get("command", "")).strip():
+        return JSONResponse({"error": "command is required for stdio transport"}, status_code=400)
+    if transport == "streamable-http" and not str(body.get("url", "")).strip():
+        return JSONResponse(
+            {"error": "url is required for streamable-http transport"}, status_code=400
+        )
 
     # Check max servers
     existing = storage.list_mcp_servers()
@@ -3443,6 +3449,20 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         if "url" in cfg or cfg.get("type") in ("http", "streamable-http"):
             transport = "streamable-http"
 
+        # Coerce fields to expected types
+        raw_args = cfg.get("args", [])
+        raw_headers = cfg.get("headers", {})
+        raw_env = cfg.get("env", {})
+        if not isinstance(raw_args, list):
+            errors.append(f"{srv_name}: args must be a list")
+            continue
+        if not isinstance(raw_headers, dict):
+            errors.append(f"{srv_name}: headers must be an object")
+            continue
+        if not isinstance(raw_env, dict):
+            errors.append(f"{srv_name}: env must be an object")
+            continue
+
         server_id = uuid.uuid4().hex
         try:
             storage.create_mcp_server(
@@ -3450,10 +3470,10 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
                 name=srv_name,
                 transport=transport,
                 command=str(cfg.get("command", "")),
-                args=json.dumps(cfg.get("args", [])),
+                args=json.dumps(raw_args),
                 url=str(cfg.get("url", "")),
-                headers=json.dumps(cfg.get("headers", {})),
-                env=json.dumps(cfg.get("env", {})),
+                headers=json.dumps(raw_headers),
+                env=json.dumps(raw_env),
                 auto_approve=False,
                 enabled=True,
                 created_by=audit_uid,

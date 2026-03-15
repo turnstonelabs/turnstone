@@ -599,10 +599,14 @@ class McpServerStatus(BaseModel):
     resources: int = 0
     prompts: int = 0
     error: str = ""
+    transport: str = ""
+    command: str = ""
+    url: str = ""
 
 
 class McpServerDetail(McpServerInfo):
     status: dict[str, McpServerStatus] = Field(default_factory=dict)
+    source: str = ""  # "config" for config-file servers, empty for DB-managed
 
 
 class CreateMcpServerRequest(BaseModel):

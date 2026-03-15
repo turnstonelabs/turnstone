@@ -509,8 +509,9 @@ bridges this with a background asyncio event loop in a daemon thread.
 **Configuration sources:** MCP servers can be defined in config files (TOML/JSON)
 or in the database via the admin UI. Database-backed definitions are managed
 through the console admin panel's MCP Servers tab and stored in the
-`mcp_servers` table. On startup, `load_mcp_config(storage=)` merges both
-sources. The console can trigger a cluster-wide reload (`POST
+`mcp_servers` table. On startup, `load_mcp_config(storage=)` uses
+first-match-wins priority: DB rows (if any enabled) take precedence over
+config files. The console can trigger a cluster-wide reload (`POST
 /_internal/mcp-reload`) that causes each node to call `reconcile_sync()`,
 which diffs the running MCP connections against the current DB state and
 adds, removes, or reconnects servers as needed.

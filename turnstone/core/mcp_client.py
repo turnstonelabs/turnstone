@@ -930,6 +930,9 @@ class MCPClientManager:
     def remove_server_sync(self, name: str, timeout: int = 15) -> bool:
         """Disconnect and remove an MCP server at runtime (blocks the calling thread).
 
+        All state mutations run on the MCP event loop thread to avoid races
+        with notification handlers and refresh tasks.
+
         Returns True if the server was connected and successfully removed.
         """
         was_connected = name in self._sessions
@@ -937,37 +940,48 @@ class MCPClientManager:
         # Remove from config to prevent reconnection
         self._server_configs.pop(name, None)
 
-        if was_connected and self._loop is not None:
+        if self._loop is not None:
 
-            async def _disconnect() -> None:
+            async def _remove() -> None:
+                # Close session + transport via per-server stack
                 self._sessions.pop(name, None)
                 stack = self._per_server_stacks.pop(name, None)
                 if stack is not None:
                     with contextlib.suppress(Exception):
                         await stack.aclose()
+                # Clean up per-server state (on the event loop thread)
+                self._per_server_tools.pop(name, None)
+                self._per_server_resources.pop(name, None)
+                self._per_server_prompts.pop(name, None)
+                self._supports_list_changed.pop(name, None)
+                self._supports_resources.pop(name, None)
+                self._supports_resource_list_changed.pop(name, None)
+                self._supports_prompts.pop(name, None)
+                self._supports_prompt_list_changed.pop(name, None)
+                # Rebuild merged state (serialized with notification handlers)
+                self._rebuild_tools()
+                self._rebuild_resources()
+                self._rebuild_prompts()
 
-            future = asyncio.run_coroutine_threadsafe(_disconnect(), self._loop)
+            future = asyncio.run_coroutine_threadsafe(_remove(), self._loop)
             try:
                 future.result(timeout=timeout)
             except Exception:
-                log.warning("Error disconnecting MCP server '%s'", name, exc_info=True)
+                log.warning("Error removing MCP server '%s'", name, exc_info=True)
         else:
+            # No event loop (tests / pre-start) — mutate directly
             self._sessions.pop(name, None)
-
-        # Clean up per-server state
-        self._per_server_tools.pop(name, None)
-        self._per_server_resources.pop(name, None)
-        self._per_server_prompts.pop(name, None)
-        self._supports_list_changed.pop(name, None)
-        self._supports_resources.pop(name, None)
-        self._supports_resource_list_changed.pop(name, None)
-        self._supports_prompts.pop(name, None)
-        self._supports_prompt_list_changed.pop(name, None)
-
-        # Rebuild merged state
-        self._rebuild_tools()
-        self._rebuild_resources()
-        self._rebuild_prompts()
+            self._per_server_tools.pop(name, None)
+            self._per_server_resources.pop(name, None)
+            self._per_server_prompts.pop(name, None)
+            self._supports_list_changed.pop(name, None)
+            self._supports_resources.pop(name, None)
+            self._supports_resource_list_changed.pop(name, None)
+            self._supports_prompts.pop(name, None)
+            self._supports_prompt_list_changed.pop(name, None)
+            self._rebuild_tools()
+            self._rebuild_resources()
+            self._rebuild_prompts()
 
         # Clean up governance templates from this server
         try:
