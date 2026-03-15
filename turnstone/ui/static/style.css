@@ -240,12 +240,18 @@
 /* ==========================================================================
    Markdown styling
    ========================================================================== */
-.msg-assistant h1, .msg-assistant h2, .msg-assistant h3 { color: var(--accent); margin: 8px 0 4px; font-family: var(--font-display); }
+/* Override KaTeX body rule — our layout requires body as a static flex container */
+body { position: static; }
+.msg-assistant h1, .msg-assistant h2, .msg-assistant h3, .msg-assistant h4, .msg-assistant h5, .msg-assistant h6 { color: var(--accent); margin: 8px 0 4px; font-family: var(--font-display); }
 .msg-assistant h1 { font-size: 18px; }
 .msg-assistant h2 { font-size: 16px; }
 .msg-assistant h3 { font-size: 14px; }
+.msg-assistant h4 { font-size: 13px; font-weight: 600; }
+.msg-assistant h5 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.msg-assistant h6 { font-size: 12px; font-weight: 500; color: var(--fg-dim); }
 .msg-assistant strong { color: var(--fg-bright); }
 .msg-assistant em { color: var(--magenta); }
+.msg-assistant del { color: var(--fg-dim); text-decoration: line-through; }
 .msg-assistant code {
   background: var(--code-bg);
   padding: 2px 6px;
@@ -268,6 +274,36 @@
 .msg-assistant blockquote { border-left: 3px solid var(--accent-dim); padding-left: 12px; color: var(--fg-dim); margin: 6px 0; }
 .msg-assistant hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
 .msg-assistant p { margin: 4px 0; }
+.msg-assistant .table-wrap { overflow-x: auto; margin: 8px 0; -webkit-overflow-scrolling: touch; }
+.msg-assistant .table-wrap:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.msg-assistant table { border-collapse: collapse; width: auto; min-width: 50%; font-size: 13px; }
+.msg-assistant thead { border-bottom: 2px solid var(--border-strong); }
+.msg-assistant th { background: var(--code-bg); font-weight: 600; color: var(--fg-bright); }
+.msg-assistant th, .msg-assistant td { padding: 6px 12px; border: 1px solid var(--border-strong); }
+.msg-assistant tbody tr { transition: background 0.12s ease; }
+.msg-assistant tbody tr:nth-child(even) { background: var(--row-alt); }
+.msg-assistant tbody tr:hover { background: var(--bg-highlight); }
+.msg-assistant .align-left { text-align: left; }
+.msg-assistant .align-center { text-align: center; }
+.msg-assistant .align-right { text-align: right; }
+.msg-assistant img { display: block; max-width: 100%; height: auto; border-radius: var(--radius); margin: 4px 0; }
+.msg-assistant .img-placeholder {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; margin: 4px 0;
+  background: var(--code-bg); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); cursor: pointer;
+  transition: border-color 0.12s ease;
+}
+.msg-assistant .img-placeholder:hover { border-color: var(--accent); }
+.msg-assistant .img-placeholder:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.msg-assistant .img-placeholder-icon { font-size: 16px; }
+.msg-assistant .img-placeholder-label { color: var(--fg-bright); font-size: 13px; }
+.msg-assistant .img-placeholder-domain { color: var(--fg-dim); font-size: 11px; }
+.msg-assistant li > input[type="checkbox"] { margin-right: 6px; vertical-align: middle; accent-color: var(--accent); }
+.msg-assistant blockquote blockquote { margin: 4px 0; border-left-color: var(--border-strong); }
+.msg-assistant blockquote blockquote blockquote { border-left-color: var(--border); }
+.msg-assistant .katex-display { margin: 8px 0; padding: 8px 0; overflow-x: auto; overflow-y: hidden; }
+.msg-assistant .katex-error { color: var(--red) !important; font-size: 12px; }
 
 /* ==========================================================================
    Input area
@@ -787,5 +823,6 @@
   #plan-buttons button, #input-area button,
   .dashboard-new-btn, .dashboard-input,
   #health-indicator, #hamburger-btn,
-  #mcp-status { transition: none; }
+  #mcp-status, .msg-assistant tbody tr,
+  .msg-assistant .img-placeholder { transition: none; }
 }

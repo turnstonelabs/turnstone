@@ -91,14 +91,16 @@ turnstone/
     _config.py        Base ChannelConfig dataclass
     discord/          Discord adapter (bot, cog, views, streaming, config)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
+    katex-0.16.38/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
     spinner.py        Braille character spinner (daemon thread)
     static/
       index.html      Single-page app shell (links to CSS and JS)
-      style.css       Page-specific UI styles (dashboard layout, approval blocks)
-      app.js          Page-specific client-side JavaScript (SSE, workstreams, markdown)
+      style.css       Page-specific UI styles (dashboard, markdown elements, approval blocks)
+      renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
+      app.js          Page-specific client-side JavaScript (SSE, workstreams, tool approval)
   tools/
     *.json            15 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
