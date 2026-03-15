@@ -437,7 +437,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
     { desc: "Navigate rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' }
   ]},
   { title: "General", keys: [
-    { desc: "Submit form from textarea", badge: '<span class="kb-key">Ctrl</span>+<span class="kb-key">Enter</span>' },
+    { desc: "Submit form from textarea", badge: '<span class="kb-key">' + (navigator.platform && navigator.platform.indexOf("Mac") > -1 ? "\u2318" : "Ctrl") + '</span>+<span class="kb-key">Enter</span>' },
     { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
     { desc: "Close overlay", badge: '<span class="kb-key">Esc</span>' }
   ]}

@@ -1421,6 +1421,7 @@ document.addEventListener("keydown", function (e) {
   }
   if (e.key === "Enter") {
     if (e.target.tagName === "SELECT") return;
+    if (e.target.tagName === "BUTTON") return; // let native click fire
     if (e.target.tagName === "TEXTAREA" && !(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
     var btn = document.getElementById("new-ws-submit");
