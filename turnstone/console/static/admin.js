@@ -267,8 +267,13 @@ function _renderUsers(users) {
   for (var i = 0; i < users.length; i++) {
     var u = users[i];
     html +=
-      '<div class="admin-row" role="listitem">' +
+      '<div class="admin-row" role="listitem" data-expandable data-user-id="' +
+      escapeHtml(u.user_id) +
+      '" data-username="' +
+      escapeHtml(u.username) +
+      '" tabindex="0" aria-expanded="false">' +
       '<span class="admin-col admin-col-username">' +
+      '<span class="admin-expand-indicator" aria-hidden="true">\u25b8</span>' +
       escapeHtml(u.username) +
       "</span>" +
       '<span class="admin-col admin-col-name">' +
@@ -307,6 +312,31 @@ function _renderUsers(users) {
       );
     });
   }
+  // Bind expandable row click + keyboard handlers for OIDC detail panel
+  var rows = container.querySelectorAll(".admin-row[data-expandable]");
+  for (var k = 0; k < rows.length; k++) {
+    (function (row) {
+      var _expand = function () {
+        var uid = row.getAttribute("data-user-id");
+        var uname = row.getAttribute("data-username");
+        _toggleOidcPanel(uid, uname, row);
+      };
+      row.addEventListener("click", function (e) {
+        if (
+          e.target.closest(".admin-btn-danger") ||
+          e.target.closest(".admin-btn-action")
+        )
+          return;
+        _expand();
+      });
+      row.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          _expand();
+        }
+      });
+    })(rows[k]);
+  }
 }
 
 function confirmDeleteUser(userId, username) {
@@ -330,6 +360,253 @@ function confirmDeleteUser(userId, username) {
         });
     },
   );
+}
+
+// ---------------------------------------------------------------------------
+// OIDC identity expansion in Users tab
+// ---------------------------------------------------------------------------
+
+function _toggleOidcPanel(userId, username, rowEl) {
+  var existing = rowEl.nextElementSibling;
+  if (existing && existing.classList.contains("oidc-detail-panel")) {
+    // Collapse
+    existing.style.maxHeight = "0";
+    var indicator = rowEl.querySelector(".admin-expand-indicator");
+    if (indicator) indicator.classList.remove("expanded");
+    rowEl.setAttribute("aria-expanded", "false");
+    setTimeout(function () {
+      if (existing.parentNode) existing.remove();
+    }, 160);
+    return;
+  }
+  // Collapse any other open panel first
+  var openPanels = document.querySelectorAll(
+    "#admin-users-table .oidc-detail-panel",
+  );
+  for (var i = 0; i < openPanels.length; i++) {
+    openPanels[i].style.maxHeight = "0";
+    var prevRow = openPanels[i].previousElementSibling;
+    if (prevRow) {
+      var ind = prevRow.querySelector(".admin-expand-indicator");
+      if (ind) ind.classList.remove("expanded");
+      prevRow.setAttribute("aria-expanded", "false");
+    }
+    (function (panel) {
+      setTimeout(function () {
+        if (panel.parentNode) panel.remove();
+      }, 160);
+    })(openPanels[i]);
+  }
+  // Mark expanded
+  var indicator = rowEl.querySelector(".admin-expand-indicator");
+  if (indicator) indicator.classList.add("expanded");
+  rowEl.setAttribute("aria-expanded", "true");
+  // Create panel (role="none" so it doesn't break the parent role="list")
+  var panel = document.createElement("div");
+  panel.className = "oidc-detail-panel";
+  panel.setAttribute("role", "none");
+  panel.innerHTML =
+    '<div class="oidc-detail-inner">' +
+    '<div class="oidc-detail-header">OIDC Identities</div>' +
+    '<div class="oidc-detail-body"><span class="oidc-detail-empty">Loading\u2026</span></div>' +
+    "</div>";
+  rowEl.after(panel);
+  // Animate open
+  requestAnimationFrame(function () {
+    panel.style.maxHeight = panel.scrollHeight + "px";
+  });
+  // Fetch identities
+  authFetch(
+    "/v1/api/admin/users/" + encodeURIComponent(userId) + "/oidc-identities",
+  )
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _renderOidcDetail(panel, data.oidc_identities || [], userId, username);
+    })
+    .catch(function () {
+      var body = panel.querySelector(".oidc-detail-body");
+      if (body)
+        body.innerHTML =
+          '<span class="oidc-detail-empty">Failed to load</span>';
+    });
+}
+
+function _renderOidcDetail(panel, identities, userId, username) {
+  var body = panel.querySelector(".oidc-detail-body");
+  if (!body) return;
+  if (!identities.length) {
+    body.innerHTML =
+      '<span class="oidc-detail-empty">No OIDC identities linked</span>';
+    panel.style.maxHeight = panel.scrollHeight + "px";
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < identities.length; i++) {
+    var oid = identities[i];
+    var shortIssuer = _issuerShortName(oid.issuer || "");
+    var shortSubject =
+      (oid.subject || "").length > 12
+        ? (oid.subject || "").slice(0, 12) + "\u2026"
+        : oid.subject || "";
+    var lastLogin = oid.last_login ? _relativeTime(oid.last_login) : "never";
+    html +=
+      '<div class="oidc-identity-row">' +
+      '<span class="oidc-identity-issuer"><span class="scope-badge">' +
+      escapeHtml(shortIssuer) +
+      "</span></span>" +
+      '<span class="oidc-identity-subject" title="' +
+      escapeHtml(oid.subject || "") +
+      '">' +
+      escapeHtml(shortSubject) +
+      "</span>" +
+      '<span class="oidc-identity-email" title="' +
+      escapeHtml(oid.email || "") +
+      '">' +
+      escapeHtml(oid.email || "\u2014") +
+      "</span>" +
+      '<span class="oidc-identity-time">' +
+      escapeHtml(lastLogin) +
+      "</span>" +
+      '<span class="oidc-identity-actions">' +
+      '<button class="admin-btn-danger" aria-label="Unlink ' +
+      escapeHtml(shortIssuer) +
+      " identity " +
+      escapeHtml(shortSubject) +
+      '" data-oidc-issuer="' +
+      escapeHtml(oid.issuer || "") +
+      '" data-oidc-subject="' +
+      escapeHtml(oid.subject || "") +
+      '" data-oidc-username="' +
+      escapeHtml(username) +
+      '" data-oidc-user-id="' +
+      escapeHtml(userId) +
+      '">unlink</button>' +
+      "</span></div>";
+  }
+  body.innerHTML = html;
+  // Update panel height for animation
+  panel.style.maxHeight = panel.scrollHeight + "px";
+  // Bind unlink buttons
+  var btns = body.querySelectorAll("[data-oidc-issuer]");
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].addEventListener("click", function (e) {
+      e.stopPropagation();
+      var issuer = this.getAttribute("data-oidc-issuer");
+      var subject = this.getAttribute("data-oidc-subject");
+      var uname = this.getAttribute("data-oidc-username");
+      var uid = this.getAttribute("data-oidc-user-id");
+      _confirmUnlinkOidc(issuer, subject, uname, uid);
+    });
+  }
+}
+
+function _confirmUnlinkOidc(issuer, subject, username, userId) {
+  var shortIssuer = _issuerShortName(issuer);
+  var shortSubject =
+    subject.length > 16 ? subject.slice(0, 16) + "\u2026" : subject;
+  showConfirmModal(
+    "Unlink OIDC Identity",
+    "Unlink " +
+      shortIssuer +
+      " identity \u2018" +
+      shortSubject +
+      "\u2019 from user " +
+      username +
+      "?\n\nThe user will need to log in via OIDC again to re-link.",
+    "Unlink",
+    function () {
+      authFetch(
+        "/v1/api/admin/oidc-identities?issuer=" +
+          encodeURIComponent(issuer) +
+          "&subject=" +
+          encodeURIComponent(subject),
+        { method: "DELETE" },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error("Unlink failed");
+          showToast("OIDC identity unlinked");
+          // Refresh the panel content in place (no close/reopen flicker)
+          var allRows = document.querySelectorAll(
+            "#admin-users-table .admin-row[data-expandable]",
+          );
+          var targetRow = null;
+          for (var ri = 0; ri < allRows.length; ri++) {
+            if (allRows[ri].getAttribute("data-user-id") === userId) {
+              targetRow = allRows[ri];
+              break;
+            }
+          }
+          if (targetRow) {
+            var panel = targetRow.nextElementSibling;
+            if (panel && panel.classList.contains("oidc-detail-panel")) {
+              var body = panel.querySelector(".oidc-detail-body");
+              if (body)
+                body.innerHTML =
+                  '<span class="oidc-detail-empty">Loading\u2026</span>';
+              authFetch(
+                "/v1/api/admin/users/" +
+                  encodeURIComponent(userId) +
+                  "/oidc-identities",
+              )
+                .then(function (r2) {
+                  if (!r2.ok) throw new Error("Failed");
+                  return r2.json();
+                })
+                .then(function (data) {
+                  _renderOidcDetail(
+                    panel,
+                    data.oidc_identities || [],
+                    userId,
+                    username,
+                  );
+                })
+                .catch(function () {
+                  if (body)
+                    body.innerHTML =
+                      '<span class="oidc-detail-empty">Failed to load</span>';
+                });
+            }
+          }
+        })
+        .catch(function () {
+          showToast("Failed to unlink OIDC identity");
+        });
+    },
+  );
+}
+
+function _issuerShortName(issuer) {
+  try {
+    var host = new URL(issuer).hostname;
+    if (host.includes("google")) return "google";
+    if (host.includes("microsoftonline") || host.includes("azure"))
+      return "azure";
+    if (host.includes("okta")) return "okta";
+    if (host.includes("auth0")) return "auth0";
+    if (host.includes("keycloak")) return "keycloak";
+    return host.replace(/^(login|accounts|auth|id|sso)\./, "");
+  } catch (e) {
+    return issuer || "unknown";
+  }
+}
+
+function _relativeTime(isoStr) {
+  try {
+    var then = new Date(
+      isoStr + (isoStr.includes("Z") || isoStr.includes("+") ? "" : "Z"),
+    );
+    var diff = (Date.now() - then.getTime()) / 1000;
+    if (diff < 60) return "just now";
+    if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+    if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+    if (diff < 2592000) return Math.floor(diff / 86400) + "d ago";
+    return isoStr.slice(0, 10);
+  } catch (e) {
+    return isoStr || "unknown";
+  }
 }
 
 // ---------------------------------------------------------------------------

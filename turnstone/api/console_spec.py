@@ -270,6 +270,20 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[404],
         tags=["Admin"],
     ),
+    # --- OIDC Identities ---
+    EndpointSpec(
+        "/v1/api/admin/users/{user_id}/oidc-identities",
+        "GET",
+        "List OIDC identities linked to a user",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/oidc-identities",
+        "DELETE",
+        "Unlink an OIDC identity (issuer + subject as query params)",
+        error_codes=[400, 404],
+        tags=["Admin"],
+    ),
     # --- Schedules ---
     EndpointSpec(
         "/v1/api/admin/schedules",

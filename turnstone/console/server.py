@@ -1053,6 +1053,67 @@ async def admin_delete_channel(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin API endpoints — OIDC identities
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_oidc_identities(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/users/{user_id}/oidc-identities — list OIDC links for a user."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+
+    user_id = request.path_params["user_id"]
+    identities = storage.list_oidc_identities_for_user(user_id)
+    return JSONResponse({"oidc_identities": identities})
+
+
+async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/oidc-identities?issuer=...&subject=... — unlink OIDC identity."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.users")
+    if err:
+        return err
+
+    issuer = request.query_params.get("issuer", "")
+    subject = request.query_params.get("subject", "")
+    if not issuer or not subject:
+        return JSONResponse({"error": "issuer and subject required"}, status_code=400)
+
+    # Look up before delete so audit captures which user was affected
+    identity = storage.get_oidc_identity(issuer, subject)
+    if not identity:
+        return JSONResponse({"error": "Identity not found"}, status_code=404)
+
+    storage.delete_oidc_identity(issuer, subject)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "oidc_identity.delete",
+        "oidc_identity",
+        f"{issuer}:{subject}",
+        {"user_id": identity["user_id"]},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # Admin API endpoints — scheduled tasks
 # ---------------------------------------------------------------------------
 
@@ -3577,6 +3638,15 @@ def create_app(
                     Route(
                         "/api/admin/channels/{channel_type}/{channel_user_id}",
                         admin_delete_channel,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/admin/users/{user_id}/oidc-identities",
+                        admin_list_oidc_identities,
+                    ),
+                    Route(
+                        "/api/admin/oidc-identities",
+                        admin_delete_oidc_identity,
                         methods=["DELETE"],
                     ),
                     Route("/api/admin/schedules", admin_list_schedules),
