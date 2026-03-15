@@ -48,6 +48,14 @@ end note
 Admin -> Server : GET /v1/api/admin/ws-templates
 Server -> Storage : list_ws_templates()
 
+Server <-- Server : GET /v1/api/ws-templates\n(read scope, summary only)
+note right
+  **Read-only listing:**
+  name, description, model.
+  Used by creation UI dropdowns.
+  Available on both server + console.
+end note
+
 Admin -> Server : DELETE /v1/api/admin/ws-templates/{id}
 Server -> Storage : delete_ws_template(id)
 

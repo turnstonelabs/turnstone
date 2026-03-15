@@ -377,20 +377,185 @@ function switchTab(wsId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// New workstream modal
+// ---------------------------------------------------------------------------
+var _newWsTrapHandler = null;
+
 function newWorkstream() {
+  showNewWsModal();
+}
+
+function showNewWsModal() {
+  var overlay = document.getElementById("new-ws-overlay");
+  overlay.style.display = "flex";
+  document.body.style.overflow = "hidden";
+
+  // Backdrop click to dismiss
+  overlay.onclick = function (e) {
+    if (e.target === overlay) hideNewWsModal();
+  };
+
+  // Populate model placeholder from header
+  var curModel = document.getElementById("model-name").textContent;
+  var modelInput = document.getElementById("new-ws-model");
+  modelInput.placeholder = curModel || "Default model";
+  modelInput.value = "";
+
+  // Populate template dropdown
+  var tplSelect = document.getElementById("new-ws-template");
+  tplSelect.innerHTML = '<option value="">Use defaults</option>';
+  authFetch("/v1/api/templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        var label = t.name;
+        if (t.is_default) label += " (default)";
+        if (t.origin === "mcp") label += " [MCP]";
+        opt.textContent = label;
+        tplSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — defaults still work */
+    });
+
+  // Populate profile (WS template) dropdown
+  var profSelect = document.getElementById("new-ws-profile");
+  profSelect.innerHTML = '<option value="">None</option>';
+  authFetch("/v1/api/ws-templates")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.ws_templates || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        var label = t.name;
+        if (t.model) label += " (" + t.model + ")";
+        opt.textContent = label;
+        profSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — profiles optional */
+    });
+
+  // Reset form
+  document.getElementById("new-ws-name").value = "";
+  var errEl = document.getElementById("new-ws-error");
+  errEl.style.display = "none";
+  errEl.textContent = "";
+  var submitBtn = document.getElementById("new-ws-submit");
+  submitBtn.disabled = false;
+  submitBtn.textContent = "Create";
+
+  // Wire buttons
+  document.getElementById("new-ws-cancel").onclick = hideNewWsModal;
+  submitBtn.onclick = submitNewWs;
+
+  // Focus trap
+  _newWsTrapHandler = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideNewWsModal();
+      return;
+    }
+    if (
+      e.key === "Enter" &&
+      e.target.tagName !== "TEXTAREA" &&
+      e.target.tagName !== "SELECT"
+    ) {
+      e.preventDefault();
+      submitNewWs();
+      return;
+    }
+    if (e.key !== "Tab") return;
+    var box = document.getElementById("new-ws-box");
+    var focusable = box.querySelectorAll(
+      'input, select, button, [tabindex]:not([tabindex="-1"])',
+    );
+    if (!focusable.length) return;
+    var first = focusable[0],
+      last = focusable[focusable.length - 1];
+    if (e.shiftKey) {
+      if (document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      }
+    } else {
+      if (document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _newWsTrapHandler);
+  setTimeout(function () {
+    document.getElementById("new-ws-name").focus();
+  }, 50);
+}
+
+function hideNewWsModal() {
+  document.getElementById("new-ws-overlay").style.display = "none";
+  document.body.style.overflow = "";
+  if (_newWsTrapHandler) {
+    document.removeEventListener("keydown", _newWsTrapHandler);
+    _newWsTrapHandler = null;
+  }
+  document.getElementById("new-tab-btn").focus();
+}
+
+function submitNewWs() {
+  var submitBtn = document.getElementById("new-ws-submit");
+  if (submitBtn.disabled) return;
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Creating\u2026";
+
+  var body = {};
+  var name = document.getElementById("new-ws-name").value.trim();
+  var model = document.getElementById("new-ws-model").value.trim();
+  var template = document.getElementById("new-ws-template").value;
+  var profile = document.getElementById("new-ws-profile").value;
+  if (name) body.name = name;
+  if (model) body.model = model;
+  if (template) body.template = template;
+  if (profile) body.ws_template = profile;
+
+  var errEl = document.getElementById("new-ws-error");
+  errEl.style.display = "none";
+
   authFetch("/v1/api/workstreams/new", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: "{}",
+    body: JSON.stringify(body),
   })
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
+      if (data.error) {
+        errEl.textContent = data.error;
+        errEl.style.display = "block";
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Create";
+        return;
+      }
       if (data.ws_id) {
         workstreams[data.ws_id] = { name: data.name, state: "idle" };
+        hideNewWsModal();
         switchTab(data.ws_id);
       }
+    })
+    .catch(function () {
+      errEl.textContent = "Failed to create workstream";
+      errEl.style.display = "block";
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Create";
     });
 }
 
@@ -1828,6 +1993,9 @@ document
 
 // Keyboard shortcuts for inline approval + plan dialog + tabs
 document.addEventListener("keydown", function (e) {
+  // Defer to modal's own keydown handler when new-ws modal is open
+  var nwsOverlay = document.getElementById("new-ws-overlay");
+  if (nwsOverlay && nwsOverlay.style.display !== "none") return;
   // Escape: close hamburger first, then dashboard
   if (
     e.key === "Escape" &&

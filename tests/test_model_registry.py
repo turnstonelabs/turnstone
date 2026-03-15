@@ -530,7 +530,9 @@ class TestWorkstreamModelParam:
 
         captured_alias = None
 
-        def factory(ui: Any, model_alias: str | None = None, ws_id: str | None = None) -> Any:
+        def factory(
+            ui: Any, model_alias: str | None = None, ws_id: str | None = None, **kwargs: Any
+        ) -> Any:
             nonlocal captured_alias
             captured_alias = model_alias
             mock_session = MagicMock()
@@ -544,7 +546,9 @@ class TestWorkstreamModelParam:
     def test_create_without_model(self) -> None:
         captured_alias = None
 
-        def factory(ui: Any, model_alias: str | None = None, ws_id: str | None = None) -> Any:
+        def factory(
+            ui: Any, model_alias: str | None = None, ws_id: str | None = None, **kwargs: Any
+        ) -> Any:
             nonlocal captured_alias
             captured_alias = model_alias
             mock_session = MagicMock()

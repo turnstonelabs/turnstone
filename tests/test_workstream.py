@@ -20,7 +20,7 @@ class FakeSession:
         self.messages = []
 
 
-def _fake_factory(ui, model_alias=None, ws_id=None):
+def _fake_factory(ui, model_alias=None, ws_id=None, **kwargs):
     return FakeSession()
 
 

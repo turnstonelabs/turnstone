@@ -1016,7 +1016,11 @@ def main() -> None:
 
     # ChatSession factory — captures shared config for creating workstreams
     def session_factory(
-        ui: SessionUI | None, model_alias: str | None = None, ws_id: str | None = None
+        ui: SessionUI | None,
+        model_alias: str | None = None,
+        ws_id: str | None = None,
+        *,
+        template: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         r_client, r_model, r_cfg = registry.resolve(model_alias)
@@ -1040,7 +1044,7 @@ def main() -> None:
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
-            template=args.template,
+            template=template if template is not None else args.template,
         )
 
     # Create workstream manager and initial workstream

@@ -85,6 +85,7 @@ from turnstone.api.schemas import (
     UpdateScheduleRequest,
     UserInfo,
 )
+from turnstone.api.server_schemas import ListPromptTemplateSummaryResponse, PromptTemplateSummary
 
 CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     # --- Cluster ---
@@ -532,6 +533,14 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListWsTemplateSummaryResponse,
         tags=["Workstreams"],
     ),
+    # --- Prompt templates ---
+    EndpointSpec(
+        "/v1/api/templates",
+        "GET",
+        "List available prompt templates (summary)",
+        response_model=ListPromptTemplateSummaryResponse,
+        tags=["Templates"],
+    ),
     # --- Governance: Usage & Audit ---
     EndpointSpec(
         "/v1/api/admin/usage",
@@ -807,6 +816,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ImportMcpConfigRequest,
     ImportMcpConfigResponse,
     McpReloadResponse,
+    PromptTemplateSummary,
+    ListPromptTemplateSummaryResponse,
 ]
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock
 
 from turnstone.core.session import ChatSession, _render_template
@@ -391,3 +392,131 @@ class TestMCPTemplates:
         session = _make_session(template="mcp__server__code")
         content = _sys_content(session)
         assert "MCP_EXPLICIT" in content
+
+
+# ---------------------------------------------------------------------------
+# Resume with deleted template
+# ---------------------------------------------------------------------------
+
+
+class TestResumeDeletedTemplate:
+    def test_resume_with_deleted_template_degrades_gracefully(self, tmp_db, capsys):
+        from turnstone.core.memory import save_message
+        from turnstone.core.storage import get_storage
+
+        db = get_storage()
+        _create_template(db, "t1", "ephemeral-tpl", "EPHEMERAL_CONTENT", is_default=False)
+
+        # Create session with template, save a message so resume has history
+        session1 = _make_session(template="ephemeral-tpl")
+        ws_id = session1.ws_id
+        save_message(ws_id, "user", "hello")
+        assert "EPHEMERAL_CONTENT" in _sys_content(session1)
+
+        # Delete the template from storage
+        db.delete_prompt_template("t1")
+
+        # Resume into a new session
+        session2 = _make_session()
+        resumed = session2.resume(ws_id)
+
+        assert resumed
+        assert session2._template_name == "ephemeral-tpl"
+        assert session2._template_content is None
+        # System message should not contain the deleted template content
+        content = _sys_content(session2)
+        assert "EPHEMERAL_CONTENT" not in content
+        # Warning should be logged via structlog
+        captured = capsys.readouterr()
+        assert "not_found" in captured.out or "not_found" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Threading safety
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateFactoryPassthrough:
+    def test_template_passed_through_workstream_create(self, tmp_db):
+        """WorkstreamManager.create(template=...) propagates to session factory."""
+        from turnstone.core.storage import get_storage
+        from turnstone.core.workstream import WorkstreamManager
+
+        db = get_storage()
+        _create_template(db, "t1", "factory-tpl", "FACTORY_CONTENT", is_default=False)
+
+        captured_template = None
+
+        def factory(ui, model_alias=None, ws_id=None, *, template=None):
+            nonlocal captured_template
+            captured_template = template
+            return _make_session(template=template)
+
+        mgr = WorkstreamManager(factory)
+        ws = mgr.create(name="test", template="factory-tpl")
+        assert captured_template == "factory-tpl"
+        assert ws.session is not None
+        assert ws.session._template_name == "factory-tpl"
+        assert "FACTORY_CONTENT" in _sys_content(ws.session)
+
+    def test_template_none_uses_defaults(self, tmp_db):
+        """WorkstreamManager.create() without template passes None."""
+        captured_template = "sentinel"
+
+        def factory(ui, model_alias=None, ws_id=None, *, template=None):
+            nonlocal captured_template
+            captured_template = template
+            return _make_session(template=template)
+
+        from turnstone.core.workstream import WorkstreamManager
+
+        mgr = WorkstreamManager(factory)
+        mgr.create(name="test")
+        assert captured_template is None
+
+
+class TestTemplateThreadSafety:
+    def test_concurrent_template_and_system_message_init(self, tmp_db):
+        from turnstone.core.storage import get_storage
+
+        db = get_storage()
+        _create_template(db, "t1", "thread-tpl", "THREAD_TEMPLATE", is_default=False)
+
+        session = _make_session(template="thread-tpl")
+        errors: list[Exception] = []
+        stop = threading.Event()
+        iterations = 200
+
+        def init_loop():
+            """Simulate MCP callback repeatedly calling _init_system_messages."""
+            try:
+                for _ in range(iterations):
+                    if stop.is_set():
+                        break
+                    session._init_system_messages()
+                    # system_messages must always be a valid list
+                    msgs = session.system_messages
+                    assert isinstance(msgs, list)
+                    assert len(msgs) > 0
+            except Exception as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=init_loop, daemon=True)
+        t.start()
+
+        # Main thread toggles template on/off
+        try:
+            for i in range(iterations):
+                if i % 2 == 0:
+                    session.set_template("thread-tpl")
+                else:
+                    session.set_template(None)
+        finally:
+            stop.set()
+            t.join(timeout=5)
+
+        assert not errors, f"Thread raised: {errors}"
+        # Final state: system_messages is a valid list
+        msgs = session.system_messages
+        assert isinstance(msgs, list)
+        assert len(msgs) > 0

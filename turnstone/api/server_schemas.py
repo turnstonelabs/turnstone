@@ -214,3 +214,21 @@ class SearchMemoriesRequest(BaseModel):
     scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
     scope_id: str = Field(default="", description="Filter by scope_id")
     limit: int = Field(default=20, description="Max results (1-50)", ge=1, le=50)
+
+
+# ---------------------------------------------------------------------------
+# Prompt templates (read-only listing)
+# ---------------------------------------------------------------------------
+
+
+class PromptTemplateSummary(BaseModel):
+    name: str = Field(description="Template name")
+    category: str = Field(default="", description="Template category")
+    is_default: bool = Field(
+        default=False, description="Whether this template is applied by default"
+    )
+    origin: str = Field(default="manual", description="Template origin: manual or mcp")
+
+
+class ListPromptTemplateSummaryResponse(BaseModel):
+    templates: list[PromptTemplateSummary]

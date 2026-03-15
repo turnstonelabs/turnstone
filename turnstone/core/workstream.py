@@ -16,8 +16,19 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Protocol
 
     from turnstone.core.session import ChatSession, SessionUI
+
+    class _SessionFactory(Protocol):
+        def __call__(
+            self,
+            ui: SessionUI | None,
+            model_alias: str | None = ...,
+            ws_id: str | None = ...,
+            *,
+            template: str | None = ...,
+        ) -> ChatSession: ...
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +76,14 @@ class WorkstreamManager:
 
     def __init__(
         self,
-        session_factory: Callable[[SessionUI | None, str | None, str | None], ChatSession],
+        session_factory: _SessionFactory,
         *,
         max_workstreams: int = 10,
         node_id: str | None = None,
     ):
         """
         Args:
-            session_factory: callable(ui, model_alias, ws_id) -> ChatSession.
+            session_factory: callable(ui, model_alias, ws_id, *, template) -> ChatSession.
                 Captures shared config (registry, temperature, …) so the
                 manager can create ChatSession instances without knowing
                 those details.  *model_alias* selects a model from the
@@ -85,9 +96,7 @@ class WorkstreamManager:
         """
         if max_workstreams < 1:
             raise ValueError(f"max_workstreams must be >= 1, got {max_workstreams}")
-        self._session_factory: Callable[[SessionUI | None, str | None, str | None], ChatSession] = (
-            session_factory
-        )
+        self._session_factory: _SessionFactory = session_factory
         self._node_id = node_id
         self._max_workstreams: int = max_workstreams
         self._workstreams: dict[str, Workstream] = {}
@@ -115,6 +124,7 @@ class WorkstreamManager:
         name: str = "",
         ui_factory: Callable[..., SessionUI] | None = None,
         model: str | None = None,
+        template: str | None = None,
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
@@ -125,6 +135,8 @@ class WorkstreamManager:
         Args:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
+            template: Optional prompt template name passed through to session
+                factory.
         """
         # Fast-fail capacity check (avoids expensive ChatSession creation when full).
         first_evicted: Workstream | None = None
@@ -147,7 +159,7 @@ class WorkstreamManager:
         ws = Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui, model, ws.id)
+        ws.session = self._session_factory(ws.ui, model, ws.id, template=template)
 
         # Authoritative insert under lock with re-check (another thread may
         # have filled capacity while we were unlocked).

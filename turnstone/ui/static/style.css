@@ -808,6 +808,141 @@ body { position: static; }
 }
 
 /* ==========================================================================
+   New workstream modal
+   ========================================================================== */
+#new-ws-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  z-index: 200;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+#new-ws-box {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 28px 32px 24px;
+  width: 380px;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.5),
+              0 0 80px -20px var(--accent-dim);
+  position: relative;
+}
+#new-ws-box::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 20%;
+  right: 20%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  border-radius: 1px;
+}
+#new-ws-box h3 {
+  font-family: var(--font-display);
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin: 0 0 16px;
+}
+#new-ws-box label {
+  display: block;
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 14px;
+  margin-bottom: 5px;
+}
+#new-ws-box label:first-of-type { margin-top: 0; }
+.nws-hint {
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  opacity: 0.6;
+}
+#new-ws-box input[type="text"],
+#new-ws-box select {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  box-sizing: border-box;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+#new-ws-box input[type="text"]:focus,
+#new-ws-box select:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+#new-ws-box input[type="text"]::placeholder { color: var(--fg-dim); }
+#new-ws-box select {
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+#new-ws-error {
+  color: var(--red);
+  font-size: 12px;
+  margin-bottom: 8px;
+  display: none;
+}
+#new-ws-buttons {
+  display: flex;
+  gap: 8px;
+  margin-top: 20px;
+  justify-content: flex-end;
+}
+#new-ws-cancel {
+  padding: 9px 20px;
+  background: var(--bg-highlight);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+#new-ws-cancel:hover { background: var(--bg-elevated); }
+#new-ws-cancel:focus-visible { outline: 2px solid var(--fg-bright); outline-offset: 2px; }
+#new-ws-submit {
+  padding: 9px 20px;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+#new-ws-submit:hover { filter: brightness(1.1); }
+#new-ws-submit:disabled { opacity: 0.4; cursor: not-allowed; filter: none; }
+#new-ws-submit:focus-visible { outline: 2px solid var(--fg-bright); outline-offset: 2px; }
+
+/* ==========================================================================
    Reduced motion — page-specific
    ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
@@ -824,5 +959,7 @@ body { position: static; }
   .dashboard-new-btn, .dashboard-input,
   #health-indicator, #hamburger-btn,
   #mcp-status, .msg-assistant tbody tr,
-  .msg-assistant .img-placeholder { transition: none; }
+  .msg-assistant .img-placeholder,
+  #new-ws-cancel, #new-ws-submit,
+  #new-ws-box input, #new-ws-box select { transition: none; }
 }

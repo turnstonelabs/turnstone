@@ -73,6 +73,26 @@
 
 <div id="messages" role="log" aria-live="polite" aria-label="Chat messages"></div>
 
+<!-- New workstream modal -->
+<div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
+  <div id="new-ws-box">
+    <h3 id="new-ws-title">New Workstream</h3>
+    <div id="new-ws-error" role="alert" aria-live="assertive"></div>
+    <label for="new-ws-name">Name <span class="nws-hint">optional</span></label>
+    <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
+    <label for="new-ws-model">Model <span class="nws-hint">optional</span></label>
+    <input id="new-ws-model" type="text" placeholder="Default model" autocomplete="off">
+    <label for="new-ws-template">Template <span class="nws-hint">optional</span></label>
+    <select id="new-ws-template"><option value="">Use defaults</option></select>
+    <label for="new-ws-profile">Profile <span class="nws-hint">optional — workstream template</span></label>
+    <select id="new-ws-profile"><option value="">None</option></select>
+    <div id="new-ws-buttons">
+      <button id="new-ws-cancel" type="button">Cancel</button>
+      <button id="new-ws-submit" type="button">Create</button>
+    </div>
+  </div>
+</div>
+
 <!-- Plan review dialog -->
 <div id="plan-overlay">
   <div id="plan-dialog" role="dialog" aria-modal="true" aria-labelledby="plan-dialog-title">

@@ -890,6 +890,43 @@ async def list_saved_workstreams(request: Request) -> JSONResponse:
     return JSONResponse({"workstreams": result})
 
 
+async def list_templates_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/templates — list available prompt templates (read scope)."""
+    from turnstone.core.storage._registry import get_storage
+
+    try:
+        storage = get_storage()
+    except Exception:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    templates = storage.list_prompt_templates()
+    summaries = [
+        {
+            "name": t["name"],
+            "category": t.get("category", ""),
+            "is_default": bool(t.get("is_default")),
+            "origin": t.get("origin", "manual"),
+        }
+        for t in templates
+    ]
+    return JSONResponse({"templates": summaries})
+
+
+async def list_ws_templates_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/ws-templates — enabled workstream templates summary (read scope)."""
+    from turnstone.core.storage._registry import get_storage
+
+    try:
+        storage = get_storage()
+    except Exception:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+    templates = storage.list_ws_templates(enabled_only=True)
+    summaries = [
+        {"name": t["name"], "description": t.get("description", ""), "model": t.get("model", "")}
+        for t in templates
+    ]
+    return JSONResponse({"ws_templates": summaries})
+
+
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     """Count workstream states for health/metrics endpoints."""
     counts = dict.fromkeys(("idle", "thinking", "running", "attention", "error"), 0)
@@ -1178,11 +1215,24 @@ async def create_workstream(request: Request) -> JSONResponse:
     resolved_model = body.get("model") or None
     if ws_tpl and ws_tpl.get("model"):
         resolved_model = ws_tpl["model"]
+    # Pre-validate prompt template before creating the workstream.
+    # This avoids the create-then-rollback pattern when template is invalid.
+    ws_tpl_overrides_prompt = bool(
+        ws_tpl and (ws_tpl["system_prompt"] or ws_tpl["prompt_template"])
+    )
+    resolved_template: str | None = None
+    if body_template and not ws_tpl_overrides_prompt:
+        from turnstone.core.memory import get_prompt_template_by_name
+
+        if not get_prompt_template_by_name(body_template):
+            return JSONResponse({"error": f"Template not found: {body_template}"}, status_code=400)
+        resolved_template = body_template
     try:
         ws = mgr.create(
             name=body.get("name", ""),
             ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
             model=resolved_model,
+            template=resolved_template,
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -1224,23 +1274,6 @@ async def create_workstream(request: Request) -> JSONResponse:
                     history = _build_history(ws.session)
                     if history:
                         ui._enqueue({"type": "history", "messages": history})
-
-        # Per-workstream template override — only when not resumed (resumed
-        # workstreams restore their own template from workstream_config).
-        # Skip validation when the ws_template will override the prompt anyway.
-        ws_tpl_overrides_prompt = bool(
-            ws_tpl and (ws_tpl["system_prompt"] or ws_tpl["prompt_template"])
-        )
-        if body_template and not resumed and ws.session and not ws_tpl_overrides_prompt:
-            from turnstone.core.memory import get_prompt_template_by_name
-
-            if not get_prompt_template_by_name(body_template):
-                # Workstream already created — close it and return error
-                mgr.close(ws.id)
-                return JSONResponse(
-                    {"error": f"Template not found: {body_template}"}, status_code=400
-                )
-            ws.session.set_template(body_template)
 
         # Apply workstream template settings (only for new workstreams)
         if ws_tpl and not resumed and ws.session:
@@ -1735,6 +1768,8 @@ def create_app(
                     Route("/api/workstreams", list_workstreams),
                     Route("/api/dashboard", dashboard),
                     Route("/api/workstreams/saved", list_saved_workstreams),
+                    Route("/api/templates", list_templates_summary),
+                    Route("/api/ws-templates", list_ws_templates_summary),
                     Route("/api/send", send_message, methods=["POST"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
@@ -2045,6 +2080,8 @@ def main() -> None:
         ui: SessionUI | None,
         model_alias: str | None = None,
         ws_id: str | None = None,
+        *,
+        template: str | None = None,
     ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
@@ -2077,7 +2114,7 @@ def main() -> None:
             tool_search=config_store.get("tools.search"),
             tool_search_threshold=config_store.get("tools.search_threshold"),
             tool_search_max_results=config_store.get("tools.search_max_results"),
-            template=args.template,
+            template=template if template is not None else args.template,
             judge_config=live_judge_config,
             user_id=uid,
             memory_config=live_memory_config,

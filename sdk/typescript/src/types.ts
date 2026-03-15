@@ -144,6 +144,21 @@ export interface ListSavedWorkstreamsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Server API — Prompt templates
+// ---------------------------------------------------------------------------
+
+export interface PromptTemplateSummary {
+  name: string;
+  category: string;
+  is_default: boolean;
+  origin: string;
+}
+
+export interface ListPromptTemplateSummaryResponse {
+  templates: PromptTemplateSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // Server API — Health
 // ---------------------------------------------------------------------------
 

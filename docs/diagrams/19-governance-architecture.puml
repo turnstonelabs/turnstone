@@ -85,6 +85,12 @@ tload --> trender : template content
 trender --> tsys : rendered content
 tset --> tload : name or None
 
+note right of pt_db
+  Read-only listing:
+  GET /v1/api/templates
+  (read scope, summary only)
+end note
+
 govjs --> wt_db : /v1/api/admin/ws-templates
 wtr --> wt_db : get_ws_template_by_name()
 wtr --> wta : template settings

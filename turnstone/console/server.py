@@ -2480,6 +2480,26 @@ async def list_ws_templates_summary(request: Request) -> JSONResponse:
     return JSONResponse({"ws_templates": summary})
 
 
+async def list_templates_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/templates — list available prompt templates (read scope)."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    templates = storage.list_prompt_templates()
+    summaries = [
+        {
+            "name": t["name"],
+            "category": t.get("category", ""),
+            "is_default": bool(t.get("is_default")),
+            "origin": t.get("origin", "manual"),
+        }
+        for t in templates
+    ]
+    return JSONResponse({"templates": summaries})
+
+
 async def admin_usage(request: Request) -> JSONResponse:
     """GET /v1/api/admin/usage — query usage data."""
     from datetime import UTC, datetime, timedelta
@@ -3532,6 +3552,7 @@ def create_app(
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
                     Route("/api/ws-templates", list_ws_templates_summary),
+                    Route("/api/templates", list_templates_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),

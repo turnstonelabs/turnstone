@@ -1263,7 +1263,7 @@ function showNewWsModal() {
   // Populate template dropdown
   var tplSelect = document.getElementById("new-ws-template");
   tplSelect.innerHTML = '<option value="">Use defaults</option>';
-  authFetch("/v1/api/admin/templates")
+  authFetch("/v1/api/templates")
     .then(function (r) {
       return r.json();
     })

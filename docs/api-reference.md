@@ -618,6 +618,67 @@ Each saved workstream object:
 
 ---
 
+### `GET /v1/api/templates`
+
+Returns a summary list of all available prompt templates. This is a read-only
+endpoint (requires `read` scope) that exposes template names and categories
+without revealing template content. Useful for populating template selectors
+in UIs or discovering available templates before creating a workstream.
+
+**Response:**
+
+```json
+{
+  "templates": [
+    {"name": "safety-guidelines", "category": "safety", "is_default": true, "origin": "manual"},
+    {"name": "mcp__server__code", "category": "", "is_default": false, "origin": "mcp"}
+  ]
+}
+```
+
+Each template summary:
+
+| Field        | Type   | Description                                          |
+|--------------|--------|------------------------------------------------------|
+| `name`       | string | Template name (used in `template` field on creation) |
+| `category`   | string | Template category                                    |
+| `is_default` | bool   | Whether template is auto-applied to all sessions     |
+| `origin`     | string | Template origin: `manual` or `mcp`                   |
+
+> **Note:** For full template management (create, update, delete, view content),
+> use the admin endpoints at `GET /v1/api/admin/templates` (requires `admin.templates` permission).
+
+---
+
+### `GET /v1/api/ws-templates`
+
+Returns a summary list of enabled workstream templates. This is a read-only
+endpoint (requires `read` scope) for populating template selectors in UIs.
+
+**Response:**
+
+```json
+{
+  "ws_templates": [
+    {"name": "code-review", "description": "Code review profile", "model": "gpt-5"},
+    {"name": "ops-triage", "description": "On-call triage", "model": ""}
+  ]
+}
+```
+
+Each workstream template summary:
+
+| Field         | Type   | Description                                     |
+|---------------|--------|-------------------------------------------------|
+| `name`        | string | Template name (used in `ws_template` on creation)|
+| `description` | string | Human-readable description                       |
+| `model`       | string | Model alias override (empty = use default)       |
+
+> **Note:** For full workstream template management, use the admin endpoints at
+> `GET /v1/api/admin/ws-templates` (requires `admin.templates` permission).
+
+---
+
 ### `POST /v1/api/send`
 
 Sends a user message to a workstream. Spawns a daemon worker thread that calls

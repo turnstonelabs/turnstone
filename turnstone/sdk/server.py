@@ -27,6 +27,7 @@ from turnstone.api.server_schemas import (
     DashboardResponse,
     HealthResponse,
     ListMemoriesResponse,
+    ListPromptTemplateSummaryResponse,
     ListSavedWorkstreamsResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
@@ -235,6 +236,13 @@ class AsyncTurnstoneServer(_BaseClient):
     async def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
         return await self._request(
             "GET", "/v1/api/workstreams/saved", response_model=ListSavedWorkstreamsResponse
+        )
+
+    # -- templates -----------------------------------------------------------
+
+    async def list_templates(self) -> ListPromptTemplateSummaryResponse:
+        return await self._request(
+            "GET", "/v1/api/templates", response_model=ListPromptTemplateSummaryResponse
         )
 
     # -- memories ------------------------------------------------------------
@@ -480,6 +488,11 @@ class TurnstoneServer:
 
     def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
         return self._runner.run(self._async.list_saved_workstreams())
+
+    # -- templates -----------------------------------------------------------
+
+    def list_templates(self) -> ListPromptTemplateSummaryResponse:
+        return self._runner.run(self._async.list_templates())
 
     # -- memories ------------------------------------------------------------
 
