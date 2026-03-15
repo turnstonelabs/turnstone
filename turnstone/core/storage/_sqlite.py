@@ -589,12 +589,13 @@ class SQLiteBackend:
             ]
 
     def delete_user(self, user_id: str) -> bool:
-        from turnstone.core.storage._schema import channel_users
+        from turnstone.core.storage._schema import channel_users, oidc_identities
 
         with self._engine.connect() as conn:
             conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
+            conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
             result = conn.execute(sa.delete(users).where(users.c.user_id == user_id))
             conn.commit()
             return result.rowcount > 0
@@ -2482,6 +2483,178 @@ class SQLiteBackend:
             )
             conn.commit()
             return result.rowcount > 0
+
+    # -- OIDC identity ---------------------------------------------------------
+
+    def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
+        from turnstone.core.storage._schema import oidc_identities
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oidc_identities).prefix_with("OR IGNORE"),
+                {
+                    "issuer": issuer,
+                    "subject": subject,
+                    "user_id": user_id,
+                    "email": email,
+                    "created": now,
+                    "last_login": now,
+                },
+            )
+            conn.commit()
+
+    def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
+        from turnstone.core.storage._schema import oidc_identities
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(
+                    oidc_identities.c.issuer,
+                    oidc_identities.c.subject,
+                    oidc_identities.c.user_id,
+                    oidc_identities.c.email,
+                    oidc_identities.c.created,
+                    oidc_identities.c.last_login,
+                ).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            ).fetchone()
+            if row:
+                return {
+                    "issuer": row[0],
+                    "subject": row[1],
+                    "user_id": row[2],
+                    "email": row[3],
+                    "created": row[4],
+                    "last_login": row[5],
+                }
+            return None
+
+    def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
+        from turnstone.core.storage._schema import oidc_identities
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(oidc_identities)
+                .where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+                .values(last_login=now)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
+        from turnstone.core.storage._schema import oidc_identities
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    oidc_identities.c.issuer,
+                    oidc_identities.c.subject,
+                    oidc_identities.c.user_id,
+                    oidc_identities.c.email,
+                    oidc_identities.c.created,
+                    oidc_identities.c.last_login,
+                )
+                .where(oidc_identities.c.user_id == user_id)
+                .order_by(oidc_identities.c.created.desc())
+            ).fetchall()
+            return [
+                {
+                    "issuer": r[0],
+                    "subject": r[1],
+                    "user_id": r[2],
+                    "email": r[3],
+                    "created": r[4],
+                    "last_login": r[5],
+                }
+                for r in rows
+            ]
+
+    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
+        from turnstone.core.storage._schema import oidc_identities
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(oidc_identities).where(
+                    (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- OIDC pending state ----------------------------------------------------
+
+    def create_oidc_pending_state(
+        self, state: str, nonce: str, code_verifier: str, audience: str
+    ) -> None:
+        from turnstone.core.storage._schema import oidc_pending_states
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(oidc_pending_states),
+                {
+                    "state": state,
+                    "nonce": nonce,
+                    "code_verifier": code_verifier,
+                    "audience": audience,
+                    "created_at": now,
+                },
+            )
+            conn.commit()
+
+    def pop_oidc_pending_state(
+        self, state: str, max_age_seconds: int = 300
+    ) -> dict[str, str] | None:
+        from turnstone.core.storage._schema import oidc_pending_states
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with self._engine.connect() as conn:
+            # Acquire write lock before SELECT to prevent TOCTOU race
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
+            row = conn.execute(
+                sa.select(
+                    oidc_pending_states.c.state,
+                    oidc_pending_states.c.nonce,
+                    oidc_pending_states.c.code_verifier,
+                    oidc_pending_states.c.audience,
+                    oidc_pending_states.c.created_at,
+                ).where(
+                    (oidc_pending_states.c.state == state)
+                    & (oidc_pending_states.c.created_at > cutoff)
+                )
+            ).fetchone()
+            # Always delete the row (whether valid, expired, or missing is fine)
+            conn.execute(sa.delete(oidc_pending_states).where(oidc_pending_states.c.state == state))
+            conn.commit()
+            if not row:
+                return None
+            return {
+                "state": row[0],
+                "nonce": row[1],
+                "code_verifier": row[2],
+                "audience": row[3],
+                "created_at": row[4],
+            }
+
+    def cleanup_expired_oidc_states(self, max_age_seconds: int = 300) -> int:
+        from turnstone.core.storage._schema import oidc_pending_states
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(oidc_pending_states).where(oidc_pending_states.c.created_at < cutoff)
+            )
+            conn.commit()
+            return result.rowcount
 
     # -- Lifecycle -------------------------------------------------------------
 

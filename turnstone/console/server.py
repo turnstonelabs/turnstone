@@ -323,6 +323,27 @@ async def auth_setup(request: Request) -> Response:
     return await handle_auth_setup(request, JWT_AUD_CONSOLE)
 
 
+async def auth_whoami(request: Request) -> Response:
+    """GET /v1/api/auth/whoami — return authenticated user info."""
+    from turnstone.core.auth import handle_auth_whoami
+
+    return await handle_auth_whoami(request)
+
+
+async def oidc_authorize(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/authorize — redirect to OIDC provider."""
+    from turnstone.core.auth import handle_oidc_authorize
+
+    return await handle_oidc_authorize(request, JWT_AUD_CONSOLE)
+
+
+async def oidc_callback(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/callback — OIDC callback, exchange code for JWT."""
+    from turnstone.core.auth import handle_oidc_callback
+
+    return await handle_oidc_callback(request, JWT_AUD_CONSOLE)
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — workstream creation
 # ---------------------------------------------------------------------------
@@ -674,6 +695,31 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.start()
+    # OIDC discovery (if configured)
+    oidc_config = app.state.oidc_config
+    if oidc_config.enabled:
+        from turnstone.core.oidc import discover_oidc
+
+        try:
+            oidc_config = await discover_oidc(oidc_config)
+            app.state.oidc_config = oidc_config
+        except Exception:
+            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
+        if oidc_config.enabled and oidc_config.jwks_uri:
+            try:
+                from turnstone.core.oidc import fetch_jwks
+
+                app.state.jwks_data = await fetch_jwks(oidc_config.jwks_uri)
+                log.info(
+                    "OIDC enabled: %s (%s)",
+                    oidc_config.provider_name,
+                    oidc_config.issuer,
+                )
+            except Exception:
+                log.warning(
+                    "OIDC JWKS prefetch failed — will retry on first login",
+                    exc_info=True,
+                )
     yield
     # Shutdown
     if scheduler is not None:
@@ -3557,6 +3603,9 @@ def create_app(
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
+                    Route("/api/auth/whoami", auth_whoami),
+                    Route("/api/auth/oidc/authorize", oidc_authorize),
+                    Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/admin/users", admin_list_users),
                     Route("/api/admin/users", admin_create_user, methods=["POST"]),
                     Route("/api/admin/users/{user_id}", admin_delete_user, methods=["DELETE"]),
@@ -3746,6 +3795,13 @@ def create_app(
     from turnstone.core.auth import LoginRateLimiter
 
     app.state.login_limiter = LoginRateLimiter()
+
+    # OIDC configuration (opt-in via env vars)
+    from turnstone.core.oidc import load_oidc_config
+
+    oidc_config = load_oidc_config()
+    app.state.oidc_config = oidc_config
+    app.state.jwks_data = None  # populated after async discovery
 
     # Scheduler — start background thread if storage is available
     if auth_storage is not None:

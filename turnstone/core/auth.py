@@ -28,6 +28,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -150,6 +151,8 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/api/auth/logout",
         "/api/auth/status",
         "/api/auth/setup",
+        "/api/auth/oidc/authorize",
+        "/api/auth/oidc/callback",
     }
 )
 PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
@@ -258,10 +261,20 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Verify a password against a bcrypt hash."""
+    """Verify a password against a bcrypt hash.
+
+    Returns ``False`` immediately for non-bcrypt hashes (e.g. the ``!oidc``
+    sentinel used for OIDC-provisioned users) to avoid ``ValueError`` from
+    ``bcrypt.checkpw``.
+    """
     import bcrypt
 
-    return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    if not password_hash.startswith("$2"):
+        return False  # Not a bcrypt hash (e.g. OIDC sentinel)
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except (ValueError, TypeError):
+        return False
 
 
 def parse_scopes(scopes_str: str) -> frozenset[str]:
@@ -909,6 +922,13 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
     password = body.get("password", "")
 
     if username and password and storage is not None:
+        # Enforce OIDC-only mode: reject password login when disabled
+        oidc_config = getattr(request.app.state, "oidc_config", None)
+        if oidc_config and oidc_config.enabled and not oidc_config.password_enabled:
+            return JSONResponse(
+                {"error": "Password login is disabled — use SSO"},
+                status_code=403,
+            )
         user = storage.get_user_by_username(username)
         if user and verify_password(password, user["password_hash"]):
             # Derive scopes and permissions from assigned roles
@@ -990,13 +1010,21 @@ async def handle_auth_status(request: Request) -> Response:
         except Exception:
             pass
 
-    return JSONResponse(
-        {
-            "auth_enabled": auth_config.enabled,
-            "has_users": has_users,
-            "setup_required": auth_config.enabled and not has_users,
-        }
-    )
+    # OIDC configuration
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    oidc_enabled = bool(oidc_config and oidc_config.enabled)
+
+    resp: dict[str, Any] = {
+        "auth_enabled": auth_config.enabled,
+        "has_users": has_users,
+        "setup_required": auth_config.enabled and not has_users,
+    }
+    if oidc_enabled and oidc_config is not None:
+        resp["oidc_enabled"] = True
+        resp["oidc_provider_name"] = oidc_config.provider_name
+        resp["password_enabled"] = oidc_config.password_enabled
+
+    return JSONResponse(resp)
 
 
 async def handle_auth_setup(request: Request, audience: str) -> Response:
@@ -1095,5 +1123,213 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
     secure = is_secure_request(dict(request.headers), request.url.scheme)
     response = JSONResponse(resp_body)
     if jwt_token:
+        response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
+    return response
+
+
+async def handle_auth_whoami(request: Request) -> Response:
+    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info."""
+    from starlette.responses import JSONResponse
+
+    auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
+    if not auth_result or not auth_result.user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    resp: dict[str, str] = {
+        "user_id": auth_result.user_id,
+    }
+    if auth_result.permissions:
+        resp["permissions"] = ",".join(sorted(auth_result.permissions))
+    return JSONResponse(resp)
+
+
+async def handle_oidc_authorize(request: Request, audience: str) -> Response:
+    """Shared ``GET /api/auth/oidc/authorize`` handler — redirect to IdP."""
+    from starlette.responses import JSONResponse, RedirectResponse
+
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    if not oidc_config or not oidc_config.enabled:
+        return JSONResponse({"error": "OIDC not configured"}, status_code=404)
+
+    # Rate limit — prevents flooding oidc_pending_states table
+    login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
+    client_ip = request.client.host if request.client else "unknown"
+    if login_limiter is not None:
+        ip_ok, _ip_retry = login_limiter.check(f"ip:{client_ip}")
+        if not ip_ok:
+            return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
+        login_limiter.record(f"ip:{client_ip}")  # Count every authorize to bound pending states
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+
+    # Require setup to be complete before allowing OIDC login
+    try:
+        users = storage.list_users()
+    except Exception:
+        return JSONResponse({"error": "Storage unavailable"}, status_code=503)
+    if not users:
+        return JSONResponse(
+            {"error": "Initial setup required before OIDC login"},
+            status_code=403,
+        )
+
+    from turnstone.core.oidc import build_authorize_url, generate_pkce_pair
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    code_verifier, _code_challenge = generate_pkce_pair()
+
+    # Store pending state in database
+    storage.create_oidc_pending_state(state, nonce, code_verifier, audience)
+
+    # Build redirect URI from request
+    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
+    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
+    # when available, rather than the request Host header. See PROGRESS.md.
+    host = request.headers.get("host", "localhost")
+    redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
+
+    url = build_authorize_url(oidc_config, redirect_uri, state, nonce, code_verifier)
+    return RedirectResponse(url, status_code=302)
+
+
+async def handle_oidc_callback(request: Request, audience: str) -> Response:
+    """Shared ``GET /api/auth/oidc/callback`` handler — exchange code, provision user, issue JWT."""
+    from starlette.responses import JSONResponse, RedirectResponse
+
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    if not oidc_config or not oidc_config.enabled:
+        return JSONResponse({"error": "OIDC not configured"}, status_code=404)
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    jwt_secret = getattr(request.app.state, "jwt_secret", "")
+
+    if storage is None:
+        return JSONResponse({"error": "Storage not available"}, status_code=503)
+
+    # Rate limiting
+    login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
+    client_ip = request.client.host if request.client else "unknown"
+    if login_limiter is not None:
+        ip_ok, ip_retry = login_limiter.check(f"ip:{client_ip}")
+        if not ip_ok:
+            return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
+
+    # Lazy cleanup of expired pending states
+    with contextlib.suppress(Exception):
+        storage.cleanup_expired_oidc_states(300)
+
+    def _record_oidc_failure() -> None:
+        if login_limiter is not None:
+            login_limiter.record(f"ip:{client_ip}")
+
+    # Check for IdP error
+    error = request.query_params.get("error", "")
+    if error:
+        _record_oidc_failure()
+        desc = request.query_params.get("error_description", error)
+        return RedirectResponse(f"/?oidc_error={urllib.parse.quote(desc)}", status_code=302)
+
+    # Validate state
+    state = request.query_params.get("state", "")
+    pending = storage.pop_oidc_pending_state(state, max_age_seconds=300)
+    if not pending:
+        _record_oidc_failure()
+        return RedirectResponse("/?oidc_error=Login+session+expired", status_code=302)
+
+    # Build redirect URI (must match what was sent in authorize)
+    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
+    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
+    # when available, rather than the request Host header. See PROGRESS.md.
+    host = request.headers.get("host", "localhost")
+    redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
+
+    try:
+        from turnstone.core.oidc import (
+            OIDCError,
+            exchange_code,
+            fetch_jwks,
+            provision_oidc_user,
+            validate_id_token,
+        )
+
+        # Exchange code for tokens
+        code = request.query_params.get("code", "")
+        tokens = await exchange_code(oidc_config, code, redirect_uri, pending["code_verifier"])
+
+        # Validate ID token against cached JWKS keys (no I/O).
+        # On unknown kid, refresh JWKS once (async) for key rotation.
+        jwks_data: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
+        if jwks_data is None and oidc_config.jwks_uri:
+            # Lazy fetch: JWKS may have failed at startup but IdP recovered
+            try:
+                jwks_data = await fetch_jwks(oidc_config.jwks_uri)
+                request.app.state.jwks_data = jwks_data
+            except OIDCError:
+                pass
+        if jwks_data is None:
+            return RedirectResponse("/?oidc_error=OIDC+temporarily+unavailable", status_code=302)
+
+        try:
+            id_claims = validate_id_token(
+                tokens["id_token"],
+                jwks_data,
+                oidc_config,
+                pending["nonce"],
+            )
+        except OIDCError as first_err:
+            if "not found in JWKS" not in str(first_err):
+                raise
+            # Key rotation: re-fetch JWKS and retry once.
+            log.info("JWKS key not found — refreshing for possible key rotation")
+            jwks_data = await fetch_jwks(oidc_config.jwks_uri)
+            request.app.state.jwks_data = jwks_data
+            id_claims = validate_id_token(
+                tokens["id_token"],
+                jwks_data,
+                oidc_config,
+                pending["nonce"],
+            )
+
+        # Verify setup is complete
+        users = storage.list_users()
+        if not users:
+            return RedirectResponse("/?oidc_error=Initial+setup+required", status_code=302)
+
+        # Provision or match user
+        user = provision_oidc_user(storage, oidc_config, id_claims)
+
+    except OIDCError as exc:
+        log.warning("OIDC callback failed: %s", exc)
+        _record_oidc_failure()
+        return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
+    except Exception:
+        log.exception("OIDC callback error")
+        _record_oidc_failure()
+        return RedirectResponse("/?oidc_error=Authentication+failed", status_code=302)
+
+    # Load permissions and issue Turnstone JWT
+    perms = _load_user_permissions(storage, user["user_id"])
+    scopes = _permissions_to_scopes(perms)
+    jwt_token = ""
+    if jwt_secret:
+        # Use the audience stored during authorize (not the handler param)
+        # to bind the JWT to the service that initiated the flow
+        jwt_audience = pending.get("audience", audience)
+        jwt_token = create_jwt(
+            user_id=user["user_id"],
+            scopes=scopes,
+            source="oidc",
+            secret=jwt_secret,
+            audience=jwt_audience,
+            permissions=frozenset(perms),
+        )
+
+    # Set cookie and redirect to app
+    response = RedirectResponse("/?oidc_success=1", status_code=302)
+    if jwt_token:
+        secure = is_secure_request(dict(request.headers), request.url.scheme)
         response.headers["Set-Cookie"] = make_set_cookie(jwt_token, secure=secure)
     return response

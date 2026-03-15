@@ -460,6 +460,85 @@
         }
       }
     },
+    "/v1/api/auth/oidc/authorize": {
+      "get": {
+        "summary": "Redirect to OIDC provider for SSO login",
+        "operationId": "v1_api_auth_oidc_authorize_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "302": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/oidc/callback": {
+      "get": {
+        "summary": "OIDC callback \u2014 validates code, provisions user, sets JWT cookie, redirects to app",
+        "operationId": "v1_api_auth_oidc_callback_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "302": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/auth/whoami": {
+      "get": {
+        "summary": "Return authenticated user info and permissions",
+        "operationId": "v1_api_auth_whoami_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthWhoamiResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/users": {
       "get": {
         "summary": "List all users",
@@ -3178,6 +3257,21 @@
           },
           "setup_required": {
             "title": "Setup Required",
+            "type": "boolean"
+          },
+          "oidc_enabled": {
+            "default": false,
+            "title": "Oidc Enabled",
+            "type": "boolean"
+          },
+          "oidc_provider_name": {
+            "default": "",
+            "title": "Oidc Provider Name",
+            "type": "string"
+          },
+          "password_enabled": {
+            "default": true,
+            "title": "Password Enabled",
             "type": "boolean"
           }
         },

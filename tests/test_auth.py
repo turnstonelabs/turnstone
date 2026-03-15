@@ -1375,3 +1375,49 @@ class TestCorsConfigurable:
         )
         assert resp.headers.get("Access-Control-Allow-Origin") == "http://example.com"
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyPassword — OIDC sentinel handling
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyPassword:
+    def test_valid_bcrypt_hash(self):
+        from turnstone.core.auth import hash_password, verify_password
+
+        hashed = hash_password("mypassword")
+        assert verify_password("mypassword", hashed) is True
+        assert verify_password("wrongpassword", hashed) is False
+
+    def test_oidc_sentinel_rejected(self):
+        from turnstone.core.auth import verify_password
+
+        # OIDC sentinel must return False, not crash with ValueError
+        assert verify_password("anypassword", "!oidc") is False
+
+    def test_non_bcrypt_hash_rejected(self):
+        from turnstone.core.auth import verify_password
+
+        assert verify_password("password", "not_a_hash") is False
+        assert verify_password("password", "") is False
+
+    def test_empty_password_against_oidc_sentinel(self):
+        from turnstone.core.auth import verify_password
+
+        assert verify_password("", "!oidc") is False
+
+
+# ---------------------------------------------------------------------------
+# TestOIDCPublicPaths — OIDC endpoints are public
+# ---------------------------------------------------------------------------
+
+
+class TestOIDCPublicPaths:
+    def test_oidc_authorize_is_public(self):
+        assert is_public_path("/api/auth/oidc/authorize") is True
+        assert is_public_path("/v1/api/auth/oidc/authorize") is True
+
+    def test_oidc_callback_is_public(self):
+        assert is_public_path("/api/auth/oidc/callback") is True
+        assert is_public_path("/v1/api/auth/oidc/callback") is True

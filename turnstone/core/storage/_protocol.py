@@ -259,6 +259,46 @@ class StorageBackend(Protocol):
         """Remove a channel user mapping. Returns True if existed."""
         ...
 
+    # -- OIDC identity ---------------------------------------------------------
+
+    def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
+        """Link an OIDC subject to a turnstone user. No-op if exists."""
+        ...
+
+    def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
+        """Lookup turnstone user by OIDC issuer+subject. Returns dict or None."""
+        ...
+
+    def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
+        """Update last_login timestamp. Returns True if row existed."""
+        ...
+
+    def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
+        """List all OIDC identities linked to a turnstone user."""
+        ...
+
+    def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
+        """Remove an OIDC identity link. Returns True if existed."""
+        ...
+
+    # -- OIDC pending state ----------------------------------------------------
+
+    def create_oidc_pending_state(
+        self, state: str, nonce: str, code_verifier: str, audience: str
+    ) -> None:
+        """Store OIDC authorization flow state for callback validation."""
+        ...
+
+    def pop_oidc_pending_state(
+        self, state: str, max_age_seconds: int = 300
+    ) -> dict[str, str] | None:
+        """Fetch and delete pending state atomically. Returns None if expired or missing."""
+        ...
+
+    def cleanup_expired_oidc_states(self, max_age_seconds: int = 300) -> int:
+        """Delete expired pending states. Returns count of deleted rows."""
+        ...
+
     # -- Channel routing -------------------------------------------------------
 
     def create_channel_route(

@@ -155,6 +155,16 @@ class AuthStatusResponse(BaseModel):
     auth_enabled: bool
     has_users: bool
     setup_required: bool
+    oidc_enabled: bool = False
+    oidc_provider_name: str = ""
+    password_enabled: bool = True
+
+
+class AuthWhoamiResponse(BaseModel):
+    """GET /v1/api/auth/whoami response."""
+
+    user_id: str
+    permissions: str = ""
 
 
 # ---------------------------------------------------------------------------

@@ -469,3 +469,31 @@ mcp_servers = sa.Table(
 )
 
 sa.Index("idx_mcp_servers_enabled", mcp_servers.c.enabled)
+
+# ---------------------------------------------------------------------------
+# OIDC identity tables
+# ---------------------------------------------------------------------------
+
+oidc_identities = sa.Table(
+    "oidc_identities",
+    metadata,
+    sa.Column("issuer", sa.Text, nullable=False),
+    sa.Column("subject", sa.Text, nullable=False),
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("email", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("last_login", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("issuer", "subject"),
+)
+
+sa.Index("idx_oidc_identities_user_id", oidc_identities.c.user_id)
+
+oidc_pending_states = sa.Table(
+    "oidc_pending_states",
+    metadata,
+    sa.Column("state", sa.Text, primary_key=True),
+    sa.Column("nonce", sa.Text, nullable=False),
+    sa.Column("code_verifier", sa.Text, nullable=False),
+    sa.Column("audience", sa.Text, nullable=False),
+    sa.Column("created_at", sa.Text, nullable=False),
+)
