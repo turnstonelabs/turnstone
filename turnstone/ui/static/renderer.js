@@ -97,7 +97,9 @@ document.addEventListener("keydown", function (e) {
 document.addEventListener("click", function (e) {
   var a = e.target.closest(".fn-ref a, .fn-backref");
   if (!a) return;
-  var target = document.querySelector(a.getAttribute("href"));
+  var href = a.getAttribute("href");
+  if (!href || href[0] !== "#") return;
+  var target = document.getElementById(href.slice(1));
   if (!target) return;
   e.preventDefault();
   target.scrollIntoView({ behavior: "smooth", block: "center" });
