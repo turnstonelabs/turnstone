@@ -4,6 +4,8 @@
 //  Inline formatting
 // ---------------------------------------------------------------------------
 function inlineMarkdown(text) {
+  // Escape HTML first so only tags we generate are real
+  text = escapeHtml(text);
   // Bold (asterisks only — underscores cause false positives on snake_case)
   text = text.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   // Italic (asterisks only)
@@ -15,11 +17,10 @@ function inlineMarkdown(text) {
   text = text.replace(/~~(.+?)~~/g, "<del>$1</del>");
   // Images (must come before links — render as click-to-load placeholder)
   text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, url) {
-    var safeUrl = escapeHtml(url);
-    var safeAlt = escapeHtml(alt || "Image");
+    var safeAlt = alt || "Image";
     var domain = "";
     try {
-      domain = new URL(url).hostname;
+      domain = escapeHtml(new URL(url).hostname);
     } catch (e) {
       domain = url.length > 40 ? url.slice(0, 40) + "…" : url;
     }
@@ -28,28 +29,27 @@ function inlineMarkdown(text) {
       'aria-label="Load image: ' +
       safeAlt +
       '" ' +
-      "onclick=\"this.outerHTML='<img src=&quot;" +
-      safeUrl +
-      "&quot; alt=&quot;" +
+      'data-src="' +
+      url +
+      '" data-alt="' +
       safeAlt +
-      "&quot; loading=&quot;lazy&quot;>';\" " +
-      "onkeydown=\"if(event.key==='Enter')this.click();\">" +
+      '">' +
       '<span class="img-placeholder-icon">&#x1F5BC;</span> ' +
       '<span class="img-placeholder-label">' +
       safeAlt +
       "</span>" +
       '<span class="img-placeholder-domain">' +
-      escapeHtml(domain) +
+      domain +
       "</span>" +
       "</span>"
     );
   });
-  // Links (escape URL, block javascript: scheme)
+  // Links (block javascript: scheme)
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (m, label, url) {
-    if (/^\s*javascript:/i.test(url)) return escapeHtml(m);
+    if (/^\s*javascript:/i.test(url)) return m;
     return (
       '<a href="' +
-      escapeHtml(url) +
+      url +
       '" target="_blank" rel="noopener noreferrer">' +
       label +
       "</a>"
@@ -57,6 +57,23 @@ function inlineMarkdown(text) {
   });
   return text;
 }
+
+// Attach click-to-load listener for image placeholders (delegated)
+document.addEventListener("click", function (e) {
+  var ph = e.target.closest(".img-placeholder");
+  if (!ph) return;
+  var img = document.createElement("img");
+  img.src = ph.getAttribute("data-src");
+  img.alt = ph.getAttribute("data-alt");
+  img.loading = "lazy";
+  ph.replaceWith(img);
+});
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Enter") return;
+  var ph = e.target.closest(".img-placeholder");
+  if (!ph) return;
+  ph.click();
+});
 
 // ---------------------------------------------------------------------------
 //  List rendering (nested + task lists)
@@ -66,6 +83,21 @@ function renderListBlock(items) {
   var minIndent = items[0].indent;
   for (var i = 1; i < items.length; i++) {
     if (items[i].indent < minIndent) minIndent = items[i].indent;
+  }
+  // Split into separate lists when marker type changes at top indent level
+  var segments = [];
+  var cur = [items[0]];
+  for (var i = 1; i < items.length; i++) {
+    if (items[i].indent <= minIndent && items[i].ordered !== cur[0].ordered) {
+      segments.push(cur);
+      cur = [items[i]];
+    } else {
+      cur.push(items[i]);
+    }
+  }
+  segments.push(cur);
+  if (segments.length > 1) {
+    return segments.map(renderListBlock).join("\n");
   }
   var type = items[0].ordered ? "ol" : "ul";
   var html = "<" + type + ">";
