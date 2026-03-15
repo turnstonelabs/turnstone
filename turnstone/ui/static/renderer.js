@@ -616,33 +616,35 @@ var _TERMINAL_LANGS = {
 var _hljsConfigured = false;
 
 function postRenderMarkdown(containerEl) {
-  if (typeof hljs === "undefined") return;
-  if (!_hljsConfigured) {
-    hljs.configure({ ignoreUnescapedHTML: true });
-    _hljsConfigured = true;
-  }
-  var codeEls = containerEl.querySelectorAll("pre code[class*='language-']");
-  for (var i = 0; i < codeEls.length; i++) {
-    var el = codeEls[i];
-    if (el.classList.contains("hljs")) continue;
-    // Extract language name from class
-    var langClass = "";
-    for (var j = 0; j < el.classList.length; j++) {
-      if (el.classList[j].startsWith("language-")) {
-        langClass = el.classList[j].substring(9);
-        break;
+  // Syntax highlighting (skip if highlight.js unavailable)
+  if (typeof hljs !== "undefined") {
+    if (!_hljsConfigured) {
+      hljs.configure({ ignoreUnescapedHTML: true });
+      _hljsConfigured = true;
+    }
+    var codeEls = containerEl.querySelectorAll("pre code[class*='language-']");
+    for (var i = 0; i < codeEls.length; i++) {
+      var el = codeEls[i];
+      if (el.classList.contains("hljs")) continue;
+      // Extract language name from class
+      var langClass = "";
+      for (var j = 0; j < el.classList.length; j++) {
+        if (el.classList[j].startsWith("language-")) {
+          langClass = el.classList[j].substring(9);
+          break;
+        }
       }
-    }
-    // Skip plaintext variants
-    if (_NO_HIGHLIGHT_LANGS[langClass]) {
-      el.classList.add("nohighlight");
-      continue;
-    }
-    // Apply highlighting
-    hljs.highlightElement(el);
-    // Add terminal styling class for shell languages
-    if (_TERMINAL_LANGS[langClass]) {
-      el.closest("pre").classList.add("code-terminal");
+      // Skip plaintext variants
+      if (_NO_HIGHLIGHT_LANGS[langClass]) {
+        el.classList.add("nohighlight");
+        continue;
+      }
+      // Apply highlighting
+      hljs.highlightElement(el);
+      // Add terminal styling class for shell languages
+      if (_TERMINAL_LANGS[langClass]) {
+        el.closest("pre").classList.add("code-terminal");
+      }
     }
   }
   // Render mermaid diagrams (lazy-loads mermaid.js on first use)
@@ -745,8 +747,9 @@ function _renderMermaidBlock(container, callback) {
       .render(id, source)
       .then(function (result) {
         container.innerHTML = result.svg;
-        container.classList.remove("mermaid-loading");
+        container.classList.remove("mermaid-loading", "mermaid-error");
         container.classList.add("mermaid-rendered");
+        if (result.bindFunctions) result.bindFunctions(container);
         if (callback) callback();
       })
       .catch(_onError);
@@ -793,7 +796,7 @@ function reRenderAllMermaid() {
   var arr = [];
   for (var i = 0; i < els.length; i++) {
     els[i].classList.add("mermaid-loading");
-    els[i].classList.remove("mermaid-rendered");
+    els[i].classList.remove("mermaid-rendered", "mermaid-error");
     arr.push(els[i]);
   }
   _renderMermaidSequence(arr, 0);
