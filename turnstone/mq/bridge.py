@@ -57,6 +57,11 @@ log = logging.getLogger("turnstone.mq.bridge")
 # Server's default safe tools (auto-approved without user confirmation)
 DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "memory", "recall"])
 
+# Maximum size of the per-ws content buffer (bytes).  Prevents unbounded
+# memory growth if a workstream produces very long responses or the idle
+# event never fires (e.g. bug / disconnect).
+_MAX_CONTENT_BUFFER_BYTES = 256 * 1024
+
 
 class Bridge:
     """Connects a message broker to turnstone-server's HTTP API.
@@ -106,6 +111,11 @@ class Bridge:
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
         self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
         self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
+        # Content buffer: accumulates assistant text per workstream from
+        # per-ws SSE.  Attached to TurnCompleteEvent when idle is detected
+        # via the global SSE so downstream consumers can catch up if the
+        # streaming path missed events (race between the two SSE connections).
+        self._ws_content_buffer: dict[str, list[str]] = {}
         self._running = True
 
     @property
@@ -587,7 +597,17 @@ class Bridge:
         etype = data.get("type", "")
 
         if etype == "content":
-            self._publish_ws(ws_id, ContentEvent(ws_id=ws_id, text=data.get("text", "")))
+            text = data.get("text", "")
+            if text:
+                with self._lock:
+                    buf = self._ws_content_buffer.setdefault(ws_id, [])
+                    buf.append(text)
+                    # Cap buffer at 256 KB per workstream to prevent DoS
+                    # from extremely long responses or missing idle events.
+                    total = sum(len(s) for s in buf)
+                    while total > _MAX_CONTENT_BUFFER_BYTES and len(buf) > 1:
+                        total -= len(buf.pop(0))
+            self._publish_ws(ws_id, ContentEvent(ws_id=ws_id, text=text))
         elif etype == "reasoning":
             self._publish_ws(ws_id, ReasoningEvent(ws_id=ws_id, text=data.get("text", "")))
         elif etype == "tool_info":
@@ -825,7 +845,15 @@ class Bridge:
             if state == "idle":
                 with self._lock:
                     cid = self._active_sends.pop(ws_id, None)
-                self._publish_ws(ws_id, TurnCompleteEvent(ws_id=ws_id, correlation_id=cid or ""))
+                    content_parts = self._ws_content_buffer.pop(ws_id, [])
+                self._publish_ws(
+                    ws_id,
+                    TurnCompleteEvent(
+                        ws_id=ws_id,
+                        correlation_id=cid or "",
+                        content="".join(content_parts),
+                    ),
+                )
 
         elif etype == "ws_rename":
             self._publish_global(WorkstreamRenameEvent(ws_id=ws_id, name=data.get("name", "")))
@@ -840,6 +868,7 @@ class Bridge:
                 self._ws_auto_approve.pop(ws_id, None)
                 self._ws_approve_tools.pop(ws_id, None)
                 self._active_sends.pop(ws_id, None)
+                self._ws_content_buffer.pop(ws_id, None)
 
     # -- heartbeat -----------------------------------------------------------
 

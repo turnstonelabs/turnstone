@@ -41,6 +41,14 @@ class ChannelAdapter(Protocol):
         """Send a message to a channel. Returns the platform message ID."""
         ...
 
+    async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
+        """Send a notification and track the reply mapping. Returns message ID.
+
+        Like :meth:`send` but associates the outgoing message with *ws_id*
+        so that replies can be routed back to the originating workstream.
+        """
+        ...
+
     async def edit_message(self, channel_id: str, message_id: str, content: str) -> None:
         """Edit an existing message in a channel."""
         ...

@@ -103,6 +103,41 @@ alt all retries exhausted
     Session --> Session : "Error: notification delivery failed"
 end
 
+== Bidirectional Reply (User responds to notification DM) ==
+
+Discord -> Adapter : user replies to\nnotification message
+Adapter -> Adapter : lookup message_id\nin _notify_ws_map
+note right
+  Maps message_id →
+  (ws_id, target_user_id)
+  Atomic pop prevents TOCTOU
+end note
+
+alt message not tracked
+    Adapter -> Discord : "This notification\nis no longer active."
+else tracked
+    Adapter -> Adapter : verify author ==\ntarget_user_id
+    Adapter -> Adapter : resolve_user()\n(unlinked → drop)
+    Adapter -> Adapter : router.send_message(ws_id, content)
+    note right
+      Routes reply via MQ to
+      the originating workstream.
+      Registers DM channel in
+      _notify_reply_channels[ws_id]
+    end note
+
+    ... workstream processes reply ...
+
+    Adapter <- Adapter : TurnCompleteEvent\n(with content)
+    Adapter -> Discord : forward response to DM
+    Adapter -> Adapter : track response message\nfor multi-turn replies
+    note right
+      Response message_id added
+      to _notify_ws_map — user can
+      reply again indefinitely
+    end note
+end
+
 == Service Registry (Background) ==
 
 note over Gateway, Storage

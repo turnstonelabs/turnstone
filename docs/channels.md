@@ -30,8 +30,8 @@ Key components:
 
 - **ChannelAdapter protocol** (`turnstone/channels/_protocol.py`) — generic
   interface for any messaging platform. Defines `start()`, `stop()`,
-  `send()`, `edit_message()`, `send_approval_request()`,
-  `send_plan_review()`, and `create_thread()`.
+  `send()`, `send_notification()`, `edit_message()`,
+  `send_approval_request()`, `send_plan_review()`, and `create_thread()`.
 - **ChannelRouter** (`turnstone/channels/_routing.py`) — maps
   channel/thread IDs to turnstone workstream IDs. Handles workstream
   creation via MQ, stale route detection, and user identity resolution.
@@ -271,12 +271,42 @@ gateway directly over HTTP:
 2. `_exec_notify()` queries the `services` table for healthy channel
    gateways (heartbeat within the last 120 seconds)
 3. The server mints a service JWT (`aud: turnstone-channel`) via
-   `ServiceTokenManager` and POSTs to the first healthy gateway
+   `ServiceTokenManager` and POSTs to the first healthy gateway. The
+   payload includes the originating `ws_id` for reply routing.
 4. The gateway validates the JWT, resolves the target, and calls
-   `adapter.send()` on the appropriate platform adapter
+   `adapter.send_notification()` which sends the message and tracks
+   the outgoing message ID for reply routing
 5. On failure, the server tries the next gateway. If all fail, it
    retries up to 2 more times (delays: 1s, 3s), re-querying the
    service registry on each attempt
+
+### Bidirectional Replies
+
+Notifications support multi-turn DM conversations. When a user replies
+to a notification DM:
+
+1. The bot looks up the originating `ws_id` from the tracked message ID
+   (`_notify_ws_map`)
+2. Verifies the replying user matches the original notification
+   recipient (defence in depth — Discord DMs are already private)
+3. Routes the reply to the workstream via `router.send_message()`
+4. Registers the DM channel for response forwarding
+   (`_notify_reply_channels`)
+5. When the workstream responds (`TurnCompleteEvent`), the response is
+   forwarded to the DM
+6. The response message is itself tracked, so the user can reply again
+   for another turn
+
+This enables scenarios like an oncall engineer responding to a CI/CD
+failure notification from their phone before opening a laptop.
+
+**Limits:**
+
+- Tracking map capped at 100 entries (FIFO eviction of oldest)
+- Entries cleaned up on workstream close/unsubscribe
+- Replying to an expired notification sends
+  *"This notification is no longer active."*
+- DM reply content capped at 4096 characters
 
 ### Service Registry
 
@@ -328,11 +358,17 @@ class ChannelAdapter(Protocol):
     async def start(self) -> None: ...
     async def stop(self) -> None: ...
     async def send(self, channel_id: str, content: str) -> str: ...
+    async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str: ...
     async def edit_message(self, channel_id: str, message_id: str, content: str) -> None: ...
     async def send_approval_request(self, channel_id: str, ws_id: str, correlation_id: str, items: list[dict]) -> None: ...
     async def send_plan_review(self, channel_id: str, ws_id: str, correlation_id: str, content: str) -> None: ...
     async def create_thread(self, parent_channel_id: str, name: str, message_id: str = "") -> str: ...
 ```
+
+`send_notification()` is like `send()` but associates the outgoing
+message with a `ws_id` so that user replies can be routed back to the
+originating workstream. Adapters must track the mapping from outgoing
+message ID to `(ws_id, target_user_id)` and handle DM replies.
 
 To add a new platform:
 

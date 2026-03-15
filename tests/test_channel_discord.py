@@ -21,7 +21,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _make_message(*, bot=False, guild=True, content="hello", channel=None):
+def _make_message(*, bot=False, guild=True, content="hello", channel=None, reference=None):
     """Build a mock ``discord.Message``."""
     msg = MagicMock(spec=discord.Message)
     msg.author = MagicMock()
@@ -31,6 +31,7 @@ def _make_message(*, bot=False, guild=True, content="hello", channel=None):
     msg.guild = MagicMock() if guild else None
     msg.channel = channel or MagicMock()
     msg.mentions = []
+    msg.reference = reference
     return msg
 
 
@@ -204,6 +205,8 @@ class TestMessageCog:
         ts.router.send_message = AsyncMock()
         ts.config = MagicMock()
         ts._ws_tasks = {}
+        ts._notify_ws_map = {}
+        ts._notify_reply_channels = {}
         bot.turnstone = ts
 
         cog = MessageCog(bot)
@@ -328,6 +331,7 @@ class TestWsEventFinalization:
         bot.config.auto_approve_tools = []
         bot._streaming = {}
         bot._pending_approval_msgs = {}
+        bot._notify_reply_channels = {}
 
         # Use the real _on_ws_event method
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
@@ -356,6 +360,7 @@ class TestWsEventFinalization:
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
         bot._pending_approval_msgs = {}
+        bot._notify_reply_channels = {}
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
 
         thread = AsyncMock()
@@ -387,6 +392,7 @@ class TestApprovalVerdictDisplay:
         bot.config.auto_approve_tools = []
         bot._streaming = {}
         bot._pending_approval_msgs = {}
+        bot._notify_reply_channels = {}
         bot._should_auto_approve = MagicMock(return_value=False)
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
         return bot
@@ -504,6 +510,7 @@ class TestApprovalVerdictDisplay:
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
         bot._pending_approval_msgs = {"ws-1": MagicMock()}
+        bot._notify_reply_channels = {}
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
 
         thread = AsyncMock()
@@ -511,6 +518,315 @@ class TestApprovalVerdictDisplay:
         _run(bot._on_ws_event("ws-1", thread, raw))
 
         assert "ws-1" not in bot._pending_approval_msgs
+
+
+class TestContentCatchup:
+    """TurnCompleteEvent with content field provides catch-up for missed ContentEvents."""
+
+    def _make_bot(self):
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot.config.streaming_edit_interval = 1.5
+        bot.config.auto_approve = False
+        bot.config.auto_approve_tools = []
+        bot._streaming = {}
+        bot._pending_approval_msgs = {}
+        bot._notify_reply_channels = {}
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        return bot
+
+    def test_catchup_sends_content_when_no_streaming(self):
+        """TurnCompleteEvent with content but no SM sends catch-up message."""
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        raw = TurnCompleteEvent(
+            ws_id="ws-1", correlation_id="", content="Caught up response"
+        ).to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        thread.send.assert_awaited_once_with("Caught up response")
+
+    def test_catchup_skipped_when_streaming_exists(self):
+        """TurnCompleteEvent with content and existing SM uses SM finalize, not catch-up."""
+        from turnstone.mq.protocol import ContentEvent, TurnCompleteEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        # Feed content event to create SM
+        content_raw = ContentEvent(ws_id="ws-1", text="Streamed").to_json()
+        _run(bot._on_ws_event("ws-1", thread, content_raw))
+        assert "ws-1" in bot._streaming
+
+        # Now TurnCompleteEvent with content — SM should be finalized, not catch-up
+        complete_raw = TurnCompleteEvent(
+            ws_id="ws-1", correlation_id="", content="Streamed"
+        ).to_json()
+        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+        assert "ws-1" not in bot._streaming
+
+    def test_catchup_empty_content_no_message(self):
+        """TurnCompleteEvent with empty content and no SM sends nothing."""
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="", content="").to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        thread.send.assert_not_awaited()
+
+
+class TestNotificationTracking:
+    """Tests for notification message tracking and DM reply routing."""
+
+    def test_send_notification_tracks_message(self):
+        """send_notification should store message_id -> (ws_id, target_user) mapping."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot._notify_ws_map = {}
+        bot._MAX_NOTIFY_TRACKING = 100
+        bot.send = AsyncMock(return_value="12345")
+        bot.send_notification = TurnstoneBot.send_notification.__get__(bot, TurnstoneBot)
+        bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
+
+        _run(bot.send_notification("chan-1", "Hello", "ws-abc"))
+
+        assert 12345 in bot._notify_ws_map
+        assert bot._notify_ws_map[12345] == ("ws-abc", "chan-1")
+
+    def test_send_notification_evicts_old_entries(self):
+        """Oldest notification tracking entries are evicted when cap is reached."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot._MAX_NOTIFY_TRACKING = 3
+        bot._notify_ws_map = {
+            1: ("ws-1", "u1"),
+            2: ("ws-2", "u2"),
+            3: ("ws-3", "u3"),
+        }
+        bot.send = AsyncMock(return_value="4")
+        bot.send_notification = TurnstoneBot.send_notification.__get__(bot, TurnstoneBot)
+        bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
+
+        _run(bot.send_notification("chan-1", "Hello", "ws-4"))
+
+        assert 4 in bot._notify_ws_map
+        assert 1 not in bot._notify_ws_map  # oldest evicted
+        assert len(bot._notify_ws_map) <= 3
+
+    def test_dm_reply_routes_to_workstream(self):
+        """DM reply to a tracked notification routes the message to the workstream."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts._is_allowed_channel = MagicMock(return_value=True)
+        ts.storage = MagicMock()
+        ts.router = MagicMock()
+        ts.router.resolve_user = AsyncMock(return_value="u_abc")
+        ts.router.send_message = AsyncMock()
+        ts.config = MagicMock()
+        # Maps message_id -> (ws_id, target_discord_user_id)
+        ts._notify_ws_map = {77777: ("ws-target", "12345")}
+        ts._notify_reply_channels = {}
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+
+        # Build a DM reply to the tracked notification message
+        ref = MagicMock()
+        ref.message_id = 77777
+        msg = _make_message(guild=False, content="additional context", reference=ref)
+        # msg.author.id defaults to 12345 from _make_message
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_awaited_once_with("ws-target", "additional context")
+        assert "ws-target" in ts._notify_reply_channels
+        dm_chan, target_uid = ts._notify_reply_channels["ws-target"]
+        assert target_uid == "12345"
+        assert 77777 not in ts._notify_ws_map  # cleaned up
+
+    def test_dm_reply_user_mismatch_rejected_and_preserved(self):
+        """DM reply from wrong user is rejected; entry re-inserted for legitimate user."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts.router = MagicMock()
+        ts.router.resolve_user = AsyncMock(return_value="u_abc")
+        ts.router.send_message = AsyncMock()
+        # Target user is "99999" but replying user has author.id = 12345
+        ts._notify_ws_map = {77777: ("ws-target", "99999")}
+        ts._notify_reply_channels = {}
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+        ref = MagicMock()
+        ref.message_id = 77777
+        msg = _make_message(guild=False, content="impostor", reference=ref)
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_not_awaited()
+        # Entry should be re-inserted so the legitimate user can still reply.
+        assert 77777 in ts._notify_ws_map
+        assert ts._notify_ws_map[77777] == ("ws-target", "99999")
+
+    def test_dm_reply_stale_notification_feedback(self):
+        """DM reply to an expired/unknown notification should inform the user."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts.router = MagicMock()
+        ts.router.send_message = AsyncMock()
+        ts._notify_ws_map = {}  # empty — no tracked notifications
+        ts._notify_reply_channels = {}
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+
+        ref = MagicMock()
+        ref.message_id = 99999  # not in map
+        dm_channel = AsyncMock()
+        msg = _make_message(guild=False, content="reply", reference=ref, channel=dm_channel)
+
+        _run(cog._on_message(msg))
+
+        # Should NOT route to any workstream
+        ts.router.send_message.assert_not_awaited()
+        # Should send feedback to the DM channel
+        dm_channel.send.assert_awaited_once_with("*This notification is no longer active.*")
+
+    def test_dm_without_reference_ignored(self):
+        """DM without a message reference should be ignored."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts.router = MagicMock()
+        ts.router.send_message = AsyncMock()
+        ts._notify_ws_map = {77777: ("ws-target", "12345")}
+        ts._notify_reply_channels = {}
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+        msg = _make_message(guild=False)  # reference=None
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_not_awaited()
+
+    def test_dm_reply_unlinked_user_ignored(self):
+        """DM reply from an unlinked user should be ignored."""
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts.router = MagicMock()
+        ts.router.resolve_user = AsyncMock(return_value=None)
+        ts.router.send_message = AsyncMock()
+        ts._notify_ws_map = {77777: ("ws-target", "12345")}
+        ts._notify_reply_channels = {}
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+
+        ref = MagicMock()
+        ref.message_id = 77777
+        msg = _make_message(guild=False, content="reply", reference=ref)
+
+        _run(cog._on_message(msg))
+
+        ts.router.send_message.assert_not_awaited()
+
+    def test_turn_complete_forwards_to_dm(self):
+        """TurnCompleteEvent should forward content to notification reply DM."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot._streaming = {}
+        bot._pending_approval_msgs = {}
+        bot._notify_ws_map = {}
+        bot._MAX_NOTIFY_TRACKING = 100
+
+        dm_channel = AsyncMock()
+        sent_msg = MagicMock()
+        sent_msg.id = 88888
+        dm_channel.send = AsyncMock(return_value=sent_msg)
+        bot._notify_reply_channels = {"ws-1": (dm_channel, "u123")}
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        bot._track_notification = TurnstoneBot._track_notification.__get__(bot, TurnstoneBot)
+
+        thread = AsyncMock()
+
+        raw = TurnCompleteEvent(
+            ws_id="ws-1", correlation_id="", content="Here's the response"
+        ).to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        # Should send to DM channel
+        dm_channel.send.assert_awaited_once_with("Here's the response")
+        # Should clean up forwarding
+        assert "ws-1" not in bot._notify_reply_channels
+        # Response message should be tracked for multi-turn replies
+        assert 88888 in bot._notify_ws_map
+        assert bot._notify_ws_map[88888] == ("ws-1", "u123")
+
+    def test_turn_complete_cleans_up_dm_even_without_content(self):
+        """TurnCompleteEvent without content should still clean up DM tracking."""
+        from turnstone.channels.discord.bot import TurnstoneBot
+        from turnstone.mq.protocol import TurnCompleteEvent
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot._streaming = {}
+        bot._pending_approval_msgs = {}
+        bot._notify_ws_map = {}
+
+        dm_channel = AsyncMock()
+        bot._notify_reply_channels = {"ws-1": (dm_channel, "u123")}
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+
+        thread = AsyncMock()
+
+        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="", content="").to_json()
+        _run(bot._on_ws_event("ws-1", thread, raw))
+
+        # DM should not be sent to (no content)
+        dm_channel.send.assert_not_awaited()
+        # But should still be cleaned up
+        assert "ws-1" not in bot._notify_reply_channels
+        # No response tracked (nothing was sent)
+        assert len(bot._notify_ws_map) == 0
 
 
 class TestChannelCLI:

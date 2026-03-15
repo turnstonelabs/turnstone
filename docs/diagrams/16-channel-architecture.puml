@@ -53,6 +53,7 @@ class "DiscordBot" as Bot <<service>> {
     +on_message(msg)
     +on_interaction(interaction)
     +send(channel_id, content)
+    +send_notification(channel_id, content, ws_id)
     +run(token)
     --
     discord.py Client
@@ -61,6 +62,9 @@ class "DiscordBot" as Bot <<service>> {
     Creates threads for workstreams
     Renders approval buttons
     escape_mentions() on send
+    --
+    _notify_ws_map: msg_id → (ws_id, user_id)
+    _notify_reply_channels: ws_id → (dm, user_id)
 }
 
 class "ChannelRouter" as Router <<service>> {
@@ -240,11 +244,20 @@ note bottom of SVC
   3. Queries services table for healthy gateways
   4. Mints JWT (aud: turnstone-channel) via
      ServiceTokenManager
-  5. POSTs to first healthy gateway
+  5. POSTs to first healthy gateway (incl. ws_id)
   6. Gateway validates JWT, resolves target
-  7. adapter.send() → Discord API
+  7. adapter.send_notification() → Discord API
+     (tracks msg_id → ws_id for reply routing)
   8. On failure: retry up to 3× (1s, 3s backoff)
   9. SSRF: only http(s) URLs allowed
+
+  **Bidirectional DM Replies**
+  1. User replies to notification DM
+  2. Bot looks up ws_id from _notify_ws_map
+  3. Verifies author == notification recipient
+  4. Routes reply via router.send_message()
+  5. Response forwarded to DM on TurnCompleteEvent
+  6. Response tracked for multi-turn conversation
 end note
 
 @enduml

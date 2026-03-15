@@ -124,6 +124,7 @@ class TurnstoneBot:
     """
 
     channel_type: str = "discord"
+    _MAX_NOTIFY_TRACKING: int = 100
 
     def __init__(
         self,
@@ -151,6 +152,16 @@ class TurnstoneBot:
         # workstream so that IntentVerdictEvent can update it with LLM judge
         # results.
         self._pending_approval_msgs: dict[str, discord.Message] = {}
+        # Notification reply tracking: maps Discord message ID →
+        # (ws_id, target_discord_user_id) so that DM replies can be routed
+        # back to the originating workstream.  The target user ID is checked
+        # on reply to prevent cross-user message injection.
+        self._notify_ws_map: dict[int, tuple[str, str]] = {}
+        # Temporary DM forwarding: maps ws_id → (DM channel, target_user_id)
+        # for forwarding the workstream's next response back to the
+        # notification reply DM.  The target_user_id is carried so the
+        # response message can be re-tracked for multi-turn DM conversations.
+        self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -256,6 +267,11 @@ class TurnstoneBot:
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pending_approval_msgs.pop(ws_id, None)
+        self._notify_reply_channels.pop(ws_id, None)
+        # Purge stale notification tracking entries for this workstream.
+        stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
+        for mid in stale:
+            del self._notify_ws_map[mid]
         log.info("discord.unsubscribed", ws_id=ws_id)
 
     # -- event dispatch ------------------------------------------------------
@@ -360,6 +376,26 @@ class TurnstoneBot:
             sm = self._streaming.pop(ws_id, None)
             if sm is not None:
                 await sm.finalize()
+            elif event.content:
+                # Catch-up: content events were missed (race between global
+                # SSE and per-ws SSE) — send the full response directly.
+                for chunk in chunk_message(event.content, self.config.max_message_length):
+                    await thread.send(chunk)
+            # Forward response to notification reply DM if active.
+            dm_entry = self._notify_reply_channels.pop(ws_id, None)
+            if dm_entry is not None and event.content:
+                dm_channel, target_user_id = dm_entry
+                last_msg: discord.Message | None = None
+                for chunk in chunk_message(event.content, self.config.max_message_length):
+                    try:
+                        last_msg = await dm_channel.send(chunk)
+                    except Exception:
+                        log.debug("discord.notify_reply_dm_failed", ws_id=ws_id)
+                        break
+                # Track the response message so the user can reply again
+                # for multi-turn DM conversations.
+                if last_msg is not None:
+                    self._track_notification(last_msg.id, ws_id, target_user_id)
             # Clean up pending approval message tracking.
             self._pending_approval_msgs.pop(ws_id, None)
 
@@ -389,6 +425,18 @@ class TurnstoneBot:
             if name not in allowed:
                 return False
         return True
+
+    def _track_notification(self, message_id: int, ws_id: str, target_user_id: str) -> None:
+        """Record a notification message for reply routing.
+
+        Evicts the oldest entry when the map exceeds
+        ``_MAX_NOTIFY_TRACKING``.  Relies on dict insertion order
+        (Python 3.7+).
+        """
+        while len(self._notify_ws_map) >= self._MAX_NOTIFY_TRACKING:
+            oldest = next(iter(self._notify_ws_map))
+            del self._notify_ws_map[oldest]
+        self._notify_ws_map[message_id] = (ws_id, target_user_id)
 
     def _is_allowed_channel(self, channel_id: int) -> bool:
         """Return True if *channel_id* is in the allowed list (or list is empty)."""
@@ -429,6 +477,26 @@ class TurnstoneBot:
             msg = await target.send(chunk)  # type: ignore[union-attr]
 
         return str(msg.id) if msg else ""
+
+    async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
+        """Send a notification DM and track the message for reply routing.
+
+        Like :meth:`send` but records a mapping from the outgoing Discord
+        message ID to ``(ws_id, channel_id)`` so that a user reply can be
+        routed back to the originating workstream.  The *channel_id* is the
+        Discord user ID the notification was sent to — verified on reply to
+        prevent cross-user message injection.
+        """
+        msg_id_str = await self.send(channel_id, content)
+        if msg_id_str and ws_id:
+            self._track_notification(int(msg_id_str), ws_id, channel_id)
+            log.debug(
+                "discord.notification_tracked",
+                message_id=msg_id_str,
+                ws_id=ws_id,
+                target_user=channel_id,
+            )
+        return msg_id_str
 
     async def stop(self) -> None:
         """Disconnect the bot and clean up subscriptions."""

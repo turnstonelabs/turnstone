@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -25,6 +26,9 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
+
+# ws_id is a hex string (8–32 chars depending on entry point).
+_WS_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 
 
 async def _handle_health(request: Request) -> JSONResponse:
@@ -81,6 +85,9 @@ async def _handle_notify(request: Request) -> JSONResponse:
     target = body.get("target")
     message = body.get("message", "").strip() if isinstance(body.get("message"), str) else ""
     title = body.get("title", "").strip() if isinstance(body.get("title"), str) else ""
+    ws_id = body.get("ws_id", "").strip() if isinstance(body.get("ws_id"), str) else ""
+    if ws_id and not _WS_ID_RE.match(ws_id):
+        return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
 
     if not target or not message:
         return JSONResponse({"error": "target and message are required"}, status_code=400)
@@ -132,7 +139,10 @@ async def _handle_notify(request: Request) -> JSONResponse:
             )
             continue
         try:
-            msg_id = await adapter.send(channel_id, content)
+            if ws_id:
+                msg_id = await adapter.send_notification(channel_id, content, ws_id)
+            else:
+                msg_id = await adapter.send(channel_id, content)
             results.append(
                 {
                     "channel_type": channel_type,

@@ -1200,8 +1200,13 @@ The bridge dispatches it to `POST /v1/api/cancel` on the server owning the works
 which sets the cooperative cancel flag and unblocks any pending approval/plan waits.
 
 **Completion detection:** The bridge tracks which `correlation_id` maps to which
-`ws_id` for active sends. When the global SSE reports `ws_state → idle` for a tracked
-workstream, the bridge emits a synthetic `TurnCompleteEvent` with the correlation ID.
+`ws_id` for active sends. Content tokens from the per-ws SSE stream are accumulated
+in a per-workstream buffer (`_ws_content_buffer`, capped at 256 KB). When the global
+SSE reports `ws_state → idle` for a tracked workstream, the bridge emits a synthetic
+`TurnCompleteEvent` carrying the correlation ID and the accumulated response text in
+`content`. This catch-up mechanism lets downstream consumers (e.g. the Discord bot)
+recover the full response even when individual `ContentEvent`s were missed due to the
+race between the two independent SSE connections.
 
 **Multi-node routing:** Each bridge retrieves its `node_id` from the server's
 `/health` endpoint on startup (with exponential backoff retry). The server
@@ -1365,11 +1370,23 @@ directly over HTTP for lower latency: `_exec_notify()` queries the
 `services` database table for healthy channel gateways (heartbeat within
 120 seconds), authenticates with a service JWT (`aud: turnstone-channel`),
 and POSTs to `POST /v1/api/notify` on the first healthy gateway. The
-gateway validates the JWT, resolves the target (username lookup via
+payload includes the originating `ws_id` for reply routing. The gateway
+validates the JWT, resolves the target (username lookup via
 `channel_users` or direct `channel_type`+`channel_id`), and delegates to
-the appropriate `ChannelAdapter.send()`. Delivery retries up to 3 times
-with backoff, re-querying the service registry on each attempt. See
-[Notification Flow diagram](diagrams/png/17-notify-flow.png).
+`ChannelAdapter.send_notification()` which sends the message and tracks
+the outgoing message ID → `(ws_id, target_user_id)` mapping. Delivery
+retries up to 3 times with backoff, re-querying the service registry on
+each attempt. See [Notification Flow diagram](diagrams/png/17-notify-flow.png).
+
+**Bidirectional replies:** When a user replies to a notification DM, the
+Discord bot looks up the originating `ws_id` from the tracked message ID,
+verifies the replying user matches the notification recipient, and routes
+the reply to the workstream via `router.send_message()`. The workstream's
+response is forwarded back to the DM via a temporary entry in
+`_notify_reply_channels`. On `TurnCompleteEvent`, the response message is
+itself tracked for further replies, enabling multi-turn DM conversations
+without requiring the user to open the web UI. Tracking entries are capped
+at 100 (FIFO eviction) and cleaned up on workstream close.
 
 ---
 

@@ -268,9 +268,15 @@ class TurnCompleteEvent(OutboundEvent):
     This is a synthetic event produced by the bridge when it detects
     the ws_state transition to 'idle'.  ``correlation_id`` is set for
     MQ-initiated turns and empty for turns initiated from the server UI.
+
+    ``content`` carries the full assistant response text accumulated from
+    per-ws SSE content tokens.  Downstream consumers (e.g. Discord bot) can
+    use it as a catch-up when the streaming path missed events due to the
+    race between the global SSE and per-ws SSE connections.
     """
 
     type: str = "turn_complete"
+    content: str = ""
 
 
 @dataclass

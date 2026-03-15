@@ -3963,6 +3963,7 @@ class ChatSession:
             "target": target,
             "message": item["message"],
             "title": item.get("title", ""),
+            "ws_id": self._ws_id,
         }
 
         # Build auth headers for service-to-service call

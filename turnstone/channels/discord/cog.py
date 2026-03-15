@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _THREAD_NAME_MAX = 100
+_DM_REPLY_MAX_LENGTH = 4096  # Discord's own message limit
 
 
 class MessageCog:
@@ -102,8 +103,9 @@ class MessageCog:
         if message.author == self.bot.user or message.author.bot:
             return
 
-        # Ignore DMs.
+        # DM handling — route replies to tracked notifications.
         if message.guild is None:
+            await self._handle_dm(message)
             return
 
         channel = message.channel
@@ -197,6 +199,61 @@ class MessageCog:
                 thread_id=thread.id,
                 author=str(message.author),
             )
+
+    # -- DM reply handling ---------------------------------------------------
+
+    async def _handle_dm(self, message: discord.Message) -> None:
+        """Route DM replies to tracked notification workstreams."""
+        # Only handle explicit replies to a tracked notification message.
+        ref = message.reference
+        if ref is None or ref.message_id is None:
+            return
+
+        # Atomic pop prevents TOCTOU race across await points.
+        entry = self.ts._notify_ws_map.pop(ref.message_id, None)
+        if entry is None:
+            # NOTE: This also fires for replies to non-notification bot
+            # messages in DMs (false positive).  Acceptable because DM
+            # interactions are almost exclusively notification-driven.
+            await message.channel.send("*This notification is no longer active.*")
+            return
+
+        ws_id, target_user_id = entry
+
+        # Defence in depth: verify the replying user is the notification
+        # recipient.  Discord enforces this (DMs are private), but a
+        # server-side check prevents cross-user injection via compromised
+        # accounts or API-level forgery.
+        if str(message.author.id) != target_user_id:
+            # Re-insert so the legitimate user can still reply.
+            self.ts._notify_ws_map[ref.message_id] = entry
+            log.warning(
+                "discord.notification_reply_user_mismatch",
+                expected=target_user_id,
+                actual=str(message.author.id),
+            )
+            return
+
+        # Resolve user identity — unlinked users are silently ignored.
+        user_id = await self.ts.router.resolve_user("discord", str(message.author.id))
+        if user_id is None:
+            return
+
+        # Route the reply to the originating workstream.
+        content = message.content[:_DM_REPLY_MAX_LENGTH]
+        await self.ts.router.send_message(ws_id, content)
+
+        # Register the DM channel for response forwarding.  The bot's
+        # _on_ws_event handler will send the next turn's response here,
+        # track the response for further replies, and clean up on
+        # TurnCompleteEvent.
+        self.ts._notify_reply_channels[ws_id] = (message.channel, target_user_id)
+
+        log.info(
+            "discord.notification_reply_routed",
+            ws_id=ws_id,
+            author=str(message.author),
+        )
 
     # -- slash commands ------------------------------------------------------
 
