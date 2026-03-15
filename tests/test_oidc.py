@@ -244,6 +244,18 @@ class TestLoadOIDCConfig:
 
         assert cfg.redirect_base == ""
 
+    def test_load_oidc_config_redirect_base_rejects_missing_hostname(self, monkeypatch):
+        """redirect_base without a hostname is rejected."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "https://")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == ""
+
     def test_load_oidc_config_redirect_base_allows_http(self, monkeypatch):
         """http:// redirect_base is allowed (with warning) for local dev."""
         monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")

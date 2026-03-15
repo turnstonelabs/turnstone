@@ -156,6 +156,12 @@ def load_oidc_config() -> OIDCConfig:
                 redirect_base,
             )
             redirect_base = ""
+        elif not parsed.hostname:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE missing hostname, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
         elif parsed.path or parsed.query or parsed.fragment:
             log.warning(
                 "TURNSTONE_OIDC_REDIRECT_BASE must be scheme://host[:port] only, ignoring: %s",
