@@ -338,6 +338,28 @@ class TestPlanExec:
         # Last user message in second call is the coaching message
         assert "did not follow" in captured_messages[1][-1]["content"]
 
+    def test_plan_includes_template_content(self, tmp_db, tmp_path, monkeypatch):
+        """Plan agent system message includes template guardrails."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        session._template_content = "SAFETY: Do not produce harmful plans."
+        _, _, messages = self._run_plan(session, "build something")
+        sys_content = messages[0]["content"]
+        assert "SAFETY: Do not produce harmful plans." in sys_content
+        assert ChatSession._PLAN_IDENTITY in sys_content
+        # Template appears before plan identity
+        tpl_pos = sys_content.index("SAFETY:")
+        identity_pos = sys_content.index("You are a planning agent.")
+        assert tpl_pos < identity_pos
+
+    def test_plan_no_template_is_identity_only(self, tmp_db, tmp_path, monkeypatch):
+        """Without templates, plan system message is exactly _PLAN_IDENTITY."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        assert session._template_content is None
+        _, _, messages = self._run_plan(session, "build something")
+        assert messages[0]["content"] == ChatSession._PLAN_IDENTITY
+
 
 # ---------------------------------------------------------------------------
 # Plan validation
@@ -556,6 +578,27 @@ class TestPlanRefinement:
         assert msgs[2]["content"] == self.GOOD_PLAN
         assert msgs[3]["role"] == "user"
         assert "add tests too" in msgs[3]["content"]
+
+    def test_refine_plan_includes_template_content(self, tmp_db, tmp_path, monkeypatch):
+        """_refine_plan system message includes template guardrails."""
+        monkeypatch.chdir(tmp_path)
+        session = _make_session()
+        session._template_content = "SAFETY: guardrails here"
+        captured = {}
+
+        def fake_run_agent(messages, **kwargs):
+            captured["messages"] = list(messages)
+            return self.GOOD_PLAN
+
+        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
+            session._refine_plan(self.GOOD_PLAN, "add auth", "add tests too")
+
+        sys_content = captured["messages"][0]["content"]
+        assert "SAFETY: guardrails here" in sys_content
+        assert ChatSession._PLAN_IDENTITY in sys_content
+        tpl_pos = sys_content.index("SAFETY:")
+        identity_pos = sys_content.index("You are a planning agent.")
+        assert tpl_pos < identity_pos
 
 
 # ---------------------------------------------------------------------------
