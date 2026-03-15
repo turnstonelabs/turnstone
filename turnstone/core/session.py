@@ -3554,6 +3554,7 @@ class ChatSession:
             return self._PLAN_IDENTITY
         tpl = self._template_content
         if len(tpl) > _MAX_TEMPLATE_CONTENT:
+            log.warning("template_content.truncated", length=len(tpl), agent="plan")
             tpl = tpl[:_MAX_TEMPLATE_CONTENT]
         return tpl + "\n\n" + self._PLAN_IDENTITY
 
@@ -3635,7 +3636,8 @@ class ChatSession:
                                 break
 
         # Plan agent gets template guardrails + its own identity — no tool
-        # patterns, MCP resources, or conversation history.
+        # patterns, MCP resources, or general conversation history (only
+        # prior plan tool_call/result pairs are forwarded for refinement).
         agent_messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._plan_system_content()},
         ]

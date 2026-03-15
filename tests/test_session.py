@@ -349,7 +349,7 @@ class TestPlanExec:
         assert ChatSession._PLAN_IDENTITY in sys_content
         # Template appears before plan identity
         tpl_pos = sys_content.index("SAFETY:")
-        identity_pos = sys_content.index("You are a planning agent.")
+        identity_pos = sys_content.index(ChatSession._PLAN_IDENTITY)
         assert tpl_pos < identity_pos
 
     def test_plan_no_template_is_identity_only(self, tmp_db, tmp_path, monkeypatch):
@@ -597,7 +597,7 @@ class TestPlanRefinement:
         assert "SAFETY: guardrails here" in sys_content
         assert ChatSession._PLAN_IDENTITY in sys_content
         tpl_pos = sys_content.index("SAFETY:")
-        identity_pos = sys_content.index("You are a planning agent.")
+        identity_pos = sys_content.index(ChatSession._PLAN_IDENTITY)
         assert tpl_pos < identity_pos
 
 
