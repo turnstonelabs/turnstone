@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.6.1",
+    "version": "0.6.2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -2045,6 +2045,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListWsTemplateSummaryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/templates": {
+      "get": {
+        "summary": "List available prompt templates (summary)",
+        "operationId": "v1_api_templates_get",
+        "tags": [
+          "Templates"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListPromptTemplateSummaryResponse"
                 }
               }
             }
@@ -5946,6 +5967,54 @@
           }
         },
         "title": "McpReloadResponse",
+        "type": "object"
+      },
+      "PromptTemplateSummary": {
+        "properties": {
+          "name": {
+            "description": "Template name",
+            "title": "Name",
+            "type": "string"
+          },
+          "category": {
+            "default": "",
+            "description": "Template category",
+            "title": "Category",
+            "type": "string"
+          },
+          "is_default": {
+            "default": false,
+            "description": "Whether this template is applied by default",
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "origin": {
+            "default": "manual",
+            "description": "Template origin: manual or mcp",
+            "title": "Origin",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "PromptTemplateSummary",
+        "type": "object"
+      },
+      "ListPromptTemplateSummaryResponse": {
+        "properties": {
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/PromptTemplateSummary"
+            },
+            "title": "Templates",
+            "type": "array"
+          }
+        },
+        "required": [
+          "templates"
+        ],
+        "title": "ListPromptTemplateSummaryResponse",
         "type": "object"
       }
     }

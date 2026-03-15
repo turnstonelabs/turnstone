@@ -159,6 +159,20 @@ export interface ListPromptTemplateSummaryResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Server API — Workstream templates
+// ---------------------------------------------------------------------------
+
+export interface WsTemplateSummary {
+  name: string;
+  description: string;
+  model: string;
+}
+
+export interface ListWsTemplateSummaryResponse {
+  ws_templates: WsTemplateSummary[];
+}
+
+// ---------------------------------------------------------------------------
 // Server API — Health
 // ---------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import type {
   ListMemoriesResponse,
   ListPromptTemplateSummaryResponse,
   ListSavedWorkstreamsResponse,
+  ListWsTemplateSummaryResponse,
   ListWorkstreamsResponse,
   MemoryInfo,
   SaveMemoryRequest,
@@ -201,6 +202,10 @@ export class TurnstoneServer extends BaseClient {
 
   async listTemplates(): Promise<ListPromptTemplateSummaryResponse> {
     return this.request("GET", "/v1/api/templates");
+  }
+
+  async listWsTemplates(): Promise<ListWsTemplateSummaryResponse> {
+    return this.request("GET", "/v1/api/ws-templates");
   }
 
   // -- Memories -------------------------------------------------------------

@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Any
 
+from turnstone.api.console_schemas import ListWsTemplateSummaryResponse
 from turnstone.api.schemas import (
     AuthLoginResponse,
     AuthSetupResponse,
@@ -243,6 +244,11 @@ class AsyncTurnstoneServer(_BaseClient):
     async def list_templates(self) -> ListPromptTemplateSummaryResponse:
         return await self._request(
             "GET", "/v1/api/templates", response_model=ListPromptTemplateSummaryResponse
+        )
+
+    async def list_ws_templates(self) -> ListWsTemplateSummaryResponse:
+        return await self._request(
+            "GET", "/v1/api/ws-templates", response_model=ListWsTemplateSummaryResponse
         )
 
     # -- memories ------------------------------------------------------------
@@ -493,6 +499,9 @@ class TurnstoneServer:
 
     def list_templates(self) -> ListPromptTemplateSummaryResponse:
         return self._runner.run(self._async.list_templates())
+
+    def list_ws_templates(self) -> ListWsTemplateSummaryResponse:
+        return self._runner.run(self._async.list_ws_templates())
 
     # -- memories ------------------------------------------------------------
 
