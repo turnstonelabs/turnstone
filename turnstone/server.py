@@ -1547,6 +1547,20 @@ async def auth_setup(request: Request) -> Response:
     return await handle_auth_setup(request, JWT_AUD_SERVER)
 
 
+async def oidc_authorize(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/authorize — redirect to OIDC provider."""
+    from turnstone.core.auth import handle_oidc_authorize
+
+    return await handle_oidc_authorize(request, JWT_AUD_SERVER)
+
+
+async def oidc_callback(request: Request) -> Response:
+    """GET /v1/api/auth/oidc/callback — OIDC callback, exchange code for JWT."""
+    from turnstone.core.auth import handle_oidc_callback
+
+    return await handle_oidc_callback(request, JWT_AUD_SERVER)
+
+
 def config_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/config-reload — invalidate config cache."""
     cs = getattr(request.app.state, "config_store", None)
@@ -1662,6 +1676,25 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Start watch runner (periodic command polling)
     if app.state.watch_runner:
         app.state.watch_runner.start()
+    # OIDC discovery (if configured)
+    oidc_config = app.state.oidc_config
+    if oidc_config.enabled:
+        from turnstone.core.oidc import discover_oidc
+
+        try:
+            from turnstone.core.oidc import fetch_jwks
+
+            oidc_config = await discover_oidc(oidc_config)
+            app.state.oidc_config = oidc_config
+            if oidc_config.enabled and oidc_config.jwks_uri:
+                app.state.jwks_data = await fetch_jwks(oidc_config.jwks_uri)
+                log.info(
+                    "OIDC enabled: %s (%s)",
+                    oidc_config.provider_name,
+                    oidc_config.issuer,
+                )
+        except Exception:
+            log.warning("OIDC discovery failed — OIDC login disabled")
     yield
     # Shutdown
     if app.state.watch_runner:
@@ -1752,6 +1785,8 @@ def create_app(
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
+                    Route("/api/auth/oidc/authorize", oidc_authorize),
+                    Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/_internal/config-reload", config_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-status", internal_mcp_status),
@@ -1788,6 +1823,14 @@ def create_app(
     from turnstone.core.auth import LoginRateLimiter
 
     app.state.login_limiter = LoginRateLimiter()
+
+    # OIDC configuration (opt-in via env vars)
+    from turnstone.core.oidc import load_oidc_config
+
+    oidc_config = load_oidc_config()
+    app.state.oidc_config = oidc_config
+    app.state.jwks_data = None  # populated after async discovery
+
     return app
 
 

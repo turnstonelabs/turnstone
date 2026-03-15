@@ -177,6 +177,20 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=StatusResponse,
         tags=["Auth"],
     ),
+    EndpointSpec(
+        "/v1/api/auth/oidc/authorize",
+        "GET",
+        "Redirect to OIDC provider for SSO login",
+        error_codes=[403, 404, 503],
+        tags=["Auth"],
+    ),
+    EndpointSpec(
+        "/v1/api/auth/oidc/callback",
+        "GET",
+        "OIDC callback — exchange code for JWT session",
+        error_codes=[302],
+        tags=["Auth"],
+    ),
     # --- Memories ---
     EndpointSpec(
         "/v1/api/memories",

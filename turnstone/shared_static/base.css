@@ -377,6 +377,55 @@ body {
 #login-error { color: var(--red); font-size: 12px; margin-bottom: 8px; display: none; }
 @media (max-width: 380px) { #login-box { padding: 28px 20px; } }
 
+/* OIDC / SSO */
+.oidc-btn {
+  width: 100%;
+  padding: 11px;
+  background: var(--bg-highlight);
+  color: var(--fg-bright);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  letter-spacing: 0.02em;
+}
+.oidc-btn:hover {
+  background: var(--bg-elevated);
+  border-color: var(--accent);
+}
+.oidc-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.oidc-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.oidc-divider {
+  display: flex;
+  align-items: center;
+  margin: 16px 0;
+  gap: 12px;
+}
+.oidc-divider::before,
+.oidc-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-strong);
+}
+.oidc-divider span {
+  font-family: var(--font-display);
+  font-size: 10px;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
 /* ==========================================================================
    Keyboard shortcuts overlay
    ========================================================================== */

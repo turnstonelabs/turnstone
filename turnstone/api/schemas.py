@@ -155,6 +155,9 @@ class AuthStatusResponse(BaseModel):
     auth_enabled: bool
     has_users: bool
     setup_required: bool
+    oidc_enabled: bool = False
+    oidc_provider_name: str = ""
+    password_enabled: bool = True
 
 
 # ---------------------------------------------------------------------------

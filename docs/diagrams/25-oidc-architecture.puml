@@ -1,0 +1,147 @@
+@startuml
+!theme plain
+title Turnstone — OIDC Authorization Code Flow with PKCE
+
+skinparam participant {
+    BackgroundColor<<browser>> #E8EAF6
+    BackgroundColor<<server>> #FFE0B2
+    BackgroundColor<<storage>> #B3E5FC
+    BackgroundColor<<idp>> #C8E6C9
+}
+
+participant "Browser" as Browser <<browser>>
+participant "Turnstone\n(Server / Console)" as Server <<server>>
+database "SQLite /\nPostgreSQL" as DB <<storage>>
+participant "Identity Provider\n(IdP)" as IdP <<idp>>
+
+== Page Load ==
+
+Browser -> Server : GET /v1/api/auth/status
+Server --> Browser : {oidc_enabled: true,\noidc_provider_name: "...",\npassword_enabled: true}
+
+note right of Browser
+  Login screen renders
+  "Continue with {provider_name}"
+  button alongside password form.
+  If password_enabled=false,
+  only the SSO button is shown.
+end note
+
+== Authorization Request ==
+
+Browser -> Server : GET /v1/api/auth/oidc/authorize
+
+Server -> Server : Generate state (random)\nnonce (random)\nPKCE code_verifier + code_challenge
+
+Server -> DB : create_oidc_pending_state(\nstate, nonce, code_verifier, audience)
+note right of DB
+  Stored with created_at timestamp.
+  Expires after 5 minutes.
+end note
+
+Server --> Browser : 302 Redirect to IdP\nauthorization_endpoint
+
+Browser -> IdP : GET /authorize?\nresponse_type=code&\nclient_id=...&\nredirect_uri=...&\nscope=openid email profile&\nstate=...&nonce=...&\ncode_challenge=...&\ncode_challenge_method=S256
+
+== User Authentication (at IdP) ==
+
+IdP -> Browser : Login page (if no\nexisting IdP session)
+Browser -> IdP : User authenticates\n(username/password, MFA, etc.)
+
+IdP --> Browser : 302 Redirect to callback\n?code=AUTH_CODE&state=STATE
+
+== Callback Processing ==
+
+Browser -> Server : GET /v1/api/auth/oidc/callback\n?code=AUTH_CODE&state=STATE
+
+Server -> Server : Rate limit check\n(5 per 5min per IP)
+
+Server -> DB : cleanup_expired_oidc_states(300)
+note right of DB
+  Lazy cleanup of states
+  older than 5 minutes.
+end note
+
+Server -> DB : pop_oidc_pending_state(state)
+DB --> Server : {nonce, code_verifier, audience}
+note right of Server
+  Atomic fetch-and-delete.
+  Returns None if state is
+  expired or unknown.
+end note
+
+== Token Exchange ==
+
+Server -> IdP : POST /token\ngrant_type=authorization_code&\ncode=AUTH_CODE&\nclient_id=...&\nclient_secret=...&\ncode_verifier=...&\nredirect_uri=...
+note right of Server
+  Client secret + PKCE verifier
+  sent server-side only.
+  Never exposed to browser.
+end note
+
+IdP --> Server : {id_token: "eyJ...",\naccess_token: "..."}
+
+== ID Token Validation ==
+
+Server -> IdP : Fetch JWKS public keys\n(cached, refreshed hourly)
+
+Server -> Server : Validate ID token:\n1. Verify signature (RS256/ES256)\n2. Check iss == configured issuer\n3. Check aud == client_id\n4. Check exp (not expired)\n5. Verify nonce matches
+
+== User Provisioning ==
+
+Server -> DB : get_oidc_identity(issuer, sub)
+
+alt Existing identity found
+    DB --> Server : {user_id, ...}
+    Server -> DB : update_oidc_identity_login()\nupdate last_login timestamp
+    Server -> DB : get_user(user_id)
+    DB --> Server : user record
+else New user (first login)
+    Server -> Server : Derive username from\npreferred_username / email
+    Server -> DB : create_user(user_id, username,\ndisplay_name, "!oidc")
+    note right of DB
+      Password hash set to sentinel
+      value "!oidc" — not a valid
+      bcrypt hash, so password login
+      is always rejected.
+    end note
+    Server -> DB : create_oidc_identity(\nissuer, sub, user_id, email)
+end
+
+opt Role mapping configured
+    Server -> Server : Read role_claim from ID token\nMap values via role_map
+    Server -> DB : assign_role(user_id, role_id)\n(additive only)
+end
+
+== Issue Turnstone JWT ==
+
+Server -> Server : Load user permissions\nDerive scopes from permissions
+Server -> Server : Create JWT (HS256)\nsub: user_id\nscopes: read,write,...\nsrc: "oidc"\naud: turnstone-server\nexp: +24h
+
+Server --> Browser : 302 Redirect to /?oidc_success=1\nSet-Cookie: session=JWT\n(HttpOnly, SameSite=Lax, Secure)
+
+== Browser Success Detection ==
+
+Browser -> Browser : Detect ?oidc_success=1\nStrip param from URL\n(history.replaceState)
+Browser -> Browser : Hide login overlay\nCall onLoginSuccess()
+
+note right of Browser
+  Browser is now authenticated.
+  JWT cookie sent on all
+  subsequent requests.
+end note
+
+== Error Paths ==
+
+note over Browser, IdP
+  **Error handling:**
+  - IdP returns error param → redirect to /?oidc_error=...
+  - State missing/expired → redirect to /?oidc_error=Login+session+expired
+  - Token exchange fails → redirect to /?oidc_error=...
+  - ID token validation fails → redirect to /?oidc_error=...
+  - No admin user exists → redirect to /?oidc_error=Initial+setup+required
+  - Rate limit exceeded → redirect to /?oidc_error=Too+many+login+attempts
+  All errors are shown as toast messages on the login screen.
+end note
+
+@enduml

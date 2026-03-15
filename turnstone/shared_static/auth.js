@@ -47,6 +47,18 @@ function initLogin() {
   overlay.innerHTML = _buildLoginHTML();
   document.body.appendChild(overlay);
   _bindLoginEvents();
+
+  // OIDC callback: detect success or error from URL params
+  var _oidcParams = new URLSearchParams(window.location.search);
+  var _oidcError = _oidcParams.get("oidc_error");
+  if (_oidcError) {
+    showLogin();
+    _showError(decodeURIComponent(_oidcError));
+    history.replaceState({}, "", window.location.pathname);
+  } else if (_oidcParams.get("oidc_success")) {
+    history.replaceState({}, "", window.location.pathname);
+    _onSuccess();
+  }
 }
 
 function _buildLoginHTML() {
@@ -57,6 +69,11 @@ function _buildLoginHTML() {
     "</h2>" +
     '<div id="login-subtitle" class="login-subtitle"></div>' +
     '<div id="login-error" role="alert" aria-live="assertive"></div>' +
+    // --- OIDC SSO button ---
+    '<div id="oidc-section" style="display:none">' +
+    '<button id="oidc-btn" class="oidc-btn" type="button">Continue with SSO</button>' +
+    '<div id="oidc-divider" class="oidc-divider"><span>or</span></div>' +
+    "</div>" +
     // --- Setup mode fields ---
     '<div id="setup-fields" style="display:none">' +
     '<label for="setup-username" class="login-label">Username</label>' +
@@ -158,6 +175,31 @@ function _switchMode(mode) {
   }
 }
 
+function _updateOIDCUI(data) {
+  var section = document.getElementById("oidc-section");
+  var btn = document.getElementById("oidc-btn");
+  var divider = document.getElementById("oidc-divider");
+  if (!section) return;
+
+  if (!data.oidc_enabled || _authMode === "setup") {
+    section.style.display = "none";
+    return;
+  }
+
+  section.style.display = "";
+  btn.textContent = "Continue with " + (data.oidc_provider_name || "SSO");
+  btn.onclick = function () {
+    window.location.href = "/v1/api/auth/oidc/authorize";
+  };
+
+  if (data.password_enabled === false) {
+    document.getElementById("login-fields").style.display = "none";
+    document.getElementById("login-toggle").style.display = "none";
+    document.getElementById("login-submit").style.display = "none";
+    divider.style.display = "none";
+  }
+}
+
 function _clearError() {
   var errEl = document.getElementById("login-error");
   if (errEl && errEl.style.display !== "none") {
@@ -194,6 +236,7 @@ function showLogin() {
       } else {
         _switchMode("login");
       }
+      _updateOIDCUI(data);
     })
     .catch(function () {
       // Fallback to login mode

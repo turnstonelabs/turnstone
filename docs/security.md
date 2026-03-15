@@ -54,7 +54,7 @@ Claims:
 |-------|-------------|
 | `sub` | User ID |
 | `scopes` | Comma-separated scope list (`read,write,approve`) |
-| `src` | Token source (`password`, `api_token`, `config`) |
+| `src` | Token source (`password`, `api_token`, `config`, `oidc`) |
 | `iss` | Issuer — always `turnstone` |
 | `aud` | Audience — `turnstone-server` or `turnstone-console` |
 | `iat` | Issued-at timestamp |
@@ -90,7 +90,8 @@ Scopes are hierarchical — higher scopes imply all lower ones.
 
 Public paths bypass authentication entirely: `/`, `/health`, `/metrics`,
 `/static/*`, `/shared/*`, `/docs`, `/openapi.json`, `/api/auth/login`,
-`/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`.
+`/api/auth/logout`, `/api/auth/status`, `/api/auth/setup`,
+`/api/auth/oidc/authorize`, `/api/auth/oidc/callback`.
 
 ### RBAC (Granular Permissions)
 
@@ -198,6 +199,91 @@ Response:
 
 The response also sets an `HttpOnly` session cookie containing the JWT,
 so the browser is immediately authenticated after setup completes.
+
+### OIDC SSO (Single Sign-On)
+
+Turnstone supports OIDC Authorization Code Flow with PKCE for
+single sign-on with external identity providers (Okta, Azure AD,
+Google, etc.). SSO is opt-in — enabled when the three required
+environment variables are set. Users are auto-provisioned on first
+login.
+
+#### Configuration
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TURNSTONE_OIDC_ISSUER` | Yes | OIDC issuer URL (e.g., `https://accounts.google.com`) |
+| `TURNSTONE_OIDC_CLIENT_ID` | Yes | Client ID from the identity provider |
+| `TURNSTONE_OIDC_CLIENT_SECRET` | Yes | Client secret (confidential client) |
+| `TURNSTONE_OIDC_SCOPES` | No | OIDC scopes (default: `openid email profile`) |
+| `TURNSTONE_OIDC_PROVIDER_NAME` | No | Display name for the SSO button (default: `SSO`) |
+| `TURNSTONE_OIDC_ROLE_CLAIM` | No | Claim name in the ID token for role mapping (e.g., `groups`) |
+| `TURNSTONE_OIDC_ROLE_MAP` | No | Comma-separated `claim_value:role_id` pairs (e.g., `admin:builtin-admin,eng:builtin-operator`) |
+| `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | Set to `false` to hide password login and force SSO-only |
+
+OIDC is enabled when all three required variables (`ISSUER`,
+`CLIENT_ID`, `CLIENT_SECRET`) are set.
+
+#### Login flow
+
+1. User clicks "Continue with [Provider]" on the login page
+2. `GET /v1/api/auth/oidc/authorize` generates state, nonce, and PKCE
+   challenge, stores them in the database, and redirects to the IdP
+3. User authenticates at the identity provider
+4. IdP redirects to `/v1/api/auth/oidc/callback` with `code` + `state`
+5. Server validates state, exchanges the authorization code (with PKCE
+   verifier), and validates the ID token (JWKS signature, issuer,
+   audience, nonce)
+6. Provisions or matches the user by `(issuer, sub)` — never by
+   username or email
+7. Issues a JWT (`src: oidc`), sets a session cookie, and redirects to
+   the application
+
+#### Security measures
+
+- **PKCE (S256)** — prevents authorization code interception
+- **State parameter** — one-time use, 5-minute TTL, database-backed
+  (multi-node safe)
+- **Nonce** — prevents ID token replay
+- **JWKS validation** — asymmetric algorithms only (RS/ES/PS), no HMAC
+- **Algorithm from JWKS key, not token header** — prevents algorithm
+  confusion attacks
+- **Identity matching by (issuer, sub) only** — prevents account
+  takeover via email or username reuse
+- **`password_enabled=false` enforced server-side** — not just a UI
+  toggle
+- **Rate limiting** on both authorize and callback endpoints
+- **OIDC-provisioned users cannot password-login** — the password hash
+  is set to the `!oidc` sentinel, which never matches bcrypt verify
+
+#### Role mapping
+
+When `TURNSTONE_OIDC_ROLE_CLAIM` is set (e.g., `groups`), the server
+reads that claim from the ID token and maps values to Turnstone roles
+via `TURNSTONE_OIDC_ROLE_MAP`. Roles are synced on every login:
+matching claim values are added, and stale OIDC-assigned roles are
+revoked. Roles assigned manually (not by OIDC) are never touched.
+
+If no role mapping is configured, OIDC users are provisioned with the
+`builtin-viewer` role by default.
+
+#### OIDC-only mode
+
+Setting `TURNSTONE_OIDC_PASSWORD_ENABLED=false` hides the password
+form on the login page and blocks password-based login at the API
+level. The setup wizard always works regardless of this setting — the
+first admin user is created with a password before OIDC is relevant.
+API tokens and config-file tokens are unaffected by this setting.
+
+#### Known limitations
+
+- **No session revocation** — deprovisioned IdP users retain their JWT
+  until the 24-hour expiry
+- **Single IdP** — configuration supports one issuer (the database
+  schema supports multiple for future expansion)
+- **Redirect URI derived from Host header** — deployments behind
+  reverse proxies should set `TURNSTONE_OIDC_REDIRECT_BASE` to the
+  externally-reachable origin (tech debt — not yet implemented)
 
 ---
 
@@ -483,3 +569,13 @@ and browsers enforce same-origin policy.
   refresh, eliminating long-lived static tokens for inter-service auth.
 - **Secret strength validation** — warning logged when JWT secret is
   shorter than 32 characters.
+- **OIDC PKCE enforcement** — S256 code challenge on every
+  authorization request prevents code interception in transit.
+- **OIDC state/nonce in database** — one-time-use, TTL-bounded tokens
+  stored in the database, safe for multi-node deployments.
+- **OIDC JWKS-only validation** — ID tokens are verified using the
+  provider's published JWKS keys with asymmetric algorithms only;
+  HMAC-based algorithms are rejected to prevent algorithm confusion.
+- **OIDC identity binding by (issuer, sub)** — user matching uses the
+  immutable subject identifier, not email or username, preventing
+  account takeover via IdP attribute changes.

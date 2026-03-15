@@ -93,6 +93,16 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `TURNSTONE_JWT_SECRET` — JWT signing secret (required if auth enabled)
 - `TURNSTONE_AUTH_TOKEN` — Static bearer token for inter-service auth
 
+### OIDC SSO (optional)
+- `TURNSTONE_OIDC_ISSUER` — OIDC issuer URL (e.g., https://accounts.google.com). Setting this + CLIENT_ID + CLIENT_SECRET enables SSO.
+- `TURNSTONE_OIDC_CLIENT_ID` — Client ID from the identity provider
+- `TURNSTONE_OIDC_CLIENT_SECRET` — Client secret (confidential client)
+- `TURNSTONE_OIDC_PROVIDER_NAME` — Display name for the SSO button (default: "SSO")
+- `TURNSTONE_OIDC_SCOPES` — OIDC scopes (default: "openid email profile")
+- `TURNSTONE_OIDC_ROLE_CLAIM` — Claim name for role mapping (e.g., "groups")
+- `TURNSTONE_OIDC_ROLE_MAP` — Comma-separated claim_value:role_id pairs (e.g., "admin:builtin-admin,eng:builtin-operator")
+- `TURNSTONE_OIDC_PASSWORD_ENABLED` — Set to "false" to hide password login and force SSO-only
+
 ### Ports
 - `SERVER_PORT` — Server port (default: 8080)
 - `CONSOLE_PORT` — Console port (default: 8090)
@@ -121,6 +131,10 @@ This is a one-time endpoint that only works when zero users exist.
 
 Subsequent governance setup (roles, policies, templates) uses the console admin API \
 with the JWT returned from setup.
+
+If OIDC is configured, users can also log in via the "Continue with [Provider]" button on the login page.
+The first admin user must still be created via the setup wizard (OIDC login requires at least one user to exist).
+OIDC users are auto-provisioned on first login with a default viewer role unless role mapping is configured.
 
 ## Runtime Settings (ConfigStore)
 After the stack is running, ~40 runtime settings (model, temperature, max_tokens, \
@@ -157,7 +171,10 @@ Walk the user through setting up their deployment step by step:
 PostgreSQL is required for cluster mode.
 5. **Security**: Recommend enabling auth for any non-local deployment. \
 Use `generate_secret` for JWT secret, Redis password, auth token, and Postgres password. \
-Ask for initial admin username and password.
+Ask for initial admin username and password. \
+If the user's deployment will use an external identity provider (Okta, Azure AD, Google, etc.), \
+offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \
+Optionally configure role mapping and OIDC-only mode.
 6. **Ports**: Check defaults with `check_port`, suggest alternatives if conflicts.
 7. **Optional features**: Discord integration, web search (Tavily key), \
 DuckDuckGo Search MCP (for cluster — uses `ddgCluster` profile with \
