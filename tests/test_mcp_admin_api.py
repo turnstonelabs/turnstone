@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from starlette.applications import Starlette
@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 from turnstone.console.server import (
+    _collect_mcp_status,
+    _notify_nodes_mcp_reload,
     admin_create_mcp_server,
     admin_delete_mcp_server,
     admin_get_mcp_server,
@@ -537,3 +539,157 @@ class TestPermission:
     def test_delete_without_permission(self, client_no_perm):
         r = client_no_perm.delete(f"/v1/api/admin/mcp-servers/{uuid.uuid4().hex}")
         assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _collect_mcp_status / _notify_nodes_mcp_reload
+# ---------------------------------------------------------------------------
+
+
+def _fake_request(*nodes: dict[str, Any], proxy_client: Any = None) -> MagicMock:
+    """Build a minimal mock request with collector and proxy_client."""
+    collector = MagicMock()
+    collector.get_nodes.return_value = (list(nodes), len(nodes))
+    req = MagicMock()
+    req.app.state.collector = collector
+    req.app.state.proxy_client = proxy_client or AsyncMock()
+    req.app.state.proxy_token_mgr = None
+    req.app.state.proxy_auth_token = "tok"
+    return req
+
+
+def _mock_resp(status_code: int = 200, json_data: Any = None) -> MagicMock:
+    """Build a mock httpx response (sync .json(), like the real thing)."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = json_data or {}
+    return resp
+
+
+class TestCollectMcpStatus:
+    @pytest.mark.anyio
+    async def test_returns_servers_on_200(self):
+        resp = _mock_resp(200, {"servers": {"s1": {"status": "ok"}}})
+        client = AsyncMock()
+        client.get.return_value = resp
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {"n1": {"s1": {"status": "ok"}}}
+
+    @pytest.mark.anyio
+    async def test_skips_non_200(self):
+        client = AsyncMock()
+        client.get.return_value = _mock_resp(503)
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            {"node_id": "n2"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+        client.get.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_handles_exception(self):
+        client = AsyncMock()
+        client.get.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _collect_mcp_status(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        ok_resp = _mock_resp(200, {"servers": {"s1": {"status": "ok"}}})
+        err_resp = _mock_resp(500)
+
+        client = AsyncMock()
+        client.get.side_effect = [ok_resp, ConnectionError("down"), err_resp]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            {"node_id": "n3", "server_url": "http://n3:8000"},
+            proxy_client=client,
+        )
+        result = await _collect_mcp_status(req)
+        assert result == {"n1": {"s1": {"status": "ok"}}}
+
+
+class TestNotifyNodesMcpReload:
+    @pytest.mark.anyio
+    async def test_returns_json_on_success(self):
+        client = AsyncMock()
+        client.post.return_value = _mock_resp(200, {"reloaded": 3})
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result == {"n1": {"reloaded": 3}}
+
+    @pytest.mark.anyio
+    async def test_skips_nodes_without_url(self):
+        client = AsyncMock()
+        req = _fake_request(
+            {"node_id": "n1", "server_url": ""},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result == {}
+        client.post.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_records_error_on_exception(self):
+        client = AsyncMock()
+        client.post.side_effect = ConnectionError("refused")
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert "n1" in result
+        assert "error" in result["n1"]
+        assert "refused" in result["n1"]["error"]
+
+    @pytest.mark.anyio
+    async def test_empty_cluster(self):
+        req = _fake_request()
+        result = await _notify_nodes_mcp_reload(req)
+        assert result == {}
+
+    @pytest.mark.anyio
+    async def test_multiple_nodes_mixed(self):
+        client = AsyncMock()
+        client.post.side_effect = [
+            _mock_resp(200, {"reloaded": 2}),
+            TimeoutError("timeout"),
+        ]
+        req = _fake_request(
+            {"node_id": "n1", "server_url": "http://n1:8000"},
+            {"node_id": "n2", "server_url": "http://n2:8000"},
+            proxy_client=client,
+        )
+        result = await _notify_nodes_mcp_reload(req)
+        assert result["n1"] == {"reloaded": 2}
+        assert "error" in result["n2"]
