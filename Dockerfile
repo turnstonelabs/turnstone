@@ -1,29 +1,14 @@
 # =============================================================================
-# Turnstone — multi-stage Docker build
+# Turnstone — Docker build with uv for reproducible, locked installs
 # Single image for all services: server, bridge, console, sim, eval
 # =============================================================================
 
-# ----------------------------------------------------------------------------
-# Stage 1: Builder — build the wheel
-# ----------------------------------------------------------------------------
-FROM python:3.13-slim AS builder
-
-WORKDIR /build
-
-RUN pip install --no-cache-dir hatchling
-
-COPY pyproject.toml README.md LICENSE ./
-COPY turnstone/ turnstone/
-
-RUN pip wheel --no-deps --wheel-dir /build/wheels .
-
-# ----------------------------------------------------------------------------
-# Stage 2: Runtime — slim image with the installed package
-# ----------------------------------------------------------------------------
 FROM python:3.13-slim
 
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
+
+COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /usr/local/bin/uv
 
 # System dependencies for psycopg (PostgreSQL client library)
 RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
@@ -32,10 +17,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
 # Non-root user
 RUN useradd --create-home --shell /bin/bash turnstone
 
-# Install the wheel with all optional extras
-COPY --from=builder /build/wheels/*.whl /tmp/wheels/
-RUN pip install --no-cache-dir "$(ls /tmp/wheels/*.whl)[mq,console,sim,postgres,discord]" \
-    && rm -rf /tmp/wheels
+WORKDIR /app
+
+# Compile bytecode for faster startup
+ENV UV_COMPILE_BYTECODE=1
+
+# Install dependencies first (cached layer — only re-runs when deps change)
+COPY pyproject.toml uv.lock README.md LICENSE ./
+RUN uv sync --frozen --no-install-project --no-dev \
+    --extra mq --extra console --extra sim --extra postgres --extra discord --extra anthropic
+
+# Install the project itself
+COPY turnstone/ turnstone/
+RUN uv sync --frozen --no-dev \
+    --extra mq --extra console --extra sim --extra postgres --extra discord --extra anthropic
+
+# Add venv to PATH so entry points are found
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Health check script (stdlib only, no pip deps needed)
 COPY docker/healthcheck.py /usr/local/bin/healthcheck.py

@@ -1,0 +1,22 @@
+name: Docker Security Scan
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly Monday 06:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t turnstone:scan .
+      - uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "turnstone:scan"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"

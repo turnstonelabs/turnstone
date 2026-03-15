@@ -14,9 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install ruff
-      - run: ruff check turnstone/ tests/
-      - run: ruff format --check turnstone/ tests/
+      - run: pip install pre-commit
+      # mypy runs separately in typecheck job with full project deps
+      - run: SKIP=mypy pre-commit run --all-files
 
   typecheck:
     runs-on: ubuntu-latest
@@ -46,3 +46,34 @@ jobs:
         with:
           name: coverage-${{ matrix.python-version }}
           path: coverage.xml
+
+  lock-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv lock --check
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --frozen --all-extras
+      - run: uv run pip-audit --strict --desc
+
+  security-ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm audit --audit-level=moderate
