@@ -110,7 +110,7 @@ end
 
 opt Role mapping configured
     Server -> Server : Read role_claim from ID token\nMap values via role_map
-    Server -> DB : assign_role(user_id, role_id)\n(additive only)
+    Server -> DB : Sync roles: add new,\nrevoke stale OIDC-assigned,\npreserve manually assigned
 end
 
 == Issue Turnstone JWT ==

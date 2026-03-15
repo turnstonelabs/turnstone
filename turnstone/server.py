@@ -1547,6 +1547,13 @@ async def auth_setup(request: Request) -> Response:
     return await handle_auth_setup(request, JWT_AUD_SERVER)
 
 
+async def auth_whoami(request: Request) -> Response:
+    """GET /v1/api/auth/whoami — return authenticated user info."""
+    from turnstone.core.auth import handle_auth_whoami
+
+    return await handle_auth_whoami(request)
+
+
 async def oidc_authorize(request: Request) -> Response:
     """GET /v1/api/auth/oidc/authorize — redirect to OIDC provider."""
     from turnstone.core.auth import handle_oidc_authorize
@@ -1694,7 +1701,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     oidc_config.issuer,
                 )
         except Exception:
-            log.warning("OIDC discovery failed — OIDC login disabled")
+            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
     yield
     # Shutdown
     if app.state.watch_runner:
@@ -1785,6 +1792,7 @@ def create_app(
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
                     Route("/api/auth/setup", auth_setup, methods=["POST"]),
+                    Route("/api/auth/whoami", auth_whoami),
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/_internal/config-reload", config_reload, methods=["POST"]),

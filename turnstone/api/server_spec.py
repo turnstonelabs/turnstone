@@ -181,14 +181,20 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/auth/oidc/authorize",
         "GET",
         "Redirect to OIDC provider for SSO login",
-        error_codes=[403, 404, 503],
+        error_codes=[404, 429, 503],
         tags=["Auth"],
     ),
     EndpointSpec(
         "/v1/api/auth/oidc/callback",
         "GET",
-        "OIDC callback — exchange code for JWT session",
-        error_codes=[302],
+        "OIDC callback — validates code, provisions user, sets JWT cookie, redirects to app",
+        tags=["Auth"],
+    ),
+    EndpointSpec(
+        "/v1/api/auth/whoami",
+        "GET",
+        "Return authenticated user info and permissions",
+        error_codes=[401],
         tags=["Auth"],
     ),
     # --- Memories ---

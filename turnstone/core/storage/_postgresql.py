@@ -2599,21 +2599,20 @@ class PostgreSQLBackend:
             "%Y-%m-%dT%H:%M:%S"
         )
         with self._engine.connect() as conn:
-            # Atomic: SELECT then DELETE in one transaction to prevent TOCTOU
+            # Atomic DELETE...RETURNING for true one-time consumption
             row = conn.execute(
-                sa.select(
-                    oidc_pending_states.c.state,
-                    oidc_pending_states.c.nonce,
-                    oidc_pending_states.c.code_verifier,
-                    oidc_pending_states.c.audience,
-                    oidc_pending_states.c.created_at,
-                ).where(
-                    (oidc_pending_states.c.state == state)
-                    & (oidc_pending_states.c.created_at > cutoff)
-                )
+                sa.text(
+                    "DELETE FROM oidc_pending_states "
+                    "WHERE state = :state AND created_at > :cutoff "
+                    "RETURNING state, nonce, code_verifier, audience, created_at"
+                ),
+                {"state": state, "cutoff": cutoff},
             ).fetchone()
-            # Always delete the row (whether valid, expired, or missing is fine)
-            conn.execute(sa.delete(oidc_pending_states).where(oidc_pending_states.c.state == state))
+            # Also clean up the row if it existed but was expired
+            if not row:
+                conn.execute(
+                    sa.delete(oidc_pending_states).where(oidc_pending_states.c.state == state)
+                )
             conn.commit()
             if not row:
                 return None

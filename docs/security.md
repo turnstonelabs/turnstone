@@ -245,9 +245,12 @@ OIDC is enabled when all three required variables (`ISSUER`,
 - **State parameter** — one-time use, 5-minute TTL, database-backed
   (multi-node safe)
 - **Nonce** — prevents ID token replay
-- **JWKS validation** — asymmetric algorithms only (RS/ES/PS), no HMAC
-- **Algorithm from JWKS key, not token header** — prevents algorithm
-  confusion attacks
+- **JWKS validation** — asymmetric algorithm allowlist (RS/ES/PS
+  256-512), HMAC excluded
+- **Algorithm allowlist enforced** — the signing key is resolved from
+  the JWKS by ``kid``; PyJWK infers the key's algorithm from the JWKS
+  ``alg``/``kty`` fields; the token header's ``alg`` must be in the
+  allowlist AND match the key type, preventing algorithm confusion
 - **Identity matching by (issuer, sub) only** — prevents account
   takeover via email or username reuse
 - **`password_enabled=false` enforced server-side** — not just a UI

@@ -344,8 +344,10 @@ def validate_id_token(
     kid = header.get("kid")  # None if absent, not ""
 
     # Find matching key in the JWKS by kid.
-    # Algorithm is derived from the JWKS key itself (alg/kty fields),
-    # NOT from the untrusted token header — prevents algorithm confusion.
+    # PyJWK infers the key's algorithm from the JWKS ``alg``/``kty``
+    # fields.  jwt.decode() requires the token header's ``alg`` to be in
+    # our _ALLOWED_ID_TOKEN_ALGS allowlist (asymmetric only) AND to match
+    # the key type — preventing algorithm confusion attacks.
     signing_key = None
     for key_dict in jwks_data.get("keys", []):
         if kid is not None and key_dict.get("kid") == kid:
@@ -425,6 +427,12 @@ def provision_oidc_user(
     storage.create_user(user_id, username, display_name, OIDC_PASSWORD_SENTINEL)
     storage.create_oidc_identity(issuer, sub, user_id, email)
     apply_role_mapping(storage, user_id, claims, config)
+
+    # Ensure new OIDC users have at least a default role so they can
+    # access the application.  builtin-viewer grants read-only access.
+    user_roles = storage.list_user_roles(user_id)
+    if not user_roles and storage.get_role("builtin-viewer") is not None:
+        storage.assign_role(user_id, "builtin-viewer", "oidc-default")
 
     created_user: dict[str, str] | None = storage.get_user(user_id)
     if created_user is None:

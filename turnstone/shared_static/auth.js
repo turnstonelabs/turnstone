@@ -53,11 +53,22 @@ function initLogin() {
   var _oidcError = _oidcParams.get("oidc_error");
   if (_oidcError) {
     showLogin();
-    _showError(decodeURIComponent(_oidcError));
+    _showError(_oidcError);
     history.replaceState({}, "", window.location.pathname);
   } else if (_oidcParams.get("oidc_success")) {
     history.replaceState({}, "", window.location.pathname);
-    _onSuccess();
+    // Fetch permissions before completing login (cookie is already set)
+    fetch("/v1/api/auth/whoami")
+      .then(function (r) {
+        return r.ok ? r.json() : {};
+      })
+      .then(function (data) {
+        _storePermissions(data);
+        _onSuccess();
+      })
+      .catch(function () {
+        _onSuccess(); // Proceed even if permissions fetch fails
+      });
   }
 }
 

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.6.1",
+    "version": "0.6.2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -453,6 +453,88 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/oidc/authorize": {
+      "get": {
+        "summary": "Redirect to OIDC provider for SSO login",
+        "operationId": "v1_api_auth_oidc_authorize_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/auth/oidc/callback": {
+      "get": {
+        "summary": "OIDC callback \u2014 validates code, provisions user, sets JWT cookie, redirects to app",
+        "operationId": "v1_api_auth_oidc_callback_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/auth/whoami": {
+      "get": {
+        "summary": "Return authenticated user info and permissions",
+        "operationId": "v1_api_auth_whoami_get",
+        "tags": [
+          "Auth"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -3157,6 +3239,21 @@
           },
           "setup_required": {
             "title": "Setup Required",
+            "type": "boolean"
+          },
+          "oidc_enabled": {
+            "default": false,
+            "title": "Oidc Enabled",
+            "type": "boolean"
+          },
+          "oidc_provider_name": {
+            "default": "",
+            "title": "Oidc Provider Name",
+            "type": "string"
+          },
+          "password_enabled": {
+            "default": true,
+            "title": "Password Enabled",
             "type": "boolean"
           }
         },

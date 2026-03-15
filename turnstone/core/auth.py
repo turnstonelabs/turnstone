@@ -1127,6 +1127,22 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
     return response
 
 
+async def handle_auth_whoami(request: Request) -> Response:
+    """Shared ``GET /api/auth/whoami`` handler — return authenticated user info."""
+    from starlette.responses import JSONResponse
+
+    auth_result: AuthResult | None = getattr(request.state, "auth_result", None)
+    if not auth_result or not auth_result.user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    resp: dict[str, str] = {
+        "user_id": auth_result.user_id,
+    }
+    if auth_result.permissions:
+        resp["permissions"] = ",".join(sorted(auth_result.permissions))
+    return JSONResponse(resp)
+
+
 async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     """Shared ``GET /api/auth/oidc/authorize`` handler — redirect to IdP."""
     from starlette.responses import JSONResponse, RedirectResponse
@@ -1141,7 +1157,7 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     if login_limiter is not None:
         ip_ok, _ip_retry = login_limiter.check(f"ip:{client_ip}")
         if not ip_ok:
-            return JSONResponse({"error": "Too many login attempts"}, status_code=429)
+            return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
 
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
@@ -1241,6 +1257,13 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         # Validate ID token against cached JWKS keys (no I/O).
         # On unknown kid, refresh JWKS once (async) for key rotation.
         jwks_data: dict[str, Any] | None = getattr(request.app.state, "jwks_data", None)
+        if jwks_data is None and oidc_config.jwks_uri:
+            # Lazy fetch: JWKS may have failed at startup but IdP recovered
+            try:
+                jwks_data = await fetch_jwks(oidc_config.jwks_uri)
+                request.app.state.jwks_data = jwks_data
+            except OIDCError:
+                pass
         if jwks_data is None:
             return RedirectResponse("/?oidc_error=OIDC+not+configured", status_code=302)
 

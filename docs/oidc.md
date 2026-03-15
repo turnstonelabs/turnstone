@@ -38,7 +38,7 @@ are set.
 | `TURNSTONE_OIDC_PROVIDER_NAME` | No | `SSO` | Display name for the login button (e.g. "Google", "Okta") |
 | `TURNSTONE_OIDC_ROLE_CLAIM` | No | — | ID token claim containing role/group values (see [Role Mapping](#role-mapping)) |
 | `TURNSTONE_OIDC_ROLE_MAP` | No | — | Mapping from claim values to Turnstone role IDs (see [Role Mapping](#role-mapping)) |
-| `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | `true` | Set to `false` to hide the password form and require OIDC for all non-admin logins |
+| `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | `true` | Set to `false` to hide the password form and block all username/password logins (including admin). API tokens and config-file tokens still work. |
 
 OIDC is enabled when all three required fields (issuer, client ID, client
 secret) are non-empty. If any is missing, OIDC is silently disabled and
@@ -146,8 +146,8 @@ TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,operator:builtin-operator"
 ## Role Mapping
 
 OIDC role mapping assigns Turnstone roles to users based on claims in the
-ID token. This is optional — without it, OIDC users are provisioned
-without any roles and need manual role assignment by an admin.
+ID token. This is optional — without it, OIDC users are provisioned with
+the `builtin-viewer` role (read-only access) by default.
 
 ### Configuration
 
@@ -165,9 +165,11 @@ TURNSTONE_OIDC_ROLE_MAP="admin:builtin-admin,engineering:builtin-operator,viewer
 
 ### Behavior
 
-- **Additive only**: role mapping never removes existing roles. If a user
-  was previously assigned `builtin-admin` and their groups claim no longer
-  includes `admin`, the role is retained.
+- **Synced on every login**: roles are added when new claim values appear,
+  and OIDC-assigned roles are revoked when the corresponding claim value
+  is no longer present. Roles assigned manually (or by other sources) are
+  never touched — only roles with `assigned_by="oidc"` are subject to
+  revocation.
 - **List or string**: the claim value can be a JSON array
   (`["admin", "engineering"]`) or a single string (`"admin"`). Both are
   handled correctly.
@@ -219,16 +221,18 @@ TURNSTONE_OIDC_PASSWORD_ENABLED=false
 
 In this mode the login screen shows only the "Continue with SSO" button.
 The password form, token toggle, and sign-in button are all hidden.
+All username/password logins are blocked at the API level, including
+admin accounts.
 
-The initial setup wizard is exempt from this restriction. The first admin
-account must always be created with a password via the setup wizard
-before OIDC can be used. This ensures there is always a local admin who
-can recover access if the identity provider is unavailable.
+The first admin account must be created via the setup wizard (with a
+password) before OIDC is enabled. The setup wizard always works
+regardless of this setting because it is only available when zero users
+exist in the database.
 
 API token login (`POST /v1/api/auth/login` with a `ts_` token) and
 config-file tokens (`Authorization: Bearer tok_xxx`) continue to work
-regardless of this setting. OIDC-only mode affects the browser login UI,
-not the programmatic API.
+regardless of this setting. OIDC-only mode affects password-based
+authentication only.
 
 ---
 
