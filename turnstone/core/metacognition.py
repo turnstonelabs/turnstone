@@ -77,9 +77,9 @@ _STRONG_CORRECTION: list[re.Pattern[str]] = [
 ]
 
 # "no <word>" is ambiguous — only match when the next word is a pronoun,
-# demonstrative, or verb that signals the user is redirecting, not a fixed
-# phrase like "no problem" or "no worries".  Allowlist > blocklist: we
-# don't need to enumerate every benign "no X" phrase.
+# demonstrative, article, or verb that signals the user is redirecting,
+# not a fixed phrase like "no problem" or "no worries".  Allowlist >
+# blocklist: we don't need to enumerate every benign "no X" phrase.
 _WEAK_CORRECTION: list[re.Pattern[str]] = [
     re.compile(
         r"(?i)^no\s+(?:I\b|you\b|we\b|they\b|it\b|he\b|she\b"
