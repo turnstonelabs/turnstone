@@ -174,6 +174,7 @@ class WsStateEvent(ServerEvent):
     context_ratio: float = 0.0
     activity: str = ""
     activity_state: str = ""
+    content: str = ""  # populated on idle transitions only
 
 
 @dataclass

@@ -67,6 +67,8 @@ _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 # WebUI — implements SessionUI for browser-based interaction
 # ---------------------------------------------------------------------------
 
+_MAX_TURN_CONTENT_CHARS = 256 * 1024  # cap piggybacked content on idle events
+
 
 class WebUI:
     """Browser-based UI using SSE for streaming and HTTP POST for actions.
@@ -107,6 +109,10 @@ class WebUI:
         self._pending_verdicts: list[dict[str, Any]] = []
         # Last user decision for late-arriving verdicts (set in resolve_approval)
         self._last_verdict_decision: str = ""
+        # Content accumulator — tokens appended in on_content_token(), joined
+        # and piggybacked onto the ws_state:idle global SSE event, then reset.
+        self._ws_turn_content: list[str] = []
+        self._ws_turn_content_size: int = 0
 
     def _enqueue(self, data: dict[str, Any]) -> None:
         with self._listeners_lock:
@@ -135,17 +141,23 @@ class WebUI:
                 ctx = self._ws_context_ratio
                 activity = self._ws_current_activity
                 activity_state = self._ws_activity_state
-            WebUI._global_queue.put(
-                {
-                    "type": "ws_state",
-                    "ws_id": self.ws_id,
-                    "state": state,
-                    "tokens": tokens,
-                    "context_ratio": ctx,
-                    "activity": activity,
-                    "activity_state": activity_state,
-                }
-            )
+            event: dict[str, Any] = {
+                "type": "ws_state",
+                "ws_id": self.ws_id,
+                "state": state,
+                "tokens": tokens,
+                "context_ratio": ctx,
+                "activity": activity,
+                "activity_state": activity_state,
+            }
+            if state == "idle":
+                event["content"] = "".join(self._ws_turn_content)
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+            elif state == "error":
+                self._ws_turn_content = []
+                self._ws_turn_content_size = 0
+            WebUI._global_queue.put(event)
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -178,6 +190,9 @@ class WebUI:
         self._enqueue({"type": "reasoning", "text": text})
 
     def on_content_token(self, text: str) -> None:
+        if self._ws_turn_content_size < _MAX_TURN_CONTENT_CHARS:
+            self._ws_turn_content.append(text)
+            self._ws_turn_content_size += len(text)
         self._enqueue({"type": "content", "text": text})
 
     def on_stream_end(self) -> None:

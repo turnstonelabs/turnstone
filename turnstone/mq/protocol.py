@@ -269,10 +269,11 @@ class TurnCompleteEvent(OutboundEvent):
     the ws_state transition to 'idle'.  ``correlation_id`` is set for
     MQ-initiated turns and empty for turns initiated from the server UI.
 
-    ``content`` carries the full assistant response text accumulated from
-    per-ws SSE content tokens.  Downstream consumers (e.g. Discord bot) can
-    use it as a catch-up when the streaming path missed events due to the
-    race between the global SSE and per-ws SSE connections.
+    ``content`` carries the full assistant response text piggybacked on
+    the server's idle SSE event (accumulated server-side in WebUI).
+    Downstream consumers (e.g. Discord bot) use it for catch-up when the
+    streaming path missed events, and as the primary delivery path for
+    bidirectional notification DM forwarding.
     """
 
     type: str = "turn_complete"

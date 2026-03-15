@@ -39,8 +39,8 @@ BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nAckEvent(status:"ok")
 ... SSE events flow: content, tool_output_chunk, tool_result, status, state_change ...
 
 BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nContentEvent, ToolResultEvent, ...
-BridgeA -> Redis : PUBLISH turnstone:events:global\nStateChangeEvent(state:"idle")
-BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nTurnCompleteEvent
+BridgeA -> Redis : PUBLISH turnstone:events:global\nStateChangeEvent(state:"idle", content:"...")
+BridgeA -> Redis : PUBLISH turnstone:events:abc12345\nTurnCompleteEvent(content:"...")
 
 == Scenario B: Directed Message to Specific Node ==
 

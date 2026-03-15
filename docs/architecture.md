@@ -1202,13 +1202,13 @@ The bridge dispatches it to `POST /v1/api/cancel` on the server owning the works
 which sets the cooperative cancel flag and unblocks any pending approval/plan waits.
 
 **Completion detection:** The bridge tracks which `correlation_id` maps to which
-`ws_id` for active sends. Content tokens from the per-ws SSE stream are accumulated
-in a per-workstream buffer (`_ws_content_buffer`, capped at 256 KB). When the global
-SSE reports `ws_state → idle` for a tracked workstream, the bridge emits a synthetic
-`TurnCompleteEvent` carrying the correlation ID and the accumulated response text in
-`content`. This catch-up mechanism lets downstream consumers (e.g. the Discord bot)
-recover the full response even when individual `ContentEvent`s were missed due to the
-race between the two independent SSE connections.
+`ws_id` for active sends. The server accumulates content tokens in the WebUI and
+piggybacks the full response text onto the `ws_state → idle` global SSE event.
+When the bridge receives this event, it emits a synthetic `TurnCompleteEvent`
+carrying the correlation ID and the server-provided `content`. This lets downstream
+consumers (e.g. the Discord bot) recover the full response when individual
+`ContentEvent`s were missed, and serves as the primary delivery path for
+bidirectional notification DM forwarding.
 
 **Multi-node routing:** Each bridge retrieves its `node_id` from the server's
 `/health` endpoint on startup (with exponential backoff retry). The server

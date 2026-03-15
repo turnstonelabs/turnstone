@@ -115,6 +115,8 @@ export interface WsStateEvent {
   context_ratio: number;
   activity: string;
   activity_state: string;
+  /** Full assistant response text — populated on idle transitions only. */
+  content?: string;
 }
 
 export interface WsActivityEvent {
