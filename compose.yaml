@@ -26,7 +26,7 @@ services:
   # PostgreSQL — production database (profile: production)
   # -------------------------------------------------------------------
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     profiles:
       - production
       - cluster
@@ -56,7 +56,7 @@ services:
   # Redis — message broker, pub/sub, node registry
   # -------------------------------------------------------------------
   redis:
-    image: redis:7.4-alpine
+    image: redis:8.6-alpine
     command:
       - sh
       - -c
