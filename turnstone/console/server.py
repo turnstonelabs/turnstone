@@ -1492,23 +1492,29 @@ async def admin_list_watches(request: Request) -> JSONResponse:
     nodes, _ = collector.get_nodes(limit=500)
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
 
     async def _fetch_node(node: dict[str, Any]) -> list[dict[str, Any]]:
         server_url = (node.get("server_url") or "").rstrip("/")
         if not server_url:
             return []
-        try:
-            resp = await client.get(f"{server_url}/v1/api/watches", headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                watches: list[dict[str, Any]] = data.get("watches", [])
-                # Tag each watch with node_id in case the server omits it
-                for w in watches:
-                    if not w.get("node_id"):
-                        w["node_id"] = node["node_id"]
-                return watches
-        except Exception:
-            log.debug("Failed to fetch watches from node %s", node.get("node_id"))
+        async with sem:
+            try:
+                resp = await client.get(f"{server_url}/v1/api/watches", headers=headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    watches: list[dict[str, Any]] = data.get("watches", [])
+                    # Tag each watch with node_id in case the server omits it
+                    for w in watches:
+                        if not w.get("node_id"):
+                            w["node_id"] = node["node_id"]
+                    return watches
+            except Exception:
+                log.debug(
+                    "Failed to fetch watches from node %s",
+                    node.get("node_id"),
+                    exc_info=True,
+                )
         return []
 
     tasks = [_fetch_node(n) for n in nodes]
@@ -1523,6 +1529,11 @@ async def admin_list_watches(request: Request) -> JSONResponse:
 
 
 _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
+
+# Max concurrent outbound requests when fanning out to cluster nodes.
+# Sized below the default httpx pool limit (100) to leave headroom for
+# other proxy traffic (UI proxying, SSE streams, etc.).
+_NODE_FAN_OUT_LIMIT = 50
 
 
 async def admin_cancel_watch(request: Request) -> Response:
@@ -3142,22 +3153,24 @@ async def _collect_mcp_status(
     nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
 
     async def _fetch(node: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]] | None]:
         node_id = node.get("node_id", "")
         url = node.get("server_url", "")
         if not url:
             return node_id, None
-        try:
-            resp = await client.get(
-                f"{url.rstrip('/')}/v1/api/_internal/mcp-status",
-                headers=headers,
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                return node_id, resp.json().get("servers", {})
-        except Exception:
-            log.debug("Failed to fetch MCP status from node %s", node_id)
+        async with sem:
+            try:
+                resp = await client.get(
+                    f"{url.rstrip('/')}/v1/api/_internal/mcp-status",
+                    headers=headers,
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    return node_id, resp.json().get("servers", {})
+            except Exception:
+                log.debug("Failed to fetch MCP status from node %s", node_id, exc_info=True)
         return node_id, None
 
     results = await asyncio.gather(*[_fetch(n) for n in nodes])
@@ -3491,21 +3504,24 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
 
     async def _notify(node: dict[str, Any]) -> tuple[str, Any]:
         node_id = node.get("node_id", "")
         url = node.get("server_url", "")
         if not url:
             return node_id, None
-        try:
-            resp = await client.post(
-                f"{url.rstrip('/')}/v1/api/_internal/mcp-reload",
-                headers=headers,
-                timeout=30,
-            )
-            return node_id, resp.json()
-        except Exception as exc:
-            return node_id, {"error": str(exc)}
+        async with sem:
+            try:
+                resp = await client.post(
+                    f"{url.rstrip('/')}/v1/api/_internal/mcp-reload",
+                    headers=headers,
+                    timeout=30,
+                )
+                return node_id, resp.json()
+            except Exception as exc:
+                log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
+                return node_id, {"error": str(exc)}
 
     results = await asyncio.gather(*[_notify(n) for n in nodes])
     return {nid: data for nid, data in results if data is not None}
