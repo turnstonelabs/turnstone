@@ -75,6 +75,7 @@ package "turnstone/ui/" <<Rectangle>> {
     component [colors.py\nANSI colors] as colors <<ui>>
     component [markdown.py\nMD rendering] as markdown <<ui>>
     component [spinner.py\nTerminal spinner] as spinner <<ui>>
+    component [renderer.js\nBrowser MD + LaTeX] as renderer <<ui>>
 }
 
 ' API schemas
