@@ -1006,6 +1006,7 @@ async def metrics_endpoint(request: Request) -> Response:
             "servers": mc.server_count,
             "resources": mc.resource_count,
             "prompts": mc.prompt_count,
+            "errors": mc.error_count,
         }
     content = _metrics.generate_text(
         workstream_states=states,

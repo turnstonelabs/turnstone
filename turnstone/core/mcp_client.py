@@ -1137,6 +1137,11 @@ class MCPClientManager:
         return len(self._sessions)
 
     @property
+    def error_count(self) -> int:
+        """Number of servers currently in error state."""
+        return len(self._last_error)
+
+    @property
     def server_names(self) -> list[str]:
         """Return configured server names."""
         return list(self._server_configs.keys())

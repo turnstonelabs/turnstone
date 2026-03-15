@@ -402,6 +402,11 @@ class MetricsCollector:
                 "Number of MCP prompts available",
                 mcp_info.get("prompts", 0),
             )
+            gauge(
+                "turnstone_mcp_server_errors",
+                "Number of MCP servers currently in error state",
+                mcp_info.get("errors", 0),
+            )
 
         lines.append("")  # trailing newline
         return "\n".join(lines)
