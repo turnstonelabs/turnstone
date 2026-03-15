@@ -53,11 +53,16 @@ _NUDGE_MAP: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# Detection heuristics
+# Detection heuristics — strong/weak tiers
+#
+# Strong patterns fire unconditionally.  Weak patterns carry inherent
+# ambiguity ("no …", "thanks …") and only fire when the surrounding
+# message looks like a genuine correction/completion rather than normal
+# conversation.
 # ---------------------------------------------------------------------------
 
-_CORRECTION_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"(?i)^no[,.\s]"),
+_STRONG_CORRECTION: list[re.Pattern[str]] = [
+    re.compile(r"(?i)^no[,.]"),  # "no," / "no." — clear rejection
     re.compile(r"(?i)\bdon'?t\b"),
     re.compile(r"(?i)^stop\b"),
     re.compile(r"(?i)^actually[,\s]"),
@@ -71,30 +76,64 @@ _CORRECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(?i)^please don'?t\b"),
 ]
 
-_COMPLETION_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"(?i)^thanks\b"),
+# "no <word>" is ambiguous — only match when the next word is a pronoun,
+# demonstrative, article, or verb that signals the user is redirecting,
+# not a fixed phrase like "no problem" or "no worries".  Allowlist >
+# blocklist: we don't need to enumerate every benign "no X" phrase.
+_WEAK_CORRECTION: list[re.Pattern[str]] = [
+    re.compile(
+        r"(?i)^no\s+(?:I\b|you\b|we\b|they\b|it\b|he\b|she\b"
+        r"|that\b|this\b|those\b|these\b"
+        r"|the\b|a\b|an\b"
+        r"|not\b|do\b|did\b|but\b)"
+    ),
+]
+
+_STRONG_COMPLETION: list[re.Pattern[str]] = [
     re.compile(r"(?i)\bthat'?s all\b"),
+    re.compile(r"(?i)^lgtm\b"),
+]
+
+# These patterns are common in both completion AND mid-conversation
+# acknowledgment.  Only fire when the message is short and has no
+# continuation markers (question marks, follow-up requests).
+_WEAK_COMPLETION: list[re.Pattern[str]] = [
+    re.compile(r"(?i)^thanks\b(?!\s+for\b)"),  # "thanks for X" = acknowledgment
     re.compile(r"(?i)\blooks good\b"),
     re.compile(r"(?i)^perfect\b"),
     re.compile(r"(?i)^great job\b"),
     re.compile(r"(?i)\bthat works\b"),
     re.compile(r"(?i)^done\b"),
-    re.compile(r"(?i)^lgtm\b"),
 ]
+
+_WEAK_MSG_CAP = 80  # weak completion patterns suppressed above this length
+
+_CONTINUATION = re.compile(
+    r"(?i)(?:\?|(?:can you|could you|please\s|also\s|but\s|now\s|next\s"
+    r"|and\s+then|after\s+that|one\s+more|however))"
+)
 
 
 def detect_correction(message: str) -> bool:
     """Return True if the message looks like a user correction."""
     if not message:
         return False
-    return any(p.search(message) for p in _CORRECTION_PATTERNS)
+    if any(p.search(message) for p in _STRONG_CORRECTION):
+        return True
+    return any(p.search(message) for p in _WEAK_CORRECTION)
 
 
 def detect_completion(message: str) -> bool:
     """Return True if the message signals session completion."""
     if not message:
         return False
-    return any(p.search(message) for p in _COMPLETION_PATTERNS)
+    if any(p.search(message) for p in _STRONG_COMPLETION):
+        return True
+    if len(message) > _WEAK_MSG_CAP:
+        return False
+    if _CONTINUATION.search(message):
+        return False
+    return any(p.search(message) for p in _WEAK_COMPLETION)
 
 
 def should_nudge(
