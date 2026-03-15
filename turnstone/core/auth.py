@@ -38,6 +38,8 @@ if TYPE_CHECKING:
     from starlette.responses import JSONResponse, Response
     from starlette.types import ASGIApp, Receive, Scope, Send
 
+    from turnstone.core.oidc import OIDCConfig
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -1143,6 +1145,19 @@ async def handle_auth_whoami(request: Request) -> Response:
     return JSONResponse(resp)
 
 
+def _build_oidc_redirect_uri(request: Request, oidc_config: OIDCConfig) -> str:
+    """Build the OIDC callback redirect URI.
+
+    Uses ``redirect_base`` from OIDC config when set (recommended for
+    reverse-proxy deployments), otherwise falls back to the request Host header.
+    """
+    if oidc_config.redirect_base:
+        return f"{oidc_config.redirect_base}/v1/api/auth/oidc/callback"
+    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
+    host = request.headers.get("host", "localhost")
+    return f"{scheme}://{host}/v1/api/auth/oidc/callback"
+
+
 async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     """Shared ``GET /api/auth/oidc/authorize`` handler — redirect to IdP."""
     from starlette.responses import JSONResponse, RedirectResponse
@@ -1184,12 +1199,8 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
     # Store pending state in database
     storage.create_oidc_pending_state(state, nonce, code_verifier, audience)
 
-    # Build redirect URI from request
-    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
-    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
-    # when available, rather than the request Host header. See PROGRESS.md.
-    host = request.headers.get("host", "localhost")
-    redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
+    # Build redirect URI (pinned by TURNSTONE_OIDC_REDIRECT_BASE when set)
+    redirect_uri = _build_oidc_redirect_uri(request, oidc_config)
 
     url = build_authorize_url(oidc_config, redirect_uri, state, nonce, code_verifier)
     return RedirectResponse(url, status_code=302)
@@ -1240,11 +1251,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
         return RedirectResponse("/?oidc_error=Login+session+expired", status_code=302)
 
     # Build redirect URI (must match what was sent in authorize)
-    scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
-    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
-    # when available, rather than the request Host header. See PROGRESS.md.
-    host = request.headers.get("host", "localhost")
-    redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
+    redirect_uri = _build_oidc_redirect_uri(request, oidc_config)
 
     try:
         from turnstone.core.oidc import (

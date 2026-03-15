@@ -39,10 +39,26 @@ are set.
 | `TURNSTONE_OIDC_ROLE_CLAIM` | No | — | ID token claim containing role/group values (see [Role Mapping](#role-mapping)) |
 | `TURNSTONE_OIDC_ROLE_MAP` | No | — | Mapping from claim values to Turnstone role IDs (see [Role Mapping](#role-mapping)) |
 | `TURNSTONE_OIDC_PASSWORD_ENABLED` | No | `true` | Set to `false` to hide the password form and block all username/password logins (including admin). API tokens and config-file tokens still work. |
+| `TURNSTONE_OIDC_REDIRECT_BASE` | No | — | Externally-reachable origin for the OIDC redirect URI (e.g. `https://app.example.com`). Recommended when running behind a reverse proxy. When unset, derived from the request Host header. |
 
 OIDC is enabled when all three required fields (issuer, client ID, client
 secret) are non-empty. If any is missing, OIDC is silently disabled and
 the login screen shows only the password form.
+
+### Reverse Proxy / Load Balancer
+
+When Turnstone runs behind a reverse proxy, the internal `Host` header may
+not match the externally-reachable URL. Set `TURNSTONE_OIDC_REDIRECT_BASE`
+to the public origin so the redirect URI sent to the identity provider is
+correct:
+
+```bash
+TURNSTONE_OIDC_REDIRECT_BASE=https://app.example.com
+```
+
+The resulting callback URL will be
+`https://app.example.com/v1/api/auth/oidc/callback` — register this as the
+authorized redirect URI in your identity provider.
 
 ### config.toml alternative
 
@@ -55,6 +71,7 @@ scopes = "openid email profile"
 provider_name = "Google"
 role_claim = "groups"
 password_enabled = true
+redirect_base = "https://app.example.com"
 
 [oidc.role_map]
 admin = "builtin-admin"

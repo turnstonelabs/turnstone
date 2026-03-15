@@ -74,6 +74,7 @@ class OIDCConfig:
     role_claim: str = ""
     role_map: dict[str, str] = field(default_factory=dict)
     password_enabled: bool = True
+    redirect_base: str = ""
     # Discovered from .well-known/openid-configuration
     authorization_endpoint: str = ""
     token_endpoint: str = ""
@@ -143,6 +144,52 @@ def load_oidc_config() -> OIDCConfig:
     else:
         password_enabled = bool(cfg.get("password_enabled", True))
 
+    redirect_base = os.environ.get("TURNSTONE_OIDC_REDIRECT_BASE", "").strip()
+    if not redirect_base:
+        redirect_base = str(cfg.get("redirect_base", "")).strip()
+    redirect_base = redirect_base.rstrip("/")
+    if redirect_base:
+        parsed = urllib.parse.urlparse(redirect_base)
+        if parsed.scheme not in ("https", "http"):
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE has invalid scheme, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif not parsed.hostname:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE missing hostname, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif parsed.username or parsed.password:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE must not contain userinfo, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        elif parsed.path or parsed.query or parsed.fragment:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE must be scheme://host[:port] only, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
+        else:
+            # Validate port is numeric (urlparse accepts "host:abc" silently).
+            try:
+                parsed.port  # noqa: B018 — triggers ValueError on non-numeric port
+            except ValueError:
+                log.warning(
+                    "TURNSTONE_OIDC_REDIRECT_BASE has invalid port, ignoring: %s",
+                    redirect_base,
+                )
+                redirect_base = ""
+        if redirect_base and parsed.scheme != "https":
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE should use https:// in production: %s",
+                redirect_base,
+            )
+
     # OIDC is enabled when all three required fields are non-empty.
     enabled = bool(issuer and client_id and client_secret)
 
@@ -161,6 +208,7 @@ def load_oidc_config() -> OIDCConfig:
         role_claim=role_claim,
         role_map=role_map,
         password_enabled=password_enabled,
+        redirect_base=redirect_base,
     )
 
 
