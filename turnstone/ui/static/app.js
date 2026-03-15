@@ -936,6 +936,7 @@ function handleEvent(evt) {
     case "stream_end":
       if (currentAssistantEl && contentBuffer) {
         currentAssistantEl.innerHTML = renderMarkdown(contentBuffer);
+        postRenderMarkdown(currentAssistantEl);
       }
       currentAssistantEl = null;
       currentReasoningEl = null;
@@ -1120,6 +1121,7 @@ function replayHistory(messages) {
         var el = document.createElement("div");
         el.className = "msg msg-assistant";
         el.innerHTML = renderMarkdown(msg.content);
+        postRenderMarkdown(el);
         messagesEl.appendChild(el);
         lastToolBlock = null;
       }
@@ -1731,6 +1733,7 @@ function _addInlinePlan(content, action, feedback) {
   body.className = "plan-inline-body";
   try {
     body.innerHTML = renderMarkdown(content);
+    postRenderMarkdown(body);
   } catch (e) {
     body.textContent = content;
   }

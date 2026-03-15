@@ -281,7 +281,7 @@ function renderMarkdown(text) {
   var codeBlocks = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, function (m, lang, code) {
     codeBlocks.push(
-      '<pre><code class="lang-' +
+      '<pre><code class="language-' +
         escapeHtml(lang) +
         '">' +
         escapeHtml(code.replace(/\n$/, "")) +
@@ -592,4 +592,56 @@ function renderMarkdown(text) {
 
   _fnDepth--;
   return result;
+}
+
+// ---------------------------------------------------------------------------
+//  Post-render hook — syntax highlighting via highlight.js
+// ---------------------------------------------------------------------------
+var _NO_HIGHLIGHT_LANGS = {
+  ascii: true,
+  text: true,
+  plaintext: true,
+  plain: true,
+  nohighlight: true,
+};
+var _TERMINAL_LANGS = {
+  bash: true,
+  shell: true,
+  sh: true,
+  zsh: true,
+  console: true,
+  terminal: true,
+};
+var _hljsConfigured = false;
+
+function postRenderMarkdown(containerEl) {
+  if (typeof hljs === "undefined") return;
+  if (!_hljsConfigured) {
+    hljs.configure({ ignoreUnescapedHTML: true });
+    _hljsConfigured = true;
+  }
+  var codeEls = containerEl.querySelectorAll("pre code[class*='language-']");
+  for (var i = 0; i < codeEls.length; i++) {
+    var el = codeEls[i];
+    if (el.classList.contains("hljs")) continue;
+    // Extract language name from class
+    var langClass = "";
+    for (var j = 0; j < el.classList.length; j++) {
+      if (el.classList[j].startsWith("language-")) {
+        langClass = el.classList[j].substring(9);
+        break;
+      }
+    }
+    // Skip plaintext variants
+    if (_NO_HIGHLIGHT_LANGS[langClass]) {
+      el.classList.add("nohighlight");
+      continue;
+    }
+    // Apply highlighting
+    hljs.highlightElement(el);
+    // Add terminal styling class for shell languages
+    if (_TERMINAL_LANGS[langClass]) {
+      el.closest("pre").classList.add("code-terminal");
+    }
+  }
 }
