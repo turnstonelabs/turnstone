@@ -1148,7 +1148,7 @@ async def handle_auth_whoami(request: Request) -> Response:
 def _build_oidc_redirect_uri(request: Request, oidc_config: OIDCConfig) -> str:
     """Build the OIDC callback redirect URI.
 
-    Uses ``TURNSTONE_OIDC_REDIRECT_BASE`` when configured (recommended for
+    Uses ``redirect_base`` from OIDC config when set (recommended for
     reverse-proxy deployments), otherwise falls back to the request Host header.
     """
     if oidc_config.redirect_base:

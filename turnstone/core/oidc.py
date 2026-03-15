@@ -162,13 +162,29 @@ def load_oidc_config() -> OIDCConfig:
                 redirect_base,
             )
             redirect_base = ""
+        elif parsed.username or parsed.password:
+            log.warning(
+                "TURNSTONE_OIDC_REDIRECT_BASE must not contain userinfo, ignoring: %s",
+                redirect_base,
+            )
+            redirect_base = ""
         elif parsed.path or parsed.query or parsed.fragment:
             log.warning(
                 "TURNSTONE_OIDC_REDIRECT_BASE must be scheme://host[:port] only, ignoring: %s",
                 redirect_base,
             )
             redirect_base = ""
-        elif parsed.scheme != "https":
+        else:
+            # Validate port is numeric (urlparse accepts "host:abc" silently).
+            try:
+                parsed.port  # noqa: B018 — triggers ValueError on non-numeric port
+            except ValueError:
+                log.warning(
+                    "TURNSTONE_OIDC_REDIRECT_BASE has invalid port, ignoring: %s",
+                    redirect_base,
+                )
+                redirect_base = ""
+        if redirect_base and parsed.scheme != "https":
             log.warning(
                 "TURNSTONE_OIDC_REDIRECT_BASE should use https:// in production: %s",
                 redirect_base,
