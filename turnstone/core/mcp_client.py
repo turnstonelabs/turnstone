@@ -109,6 +109,8 @@ class MCPClientManager:
         # Config-file servers loaded at startup are NOT in this set and
         # will never be removed by reconcile_sync.
         self._db_managed: set[str] = set()
+        # Per-server last-error tracking (set on failure, cleared on success)
+        self._last_error: dict[str, str] = {}
 
         # Per-server tool storage for surgical refresh
         self._per_server_tools: dict[str, list[dict[str, Any]]] = {}
@@ -171,8 +173,9 @@ class MCPClientManager:
         for name, cfg in self._server_configs.items():
             try:
                 await self._connect_one(name, cfg)
-            except Exception:
+            except Exception as exc:
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
+                self._last_error[name] = f"{type(exc).__name__}: {exc}"
 
         self._connected.set()
 
@@ -244,8 +247,9 @@ class MCPClientManager:
                 elif isinstance(root, mcp_types.PromptListChangedNotification):
                     log.info("Received prompts/list_changed from '%s'", name)
                     await self._refresh_server_prompts(name)
-            except Exception:
+            except Exception as exc:
                 log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
+                self._last_error[name] = f"Refresh failed: {exc}"
 
         try:
             session = await stack.enter_async_context(
@@ -372,6 +376,9 @@ class MCPClientManager:
         except Exception:
             log.warning("Prompt sync after connect failed for '%s'", name, exc_info=True)
 
+        # Connection succeeded — clear any previous error
+        self._last_error.pop(name, None)
+
     # -- tool refresh --------------------------------------------------------
 
     def _rebuild_tools(self) -> None:
@@ -428,6 +435,7 @@ class MCPClientManager:
         added, removed = await self._refresh_server_tools(name)
         await self._refresh_server_resources(name)
         await self._refresh_server_prompts(name)
+        self._last_error.pop(name, None)
         return added, removed
 
     async def _refresh_all(
@@ -456,8 +464,9 @@ class MCPClientManager:
                     continue
                 added, removed = await self._refresh_server(name)
                 results[name] = (added, removed)
-            except Exception:
+            except Exception as exc:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
+                self._last_error[name] = f"Refresh failed: {exc}"
                 results[name] = ([], [])
 
         # Final sync to clean up templates from servers that are no longer connected
@@ -497,8 +506,10 @@ class MCPClientManager:
                         await self._refresh_server_resources(name)
                     if not self._supports_prompt_list_changed.get(name, False):
                         await self._refresh_server_prompts(name)
-                except Exception:
+                    self._last_error.pop(name, None)
+                except Exception as exc:
                     log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
+                    self._last_error[name] = f"Periodic refresh failed: {exc}"
             await asyncio.sleep(self._refresh_interval)
 
     # -- resource refresh ----------------------------------------------------
@@ -958,6 +969,7 @@ class MCPClientManager:
                 self._supports_resource_list_changed.pop(name, None)
                 self._supports_prompts.pop(name, None)
                 self._supports_prompt_list_changed.pop(name, None)
+                self._last_error.pop(name, None)
                 # Rebuild merged state (serialized with notification handlers)
                 self._rebuild_tools()
                 self._rebuild_resources()
@@ -979,6 +991,7 @@ class MCPClientManager:
             self._supports_resource_list_changed.pop(name, None)
             self._supports_prompts.pop(name, None)
             self._supports_prompt_list_changed.pop(name, None)
+            self._last_error.pop(name, None)
             self._rebuild_tools()
             self._rebuild_resources()
             self._rebuild_prompts()
@@ -1002,7 +1015,7 @@ class MCPClientManager:
             "tools": len(self._per_server_tools.get(name, [])) if connected else 0,
             "resources": len(self._per_server_resources.get(name, [])) if connected else 0,
             "prompts": len(self._per_server_prompts.get(name, [])) if connected else 0,
-            "error": "",
+            "error": self._last_error.get(name, ""),
             "transport": transport,
             "command": cfg.get("command", "") if transport == "stdio" else "",
             "url": cfg.get("url", "") if transport != "stdio" else "",

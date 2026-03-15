@@ -2681,6 +2681,7 @@ function _renderMcpServers(items) {
     var nodeIds = Object.keys(statusEntries);
     var anyConnected = false;
     var anyError = false;
+    var firstError = "";
     var totalTools = 0,
       totalRes = 0,
       totalPrompts = 0;
@@ -2692,7 +2693,10 @@ function _renderMcpServers(items) {
         totalRes += ns.resources || 0;
         totalPrompts += ns.prompts || 0;
       }
-      if (ns.error) anyError = true;
+      if (ns.error) {
+        anyError = true;
+        if (!firstError) firstError = ns.error;
+      }
     }
 
     var dotClass = "mcp-status-dot disabled";
@@ -2769,7 +2773,9 @@ function _renderMcpServers(items) {
       '<span class="admin-col admin-col-mprompts">' +
       promptsVal +
       "</span>" +
-      '<span class="admin-col admin-col-mstatus"><span class="' +
+      '<span class="admin-col admin-col-mstatus"' +
+      (firstError ? ' title="' + escapeHtml(firstError) + '"' : "") +
+      '><span class="' +
       dotClass +
       '" aria-hidden="true"></span>' +
       escapeHtml(statusText) +
@@ -3102,9 +3108,7 @@ function _openMcpDetail(s) {
       var dot = ns.connected
         ? '<span class="mcp-status-dot connected"></span>'
         : '<span class="mcp-status-dot error"></span>';
-      html +=
-        "<li>" +
-        dot +
+      var nodeInfo =
         escapeHtml(nodeIds[j]) +
         " — " +
         (ns.tools || 0) +
@@ -3112,7 +3116,14 @@ function _openMcpDetail(s) {
         (ns.resources || 0) +
         " resources, " +
         (ns.prompts || 0) +
-        " prompts</li>";
+        " prompts";
+      if (ns.error) {
+        nodeInfo +=
+          '<br><span style="color:var(--red);font-size:11px">' +
+          escapeHtml(ns.error) +
+          "</span>";
+      }
+      html += "<li>" + dot + nodeInfo + "</li>";
     }
     html += "</ul>";
   }

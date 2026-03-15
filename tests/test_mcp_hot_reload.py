@@ -236,6 +236,56 @@ class TestGetAllServerStatus:
 
 
 # ---------------------------------------------------------------------------
+# Error tracking (_last_error)
+# ---------------------------------------------------------------------------
+
+
+class TestErrorTracking:
+    def test_get_server_status_returns_error(self) -> None:
+        """Error stored in _last_error flows through get_server_status."""
+        mgr = MCPClientManager({"test": {"command": "echo"}})
+        mgr._last_error["test"] = "Connection refused"
+        status = mgr.get_server_status("test")
+        assert status["error"] == "Connection refused"
+        assert status["connected"] is False
+
+    def test_no_error_by_default(self) -> None:
+        """Default error is empty string."""
+        mgr = MCPClientManager({"test": {"command": "echo"}})
+        status = mgr.get_server_status("test")
+        assert status["error"] == ""
+
+    def test_error_cleared_after_pop(self) -> None:
+        """Clearing _last_error makes get_server_status return empty."""
+        mgr = MCPClientManager({"test": {"command": "echo"}})
+        mgr._last_error["test"] = "Connection refused"
+        mgr._last_error.pop("test", None)
+        status = mgr.get_server_status("test")
+        assert status["error"] == ""
+
+    def test_error_cleared_on_remove(self) -> None:
+        """remove_server_sync cleans up _last_error entry."""
+        mgr = MCPClientManager({"test": {"command": "echo"}})
+        mgr._last_error["test"] = "Connection refused"
+        mgr.remove_server_sync("test")
+        assert "test" not in mgr._last_error
+
+    def test_all_server_status_includes_errors(self) -> None:
+        """get_all_server_status propagates per-server errors."""
+        mgr = MCPClientManager({"alpha": {}, "bravo": {}})
+        mgr._last_error["alpha"] = "Timeout"
+        statuses = mgr.get_all_server_status()
+        assert statuses["alpha"]["error"] == "Timeout"
+        assert statuses["bravo"]["error"] == ""
+
+    def test_error_does_not_leak_across_servers(self) -> None:
+        """Error on one server does not affect another."""
+        mgr = MCPClientManager({"a": {}, "b": {}})
+        mgr._last_error["a"] = "Failed"
+        assert mgr.get_server_status("b")["error"] == ""
+
+
+# ---------------------------------------------------------------------------
 # reconcile_sync
 # ---------------------------------------------------------------------------
 
