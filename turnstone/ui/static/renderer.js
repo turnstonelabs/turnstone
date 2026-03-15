@@ -3,9 +3,10 @@
 // ---------------------------------------------------------------------------
 //  Inline formatting
 // ---------------------------------------------------------------------------
-// Safe HTML tags allowed through escapeHtml (no attributes — XSS safe)
+// Safe inline HTML tags allowed through escapeHtml (no attributes — XSS safe)
+// Block-level tags (details, summary, hr) handled by their own protection passes
 var _SAFE_TAGS =
-  /&lt;(\/?(?:br|hr|kbd|mark|sub|sup|ins|wbr|details|summary|abbr|small|u|s))(?:\s*\/?)&gt;/gi;
+  /&lt;(\/?(?:br|kbd|mark|sub|sup|ins|wbr|abbr|small|u|s))(?:\s*\/?)&gt;/gi;
 
 function inlineMarkdown(text) {
   // Escape HTML first so only tags we generate are real
@@ -315,7 +316,7 @@ function renderMarkdown(text) {
   // Protect <details> blocks (safe HTML — attribute-free only)
   var detailsBlocks = [];
   text = text.replace(
-    /<details>\s*\n([\s\S]*?)<\/details>/gi,
+    /<details>\s*\n?([\s\S]*?)<\/details>/gi,
     function (m, inner) {
       var sumMatch = inner.match(
         /^\s*<summary>([\s\S]*?)<\/summary>\s*\n?([\s\S]*)/i,
