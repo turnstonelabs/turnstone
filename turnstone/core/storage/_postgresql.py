@@ -2207,7 +2207,7 @@ class PostgreSQLBackend:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
                 q = q.where(structured_memories.c.scope == scope)
-            if scope_id:
+            if scope_id and scope:
                 q = q.where(structured_memories.c.scope_id == scope_id)
             q = q.limit(limit)
             rows = conn.execute(q).fetchall()
@@ -2246,7 +2246,7 @@ class PostgreSQLBackend:
             if scope:
                 where += " AND scope = :scope_filter"
                 params["scope_filter"] = scope
-            if scope_id:
+            if scope_id and scope:
                 where += " AND scope_id = :scope_id_filter"
                 params["scope_id_filter"] = scope_id
             rows = conn.execute(
@@ -2267,7 +2267,7 @@ class PostgreSQLBackend:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
                 q = q.where(structured_memories.c.scope == scope)
-            if scope_id:
+            if scope_id and scope:
                 q = q.where(structured_memories.c.scope_id == scope_id)
             result = conn.execute(q).scalar()
             return int(result or 0)

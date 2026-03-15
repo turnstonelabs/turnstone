@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Workstream management
@@ -186,6 +186,14 @@ class SaveMemoryRequest(BaseModel):
         description="Scope identifier (ws_id for workstream, user_id for user scope)",
     )
 
+    @model_validator(mode="after")
+    def _validate_scope_scope_id(self) -> SaveMemoryRequest:
+        if self.scope == "global" and self.scope_id:
+            raise ValueError("scope_id is not allowed with global scope")
+        if self.scope in ("workstream", "user") and not self.scope_id:
+            raise ValueError(f"scope_id is required for {self.scope} scope")
+        return self
+
 
 class MemoryInfo(BaseModel):
     memory_id: str
@@ -214,6 +222,14 @@ class SearchMemoriesRequest(BaseModel):
     scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
     scope_id: str = Field(default="", description="Filter by scope_id")
     limit: int = Field(default=20, description="Max results (1-50)", ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _validate_scope_scope_id(self) -> SearchMemoriesRequest:
+        if self.scope == "global" and self.scope_id:
+            raise ValueError("scope_id is not allowed with global scope")
+        if self.scope_id and not self.scope:
+            raise ValueError("scope is required when scope_id is provided")
+        return self
 
 
 # ---------------------------------------------------------------------------

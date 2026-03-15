@@ -2753,6 +2753,17 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _validate_memory_scope_filter(scope: str, scope_id: str) -> JSONResponse | None:
+    """Validate scope/scope_id consistency for memory queries."""
+    if scope == "global" and scope_id:
+        return JSONResponse({"error": "scope_id is not allowed with global scope"}, status_code=400)
+    if scope_id and not scope:
+        return JSONResponse(
+            {"error": "scope is required when scope_id is provided"}, status_code=400
+        )
+    return None
+
+
 async def admin_list_memories(request: Request) -> JSONResponse:
     """GET /v1/api/admin/memories — list structured memories with filters."""
     from turnstone.core.auth import require_permission
@@ -2768,6 +2779,9 @@ async def admin_list_memories(request: Request) -> JSONResponse:
     mem_type = request.query_params.get("type", "")
     scope = request.query_params.get("scope", "")
     scope_id = request.query_params.get("scope_id", "")
+    err = _validate_memory_scope_filter(scope, scope_id)
+    if err:
+        return err
     try:
         limit = min(int(request.query_params.get("limit", "100")), 200)
     except (ValueError, TypeError):
@@ -2798,6 +2812,9 @@ async def admin_search_memories(request: Request) -> JSONResponse:
     mem_type = request.query_params.get("type", "")
     scope = request.query_params.get("scope", "")
     scope_id = request.query_params.get("scope_id", "")
+    err = _validate_memory_scope_filter(scope, scope_id)
+    if err:
+        return err
     try:
         limit = min(int(request.query_params.get("limit", "20")), 50)
     except (ValueError, TypeError):

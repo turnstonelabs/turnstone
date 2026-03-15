@@ -292,6 +292,69 @@ class TestServerUserScopeSecurity:
         assert r.status_code == 403
 
 
+class TestServerScopeScopeIdValidation:
+    """scope_id requires scope; global scope rejects scope_id."""
+
+    def test_save_global_with_scope_id_rejected(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "k", "content": "c", "scope": "global", "scope_id": "ws1"},
+        )
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
+
+    def test_save_workstream_without_scope_id_rejected(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "k", "content": "c", "scope": "workstream"},
+        )
+        assert r.status_code == 400
+        assert "scope_id is required" in r.json()["error"]
+
+    def test_save_workstream_with_scope_id_ok(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories",
+            json={"name": "k", "content": "c", "scope": "workstream", "scope_id": "ws1"},
+        )
+        assert r.status_code == 201
+
+    def test_list_scope_id_without_scope_rejected(self, server_client):
+        r = server_client.get("/v1/api/memories?scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope is required" in r.json()["error"]
+
+    def test_list_global_with_scope_id_rejected(self, server_client):
+        r = server_client.get("/v1/api/memories?scope=global&scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
+
+    def test_search_scope_id_without_scope_rejected(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories/search",
+            json={"query": "test", "scope_id": "ws1"},
+        )
+        assert r.status_code == 400
+        assert "scope is required" in r.json()["error"]
+
+    def test_search_global_with_scope_id_rejected(self, server_client):
+        r = server_client.post(
+            "/v1/api/memories/search",
+            json={"query": "test", "scope": "global", "scope_id": "ws1"},
+        )
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
+
+    def test_delete_global_with_scope_id_rejected(self, server_client):
+        r = server_client.delete("/v1/api/memories/k?scope=global&scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
+
+    def test_delete_workstream_without_scope_id_rejected(self, server_client):
+        r = server_client.delete("/v1/api/memories/k?scope=workstream")
+        assert r.status_code == 400
+        assert "scope_id is required" in r.json()["error"]
+
+
 class TestServerSearchMemories:
     def test_search(self, server_client, storage):
         _seed_memory(storage, "db_config", "postgresql host", description="database")
@@ -365,6 +428,30 @@ class TestAdminListMemories:
         _seed_memory(storage, "b", "2", mem_type="project")
         r = admin_client.get("/v1/api/admin/memories?type=user")
         assert r.json()["total"] == 1
+
+
+class TestAdminScopeScopeIdValidation:
+    """Console admin: scope_id requires scope; global scope rejects scope_id."""
+
+    def test_list_scope_id_without_scope_rejected(self, admin_client):
+        r = admin_client.get("/v1/api/admin/memories?scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope is required" in r.json()["error"]
+
+    def test_list_global_with_scope_id_rejected(self, admin_client):
+        r = admin_client.get("/v1/api/admin/memories?scope=global&scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
+
+    def test_search_scope_id_without_scope_rejected(self, admin_client):
+        r = admin_client.get("/v1/api/admin/memories/search?q=test&scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope is required" in r.json()["error"]
+
+    def test_search_global_with_scope_id_rejected(self, admin_client):
+        r = admin_client.get("/v1/api/admin/memories/search?q=test&scope=global&scope_id=ws1")
+        assert r.status_code == 400
+        assert "scope_id" in r.json()["error"]
 
 
 class TestAdminSearchMemories:

@@ -1403,6 +1403,28 @@ _VALID_MEMORY_SCOPES = frozenset({"global", "workstream", "user"})
 _MAX_MEMORY_CONTENT = 65536  # hard upper bound; server may enforce lower via config
 
 
+def _validate_scope_scope_id(
+    scope: str, scope_id: str, *, require_scope_id: bool = False
+) -> JSONResponse | None:
+    """Validate scope/scope_id consistency. Returns error response or None."""
+    if scope == "global" and scope_id:
+        return JSONResponse(
+            {"error": "scope_id is not allowed with global scope"},
+            status_code=400,
+        )
+    if scope_id and not scope:
+        return JSONResponse(
+            {"error": "scope is required when scope_id is provided"},
+            status_code=400,
+        )
+    if require_scope_id and scope in ("workstream", "user") and not scope_id:
+        return JSONResponse(
+            {"error": f"scope_id is required for {scope} scope"},
+            status_code=400,
+        )
+    return None
+
+
 def _resolve_user_scope_id(
     request: Request, provided_scope_id: str = ""
 ) -> tuple[str, JSONResponse | None]:
@@ -1437,6 +1459,9 @@ async def list_memories(request: Request) -> JSONResponse:
         limit = min(int(request.query_params.get("limit", "100")), 200)
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    err = _validate_scope_scope_id(scope, scope_id)
+    if err:
+        return err
     if scope == "user":
         scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
@@ -1482,6 +1507,9 @@ async def save_memory(request: Request) -> JSONResponse:
         scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
+    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    if err:
+        return err
     # save_structured_memory normalises the name internally
     from turnstone.core.memory import normalize_key
 
@@ -1525,6 +1553,9 @@ async def search_memories(request: Request) -> JSONResponse:
         limit = min(int(body.get("limit", 20)), 50)
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
+    err = _validate_scope_scope_id(scope, scope_id)
+    if err:
+        return err
     if scope == "user":
         scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
@@ -1549,6 +1580,9 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
         scope_id, err = _resolve_user_scope_id(request, scope_id)
         if err:
             return err
+    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    if err:
+        return err
     if delete_structured_memory(name, scope, scope_id):
         return JSONResponse({"status": "ok", "name": name})
     return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
