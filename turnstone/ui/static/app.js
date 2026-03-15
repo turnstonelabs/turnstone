@@ -1597,7 +1597,8 @@ function showInlineToolBlock(items, autoApproved, judgePending) {
         return (
           it.needs_approval &&
           it.func_name &&
-          it.func_name !== "__budget_override__"
+          it.func_name !== "__budget_override__" &&
+          !it.error
         );
       })
       .map(function (it) {
@@ -1612,11 +1613,13 @@ function showInlineToolBlock(items, autoApproved, judgePending) {
     actions.innerHTML =
       '<button class="approval-btn btn-approve" onclick="resolveInlineApproval(true,false,getFeedback())"><span class="key">y</span> Approve</button>' +
       '<button class="approval-btn btn-deny" onclick="resolveInlineApproval(false,false,getFeedback())"><span class="key">n</span> Deny</button>' +
-      '<button class="approval-btn btn-always" title="' +
-      escapeHtml(alwaysTitle) +
-      '" aria-label="' +
-      escapeHtml(alwaysTitle) +
-      '" onclick="resolveInlineApproval(true,true,getFeedback())"><span class="key">a</span> Always</button>';
+      (alwaysNames.length
+        ? '<button class="approval-btn btn-always" title="' +
+          escapeHtml(alwaysTitle) +
+          '" aria-label="' +
+          escapeHtml(alwaysTitle) +
+          '" onclick="resolveInlineApproval(true,true,getFeedback())"><span class="key">a</span> Always</button>'
+        : "");
     prompt.appendChild(actions);
 
     const fbInput = document.createElement("input");

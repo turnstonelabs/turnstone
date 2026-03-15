@@ -625,8 +625,9 @@ does not auto-approve MCP tools based on their schema, since it cannot guarantee
 that external tools are read-only. However, global overrides such as
 `--skip-permissions` will auto-approve all tools, including MCP tools. The
 interactive "Always" button adds specific tool types to the per-tool auto-approve
-set (using `approval_label` for MCP tools, giving per-prompt/per-resource
-granularity).
+set. The web UI and server use `approval_label` for MCP tools, giving
+per-prompt/per-resource granularity. The CLI and bridge use `func_name`, which
+gives per-tool-type granularity (e.g., all `use_prompt` calls).
 
 ### Sub-agent availability
 

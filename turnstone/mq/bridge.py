@@ -733,7 +733,9 @@ class Bridge:
                         tool_names = {
                             it.get("func_name", "")
                             for it in items
-                            if it.get("needs_approval") and it.get("func_name")
+                            if it.get("needs_approval")
+                            and it.get("func_name")
+                            and not it.get("error")
                         }
                         tool_names.discard("")
                         tool_names.discard("__budget_override__")

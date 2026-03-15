@@ -1097,7 +1097,7 @@ async def approve(request: Request) -> JSONResponse:
         tool_names = {
             it.get("approval_label", "") or it.get("func_name", "")
             for it in ui._pending_approval.get("items", [])
-            if it.get("needs_approval") and it.get("func_name")
+            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
         }
         tool_names.discard("")
         tool_names.discard("__budget_override__")
