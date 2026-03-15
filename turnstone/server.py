@@ -1407,6 +1407,8 @@ def _validate_scope_scope_id(
     scope: str, scope_id: str, *, require_scope_id: bool = False
 ) -> JSONResponse | None:
     """Validate scope/scope_id consistency. Returns error response or None."""
+    scope = scope.strip()
+    scope_id = scope_id.strip()
     if scope == "global" and scope_id:
         return JSONResponse(
             {"error": "scope_id is not allowed with global scope"},

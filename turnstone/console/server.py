@@ -2755,6 +2755,8 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
 
 def _validate_memory_scope_filter(scope: str, scope_id: str) -> JSONResponse | None:
     """Validate scope/scope_id consistency for memory queries."""
+    scope = scope.strip()
+    scope_id = scope_id.strip()
     if scope == "global" and scope_id:
         return JSONResponse({"error": "scope_id is not allowed with global scope"}, status_code=400)
     if scope_id and not scope:

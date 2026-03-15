@@ -188,10 +188,11 @@ class SaveMemoryRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_scope_scope_id(self) -> SaveMemoryRequest:
-        if self.scope == "global" and self.scope_id:
+        scope_id = self.scope_id.strip()
+        if self.scope == "global" and scope_id:
             raise ValueError("scope_id is not allowed with global scope")
-        if self.scope in ("workstream", "user") and not self.scope_id:
-            raise ValueError(f"scope_id is required for {self.scope} scope")
+        if self.scope == "workstream" and not scope_id:
+            raise ValueError("scope_id is required for workstream scope")
         return self
 
 
@@ -225,9 +226,10 @@ class SearchMemoriesRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_scope_scope_id(self) -> SearchMemoriesRequest:
-        if self.scope == "global" and self.scope_id:
+        scope_id = self.scope_id.strip()
+        if self.scope == "global" and scope_id:
             raise ValueError("scope_id is not allowed with global scope")
-        if self.scope_id and not self.scope:
+        if scope_id and not self.scope:
             raise ValueError("scope is required when scope_id is provided")
         return self
 
