@@ -16,7 +16,6 @@ import os
 import threading
 import time
 import uuid
-from collections import deque
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -57,11 +56,6 @@ log = logging.getLogger("turnstone.mq.bridge")
 
 # Server's default safe tools (auto-approved without user confirmation)
 DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "memory", "recall"])
-
-# Maximum total character count of the per-ws content buffer.  Prevents
-# unbounded memory growth if a workstream produces very long responses or
-# the idle event never fires (e.g. bug / disconnect).
-_MAX_CONTENT_BUFFER_CHARS = 256 * 1024
 
 
 class Bridge:
@@ -112,12 +106,6 @@ class Bridge:
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
         self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
         self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
-        # Content buffer: accumulates assistant text per workstream from
-        # per-ws SSE.  Attached to TurnCompleteEvent when idle is detected
-        # via the global SSE so downstream consumers can catch up if the
-        # streaming path missed events (race between the two SSE connections).
-        self._ws_content_buffer: dict[str, deque[str]] = {}
-        self._ws_content_buffer_size: dict[str, int] = {}  # running char total
         self._running = True
 
     @property
@@ -599,23 +587,7 @@ class Bridge:
         etype = data.get("type", "")
 
         if etype == "content":
-            text = data.get("text", "")
-            if text:
-                with self._lock:
-                    if ws_id not in self._ws_content_buffer:
-                        self._ws_content_buffer[ws_id] = deque()
-                        self._ws_content_buffer_size[ws_id] = 0
-                    buf = self._ws_content_buffer[ws_id]
-                    buf.append(text)
-                    self._ws_content_buffer_size[ws_id] += len(text)
-                    # Cap buffer per workstream to prevent DoS from
-                    # extremely long responses or missing idle events.
-                    while (
-                        self._ws_content_buffer_size[ws_id] > _MAX_CONTENT_BUFFER_CHARS
-                        and len(buf) > 1
-                    ):
-                        self._ws_content_buffer_size[ws_id] -= len(buf.popleft())
-            self._publish_ws(ws_id, ContentEvent(ws_id=ws_id, text=text))
+            self._publish_ws(ws_id, ContentEvent(ws_id=ws_id, text=data.get("text", "")))
         elif etype == "reasoning":
             self._publish_ws(ws_id, ReasoningEvent(ws_id=ws_id, text=data.get("text", "")))
         elif etype == "tool_info":
@@ -853,14 +825,12 @@ class Bridge:
             if state == "idle":
                 with self._lock:
                     cid = self._active_sends.pop(ws_id, None)
-                    content_parts = self._ws_content_buffer.pop(ws_id, deque())
-                    self._ws_content_buffer_size.pop(ws_id, None)
                 self._publish_ws(
                     ws_id,
                     TurnCompleteEvent(
                         ws_id=ws_id,
                         correlation_id=cid or "",
-                        content="".join(content_parts),
+                        content=data.get("content", ""),
                     ),
                 )
 
@@ -877,8 +847,6 @@ class Bridge:
                 self._ws_auto_approve.pop(ws_id, None)
                 self._ws_approve_tools.pop(ws_id, None)
                 self._active_sends.pop(ws_id, None)
-                self._ws_content_buffer.pop(ws_id, None)
-                self._ws_content_buffer_size.pop(ws_id, None)
 
     # -- heartbeat -----------------------------------------------------------
 
