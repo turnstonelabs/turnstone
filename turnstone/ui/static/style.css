@@ -305,6 +305,77 @@ body { position: static; }
 .msg-assistant .katex-display { margin: 8px 0; padding: 8px 0; overflow-x: auto; overflow-y: hidden; }
 .msg-assistant .katex-error { color: var(--red) !important; font-size: 12px; }
 
+/* GFM Callouts / Alerts */
+.msg-assistant .callout {
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  margin: 8px 0;
+  overflow: hidden;
+}
+.msg-assistant .callout-title {
+  padding: 8px 12px 4px;
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.msg-assistant .callout-icon { font-size: 14px; }
+.msg-assistant .callout-body { padding: 0 12px 8px; color: var(--fg); }
+.msg-assistant .callout-body p:first-child { margin-top: 0; }
+.msg-assistant .callout-body p:last-child { margin-bottom: 0; }
+.msg-assistant .callout-note { border-left-color: var(--cyan); }
+.msg-assistant .callout-note .callout-title { color: var(--cyan); }
+.msg-assistant .callout-tip { border-left-color: var(--green); }
+.msg-assistant .callout-tip .callout-title { color: var(--green); }
+.msg-assistant .callout-important { border-left-color: var(--magenta); }
+.msg-assistant .callout-important .callout-title { color: var(--magenta); }
+.msg-assistant .callout-warning { border-left-color: var(--yellow); }
+.msg-assistant .callout-warning .callout-title { color: var(--yellow); }
+.msg-assistant .callout-caution { border-left-color: var(--red); }
+.msg-assistant .callout-caution .callout-title { color: var(--red); }
+
+/* Definition lists */
+.msg-assistant dl { margin: 8px 0; }
+.msg-assistant dt {
+  font-weight: 600;
+  color: var(--fg-bright);
+  margin-top: 8px;
+}
+.msg-assistant dt:first-child { margin-top: 0; }
+.msg-assistant dd {
+  margin: 2px 0 0 20px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+}
+
+/* Footnotes */
+.msg-assistant .footnotes { margin-top: 16px; font-size: 12px; color: var(--fg-dim); }
+.msg-assistant .footnotes-sep { border: none; border-top: 1px solid var(--border); margin-bottom: 8px; }
+.msg-assistant .footnotes-list { margin: 0 0 0 20px; padding: 0; }
+.msg-assistant .footnote-item { margin: 4px 0; line-height: 1.5; }
+.msg-assistant .fn-ref a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 600;
+}
+.msg-assistant .fn-ref a:hover { text-decoration: underline; }
+.msg-assistant .fn-backref {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  margin-left: 4px;
+}
+.msg-assistant .fn-backref:hover { text-decoration: underline; }
+.msg-assistant .fn-ref a:focus-visible,
+.msg-assistant .fn-backref:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
 /* ==========================================================================
    Input area
    ========================================================================== */

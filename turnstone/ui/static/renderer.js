@@ -55,6 +55,24 @@ function inlineMarkdown(text) {
       "</a>"
     );
   });
+  // Footnote references [^id] — after links (link regex requires (url), so no conflict)
+  text = text.replace(/\[\^([^\]]+)\]/g, function (m, fnId) {
+    var safeFnId = escapeHtml(fnId);
+    return (
+      '<sup class="fn-ref" id="fn-' +
+      _fnScopeId +
+      "-ref-" +
+      safeFnId +
+      '">' +
+      '<a href="#fn-' +
+      _fnScopeId +
+      "-def-" +
+      safeFnId +
+      '" role="doc-noteref">[' +
+      safeFnId +
+      "]</a></sup>"
+    );
+  });
   return text;
 }
 
@@ -73,6 +91,16 @@ document.addEventListener("keydown", function (e) {
   var ph = e.target.closest(".img-placeholder");
   if (!ph) return;
   ph.click();
+});
+
+// Smooth-scroll footnote navigation (native fragment jumps don't work in scrollable containers)
+document.addEventListener("click", function (e) {
+  var a = e.target.closest(".fn-ref a, .fn-backref");
+  if (!a) return;
+  var target = document.querySelector(a.getAttribute("href"));
+  if (!target) return;
+  e.preventDefault();
+  target.scrollIntoView({ behavior: "smooth", block: "center" });
 });
 
 // ---------------------------------------------------------------------------
@@ -159,9 +187,30 @@ function renderLatex(tex, displayMode) {
 }
 
 // ---------------------------------------------------------------------------
+//  Footnote scope — prevents ID collisions across multiple renderMarkdown calls
+// ---------------------------------------------------------------------------
+var _fnScopeId = 0;
+var _fnDepth = 0;
+
+// ---------------------------------------------------------------------------
+//  GFM callout types (alerts)
+// ---------------------------------------------------------------------------
+var CALLOUT_TYPES = {
+  NOTE: { icon: "\u2139", label: "Note" },
+  TIP: { icon: "\u{1F4A1}", label: "Tip" },
+  IMPORTANT: { icon: "\u2757", label: "Important" },
+  WARNING: { icon: "\u26A0", label: "Warning" },
+  CAUTION: { icon: "\u{1F6D1}", label: "Caution" },
+};
+
+// ---------------------------------------------------------------------------
 //  Main markdown renderer
 // ---------------------------------------------------------------------------
 function renderMarkdown(text) {
+  // Scope footnote IDs per top-level render call (prevents collisions across messages)
+  if (_fnDepth === 0) _fnScopeId++;
+  _fnDepth++;
+
   // Pre-pass: extract blockquote blocks and recursively render.
   // Must run FIRST (before code/math protection) so the recursive call
   // processes raw markdown, not text with outer-scope placeholders.
@@ -180,9 +229,43 @@ function renderMarkdown(text) {
           inner.push(blines[i] === ">" ? "" : blines[i].slice(2));
           i++;
         }
-        bqBlocks.push(
-          "<blockquote>" + renderMarkdown(inner.join("\n")) + "</blockquote>",
-        );
+        // Check for GFM alert/callout syntax: > [!NOTE], > [!TIP], etc.
+        var alertMatch =
+          inner.length > 0 &&
+          inner[0].match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*$/i);
+        if (alertMatch) {
+          var alertType = alertMatch[1].toUpperCase();
+          var info = CALLOUT_TYPES[alertType];
+          var bodyLines = inner.slice(1);
+          if (bodyLines.length > 0 && bodyLines[0].trim() === "") {
+            bodyLines = bodyLines.slice(1);
+          }
+          var bodyHtml =
+            bodyLines.length > 0 ? renderMarkdown(bodyLines.join("\n")) : "";
+          bqBlocks.push(
+            '<div class="callout callout-' +
+              alertType.toLowerCase() +
+              '" role="note" aria-label="' +
+              info.label +
+              '">' +
+              '<div class="callout-title">' +
+              '<span class="callout-icon" aria-hidden="true">' +
+              info.icon +
+              "</span> " +
+              '<span class="callout-label">' +
+              info.label +
+              "</span>" +
+              "</div>" +
+              (bodyHtml
+                ? '<div class="callout-body">' + bodyHtml + "</div>"
+                : "") +
+              "</div>",
+          );
+        } else {
+          bqBlocks.push(
+            "<blockquote>" + renderMarkdown(inner.join("\n")) + "</blockquote>",
+          );
+        }
         result.push("\x00BQ" + (bqBlocks.length - 1) + "\x00");
       } else {
         result.push(blines[i]);
@@ -314,6 +397,33 @@ function renderMarkdown(text) {
     text = result.join("\n");
   })();
 
+  // Collect footnote definitions ([^id]: content)
+  var footnoteDefs = {};
+  (function () {
+    var flines = text.split("\n");
+    var result = [];
+    var i = 0;
+    while (i < flines.length) {
+      var fnm = flines[i].match(/^\[\^([^\]]+)\]:\s*(.*)/);
+      if (fnm) {
+        var fnId = fnm[1];
+        var fnContent = fnm[2];
+        // Collect continuation lines (indented by 2+ spaces)
+        var j = i + 1;
+        while (j < flines.length && /^ {2}/.test(flines[j])) {
+          fnContent += "\n" + flines[j].slice(2);
+          j++;
+        }
+        footnoteDefs[fnId] = fnContent;
+        i = j;
+      } else {
+        result.push(flines[i]);
+        i++;
+      }
+    }
+    text = result.join("\n");
+  })();
+
   // Process block-level elements per line
   var lines = text.split("\n");
   var out = [];
@@ -362,6 +472,56 @@ function renderMarkdown(text) {
       continue;
     }
 
+    // Definition list — term followed by `: definition` lines
+    if (
+      line.trim() !== "" &&
+      i + 1 < lines.length &&
+      /^:\s+/.test(lines[i + 1])
+    ) {
+      var dlItems = [];
+      while (i < lines.length) {
+        if (lines[i].trim() === "" || /^:\s+/.test(lines[i])) break;
+        var dlTerm = lines[i];
+        var dlDefs = [];
+        i++;
+        while (i < lines.length && /^:\s+/.test(lines[i])) {
+          dlDefs.push(lines[i].match(/^:\s+(.*)/)[1]);
+          i++;
+        }
+        if (dlDefs.length > 0) {
+          dlItems.push({ term: dlTerm, defs: dlDefs });
+        } else {
+          break;
+        }
+        // Skip blank lines between entries
+        while (i < lines.length && lines[i].trim() === "") i++;
+        // Check if another term+definition follows
+        if (
+          i < lines.length &&
+          lines[i].trim() !== "" &&
+          !/^:\s+/.test(lines[i]) &&
+          i + 1 < lines.length &&
+          /^:\s+/.test(lines[i + 1])
+        ) {
+          continue;
+        }
+        break;
+      }
+      if (dlItems.length > 0) {
+        var dlHtml = "<dl>";
+        for (var di = 0; di < dlItems.length; di++) {
+          dlHtml += "<dt>" + inlineMarkdown(dlItems[di].term) + "</dt>";
+          for (var dd = 0; dd < dlItems[di].defs.length; dd++) {
+            dlHtml += "<dd>" + inlineMarkdown(dlItems[di].defs[dd]) + "</dd>";
+          }
+        }
+        dlHtml += "</dl>";
+        out.push(dlHtml);
+        i--; // for-loop will increment
+        continue;
+      }
+    }
+
     // Paragraph / plain text
     if (line.trim() === "") {
       out.push("");
@@ -371,6 +531,33 @@ function renderMarkdown(text) {
   }
 
   var result = out.join("\n");
+
+  // Append footnote section if any definitions were collected
+  var fnKeys = Object.keys(footnoteDefs);
+  if (fnKeys.length > 0) {
+    var fnHtml =
+      '<section class="footnotes" role="doc-endnotes">' +
+      '<hr class="footnotes-sep"><ol class="footnotes-list">';
+    for (var fi = 0; fi < fnKeys.length; fi++) {
+      var fid = fnKeys[fi];
+      var safeFid = escapeHtml(fid);
+      fnHtml +=
+        '<li class="footnote-item" id="fn-' +
+        _fnScopeId +
+        "-def-" +
+        safeFid +
+        '">' +
+        renderMarkdown(footnoteDefs[fid]) +
+        ' <a href="#fn-' +
+        _fnScopeId +
+        "-ref-" +
+        safeFid +
+        '" class="fn-backref" ' +
+        'role="doc-backlink" aria-label="Back to reference">\u21A9</a></li>';
+    }
+    fnHtml += "</ol></section>";
+    result += fnHtml;
+  }
 
   // Restore protected blocks
   result = result.replace(/\x00CB(\d+)\x00/g, function (m, idx) {
@@ -401,5 +588,6 @@ function renderMarkdown(text) {
     return inlineMaths[parseInt(idx)];
   });
 
+  _fnDepth--;
   return result;
 }
