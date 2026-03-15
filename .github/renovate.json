@@ -5,37 +5,55 @@
     "helpers:pinGitHubActionDigests",
     ":separateMajorReleases"
   ],
-  "labels": ["dependencies"],
+  "labels": [
+    "dependencies"
+  ],
   "prConcurrentLimit": 5,
   "prHourlyLimit": 2,
-  "schedule": ["before 9am on Monday"],
+  "schedule": [
+    "before 9am on Monday"
+  ],
   "timezone": "America/New_York",
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 9am on Monday"]
+    "schedule": [
+      "before 9am on Monday"
+    ]
   },
   "customManagers": [
     {
       "customType": "regex",
       "description": "Track vendored KaTeX version",
-      "fileMatch": ["pyproject\\.toml$"],
-      "matchStrings": ["katex-(?<currentValue>[\\d.]+)/"],
+      "managerFilePatterns": [
+        "/pyproject\\.toml$/"
+      ],
+      "matchStrings": [
+        "katex-(?<currentValue>[\\d.]+)/"
+      ],
       "depNameTemplate": "katex",
       "datasourceTemplate": "npm"
     },
     {
       "customType": "regex",
       "description": "Track vendored Highlight.js version",
-      "fileMatch": ["pyproject\\.toml$"],
-      "matchStrings": ["hljs-(?<currentValue>[\\d.]+)/"],
+      "managerFilePatterns": [
+        "/pyproject\\.toml$/"
+      ],
+      "matchStrings": [
+        "hljs-(?<currentValue>[\\d.]+)/"
+      ],
       "depNameTemplate": "highlight.js",
       "datasourceTemplate": "npm"
     },
     {
       "customType": "regex",
       "description": "Track vendored Mermaid version",
-      "fileMatch": ["pyproject\\.toml$"],
-      "matchStrings": ["mermaid-(?<currentValue>[\\d.]+)/"],
+      "managerFilePatterns": [
+        "/pyproject\\.toml$/"
+      ],
+      "matchStrings": [
+        "mermaid-(?<currentValue>[\\d.]+)/"
+      ],
       "depNameTemplate": "mermaid",
       "datasourceTemplate": "npm"
     }
@@ -44,8 +62,14 @@
     {
       "description": "LLM SDKs — always review manually",
       "groupName": "LLM SDKs",
-      "matchPackageNames": ["openai", "anthropic", "mcp"],
-      "schedule": ["before 9am on Monday"],
+      "matchPackageNames": [
+        "openai",
+        "anthropic",
+        "mcp"
+      ],
+      "schedule": [
+        "before 9am on Monday"
+      ],
       "automerge": false
     },
     {
@@ -59,37 +83,68 @@
         "httpx-sse",
         "pydantic"
       ],
-      "schedule": ["before 9am on Wednesday"],
+      "schedule": [
+        "before 9am on Wednesday"
+      ],
       "automerge": true,
-      "matchUpdateTypes": ["patch"]
+      "matchUpdateTypes": [
+        "patch"
+      ]
     },
     {
       "description": "Database layer",
       "groupName": "Database",
-      "matchPackageNames": ["sqlalchemy", "alembic", "psycopg"],
-      "schedule": ["before 9am on Wednesday"],
+      "matchPackageNames": [
+        "sqlalchemy",
+        "alembic",
+        "psycopg"
+      ],
+      "schedule": [
+        "before 9am on Wednesday"
+      ],
       "automerge": true,
-      "matchUpdateTypes": ["patch"]
+      "matchUpdateTypes": [
+        "patch"
+      ]
     },
     {
       "description": "Security-critical — always review manually",
       "groupName": "Security",
-      "matchPackageNames": ["PyJWT", "pyjwt", "bcrypt"],
+      "matchPackageNames": [
+        "PyJWT",
+        "pyjwt",
+        "bcrypt"
+      ],
       "automerge": false
     },
     {
       "description": "Infrastructure dependencies",
       "groupName": "Infrastructure",
-      "matchPackageNames": ["structlog", "redis", "croniter", "discord.py"],
-      "schedule": ["before 9am on the first day of the month"],
+      "matchPackageNames": [
+        "structlog",
+        "redis",
+        "croniter",
+        "discord.py"
+      ],
+      "schedule": [
+        "before 9am on the first day of the month"
+      ],
       "automerge": true,
-      "matchUpdateTypes": ["patch"]
+      "matchUpdateTypes": [
+        "patch"
+      ]
     },
     {
       "description": "Vendored JS — requires manual file download after merge",
       "groupName": "Vendored JS",
-      "matchPackageNames": ["katex", "highlight.js", "mermaid"],
-      "schedule": ["before 9am on the first day of the month"],
+      "matchPackageNames": [
+        "katex",
+        "highlight.js",
+        "mermaid"
+      ],
+      "schedule": [
+        "before 9am on the first day of the month"
+      ],
       "automerge": false,
       "prBodyNotes": [
         "This PR updates version references only.",
@@ -107,29 +162,46 @@
         "pytest-cov",
         "pre-commit"
       ],
-      "schedule": ["before 9am on the first day of the month"],
+      "schedule": [
+        "before 9am on the first day of the month"
+      ],
       "automerge": true,
-      "matchUpdateTypes": ["patch"]
+      "matchUpdateTypes": [
+        "patch"
+      ]
     },
     {
       "description": "Docker base images",
       "groupName": "Docker Images",
-      "matchManagers": ["dockerfile", "docker-compose"],
-      "schedule": ["before 9am on the first day of the month"],
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "schedule": [
+        "before 9am on the first day of the month"
+      ],
       "automerge": false
     },
     {
       "description": "TypeScript SDK dev dependencies",
       "groupName": "TypeScript SDK",
-      "matchFileNames": ["sdk/typescript/**"],
-      "schedule": ["before 9am on the first day of the month"],
+      "matchFileNames": [
+        "sdk/typescript/**"
+      ],
+      "schedule": [
+        "before 9am on the first day of the month"
+      ],
       "automerge": true,
-      "matchUpdateTypes": ["patch"]
+      "matchUpdateTypes": [
+        "patch"
+      ]
     },
     {
       "description": "GitHub Actions — group all action updates",
       "groupName": "GitHub Actions",
-      "matchManagers": ["github-actions"],
+      "matchManagers": [
+        "github-actions"
+      ],
       "automerge": false
     }
   ]
