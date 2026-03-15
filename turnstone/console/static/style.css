@@ -627,8 +627,9 @@
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
-  opacity: 0.6;
+  opacity: 0.75;
 }
+#new-ws-box label:first-of-type { margin-top: 0; }
 #new-ws-box select,
 #new-ws-box input[type="text"],
 #new-ws-box textarea {
@@ -642,7 +643,7 @@
   font-size: 13px;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-#new-ws-box textarea { resize: vertical; min-height: 40px; }
+#new-ws-box textarea { resize: vertical; min-height: 60px; }
 #new-ws-box textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
 #new-ws-box select:focus,
 #new-ws-box input:focus,
@@ -688,6 +689,7 @@
   letter-spacing: 0.02em;
 }
 #new-ws-cancel:hover { background: var(--bg-elevated); border-color: var(--border-strong); }
+#new-ws-cancel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #new-ws-submit {
   background: var(--accent);
   color: var(--bg);

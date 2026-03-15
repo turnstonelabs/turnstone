@@ -437,6 +437,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
     { desc: "Navigate rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' }
   ]},
   { title: "General", keys: [
+    { desc: "Submit form from textarea", badge: '<span class="kb-key">Ctrl</span>+<span class="kb-key">Enter</span>' },
     { desc: "Show this help", badge: '<span class="kb-key">?</span>' },
     { desc: "Close overlay", badge: '<span class="kb-key">Esc</span>' }
   ]}
@@ -452,6 +453,8 @@ window.TURNSTONE_KB_SHORTCUTS = [
   <div id="new-ws-box">
     <h2 id="new-ws-title">New Workstream</h2>
     <div id="new-ws-error" role="alert" aria-live="assertive"></div>
+    <label for="new-ws-task">Task <span class="label-hint">optional &mdash; sent as first message</span></label>
+    <textarea id="new-ws-task" rows="4" placeholder="What should this workstream work on?"></textarea>
     <label for="new-ws-node">Node</label>
     <select id="new-ws-node">
       <option value="">Auto (best available)</option>
@@ -468,8 +471,6 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <select id="new-ws-profile">
       <option value="">None</option>
     </select>
-    <label for="new-ws-task">Task <span class="label-hint">optional &mdash; sent as first message</span></label>
-    <textarea id="new-ws-task" rows="3" placeholder="What should this workstream work on?"></textarea>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>

@@ -1303,7 +1303,14 @@ function showNewWsModal() {
     });
   document.getElementById("new-ws-name").value = "";
   document.getElementById("new-ws-model").value = "";
-  document.getElementById("new-ws-task").value = "";
+  var taskEl = document.getElementById("new-ws-task");
+  taskEl.value = "";
+  var mod =
+    navigator.platform && navigator.platform.indexOf("Mac") > -1
+      ? "\u2318"
+      : "Ctrl";
+  taskEl.placeholder =
+    "What should this workstream work on? (" + mod + "+Enter to create)";
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
@@ -1336,7 +1343,7 @@ function showNewWsModal() {
   document.addEventListener("keydown", _newWsTrapHandler);
 
   setTimeout(function () {
-    document.getElementById("new-ws-name").focus();
+    document.getElementById("new-ws-task").focus();
   }, 50);
 }
 
@@ -1412,11 +1419,9 @@ document.addEventListener("keydown", function (e) {
     e.preventDefault();
     hideNewWsModal();
   }
-  if (
-    e.key === "Enter" &&
-    e.target.tagName !== "SELECT" &&
-    e.target.tagName !== "TEXTAREA"
-  ) {
+  if (e.key === "Enter") {
+    if (e.target.tagName === "SELECT") return;
+    if (e.target.tagName === "TEXTAREA" && !(e.ctrlKey || e.metaKey)) return;
     e.preventDefault();
     var btn = document.getElementById("new-ws-submit");
     if (btn && !btn.disabled) submitNewWs();
