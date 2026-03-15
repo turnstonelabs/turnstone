@@ -235,8 +235,10 @@ class MessageCog:
             return
 
         # Resolve user identity — unlinked users are silently ignored.
+        # Re-insert the tracking entry so the user can retry after linking.
         user_id = await self.ts.router.resolve_user("discord", str(message.author.id))
         if user_id is None:
+            self.ts._notify_ws_map[ref.message_id] = entry
             return
 
         # Route the reply to the originating workstream.
