@@ -53,8 +53,13 @@ function initLogin() {
   var _oidcError = _oidcParams.get("oidc_error");
   if (_oidcError) {
     showLogin();
-    _showError(_oidcError);
     history.replaceState({}, "", window.location.pathname);
+    // Defer: showLogin() triggers async status fetch → _switchMode() → _clearError().
+    // Display after that settles.
+    var _pendingOidcError = _oidcError;
+    setTimeout(function () {
+      _showError(_pendingOidcError);
+    }, 300);
   } else if (_oidcParams.get("oidc_success")) {
     history.replaceState({}, "", window.location.pathname);
     // Fetch permissions before completing login (cookie is already set)

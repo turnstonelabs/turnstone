@@ -83,7 +83,7 @@ IdP --> Server : {id_token: "eyJ...",\naccess_token: "..."}
 
 == ID Token Validation ==
 
-Server -> IdP : Fetch JWKS public keys\n(cached, refreshed hourly)
+Server -> IdP : Fetch JWKS public keys\n(cached at startup, refreshed\non-demand when unknown kid\nencountered — key rotation)
 
 Server -> Server : Validate ID token:\n1. Verify signature (RS256/ES256)\n2. Check iss == configured issuer\n3. Check aud == client_id\n4. Check exp (not expired)\n5. Verify nonce matches
 

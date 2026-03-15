@@ -2596,7 +2596,7 @@ class SQLiteBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                sa.insert(oidc_pending_states).prefix_with("OR IGNORE"),
+                sa.insert(oidc_pending_states),
                 {
                     "state": state,
                     "nonce": nonce,
@@ -2616,7 +2616,8 @@ class SQLiteBackend:
             "%Y-%m-%dT%H:%M:%S"
         )
         with self._engine.connect() as conn:
-            # Atomic: SELECT then DELETE in one transaction to prevent TOCTOU
+            # Acquire write lock before SELECT to prevent TOCTOU race
+            conn.execute(sa.text("BEGIN IMMEDIATE"))
             row = conn.execute(
                 sa.select(
                     oidc_pending_states.c.state,

@@ -701,19 +701,25 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         from turnstone.core.oidc import discover_oidc
 
         try:
-            from turnstone.core.oidc import fetch_jwks
-
             oidc_config = await discover_oidc(oidc_config)
             app.state.oidc_config = oidc_config
-            if oidc_config.enabled and oidc_config.jwks_uri:
+        except Exception:
+            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
+        if oidc_config.enabled and oidc_config.jwks_uri:
+            try:
+                from turnstone.core.oidc import fetch_jwks
+
                 app.state.jwks_data = await fetch_jwks(oidc_config.jwks_uri)
                 log.info(
                     "OIDC enabled: %s (%s)",
                     oidc_config.provider_name,
                     oidc_config.issuer,
                 )
-        except Exception:
-            log.warning("OIDC discovery failed — OIDC login disabled", exc_info=True)
+            except Exception:
+                log.warning(
+                    "OIDC JWKS prefetch failed — will retry on first login",
+                    exc_info=True,
+                )
     yield
     # Shutdown
     if scheduler is not None:

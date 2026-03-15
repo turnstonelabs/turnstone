@@ -1158,6 +1158,7 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
         ip_ok, _ip_retry = login_limiter.check(f"ip:{client_ip}")
         if not ip_ok:
             return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
+        login_limiter.record(f"ip:{client_ip}")  # Count every authorize to bound pending states
 
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
@@ -1185,6 +1186,8 @@ async def handle_oidc_authorize(request: Request, audience: str) -> Response:
 
     # Build redirect URI from request
     scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
+    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
+    # when available, rather than the request Host header. See PROGRESS.md.
     host = request.headers.get("host", "localhost")
     redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
 
@@ -1238,6 +1241,8 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
 
     # Build redirect URI (must match what was sent in authorize)
     scheme = "https" if is_secure_request(dict(request.headers), request.url.scheme) else "http"
+    # TODO(tech-debt): derive from TURNSTONE_OIDC_REDIRECT_BASE env var
+    # when available, rather than the request Host header. See PROGRESS.md.
     host = request.headers.get("host", "localhost")
     redirect_uri = f"{scheme}://{host}/v1/api/auth/oidc/callback"
 
@@ -1265,7 +1270,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
             except OIDCError:
                 pass
         if jwks_data is None:
-            return RedirectResponse("/?oidc_error=OIDC+not+configured", status_code=302)
+            return RedirectResponse("/?oidc_error=OIDC+temporarily+unavailable", status_code=302)
 
         try:
             id_claims = validate_id_token(

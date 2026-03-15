@@ -160,6 +160,13 @@ class AuthStatusResponse(BaseModel):
     password_enabled: bool = True
 
 
+class AuthWhoamiResponse(BaseModel):
+    """GET /v1/api/auth/whoami response."""
+
+    user_id: str
+    permissions: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Schedules
 # ---------------------------------------------------------------------------

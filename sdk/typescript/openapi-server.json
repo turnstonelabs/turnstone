@@ -589,21 +589,11 @@
           "Auth"
         ],
         "responses": {
-          "200": {
+          "302": {
             "description": "Success"
           },
           "404": {
             "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Error 429",
             "content": {
               "application/json": {
                 "schema": {
@@ -633,7 +623,7 @@
           "Auth"
         ],
         "responses": {
-          "200": {
+          "302": {
             "description": "Success"
           }
         }
@@ -648,7 +638,14 @@
         ],
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthWhoamiResponse"
+                }
+              }
+            }
           },
           "401": {
             "description": "Error 401",

@@ -184,15 +184,13 @@ class TestOIDCPendingState:
         result = db.pop_oidc_pending_state("state-long", max_age_seconds=600)
         assert result is not None
 
-    def test_create_pending_state_idempotent(self, db):
-        """OR IGNORE -- creating same state twice doesn't error."""
-        db.create_oidc_pending_state("state-dup", "nonce-1", "verifier-1", "server")
-        db.create_oidc_pending_state("state-dup", "nonce-2", "verifier-2", "server")
+    def test_create_pending_state_duplicate_raises(self, db):
+        """Duplicate state insertion raises IntegrityError (no silent drop)."""
+        import sqlalchemy.exc
 
-        result = db.pop_oidc_pending_state("state-dup")
-        assert result is not None
-        # First insert preserved
-        assert result["nonce"] == "nonce-1"
+        db.create_oidc_pending_state("state-dup", "nonce-1", "verifier-1", "server")
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            db.create_oidc_pending_state("state-dup", "nonce-2", "verifier-2", "server")
 
     def test_cleanup_expired_states(self, db):
         """Create expired + fresh, cleanup removes only expired."""

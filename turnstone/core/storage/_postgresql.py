@@ -2571,22 +2571,19 @@ class PostgreSQLBackend:
     def create_oidc_pending_state(
         self, state: str, nonce: str, code_verifier: str, audience: str
     ) -> None:
-        from sqlalchemy.dialects import postgresql
-
         from turnstone.core.storage._schema import oidc_pending_states
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                postgresql.insert(oidc_pending_states)
-                .values(
-                    state=state,
-                    nonce=nonce,
-                    code_verifier=code_verifier,
-                    audience=audience,
-                    created_at=now,
-                )
-                .on_conflict_do_nothing()
+                sa.insert(oidc_pending_states),
+                {
+                    "state": state,
+                    "nonce": nonce,
+                    "code_verifier": code_verifier,
+                    "audience": audience,
+                    "created_at": now,
+                },
             )
             conn.commit()
 
