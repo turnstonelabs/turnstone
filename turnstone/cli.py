@@ -98,6 +98,7 @@ class TerminalUI(SessionUI):
         self.spinner: Spinner | None = None
         self._print_lock = threading.Lock()
         self.auto_approve = False
+        self.auto_approve_tools: set[str] = set()
 
     def on_thinking_start(self) -> None:
         self.spinner = Spinner("Thinking")
@@ -159,6 +160,12 @@ class TerminalUI(SessionUI):
             if not pending or self.auto_approve:
                 return True, None
 
+            # Per-tool auto-approve check
+            if self.auto_approve_tools:
+                pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+                if pending_names and pending_names.issubset(self.auto_approve_tools):
+                    return True, None
+
             # Prompt
             try:
                 if len(pending) == 1:
@@ -188,7 +195,10 @@ class TerminalUI(SessionUI):
                     break
 
             if decision in ("a", "always"):
-                self.auto_approve = True
+                tool_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+                tool_names.discard("")
+                tool_names.discard("__budget_override__")
+                self.auto_approve_tools.update(tool_names)
                 return True, feedback
             elif decision in ("y", "yes"):
                 return True, feedback

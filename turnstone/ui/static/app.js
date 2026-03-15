@@ -1592,12 +1592,31 @@ function showInlineToolBlock(items, autoApproved, judgePending) {
       else prompt.classList.add("verdict-glow-review");
     }
 
+    var alwaysNames = items
+      .filter(function (it) {
+        return (
+          it.needs_approval &&
+          it.func_name &&
+          it.func_name !== "__budget_override__"
+        );
+      })
+      .map(function (it) {
+        return it.approval_label || it.func_name;
+      });
+    block.dataset.alwaysNames = JSON.stringify(alwaysNames);
+    var alwaysTitle = alwaysNames.length
+      ? "Always approve " + alwaysNames.join(", ")
+      : "Always approve this tool type";
     const actions = document.createElement("div");
     actions.className = "approval-actions";
     actions.innerHTML =
       '<button class="approval-btn btn-approve" onclick="resolveInlineApproval(true,false,getFeedback())"><span class="key">y</span> Approve</button>' +
       '<button class="approval-btn btn-deny" onclick="resolveInlineApproval(false,false,getFeedback())"><span class="key">n</span> Deny</button>' +
-      '<button class="approval-btn btn-always" onclick="resolveInlineApproval(true,true,getFeedback())"><span class="key">a</span> Always</button>';
+      '<button class="approval-btn btn-always" title="' +
+      escapeHtml(alwaysTitle) +
+      '" aria-label="' +
+      escapeHtml(alwaysTitle) +
+      '" onclick="resolveInlineApproval(true,true,getFeedback())"><span class="key">a</span> Always</button>';
     prompt.appendChild(actions);
 
     const fbInput = document.createElement("input");
@@ -1633,7 +1652,14 @@ function resolveInlineApproval(approved, always, feedback, skipPost) {
   badge.setAttribute("role", "status");
   if (approved) {
     badge.className = "approval-badge badge-approved";
-    var label = always ? "\u2713 always approve" : "\u2713 approved";
+    var label = "\u2713 approved";
+    if (always) {
+      var raw = approvalBlockEl.dataset.alwaysNames;
+      var names = raw ? JSON.parse(raw) : [];
+      label = names.length
+        ? "\u2713 always approve " + names.join(", ")
+        : "\u2713 always approve";
+    }
     badge.textContent = feedback ? label + ": " + feedback : label;
     approvalBlockEl.classList.add("approved");
   } else {

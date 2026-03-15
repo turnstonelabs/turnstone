@@ -87,8 +87,11 @@ All prepared items are sent to the UI via `ui.approve_tools(items)`.
   but do not block execution.
 - Items where `needs_approval` is `True` require the user to accept or deny.
 - The user can provide feedback alongside their approval (e.g. "y, use full path").
-- If `auto_approve` is `True` on the session (headless mode), all tools are
-  approved automatically.
+- Choosing "always" (key `a`) adds the pending tool names to `auto_approve_tools`,
+  so that specific tool type is auto-approved going forward (other tool types still
+  prompt). This is per-tool, not blanket.
+- If `auto_approve` is `True` on the session (via `--skip-permissions` or workstream
+  template), all tools are approved automatically.
 
 ### Phase 3: Execute
 
@@ -620,8 +623,10 @@ MCP-compatible service.
 MCP tools **require user approval by default** (`needs_approval: True`). turnstone
 does not auto-approve MCP tools based on their schema, since it cannot guarantee
 that external tools are read-only. However, global overrides such as
-`--skip-permissions` or the UI's "always allow" setting will auto-approve all
-tools, including MCP tools.
+`--skip-permissions` will auto-approve all tools, including MCP tools. The
+interactive "Always" button adds specific tool types to the per-tool auto-approve
+set (using `approval_label` for MCP tools, giving per-prompt/per-resource
+granularity).
 
 ### Sub-agent availability
 

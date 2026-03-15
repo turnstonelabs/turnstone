@@ -69,8 +69,8 @@ partition "Phase 2: Approve" #FFF3E0 {
             **TerminalUI**: Print headers/previews,
             prompt [y/n/a, optional message]
             If user chose "always":
-              Set ui.auto_approve = True
-              (auto-approve all future tools in this session)
+              Add pending tool names to auto_approve_tools
+              (auto-approve these tool types going forward)
             **WebUI**: Enqueue approve_request,
             block on _approval_event.wait()
             **NullUI**: Return (True, None)

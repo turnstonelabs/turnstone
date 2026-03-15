@@ -561,6 +561,7 @@ body { position: static; }
 }
 .btn-approve:hover { border-color: var(--green); color: var(--green); }
 .btn-deny:hover { border-color: var(--red); color: var(--red); }
+.btn-always { border-style: dashed; }
 .btn-always:hover { border-color: var(--accent); color: var(--accent); }
 .approval-feedback-input {
   width: 100%;
@@ -576,7 +577,7 @@ body { position: static; }
 }
 .approval-feedback-input:focus { border-color: var(--accent); }
 .approval-feedback-input::placeholder { color: var(--fg-dim); }
-.approval-badge { padding: 6px 12px; font-size: 12px; font-weight: 600; border-top: 1px solid var(--border); }
+.approval-badge { padding: 6px 12px; font-size: 12px; font-weight: 600; border-top: 1px solid var(--border); overflow-wrap: break-word; word-break: break-word; }
 .approval-badge.badge-approved { color: var(--green); }
 .approval-badge.badge-denied { color: var(--red); }
 .tool-output {
@@ -768,7 +769,7 @@ body { position: static; }
    Focus indicators — server-specific overrides
    ========================================================================== */
 #input-area textarea:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
-.approval-btn:focus-visible { outline-offset: 1px; }
+.approval-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* ==========================================================================
    Empty state

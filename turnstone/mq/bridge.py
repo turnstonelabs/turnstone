@@ -729,9 +729,20 @@ class Bridge:
                     feedback = getattr(resp_msg, "feedback", None)
                     always = getattr(resp_msg, "always", False)
                     self._api_approve(ws_id, approved=approved, feedback=feedback)
-                    if always:
-                        with self._lock:
-                            self._ws_auto_approve[ws_id] = True
+                    if always and approved:
+                        tool_names = {
+                            it.get("func_name", "")
+                            for it in items
+                            if it.get("needs_approval") and it.get("func_name")
+                        }
+                        tool_names.discard("")
+                        tool_names.discard("__budget_override__")
+                        if tool_names:
+                            with self._lock:
+                                existing = self._ws_approve_tools.get(
+                                    ws_id, set(DEFAULT_SAFE_TOOLS)
+                                )
+                                self._ws_approve_tools[ws_id] = existing | tool_names
                 else:
                     log.warning("Approval timeout for ws %s — denying", ws_id)
                     self._api_approve(ws_id, approved=False, feedback="Approval timed out")

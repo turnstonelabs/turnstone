@@ -23,7 +23,9 @@ class SendResponse(BaseModel):
 class ApproveRequest(BaseModel):
     approved: bool = Field(description="True to approve, false to deny")
     feedback: str | None = Field(default=None, description="Optional denial reason")
-    always: bool = Field(default=False, description="Enable auto-approve for this tool")
+    always: bool = Field(
+        default=False, description="Auto-approve the tools in this batch going forward"
+    )
     ws_id: str = Field(description="Target workstream ID")
 
 

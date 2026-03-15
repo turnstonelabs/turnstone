@@ -262,7 +262,7 @@ class WebUI:
                 log.debug("Tool policy evaluation failed", exc_info=True)
         # -- End tool policy evaluation -------------------------------------------
 
-        # Per-tool auto-approve check (server-side, from workstream template)
+        # Per-tool auto-approve check (from workstream template or interactive "Always")
         if pending and self.auto_approve_tools:
             pending_names = {
                 it.get("approval_label", "") or it.get("func_name", "")
@@ -1093,8 +1093,16 @@ async def approve(request: Request) -> JSONResponse:
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    if always and approved:
-        ui.auto_approve = True
+    if always and approved and ui._pending_approval:
+        tool_names = {
+            it.get("approval_label", "") or it.get("func_name", "")
+            for it in ui._pending_approval.get("items", [])
+            if it.get("needs_approval") and it.get("func_name")
+        }
+        tool_names.discard("")
+        tool_names.discard("__budget_override__")
+        if tool_names:
+            ui.auto_approve_tools.update(tool_names)
     ui.resolve_approval(approved, feedback)
     return JSONResponse({"status": "ok"})
 
