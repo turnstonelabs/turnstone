@@ -3140,24 +3140,28 @@ async def _collect_mcp_status(
     """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
     collector: ClusterCollector = request.app.state.collector
     nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
-    result: dict[str, dict[str, dict[str, Any]]] = {}
-    for node in nodes:
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+
+    async def _fetch(node: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]] | None]:
         node_id = node.get("node_id", "")
         url = node.get("server_url", "")
         if not url:
-            continue
+            return node_id, None
         try:
-            headers = _proxy_auth_headers(request)
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10)) as client:
-                resp = await client.get(
-                    f"{url.rstrip('/')}/v1/api/_internal/mcp-status",
-                    headers=headers,
-                )
-                if resp.status_code == 200:
-                    result[node_id] = resp.json().get("servers", {})
+            resp = await client.get(
+                f"{url.rstrip('/')}/v1/api/_internal/mcp-status",
+                headers=headers,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return node_id, resp.json().get("servers", {})
         except Exception:
-            pass
-    return result
+            log.debug("Failed to fetch MCP status from node %s", node_id)
+        return node_id, None
+
+    results = await asyncio.gather(*[_fetch(n) for n in nodes])
+    return {nid: servers for nid, servers in results if servers is not None}
 
 
 async def admin_list_mcp_servers(request: Request) -> JSONResponse:
@@ -3485,25 +3489,26 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
     collector: ClusterCollector = request.app.state.collector
     nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
-    results: dict[str, Any] = {}
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
 
-    for node in nodes:
+    async def _notify(node: dict[str, Any]) -> tuple[str, Any]:
         node_id = node.get("node_id", "")
         url = node.get("server_url", "")
         if not url:
-            continue
+            return node_id, None
         try:
-            headers = _proxy_auth_headers(request)
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
-                resp = await client.post(
-                    f"{url.rstrip('/')}/v1/api/_internal/mcp-reload",
-                    headers=headers,
-                )
-                results[node_id] = resp.json()
+            resp = await client.post(
+                f"{url.rstrip('/')}/v1/api/_internal/mcp-reload",
+                headers=headers,
+                timeout=30,
+            )
+            return node_id, resp.json()
         except Exception as exc:
-            results[node_id] = {"error": str(exc)}
+            return node_id, {"error": str(exc)}
 
-    return results
+    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    return {nid: data for nid, data in results if data is not None}
 
 
 async def admin_mcp_reload(request: Request) -> JSONResponse:
