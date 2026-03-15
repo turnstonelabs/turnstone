@@ -3,12 +3,12 @@
 # Single image for all services: server, bridge, console, sim, eval
 # =============================================================================
 
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
 
-COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.10.10 /uv /usr/local/bin/uv
 
 # System dependencies for psycopg (PostgreSQL client library)
 RUN apt-get update && apt-get install -y --no-install-recommends libpq5 \
