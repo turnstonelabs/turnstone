@@ -358,6 +358,35 @@ body { position: static; }
   .msg-assistant .mermaid-container svg * { animation: none !important; }
 }
 
+/* Safe HTML elements */
+.msg-assistant details {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+.msg-assistant details summary {
+  padding: 8px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--fg-bright);
+  user-select: none;
+}
+.msg-assistant details summary:hover { color: var(--accent); }
+.msg-assistant details[open] > summary { border-bottom: 1px solid var(--border); }
+.msg-assistant details > :not(summary) { padding: 0 12px; }
+.msg-assistant kbd {
+  background: var(--bg-highlight);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  box-shadow: 0 1px 0 var(--border-strong);
+}
+.msg-assistant mark { background: var(--yellow-glow); color: var(--fg-bright); border-radius: 2px; padding: 0 2px; }
+
 /* GFM Callouts / Alerts */
 .msg-assistant .callout {
   border-left: 3px solid var(--border-strong);
