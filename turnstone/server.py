@@ -1217,11 +1217,14 @@ async def create_workstream(request: Request) -> JSONResponse:
         resolved_model = ws_tpl["model"]
     # Pre-validate prompt template before creating the workstream.
     # This avoids the create-then-rollback pattern when template is invalid.
+    # Skip when resuming — resumed workstreams restore their own template
+    # from workstream_config, so the request's template is irrelevant.
     ws_tpl_overrides_prompt = bool(
         ws_tpl and (ws_tpl["system_prompt"] or ws_tpl["prompt_template"])
     )
+    resume_ws_id = body.get("resume_ws", "")
     resolved_template: str | None = None
-    if body_template and not ws_tpl_overrides_prompt:
+    if body_template and not ws_tpl_overrides_prompt and not resume_ws_id:
         from turnstone.core.memory import get_prompt_template_by_name
 
         if not get_prompt_template_by_name(body_template):
@@ -1259,7 +1262,6 @@ async def create_workstream(request: Request) -> JSONResponse:
         # Atomic workstream resume during creation.
         resumed = False
         message_count = 0
-        resume_ws_id = body.get("resume_ws", "")
         if resume_ws_id and ws.session is not None:
             from turnstone.core.memory import get_workstream_display_name, resolve_workstream
 
