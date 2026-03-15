@@ -184,6 +184,124 @@ class TestLoadOIDCConfig:
         assert cfg.scopes == "openid email profile"
         assert cfg.provider_name == "SSO"
 
+    def test_load_oidc_config_redirect_base_from_env(self, monkeypatch):
+        """TURNSTONE_OIDC_REDIRECT_BASE populates redirect_base."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "https://app.example.com")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == "https://app.example.com"
+
+    def test_load_oidc_config_redirect_base_strips_trailing_slash(self, monkeypatch):
+        """Trailing slashes are stripped from redirect_base."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "https://app.example.com/")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == "https://app.example.com"
+
+    def test_load_oidc_config_redirect_base_default_empty(self, monkeypatch):
+        """redirect_base defaults to empty string when not set."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.delenv("TURNSTONE_OIDC_REDIRECT_BASE", raising=False)
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == ""
+
+    def test_load_oidc_config_redirect_base_rejects_path(self, monkeypatch):
+        """redirect_base with a path component is rejected (falls back to empty)."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "https://app.example.com/subpath")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == ""
+
+    def test_load_oidc_config_redirect_base_rejects_no_scheme(self, monkeypatch):
+        """redirect_base without a scheme is rejected."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "app.example.com")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == ""
+
+    def test_load_oidc_config_redirect_base_allows_http(self, monkeypatch):
+        """http:// redirect_base is allowed (with warning) for local dev."""
+        monkeypatch.setenv("TURNSTONE_OIDC_ISSUER", "https://auth.example.com")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_ID", "cid")
+        monkeypatch.setenv("TURNSTONE_OIDC_CLIENT_SECRET", "csecret")
+        monkeypatch.setenv("TURNSTONE_OIDC_REDIRECT_BASE", "http://localhost:8000")
+
+        with patch("turnstone.core.config.load_config", return_value={}):
+            cfg = load_oidc_config()
+
+        assert cfg.redirect_base == "http://localhost:8000"
+
+
+# ---------------------------------------------------------------------------
+# Redirect URI Builder
+# ---------------------------------------------------------------------------
+
+
+class TestBuildOIDCRedirectURI:
+    """Tests for ``_build_oidc_redirect_uri`` in auth.py."""
+
+    def _make_request(self, host="app.example.com", scheme="https", forwarded_proto=""):
+        """Build a minimal mock Starlette Request."""
+        req = MagicMock()
+        headers = {"host": host}
+        if forwarded_proto:
+            headers["x-forwarded-proto"] = forwarded_proto
+        req.headers = headers
+        req.url.scheme = scheme
+        return req
+
+    def test_pinned_redirect_base(self):
+        """When redirect_base is set, Host header is ignored."""
+        from turnstone.core.auth import _build_oidc_redirect_uri
+
+        config = _make_config(redirect_base="https://public.example.com")
+        req = self._make_request(host="internal-host:8080", scheme="http")
+        result = _build_oidc_redirect_uri(req, config)
+        assert result == "https://public.example.com/v1/api/auth/oidc/callback"
+
+    def test_fallback_to_host_header(self):
+        """When redirect_base is empty, redirect URI uses Host header."""
+        from turnstone.core.auth import _build_oidc_redirect_uri
+
+        config = _make_config(redirect_base="")
+        req = self._make_request(host="app.example.com", scheme="https")
+        result = _build_oidc_redirect_uri(req, config)
+        assert result == "https://app.example.com/v1/api/auth/oidc/callback"
+
+    def test_fallback_x_forwarded_proto(self):
+        """When redirect_base is empty and X-Forwarded-Proto is https, scheme is https."""
+        from turnstone.core.auth import _build_oidc_redirect_uri
+
+        config = _make_config(redirect_base="")
+        req = self._make_request(host="app.example.com", scheme="http", forwarded_proto="https")
+        result = _build_oidc_redirect_uri(req, config)
+        assert result == "https://app.example.com/v1/api/auth/oidc/callback"
+
 
 # ---------------------------------------------------------------------------
 # PKCE

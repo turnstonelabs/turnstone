@@ -284,9 +284,9 @@ API tokens and config-file tokens are unaffected by this setting.
   until the 24-hour expiry
 - **Single IdP** — configuration supports one issuer (the database
   schema supports multiple for future expansion)
-- **Redirect URI derived from Host header** — deployments behind
+- **Redirect URI** — defaults to request Host header; deployments behind
   reverse proxies should set `TURNSTONE_OIDC_REDIRECT_BASE` to the
-  externally-reachable origin (tech debt — not yet implemented)
+  externally-reachable origin to pin the redirect URI
 
 ---
 
