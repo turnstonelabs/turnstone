@@ -296,7 +296,7 @@ class ChatSession:
         self._watch_dispatch_depth = 0
         # Metacognitive nudges: ephemeral prompts for proactive memory use
         self._metacog_state: dict[str, float] = {}
-        self._pending_nudge: str | None = None
+        self._pending_nudge: list[str] = []
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg: dict[str, Any] | None = None
@@ -666,7 +666,7 @@ class ChatSession:
             memory_count=self._visible_memory_count(),
             cooldown_secs=self._memory_config.nudge_cooldown,
         ):
-            self._pending_nudge = format_nudge("resume")
+            self._pending_nudge.append(format_nudge("resume"))
         self._init_system_messages()
         return True
 
@@ -807,9 +807,10 @@ class ChatSession:
                 "Use memory(action='search') or memory(action='list') for more."
             )
         if self._pending_nudge:
-            dev_parts.append("")
-            dev_parts.append(self._pending_nudge)
-            self._pending_nudge = None
+            for nudge in self._pending_nudge:
+                dev_parts.append("")
+                dev_parts.append(nudge)
+            self._pending_nudge.clear()
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Atomic swap — readers see either old or new, never partial
         self.system_messages = new_system_messages
@@ -997,7 +998,7 @@ class ChatSession:
         # Metacognitive nudge: check for correction/completion signals
         nudge = self._check_metacognitive_nudge(user_input)
         if nudge:
-            self._pending_nudge = nudge
+            self._pending_nudge.append(nudge)
             self._init_system_messages()
 
         try:
@@ -1873,7 +1874,7 @@ class ChatSession:
                 memory_count=self._visible_memory_count(),
                 cooldown_secs=self._memory_config.nudge_cooldown,
             ):
-                self._pending_nudge = format_nudge("denial")
+                self._pending_nudge.append(format_nudge("denial"))
                 self._init_system_messages()
 
         # Phase 3: execute (check cancellation before starting)
