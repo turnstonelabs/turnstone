@@ -165,6 +165,10 @@ class SessionUI(Protocol):
         """Called when the LLM judge produces a verdict for a pending approval."""
         ...
 
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        """Called when the output guard detects risk signals in tool output."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Notify auth helper (module-level, lazy-init)
@@ -1099,6 +1103,15 @@ class ChatSession:
                 # Map tool_call_id → tool name for logging
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
+                    # Output guard: evaluate tool result before it enters context
+                    if (
+                        isinstance(output, str)
+                        and self._judge_config
+                        and self._judge_config.enabled
+                        and self._judge_config.output_guard
+                    ):
+                        output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
+
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
                         "tool_call_id": tc_id,
@@ -1857,6 +1870,38 @@ class ChatSession:
         # Attach heuristic verdicts to items for the approval UI
         for item, verdict in zip(pending, heuristic_verdicts, strict=True):
             item["_heuristic_verdict"] = verdict.to_dict()
+
+    def _evaluate_output(self, call_id: str, output: str, func_name: str) -> str:
+        """Run the output guard on tool result text.
+
+        Returns the (possibly sanitized) output.  Surfaces warnings via
+        ``ui.on_output_warning`` and logs at debug level.
+        """
+        from turnstone.core.output_guard import evaluate_output
+
+        assessment = evaluate_output(output, func_name=func_name, call_id=call_id)
+        if assessment.risk_level == "none":
+            return output
+
+        log.debug(
+            "output_guard.flagged",
+            call_id=call_id,
+            func_name=func_name,
+            risk=assessment.risk_level,
+            flags=assessment.flags,
+        )
+        try:
+            self.ui.on_output_warning(call_id, assessment.to_dict())
+        except Exception:
+            log.debug("output_guard.callback_failed", exc_info=True)
+
+        if (
+            assessment.sanitized is not None
+            and self._judge_config
+            and self._judge_config.redact_secrets
+        ):
+            return assessment.sanitized
+        return output
 
     # -- Two-phase tool execution -----------------------------------------------
     #

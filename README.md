@@ -174,6 +174,8 @@ Verdicts are persisted for audit and exposed via Prometheus metrics (`turnstone_
 
 Skills are also scanned at install time — the scanner evaluates content, supply chain, vulnerability, and declared capability risk across four independent axes. Results populate `scan_status` (tier) and `scan_report` (structured JSON breakdown) on the skill record so administrators can assess risk before enabling a skill.
 
+Tool execution results are evaluated by an output guard before entering the conversation — detecting prompt injection payloads in fetched content, credential leakage in command output, and encoded payloads. Detected credentials are automatically redacted.
+
 See [docs/judge.md](docs/judge.md) for the full guide.
 
 ## Multi-node routing

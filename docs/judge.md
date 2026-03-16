@@ -315,6 +315,53 @@ See [docs/governance.md](governance.md) for the skill governance model.
 
 ---
 
+## Output Guard
+
+The output guard evaluates tool execution results *after* execution but *before*
+they enter the conversation context. It catches content-level threats that the
+input heuristic (which evaluates commands) cannot see — prompt injection
+payloads in fetched web pages, credential leakage in command output, encoded
+payloads, and adversarial URLs.
+
+The guard runs as a synchronous heuristic on the tool result text with a
+configurable time budget (default 5 seconds). Pattern checks run in priority
+order: prompt injection first, then credentials, then encoded payloads, then
+lower-priority checks. If the budget is exhausted mid-evaluation, whatever
+flags have been found so far are returned.
+
+The guard **annotates but does not gate** — it surfaces warnings via the
+`on_output_warning` SSE event and optionally redacts detected credentials
+from the output before it enters the conversation.
+
+### Detection priorities
+
+| Priority | Category | Risk | Examples |
+|----------|----------|------|----------|
+| 1 | Prompt injection | high | Override phrases, role injection (`{"role":"system"}`), instruction override markers |
+| 2 | Credential leakage | high | API keys, private key blocks, connection strings, `.env` format secrets |
+| 3 | Encoded payloads | medium | Script data URIs, hex shellcode sequences |
+| 4 | Adversarial URLs | medium | Cloud metadata endpoints, credential-bearing query parameters |
+| 5 | System info disclosure | low | Private IP addresses, sensitive file paths |
+
+### Credential redaction
+
+When `redact_secrets` is enabled (default), detected credentials in tool output
+are replaced with `[REDACTED:<type>]` markers before the output enters the
+conversation. The original unredacted output is never shown to the model.
+Redaction types: `api_key`, `private_key`, `password`, `secret`.
+
+### Configuration
+
+```toml
+[judge]
+output_guard = true    # enable output evaluation (default)
+redact_secrets = true  # auto-redact detected credentials (default)
+```
+
+CLI: `--no-output-guard` to disable.
+
+---
+
 ## v2 Calibration Path
 
 Run v1 with all tools requiring manual approval to build a local verdict
