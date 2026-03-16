@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.6.2",
+    "version": "0.7.0",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1181,7 +1181,7 @@
           },
           "always": {
             "default": false,
-            "description": "Enable auto-approve for this tool",
+            "description": "Auto-approve the tools in this batch going forward",
             "title": "Always",
             "type": "boolean"
           },

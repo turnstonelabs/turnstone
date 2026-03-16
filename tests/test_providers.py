@@ -2322,13 +2322,12 @@ class TestAnthropicPromptCaching:
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_streaming_cache_metrics_missing_gracefully(self, mock_ensure: MagicMock) -> None:
         """When cache attributes are absent, tokens default to 0."""
+        import types
+
         msg_start = MagicMock()
         msg_start.type = "message_start"
-        msg_usage = MagicMock(spec=[])  # No attributes at all
-        msg_usage.input_tokens = 50
-        # Deliberately no cache_creation_input_tokens / cache_read_input_tokens
-        del msg_usage.cache_creation_input_tokens
-        del msg_usage.cache_read_input_tokens
+        # SimpleNamespace with only input_tokens — no cache attributes at all
+        msg_usage = types.SimpleNamespace(input_tokens=50)
         msg_start.message = MagicMock()
         msg_start.message.usage = msg_usage
 

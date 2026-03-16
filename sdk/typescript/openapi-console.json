@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.6.2",
+    "version": "0.7.0",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -873,6 +873,64 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/users/{user_id}/oidc-identities": {
+      "get": {
+        "summary": "List OIDC identities linked to a user",
+        "operationId": "v1_api_admin_users_{user_id}_oidc-identities_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/oidc-identities": {
+      "delete": {
+        "summary": "Unlink an OIDC identity (issuer + subject as query params)",
+        "operationId": "v1_api_admin_oidc-identities_delete",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2750,6 +2808,137 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/mcp-registry/search": {
+      "get": {
+        "summary": "Search the MCP Registry for available servers",
+        "operationId": "v1_api_admin_mcp-registry_search_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search query"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Max results (default 20, max 100)"
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Pagination cursor for next page"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegistrySearchResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/mcp-registry/install": {
+      "post": {
+        "summary": "Install an MCP server from the registry",
+        "operationId": "v1_api_admin_mcp-registry_install_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegistryInstallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpServerDetail"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
             "content": {
               "application/json": {
                 "schema": {
@@ -5187,6 +5376,16 @@
             "default": 0,
             "title": "Tool Calls Count",
             "type": "integer"
+          },
+          "cache_creation_tokens": {
+            "default": 0,
+            "title": "Cache Creation Tokens",
+            "type": "integer"
+          },
+          "cache_read_tokens": {
+            "default": 0,
+            "title": "Cache Read Tokens",
+            "type": "integer"
           }
         },
         "title": "UsageBreakdownItem",
@@ -5726,6 +5925,28 @@
             "title": "Created By",
             "type": "string"
           },
+          "registry_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Registry Name"
+          },
+          "registry_version": {
+            "default": "",
+            "title": "Registry Version",
+            "type": "string"
+          },
+          "registry_meta": {
+            "default": "{}",
+            "title": "Registry Meta",
+            "type": "string"
+          },
           "created": {
             "title": "Created",
             "type": "string"
@@ -6061,6 +6282,243 @@
           }
         },
         "title": "McpReloadResponse",
+        "type": "object"
+      },
+      "RegistrySearchResponse": {
+        "properties": {
+          "servers": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryServerInfo"
+            },
+            "title": "Servers",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "servers"
+        ],
+        "title": "RegistrySearchResponse",
+        "type": "object"
+      },
+      "RegistryPackageInfo": {
+        "properties": {
+          "registry_type": {
+            "default": "",
+            "title": "Registry Type",
+            "type": "string"
+          },
+          "identifier": {
+            "default": "",
+            "title": "Identifier",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "title": "Version",
+            "type": "string"
+          },
+          "transport_type": {
+            "default": "stdio",
+            "title": "Transport Type",
+            "type": "string"
+          },
+          "environment_variables": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Environment Variables",
+            "type": "array"
+          }
+        },
+        "title": "RegistryPackageInfo",
+        "type": "object"
+      },
+      "RegistryRemoteInfo": {
+        "properties": {
+          "type": {
+            "default": "streamable-http",
+            "title": "Type",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "title": "Url",
+            "type": "string"
+          },
+          "headers": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Headers",
+            "type": "array"
+          },
+          "variables": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Variables",
+            "type": "object"
+          }
+        },
+        "title": "RegistryRemoteInfo",
+        "type": "object"
+      },
+      "RegistryServerInfo": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "default": "",
+            "title": "Version",
+            "type": "string"
+          },
+          "website_url": {
+            "default": "",
+            "title": "Website Url",
+            "type": "string"
+          },
+          "repository": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Repository",
+            "type": "object"
+          },
+          "icons": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Icons",
+            "type": "array"
+          },
+          "remotes": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryRemoteInfo"
+            },
+            "title": "Remotes",
+            "type": "array"
+          },
+          "packages": {
+            "items": {
+              "$ref": "#/components/schemas/RegistryPackageInfo"
+            },
+            "title": "Packages",
+            "type": "array"
+          },
+          "meta": {
+            "additionalProperties": true,
+            "title": "Meta",
+            "type": "object"
+          },
+          "installed": {
+            "default": false,
+            "title": "Installed",
+            "type": "boolean"
+          },
+          "installed_server_id": {
+            "default": "",
+            "title": "Installed Server Id",
+            "type": "string"
+          },
+          "installed_version": {
+            "default": "",
+            "title": "Installed Version",
+            "type": "string"
+          },
+          "update_available": {
+            "default": false,
+            "title": "Update Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "RegistryServerInfo",
+        "type": "object"
+      },
+      "RegistryInstallRequest": {
+        "properties": {
+          "registry_name": {
+            "title": "Registry Name",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "index": {
+            "default": 0,
+            "title": "Index",
+            "type": "integer"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Variables",
+            "type": "object"
+          },
+          "env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Env",
+            "type": "object"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Headers",
+            "type": "object"
+          }
+        },
+        "required": [
+          "registry_name",
+          "source"
+        ],
+        "title": "RegistryInstallRequest",
         "type": "object"
       },
       "PromptTemplateSummary": {

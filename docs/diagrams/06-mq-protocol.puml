@@ -3,8 +3,9 @@
 title Turnstone — Message Queue Protocol Types
 skinparam classAttributeIconSize 0
 skinparam packageStyle rectangle
+skinparam packageBorderThickness 2
 
-package "Inbound Messages (Client → Bridge)" #FFF3E0 {
+package "Inbound Messages (Client → Bridge)" as InPkg #FFF3E0 {
 
     abstract class "InboundMessage" as IM {
         + type: str
@@ -99,7 +100,7 @@ package "Inbound Messages (Client → Bridge)" #FFF3E0 {
     IM <|-- CancelMessage
 }
 
-package "Outbound Events (Bridge → Client)" #E3F2FD {
+package "Outbound Events (Bridge → Client)" as OutPkg #E3F2FD {
 
     abstract class "OutboundEvent" as OE {
         + type: str
@@ -247,6 +248,8 @@ package "Outbound Events (Bridge → Client)" #E3F2FD {
     OE <|-- NodeListEvent
     OE <|-- ClusterStateEvent
 }
+
+SendMessage -[hidden]down- OE
 
 note bottom of IM
   **Deserialization**: Strict type-dispatch via _INBOUND_REGISTRY.
