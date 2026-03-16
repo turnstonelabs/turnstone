@@ -60,8 +60,7 @@ package "Inbound Messages (Client → Bridge)" as InPkg #FFF3E0 {
         + auto_approve_tools: list[str] = []
         + target_node: str = ""
         + initial_message: str = ""
-        + template: str = ""
-        + ws_template: str = ""
+        + skill: str = ""
     }
 
     class CloseWorkstreamMessage {

@@ -62,11 +62,18 @@ def load_messages(ws_id: str) -> list[dict[str, Any]]:
 
 
 def register_workstream(
-    ws_id: str, node_id: str | None = None, name: str = "", state: str = "idle"
+    ws_id: str,
+    node_id: str | None = None,
+    name: str = "",
+    state: str = "idle",
+    skill_id: str = "",
+    skill_version: int = 0,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
     with contextlib.suppress(Exception):
-        get_storage().register_workstream(ws_id, node_id, name, state)
+        get_storage().register_workstream(
+            ws_id, node_id, name, state, skill_id=skill_id, skill_version=skill_version
+        )
 
 
 def update_workstream_state(ws_id: str, state: str) -> None:
@@ -79,12 +86,6 @@ def update_workstream_name(ws_id: str, name: str) -> None:
     """Update a workstream's display name."""
     with contextlib.suppress(Exception):
         get_storage().update_workstream_name(ws_id, name)
-
-
-def update_workstream_template(ws_id: str, ws_template_id: str, ws_template_version: int) -> None:
-    """Set ws_template_id and ws_template_version on the workstreams row."""
-    with contextlib.suppress(Exception):
-        get_storage().update_workstream_template(ws_id, ws_template_id, ws_template_version)
 
 
 def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
@@ -159,40 +160,29 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
         return {}
 
 
-# -- Prompt templates ---------------------------------------------------------
+# -- Skills -------------------------------------------------------------------
 
 
-def list_default_templates(org_id: str = "") -> list[dict[str, Any]]:
-    """Return all templates where is_default=True, ordered by name."""
-    try:
-        return get_storage().list_default_templates(org_id)
-    except Exception:
-        return []
-
-
-def get_prompt_template_by_name(name: str) -> dict[str, Any] | None:
-    """Lookup prompt template by name."""
+def get_skill_by_name(name: str) -> dict[str, Any] | None:
+    """Lookup skill by name (reads from prompt_templates table)."""
     try:
         return get_storage().get_prompt_template_by_name(name)
     except Exception:
         return None
 
 
-# -- Workstream templates -----------------------------------------------------
-
-
-def get_ws_template_by_name(name: str) -> dict[str, Any] | None:
-    """Lookup workstream template by name."""
+def list_default_skills(org_id: str = "") -> list[dict[str, Any]]:
+    """Return all skills where is_default=True, ordered by name."""
     try:
-        return get_storage().get_ws_template_by_name(name)
+        return get_storage().list_default_templates(org_id)
     except Exception:
-        return None
+        return []
 
 
-def list_ws_templates(enabled_only: bool = False) -> list[dict[str, Any]]:
-    """Return all workstream templates, optionally enabled only."""
+def list_skills_by_activation(activation: str) -> list[dict[str, Any]]:
+    """Return skills filtered by activation value, ordered by name."""
     try:
-        return get_storage().list_ws_templates(enabled_only=enabled_only)
+        return get_storage().list_skills_by_activation(activation)
     except Exception:
         return []
 

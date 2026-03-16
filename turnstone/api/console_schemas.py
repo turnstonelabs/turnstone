@@ -136,12 +136,7 @@ class ConsoleCreateWsRequest(BaseModel):
     initial_message: str = Field(
         default="", description="Optional first message sent after creation"
     )
-    template: str = Field(
-        default="", description="Prompt template name (replaces default templates)"
-    )
-    ws_template: str = Field(
-        default="", description="Workstream template name (behavioral profile)"
-    )
+    skill: str = Field(default="", description="Skill name (replaces default skills)")
 
 
 class ConsoleCreateWsResponse(BaseModel):
@@ -279,102 +274,80 @@ class ListToolPoliciesResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Governance: Prompt Templates
+# Governance: Skills
 # ---------------------------------------------------------------------------
 
 
-class PromptTemplateInfo(BaseModel):
-    template_id: str
+class SkillInfo(BaseModel):
+    template_id: str = Field(description="Skill ID")
     name: str
     category: str
     content: str
-    variables: str
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    variables: str = "[]"
     is_default: bool
+    activation: str = "named"
     org_id: str
     created_by: str
     origin: str = "manual"
     mcp_server: str = ""
     readonly: bool = False
-    created: str
-    updated: str
-
-
-class CreatePromptTemplateRequest(BaseModel):
-    name: str
-    content: str
-    category: str = "general"
-    variables: str = "[]"
-    is_default: bool = False
-    org_id: str = ""
-
-
-class UpdatePromptTemplateRequest(BaseModel):
-    name: str | None = None
-    content: str | None = None
-    category: str | None = None
-    variables: str | None = None
-    is_default: bool | None = None
-
-
-class ListPromptTemplatesResponse(BaseModel):
-    templates: list[PromptTemplateInfo]
-
-
-# ---------------------------------------------------------------------------
-# Governance: Workstream Templates
-# ---------------------------------------------------------------------------
-
-
-class WsTemplateInfo(BaseModel):
-    ws_template_id: str
-    name: str
-    description: str
-    system_prompt: str
-    prompt_template: str
-    prompt_template_hash: str = ""
-    model: str
-    auto_approve: bool
-    auto_approve_tools: str
-    temperature: float | None = None
-    reasoning_effort: str
-    max_tokens: int | None = None
-    token_budget: int
-    agent_max_turns: int | None = None
-    notify_on_complete: str
-    org_id: str
-    created_by: str
-    enabled: bool
-    version: int
-    created: str
-    updated: str
-
-
-class CreateWsTemplateRequest(BaseModel):
-    name: str
-    description: str = ""
-    system_prompt: str = ""
-    prompt_template: str = ""
+    source_url: str = ""
+    version: str = "1.0.0"
+    author: str = ""
+    token_estimate: int = 0
     model: str = ""
     auto_approve: bool = False
-    auto_approve_tools: str = ""
     temperature: float | None = None
     reasoning_effort: str = ""
     max_tokens: int | None = None
     token_budget: int = 0
     agent_max_turns: int | None = None
     notify_on_complete: str = "{}"
-    org_id: str = ""
     enabled: bool = True
+    allowed_tools: str = "[]"
+    created: str
+    updated: str
 
 
-class UpdateWsTemplateRequest(BaseModel):
+class CreateSkillRequest(BaseModel):
+    name: str
+    content: str
+    category: str = "general"
+    description: str = ""
+    tags: str = "[]"
+    variables: str = "[]"
+    is_default: bool = False
+    activation: str = "named"
+    org_id: str = ""
+    author: str = ""
+    version: str = "1.0.0"
+    model: str = ""
+    auto_approve: bool = False
+    temperature: float | None = None
+    reasoning_effort: str = ""
+    max_tokens: int | None = None
+    token_budget: int = 0
+    agent_max_turns: int | None = None
+    notify_on_complete: str = "{}"
+    enabled: bool = True
+    allowed_tools: str = "[]"
+
+
+class UpdateSkillRequest(BaseModel):
     name: str | None = None
+    content: str | None = None
+    category: str | None = None
     description: str | None = None
-    system_prompt: str | None = None
-    prompt_template: str | None = None
+    tags: str | None = None
+    variables: str | None = None
+    is_default: bool | None = None
+    activation: str | None = None
+    author: str | None = None
+    version: str | None = None
     model: str | None = None
     auto_approve: bool | None = None
-    auto_approve_tools: str | None = None
     temperature: float | None = None
     reasoning_effort: str | None = None
     max_tokens: int | None = None
@@ -382,33 +355,29 @@ class UpdateWsTemplateRequest(BaseModel):
     agent_max_turns: int | None = None
     notify_on_complete: str | None = None
     enabled: bool | None = None
+    allowed_tools: str | None = None
 
 
-class ListWsTemplatesResponse(BaseModel):
-    ws_templates: list[WsTemplateInfo]
+class ListSkillsResponse(BaseModel):
+    skills: list[SkillInfo]
 
 
-class WsTemplateVersionInfo(BaseModel):
+# ---------------------------------------------------------------------------
+# Governance: Skill Versions
+# ---------------------------------------------------------------------------
+
+
+class SkillVersionInfo(BaseModel):
     id: int
-    ws_template_id: str
+    skill_id: str
     version: int
     snapshot: str
     changed_by: str
     created: str
 
 
-class ListWsTemplateVersionsResponse(BaseModel):
-    versions: list[WsTemplateVersionInfo]
-
-
-class WsTemplateSummary(BaseModel):
-    name: str
-    description: str
-    model: str
-
-
-class ListWsTemplateSummaryResponse(BaseModel):
-    ws_templates: list[WsTemplateSummary]
+class ListSkillVersionsResponse(BaseModel):
+    versions: list[SkillVersionInfo]
 
 
 # ---------------------------------------------------------------------------

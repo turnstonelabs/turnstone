@@ -36,9 +36,9 @@ from turnstone.core.memory import (
     count_structured_memories,
     delete_structured_memory,
     delete_workstream,
-    get_prompt_template_by_name,
+    get_skill_by_name,
     get_workstream_display_name,
-    list_default_templates,
+    list_default_skills,
     list_structured_memories,
     list_workstreams_with_history,
     load_messages,
@@ -121,8 +121,8 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 # 4 MB raw → ~5.3 MB base64, safely under Anthropic's per-block limit
 _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 
-# Upper bound on total prompt template content injected into system messages
-_MAX_TEMPLATE_CONTENT: int = 32768
+# Upper bound on total skill content injected into system messages
+_MAX_SKILL_CONTENT: int = 32768
 
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -233,7 +233,7 @@ class ChatSession:
         tool_search: str = "auto",
         tool_search_threshold: int = 20,
         tool_search_max_results: int = 5,
-        template: str | None = None,
+        skill: str | None = None,
         judge_config: JudgeConfig | None = None,
         user_id: str = "",
         memory_config: MemoryConfig | None = None,
@@ -284,9 +284,9 @@ class ChatSession:
         self._budget_warned: bool = False
         self._budget_exhausted: bool = False
         self._notify_on_complete: str = "{}"
-        self._ws_template_id: str = ""
-        self._ws_template_version: int = 0
-        self._ws_template_system_prompt: str = ""  # inline prompt from ws_template
+        self._applied_skill_id: str = ""
+        self._applied_skill_version: int = 0
+        self._applied_skill_content: str = ""  # inline prompt from applied skill
         self._assistant_pending_tokens = 0
         self.creative_mode = False
         self._notify_count = 0
@@ -340,10 +340,10 @@ class ChatSession:
                 threshold=tool_search_threshold,
                 max_results=tool_search_max_results,
             )
-        # Prompt template: explicit name overrides is_default templates
-        self._template_name: str | None = template
-        self._template_content: str | None = None
-        self._load_templates()
+        # Skill: explicit name overrides is_default skills
+        self._skill_name: str | None = skill
+        self._skill_content: str | None = None
+        self._load_skills()
         self._init_system_messages()
         self._save_config()
 
@@ -377,43 +377,57 @@ class ChatSession:
                 "max_tokens": str(self.max_tokens),
                 "instructions": self.instructions or "",
                 "creative_mode": str(self.creative_mode),
-                "template": self._template_name or "",
+                "skill": self._skill_name or "",
                 "token_budget": str(self._token_budget),
-                "ws_template_id": self._ws_template_id,
-                "ws_template_version": str(self._ws_template_version),
-                "ws_template_system_prompt": self._ws_template_system_prompt,
+                "applied_skill_id": self._applied_skill_id,
+                "applied_skill_version": str(self._applied_skill_version),
+                # Snapshot isolation: skill content is persisted per-workstream so that
+                # edits to the skill between sessions don't break resume. This duplicates
+                # up to 32KB per active workstream — acceptable trade-off for correctness.
+                "applied_skill_content": self._applied_skill_content,
                 "notify_on_complete": self._notify_on_complete,
             },
         )
 
-    def _load_templates(self) -> None:
-        """Load prompt templates from storage.  Called once at init and on /template."""
+    def _load_skills(self) -> None:
+        """Load skills from storage.  Called once at init and on /skill."""
         context = {
             "model": self.model,
             "ws_id": self._ws_id,
             "node_id": self._node_id or "",
         }
-        if self._template_name:
-            tpl = get_prompt_template_by_name(self._template_name)
-            if tpl:
-                self._template_content = _render_template(tpl["content"], context)
+        if self._skill_name:
+            skill_data = get_skill_by_name(self._skill_name)
+            if skill_data:
+                self._skill_content = _render_template(skill_data["content"], context)
+                self._check_skill_budget(skill_data)
             else:
-                log.warning("prompt_template.not_found", name=self._template_name)
-                self._template_content = None
+                log.warning("skill.not_found", name=self._skill_name)
+                self._skill_content = None
         else:
-            defaults = list_default_templates()
+            defaults = list_default_skills()
             if defaults:
                 parts = [_render_template(t["content"], context) for t in defaults]
-                self._template_content = "\n\n".join(parts)
+                self._skill_content = "\n\n".join(parts)
             else:
-                self._template_content = None
+                self._skill_content = None
 
-    def set_template(self, name: str | None) -> None:
-        """Set or clear the active prompt template."""
-        self._template_name = name
-        self._load_templates()
+    def set_skill(self, name: str | None) -> None:
+        """Set or clear the active skill."""
+        self._skill_name = name
+        self._load_skills()
         self._init_system_messages()
         self._save_config()
+
+    def _check_skill_budget(self, skill: dict[str, Any]) -> None:
+        """Log warning if skill content exceeds 25% of context window."""
+        if skill.get("token_estimate", 0) > self.context_window * 0.25:
+            log.warning(
+                "skill.token_budget_warning",
+                skill=skill.get("name", ""),
+                estimate=skill["token_estimate"],
+                context_window=self.context_window,
+            )
 
     # -- MCP tool refresh ----------------------------------------------------
 
@@ -643,20 +657,20 @@ class ChatSession:
                 self.instructions = config["instructions"] or None
             if "creative_mode" in config:
                 self.creative_mode = config["creative_mode"] == "True"
-            if "template" in config:
-                self._template_name = config["template"] or None
-                self._load_templates()
+            if "skill" in config or "template" in config:
+                self._skill_name = config.get("skill") or config.get("template") or None
+                self._load_skills()
             if "token_budget" in config:
                 self._token_budget = int(config["token_budget"] or "0")
-            if "ws_template_id" in config:
-                self._ws_template_id = config["ws_template_id"]
-            if "ws_template_version" in config:
-                self._ws_template_version = int(config["ws_template_version"] or "0")
-            if "ws_template_system_prompt" in config:
-                self._ws_template_system_prompt = config["ws_template_system_prompt"]
-                if self._ws_template_system_prompt:
-                    self._template_content = self._ws_template_system_prompt
-                    self._template_name = None
+            if "applied_skill_id" in config:
+                self._applied_skill_id = config["applied_skill_id"]
+            if "applied_skill_version" in config:
+                self._applied_skill_version = int(config["applied_skill_version"] or "0")
+            if "applied_skill_content" in config:
+                self._applied_skill_content = config["applied_skill_content"]
+                if self._applied_skill_content:
+                    self._skill_content = self._applied_skill_content
+                    self._skill_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
         if self._memory_config.nudges and should_nudge(
@@ -784,11 +798,11 @@ class ChatSession:
                     "to invoke the prompts listed above."
                 )
                 dev_parts.append("\n".join(lines))
-        if self._template_content:
-            tpl = self._template_content
-            if len(tpl) > _MAX_TEMPLATE_CONTENT:
-                log.warning("template_content.truncated", length=len(tpl))
-                tpl = tpl[:_MAX_TEMPLATE_CONTENT]
+        if self._skill_content:
+            tpl = self._skill_content
+            if len(tpl) > _MAX_SKILL_CONTENT:
+                log.warning("skill_content.truncated", length=len(tpl))
+                tpl = tpl[:_MAX_SKILL_CONTENT]
             dev_parts.append("")
             dev_parts.append(tpl)
         if self.instructions:
@@ -3560,13 +3574,13 @@ class ChatSession:
     )
 
     def _plan_system_content(self) -> str:
-        """Plan agent system message: template guardrails + plan identity."""
-        if not self._template_content:
+        """Plan agent system message: skill guardrails + plan identity."""
+        if not self._skill_content:
             return self._PLAN_IDENTITY
-        tpl = self._template_content
-        if len(tpl) > _MAX_TEMPLATE_CONTENT:
-            log.warning("template_content.truncated", length=len(tpl), agent="plan")
-            tpl = tpl[:_MAX_TEMPLATE_CONTENT]
+        tpl = self._skill_content
+        if len(tpl) > _MAX_SKILL_CONTENT:
+            log.warning("skill_content.truncated", length=len(tpl), agent="plan")
+            tpl = tpl[:_MAX_SKILL_CONTENT]
         return tpl + "\n\n" + self._PLAN_IDENTITY
 
     _MIN_PLAN_LENGTH = 100
@@ -4625,24 +4639,22 @@ class ChatSession:
                 self._save_config()
                 self.ui.on_info("Instructions updated.")
 
-        elif cmd == "/template":
+        elif cmd == "/skill":
             if not arg:
-                if self._template_name:
-                    self.ui.on_info(f"Active template: {self._template_name}")
+                if self._skill_name:
+                    self.ui.on_info(f"Active skill: {self._skill_name}")
                 else:
-                    self.ui.on_info(
-                        "Using default templates. Usage: /template <name> or /template clear"
-                    )
+                    self.ui.on_info("Using defaults. Usage: /skill <name> or /skill clear")
             elif arg.strip().lower() == "clear":
-                self.set_template(None)
-                self.ui.on_info("Template cleared; using defaults.")
+                self.set_skill(None)
+                self.ui.on_info("Skill cleared; using defaults.")
             else:
-                tpl = get_prompt_template_by_name(arg.strip())
+                tpl = get_skill_by_name(arg.strip())
                 if tpl:
-                    self.set_template(tpl["name"])
-                    self.ui.on_info(f"Template set: {tpl['name']}")
+                    self.set_skill(tpl["name"])
+                    self.ui.on_info(f"Skill set: {tpl['name']}")
                 else:
-                    self.ui.on_error(f"Template not found: {arg.strip()}")
+                    self.ui.on_error(f"Skill not found: {arg.strip()}")
 
         elif cmd == "/clear":
             self.messages.clear()
@@ -4876,7 +4888,7 @@ class ChatSession:
                     [
                         "── Slash Commands ─────────────────────────────────────",
                         "  /instructions <text>   Set developer instructions",
-                        "  /template [name|clear] Set/show/clear prompt template",
+                        "  /skill [name|clear]    Set/show/clear active skill",
                         "  /clear                 Clear context (workstream preserved in database)",
                         "  /new                   Start a new workstream (old one stays resumable)",
                         "",

@@ -27,17 +27,22 @@ def row_to_dict(row: Any, *bool_fields: str) -> dict[str, Any]:
 ROLE_MUTABLE = frozenset({"display_name", "permissions"})
 ORG_MUTABLE = frozenset({"display_name", "settings"})
 POLICY_MUTABLE = frozenset({"name", "tool_pattern", "action", "priority", "enabled"})
-TEMPLATE_MUTABLE = frozenset({"name", "content", "category", "variables", "is_default"})
-WS_TEMPLATE_MUTABLE = frozenset(
+SKILL_MUTABLE = frozenset(
     {
         "name",
+        "content",
+        "category",
+        "variables",
+        "is_default",
         "description",
-        "system_prompt",
-        "prompt_template",
-        "prompt_template_hash",
+        "tags",
+        "source_url",
+        "version",
+        "author",
+        "activation",
+        "token_estimate",
         "model",
         "auto_approve",
-        "auto_approve_tools",
         "temperature",
         "reasoning_effort",
         "max_tokens",
@@ -45,6 +50,7 @@ WS_TEMPLATE_MUTABLE = frozenset(
         "agent_max_turns",
         "notify_on_complete",
         "enabled",
+        "allowed_tools",
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})

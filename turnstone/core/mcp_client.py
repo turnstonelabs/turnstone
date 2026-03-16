@@ -818,6 +818,7 @@ class MCPClientManager:
                     content=content,
                     variables=variables,
                     is_default=False,
+                    token_estimate=len(content) // 4,
                 )
             else:
                 # Create new MCP-sourced template
@@ -834,6 +835,8 @@ class MCPClientManager:
                     origin="mcp",
                     mcp_server=server,
                     readonly=True,
+                    activation="named",
+                    token_estimate=len(content) // 4,
                 )
                 added.append(name)
 

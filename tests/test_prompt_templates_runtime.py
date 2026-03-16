@@ -194,13 +194,13 @@ class TestExplicitTemplate:
         _create_template(db, "t1", "default-tpl", "DEFAULT_CONTENT", is_default=True)
         _create_template(db, "t2", "specific-tpl", "SPECIFIC_CONTENT", is_default=False)
 
-        session = _make_session(template="specific-tpl")
+        session = _make_session(skill="specific-tpl")
         content = _sys_content(session)
         assert "SPECIFIC_CONTENT" in content
         assert "DEFAULT_CONTENT" not in content
 
     def test_explicit_template_not_found(self, tmp_db):
-        session = _make_session(template="nonexistent")
+        session = _make_session(skill="nonexistent")
         content = _sys_content(session)
         # Graceful degradation — no template content injected
         assert "nonexistent" not in content
@@ -257,9 +257,9 @@ class TestTemplatePersistence:
         db = get_storage()
         _create_template(db, "t1", "my-tpl", "TPL_CONTENT", is_default=False)
 
-        session = _make_session(template="my-tpl")
+        session = _make_session(skill="my-tpl")
         config = load_workstream_config(session.ws_id)
-        assert config["template"] == "my-tpl"
+        assert config["skill"] == "my-tpl"
 
     def test_template_restored_on_resume(self, tmp_db):
         from turnstone.core.memory import save_message
@@ -268,17 +268,17 @@ class TestTemplatePersistence:
         db = get_storage()
         _create_template(db, "t1", "my-tpl", "PERSISTED_TEMPLATE", is_default=False)
 
-        # Create session with template, save a message so resume has history
-        session1 = _make_session(template="my-tpl")
+        # Create session with skill, save a message so resume has history
+        session1 = _make_session(skill="my-tpl")
         ws_id = session1.ws_id
         save_message(ws_id, "user", "hello")
 
         # New session without template, then resume
         session2 = _make_session()
-        assert session2._template_name is None
+        assert session2._skill_name is None
         resumed = session2.resume(ws_id)
         assert resumed
-        assert session2._template_name == "my-tpl"
+        assert session2._skill_name == "my-tpl"
         content = _sys_content(session2)
         assert "PERSISTED_TEMPLATE" in content
 
@@ -287,7 +287,7 @@ class TestTemplatePersistence:
 
         session = _make_session()
         config = load_workstream_config(session.ws_id)
-        assert config["template"] == ""
+        assert config["skill"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +306,8 @@ class TestTemplateSlashCommand:
         content_before = _sys_content(session)
         assert "SLASH_TEMPLATE" not in content_before
 
-        session.handle_command("/template my-tpl")
-        assert session._template_name == "my-tpl"
+        session.handle_command("/skill my-tpl")
+        assert session._skill_name == "my-tpl"
         content_after = _sys_content(session)
         assert "SLASH_TEMPLATE" in content_after
 
@@ -318,12 +318,12 @@ class TestTemplateSlashCommand:
         _create_template(db, "t1", "my-tpl", "EXPLICIT_TEMPLATE", is_default=False)
         _create_template(db, "t2", "default-tpl", "DEFAULT_TEMPLATE", is_default=True)
 
-        session = _make_session(template="my-tpl")
+        session = _make_session(skill="my-tpl")
         assert "EXPLICIT_TEMPLATE" in _sys_content(session)
         assert "DEFAULT_TEMPLATE" not in _sys_content(session)
 
-        session.handle_command("/template clear")
-        assert session._template_name is None
+        session.handle_command("/skill clear")
+        assert session._skill_name is None
         assert "DEFAULT_TEMPLATE" in _sys_content(session)
         assert "EXPLICIT_TEMPLATE" not in _sys_content(session)
 
@@ -331,7 +331,7 @@ class TestTemplateSlashCommand:
         ui = NullUI()
         ui.on_error = MagicMock()
         session = _make_session(ui=ui)
-        session.handle_command("/template nonexistent")
+        session.handle_command("/skill nonexistent")
         ui.on_error.assert_called_once()
         assert "not found" in ui.on_error.call_args[0][0].lower()
 
@@ -343,8 +343,8 @@ class TestTemplateSlashCommand:
 
         ui = NullUI()
         ui.on_info = MagicMock()
-        session = _make_session(ui=ui, template="my-tpl")
-        session.handle_command("/template")
+        session = _make_session(ui=ui, skill="my-tpl")
+        session.handle_command("/skill")
         ui.on_info.assert_called_once()
         assert "my-tpl" in ui.on_info.call_args[0][0]
 
@@ -389,7 +389,7 @@ class TestMCPTemplates:
             readonly=True,
         )
 
-        session = _make_session(template="mcp__server__code")
+        session = _make_session(skill="mcp__server__code")
         content = _sys_content(session)
         assert "MCP_EXPLICIT" in content
 
@@ -408,7 +408,7 @@ class TestResumeDeletedTemplate:
         _create_template(db, "t1", "ephemeral-tpl", "EPHEMERAL_CONTENT", is_default=False)
 
         # Create session with template, save a message so resume has history
-        session1 = _make_session(template="ephemeral-tpl")
+        session1 = _make_session(skill="ephemeral-tpl")
         ws_id = session1.ws_id
         save_message(ws_id, "user", "hello")
         assert "EPHEMERAL_CONTENT" in _sys_content(session1)
@@ -421,8 +421,8 @@ class TestResumeDeletedTemplate:
         resumed = session2.resume(ws_id)
 
         assert resumed
-        assert session2._template_name == "ephemeral-tpl"
-        assert session2._template_content is None
+        assert session2._skill_name == "ephemeral-tpl"
+        assert session2._skill_content is None
         # System message should not contain the deleted template content
         content = _sys_content(session2)
         assert "EPHEMERAL_CONTENT" not in content
@@ -436,43 +436,43 @@ class TestResumeDeletedTemplate:
 # ---------------------------------------------------------------------------
 
 
-class TestTemplateFactoryPassthrough:
-    def test_template_passed_through_workstream_create(self, tmp_db):
-        """WorkstreamManager.create(template=...) propagates to session factory."""
+class TestSkillFactoryPassthrough:
+    def test_skill_passed_through_workstream_create(self, tmp_db):
+        """WorkstreamManager.create(skill=...) propagates to session factory."""
         from turnstone.core.storage import get_storage
         from turnstone.core.workstream import WorkstreamManager
 
         db = get_storage()
         _create_template(db, "t1", "factory-tpl", "FACTORY_CONTENT", is_default=False)
 
-        captured_template = None
+        captured_skill = None
 
-        def factory(ui, model_alias=None, ws_id=None, *, template=None):
-            nonlocal captured_template
-            captured_template = template
-            return _make_session(template=template)
+        def factory(ui, model_alias=None, ws_id=None, *, skill=None):
+            nonlocal captured_skill
+            captured_skill = skill
+            return _make_session(skill=captured_skill)
 
         mgr = WorkstreamManager(factory)
-        ws = mgr.create(name="test", template="factory-tpl")
-        assert captured_template == "factory-tpl"
+        ws = mgr.create(name="test", skill="factory-tpl")
+        assert captured_skill == "factory-tpl"
         assert ws.session is not None
-        assert ws.session._template_name == "factory-tpl"
+        assert ws.session._skill_name == "factory-tpl"
         assert "FACTORY_CONTENT" in _sys_content(ws.session)
 
-    def test_template_none_uses_defaults(self, tmp_db):
-        """WorkstreamManager.create() without template passes None."""
-        captured_template = "sentinel"
+    def test_skill_none_uses_defaults(self, tmp_db):
+        """WorkstreamManager.create() without skill passes None."""
+        captured_skill = "sentinel"
 
-        def factory(ui, model_alias=None, ws_id=None, *, template=None):
-            nonlocal captured_template
-            captured_template = template
-            return _make_session(template=template)
+        def factory(ui, model_alias=None, ws_id=None, *, skill=None):
+            nonlocal captured_skill
+            captured_skill = skill
+            return _make_session(skill=skill)
 
         from turnstone.core.workstream import WorkstreamManager
 
         mgr = WorkstreamManager(factory)
         mgr.create(name="test")
-        assert captured_template is None
+        assert captured_skill is None
 
 
 class TestTemplateThreadSafety:
@@ -482,7 +482,7 @@ class TestTemplateThreadSafety:
         db = get_storage()
         _create_template(db, "t1", "thread-tpl", "THREAD_TEMPLATE", is_default=False)
 
-        session = _make_session(template="thread-tpl")
+        session = _make_session(skill="thread-tpl")
         errors: list[Exception] = []
         stop = threading.Event()
         iterations = 200
@@ -508,9 +508,9 @@ class TestTemplateThreadSafety:
         try:
             for i in range(iterations):
                 if i % 2 == 0:
-                    session.set_template("thread-tpl")
+                    session.set_skill("thread-tpl")
                 else:
-                    session.set_template(None)
+                    session.set_skill(None)
         finally:
             stop.set()
             t.join(timeout=5)

@@ -370,8 +370,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_name = body.get("name", "")
     raw_model = body.get("model", "")
     raw_initial_message = body.get("initial_message", "")
-    raw_template = body.get("template", "")
-    raw_ws_template = body.get("ws_template", "")
+    raw_skill = body.get("skill", "")
     if not isinstance(raw_node_id, str):
         raw_node_id = "" if raw_node_id is None else None
     if not isinstance(raw_name, str):
@@ -380,30 +379,24 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_model = "" if raw_model is None else None
     if not isinstance(raw_initial_message, str):
         raw_initial_message = "" if raw_initial_message is None else None
-    if not isinstance(raw_template, str):
-        raw_template = "" if raw_template is None else None
-    if not isinstance(raw_ws_template, str):
-        raw_ws_template = "" if raw_ws_template is None else None
+    if not isinstance(raw_skill, str):
+        raw_skill = "" if raw_skill is None else None
     if (
         raw_node_id is None
         or raw_name is None
         or raw_model is None
         or raw_initial_message is None
-        or raw_template is None
-        or raw_ws_template is None
+        or raw_skill is None
     ):
         return JSONResponse(
-            {
-                "error": "node_id, name, model, initial_message, template, and ws_template must be strings"
-            },
+            {"error": "node_id, name, model, initial_message, and skill must be strings"},
             status_code=400,
         )
     node_id = raw_node_id
     name = raw_name[:256]
     model = raw_model[:128]
     initial_message = raw_initial_message[:4096]
-    template = raw_template[:256]
-    ws_template = raw_ws_template[:256]
+    skill = raw_skill[:256]
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
@@ -413,8 +406,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             name=name,
             model=model,
             initial_message=initial_message,
-            template=template,
-            ws_template=ws_template,
+            skill=skill,
         )
         broker.push_inbound(msg.to_json())
         log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
@@ -442,8 +434,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         model=model,
         target_node=node_id,
         initial_message=initial_message,
-        template=template,
-        ws_template=ws_template,
+        skill=skill,
     )
     broker.push_inbound(msg.to_json(), node_id=node_id)
 
@@ -1263,20 +1254,15 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     auto_approve = bool(body.get("auto_approve", False))
     raw_tools = body.get("auto_approve_tools", [])
     auto_approve_tools = raw_tools if isinstance(raw_tools, list) else []
-    template = str(body.get("template", "")).strip()[:256]
-    ws_template = str(body.get("ws_template", "")).strip()[:256]
+    skill_name = str(body.get("skill", "")).strip()[:256]
     enabled = bool(body.get("enabled", True))
 
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not initial_message:
         return JSONResponse({"error": "initial_message is required"}, status_code=400)
-    if template and not storage.get_prompt_template_by_name(template):
-        return JSONResponse({"error": f"Template not found: {template}"}, status_code=400)
-    if ws_template and not storage.get_ws_template_by_name(ws_template):
-        return JSONResponse(
-            {"error": f"Workstream template not found: {ws_template}"}, status_code=400
-        )
+    if skill_name and not storage.get_prompt_template_by_name(skill_name):
+        return JSONResponse({"error": f"Skill not found: {skill_name}"}, status_code=400)
 
     validation_err = _validate_schedule_fields(schedule_type, cron_expr, at_time)
     if validation_err:
@@ -1311,8 +1297,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         auto_approve_tools=auto_approve_tools,
         created_by=created_by,
         next_run=next_run if enabled else "",
-        template=template,
-        ws_template=ws_template,
+        skill=skill_name,
     )
 
     if not enabled:
@@ -1387,18 +1372,11 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
     if "auto_approve_tools" in body:
         raw = body["auto_approve_tools"]
         updates["auto_approve_tools"] = raw if isinstance(raw, list) else []
-    if "template" in body:
-        tpl_name = str(body["template"]).strip()[:256]
-        if tpl_name and not storage.get_prompt_template_by_name(tpl_name):
-            return JSONResponse({"error": f"Template not found: {tpl_name}"}, status_code=400)
-        updates["template"] = tpl_name
-    if "ws_template" in body:
-        ws_tpl_name = str(body["ws_template"]).strip()[:256]
-        if ws_tpl_name and not storage.get_ws_template_by_name(ws_tpl_name):
-            return JSONResponse(
-                {"error": f"Workstream template not found: {ws_tpl_name}"}, status_code=400
-            )
-        updates["ws_template"] = ws_tpl_name
+    if "skill" in body:
+        skill_val = str(body["skill"]).strip()[:256]
+        if skill_val and not storage.get_prompt_template_by_name(skill_val):
+            return JSONResponse({"error": f"Skill not found: {skill_val}"}, status_code=400)
+        updates["skill"] = skill_val
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -1583,13 +1561,6 @@ async def admin_cancel_watch(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
-def _hash_content(content: str) -> str:
-    """SHA-256 hash of content for drift detection."""
-    import hashlib
-
-    return hashlib.sha256(content.encode()).hexdigest()
-
-
 def _audit_context(request: Request) -> tuple[str, str]:
     """Extract (user_id, ip_address) from request for audit logging.
 
@@ -1622,12 +1593,11 @@ _VALID_PERMISSIONS = frozenset(
         "admin.roles",
         "admin.orgs",
         "admin.policies",
-        "admin.templates",
+        "admin.skills",
         "admin.audit",
         "admin.usage",
         "admin.schedules",
         "admin.watches",
-        "admin.ws_templates",
         "admin.judge",
         "admin.memories",
         "admin.settings",
@@ -2158,22 +2128,211 @@ async def admin_delete_policy(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-async def admin_list_templates(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/templates — list all prompt templates."""
+# ---------------------------------------------------------------------------
+# Admin: Skills (thin layer over prompt templates with extended fields)
+# ---------------------------------------------------------------------------
+
+_VALID_ACTIVATIONS = {"named", "default", "search"}
+
+
+def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], JSONResponse | None]:
+    """Parse and validate session config fields from a skill request body.
+
+    Returns (fields_dict, error_response). error_response is None on success.
+    Only includes fields that are present in the body (for partial updates).
+    """
+    import json as _json
+
+    fields: dict[str, Any] = {}
+
+    if "model" in body:
+        fields["model"] = str(body["model"] or "").strip()
+
+    if "temperature" in body:
+        temp = body["temperature"]
+        if temp is not None and temp != "":
+            try:
+                temp = float(temp)
+                if not (0.0 <= temp <= 2.0):
+                    return {}, JSONResponse(
+                        {"error": "temperature must be between 0 and 2"}, status_code=400
+                    )
+                fields["temperature"] = temp
+            except (ValueError, TypeError):
+                fields["temperature"] = None
+        else:
+            fields["temperature"] = None
+
+    if "token_budget" in body:
+        try:
+            tb = int(body.get("token_budget", 0) or 0)
+        except (ValueError, TypeError):
+            return {}, JSONResponse({"error": "token_budget must be an integer"}, status_code=400)
+        if tb < 0:
+            return {}, JSONResponse({"error": "token_budget must be non-negative"}, status_code=400)
+        fields["token_budget"] = tb
+
+    if "max_tokens" in body:
+        mt = body["max_tokens"]
+        if mt is not None and mt != "":
+            try:
+                mt = int(mt)
+            except (ValueError, TypeError):
+                return {}, JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
+            if mt < 1:
+                return {}, JSONResponse({"error": "max_tokens must be positive"}, status_code=400)
+            fields["max_tokens"] = mt
+        else:
+            fields["max_tokens"] = None
+
+    if "agent_max_turns" in body:
+        amt = body["agent_max_turns"]
+        if amt is not None and amt != "":
+            try:
+                amt = int(amt)
+            except (ValueError, TypeError):
+                return {}, JSONResponse(
+                    {"error": "agent_max_turns must be an integer"}, status_code=400
+                )
+            if amt < 1:
+                return {}, JSONResponse(
+                    {"error": "agent_max_turns must be positive"}, status_code=400
+                )
+            fields["agent_max_turns"] = amt
+        else:
+            fields["agent_max_turns"] = None
+
+    if "reasoning_effort" in body:
+        fields["reasoning_effort"] = str(body["reasoning_effort"] or "").strip()
+
+    if "auto_approve" in body:
+        fields["auto_approve"] = bool(body.get("auto_approve", False))
+
+    if "enabled" in body:
+        fields["enabled"] = bool(body.get("enabled", True))
+
+    if "activation" in body:
+        activation = str(body["activation"] or "named").strip()
+        if activation not in _VALID_ACTIVATIONS:
+            return {}, JSONResponse(
+                {"error": f"activation must be one of: {', '.join(sorted(_VALID_ACTIVATIONS))}"},
+                status_code=400,
+            )
+        fields["activation"] = activation
+
+    if "notify_on_complete" in body:
+        nc = str(body.get("notify_on_complete", "{}")).strip()
+        if nc and nc != "{}":
+            try:
+                _json.loads(nc)
+            except (_json.JSONDecodeError, TypeError):
+                return {}, JSONResponse(
+                    {"error": "notify_on_complete must be valid JSON"}, status_code=400
+                )
+        fields["notify_on_complete"] = nc
+
+    if "allowed_tools" in body:
+        at_raw = body.get("allowed_tools", "[]")
+        if isinstance(at_raw, list):
+            fields["allowed_tools"] = _json.dumps(at_raw)
+        else:
+            at_str = str(at_raw).strip()
+            if at_str and not at_str.startswith("["):
+                at_str = _json.dumps([t.strip() for t in at_str.split(",") if t.strip()])
+            try:
+                _json.loads(at_str or "[]")
+            except (ValueError, TypeError):
+                at_str = "[]"
+            fields["allowed_tools"] = at_str or "[]"
+
+    return fields, None
+
+
+def _skill_to_response(r: dict[str, Any]) -> dict[str, Any]:
+    """Convert a storage skill dict to a JSON-safe response dict."""
+    import contextlib
+    import json as _json
+
+    tags: list[str] = []
+    with contextlib.suppress(ValueError, TypeError):
+        tags = _json.loads(r.get("tags", "[]"))
+    return {
+        "template_id": r.get("template_id", ""),
+        "name": r.get("name", ""),
+        "category": r.get("category", ""),
+        "description": r.get("description", ""),
+        "content": r.get("content", ""),
+        "tags": tags,
+        "is_default": r.get("is_default", False),
+        "activation": r.get("activation", "named"),
+        "origin": r.get("origin", "manual"),
+        "mcp_server": r.get("mcp_server", ""),
+        "readonly": r.get("readonly", False),
+        "author": r.get("author", ""),
+        "version": r.get("version", "1.0.0"),
+        "variables": r.get("variables", "[]"),
+        "token_estimate": r.get("token_estimate", 0),
+        "source_url": r.get("source_url", ""),
+        "org_id": r.get("org_id", ""),
+        "created_by": r.get("created_by", ""),
+        # Session config fields
+        "model": r.get("model", ""),
+        "auto_approve": r.get("auto_approve", False),
+        "temperature": r.get("temperature"),
+        "reasoning_effort": r.get("reasoning_effort", ""),
+        "max_tokens": r.get("max_tokens"),
+        "token_budget": r.get("token_budget", 0),
+        "agent_max_turns": r.get("agent_max_turns"),
+        "notify_on_complete": r.get("notify_on_complete", "{}"),
+        "enabled": r.get("enabled", True),
+        "allowed_tools": r.get("allowed_tools", "[]"),
+        "created": r.get("created", ""),
+        "updated": r.get("updated", ""),
+    }
+
+
+async def admin_list_skills(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills — list all skills."""
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
-    return JSONResponse({"templates": storage.list_prompt_templates()})
+    params = dict(request.query_params)
+    limit = _parse_int(params, "limit", 0, minimum=0, maximum=10000)
+    offset = _parse_int(params, "offset", 0, minimum=0, maximum=100000)
+    rows = storage.list_prompt_templates(limit=limit, offset=offset)
+    total = storage.count_prompt_templates()
+    skills = [_skill_to_response(r) for r in rows]
+    return JSONResponse({"skills": skills, "total": total})
 
 
-async def admin_create_template(request: Request) -> JSONResponse:
-    """POST /v1/api/admin/templates — create a prompt template."""
+async def admin_get_skill(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills/{skill_id} — get a single skill."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    skill = storage.get_prompt_template(skill_id)
+    if skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    return JSONResponse(_skill_to_response(skill))
+
+
+async def admin_create_skill(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills — create a skill."""
+    import json as _json
     import uuid
 
     from turnstone.core.audit import record_audit
@@ -2183,7 +2342,7 @@ async def admin_create_template(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
@@ -2194,24 +2353,53 @@ async def admin_create_template(request: Request) -> JSONResponse:
     name = str(body.get("name", "")).strip()[:256]
     content = str(body.get("content", "")).strip()[:32768]
     category = str(body.get("category", "general")).strip()[:64]
+    description = str(body.get("description", "")).strip()[:1024]
     variables = str(body.get("variables", "[]")).strip()
     try:
-        json.loads(variables)
-    except (json.JSONDecodeError, TypeError):
+        _json.loads(variables)
+    except (_json.JSONDecodeError, TypeError):
         return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
     is_default = bool(body.get("is_default", False))
     org_id = str(body.get("org_id", "")).strip()[:64]
+    author = str(body.get("author", "")).strip()[:256]
+    version = str(body.get("version", "1.0.0")).strip()[:64]
+
+    raw_tags = body.get("tags", [])
+    if isinstance(raw_tags, list):
+        tags_str = _json.dumps(raw_tags)
+    else:
+        tags_str = str(raw_tags).strip()
+        try:
+            _json.loads(tags_str)
+        except (ValueError, TypeError):
+            tags_str = "[]"
+
+    token_estimate = len(content) // 4 if content else 0
+
+    # Session config fields via shared helper
+    session_fields, session_err = _parse_skill_session_config(body)
+    if session_err:
+        return session_err
+
+    # Resolve activation / is_default sync
+    activation = session_fields.pop("activation", "")
+    if not activation:
+        activation = "default" if is_default else "named"
+    if activation == "default":
+        is_default = True
 
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not content:
         return JSONResponse({"error": "content is required"}, status_code=400)
+    if storage.get_prompt_template_by_name(name):
+        return JSONResponse({"error": "Skill name already exists"}, status_code=409)
 
     audit_uid, ip = _audit_context(request)
 
-    template_id = uuid.uuid4().hex
+    skill_id = uuid.uuid4().hex
     storage.create_prompt_template(
-        template_id=template_id,
+        template_id=skill_id,
         name=name,
         category=category,
         content=content,
@@ -2219,24 +2407,33 @@ async def admin_create_template(request: Request) -> JSONResponse:
         is_default=is_default,
         org_id=org_id,
         created_by=audit_uid,
+        description=description,
+        tags=tags_str,
+        version=version,
+        author=author,
+        activation=activation,
+        token_estimate=token_estimate,
+        **session_fields,
     )
 
     record_audit(
         storage,
         audit_uid,
-        "template.create",
-        "template",
-        template_id,
+        "skill.create",
+        "skill",
+        skill_id,
         {"name": name},
         ip,
     )
 
-    template = storage.get_prompt_template(template_id)
-    return JSONResponse(template)
+    skill = storage.get_prompt_template(skill_id)
+    return JSONResponse(_skill_to_response(skill))
 
 
-async def admin_update_template(request: Request) -> JSONResponse:
-    """PUT /v1/api/admin/templates/{template_id} — update a prompt template."""
+async def admin_update_skill(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/skills/{skill_id} — update a skill."""
+    import json as _json
+
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
@@ -2244,57 +2441,97 @@ async def admin_update_template(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
-    template_id = request.path_params["template_id"]
-    existing = storage.get_prompt_template(template_id)
+    skill_id = request.path_params["skill_id"]
+    existing = storage.get_prompt_template(skill_id)
     if existing is None:
-        return JSONResponse({"error": "Template not found"}, status_code=404)
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     if existing.get("readonly"):
-        return JSONResponse({"error": "MCP-sourced templates are read-only"}, status_code=403)
+        return JSONResponse({"error": "MCP-sourced skills are read-only"}, status_code=403)
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
 
-    updates: dict[str, Any] = {}
+    # Session config fields via shared helper
+    session_fields, session_err = _parse_skill_session_config(body)
+    if session_err:
+        return session_err
+
+    updates: dict[str, Any] = dict(session_fields)
     if "name" in body:
         updates["name"] = str(body["name"]).strip()[:256]
+        existing_by_name = storage.get_prompt_template_by_name(updates["name"])
+        if existing_by_name and existing_by_name["template_id"] != skill_id:
+            return JSONResponse({"error": "Skill name already exists"}, status_code=409)
     if "content" in body:
-        updates["content"] = str(body["content"]).strip()[:32768]
+        content = str(body["content"]).strip()[:32768]
+        updates["content"] = content
+        updates["token_estimate"] = len(content) // 4 if content else 0
     if "category" in body:
         updates["category"] = str(body["category"]).strip()[:64]
+    if "description" in body:
+        updates["description"] = str(body["description"]).strip()[:1024]
     if "variables" in body:
         var_str = str(body["variables"]).strip()
         try:
-            json.loads(var_str)
-        except (json.JSONDecodeError, TypeError):
+            _json.loads(var_str)
+        except (_json.JSONDecodeError, TypeError):
             return JSONResponse({"error": "variables must be a valid JSON array"}, status_code=400)
         updates["variables"] = var_str
     if "is_default" in body:
         updates["is_default"] = bool(body["is_default"])
+    if "activation" in updates and updates["activation"] == "default":
+        updates["is_default"] = True
+    if "author" in body:
+        updates["author"] = str(body["author"]).strip()[:256]
+    if "version" in body:
+        updates["version"] = str(body["version"]).strip()[:64]
+    if "tags" in body:
+        raw_tags = body["tags"]
+        if isinstance(raw_tags, list):
+            updates["tags"] = _json.dumps(raw_tags)
+        else:
+            tag_str = str(raw_tags).strip()
+            try:
+                _json.loads(tag_str)
+            except (ValueError, TypeError):
+                tag_str = "[]"
+            updates["tags"] = tag_str
 
-    storage.update_prompt_template(template_id, **updates)
+    # Snapshot current state for version history before applying update
+    existing_versions = storage.list_skill_versions(skill_id)
+    version_int = len(existing_versions) + 1
+    audit_uid_pre, _ = _audit_context(request)
+    storage.create_skill_version(
+        skill_id=skill_id,
+        version=version_int,
+        snapshot=_json.dumps(existing, default=str),
+        changed_by=audit_uid_pre,
+    )
+
+    storage.update_prompt_template(skill_id, **updates)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
         storage,
         audit_uid,
-        "template.update",
-        "template",
-        template_id,
+        "skill.update",
+        "skill",
+        skill_id,
         updates,
         ip,
     )
 
-    template = storage.get_prompt_template(template_id)
-    return JSONResponse(template)
+    updated_skill = storage.get_prompt_template(skill_id)
+    return JSONResponse(_skill_to_response(updated_skill))
 
 
-async def admin_delete_template(request: Request) -> JSONResponse:
-    """DELETE /v1/api/admin/templates/{template_id} — delete a prompt template."""
+async def admin_delete_skill(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/skills/{skill_id} — delete a skill."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
@@ -2302,26 +2539,28 @@ async def admin_delete_template(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
-    template_id = request.path_params["template_id"]
-    existing = storage.get_prompt_template(template_id)
+    skill_id = request.path_params["skill_id"]
+    existing = storage.get_prompt_template(skill_id)
     if existing is None:
-        return JSONResponse({"error": "Template not found"}, status_code=404)
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
     if existing.get("readonly"):
-        return JSONResponse({"error": "MCP-sourced templates are read-only"}, status_code=403)
+        return JSONResponse({"error": "MCP-sourced skills are read-only"}, status_code=403)
 
-    storage.delete_prompt_template(template_id)
+    storage.delete_skill_resources(skill_id)
+    storage.delete_skill_versions(skill_id)
+    storage.delete_prompt_template(skill_id)
 
     audit_uid, ip = _audit_context(request)
     record_audit(
         storage,
         audit_uid,
-        "template.delete",
-        "template",
-        template_id,
+        "skill.delete",
+        "skill",
+        skill_id,
         {"name": existing.get("name", "")},
         ip,
     )
@@ -2329,293 +2568,55 @@ async def admin_delete_template(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
-# ---------------------------------------------------------------------------
-# Admin: Workstream Templates
-# ---------------------------------------------------------------------------
-
-
-async def admin_list_ws_templates(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/ws-templates — list all workstream templates."""
+async def admin_list_skill_versions(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills/{skill_id}/versions — version history."""
     from turnstone.core.auth import require_permission
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.ws_templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
-    return JSONResponse({"ws_templates": storage.list_ws_templates()})
 
-
-async def admin_create_ws_template(request: Request) -> JSONResponse:
-    """POST /v1/api/admin/ws-templates — create a workstream template."""
-    import uuid
-
-    from turnstone.core.audit import record_audit
-    from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    err = require_permission(request, "admin.ws_templates")
-    if err:
-        return err
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-
-    name = str(body.get("name", "")).strip()[:256]
-    if not name:
-        return JSONResponse({"error": "name is required"}, status_code=400)
-    if storage.get_ws_template_by_name(name) is not None:
-        return JSONResponse({"error": "Name already exists"}, status_code=409)
-
-    prompt_template_ref = str(body.get("prompt_template", ""))[:256]
-    prompt_template_hash = ""
-    if prompt_template_ref:
-        pt = storage.get_prompt_template_by_name(prompt_template_ref)
-        if not pt:
-            return JSONResponse(
-                {"error": f"Prompt template not found: {prompt_template_ref}"}, status_code=400
-            )
-        prompt_template_hash = _hash_content(pt.get("content", ""))
-
-    try:
-        temperature = float(body["temperature"]) if body.get("temperature") is not None else None
-        max_tokens = int(body["max_tokens"]) if body.get("max_tokens") is not None else None
-        token_budget = int(body.get("token_budget", 0))
-        agent_max_turns = (
-            int(body["agent_max_turns"]) if body.get("agent_max_turns") is not None else None
-        )
-    except (ValueError, TypeError) as exc:
-        return JSONResponse({"error": f"Invalid numeric field: {exc}"}, status_code=400)
-
-    ws_template_id = uuid.uuid4().hex
-    storage.create_ws_template(
-        ws_template_id=ws_template_id,
-        name=name,
-        description=str(body.get("description", ""))[:1024],
-        system_prompt=str(body.get("system_prompt", ""))[:32768],
-        prompt_template=prompt_template_ref,
-        prompt_template_hash=prompt_template_hash,
-        model=str(body.get("model", ""))[:128],
-        auto_approve=bool(body.get("auto_approve", False)),
-        auto_approve_tools=str(body.get("auto_approve_tools", ""))[:2048],
-        temperature=temperature,
-        reasoning_effort=str(body.get("reasoning_effort", ""))[:32],
-        max_tokens=max_tokens,
-        token_budget=token_budget,
-        agent_max_turns=agent_max_turns,
-        notify_on_complete=str(body.get("notify_on_complete", "{}"))[:4096],
-        org_id=str(body.get("org_id", ""))[:128],
-        created_by=getattr(getattr(request.state, "auth_result", None), "user_id", ""),
-        enabled=bool(body.get("enabled", True)),
-    )
-
-    audit_uid, ip = _audit_context(request)
-    record_audit(
-        storage,
-        audit_uid,
-        "ws_template.create",
-        "ws_template",
-        ws_template_id,
-        {"name": name},
-        ip,
-    )
-
-    tpl = storage.get_ws_template(ws_template_id)
-    return JSONResponse(tpl)
-
-
-async def admin_get_ws_template(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/ws-templates/{ws_template_id} — get a single workstream template."""
-    from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    err = require_permission(request, "admin.ws_templates")
-    if err:
-        return err
-    ws_template_id = request.path_params["ws_template_id"]
-    tpl = storage.get_ws_template(ws_template_id)
-    if not tpl:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    return JSONResponse(tpl)
-
-
-async def admin_update_ws_template(request: Request) -> JSONResponse:
-    """PUT /v1/api/admin/ws-templates/{ws_template_id} — update a workstream template."""
-    from turnstone.core.audit import record_audit
-    from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    err = require_permission(request, "admin.ws_templates")
-    if err:
-        return err
-    ws_template_id = request.path_params["ws_template_id"]
-    existing = storage.get_ws_template(ws_template_id)
-    if not existing:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-
-    updates: dict[str, Any] = {}
-    if "name" in body:
-        new_name = str(body["name"]).strip()[:256]
-        if new_name != existing["name"] and storage.get_ws_template_by_name(new_name) is not None:
-            return JSONResponse({"error": "Name already exists"}, status_code=409)
-        updates["name"] = new_name
-    if "description" in body:
-        updates["description"] = str(body["description"])[:1024]
-    if "system_prompt" in body:
-        updates["system_prompt"] = str(body["system_prompt"])[:32768]
-    if "prompt_template" in body:
-        pt_ref = str(body["prompt_template"])[:256]
-        pt_obj = storage.get_prompt_template_by_name(pt_ref) if pt_ref else None
-        if pt_ref and not pt_obj:
-            return JSONResponse({"error": f"Prompt template not found: {pt_ref}"}, status_code=400)
-        updates["prompt_template"] = pt_ref
-        updates["prompt_template_hash"] = _hash_content(pt_obj.get("content", "")) if pt_obj else ""
-    if "model" in body:
-        updates["model"] = str(body["model"])[:128]
-    if "auto_approve" in body:
-        updates["auto_approve"] = bool(body["auto_approve"])
-    if "auto_approve_tools" in body:
-        updates["auto_approve_tools"] = str(body["auto_approve_tools"])[:2048]
-    try:
-        if "temperature" in body:
-            updates["temperature"] = (
-                float(body["temperature"]) if body["temperature"] is not None else None
-            )
-        if "max_tokens" in body:
-            updates["max_tokens"] = (
-                int(body["max_tokens"]) if body["max_tokens"] is not None else None
-            )
-        if "token_budget" in body:
-            updates["token_budget"] = int(body["token_budget"])
-        if "agent_max_turns" in body:
-            updates["agent_max_turns"] = (
-                int(body["agent_max_turns"]) if body["agent_max_turns"] is not None else None
-            )
-    except (ValueError, TypeError) as exc:
-        return JSONResponse({"error": f"Invalid numeric field: {exc}"}, status_code=400)
-    if "reasoning_effort" in body:
-        updates["reasoning_effort"] = str(body["reasoning_effort"])[:32]
-    if "notify_on_complete" in body:
-        updates["notify_on_complete"] = str(body["notify_on_complete"])[:4096]
-    if "enabled" in body:
-        updates["enabled"] = bool(body["enabled"])
-
-    changed_by = getattr(getattr(request.state, "auth_result", None), "user_id", "")
-    storage.update_ws_template(ws_template_id, changed_by=changed_by, **updates)
-
-    audit_uid, ip = _audit_context(request)
-    record_audit(
-        storage,
-        audit_uid,
-        "ws_template.update",
-        "ws_template",
-        ws_template_id,
-        updates,
-        ip,
-    )
-
-    tpl = storage.get_ws_template(ws_template_id)
-    return JSONResponse(tpl)
-
-
-async def admin_delete_ws_template(request: Request) -> JSONResponse:
-    """DELETE /v1/api/admin/ws-templates/{ws_template_id} — delete a workstream template."""
-    from turnstone.core.audit import record_audit
-    from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    err = require_permission(request, "admin.ws_templates")
-    if err:
-        return err
-    ws_template_id = request.path_params["ws_template_id"]
-    existing = storage.get_ws_template(ws_template_id)
-    if not existing:
-        return JSONResponse({"error": "Not found"}, status_code=404)
-
-    storage.delete_ws_template(ws_template_id)
-
-    audit_uid, ip = _audit_context(request)
-    record_audit(
-        storage,
-        audit_uid,
-        "ws_template.delete",
-        "ws_template",
-        ws_template_id,
-        {"name": existing["name"]},
-        ip,
-    )
-    return JSONResponse({"status": "ok"})
-
-
-async def admin_list_ws_template_versions(request: Request) -> JSONResponse:
-    """GET /v1/api/admin/ws-templates/{ws_template_id}/versions — version history."""
-    from turnstone.core.auth import require_permission
-    from turnstone.core.web_helpers import require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    err = require_permission(request, "admin.ws_templates")
-    if err:
-        return err
-    ws_template_id = request.path_params["ws_template_id"]
-    if not storage.get_ws_template(ws_template_id):
-        return JSONResponse({"error": "Not found"}, status_code=404)
-    versions = storage.list_ws_template_versions(ws_template_id)
+    skill_id = request.path_params["skill_id"]
+    versions = storage.list_skill_versions(skill_id)
     return JSONResponse({"versions": versions})
 
 
-async def list_ws_templates_summary(request: Request) -> JSONResponse:
-    """GET /v1/api/ws-templates — enabled workstream templates summary."""
+async def list_skills_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/skills — list available skills (summary)."""
+    import contextlib
+    import json as _json
+
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    templates = storage.list_ws_templates(enabled_only=True)
-    summary = [
-        {"name": t["name"], "description": t.get("description", ""), "model": t.get("model", "")}
-        for t in templates
-    ]
-    return JSONResponse({"ws_templates": summary})
-
-
-async def list_templates_summary(request: Request) -> JSONResponse:
-    """GET /v1/api/templates — list available prompt templates (read scope)."""
-    from turnstone.core.web_helpers import require_storage_or_503
-
-    storage, err = require_storage_or_503(request)
-    if err:
-        return err
-    templates = storage.list_prompt_templates()
-    summaries = [
-        {
-            "name": t["name"],
-            "category": t.get("category", ""),
-            "is_default": bool(t.get("is_default")),
-            "origin": t.get("origin", "manual"),
-        }
-        for t in templates
-    ]
-    return JSONResponse({"templates": summaries})
+    rows = storage.list_prompt_templates()
+    skills = []
+    for r in rows:
+        if not r.get("enabled", True):
+            continue
+        tags: list[str] = []
+        with contextlib.suppress(ValueError, TypeError):
+            tags = _json.loads(r.get("tags", "[]"))
+        skills.append(
+            {
+                "name": r["name"],
+                "category": r.get("category", ""),
+                "description": r.get("description", ""),
+                "tags": tags,
+                "is_default": r.get("is_default", False),
+                "activation": r.get("activation", "named"),
+                "origin": r.get("origin", "manual"),
+                "author": r.get("author", ""),
+                "version": r.get("version", "1.0.0"),
+            }
+        )
+    return JSONResponse({"skills": skills})
 
 
 async def admin_usage(request: Request) -> JSONResponse:
@@ -3961,8 +3962,7 @@ def create_app(
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
-                    Route("/api/ws-templates", list_ws_templates_summary),
-                    Route("/api/templates", list_templates_summary),
+                    Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
                     Route("/api/auth/status", auth_status),
@@ -4050,36 +4050,23 @@ def create_app(
                         admin_delete_policy,
                         methods=["DELETE"],
                     ),
-                    # Governance: Prompt templates
-                    Route("/api/admin/templates", admin_list_templates),
-                    Route("/api/admin/templates", admin_create_template, methods=["POST"]),
+                    # Governance: Skills
+                    Route("/api/admin/skills", admin_list_skills),
+                    Route("/api/admin/skills", admin_create_skill, methods=["POST"]),
+                    Route("/api/admin/skills/{skill_id}", admin_get_skill),
                     Route(
-                        "/api/admin/templates/{template_id}",
-                        admin_update_template,
+                        "/api/admin/skills/{skill_id}",
+                        admin_update_skill,
                         methods=["PUT"],
                     ),
                     Route(
-                        "/api/admin/templates/{template_id}",
-                        admin_delete_template,
-                        methods=["DELETE"],
-                    ),
-                    # Governance: Workstream templates
-                    Route("/api/admin/ws-templates", admin_list_ws_templates),
-                    Route("/api/admin/ws-templates", admin_create_ws_template, methods=["POST"]),
-                    Route("/api/admin/ws-templates/{ws_template_id}", admin_get_ws_template),
-                    Route(
-                        "/api/admin/ws-templates/{ws_template_id}",
-                        admin_update_ws_template,
-                        methods=["PUT"],
-                    ),
-                    Route(
-                        "/api/admin/ws-templates/{ws_template_id}",
-                        admin_delete_ws_template,
+                        "/api/admin/skills/{skill_id}",
+                        admin_delete_skill,
                         methods=["DELETE"],
                     ),
                     Route(
-                        "/api/admin/ws-templates/{ws_template_id}/versions",
-                        admin_list_ws_template_versions,
+                        "/api/admin/skills/{skill_id}/versions",
+                        admin_list_skill_versions,
                     ),
                     # Governance: Memories
                     Route("/api/admin/memories", admin_list_memories),

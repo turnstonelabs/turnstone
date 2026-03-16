@@ -23,11 +23,10 @@ package "Governance Storage" {
   database "user_roles" as ur_db
   database "orgs" as orgs_db
   database "tool_policies" as tp_db
-  database "prompt_templates" as pt_db
+  database "prompt_templates\n(skills)" as pt_db
   database "usage_events" as ue_db
   database "audit_events" as ae_db
-  database "workstream_templates" as wt_db
-  database "workstream_template_versions" as wtv_db
+  database "skills" as wt_db
 }
 
 package "Runtime Enforcement" {
@@ -44,10 +43,9 @@ package "Template Runtime" {
   [set_template() / /template] as tset
 }
 
-package "WS Template Runtime" {
-  [resolve_ws_template()] as wtr
+package "Skill Runtime" {
+  [resolve_skill()] as wtr
   [apply settings\n(model, budget, prompt)] as wta
-  [drift detection\n(prompt_template_hash)] as wtd
   [budget gate\n(session.send)] as wtb
 }
 
@@ -76,7 +74,7 @@ audit --> ae_db : admin handlers
 
 govjs --> roles_db : /v1/api/admin/roles
 govjs --> tp_db : /v1/api/admin/policies
-govjs --> pt_db : /v1/api/admin/templates
+govjs --> pt_db : /v1/api/admin/skills
 govjs --> ue_db : /v1/api/admin/usage
 govjs --> ae_db : /v1/api/admin/audit
 
@@ -87,17 +85,15 @@ tset --> tload : name or None
 
 note right of pt_db
   Read-only listing:
-  GET /v1/api/templates
+  GET /v1/api/skills
   (read scope, summary only)
 end note
 
-govjs --> wt_db : /v1/api/admin/ws-templates
-wtr --> wt_db : get_ws_template_by_name()
-wtr --> wta : template settings
-wta --> pt_db : prompt_template lookup
-wtd --> wt_db : compare hash
+govjs --> wt_db : /v1/api/admin/skills
+wtr --> wt_db : get_skill_by_name()
+wtr --> wta : skill settings
+wta --> pt_db : skill lookup
 wtb --> approve : __budget_override__
-wtv_db <.. wt_db : version snapshots
 
 auth -[hidden]-> mw
 mw -[hidden]-> approve

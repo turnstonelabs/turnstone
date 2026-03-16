@@ -92,10 +92,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "session.instructions",
             "str",
             "",
-            "Default system instructions (applied before prompt templates)",
+            "Default system instructions (applied before skills)",
             "session",
             help="Text that tells the model how to behave (e.g. \u2018You are a helpful coding assistant\u2019). "
-            "Applied to every conversation before any prompt templates.",
+            "Applied to every conversation before any skills.",
         ),
         SettingDef(
             "session.retention_days",
