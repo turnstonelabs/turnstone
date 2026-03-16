@@ -437,12 +437,12 @@
         }
       }
     },
-    "/v1/api/templates": {
+    "/v1/api/skills": {
       "get": {
-        "summary": "List available prompt templates (summary)",
-        "operationId": "v1_api_templates_get",
+        "summary": "List available skills (summary)",
+        "operationId": "v1_api_skills_get",
         "tags": [
-          "Templates"
+          "Skills"
         ],
         "responses": {
           "200": {
@@ -450,28 +450,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListPromptTemplateSummaryResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/api/ws-templates": {
-      "get": {
-        "summary": "List enabled workstream templates (summary)",
-        "operationId": "v1_api_ws-templates_get",
-        "tags": [
-          "Templates"
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListWsTemplateSummaryResponse"
+                  "$ref": "#/components/schemas/ListSkillSummaryResponse"
                 }
               }
             }
@@ -1278,16 +1257,10 @@
             "title": "Resume Ws",
             "type": "string"
           },
-          "template": {
+          "skill": {
             "default": "",
-            "description": "Prompt template name (replaces default templates)",
-            "title": "Template",
-            "type": "string"
-          },
-          "ws_template": {
-            "default": "",
-            "description": "Workstream template name to apply defaults from",
-            "title": "Ws Template",
+            "description": "Skill name (replaces default skills)",
+            "title": "Skill",
             "type": "string"
           }
         },
@@ -1914,91 +1887,84 @@
         "title": "SearchMemoriesRequest",
         "type": "object"
       },
-      "PromptTemplateSummary": {
+      "SkillSummary": {
         "properties": {
           "name": {
-            "description": "Template name",
+            "description": "Skill name",
             "title": "Name",
             "type": "string"
           },
           "category": {
             "default": "",
-            "description": "Template category",
+            "description": "Skill category",
             "title": "Category",
             "type": "string"
           },
+          "description": {
+            "default": "",
+            "description": "Skill description for discovery",
+            "title": "Description",
+            "type": "string"
+          },
+          "tags": {
+            "description": "Semantic tags",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
           "is_default": {
             "default": false,
-            "description": "Whether this template is applied by default",
+            "description": "Whether auto-applied to all sessions",
             "title": "Is Default",
             "type": "boolean"
           },
+          "activation": {
+            "default": "named",
+            "description": "Activation mode: default, named, search",
+            "title": "Activation",
+            "type": "string"
+          },
           "origin": {
             "default": "manual",
-            "description": "Template origin: manual or mcp",
+            "description": "Source: manual, mcp, skills.sh, github",
             "title": "Origin",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "description": "Skill author",
+            "title": "Author",
+            "type": "string"
+          },
+          "version": {
+            "default": "1.0.0",
+            "description": "Skill version",
+            "title": "Version",
             "type": "string"
           }
         },
         "required": [
           "name"
         ],
-        "title": "PromptTemplateSummary",
+        "title": "SkillSummary",
         "type": "object"
       },
-      "ListPromptTemplateSummaryResponse": {
+      "ListSkillSummaryResponse": {
         "properties": {
-          "templates": {
+          "skills": {
             "items": {
-              "$ref": "#/components/schemas/PromptTemplateSummary"
+              "$ref": "#/components/schemas/SkillSummary"
             },
-            "title": "Templates",
+            "title": "Skills",
             "type": "array"
           }
         },
         "required": [
-          "templates"
+          "skills"
         ],
-        "title": "ListPromptTemplateSummaryResponse",
-        "type": "object"
-      },
-      "WsTemplateSummary": {
-        "properties": {
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "description": {
-            "title": "Description",
-            "type": "string"
-          },
-          "model": {
-            "title": "Model",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "description",
-          "model"
-        ],
-        "title": "WsTemplateSummary",
-        "type": "object"
-      },
-      "ListWsTemplateSummaryResponse": {
-        "properties": {
-          "ws_templates": {
-            "items": {
-              "$ref": "#/components/schemas/WsTemplateSummary"
-            },
-            "title": "Ws Templates",
-            "type": "array"
-          }
-        },
-        "required": [
-          "ws_templates"
-        ],
-        "title": "ListWsTemplateSummaryResponse",
+        "title": "ListSkillSummaryResponse",
         "type": "object"
       }
     }

@@ -624,10 +624,10 @@ Each saved workstream object:
 
 ### `GET /v1/api/templates`
 
-Returns a summary list of all available prompt templates. This is a read-only
-endpoint (requires `read` scope) that exposes template names and categories
-without revealing template content. Useful for populating template selectors
-in UIs or discovering available templates before creating a workstream.
+Returns a summary list of all available skills. This is a read-only
+endpoint (requires `read` scope) that exposes skill names and categories
+without revealing skill content. Useful for populating skill selectors
+in UIs or discovering available skills before creating a workstream.
 
 **Response:**
 
@@ -651,35 +651,6 @@ Each template summary:
 
 > **Note:** For full template management (create, update, delete, view content),
 > use the admin endpoints at `GET /v1/api/admin/templates` (requires `admin.templates` permission).
-
----
-
-### `GET /v1/api/ws-templates`
-
-Returns a summary list of enabled workstream templates. This is a read-only
-endpoint (requires `read` scope) for populating template selectors in UIs.
-
-**Response:**
-
-```json
-{
-  "ws_templates": [
-    {"name": "code-review", "description": "Code review profile", "model": "gpt-5"},
-    {"name": "ops-triage", "description": "On-call triage", "model": ""}
-  ]
-}
-```
-
-Each workstream template summary:
-
-| Field         | Type   | Description                                     |
-|---------------|--------|-------------------------------------------------|
-| `name`        | string | Template name (used in `ws_template` on creation)|
-| `description` | string | Human-readable description                       |
-| `model`       | string | Model alias override (empty = use default)       |
-
-> **Note:** For full workstream template management, use the admin endpoints at
-> `GET /v1/api/admin/ws-templates` (requires `admin.templates` permission).
 
 ---
 
@@ -874,9 +845,9 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
 | `template`       | string | ""      | Prompt template name (replaces default templates; 400 if not found)|
-| `ws_template`    | string | ""      | Workstream template name. Applies model, temperature, reasoning effort, max tokens, auto-approve policy, and token budget. Returns 400 if not found or disabled. |
+| `skill`          | string | ""      | Skill name. Applies model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and system prompt from the skill profile. Returns 400 if not found or disabled. |
 
-> **Template precedence:** When `ws_template` is specified, its model override takes effect before workstream creation. Both `template` (prompt template) and `ws_template` (workstream template) can be used together — `ws_template` controls the behavioral profile while `template` sets the system message text. If `ws_template` defines its own system prompt or prompt template reference, that takes precedence over the `template` parameter.
+> **Skill precedence:** When `skill` is specified, its settings (model, temperature, auto-approve, token budget, system prompt, etc.) are applied at workstream creation. The `template` parameter can still be used alongside `skill` to override the system message text.
 
 **Response (success):**
 

@@ -148,8 +148,8 @@ class StorageBackend(Protocol):
         user_id: str | None = None,
         alias: str | None = None,
         title: str | None = None,
-        ws_template_id: str = "",
-        ws_template_version: int = 0,
+        skill_id: str = "",
+        skill_version: int = 0,
     ) -> None:
         """Create a workstreams row (no-op if already exists)."""
         ...
@@ -160,12 +160,6 @@ class StorageBackend(Protocol):
 
     def update_workstream_name(self, ws_id: str, name: str) -> None:
         """Update a workstream's display name."""
-        ...
-
-    def update_workstream_template(
-        self, ws_id: str, ws_template_id: str, ws_template_version: int
-    ) -> None:
-        """Set the ws_template_id and ws_template_version on a workstream row."""
         ...
 
     def delete_workstream(self, ws_id: str) -> bool:
@@ -340,8 +334,7 @@ class StorageBackend(Protocol):
         auto_approve_tools: list[str],
         created_by: str,
         next_run: str,
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> None:
         """Create a scheduled task. No-op if task_id already exists."""
         ...
@@ -569,8 +562,25 @@ class StorageBackend(Protocol):
         origin: str = "manual",
         mcp_server: str = "",
         readonly: bool = False,
+        description: str = "",
+        tags: str = "[]",
+        source_url: str = "",
+        version: str = "1.0.0",
+        author: str = "",
+        activation: str = "named",
+        token_estimate: int = 0,
+        model: str = "",
+        auto_approve: bool = False,
+        temperature: float | None = None,
+        reasoning_effort: str = "",
+        max_tokens: int | None = None,
+        token_budget: int = 0,
+        agent_max_turns: int | None = None,
+        notify_on_complete: str = "{}",
+        enabled: bool = True,
+        allowed_tools: str = "[]",
     ) -> None:
-        """Create a prompt template."""
+        """Create a prompt template (skill)."""
         ...
 
     def get_prompt_template(self, template_id: str) -> dict[str, Any] | None:
@@ -581,7 +591,9 @@ class StorageBackend(Protocol):
         """Lookup prompt template by name. Returns same dict as get_prompt_template or None."""
         ...
 
-    def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+    def list_prompt_templates(
+        self, org_id: str = "", limit: int = 0, offset: int = 0
+    ) -> list[dict[str, Any]]:
         """Return all prompt templates ordered by name."""
         ...
 
@@ -601,66 +613,61 @@ class StorageBackend(Protocol):
         """Delete a prompt template. Returns True if found."""
         ...
 
-    # -- Workstream templates --------------------------------------------------
+    def count_prompt_templates(self, org_id: str = "") -> int:
+        """Count prompt templates, optionally filtered by org_id."""
+        ...
 
-    def create_ws_template(
+    def list_skills_by_activation(self, activation: str) -> list[dict[str, Any]]:
+        """Return prompt templates filtered by activation value, ordered by name."""
+        ...
+
+    def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
+        """Lookup skill (prompt template) by name. Returns dict or None."""
+        ...
+
+    # -- Skill resources -------------------------------------------------------
+
+    def create_skill_resource(
         self,
-        ws_template_id: str,
-        name: str,
-        description: str = "",
-        system_prompt: str = "",
-        prompt_template: str = "",
-        prompt_template_hash: str = "",
-        model: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        temperature: float | None = None,
-        reasoning_effort: str = "",
-        max_tokens: int | None = None,
-        token_budget: int = 0,
-        agent_max_turns: int | None = None,
-        notify_on_complete: str = "{}",
-        org_id: str = "",
-        created_by: str = "",
-        enabled: bool = True,
+        resource_id: str,
+        skill_id: str,
+        path: str,
+        content: str,
+        content_type: str = "text/plain",
     ) -> None:
-        """Create a workstream template."""
+        """Create a bundled resource file for a skill."""
         ...
 
-    def get_ws_template(self, ws_template_id: str) -> dict[str, Any] | None:
-        """Return workstream template dict or None."""
+    def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
+        """Return all resource files for a skill, ordered by path."""
         ...
 
-    def get_ws_template_by_name(self, name: str) -> dict[str, Any] | None:
-        """Lookup workstream template by name. Returns same dict or None."""
+    def get_skill_resource(self, skill_id: str, path: str) -> dict[str, Any] | None:
+        """Return a single resource file by skill ID and path."""
         ...
 
-    def list_ws_templates(
-        self, org_id: str = "", enabled_only: bool = False
-    ) -> list[dict[str, Any]]:
-        """Return all workstream templates ordered by name."""
+    def delete_skill_resources(self, skill_id: str) -> int:
+        """Delete all resource files for a skill. Returns count deleted."""
         ...
 
-    def update_ws_template(self, ws_template_id: str, changed_by: str = "", **fields: Any) -> bool:
-        """Update fields on a workstream template. Auto-snapshots version. Returns True if found."""
-        ...
+    # -- Skill versions --------------------------------------------------------
 
-    def delete_ws_template(self, ws_template_id: str) -> bool:
-        """Delete a workstream template and cascade-delete versions. Returns True if found."""
-        ...
-
-    def create_ws_template_version(
+    def create_skill_version(
         self,
-        ws_template_id: str,
+        skill_id: str,
         version: int,
         snapshot: str,
         changed_by: str = "",
     ) -> None:
-        """Create a version snapshot for a workstream template."""
+        """Create a version snapshot for a skill."""
         ...
 
-    def list_ws_template_versions(self, ws_template_id: str) -> list[dict[str, Any]]:
-        """List version history for a workstream template, ordered by version DESC."""
+    def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
+        """List version history for a skill, ordered by version DESC."""
+        ...
+
+    def delete_skill_versions(self, skill_id: str) -> int:
+        """Delete all version snapshots for a skill. Returns count deleted."""
         ...
 
     # -- Usage events ----------------------------------------------------------

@@ -69,7 +69,7 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 |----------|--------|---------|
 | **Workstreams** | `list_workstreams()` | `ListWorkstreamsResponse` |
 | | `dashboard()` | `DashboardResponse` |
-| | `create_workstream(*, name, model, auto_approve, ws_template)` | `CreateWorkstreamResponse` |
+| | `create_workstream(*, name, model, auto_approve, skill)` | `CreateWorkstreamResponse` |
 | | `close_workstream(ws_id)` | `StatusResponse` |
 | **Chat** | `send(message, ws_id)` | `SendResponse` |
 | | `approve(*, ws_id, approved, feedback, always)` | `StatusResponse` |
@@ -97,19 +97,13 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `workstreams(*, state, node, search, sort, page, per_page)` | `ClusterWorkstreamsResponse` |
 | | `node_detail(node_id)` | `NodeDetailResponse` |
 | | `snapshot()` | `ClusterSnapshotResponse` |
-| | `create_workstream(*, node_id, name, model, initial_message, ws_template)` | `ConsoleCreateWsResponse` |
+| | `create_workstream(*, node_id, name, model, initial_message, skill)` | `ConsoleCreateWsResponse` |
 | **Schedules** | `list_schedules()` | `ListSchedulesResponse` |
 | | `create_schedule(*, name, schedule_type, initial_message, ...)` | `ScheduleInfo` |
 | | `get_schedule(task_id)` | `ScheduleInfo` |
 | | `update_schedule(task_id, *, name=..., enabled=..., ...)` | `ScheduleInfo` |
 | | `delete_schedule(task_id)` | `StatusResponse` |
 | | `list_schedule_runs(task_id, *, limit=50)` | `ListScheduleRunsResponse` |
-| **WS Templates** | `list_ws_templates()` | `ListWsTemplatesResponse` |
-| | `create_ws_template(*, name, description, ...)` | `WsTemplateInfo` |
-| | `get_ws_template(template_id)` | `WsTemplateInfo` |
-| | `update_ws_template(template_id, *, name=..., enabled=..., ...)` | `WsTemplateInfo` |
-| | `delete_ws_template(template_id)` | `StatusResponse` |
-| | `list_ws_template_versions(template_id)` | `ListWsTemplateVersionsResponse` |
 | **MCP Registry** | `search_mcp_registry(q="", *, limit=20, cursor=None)` | `RegistrySearchResponse` |
 | | `install_from_registry(registry_name, source, *, index=0, name="", variables=None, env=None, headers=None)` | `McpServerDetail` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |

@@ -51,8 +51,8 @@ workstreams = sa.Table(
     sa.Column("title", sa.Text),
     sa.Column("name", sa.Text, nullable=False, server_default=""),
     sa.Column("state", sa.Text, nullable=False, server_default="idle"),
-    sa.Column("ws_template_id", sa.Text, nullable=False, server_default=""),
-    sa.Column("ws_template_version", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("skill_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("skill_version", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -151,8 +151,7 @@ scheduled_tasks = sa.Table(
     sa.Column("initial_message", sa.Text, nullable=False),
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("auto_approve_tools", sa.Text, nullable=False, server_default=""),
-    sa.Column("template", sa.Text, nullable=False, server_default=""),
-    sa.Column("ws_template", sa.Text, nullable=False, server_default=""),
+    sa.Column("skill", sa.Text, nullable=False, server_default=""),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("last_run", sa.Text),
@@ -304,61 +303,71 @@ prompt_templates = sa.Table(
     sa.Column("origin", sa.Text, nullable=False, server_default="manual"),
     sa.Column("mcp_server", sa.Text, nullable=False, server_default=""),
     sa.Column("readonly", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("created", sa.Text, nullable=False),
-    sa.Column("updated", sa.Text, nullable=False),
-)
-
-# ---------------------------------------------------------------------------
-# Workstream templates — behavioral profiles for workstream creation
-# ---------------------------------------------------------------------------
-
-workstream_templates = sa.Table(
-    "workstream_templates",
-    metadata,
-    sa.Column("ws_template_id", sa.Text, primary_key=True),
-    sa.Column("name", sa.Text, nullable=False, unique=True),
     sa.Column("description", sa.Text, nullable=False, server_default=""),
-    sa.Column("system_prompt", sa.Text, nullable=False, server_default=""),
-    sa.Column("prompt_template", sa.Text, nullable=False, server_default=""),
-    sa.Column("prompt_template_hash", sa.Text, nullable=False, server_default=""),
+    sa.Column("tags", sa.Text, nullable=False, server_default="[]"),
+    sa.Column("source_url", sa.Text, nullable=False, server_default=""),
+    sa.Column("version", sa.Text, nullable=False, server_default="1.0.0"),
+    sa.Column("author", sa.Text, nullable=False, server_default=""),
+    sa.Column("activation", sa.Text, nullable=False, server_default="named"),
+    sa.Column("token_estimate", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("allowed_tools", sa.Text, nullable=False, server_default="[]"),  # JSON array
+    sa.Column("scan_status", sa.Text, nullable=False, server_default=""),
+    sa.Column("scan_report", sa.Text, nullable=False, server_default="{}"),  # JSON
+    sa.Column("installed_at", sa.Text, nullable=False, server_default=""),
+    sa.Column("installed_by", sa.Text, nullable=False, server_default=""),
+    # Session config (merged from workstream templates)
     sa.Column("model", sa.Text, nullable=False, server_default=""),
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("auto_approve_tools", sa.Text, nullable=False, server_default=""),
-    sa.Column("temperature", sa.Float),
+    sa.Column("temperature", sa.Float, nullable=True),
     sa.Column("reasoning_effort", sa.Text, nullable=False, server_default=""),
-    sa.Column("max_tokens", sa.Integer),
+    sa.Column("max_tokens", sa.Integer, nullable=True),
     sa.Column("token_budget", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("agent_max_turns", sa.Integer),
+    sa.Column("agent_max_turns", sa.Integer, nullable=True),
     sa.Column("notify_on_complete", sa.Text, nullable=False, server_default="{}"),
-    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
-    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
-    sa.Column("version", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
 
-sa.Index("idx_ws_templates_enabled", workstream_templates.c.enabled)
-sa.Index("idx_ws_templates_org", workstream_templates.c.org_id)
+# ---------------------------------------------------------------------------
+# Skill resources — bundled files (scripts/, references/, assets/)
+# ---------------------------------------------------------------------------
 
-workstream_template_versions = sa.Table(
-    "workstream_template_versions",
+skill_resources = sa.Table(
+    "skill_resources",
     metadata,
-    sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
-    sa.Column("ws_template_id", sa.Text, nullable=False),
+    sa.Column("resource_id", sa.Text, primary_key=True),
+    sa.Column("skill_id", sa.Text, nullable=False),  # prompt_templates.template_id
+    sa.Column("path", sa.Text, nullable=False),  # e.g. "scripts/search.py"
+    sa.Column("content", sa.Text, nullable=False),
+    sa.Column("content_type", sa.Text, nullable=False, server_default="text/plain"),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_skill_resources_skill_id", skill_resources.c.skill_id)
+sa.Index(
+    "idx_skill_resources_skill_path",
+    skill_resources.c.skill_id,
+    skill_resources.c.path,
+    unique=True,
+)
+
+# ---------------------------------------------------------------------------
+# Skill versions — version history for skills
+# ---------------------------------------------------------------------------
+
+skill_versions = sa.Table(
+    "skill_versions",
+    metadata,
+    sa.Column("id", sa.Integer, primary_key=True),
+    sa.Column("skill_id", sa.Text, nullable=False),
     sa.Column("version", sa.Integer, nullable=False),
     sa.Column("snapshot", sa.Text, nullable=False),
     sa.Column("changed_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
 )
 
-sa.Index("idx_ws_tpl_versions_tpl", workstream_template_versions.c.ws_template_id)
-sa.Index(
-    "uq_ws_tpl_versions_tpl_ver",
-    workstream_template_versions.c.ws_template_id,
-    workstream_template_versions.c.version,
-    unique=True,
-)
+sa.Index("idx_skill_versions_skill_id", skill_versions.c.skill_id)
 
 usage_events = sa.Table(
     "usage_events",

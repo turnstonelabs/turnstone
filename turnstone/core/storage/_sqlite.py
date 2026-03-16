@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -19,6 +18,8 @@ from turnstone.core.storage._schema import (
     orgs,
     prompt_templates,
     roles,
+    skill_resources,
+    skill_versions,
     structured_memories,
     system_settings,
     tool_policies,
@@ -26,8 +27,6 @@ from turnstone.core.storage._schema import (
     user_roles,
     users,
     workstream_config,
-    workstream_template_versions,
-    workstream_templates,
     workstreams,
 )
 from turnstone.core.storage._utils import (
@@ -43,16 +42,13 @@ from turnstone.core.storage._utils import (
     ROLE_MUTABLE as _ROLE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    SKILL_MUTABLE as _SKILL_MUTABLE,
+)
+from turnstone.core.storage._utils import (
     STRUCTURED_MEMORY_MUTABLE as _SMEM_MUTABLE,
 )
 from turnstone.core.storage._utils import (
-    TEMPLATE_MUTABLE as _TEMPLATE_MUTABLE,
-)
-from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
-)
-from turnstone.core.storage._utils import (
-    WS_TEMPLATE_MUTABLE as _WS_TEMPLATE_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
@@ -360,8 +356,8 @@ class SQLiteBackend:
         user_id: str | None = None,
         alias: str | None = None,
         title: str | None = None,
-        ws_template_id: str = "",
-        ws_template_version: int = 0,
+        skill_id: str = "",
+        skill_version: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -375,8 +371,8 @@ class SQLiteBackend:
                     "title": title,
                     "name": name,
                     "state": state,
-                    "ws_template_id": ws_template_id,
-                    "ws_template_version": ws_template_version,
+                    "skill_id": skill_id,
+                    "skill_version": skill_version,
                     "created": now,
                     "updated": now,
                 },
@@ -390,22 +386,6 @@ class SQLiteBackend:
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
                 .values(state=state, updated=now)
-            )
-            conn.commit()
-
-    def update_workstream_template(
-        self, ws_id: str, ws_template_id: str, ws_template_version: int
-    ) -> None:
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
-            conn.execute(
-                sa.update(workstreams)
-                .where(workstreams.c.ws_id == ws_id)
-                .values(
-                    ws_template_id=ws_template_id,
-                    ws_template_version=ws_template_version,
-                    updated=now,
-                )
             )
             conn.commit()
 
@@ -895,8 +875,7 @@ class SQLiteBackend:
         auto_approve_tools: list[str],
         created_by: str,
         next_run: str,
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> None:
         from turnstone.core.storage._schema import scheduled_tasks
 
@@ -916,8 +895,7 @@ class SQLiteBackend:
                     "initial_message": initial_message,
                     "auto_approve": 1 if auto_approve else 0,
                     "auto_approve_tools": ",".join(auto_approve_tools),
-                    "template": template,
-                    "ws_template": ws_template,
+                    "skill": skill,
                     "enabled": 1,
                     "created_by": created_by,
                     "next_run": next_run,
@@ -959,8 +937,7 @@ class SQLiteBackend:
             "initial_message",
             "auto_approve",
             "auto_approve_tools",
-            "template",
-            "ws_template",
+            "skill",
             "enabled",
             "last_run",
             "next_run",
@@ -1534,7 +1511,27 @@ class SQLiteBackend:
         origin: str = "manual",
         mcp_server: str = "",
         readonly: bool = False,
+        description: str = "",
+        tags: str = "[]",
+        source_url: str = "",
+        version: str = "1.0.0",
+        author: str = "",
+        activation: str = "named",
+        token_estimate: int = 0,
+        model: str = "",
+        auto_approve: bool = False,
+        temperature: float | None = None,
+        reasoning_effort: str = "",
+        max_tokens: int | None = None,
+        token_budget: int = 0,
+        agent_max_turns: int | None = None,
+        notify_on_complete: str = "{}",
+        enabled: bool = True,
+        allowed_tools: str = "[]",
     ) -> None:
+        # Sync is_default from activation when activation is explicitly set
+        if activation == "default":
+            is_default = True
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
@@ -1551,6 +1548,23 @@ class SQLiteBackend:
                     "origin": origin,
                     "mcp_server": mcp_server,
                     "readonly": 1 if readonly else 0,
+                    "description": description,
+                    "tags": tags,
+                    "source_url": source_url,
+                    "version": version,
+                    "author": author,
+                    "activation": activation,
+                    "token_estimate": token_estimate,
+                    "allowed_tools": allowed_tools,
+                    "model": model,
+                    "auto_approve": 1 if auto_approve else 0,
+                    "temperature": temperature,
+                    "reasoning_effort": reasoning_effort,
+                    "max_tokens": max_tokens,
+                    "token_budget": token_budget,
+                    "agent_max_turns": agent_max_turns,
+                    "notify_on_complete": notify_on_complete,
+                    "enabled": 1 if enabled else 0,
                     "created": now,
                     "updated": now,
                 },
@@ -1563,7 +1577,7 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default", "readonly")
+                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
             return None
 
     def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
@@ -1572,28 +1586,46 @@ class SQLiteBackend:
                 sa.select(prompt_templates).where(prompt_templates.c.name == name)
             ).fetchone()
             if row:
-                return _row_to_dict(row, "is_default", "readonly")
+                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
             return None
 
-    def list_prompt_templates(self, org_id: str = "") -> list[dict[str, Any]]:
+    def list_prompt_templates(
+        self, org_id: str = "", limit: int = 0, offset: int = 0
+    ) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
             q = sa.select(prompt_templates).order_by(prompt_templates.c.name)
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
+            if offset > 0:
+                q = q.offset(offset)
+            if limit > 0:
+                q = q.limit(limit)
             rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
+            return [
+                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+            ]
+
+    def count_prompt_templates(self, org_id: str = "") -> int:
+        with self._engine.connect() as conn:
+            q = sa.select(sa.func.count()).select_from(prompt_templates)
+            if org_id:
+                q = q.where(prompt_templates.c.org_id == org_id)
+            return conn.execute(q).scalar() or 0
 
     def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
             q = (
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.is_default == 1)
+                .where(prompt_templates.c.enabled == 1)
                 .order_by(prompt_templates.c.name)
             )
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
             rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
+            return [
+                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+            ]
 
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
@@ -1602,16 +1634,27 @@ class SQLiteBackend:
                 .where(prompt_templates.c.origin == origin)
                 .order_by(prompt_templates.c.name)
             ).fetchall()
-            return [_row_to_dict(r, "is_default", "readonly") for r in rows]
+            return [
+                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+            ]
 
     def update_prompt_template(self, template_id: str, **fields: Any) -> bool:
-        dropped = set(fields) - _TEMPLATE_MUTABLE
+        dropped = set(fields) - _SKILL_MUTABLE
         if dropped:
             log.warning("update_prompt_template: ignoring unknown fields: %s", dropped)
-        fields = {k: v for k, v in fields.items() if k in _TEMPLATE_MUTABLE}
+        fields = {k: v for k, v in fields.items() if k in _SKILL_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         if "is_default" in fields:
             fields["is_default"] = int(fields["is_default"])
+        # Keep activation and is_default in sync
+        if "activation" in fields and "is_default" not in fields:
+            fields["is_default"] = 1 if fields["activation"] == "default" else 0
+        if "is_default" in fields and "activation" not in fields:
+            fields["activation"] = "default" if fields["is_default"] else "named"
+        if "auto_approve" in fields:
+            fields["auto_approve"] = int(fields["auto_approve"])
+        if "enabled" in fields:
+            fields["enabled"] = int(fields["enabled"])
         with self._engine.connect() as conn:
             result = conn.execute(
                 sa.update(prompt_templates)
@@ -1629,158 +1672,78 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
-    # -- Workstream templates --------------------------------------------------
+    def list_skills_by_activation(self, activation: str) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(prompt_templates)
+                .where(prompt_templates.c.activation == activation)
+                .order_by(prompt_templates.c.name)
+            ).fetchall()
+            return [
+                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+            ]
 
-    def create_ws_template(
+    def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
+        return self.get_prompt_template_by_name(name)
+
+    # -- Skill resources -------------------------------------------------------
+
+    def create_skill_resource(
         self,
-        ws_template_id: str,
-        name: str,
-        description: str = "",
-        system_prompt: str = "",
-        prompt_template: str = "",
-        prompt_template_hash: str = "",
-        model: str = "",
-        auto_approve: bool = False,
-        auto_approve_tools: str = "",
-        temperature: float | None = None,
-        reasoning_effort: str = "",
-        max_tokens: int | None = None,
-        token_budget: int = 0,
-        agent_max_turns: int | None = None,
-        notify_on_complete: str = "{}",
-        org_id: str = "",
-        created_by: str = "",
-        enabled: bool = True,
+        resource_id: str,
+        skill_id: str,
+        path: str,
+        content: str,
+        content_type: str = "text/plain",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                sa.insert(workstream_templates),
+                sa.insert(skill_resources),
                 {
-                    "ws_template_id": ws_template_id,
-                    "name": name,
-                    "description": description,
-                    "system_prompt": system_prompt,
-                    "prompt_template": prompt_template,
-                    "prompt_template_hash": prompt_template_hash,
-                    "model": model,
-                    "auto_approve": 1 if auto_approve else 0,
-                    "auto_approve_tools": auto_approve_tools,
-                    "temperature": temperature,
-                    "reasoning_effort": reasoning_effort,
-                    "max_tokens": max_tokens,
-                    "token_budget": token_budget,
-                    "agent_max_turns": agent_max_turns,
-                    "notify_on_complete": notify_on_complete,
-                    "org_id": org_id,
-                    "created_by": created_by,
-                    "enabled": 1 if enabled else 0,
-                    "version": 1,
-                    "created": now,
-                    "updated": now,
-                },
-            )
-            conn.commit()
-
-    def get_ws_template(self, ws_template_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(workstream_templates).where(
-                    workstream_templates.c.ws_template_id == ws_template_id
-                )
-            ).fetchone()
-            if row:
-                return _row_to_dict(row, "auto_approve", "enabled")
-            return None
-
-    def get_ws_template_by_name(self, name: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
-            row = conn.execute(
-                sa.select(workstream_templates).where(workstream_templates.c.name == name)
-            ).fetchone()
-            if row:
-                return _row_to_dict(row, "auto_approve", "enabled")
-            return None
-
-    def list_ws_templates(
-        self, org_id: str = "", enabled_only: bool = False
-    ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
-            q = sa.select(workstream_templates).order_by(workstream_templates.c.name)
-            if org_id:
-                q = q.where(workstream_templates.c.org_id == org_id)
-            if enabled_only:
-                q = q.where(workstream_templates.c.enabled == 1)
-            rows = conn.execute(q).fetchall()
-            return [_row_to_dict(r, "auto_approve", "enabled") for r in rows]
-
-    def update_ws_template(self, ws_template_id: str, changed_by: str = "", **fields: Any) -> bool:
-        with self._engine.connect() as conn:
-            # Snapshot current state before updating
-            current = conn.execute(
-                sa.select(workstream_templates).where(
-                    workstream_templates.c.ws_template_id == ws_template_id
-                )
-            ).fetchone()
-            if not current:
-                return False
-            cur = _row_to_dict(current, "auto_approve", "enabled")
-
-            # Filter to allowed fields — skip snapshot if no effective changes
-            dropped = set(fields) - _WS_TEMPLATE_MUTABLE
-            if dropped:
-                log.warning("update_ws_template: ignoring unknown fields: %s", dropped)
-            fields = {k: v for k, v in fields.items() if k in _WS_TEMPLATE_MUTABLE}
-            if not fields:
-                return True  # Nothing to update
-
-            # Create version snapshot
-            now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-            conn.execute(
-                sa.insert(workstream_template_versions),
-                {
-                    "ws_template_id": ws_template_id,
-                    "version": cur["version"],
-                    "snapshot": json.dumps(cur, default=str),
-                    "changed_by": changed_by,
+                    "resource_id": resource_id,
+                    "skill_id": skill_id,
+                    "path": path,
+                    "content": content,
+                    "content_type": content_type,
                     "created": now,
                 },
             )
-
-            fields["updated"] = now
-            fields["version"] = cur["version"] + 1
-            if "auto_approve" in fields:
-                fields["auto_approve"] = int(fields["auto_approve"])
-            if "enabled" in fields:
-                fields["enabled"] = int(fields["enabled"])
-
-            result = conn.execute(
-                sa.update(workstream_templates)
-                .where(workstream_templates.c.ws_template_id == ws_template_id)
-                .values(**fields)
-            )
             conn.commit()
-            return result.rowcount > 0
 
-    def delete_ws_template(self, ws_template_id: str) -> bool:
+    def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
-            # Cascade-delete versions first
-            conn.execute(
-                sa.delete(workstream_template_versions).where(
-                    workstream_template_versions.c.ws_template_id == ws_template_id
-                )
-            )
+            rows = conn.execute(
+                sa.select(skill_resources)
+                .where(skill_resources.c.skill_id == skill_id)
+                .order_by(skill_resources.c.path)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_skill_resource(self, skill_id: str, path: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(skill_resources)
+                .where(skill_resources.c.skill_id == skill_id)
+                .where(skill_resources.c.path == path)
+            ).fetchone()
+            if row:
+                return dict(row._mapping)
+            return None
+
+    def delete_skill_resources(self, skill_id: str) -> int:
+        with self._engine.connect() as conn:
             result = conn.execute(
-                sa.delete(workstream_templates).where(
-                    workstream_templates.c.ws_template_id == ws_template_id
-                )
+                sa.delete(skill_resources).where(skill_resources.c.skill_id == skill_id)
             )
             conn.commit()
-            return result.rowcount > 0
+            return result.rowcount
 
-    def create_ws_template_version(
+    # -- Skill versions --------------------------------------------------------
+
+    def create_skill_version(
         self,
-        ws_template_id: str,
+        skill_id: str,
         version: int,
         snapshot: str,
         changed_by: str = "",
@@ -1788,9 +1751,9 @@ class SQLiteBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             conn.execute(
-                sa.insert(workstream_template_versions),
+                sa.insert(skill_versions),
                 {
-                    "ws_template_id": ws_template_id,
+                    "skill_id": skill_id,
                     "version": version,
                     "snapshot": snapshot,
                     "changed_by": changed_by,
@@ -1799,14 +1762,22 @@ class SQLiteBackend:
             )
             conn.commit()
 
-    def list_ws_template_versions(self, ws_template_id: str) -> list[dict[str, Any]]:
+    def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
             rows = conn.execute(
-                sa.select(workstream_template_versions)
-                .where(workstream_template_versions.c.ws_template_id == ws_template_id)
-                .order_by(workstream_template_versions.c.version.desc())
+                sa.select(skill_versions)
+                .where(skill_versions.c.skill_id == skill_id)
+                .order_by(skill_versions.c.version.desc())
             ).fetchall()
             return [_row_to_dict(r) for r in rows]
+
+    def delete_skill_versions(self, skill_id: str) -> int:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(skill_versions).where(skill_versions.c.skill_id == skill_id)
+            )
+            conn.commit()
+            return result.rowcount
 
     # -- Usage events ----------------------------------------------------------
 

@@ -812,7 +812,7 @@ the `initialize` handshake. Each prompt is stored with its prefixed name
 | `name`      | string | yes      | The prompt name (e.g. `mcp__server__prompt_name`). |
 | `arguments` | object | no       | Key-value argument pairs for the prompt. Values must be strings. |
 
-- **What it does**: Invokes an MCP prompt template by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
+- **What it does**: Invokes an MCP prompt by name via `MCPClientManager.get_prompt_sync()`, expanding it into messages. Returns the expanded prompt content formatted as `[role]: content` blocks joined with blank lines. The prompt catalog is listed in the system message so the model knows which prompts are available. Output is truncated by the standard tool output limiter.
 - **Auto-approve**: No -- requires user confirmation (invokes external prompt servers).
 - **Agent availability**: `agent` and `task_agent`.
 
@@ -825,18 +825,18 @@ built-in tool exposes this to the model as a function call.
 ### Governance Sync
 
 Discovered MCP prompts are automatically synced into the `prompt_templates`
-governance table as first-class governed templates:
+table (which stores skills) as first-class governed skills:
 
-- **Origin tracking**: MCP-sourced templates have `origin="mcp"` and
-  `mcp_server` set to the server name. Manual templates have
+- **Origin tracking**: MCP-sourced skills have `origin="mcp"` and
+  `mcp_server` set to the server name. Manual skills have
   `origin="manual"`.
-- **Read-only**: MCP-sourced templates are `readonly=True`. The admin API
+- **Read-only**: MCP-sourced skills are `readonly=True`. The admin API
   returns 403 on update/delete attempts. The admin UI disables edit/delete
   buttons and shows an origin badge.
-- **Precedence**: If a manual template and MCP prompt share the same name,
-  the manual template wins and the MCP prompt is skipped (with a log
+- **Precedence**: If a manual skill and MCP prompt share the same name,
+  the manual skill wins and the MCP prompt is skipped (with a log
   warning).
-- **Lifecycle**: Templates are created on connect, updated on prompt list
+- **Lifecycle**: Skills are created on connect, updated on prompt list
   refresh, and removed when the MCP server no longer exposes the prompt.
   The sync runs automatically on connect, on `PromptListChangedNotification`,
   and on manual `/mcp refresh`.

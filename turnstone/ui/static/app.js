@@ -403,15 +403,15 @@ function showNewWsModal() {
   modelInput.placeholder = curModel || "Default model";
   modelInput.value = "";
 
-  // Populate template dropdown
-  var tplSelect = document.getElementById("new-ws-template");
+  // Populate skill dropdown
+  var tplSelect = document.getElementById("new-ws-skill");
   tplSelect.innerHTML = '<option value="">Use defaults</option>';
-  authFetch("/v1/api/templates")
+  authFetch("/v1/api/skills")
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      (data.templates || []).forEach(function (t) {
+      (data.skills || []).forEach(function (t) {
         var opt = document.createElement("option");
         opt.value = t.name;
         var label = t.name;
@@ -423,27 +423,6 @@ function showNewWsModal() {
     })
     .catch(function () {
       /* ignore — defaults still work */
-    });
-
-  // Populate profile (WS template) dropdown
-  var profSelect = document.getElementById("new-ws-profile");
-  profSelect.innerHTML = '<option value="">None</option>';
-  authFetch("/v1/api/ws-templates")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.ws_templates || []).forEach(function (t) {
-        var opt = document.createElement("option");
-        opt.value = t.name;
-        var label = t.name;
-        if (t.model) label += " (" + t.model + ")";
-        opt.textContent = label;
-        profSelect.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore — profiles optional */
     });
 
   // Reset form
@@ -520,12 +499,10 @@ function submitNewWs() {
   var body = {};
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
-  var template = document.getElementById("new-ws-template").value;
-  var profile = document.getElementById("new-ws-profile").value;
+  var skill = document.getElementById("new-ws-skill").value;
   if (name) body.name = name;
   if (model) body.model = model;
-  if (template) body.template = template;
-  if (profile) body.ws_template = profile;
+  if (skill) body.skill = skill;
 
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";

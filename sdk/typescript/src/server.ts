@@ -11,9 +11,8 @@ import type {
   HealthResponse,
   ListMemoriesOptions,
   ListMemoriesResponse,
-  ListPromptTemplateSummaryResponse,
   ListSavedWorkstreamsResponse,
-  ListWsTemplateSummaryResponse,
+  SkillSummary,
   ListWorkstreamsResponse,
   MemoryInfo,
   SaveMemoryRequest,
@@ -198,14 +197,14 @@ export class TurnstoneServer extends BaseClient {
     return this.request("GET", "/v1/api/workstreams/saved");
   }
 
-  // -- Templates --------------------------------------------------------------
+  // -- Skills -----------------------------------------------------------------
 
-  async listTemplates(): Promise<ListPromptTemplateSummaryResponse> {
-    return this.request("GET", "/v1/api/templates");
-  }
-
-  async listWsTemplates(): Promise<ListWsTemplateSummaryResponse> {
-    return this.request("GET", "/v1/api/ws-templates");
+  async listSkills(): Promise<SkillSummary[]> {
+    const resp = await this.request<{ skills: SkillSummary[] }>(
+      "GET",
+      "/v1/api/skills",
+    );
+    return resp.skills;
   }
 
   // -- Memories -------------------------------------------------------------

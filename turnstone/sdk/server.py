@@ -16,7 +16,6 @@ import asyncio
 import contextlib
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.console_schemas import ListWsTemplateSummaryResponse
 from turnstone.api.schemas import (
     AuthLoginResponse,
     AuthSetupResponse,
@@ -28,8 +27,8 @@ from turnstone.api.server_schemas import (
     DashboardResponse,
     HealthResponse,
     ListMemoriesResponse,
-    ListPromptTemplateSummaryResponse,
     ListSavedWorkstreamsResponse,
+    ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
     SendResponse,
@@ -81,8 +80,7 @@ class AsyncTurnstoneServer(_BaseClient):
         model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -93,10 +91,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["auto_approve"] = True
         if resume_ws:
             body["resume_ws"] = resume_ws
-        if template:
-            body["template"] = template
-        if ws_template:
-            body["ws_template"] = ws_template
+        if skill:
+            body["skill"] = skill
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -239,17 +235,10 @@ class AsyncTurnstoneServer(_BaseClient):
             "GET", "/v1/api/workstreams/saved", response_model=ListSavedWorkstreamsResponse
         )
 
-    # -- templates -----------------------------------------------------------
+    # -- skills --------------------------------------------------------------
 
-    async def list_templates(self) -> ListPromptTemplateSummaryResponse:
-        return await self._request(
-            "GET", "/v1/api/templates", response_model=ListPromptTemplateSummaryResponse
-        )
-
-    async def list_ws_templates(self) -> ListWsTemplateSummaryResponse:
-        return await self._request(
-            "GET", "/v1/api/ws-templates", response_model=ListWsTemplateSummaryResponse
-        )
+    async def list_skills(self) -> ListSkillSummaryResponse:
+        return await self._request("GET", "/v1/api/skills", response_model=ListSkillSummaryResponse)
 
     # -- memories ------------------------------------------------------------
 
@@ -425,8 +414,7 @@ class TurnstoneServer:
         model: str = "",
         auto_approve: bool = False,
         resume_ws: str = "",
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -434,8 +422,7 @@ class TurnstoneServer:
                 model=model,
                 auto_approve=auto_approve,
                 resume_ws=resume_ws,
-                template=template,
-                ws_template=ws_template,
+                skill=skill,
             )
         )
 
@@ -495,13 +482,10 @@ class TurnstoneServer:
     def list_saved_workstreams(self) -> ListSavedWorkstreamsResponse:
         return self._runner.run(self._async.list_saved_workstreams())
 
-    # -- templates -----------------------------------------------------------
+    # -- skills --------------------------------------------------------------
 
-    def list_templates(self) -> ListPromptTemplateSummaryResponse:
-        return self._runner.run(self._async.list_templates())
-
-    def list_ws_templates(self) -> ListWsTemplateSummaryResponse:
-        return self._runner.run(self._async.list_ws_templates())
+    def list_skills(self) -> ListSkillSummaryResponse:
+        return self._runner.run(self._async.list_skills())
 
     # -- memories ------------------------------------------------------------
 

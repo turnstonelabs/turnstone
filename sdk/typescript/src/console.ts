@@ -20,8 +20,7 @@ import type {
   CreatePolicyOptions,
   CreateRoleOptions,
   CreateScheduleRequest,
-  CreateTemplateOptions,
-  CreateWsTemplateOptions,
+  CreateSkillRequest,
   ImportMcpConfigResponse,
   ListAdminMemoriesResponse,
   ListMcpServersResponse,
@@ -29,16 +28,17 @@ import type {
   ListSchedulesResponse,
   ListSettingSchemaResponse,
   ListSettingsResponse,
+  ListSkillsResponse,
   McpServerDetail,
   RegistryInstallRequest,
   RegistrySearchResponse,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
-  PromptTemplateInfo,
   RoleInfo,
   ScheduleInfo,
   SettingInfo,
+  SkillInfo,
   StatusResponse,
   ToolPolicyInfo,
   UpdateMcpServerRequest,
@@ -47,14 +47,11 @@ import type {
   UpdateRoleOptions,
   UpdateScheduleRequest,
   UpdateSettingOptions,
-  UpdateTemplateOptions,
-  UpdateWsTemplateOptions,
+  UpdateSkillRequest,
   UsageQueryOptions,
   UsageResponse,
   UserRoleInfo,
   WorkstreamsOptions,
-  WsTemplateInfo,
-  WsTemplateVersionInfo,
 } from "./types.js";
 
 /** Async client for the turnstone console API. */
@@ -267,74 +264,31 @@ export class TurnstoneConsole extends BaseClient {
     return this.request("DELETE", `/v1/api/admin/policies/${policyId}`);
   }
 
-  // -- Governance: Prompt Templates -------------------------------------------
+  // -- Governance: Skills -------------------------------------------------------
 
-  async listTemplates(): Promise<{ templates: PromptTemplateInfo[] }> {
-    return this.request("GET", "/v1/api/admin/templates");
-  }
-
-  async createTemplate(
-    opts: CreateTemplateOptions,
-  ): Promise<PromptTemplateInfo> {
-    return this.request("POST", "/v1/api/admin/templates", { json: opts });
-  }
-
-  async updateTemplate(
-    templateId: string,
-    opts: UpdateTemplateOptions,
-  ): Promise<PromptTemplateInfo> {
-    return this.request("PUT", `/v1/api/admin/templates/${templateId}`, {
-      json: opts,
-    });
-  }
-
-  async deleteTemplate(templateId: string): Promise<StatusResponse> {
-    return this.request("DELETE", `/v1/api/admin/templates/${templateId}`);
-  }
-
-  // -- Governance: Workstream Templates ----------------------------------------
-
-  async listWsTemplates(): Promise<WsTemplateInfo[]> {
-    const data = await this.request<{ ws_templates: WsTemplateInfo[] }>(
+  async listSkills(): Promise<SkillInfo[]> {
+    const resp = await this.request<ListSkillsResponse>(
       "GET",
-      "/v1/api/admin/ws-templates",
+      "/v1/api/admin/skills",
     );
-    return data.ws_templates || [];
+    return resp.skills;
   }
 
-  async createWsTemplate(
-    opts: CreateWsTemplateOptions,
-  ): Promise<WsTemplateInfo> {
-    return this.request("POST", "/v1/api/admin/ws-templates", {
-      json: opts,
+  async createSkill(body: CreateSkillRequest): Promise<SkillInfo> {
+    return this.request("POST", "/v1/api/admin/skills", { json: body });
+  }
+
+  async updateSkill(
+    skillId: string,
+    body: UpdateSkillRequest,
+  ): Promise<SkillInfo> {
+    return this.request("PUT", `/v1/api/admin/skills/${skillId}`, {
+      json: body,
     });
   }
 
-  async getWsTemplate(wsTemplateId: string): Promise<WsTemplateInfo> {
-    return this.request("GET", `/v1/api/admin/ws-templates/${wsTemplateId}`);
-  }
-
-  async updateWsTemplate(
-    wsTemplateId: string,
-    opts: UpdateWsTemplateOptions,
-  ): Promise<WsTemplateInfo> {
-    return this.request("PUT", `/v1/api/admin/ws-templates/${wsTemplateId}`, {
-      json: opts,
-    });
-  }
-
-  async deleteWsTemplate(wsTemplateId: string): Promise<void> {
-    await this.request("DELETE", `/v1/api/admin/ws-templates/${wsTemplateId}`);
-  }
-
-  async listWsTemplateVersions(
-    wsTemplateId: string,
-  ): Promise<WsTemplateVersionInfo[]> {
-    const data = await this.request<{ versions: WsTemplateVersionInfo[] }>(
-      "GET",
-      `/v1/api/admin/ws-templates/${wsTemplateId}/versions`,
-    );
-    return data.versions || [];
+  async deleteSkill(skillId: string): Promise<void> {
+    await this.request("DELETE", `/v1/api/admin/skills/${skillId}`);
   }
 
   // -- Governance: Usage & Audit ----------------------------------------------

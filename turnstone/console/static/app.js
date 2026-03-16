@@ -1260,15 +1260,15 @@ function showNewWsModal() {
     .catch(function () {
       /* ignore — auto is always available */
     });
-  // Populate template dropdown
-  var tplSelect = document.getElementById("new-ws-template");
+  // Populate skill dropdown
+  var tplSelect = document.getElementById("new-ws-skill");
   tplSelect.innerHTML = '<option value="">Use defaults</option>';
-  authFetch("/v1/api/templates")
+  authFetch("/v1/api/skills")
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      (data.templates || []).forEach(function (t) {
+      (data.skills || []).forEach(function (t) {
         var opt = document.createElement("option");
         opt.value = t.name;
         var label = t.name;
@@ -1280,26 +1280,6 @@ function showNewWsModal() {
     })
     .catch(function () {
       /* ignore — defaults still work */
-    });
-  // Populate profile (WS template) dropdown
-  var profSelect = document.getElementById("new-ws-profile");
-  profSelect.innerHTML = '<option value="">None</option>';
-  authFetch("/v1/api/ws-templates")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.ws_templates || []).forEach(function (t) {
-        var opt = document.createElement("option");
-        opt.value = t.name;
-        var label = t.name;
-        if (t.model) label += " (" + t.model + ")";
-        opt.textContent = label;
-        profSelect.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore — profiles optional */
     });
   document.getElementById("new-ws-name").value = "";
   document.getElementById("new-ws-model").value = "";
@@ -1362,7 +1342,7 @@ function submitNewWs() {
   var nodeId = document.getElementById("new-ws-node").value;
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
-  var template = document.getElementById("new-ws-template").value;
+  var skill = document.getElementById("new-ws-skill").value;
   var task = document.getElementById("new-ws-task").value.trim();
   var errEl = document.getElementById("new-ws-error");
   var btn = document.getElementById("new-ws-submit");
@@ -1376,9 +1356,7 @@ function submitNewWs() {
   if (name) body.name = name;
   if (model) body.model = model;
   if (task) body.initial_message = task;
-  if (template) body.template = template;
-  var profile = document.getElementById("new-ws-profile").value;
-  if (profile) body.ws_template = profile;
+  if (skill) body.skill = skill;
 
   authFetch("/v1/api/cluster/workstreams/new", {
     method: "POST",

@@ -20,22 +20,18 @@ from turnstone.console.server import (
     admin_audit,
     admin_create_policy,
     admin_create_role,
-    admin_create_template,
     admin_delete_policy,
     admin_delete_role,
-    admin_delete_template,
     admin_delete_user,
     admin_get_org,
     admin_list_orgs,
     admin_list_policies,
     admin_list_roles,
-    admin_list_templates,
     admin_list_user_roles,
     admin_unassign_role,
     admin_update_org,
     admin_update_policy,
     admin_update_role,
-    admin_update_template,
     admin_usage,
 )
 from turnstone.core.auth import AuthResult
@@ -138,19 +134,6 @@ def client(storage):
                         admin_delete_policy,
                         methods=["DELETE"],
                     ),
-                    # Templates
-                    Route("/api/admin/templates", admin_list_templates),
-                    Route("/api/admin/templates", admin_create_template, methods=["POST"]),
-                    Route(
-                        "/api/admin/templates/{template_id}",
-                        admin_update_template,
-                        methods=["PUT"],
-                    ),
-                    Route(
-                        "/api/admin/templates/{template_id}",
-                        admin_delete_template,
-                        methods=["DELETE"],
-                    ),
                     # Usage & Audit
                     Route("/api/admin/usage", admin_usage),
                     Route("/api/admin/audit", admin_audit),
@@ -184,16 +167,6 @@ def _policy_payload(**overrides: Any) -> dict[str, Any]:
         "tool_pattern": "bash_*",
         "action": "allow",
         "priority": 10,
-    }
-    defaults.update(overrides)
-    return defaults
-
-
-def _template_payload(**overrides: Any) -> dict[str, Any]:
-    defaults: dict[str, Any] = {
-        "name": "Greeting",
-        "content": "Hello {{user}}, how can I help?",
-        "category": "system",
     }
     defaults.update(overrides)
     return defaults
@@ -519,89 +492,6 @@ class TestPolicies:
 
     def test_delete_policy_not_found(self, client):
         resp = client.delete("/v1/api/admin/policies/nonexistent")
-        assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Tests — Prompt templates
-# ---------------------------------------------------------------------------
-
-
-class TestTemplates:
-    def test_list_empty(self, client):
-        resp = client.get("/v1/api/admin/templates")
-        assert resp.status_code == 200
-        assert resp.json()["templates"] == []
-
-    def test_create_template(self, client):
-        resp = client.post("/v1/api/admin/templates", json=_template_payload())
-        assert resp.status_code == 200
-        tmpl = resp.json()
-        assert tmpl["name"] == "Greeting"
-        assert "{{user}}" in tmpl["content"]
-        assert tmpl["category"] == "system"
-        assert "template_id" in tmpl
-        assert "created" in tmpl
-
-    def test_create_template_missing_name(self, client):
-        resp = client.post(
-            "/v1/api/admin/templates",
-            json=_template_payload(name=""),
-        )
-        assert resp.status_code == 400
-        assert "name" in resp.json()["error"].lower()
-
-    def test_create_template_missing_content(self, client):
-        resp = client.post(
-            "/v1/api/admin/templates",
-            json=_template_payload(content=""),
-        )
-        assert resp.status_code == 400
-        assert "content" in resp.json()["error"].lower()
-
-    def test_list_after_create(self, client):
-        client.post("/v1/api/admin/templates", json=_template_payload())
-        resp = client.get("/v1/api/admin/templates")
-        assert resp.status_code == 200
-        templates = resp.json()["templates"]
-        assert len(templates) == 1
-        assert templates[0]["name"] == "Greeting"
-
-    def test_update_template(self, client):
-        create_resp = client.post("/v1/api/admin/templates", json=_template_payload())
-        template_id = create_resp.json()["template_id"]
-
-        resp = client.put(
-            f"/v1/api/admin/templates/{template_id}",
-            json={"name": "Welcome", "content": "Welcome, {{user}}!", "is_default": True},
-        )
-        assert resp.status_code == 200
-        tmpl = resp.json()
-        assert tmpl["name"] == "Welcome"
-        assert tmpl["content"] == "Welcome, {{user}}!"
-        assert tmpl["is_default"] is True
-
-    def test_update_template_not_found(self, client):
-        resp = client.put(
-            "/v1/api/admin/templates/nonexistent",
-            json={"name": "Nope"},
-        )
-        assert resp.status_code == 404
-
-    def test_delete_template(self, client):
-        create_resp = client.post("/v1/api/admin/templates", json=_template_payload())
-        template_id = create_resp.json()["template_id"]
-
-        resp = client.delete(f"/v1/api/admin/templates/{template_id}")
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
-
-        # Verify gone
-        list_resp = client.get("/v1/api/admin/templates")
-        assert list_resp.json()["templates"] == []
-
-    def test_delete_template_not_found(self, client):
-        resp = client.delete("/v1/api/admin/templates/nonexistent")
         assert resp.status_code == 404
 
 

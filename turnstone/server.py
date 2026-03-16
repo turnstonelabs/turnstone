@@ -912,41 +912,38 @@ async def list_saved_workstreams(request: Request) -> JSONResponse:
     return JSONResponse({"workstreams": result})
 
 
-async def list_templates_summary(request: Request) -> JSONResponse:
-    """GET /v1/api/templates — list available prompt templates (read scope)."""
+async def list_skills_summary(request: Request) -> JSONResponse:
+    """GET /v1/api/skills — list available skills (summary)."""
+    import json as _json
+
     from turnstone.core.storage._registry import get_storage
 
     try:
         storage = get_storage()
     except Exception:
         return JSONResponse({"error": "Storage not available"}, status_code=503)
-    templates = storage.list_prompt_templates()
-    summaries = [
-        {
-            "name": t["name"],
-            "category": t.get("category", ""),
-            "is_default": bool(t.get("is_default")),
-            "origin": t.get("origin", "manual"),
-        }
-        for t in templates
-    ]
-    return JSONResponse({"templates": summaries})
-
-
-async def list_ws_templates_summary(request: Request) -> JSONResponse:
-    """GET /v1/api/ws-templates — enabled workstream templates summary (read scope)."""
-    from turnstone.core.storage._registry import get_storage
-
-    try:
-        storage = get_storage()
-    except Exception:
-        return JSONResponse({"error": "Storage not available"}, status_code=503)
-    templates = storage.list_ws_templates(enabled_only=True)
-    summaries = [
-        {"name": t["name"], "description": t.get("description", ""), "model": t.get("model", "")}
-        for t in templates
-    ]
-    return JSONResponse({"ws_templates": summaries})
+    rows = storage.list_prompt_templates()
+    skills = []
+    for r in rows:
+        if not r.get("enabled", True):
+            continue
+        tags: list[str] = []
+        with contextlib.suppress(ValueError, TypeError):
+            tags = _json.loads(r.get("tags", "[]"))
+        skills.append(
+            {
+                "name": r["name"],
+                "category": r.get("category", ""),
+                "description": r.get("description", ""),
+                "tags": tags,
+                "is_default": r.get("is_default", False),
+                "activation": r.get("activation", "named"),
+                "origin": r.get("origin", "manual"),
+                "author": r.get("author", ""),
+                "version": r.get("version", "1.0.0"),
+            }
+        )
+    return JSONResponse({"skills": skills})
 
 
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
@@ -1230,43 +1227,33 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
-    body_template = body.get("template", "")
-    # Resolve workstream template before creation (model override flows through)
-    ws_template_name = body.get("ws_template", "")
-    ws_tpl: dict[str, Any] | None = None
-    if ws_template_name:
-        from turnstone.core.memory import get_ws_template_by_name
+    body_skill = body.get("skill", "")
+    # Resolve skill — applies content + session config (model, temperature, etc.)
+    skill_data: dict[str, Any] | None = None
+    if body_skill:
+        from turnstone.core.memory import get_skill_by_name
 
-        ws_tpl = get_ws_template_by_name(ws_template_name)
-        if not ws_tpl or not ws_tpl.get("enabled"):
+        skill_data = get_skill_by_name(body_skill)
+        if not skill_data or not skill_data.get("enabled", False):
             return JSONResponse(
-                {"error": f"Workstream template not found or disabled: {ws_template_name}"},
+                {"error": f"Skill not found or disabled: {body_skill}"},
                 status_code=400,
             )
     resolved_model = body.get("model") or None
-    if ws_tpl and ws_tpl.get("model"):
-        resolved_model = ws_tpl["model"]
-    # Pre-validate prompt template before creating the workstream.
-    # This avoids the create-then-rollback pattern when template is invalid.
-    # Skip when resuming — resumed workstreams restore their own template
-    # from workstream_config, so the request's template is irrelevant.
-    ws_tpl_overrides_prompt = bool(
-        ws_tpl and (ws_tpl["system_prompt"] or ws_tpl["prompt_template"])
-    )
+    if skill_data and skill_data.get("model"):
+        resolved_model = skill_data["model"]
     resume_ws_id = body.get("resume_ws", "")
-    resolved_template: str | None = None
-    if body_template and not ws_tpl_overrides_prompt and not resume_ws_id:
-        from turnstone.core.memory import get_prompt_template_by_name
-
-        if not get_prompt_template_by_name(body_template):
-            return JSONResponse({"error": f"Template not found: {body_template}"}, status_code=400)
-        resolved_template = body_template
+    resolved_skill: str | None = None
+    if body_skill and not resume_ws_id:
+        resolved_skill = body_skill
     try:
         ws = mgr.create(
             name=body.get("name", ""),
             ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
             model=resolved_model,
-            template=resolved_template,
+            skill=resolved_skill,
+            skill_id=skill_data["template_id"] if skill_data else "",
+            skill_version=1 if skill_data else 0,
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -1308,60 +1295,41 @@ async def create_workstream(request: Request) -> JSONResponse:
                     if history:
                         ui._enqueue({"type": "history", "messages": history})
 
-        # Apply workstream template settings (only for new workstreams)
-        if ws_tpl and not resumed and ws.session:
+        # Apply skill session config (only for new workstreams with a skill)
+        if skill_data and not resumed and ws.session:
             sess = ws.session
-            # System prompt: inline takes precedence over prompt_template ref
-            if ws_tpl["system_prompt"]:
-                sess._template_content = ws_tpl["system_prompt"]
-                sess._template_name = None
-                sess._ws_template_system_prompt = ws_tpl["system_prompt"]
-                sess._init_system_messages()
-            elif ws_tpl["prompt_template"]:
-                sess.set_template(ws_tpl["prompt_template"])
-                # Check for prompt template content drift
-                if ws_tpl.get("prompt_template_hash"):
-                    import hashlib
-
-                    from turnstone.core.memory import get_prompt_template_by_name
-
-                    pt = get_prompt_template_by_name(ws_tpl["prompt_template"])
-                    if pt:
-                        current_hash = hashlib.sha256(pt.get("content", "").encode()).hexdigest()
-                        if current_hash != ws_tpl["prompt_template_hash"]:
-                            log.warning(
-                                "Prompt template '%s' content has changed since "
-                                "WS template '%s' was last updated",
-                                ws_tpl["prompt_template"],
-                                ws_tpl["name"],
-                            )
-            # Session settings
-            if ws_tpl.get("temperature") is not None:
-                sess.temperature = ws_tpl["temperature"]
-            if ws_tpl["reasoning_effort"]:
-                sess.reasoning_effort = ws_tpl["reasoning_effort"]
-            if ws_tpl.get("max_tokens") is not None:
-                sess.max_tokens = ws_tpl["max_tokens"]
-            if ws_tpl["token_budget"] > 0:
-                sess._token_budget = ws_tpl["token_budget"]
-            if ws_tpl.get("agent_max_turns") is not None:
-                sess.agent_max_turns = ws_tpl["agent_max_turns"]
+            # Session settings from skill
+            if skill_data.get("temperature") is not None:
+                sess.temperature = skill_data["temperature"]
+            if skill_data.get("reasoning_effort"):
+                sess.reasoning_effort = skill_data["reasoning_effort"]
+            if skill_data.get("max_tokens") is not None:
+                sess.max_tokens = skill_data["max_tokens"]
+            if skill_data.get("token_budget", 0) > 0:
+                sess._token_budget = skill_data["token_budget"]
+            if skill_data.get("agent_max_turns") is not None:
+                sess.agent_max_turns = skill_data["agent_max_turns"]
             # Approval policy
-            if ws_tpl["auto_approve"]:
+            if skill_data.get("auto_approve"):
                 ws.ui.auto_approve = True
-            if ws_tpl["auto_approve_tools"]:
-                ws.ui.auto_approve_tools = {
-                    t.strip() for t in ws_tpl["auto_approve_tools"].split(",") if t.strip()
-                }
-            # Metadata
-            sess._notify_on_complete = ws_tpl.get("notify_on_complete", "{}")
-            sess._ws_template_id = ws_tpl["ws_template_id"]
-            sess._ws_template_version = ws_tpl["version"]
-            sess._save_config()
-            # Persist template lineage on the workstreams row
-            from turnstone.core.memory import update_workstream_template
+            allowed = skill_data.get("allowed_tools", "")
+            if allowed and allowed != "[]":
+                # Parse as JSON array or comma-separated
+                import json as _json
 
-            update_workstream_template(ws.id, ws_tpl["ws_template_id"], ws_tpl["version"])
+                try:
+                    tools_list = _json.loads(allowed)
+                except (ValueError, TypeError):
+                    tools_list = [t.strip() for t in allowed.split(",") if t.strip()]
+                if tools_list:
+                    ws.ui.auto_approve_tools = set(tools_list)
+            # Metadata
+            sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
+            sess._applied_skill_id = skill_data["template_id"]
+            sess._applied_skill_version = 0
+            if skill_data.get("content"):
+                sess._applied_skill_content = skill_data["content"]
+            sess._save_config()
 
         return JSONResponse(
             {
@@ -1883,8 +1851,7 @@ def create_app(
                     Route("/api/workstreams", list_workstreams),
                     Route("/api/dashboard", dashboard),
                     Route("/api/workstreams/saved", list_saved_workstreams),
-                    Route("/api/templates", list_templates_summary),
-                    Route("/api/ws-templates", list_ws_templates_summary),
+                    Route("/api/skills", list_skills_summary),
                     Route("/api/send", send_message, methods=["POST"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
@@ -1980,9 +1947,9 @@ def main() -> None:
         help="Model name (default: auto-detect from server)",
     )
     parser.add_argument(
-        "--template",
+        "--skill",
         default=None,
-        help="Prompt template name (replaces default templates)",
+        help="Skill name (replaces default skills)",
     )
     parser.add_argument(
         "--provider",
@@ -2207,7 +2174,7 @@ def main() -> None:
         model_alias: str | None = None,
         ws_id: str | None = None,
         *,
-        template: str | None = None,
+        skill: str | None = None,
     ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
@@ -2240,7 +2207,7 @@ def main() -> None:
             tool_search=config_store.get("tools.search"),
             tool_search_threshold=config_store.get("tools.search_threshold"),
             tool_search_max_results=config_store.get("tools.search_max_results"),
-            template=template if template is not None else args.template,
+            skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,
             memory_config=live_memory_config,

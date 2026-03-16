@@ -26,24 +26,19 @@ from turnstone.api.console_schemas import (
     ListAuditEventsResponse,
     ListMcpServersResponse,
     ListOrgsResponse,
-    ListPromptTemplatesResponse,
     ListRolesResponse,
     ListSettingSchemaResponse,
     ListSettingsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
-    ListWsTemplatesResponse,
-    ListWsTemplateVersionsResponse,
     McpServerDetail,
     NodeDetailResponse,
     OrgInfo,
-    PromptTemplateInfo,
     RegistrySearchResponse,
     RoleInfo,
     SettingInfo,
     ToolPolicyInfo,
     UsageResponse,
-    WsTemplateInfo,
 )
 from turnstone.api.schemas import (
     AuthLoginResponse,
@@ -138,8 +133,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         name: str = "",
         model: str = "",
         initial_message: str = "",
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
         if node_id:
@@ -150,10 +144,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["model"] = model
         if initial_message:
             body["initial_message"] = initial_message
-        if template:
-            body["template"] = template
-        if ws_template:
-            body["ws_template"] = ws_template
+        if skill:
+            body["skill"] = skill
         return await self._request(
             "POST",
             "/v1/api/cluster/workstreams/new",
@@ -433,101 +425,31 @@ class AsyncTurnstoneConsole(_BaseClient):
             "DELETE", f"/v1/api/admin/policies/{policy_id}", response_model=StatusResponse
         )
 
-    # -- governance: prompt templates ----------------------------------------
+    # -- governance: skills --------------------------------------------------
 
-    async def list_templates(self) -> ListPromptTemplatesResponse:
-        """List prompt templates."""
+    async def list_skills(self) -> list[dict[str, Any]]:
+        """List all skills."""
+        resp = await self._request("GET", "/v1/api/admin/skills")
+        skills: list[dict[str, Any]] = resp.get("skills", [])
+        return skills
+
+    async def create_skill(self, name: str, content: str, **kwargs: Any) -> dict[str, Any]:
+        """Create a skill."""
+        body: dict[str, Any] = {"name": name, "content": content, **kwargs}
+        return await self._request("POST", "/v1/api/admin/skills", json_body=body)
+
+    async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+        """Get a skill by ID."""
+        return await self._request("GET", f"/v1/api/admin/skills/{skill_id}")
+
+    async def update_skill(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Update a skill."""
+        return await self._request("PUT", f"/v1/api/admin/skills/{skill_id}", json_body=kwargs)
+
+    async def delete_skill(self, skill_id: str) -> StatusResponse:
+        """Delete a skill."""
         return await self._request(
-            "GET", "/v1/api/admin/templates", response_model=ListPromptTemplatesResponse
-        )
-
-    async def create_template(
-        self,
-        name: str,
-        content: str,
-        category: str = "general",
-        variables: str = "[]",
-        is_default: bool = False,
-        **kwargs: Any,
-    ) -> PromptTemplateInfo:
-        """Create a prompt template."""
-        body: dict[str, Any] = {
-            "name": name,
-            "content": content,
-            "category": category,
-            "variables": variables,
-            "is_default": is_default,
-            **kwargs,
-        }
-        return await self._request(
-            "POST", "/v1/api/admin/templates", json_body=body, response_model=PromptTemplateInfo
-        )
-
-    async def update_template(self, template_id: str, **fields: Any) -> PromptTemplateInfo:
-        """Update a prompt template."""
-        return await self._request(
-            "PUT",
-            f"/v1/api/admin/templates/{template_id}",
-            json_body=fields,
-            response_model=PromptTemplateInfo,
-        )
-
-    async def delete_template(self, template_id: str) -> StatusResponse:
-        """Delete a prompt template."""
-        return await self._request(
-            "DELETE",
-            f"/v1/api/admin/templates/{template_id}",
-            response_model=StatusResponse,
-        )
-
-    # -- governance: workstream templates ------------------------------------
-
-    async def list_ws_templates(self) -> ListWsTemplatesResponse:
-        """List all workstream templates."""
-        return await self._request(
-            "GET", "/v1/api/admin/ws-templates", response_model=ListWsTemplatesResponse
-        )
-
-    async def create_ws_template(self, name: str, **kwargs: Any) -> WsTemplateInfo:
-        """Create a workstream template."""
-        payload: dict[str, Any] = {"name": name, **kwargs}
-        return await self._request(
-            "POST", "/v1/api/admin/ws-templates", json_body=payload, response_model=WsTemplateInfo
-        )
-
-    async def get_ws_template(self, ws_template_id: str) -> WsTemplateInfo:
-        """Get a workstream template by ID."""
-        return await self._request(
-            "GET",
-            f"/v1/api/admin/ws-templates/{ws_template_id}",
-            response_model=WsTemplateInfo,
-        )
-
-    async def update_ws_template(self, ws_template_id: str, **kwargs: Any) -> WsTemplateInfo:
-        """Update a workstream template."""
-        return await self._request(
-            "PUT",
-            f"/v1/api/admin/ws-templates/{ws_template_id}",
-            json_body=kwargs,
-            response_model=WsTemplateInfo,
-        )
-
-    async def delete_ws_template(self, ws_template_id: str) -> StatusResponse:
-        """Delete a workstream template."""
-        return await self._request(
-            "DELETE",
-            f"/v1/api/admin/ws-templates/{ws_template_id}",
-            response_model=StatusResponse,
-        )
-
-    async def list_ws_template_versions(
-        self, ws_template_id: str
-    ) -> ListWsTemplateVersionsResponse:
-        """List version history for a workstream template."""
-        return await self._request(
-            "GET",
-            f"/v1/api/admin/ws-templates/{ws_template_id}/versions",
-            response_model=ListWsTemplateVersionsResponse,
+            "DELETE", f"/v1/api/admin/skills/{skill_id}", response_model=StatusResponse
         )
 
     # -- governance: usage & audit -------------------------------------------
@@ -883,8 +805,7 @@ class TurnstoneConsole:
         name: str = "",
         model: str = "",
         initial_message: str = "",
-        template: str = "",
-        ws_template: str = "",
+        skill: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -892,8 +813,7 @@ class TurnstoneConsole:
                 name=name,
                 model=model,
                 initial_message=initial_message,
-                template=template,
-                ws_template=ws_template,
+                skill=skill,
             )
         )
 
@@ -1060,56 +980,22 @@ class TurnstoneConsole:
     def delete_policy(self, policy_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_policy(policy_id))
 
-    # -- governance: prompt templates ----------------------------------------
+    # -- governance: skills --------------------------------------------------
 
-    def list_templates(self) -> ListPromptTemplatesResponse:
-        return self._runner.run(self._async.list_templates())
+    def list_skills(self) -> list[dict[str, Any]]:
+        return self._runner.run(self._async.list_skills())
 
-    def create_template(
-        self,
-        name: str,
-        content: str,
-        category: str = "general",
-        variables: str = "[]",
-        is_default: bool = False,
-        **kwargs: Any,
-    ) -> PromptTemplateInfo:
-        return self._runner.run(
-            self._async.create_template(
-                name,
-                content,
-                category=category,
-                variables=variables,
-                is_default=is_default,
-                **kwargs,
-            )
-        )
+    def create_skill(self, name: str, content: str, **kwargs: Any) -> dict[str, Any]:
+        return self._runner.run(self._async.create_skill(name, content, **kwargs))
 
-    def update_template(self, template_id: str, **fields: Any) -> PromptTemplateInfo:
-        return self._runner.run(self._async.update_template(template_id, **fields))
+    def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+        return self._runner.run(self._async.get_skill(skill_id))
 
-    def delete_template(self, template_id: str) -> StatusResponse:
-        return self._runner.run(self._async.delete_template(template_id))
+    def update_skill(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self._runner.run(self._async.update_skill(skill_id, **kwargs))
 
-    # -- governance: workstream templates ------------------------------------
-
-    def list_ws_templates(self) -> ListWsTemplatesResponse:
-        return self._runner.run(self._async.list_ws_templates())
-
-    def create_ws_template(self, name: str, **kwargs: Any) -> WsTemplateInfo:
-        return self._runner.run(self._async.create_ws_template(name, **kwargs))
-
-    def get_ws_template(self, ws_template_id: str) -> WsTemplateInfo:
-        return self._runner.run(self._async.get_ws_template(ws_template_id))
-
-    def update_ws_template(self, ws_template_id: str, **kwargs: Any) -> WsTemplateInfo:
-        return self._runner.run(self._async.update_ws_template(ws_template_id, **kwargs))
-
-    def delete_ws_template(self, ws_template_id: str) -> StatusResponse:
-        return self._runner.run(self._async.delete_ws_template(ws_template_id))
-
-    def list_ws_template_versions(self, ws_template_id: str) -> ListWsTemplateVersionsResponse:
-        return self._runner.run(self._async.list_ws_template_versions(ws_template_id))
+    def delete_skill(self, skill_id: str) -> StatusResponse:
+        return self._runner.run(self._async.delete_skill(skill_id))
 
     # -- governance: usage & audit -------------------------------------------
 

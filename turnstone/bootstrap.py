@@ -129,7 +129,7 @@ After the stack starts, the first admin user is created via:
 `POST /v1/api/auth/setup` with `{"username", "display_name", "password"}`
 This is a one-time endpoint that only works when zero users exist.
 
-Subsequent governance setup (roles, policies, templates) uses the console admin API \
+Subsequent governance setup (roles, policies, skills) uses the console admin API \
 with the JWT returned from setup.
 
 If OIDC is configured, users can also log in via the "Continue with [Provider]" button on the login page.
@@ -155,8 +155,8 @@ Glob-pattern rules for tool execution. Actions: `allow`, `deny`, `ask`. \
 First match by priority wins. Example: `{"name": "Block bash", "tool_pattern": "bash*", \
 "action": "deny", "priority": 100}`
 
-## Prompt Templates
-Reusable system message templates with `{{variable}}` placeholders. \
+## Skills
+Reusable system message content with `{{variable}}` placeholders. \
 Categories like "engineering", "analysis", etc.
 
 ## Your Task
@@ -181,7 +181,7 @@ DuckDuckGo Search MCP (for cluster — uses `ddgCluster` profile with \
 `MCP_CONFIG=/etc/turnstone/mcp-ddg.json`, no API key needed).
 8. **Generate .env**: Call `write_file` with the complete `.env` content.
 9. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
-user and any roles/policies/templates the user wants.
+user and any roles/policies/skills the user wants.
 10. **Finish**: Call the `finish` tool with a summary of what was configured and the \
 exact commands to run next (e.g., `docker compose --profile production up -d` then `./setup.sh`).
 

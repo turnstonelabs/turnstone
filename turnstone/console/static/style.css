@@ -919,6 +919,16 @@
 
 .admin-col { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-col code { font-family: var(--font-mono); font-size: 11px; color: var(--fg-dim); }
+.admin-col-subtitle {
+  display: block;
+  font-size: 11px;
+  color: var(--fg-dim);
+  font-weight: 400;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* Users grid: USERNAME | NAME | CREATED | ACTIONS */
 #admin-users .admin-colheaders,
@@ -956,6 +966,7 @@
 .scope-write { color: var(--cyan); border-color: rgba(103, 232, 249, 0.2); }
 .scope-approve { color: var(--accent); border-color: var(--accent-dim); }
 .scope-channel { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
+.scope-mcp { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
 
 /* Action buttons */
 .admin-btn-danger {
@@ -1134,6 +1145,35 @@
 .admin-modal textarea { resize: vertical; min-height: 40px; }
 .admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; display: none; }
 
+.admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
+.admin-details[open] { padding-bottom: 12px; }
+.admin-details summary {
+  cursor: pointer;
+  padding: 10px 0;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  list-style: none;
+}
+.admin-details summary::-webkit-details-marker { display: none; }
+.admin-details summary::after {
+  content: "\25B8";
+  font-size: 11px;
+  color: var(--fg-dim);
+  transition: transform 0.15s ease;
+}
+.admin-details[open] summary::after {
+  transform: rotate(90deg);
+}
+.admin-details summary .label-hint { font-weight: 400; }
+.admin-details label:first-of-type { margin-top: 4px; }
+
 .modal-buttons { display: flex; gap: 10px; margin-top: 20px; }
 .modal-cancel {
   flex: 1;
@@ -1174,7 +1214,6 @@
 #create-role-overlay, #edit-role-overlay, #user-roles-overlay,
 #create-policy-overlay, #edit-policy-overlay,
 #create-template-overlay, #edit-template-overlay,
-#create-wst-overlay, #edit-wst-overlay, #wst-history-overlay,
 #memory-detail-overlay,
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay {
   position: fixed;
@@ -1300,15 +1339,10 @@
 /* ==========================================================================
    Governance: Prompt Templates grid
    ========================================================================== */
-#admin-templates .admin-colheaders,
-#admin-templates .admin-row {
+#admin-skills .admin-colheaders,
+#admin-skills .admin-row {
   grid-template-columns: 1.5fr 100px 1fr 140px;
 }
-#admin-ws-templates .admin-colheaders,
-#admin-ws-templates .admin-row {
-  grid-template-columns: 1.5fr 100px 1fr 180px;
-}
-
 /* ==========================================================================
    Governance: Audit grid
    ========================================================================== */
@@ -1589,13 +1623,10 @@
     grid-template-columns: 1fr 70px 50px 100px;
   }
   .admin-col-pstatus, .admin-col-ppriority { display: none; }
-  #admin-templates .admin-colheaders, #admin-templates .admin-row {
+  #admin-skills .admin-colheaders, #admin-skills .admin-row {
     grid-template-columns: 1fr 100px;
   }
   .admin-col-tmcat, .admin-col-tmvars { display: none; }
-  #admin-ws-templates .admin-colheaders, #admin-ws-templates .admin-row {
-    grid-template-columns: 1fr 140px;
-  }
   #admin-audit .admin-colheaders, #admin-audit .admin-row {
     grid-template-columns: 60px 1fr 100px;
   }
@@ -2094,6 +2125,7 @@
   .admin-modal input, .admin-modal select { transition: none; }
   .mcp-status-dot.connecting { animation: none; }
   .oidc-detail-panel, .admin-expand-indicator { transition: none; }
+  .admin-details summary::after { transition: none; }
   .mcp-view-btn, .mcp-reg-card, .mcp-install-btn, .mcp-install-source-label { transition: none; }
   .mcp-registry-search input[type="search"] { transition: none; }
   .mcp-reg-card-repo { transition: none; }

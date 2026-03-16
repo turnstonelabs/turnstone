@@ -1768,10 +1768,10 @@
         }
       }
     },
-    "/v1/api/admin/templates": {
+    "/v1/api/admin/skills": {
       "get": {
-        "summary": "List prompt templates",
-        "operationId": "v1_api_admin_templates_get",
+        "summary": "List skills",
+        "operationId": "v1_api_admin_skills_get",
         "tags": [
           "Admin"
         ],
@@ -1781,7 +1781,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListPromptTemplatesResponse"
+                  "$ref": "#/components/schemas/ListSkillsResponse"
                 }
               }
             }
@@ -1789,8 +1789,8 @@
         }
       },
       "post": {
-        "summary": "Create a prompt template",
-        "operationId": "v1_api_admin_templates_post",
+        "summary": "Create a skill",
+        "operationId": "v1_api_admin_skills_post",
         "tags": [
           "Admin"
         ],
@@ -1799,7 +1799,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/CreatePromptTemplateRequest"
+                "$ref": "#/components/schemas/CreateSkillRequest"
               }
             }
           }
@@ -1810,7 +1810,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PromptTemplateInfo"
+                  "$ref": "#/components/schemas/SkillInfo"
                 }
               }
             }
@@ -1828,176 +1828,16 @@
         }
       }
     },
-    "/v1/api/admin/templates/{template_id}": {
-      "put": {
-        "summary": "Update a prompt template",
-        "operationId": "v1_api_admin_templates_{template_id}_put",
-        "tags": [
-          "Admin"
-        ],
-        "parameters": [
-          {
-            "name": "template_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdatePromptTemplateRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PromptTemplateInfo"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Delete a prompt template",
-        "operationId": "v1_api_admin_templates_{template_id}_delete",
-        "tags": [
-          "Admin"
-        ],
-        "parameters": [
-          {
-            "name": "template_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/api/admin/ws-templates": {
+    "/v1/api/admin/skills/{skill_id}": {
       "get": {
-        "summary": "List workstream templates",
-        "operationId": "v1_api_admin_ws-templates_get",
-        "tags": [
-          "Admin"
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListWsTemplatesResponse"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "summary": "Create a workstream template",
-        "operationId": "v1_api_admin_ws-templates_post",
-        "tags": [
-          "Admin"
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateWsTemplateRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WsTemplateInfo"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Error 400",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Error 409",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/api/admin/ws-templates/{ws_template_id}": {
-      "get": {
-        "summary": "Get a workstream template",
-        "operationId": "v1_api_admin_ws-templates_{ws_template_id}_get",
+        "summary": "Get a skill by ID",
+        "operationId": "v1_api_admin_skills_{skill_id}_get",
         "tags": [
           "Admin"
         ],
         "parameters": [
           {
-            "name": "ws_template_id",
+            "name": "skill_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -2011,7 +1851,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WsTemplateInfo"
+                  "$ref": "#/components/schemas/SkillInfo"
                 }
               }
             }
@@ -2029,14 +1869,14 @@
         }
       },
       "put": {
-        "summary": "Update a workstream template",
-        "operationId": "v1_api_admin_ws-templates_{ws_template_id}_put",
+        "summary": "Update a skill",
+        "operationId": "v1_api_admin_skills_{skill_id}_put",
         "tags": [
           "Admin"
         ],
         "parameters": [
           {
-            "name": "ws_template_id",
+            "name": "skill_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -2049,7 +1889,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/UpdateWsTemplateRequest"
+                "$ref": "#/components/schemas/UpdateSkillRequest"
               }
             }
           }
@@ -2060,23 +1900,13 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/WsTemplateInfo"
+                  "$ref": "#/components/schemas/SkillInfo"
                 }
               }
             }
           },
           "404": {
             "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Error 409",
             "content": {
               "application/json": {
                 "schema": {
@@ -2088,14 +1918,14 @@
         }
       },
       "delete": {
-        "summary": "Delete a workstream template",
-        "operationId": "v1_api_admin_ws-templates_{ws_template_id}_delete",
+        "summary": "Delete a skill",
+        "operationId": "v1_api_admin_skills_{skill_id}_delete",
         "tags": [
           "Admin"
         ],
         "parameters": [
           {
-            "name": "ws_template_id",
+            "name": "skill_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -2105,14 +1935,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
-                }
-              }
-            }
+            "description": "Success"
           },
           "404": {
             "description": "Error 404",
@@ -2127,16 +1950,16 @@
         }
       }
     },
-    "/v1/api/admin/ws-templates/{ws_template_id}/versions": {
+    "/v1/api/admin/skills/{skill_id}/versions": {
       "get": {
-        "summary": "List workstream template version history",
-        "operationId": "v1_api_admin_ws-templates_{ws_template_id}_versions_get",
+        "summary": "List version history for a skill",
+        "operationId": "v1_api_admin_skills_{skill_id}_versions_get",
         "tags": [
           "Admin"
         ],
         "parameters": [
           {
-            "name": "ws_template_id",
+            "name": "skill_id",
             "in": "path",
             "required": true,
             "schema": {
@@ -2150,17 +1973,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListWsTemplateVersionsResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Error 404",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "$ref": "#/components/schemas/ListSkillVersionsResponse"
                 }
               }
             }
@@ -2168,12 +1981,12 @@
         }
       }
     },
-    "/v1/api/ws-templates": {
+    "/v1/api/skills": {
       "get": {
-        "summary": "List enabled workstream templates (summary)",
-        "operationId": "v1_api_ws-templates_get",
+        "summary": "List available skills (summary)",
+        "operationId": "v1_api_skills_get",
         "tags": [
-          "Workstreams"
+          "Skills"
         ],
         "responses": {
           "200": {
@@ -2181,28 +1994,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ListWsTemplateSummaryResponse"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/api/templates": {
-      "get": {
-        "summary": "List available prompt templates (summary)",
-        "operationId": "v1_api_templates_get",
-        "tags": [
-          "Templates"
-        ],
-        "responses": {
-          "200": {
-            "description": "Success",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListPromptTemplateSummaryResponse"
+                  "$ref": "#/components/schemas/ListSkillSummaryResponse"
                 }
               }
             }
@@ -4162,16 +3954,10 @@
             "title": "Initial Message",
             "type": "string"
           },
-          "template": {
+          "skill": {
             "default": "",
-            "description": "Prompt template name (replaces default templates)",
-            "title": "Template",
-            "type": "string"
-          },
-          "ws_template": {
-            "default": "",
-            "description": "Workstream template name (behavioral profile)",
-            "title": "Ws Template",
+            "description": "Skill name (replaces default skills)",
+            "title": "Skill",
             "type": "string"
           }
         },
@@ -4301,16 +4087,10 @@
             "title": "Auto Approve Tools",
             "type": "array"
           },
-          "template": {
+          "skill": {
             "default": "",
-            "description": "Prompt template name",
-            "title": "Template",
-            "type": "string"
-          },
-          "ws_template": {
-            "default": "",
-            "description": "Workstream template name",
-            "title": "Ws Template",
+            "description": "Skill name (replaces default skills)",
+            "title": "Skill",
             "type": "string"
           },
           "enabled": {
@@ -4453,7 +4233,7 @@
             "default": null,
             "title": "Auto Approve Tools"
           },
-          "template": {
+          "skill": {
             "anyOf": [
               {
                 "type": "string"
@@ -4463,19 +4243,7 @@
               }
             ],
             "default": null,
-            "title": "Template"
-          },
-          "ws_template": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Ws Template"
+            "title": "Skill"
           },
           "enabled": {
             "anyOf": [
@@ -4549,14 +4317,9 @@
             "title": "Auto Approve Tools",
             "type": "array"
           },
-          "template": {
+          "skill": {
             "default": "",
-            "title": "Template",
-            "type": "string"
-          },
-          "ws_template": {
-            "default": "",
-            "title": "Ws Template",
+            "title": "Skill",
             "type": "string"
           },
           "enabled": {
@@ -5160,199 +4923,6 @@
           "policies"
         ],
         "title": "ListToolPoliciesResponse",
-        "type": "object"
-      },
-      "PromptTemplateInfo": {
-        "properties": {
-          "template_id": {
-            "title": "Template Id",
-            "type": "string"
-          },
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "category": {
-            "title": "Category",
-            "type": "string"
-          },
-          "content": {
-            "title": "Content",
-            "type": "string"
-          },
-          "variables": {
-            "title": "Variables",
-            "type": "string"
-          },
-          "is_default": {
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "org_id": {
-            "title": "Org Id",
-            "type": "string"
-          },
-          "created_by": {
-            "title": "Created By",
-            "type": "string"
-          },
-          "origin": {
-            "default": "manual",
-            "title": "Origin",
-            "type": "string"
-          },
-          "mcp_server": {
-            "default": "",
-            "title": "Mcp Server",
-            "type": "string"
-          },
-          "readonly": {
-            "default": false,
-            "title": "Readonly",
-            "type": "boolean"
-          },
-          "created": {
-            "title": "Created",
-            "type": "string"
-          },
-          "updated": {
-            "title": "Updated",
-            "type": "string"
-          }
-        },
-        "required": [
-          "template_id",
-          "name",
-          "category",
-          "content",
-          "variables",
-          "is_default",
-          "org_id",
-          "created_by",
-          "created",
-          "updated"
-        ],
-        "title": "PromptTemplateInfo",
-        "type": "object"
-      },
-      "CreatePromptTemplateRequest": {
-        "properties": {
-          "name": {
-            "title": "Name",
-            "type": "string"
-          },
-          "content": {
-            "title": "Content",
-            "type": "string"
-          },
-          "category": {
-            "default": "general",
-            "title": "Category",
-            "type": "string"
-          },
-          "variables": {
-            "default": "[]",
-            "title": "Variables",
-            "type": "string"
-          },
-          "is_default": {
-            "default": false,
-            "title": "Is Default",
-            "type": "boolean"
-          },
-          "org_id": {
-            "default": "",
-            "title": "Org Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "name",
-          "content"
-        ],
-        "title": "CreatePromptTemplateRequest",
-        "type": "object"
-      },
-      "UpdatePromptTemplateRequest": {
-        "properties": {
-          "name": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Name"
-          },
-          "content": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Content"
-          },
-          "category": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Category"
-          },
-          "variables": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Variables"
-          },
-          "is_default": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "default": null,
-            "title": "Is Default"
-          }
-        },
-        "title": "UpdatePromptTemplateRequest",
-        "type": "object"
-      },
-      "ListPromptTemplatesResponse": {
-        "properties": {
-          "templates": {
-            "items": {
-              "$ref": "#/components/schemas/PromptTemplateInfo"
-            },
-            "title": "Templates",
-            "type": "array"
-          }
-        },
-        "required": [
-          "templates"
-        ],
-        "title": "ListPromptTemplatesResponse",
         "type": "object"
       },
       "UsageBreakdownItem": {
@@ -6521,52 +6091,714 @@
         "title": "RegistryInstallRequest",
         "type": "object"
       },
-      "PromptTemplateSummary": {
+      "SkillInfo": {
+        "properties": {
+          "template_id": {
+            "description": "Skill ID",
+            "title": "Template Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "tags": {
+            "default": "[]",
+            "title": "Tags",
+            "type": "string"
+          },
+          "variables": {
+            "default": "[]",
+            "title": "Variables",
+            "type": "string"
+          },
+          "is_default": {
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "activation": {
+            "default": "named",
+            "title": "Activation",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "origin": {
+            "default": "manual",
+            "title": "Origin",
+            "type": "string"
+          },
+          "mcp_server": {
+            "default": "",
+            "title": "Mcp Server",
+            "type": "string"
+          },
+          "readonly": {
+            "default": false,
+            "title": "Readonly",
+            "type": "boolean"
+          },
+          "source_url": {
+            "default": "",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "version": {
+            "default": "1.0.0",
+            "title": "Version",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "title": "Author",
+            "type": "string"
+          },
+          "token_estimate": {
+            "default": 0,
+            "title": "Token Estimate",
+            "type": "integer"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "auto_approve": {
+            "default": false,
+            "title": "Auto Approve",
+            "type": "boolean"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "reasoning_effort": {
+            "default": "",
+            "title": "Reasoning Effort",
+            "type": "string"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "token_budget": {
+            "default": 0,
+            "title": "Token Budget",
+            "type": "integer"
+          },
+          "agent_max_turns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Max Turns"
+          },
+          "notify_on_complete": {
+            "default": "{}",
+            "title": "Notify On Complete",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "allowed_tools": {
+            "default": "[]",
+            "title": "Allowed Tools",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_id",
+          "name",
+          "category",
+          "content",
+          "is_default",
+          "org_id",
+          "created_by",
+          "created",
+          "updated"
+        ],
+        "title": "SkillInfo",
+        "type": "object"
+      },
+      "SkillVersionInfo": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "skill_id": {
+            "title": "Skill Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "snapshot": {
+            "title": "Snapshot",
+            "type": "string"
+          },
+          "changed_by": {
+            "title": "Changed By",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "skill_id",
+          "version",
+          "snapshot",
+          "changed_by",
+          "created"
+        ],
+        "title": "SkillVersionInfo",
+        "type": "object"
+      },
+      "CreateSkillRequest": {
         "properties": {
           "name": {
-            "description": "Template name",
+            "title": "Name",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "category": {
+            "default": "general",
+            "title": "Category",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "tags": {
+            "default": "[]",
+            "title": "Tags",
+            "type": "string"
+          },
+          "variables": {
+            "default": "[]",
+            "title": "Variables",
+            "type": "string"
+          },
+          "is_default": {
+            "default": false,
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "activation": {
+            "default": "named",
+            "title": "Activation",
+            "type": "string"
+          },
+          "org_id": {
+            "default": "",
+            "title": "Org Id",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "title": "Author",
+            "type": "string"
+          },
+          "version": {
+            "default": "1.0.0",
+            "title": "Version",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "auto_approve": {
+            "default": false,
+            "title": "Auto Approve",
+            "type": "boolean"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "reasoning_effort": {
+            "default": "",
+            "title": "Reasoning Effort",
+            "type": "string"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "token_budget": {
+            "default": 0,
+            "title": "Token Budget",
+            "type": "integer"
+          },
+          "agent_max_turns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Max Turns"
+          },
+          "notify_on_complete": {
+            "default": "{}",
+            "title": "Notify On Complete",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "allowed_tools": {
+            "default": "[]",
+            "title": "Allowed Tools",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "content"
+        ],
+        "title": "CreateSkillRequest",
+        "type": "object"
+      },
+      "UpdateSkillRequest": {
+        "properties": {
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Content"
+          },
+          "category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Category"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "tags": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tags"
+          },
+          "variables": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Variables"
+          },
+          "is_default": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Is Default"
+          },
+          "activation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Activation"
+          },
+          "author": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Author"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Version"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model"
+          },
+          "auto_approve": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Auto Approve"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "token_budget": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Token Budget"
+          },
+          "agent_max_turns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent Max Turns"
+          },
+          "notify_on_complete": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Notify On Complete"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Enabled"
+          },
+          "allowed_tools": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Allowed Tools"
+          }
+        },
+        "title": "UpdateSkillRequest",
+        "type": "object"
+      },
+      "ListSkillsResponse": {
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillInfo"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "ListSkillsResponse",
+        "type": "object"
+      },
+      "ListSkillVersionsResponse": {
+        "properties": {
+          "versions": {
+            "items": {
+              "$ref": "#/components/schemas/SkillVersionInfo"
+            },
+            "title": "Versions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "versions"
+        ],
+        "title": "ListSkillVersionsResponse",
+        "type": "object"
+      },
+      "SkillSummary": {
+        "properties": {
+          "name": {
+            "description": "Skill name",
             "title": "Name",
             "type": "string"
           },
           "category": {
             "default": "",
-            "description": "Template category",
+            "description": "Skill category",
             "title": "Category",
             "type": "string"
           },
+          "description": {
+            "default": "",
+            "description": "Skill description for discovery",
+            "title": "Description",
+            "type": "string"
+          },
+          "tags": {
+            "description": "Semantic tags",
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
           "is_default": {
             "default": false,
-            "description": "Whether this template is applied by default",
+            "description": "Whether auto-applied to all sessions",
             "title": "Is Default",
             "type": "boolean"
           },
+          "activation": {
+            "default": "named",
+            "description": "Activation mode: default, named, search",
+            "title": "Activation",
+            "type": "string"
+          },
           "origin": {
             "default": "manual",
-            "description": "Template origin: manual or mcp",
+            "description": "Source: manual, mcp, skills.sh, github",
             "title": "Origin",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "description": "Skill author",
+            "title": "Author",
+            "type": "string"
+          },
+          "version": {
+            "default": "1.0.0",
+            "description": "Skill version",
+            "title": "Version",
             "type": "string"
           }
         },
         "required": [
           "name"
         ],
-        "title": "PromptTemplateSummary",
+        "title": "SkillSummary",
         "type": "object"
       },
-      "ListPromptTemplateSummaryResponse": {
+      "ListSkillSummaryResponse": {
         "properties": {
-          "templates": {
+          "skills": {
             "items": {
-              "$ref": "#/components/schemas/PromptTemplateSummary"
+              "$ref": "#/components/schemas/SkillSummary"
             },
-            "title": "Templates",
+            "title": "Skills",
             "type": "array"
           }
         },
         "required": [
-          "templates"
+          "skills"
         ],
-        "title": "ListPromptTemplateSummaryResponse",
+        "title": "ListSkillSummaryResponse",
         "type": "object"
       }
     }

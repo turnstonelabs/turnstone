@@ -1,8 +1,7 @@
 # Governance
 
 Turnstone governance provides role-based access control (RBAC), tool execution
-policies, prompt templates, usage tracking, and audit logging for the admin
-console.
+policies, skills, usage tracking, and audit logging for the admin console.
 
 ## Architecture
 
@@ -51,59 +50,35 @@ Admin-defined rules that control tool execution:
     `mcp__*` to require approval for all)
   - Built-in tools continue to use `func_name` for backward compatibility
 
-### Prompt Templates
+### Skills
 
-Admin-curated system message templates injected at workstream startup:
+Admin-curated system message skills injected at workstream startup. Skills also
+include session configuration (model, temperature, auto-approve, token budget,
+etc.) since workstream templates were merged into the skills system in v0.8.0.
 
-- **Runtime behavior**: Templates are loaded once at session creation and injected
-  into the system message *before* user `instructions`. Templates set the baseline;
+- **Runtime behavior**: Skills are loaded once at session creation and injected
+  into the system message *before* user `instructions`. Skills set the baseline;
   instructions customize per-workstream behavior.
-- **Default templates**: All `is_default=true` templates auto-apply to new
+- **Default skills**: All `is_default=true` skills auto-apply to new
   workstreams, concatenated in alphabetical order by name. Use name prefixes
   (e.g. `01-safety`, `02-style`) to control ordering.
 - **Explicit selection**: `--template <name>` CLI flag, `template` field on
   `POST /v1/api/workstreams/new`, console creation modal dropdown, scheduled task
-  config, and channel adapter config. An explicit template *replaces* defaults.
+  config, and channel adapter config. An explicit skill *replaces* defaults.
 - **Variables**: Three built-in placeholders resolved at load time:
   `{{model}}` (active model name), `{{ws_id}}` (workstream ID),
   `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
 - **Runtime switching**: `/template <name>` to switch, `/template clear` to revert
   to defaults, `/template` to show current. Persisted across resume.
 - **Categories**: general, engineering, support, custom, mcp
-- **Content limit**: 32 KB per template (enforced on create/update)
-- **Storage**: `prompt_templates` table with JSON `variables` array. Migration 010
-  adds `template` column to `scheduled_tasks`.
-- **MCP sync**: MCP server prompts auto-sync into prompt_templates with
-  `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual templates take
+- **Content limit**: 32 KB per skill (enforced on create/update)
+- **Storage**: `prompt_templates` table (stores skills) with JSON `variables`
+  array. Migration 010 adds `template` column to `scheduled_tasks`.
+- **MCP sync**: MCP server prompts auto-sync into the `prompt_templates` table
+  with `origin="mcp"`, `mcp_server` set, and `readonly=True`. Manual skills take
   precedence on name collision. MCP-synced content updates reset `is_default` to
   prevent compromised servers from injecting defaults. Admin UI shows origin badge
-  and disables edit/delete for MCP-sourced templates.
-
-### Workstream Templates
-
-Workstream templates are behavioral profiles applied at workstream creation — the next level beyond prompt templates. While prompt templates inject system message text, workstream templates define the complete workstream configuration.
-
-**What they define:**
-- System prompt (inline text OR reference to a prompt template by name)
-- Model override (empty = server default)
-- Temperature, reasoning effort, max tokens, agent max turns
-- Auto-approve policy (blanket and/or per-tool list)
-- Token budget (0 = unlimited; warns at 80%, requires approval at 100%)
-- Completion notification config (stored for v2 dispatch)
-
-**Storage:** `workstream_templates` table (migration 011) with auto-versioning. Edits snapshot the pre-update state into `workstream_template_versions`. Workstreams record which template and version spawned them via `ws_template_id` + `ws_template_version` columns.
-
-**Applied once at creation:** Template settings are snapshot-applied to the workstream's config. Not a live binding — template updates don't affect running workstreams.
-
-**Prompt template drift detection:** When a workstream template references a prompt template, a SHA-256 hash of the prompt content is stored at ws_template create/update time. At workstream creation, the server compares the stored hash against current content and logs a warning on mismatch.
-
-**Admin API:** 7 endpoints under `/v1/api/admin/ws-templates` (list, create, get, update, delete, version history) plus a read-only summary at `/v1/api/ws-templates`. Permission: `admin.ws_templates`.
-
-**Console UI:** "WS Templates" tab with CRUD table, create/edit modals (name, description, system prompt source toggle, model, auto-approve, per-tool auto-approve, temperature, reasoning effort, max tokens, agent max turns, token budget, enabled), and version history modal. "Profile" dropdown on workstream creation modal. "WS Template" dropdown on scheduler create/edit modals.
-
-**Token budget enforcement:** Tracked in `session.send()`. At 80% consumption, emits an info message. At 100%, the next turn requires explicit approval via the `__budget_override__` synthetic tool name (reuses existing approval UI — inline in browser, Discord buttons, bridge auto-approve). The synthetic name can be targeted by tool policies (e.g. `__budget_override__` → `allow` for admins).
-
-**SDK:** Python (`list_ws_templates`, `create_ws_template`, `get_ws_template`, `update_ws_template`, `delete_ws_template`, `list_ws_template_versions`) and TypeScript (`listWsTemplates`, `createWsTemplate`, etc.) on both sync and async console clients. `ws_template` parameter on `create_workstream()` for both server and console SDKs.
+  and disables edit/delete for MCP-sourced skills.
 
 ### Usage Tracking
 
@@ -133,7 +108,7 @@ Append-only trail of admin actions:
   channel.link, channel.unlink, role.create, role.update, role.delete,
   role.assign, role.unassign, policy.create, policy.update, policy.delete,
   template.create, template.update, template.delete,
-  ws_template.create, ws_template.update, ws_template.delete, org.update
+  skill.create, skill.update, skill.delete, org.update
 - **Querying**: `GET /v1/api/admin/audit` with action/user/time filters + pagination
 
 ## Database Schema
@@ -146,7 +121,7 @@ Migration 008 adds 7 tables:
 | `roles` | Named permission bundles (3 builtin + custom) |
 | `user_roles` | User-to-role assignments (composite PK) |
 | `tool_policies` | Per-tool approve/deny/ask rules |
-| `prompt_templates` | Reusable system message templates |
+| `prompt_templates` | Reusable system message skills |
 | `usage_events` | Per-request token/tool/cache metrics |
 | `audit_events` | Admin action log |
 
@@ -162,9 +137,8 @@ All under `/v1/api/admin/` (requires `approve` scope + granular permission).
 | Roles | 7 (CRUD + assignment) | `admin.roles` / `admin.users` |
 | Orgs | 3 (list, get, update) | `admin.orgs` |
 | Tool Policies | 4 (CRUD) | `admin.policies` |
-| Prompt Templates | 4 (CRUD) | `admin.templates` |
+| Skills | 4 (CRUD) | `admin.templates` |
 | Schedules | 6 (CRUD + runs) | `admin.schedules` |
-| WS Templates | 7 (CRUD + versions + summary) | `admin.ws_templates` |
 | Watches | 3 (list, create, cancel) | `admin.watches` |
 | Usage | 1 (aggregated query) | `admin.usage` |
 | Audit | 1 (paginated, filtered) | `admin.audit` |
@@ -177,8 +151,7 @@ Full OpenAPI spec at `/openapi.json` and Swagger UI at `/docs`.
 
 - **Roles** — CRUD roles, permission checkbox grid, user role assignment modal
 - **Policies** — CRUD tool policies with colored action badges (green/red/amber)
-- **Templates** — CRUD prompt templates with wide modal, textarea editor
-- **WS Templates** — CRUD workstream templates with create/edit modals, version history
+- **Skills** — CRUD skills with wide modal, textarea editor
 - **Usage** — Summary readouts + CSS bar chart, time range + group-by selectors
 - **Audit** — Filterable log with relative timestamps, load-more pagination
 
@@ -194,7 +167,6 @@ Both Python and TypeScript console SDKs expose governance methods:
 - `list_orgs()`, `get_org()`, `update_org()`
 - `list_policies()`, `create_policy()`, `update_policy()`, `delete_policy()`
 - `list_templates()`, `create_template()`, `update_template()`, `delete_template()`
-- `list_ws_templates()`, `create_ws_template()`, `get_ws_template()`, `update_ws_template()`, `delete_ws_template()`, `list_ws_template_versions()`
 - `get_usage(since, group_by=...)`, `get_audit(action=..., limit=...)`
 
 **TypeScript** (`TurnstoneConsole`):

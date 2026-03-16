@@ -209,18 +209,18 @@ def test_create_workstream_target_node():
     assert restored.name == "debug-ws"
 
 
-def test_create_workstream_template_field():
-    msg = CreateWorkstreamMessage(name="ws", template="code-review")
-    assert msg.template == "code-review"
+def test_create_workstream_skill_field():
+    msg = CreateWorkstreamMessage(name="ws", skill="code-review")
+    assert msg.skill == "code-review"
     raw = msg.to_json()
     restored = InboundMessage.from_json(raw)
     assert isinstance(restored, CreateWorkstreamMessage)
-    assert restored.template == "code-review"
+    assert restored.skill == "code-review"
 
 
-def test_create_workstream_template_default_empty():
+def test_create_workstream_skill_default_empty():
     msg = CreateWorkstreamMessage(name="ws")
-    assert msg.template == ""
+    assert msg.skill == ""
 
 
 def test_list_nodes_round_trip():

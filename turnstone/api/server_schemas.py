@@ -51,12 +51,7 @@ class CreateWorkstreamRequest(BaseModel):
         default="",
         description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
-    template: str = Field(
-        default="", description="Prompt template name (replaces default templates)"
-    )
-    ws_template: str = Field(
-        default="", description="Workstream template name to apply defaults from"
-    )
+    skill: str = Field(default="", description="Skill name (replaces default skills)")
 
 
 class CreateWorkstreamResponse(BaseModel):
@@ -237,18 +232,21 @@ class SearchMemoriesRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Prompt templates (read-only listing)
+# Skills
 # ---------------------------------------------------------------------------
 
 
-class PromptTemplateSummary(BaseModel):
-    name: str = Field(description="Template name")
-    category: str = Field(default="", description="Template category")
-    is_default: bool = Field(
-        default=False, description="Whether this template is applied by default"
-    )
-    origin: str = Field(default="manual", description="Template origin: manual or mcp")
+class SkillSummary(BaseModel):
+    name: str = Field(description="Skill name")
+    category: str = Field(default="", description="Skill category")
+    description: str = Field(default="", description="Skill description for discovery")
+    tags: list[str] = Field(default_factory=list, description="Semantic tags")
+    is_default: bool = Field(default=False, description="Whether auto-applied to all sessions")
+    activation: str = Field(default="named", description="Activation mode: default, named, search")
+    origin: str = Field(default="manual", description="Source: manual, mcp, skills.sh, github")
+    author: str = Field(default="", description="Skill author")
+    version: str = Field(default="1.0.0", description="Skill version")
 
 
-class ListPromptTemplateSummaryResponse(BaseModel):
-    templates: list[PromptTemplateSummary]
+class ListSkillSummaryResponse(BaseModel):
+    skills: list[SkillSummary]

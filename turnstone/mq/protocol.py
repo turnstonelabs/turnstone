@@ -97,8 +97,7 @@ class CreateWorkstreamMessage(InboundMessage):
     initial_message: str = ""
     resume_ws: str = ""
     user_id: str = ""
-    template: str = ""
-    ws_template: str = ""
+    skill: str = ""
 
 
 @dataclass

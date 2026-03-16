@@ -27,7 +27,7 @@ if TYPE_CHECKING:
             model_alias: str | None = ...,
             ws_id: str | None = ...,
             *,
-            template: str | None = ...,
+            skill: str | None = ...,
         ) -> ChatSession: ...
 
 
@@ -83,7 +83,7 @@ class WorkstreamManager:
     ):
         """
         Args:
-            session_factory: callable(ui, model_alias, ws_id, *, template) -> ChatSession.
+            session_factory: callable(ui, model_alias, ws_id, *, skill) -> ChatSession.
                 Captures shared config (registry, temperature, …) so the
                 manager can create ChatSession instances without knowing
                 those details.  *model_alias* selects a model from the
@@ -124,7 +124,9 @@ class WorkstreamManager:
         name: str = "",
         ui_factory: Callable[..., SessionUI] | None = None,
         model: str | None = None,
-        template: str | None = None,
+        skill: str | None = None,
+        skill_id: str = "",
+        skill_version: int = 0,
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
@@ -135,8 +137,9 @@ class WorkstreamManager:
         Args:
             model: Optional model alias from the registry.  ``None`` uses the
                 default model.
-            template: Optional prompt template name passed through to session
-                factory.
+            skill: Optional skill name.
+            skill_id: Template ID of the skill (for lineage tracking).
+            skill_version: Version of the skill at creation time.
         """
         # Fast-fail capacity check (avoids expensive ChatSession creation when full).
         first_evicted: Workstream | None = None
@@ -159,7 +162,7 @@ class WorkstreamManager:
         ws = Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui, model, ws.id, template=template)
+        ws.session = self._session_factory(ws.ui, model, ws.id, skill=skill)
 
         # Authoritative insert under lock with re-check (another thread may
         # have filled capacity while we were unlocked).
@@ -177,7 +180,13 @@ class WorkstreamManager:
         # Persist to storage only after successful insertion
         from turnstone.core.memory import register_workstream
 
-        register_workstream(ws.id, node_id=self._node_id, name=ws.name)
+        register_workstream(
+            ws.id,
+            node_id=self._node_id,
+            name=ws.name,
+            skill_id=skill_id,
+            skill_version=skill_version,
+        )
 
         # Cleanup second-phase eviction outside the lock.
         if second_evicted is not None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.console_schemas import ListWsTemplateSummaryResponse, WsTemplateSummary
 from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
 
 if TYPE_CHECKING:
@@ -29,16 +28,16 @@ from turnstone.api.server_schemas import (
     DashboardResponse,
     HealthResponse,
     ListMemoriesResponse,
-    ListPromptTemplateSummaryResponse,
     ListSavedWorkstreamsResponse,
+    ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
     PlanFeedbackRequest,
-    PromptTemplateSummary,
     SaveMemoryRequest,
     SearchMemoriesRequest,
     SendRequest,
     SendResponse,
+    SkillSummary,
 )
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
@@ -148,21 +147,13 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListSavedWorkstreamsResponse,
         tags=["Workstreams"],
     ),
-    # --- Prompt templates ---
+    # --- Skills ---
     EndpointSpec(
-        "/v1/api/templates",
+        "/v1/api/skills",
         "GET",
-        "List available prompt templates (summary)",
-        response_model=ListPromptTemplateSummaryResponse,
-        tags=["Templates"],
-    ),
-    # --- Workstream templates ---
-    EndpointSpec(
-        "/v1/api/ws-templates",
-        "GET",
-        "List enabled workstream templates (summary)",
-        response_model=ListWsTemplateSummaryResponse,
-        tags=["Templates"],
+        "List available skills (summary)",
+        response_model=ListSkillSummaryResponse,
+        tags=["Skills"],
     ),
     # --- Auth ---
     EndpointSpec(
@@ -300,10 +291,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     MemoryInfo,
     ListMemoriesResponse,
     SearchMemoriesRequest,
-    PromptTemplateSummary,
-    ListPromptTemplateSummaryResponse,
-    WsTemplateSummary,
-    ListWsTemplateSummaryResponse,
+    SkillSummary,
+    ListSkillSummaryResponse,
 ]
 
 
