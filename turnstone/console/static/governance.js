@@ -146,7 +146,7 @@ var _ALL_PERMISSIONS = [
   "admin.roles",
   "admin.orgs",
   "admin.policies",
-  "admin.templates",
+  "admin.skills",
   "admin.audit",
   "admin.usage",
   "admin.schedules",

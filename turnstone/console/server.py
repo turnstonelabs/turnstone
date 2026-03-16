@@ -1593,7 +1593,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.roles",
         "admin.orgs",
         "admin.policies",
-        "admin.templates",
+        "admin.skills",
         "admin.audit",
         "admin.usage",
         "admin.schedules",
@@ -2299,7 +2299,7 @@ async def admin_list_skills(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
     params = dict(request.query_params)
@@ -2319,7 +2319,7 @@ async def admin_get_skill(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
@@ -2342,7 +2342,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
@@ -2441,7 +2441,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
@@ -2539,7 +2539,7 @@ async def admin_delete_skill(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 
@@ -2576,7 +2576,7 @@ async def admin_list_skill_versions(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.templates")
+    err = require_permission(request, "admin.skills")
     if err:
         return err
 

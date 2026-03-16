@@ -232,7 +232,7 @@ services = sa.Table(
 sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)
 
 # ---------------------------------------------------------------------------
-# Governance tables — RBAC, orgs, policies, templates, usage, audit
+# Governance tables — RBAC, orgs, policies, skills, usage, audit
 # ---------------------------------------------------------------------------
 
 orgs = sa.Table(

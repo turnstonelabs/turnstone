@@ -234,6 +234,12 @@ def upgrade() -> None:
         "WHERE permissions = 'admin.ws_templates'"
     )
 
+    # Rename admin.templates permission → admin.skills
+    op.execute(
+        "UPDATE roles SET permissions = REPLACE(permissions, 'admin.templates', 'admin.skills') "
+        "WHERE permissions LIKE '%admin.templates%'"
+    )
+
     # Migrate workstream_config keys: ws_template_* → applied_skill_*
     op.execute("UPDATE workstream_config SET key = 'applied_skill_id' WHERE key = 'ws_template_id'")
     op.execute(

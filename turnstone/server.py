@@ -1228,9 +1228,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
     body_skill = body.get("skill", "")
+    resume_ws_id = body.get("resume_ws", "")
     # Resolve skill — applies content + session config (model, temperature, etc.)
+    # Skip when resuming: the resumed session restores its own skill from config.
     skill_data: dict[str, Any] | None = None
-    if body_skill:
+    if body_skill and not resume_ws_id:
         from turnstone.core.memory import get_skill_by_name
 
         skill_data = get_skill_by_name(body_skill)
@@ -1242,10 +1244,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     resolved_model = body.get("model") or None
     if skill_data and skill_data.get("model"):
         resolved_model = skill_data["model"]
-    resume_ws_id = body.get("resume_ws", "")
-    resolved_skill: str | None = None
-    if body_skill and not resume_ws_id:
-        resolved_skill = body_skill
+    resolved_skill: str | None = body_skill if skill_data else None
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -1326,7 +1325,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             # Metadata
             sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
             sess._applied_skill_id = skill_data["template_id"]
-            sess._applied_skill_version = 0
+            sess._applied_skill_version = 1
             if skill_data.get("content"):
                 sess._applied_skill_content = skill_data["content"]
             sess._save_config()

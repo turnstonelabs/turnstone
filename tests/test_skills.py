@@ -633,14 +633,14 @@ class TestSkillSearch:
 
 
 class _InjectAuthMiddleware(BaseHTTPMiddleware):
-    """Inject an admin auth result with admin.templates permission."""
+    """Inject an admin auth result with admin.skills permission."""
 
     async def dispatch(self, request: Request, call_next: Any) -> Response:
         request.state.auth_result = AuthResult(
             user_id="test-user",
             scopes=frozenset({"approve"}),
             token_source="config",
-            permissions=frozenset({"read", "write", "approve", "admin.templates"}),
+            permissions=frozenset({"read", "write", "approve", "admin.skills"}),
         )
         return await call_next(request)
 

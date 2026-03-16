@@ -74,7 +74,7 @@ audit --> ae_db : admin handlers
 
 govjs --> roles_db : /v1/api/admin/roles
 govjs --> tp_db : /v1/api/admin/policies
-govjs --> pt_db : /v1/api/admin/templates
+govjs --> pt_db : /v1/api/admin/skills
 govjs --> ue_db : /v1/api/admin/usage
 govjs --> ae_db : /v1/api/admin/audit
 
@@ -85,7 +85,7 @@ tset --> tload : name or None
 
 note right of pt_db
   Read-only listing:
-  GET /v1/api/templates
+  GET /v1/api/skills
   (read scope, summary only)
 end note
 

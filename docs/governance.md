@@ -20,7 +20,7 @@ The permission model has two layers:
 
 | Role | Permissions |
 |------|-------------|
-| admin | read, write, approve, admin.users, admin.roles, admin.orgs, admin.policies, admin.templates, admin.audit, admin.usage, admin.schedules, admin.watches, tools.approve, workstreams.create, workstreams.close |
+| admin | read, write, approve, admin.users, admin.roles, admin.orgs, admin.policies, admin.skills, admin.audit, admin.usage, admin.schedules, admin.watches, tools.approve, workstreams.create, workstreams.close |
 | operator | read, write, workstreams.create, workstreams.close |
 | viewer | read |
 
@@ -137,7 +137,7 @@ All under `/v1/api/admin/` (requires `approve` scope + granular permission).
 | Roles | 7 (CRUD + assignment) | `admin.roles` / `admin.users` |
 | Orgs | 3 (list, get, update) | `admin.orgs` |
 | Tool Policies | 4 (CRUD) | `admin.policies` |
-| Skills | 4 (CRUD) | `admin.templates` |
+| Skills | 4 (CRUD) | `admin.skills` |
 | Schedules | 6 (CRUD + runs) | `admin.schedules` |
 | Watches | 3 (list, create, cancel) | `admin.watches` |
 | Usage | 1 (aggregated query) | `admin.usage` |

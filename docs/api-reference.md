@@ -622,7 +622,7 @@ Each saved workstream object:
 
 ---
 
-### `GET /v1/api/templates`
+### `GET /v1/api/skills`
 
 Returns a summary list of all available skills. This is a read-only
 endpoint (requires `read` scope) that exposes skill names and categories
@@ -644,13 +644,13 @@ Each template summary:
 
 | Field        | Type   | Description                                          |
 |--------------|--------|------------------------------------------------------|
-| `name`       | string | Template name (used in `template` field on creation) |
-| `category`   | string | Template category                                    |
-| `is_default` | bool   | Whether template is auto-applied to all sessions     |
-| `origin`     | string | Template origin: `manual` or `mcp`                   |
+| `name`       | string | Skill name (used in `skill` field on workstream creation) |
+| `category`   | string | Skill category                                       |
+| `is_default` | bool   | Whether skill is auto-applied to all sessions        |
+| `origin`     | string | Skill origin: `manual` or `mcp`                      |
 
-> **Note:** For full template management (create, update, delete, view content),
-> use the admin endpoints at `GET /v1/api/admin/templates` (requires `admin.templates` permission).
+> **Note:** For full skill management (create, update, delete, view content),
+> use the admin endpoints at `GET /v1/api/admin/skills` (requires `admin.skills` permission).
 
 ---
 
@@ -844,10 +844,9 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `model`          | string | default | Model alias from the registry (`[models.*]`)                   |
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
-| `template`       | string | ""      | Prompt template name (replaces default templates; 400 if not found)|
-| `skill`          | string | ""      | Skill name. Applies model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and system prompt from the skill profile. Returns 400 if not found or disabled. |
+| `skill`          | string | ""      | Skill name. Applies content (system prompt), model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and other session config from the skill. Returns 400 if not found or disabled. Ignored when `resume_ws` is set (resumed sessions restore their own skill). |
 
-> **Skill precedence:** When `skill` is specified, its settings (model, temperature, auto-approve, token budget, system prompt, etc.) are applied at workstream creation. The `template` parameter can still be used alongside `skill` to override the system message text.
+> **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.
 
 **Response (success):**
 

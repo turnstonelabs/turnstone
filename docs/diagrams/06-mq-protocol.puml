@@ -60,7 +60,6 @@ package "Inbound Messages (Client → Bridge)" as InPkg #FFF3E0 {
         + auto_approve_tools: list[str] = []
         + target_node: str = ""
         + initial_message: str = ""
-        + template: str = ""
         + skill: str = ""
     }
 

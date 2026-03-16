@@ -59,7 +59,7 @@ function showAdmin() {
     watches: "admin.watches",
     roles: "admin.roles",
     policies: "admin.policies",
-    skills: "admin.templates",
+    skills: "admin.skills",
     usage: "admin.usage",
     audit: "admin.audit",
     memories: "admin.memories",
