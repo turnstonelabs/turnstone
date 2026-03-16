@@ -147,6 +147,43 @@ note right
   with daemon judge thread.
 end note
 
+== Tool Execution ==
+
+Session -> Session : _execute_tools()
+note right
+  Tools execute with
+  user approval.
+end note
+
+== Output Guard (synchronous, time-budgeted) ==
+
+Session -> Session : _evaluate_output()\nfor each tool result
+note right
+  **Priority-ordered checks (5s budget):**
+  P1: Prompt injection (role injection,
+    override phrases, instruction tags)
+  P2: Credential leakage (API keys,
+    PEM blocks, connection strings)
+  P3: Encoded payloads (data URIs,
+    hex shellcode)
+  P4: Adversarial URLs (cloud metadata,
+    credential query params)
+  P5: System info disclosure (private
+    IPs, sensitive paths)
+
+  Annotates + optionally redacts.
+  Does NOT gate.
+end note
+
+alt output_warning flags detected
+    Session -> UI : SSE: output_warning\n{call_id, risk_level, flags}
+    note right
+      Credential values replaced
+      with [REDACTED:<type>] before
+      output enters conversation.
+    end note
+end
+
 == Lifecycle ==
 
 note over Session, Judge
@@ -157,6 +194,10 @@ note over Session, Judge
 
   **Sub-agent exemption:**
   Plan agent and task agent skip intent validation entirely.
+
+  **Output guard:**
+  Runs when judge_config.output_guard is true (default).
+  Credential redaction when judge_config.redact_secrets is true.
 
   **Storage:**
   intent_verdicts table (migration 012). Verdicts queryable via

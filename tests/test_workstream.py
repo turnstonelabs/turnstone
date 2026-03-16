@@ -72,6 +72,12 @@ class FakeUI:
     def on_error(self, message):
         pass
 
+    def on_rename(self, name):
+        pass
+
+    def on_output_warning(self, call_id, assessment):
+        pass
+
 
 # ---------------------------------------------------------------------------
 # WorkstreamState enum

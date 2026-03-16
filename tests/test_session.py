@@ -52,6 +52,9 @@ class NullUI:
     def on_rename(self, name):
         pass
 
+    def on_output_warning(self, call_id, assessment):
+        pass
+
 
 def _make_session(
     mock_openai_client=None,

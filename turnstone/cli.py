@@ -270,6 +270,17 @@ class TerminalUI(SessionUI):
         if summary:
             print(f"    {summary}")
 
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        """Display output guard warning when risk signals are detected."""
+        risk = assessment.get("risk_level", "none")
+        if risk == "none":
+            return
+        summary = assessment.get("summary", "")
+        color = _VERDICT_COLORS.get(risk, YELLOW)
+        print(f"\n  {color}▸ OUTPUT WARNING: {risk.upper()}{RESET}")
+        if summary:
+            print(f"    {summary}")
+
     def on_rename(self, name: str) -> None:
         pass  # base TerminalUI ignores renames
 

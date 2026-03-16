@@ -112,6 +112,9 @@ class RecordingUI:
     def on_rename(self, name: str):
         self.events.append(("rename", name))
 
+    def on_output_warning(self, call_id, assessment):
+        pass
+
     @property
     def full_content(self) -> str:
         return "".join(self.content_tokens)

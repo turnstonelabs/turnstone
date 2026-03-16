@@ -82,6 +82,8 @@ class JudgeConfig:
     max_context_ratio: float = 0.5
     timeout: float = 60.0
     read_only_tools: bool = True
+    output_guard: bool = True
+    redact_secrets: bool = True
 
 
 # ---------------------------------------------------------------------------
