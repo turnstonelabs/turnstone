@@ -79,6 +79,13 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   precedence on name collision. MCP-synced content updates reset `is_default` to
   prevent compromised servers from injecting defaults. Admin UI shows origin badge
   and disables edit/delete for MCP-sourced skills.
+- **Security scanning**: Skills are automatically scanned at creation and update
+  time. The scanner evaluates four risk axes: content risk (command execution,
+  data exfiltration), supply chain risk (pipe-to-shell, transitive installs),
+  vulnerability risk (prompt injection, insecure credentials), and declared
+  capability risk (from `allowed_tools`). Results populate the `scan_status`
+  (safe/low/medium/high/critical) and `scan_report` (JSON breakdown) columns.
+  These fields are system-managed and cannot be overwritten via the admin API.
 
 ### Usage Tracking
 

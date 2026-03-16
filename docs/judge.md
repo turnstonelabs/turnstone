@@ -286,6 +286,35 @@ heuristic verdict badge with the LLM verdict:
 
 ---
 
+## Skill Scanner
+
+Skills are evaluated by a content scanner at creation and update time. The
+scanner runs the same class of pattern analysis as the heuristic rules but
+operates on SKILL.md content rather than individual tool calls. It evaluates
+four independent risk axes:
+
+1. **Content risk** — command execution scope, external downloads, credential
+   handling, eval/exec, sudo, data exfiltration, browser automation
+2. **Supply chain risk** — pipe-to-shell, transitive installs (`npx skills add`),
+   obfuscation, download-execute chains, executable URLs from untrusted domains
+3. **Vulnerability risk** — prompt injection patterns, insecure credential
+   handling, third-party content exposure (indirect prompt injection surface)
+4. **Declared capability risk** — parsed from the skill's `allowed_tools` field.
+   `Bash(*)` (unrestricted shell) is high risk. `Bash(git:*)` is low.
+   Read-only tools are safe.
+
+Results are stored in `scan_status` (tier: safe/low/medium/high/critical) and
+`scan_report` (JSON breakdown) on the `prompt_templates` table. These fields are
+system-managed and not editable via the admin API.
+
+The scanner is a pure function (~2ms) with no I/O. It runs synchronously in
+the storage layer. Scanner failures are silently caught to never block skill
+creation.
+
+See [docs/governance.md](governance.md) for the skill governance model.
+
+---
+
 ## v2 Calibration Path
 
 Run v1 with all tools requiring manual approval to build a local verdict

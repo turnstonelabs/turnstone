@@ -170,7 +170,11 @@ provider = ""            # empty = same as session provider
 timeout = 60.0           # generous for local models
 ```
 
-Verdicts are persisted for audit and exposed via Prometheus metrics (`turnstone_judge_verdicts_total`, `turnstone_judge_llm_latency_seconds`). See [docs/judge.md](docs/judge.md) for the full guide.
+Verdicts are persisted for audit and exposed via Prometheus metrics (`turnstone_judge_verdicts_total`, `turnstone_judge_llm_latency_seconds`).
+
+Skills are also scanned at install time — the scanner evaluates content, supply chain, vulnerability, and declared capability risk across four independent axes. Results populate `scan_status` (tier) and `scan_report` (structured JSON breakdown) on the skill record so administrators can assess risk before enabling a skill.
+
+See [docs/judge.md](docs/judge.md) for the full guide.
 
 ## Multi-node routing
 

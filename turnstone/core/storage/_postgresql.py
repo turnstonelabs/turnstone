@@ -56,6 +56,9 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
 )
+from turnstone.core.storage._utils import (
+    scan_skill_content as _scan_skill_content,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1509,6 +1512,10 @@ class PostgreSQLBackend:
         if activation == "default":
             is_default = True
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+        # Scan skill content for risk signals
+        scan_status, scan_report = _scan_skill_content(content, allowed_tools)
+
         with self._engine.connect() as conn:
             conn.execute(
                 sa.insert(prompt_templates),
@@ -1532,6 +1539,8 @@ class PostgreSQLBackend:
                     "activation": activation,
                     "token_estimate": token_estimate,
                     "allowed_tools": allowed_tools,
+                    "scan_status": scan_status,
+                    "scan_report": scan_report,
                     "model": model,
                     "auto_approve": 1 if auto_approve else 0,
                     "temperature": temperature,
@@ -1631,6 +1640,23 @@ class PostgreSQLBackend:
             fields["auto_approve"] = int(fields["auto_approve"])
         if "enabled" in fields:
             fields["enabled"] = int(fields["enabled"])
+        # Re-scan if content or allowed_tools changed
+        if "content" in fields or "allowed_tools" in fields:
+            content = fields.get("content")
+            allowed_tools = fields.get("allowed_tools")
+            if content is None or allowed_tools is None:
+                existing = self.get_prompt_template(template_id)
+                if existing is None:
+                    pass  # template not found — skip scan, update will be no-op
+                else:
+                    if content is None:
+                        content = existing.get("content", "")
+                    if allowed_tools is None:
+                        allowed_tools = existing.get("allowed_tools", "[]")
+            if content is not None:
+                scan_status, scan_report = _scan_skill_content(content, allowed_tools or "[]")
+                fields["scan_status"] = scan_status
+                fields["scan_report"] = scan_report
         with self._engine.connect() as conn:
             result = conn.execute(
                 sa.update(prompt_templates)

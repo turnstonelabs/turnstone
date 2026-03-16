@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Row helper
@@ -84,6 +87,38 @@ VERDICT_MUTABLE = frozenset(
         "latency_ms",
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Skill scanning helper
+# ---------------------------------------------------------------------------
+
+
+def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str]:
+    """Run the skill scanner and return ``(scan_status, scan_report_json)``.
+
+    Uses a lazy import to avoid circular dependencies.  Silently returns
+    empty results on import or scan errors so skill creation is never
+    blocked by a scanner bug.
+    """
+    try:
+        from turnstone.core.skill_scanner import scan_skill
+
+        tools: list[str] | None = None
+        if allowed_tools and allowed_tools.strip() != "[]":
+            try:
+                parsed = json.loads(allowed_tools)
+                if isinstance(parsed, list):
+                    tools = [str(x) for x in parsed if isinstance(x, str)]
+                    if not tools:
+                        tools = None
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result = scan_skill(content, tools)
+        return result.tier, json.dumps(result.to_dict(), ensure_ascii=False)
+    except Exception:
+        log.debug("skill_scanner: scan failed", exc_info=True)
+        return "", "{}"
 
 
 # ---------------------------------------------------------------------------
