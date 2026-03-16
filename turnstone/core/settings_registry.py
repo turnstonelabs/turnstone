@@ -404,6 +404,26 @@ def _build_registry() -> dict[str, SettingDef]:
             help="The judge can inspect files and directories to gather evidence for its verdict. "
             "When enabled, it can only read \u2014 not modify \u2014 the filesystem.",
         ),
+        SettingDef(
+            "judge.output_guard",
+            "bool",
+            True,
+            "Evaluate tool output for security signals",
+            "judge",
+            help="When enabled, tool execution results are scanned for prompt injection "
+            "payloads, credential leakage, and encoded payloads before entering the "
+            "conversation context. Warnings are surfaced via the UI.",
+        ),
+        SettingDef(
+            "judge.redact_secrets",
+            "bool",
+            True,
+            "Auto-redact credentials in tool output",
+            "judge",
+            help="When enabled alongside output_guard, detected credentials (API keys, "
+            "private keys, connection strings) are replaced with [REDACTED] markers "
+            "before tool output enters the conversation.",
+        ),
         # -- memory ---------------------------------------------------------
         SettingDef(
             "memory.relevance_k",

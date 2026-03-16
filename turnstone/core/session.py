@@ -1105,12 +1105,21 @@ class ChatSession:
                 for tc_id, output in results:
                     # Output guard: evaluate tool result before it enters context
                     if (
-                        isinstance(output, str)
-                        and self._judge_config
+                        self._judge_config
                         and self._judge_config.enabled
                         and self._judge_config.output_guard
                     ):
-                        output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
+                        if isinstance(output, str):
+                            output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
+                        elif isinstance(output, list):
+                            # Image/structured output — evaluate text parts only
+                            _text = " ".join(
+                                p.get("text", "")
+                                for p in output
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            )
+                            if _text:
+                                self._evaluate_output(tc_id, _text, _tc_names.get(tc_id, ""))
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",

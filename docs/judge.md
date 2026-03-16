@@ -358,7 +358,7 @@ output_guard = true    # enable output evaluation (default)
 redact_secrets = true  # auto-redact detected credentials (default)
 ```
 
-CLI: `--no-output-guard` to disable.
+Configurable at runtime via the admin Settings tab.
 
 ---
 

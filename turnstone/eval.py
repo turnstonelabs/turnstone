@@ -114,6 +114,9 @@ class NullUI:
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
         pass
 
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        pass
+
 
 def _log(msg: str, dim: bool = False) -> None:
     """Print a log line with optional dim styling."""

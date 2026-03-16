@@ -509,6 +509,9 @@ class WebUI:
         else:
             self._pending_verdicts.append(verdict)
 
+    def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
+
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Resolve a pending approval, whether triggered by the HTTP handler
         (user approves/denies in the browser) or by server-initiated flows
@@ -2154,6 +2157,8 @@ def main() -> None:
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),
             read_only_tools=config_store.get("judge.read_only_tools"),
+            output_guard=config_store.get("judge.output_guard"),
+            redact_secrets=config_store.get("judge.redact_secrets"),
         )
 
     def _build_memory_config() -> MemoryConfig:

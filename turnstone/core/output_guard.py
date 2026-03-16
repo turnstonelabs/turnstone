@@ -146,7 +146,10 @@ class OutputAssessment:
         }
 
 
-_CLEAN = OutputAssessment()
+def _clean() -> OutputAssessment:
+    """Return a fresh no-risk assessment (avoids mutable singleton sharing)."""
+    return OutputAssessment()
+
 
 # -- Check functions (one per priority tier) --------------------------------
 
@@ -193,13 +196,6 @@ def _check_credentials(
             found = True
             risk = "high"
             break  # one hit is enough to flag + trigger redaction
-
-    # Check remaining specific patterns even if generic already matched
-    for pattern, _label in _CREDENTIAL_PATTERNS:
-        if pattern.search(text):
-            found = True
-            risk = "high"
-            break
 
     if _RE_PRIVATE_KEY_BLOCK.search(text):
         _add_flag(flags, "credential_leak")
@@ -331,7 +327,7 @@ def evaluate_output(
         optionally a sanitized copy of the output (credential redaction only).
     """
     if not output:
-        return _CLEAN
+        return _clean()
 
     deadline = time.monotonic() + budget_seconds
     flags: list[str] = []
