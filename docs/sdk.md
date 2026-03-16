@@ -133,7 +133,7 @@ SSE events are deserialized into typed dataclasses. Use `event.type` to discrimi
 | `approve_request` | `ApproveRequestEvent` | `items` |
 | `tool_result` | `ToolResultEvent` | `call_id`, `name`, `output` |
 | `tool_output_chunk` | `ToolOutputChunkEvent` | `call_id`, `chunk` |
-| `status` | `StatusEvent` | `prompt_tokens`, `total_tokens`, `pct`, `effort` |
+| `status` | `StatusEvent` | `prompt_tokens`, `total_tokens`, `pct`, `effort`, `cache_creation_tokens`, `cache_read_tokens` |
 | `plan_review` | `PlanReviewEvent` | `content` |
 | `error` | `ErrorEvent` | `message` |
 | `info` | `InfoEvent` | `message` |

@@ -689,6 +689,78 @@ class TestUsageEvents:
         result = db.query_usage(since="2000-01-01T00:00:00")
         assert result[0]["prompt_tokens"] == 20
 
+    def test_record_and_query_cache_tokens(self, db):
+        """Cache token columns are recorded and aggregated in query_usage."""
+        db.record_usage_event(
+            "ev1",
+            model="claude-sonnet-4-6",
+            prompt_tokens=100,
+            completion_tokens=50,
+            cache_creation_tokens=80,
+            cache_read_tokens=0,
+        )
+        db.record_usage_event(
+            "ev2",
+            model="claude-sonnet-4-6",
+            prompt_tokens=100,
+            completion_tokens=50,
+            cache_creation_tokens=0,
+            cache_read_tokens=80,
+        )
+        result = db.query_usage(since="2000-01-01T00:00:00")
+        assert len(result) == 1
+        assert result[0]["cache_creation_tokens"] == 80
+        assert result[0]["cache_read_tokens"] == 80
+
+    def test_query_cache_tokens_grouped_by_model(self, db):
+        """Cache tokens are included in grouped query results."""
+        from turnstone.core.storage._schema import usage_events
+
+        with db._engine.connect() as conn:
+            conn.execute(
+                sa.insert(usage_events),
+                [
+                    {
+                        "event_id": "e1",
+                        "timestamp": "2026-03-01T10:00:00",
+                        "user_id": "",
+                        "ws_id": "",
+                        "node_id": "",
+                        "model": "claude-sonnet-4-6",
+                        "prompt_tokens": 100,
+                        "completion_tokens": 50,
+                        "tool_calls_count": 0,
+                        "cache_creation_tokens": 90,
+                        "cache_read_tokens": 0,
+                        "created": "2026-03-01T10:00:00",
+                    },
+                    {
+                        "event_id": "e2",
+                        "timestamp": "2026-03-01T14:00:00",
+                        "user_id": "",
+                        "ws_id": "",
+                        "node_id": "",
+                        "model": "gpt-5.1",
+                        "prompt_tokens": 200,
+                        "completion_tokens": 100,
+                        "tool_calls_count": 0,
+                        "cache_creation_tokens": 0,
+                        "cache_read_tokens": 150,
+                        "created": "2026-03-01T14:00:00",
+                    },
+                ],
+            )
+            conn.commit()
+
+        result = db.query_usage(since="2026-03-01T00:00:00", group_by="model")
+        assert len(result) == 2
+        claude = next(r for r in result if r["key"] == "claude-sonnet-4-6")
+        gpt = next(r for r in result if r["key"] == "gpt-5.1")
+        assert claude["cache_creation_tokens"] == 90
+        assert claude["cache_read_tokens"] == 0
+        assert gpt["cache_creation_tokens"] == 0
+        assert gpt["cache_read_tokens"] == 150
+
 
 # ---------------------------------------------------------------------------
 # Audit Events

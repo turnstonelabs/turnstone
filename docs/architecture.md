@@ -596,7 +596,7 @@ LLMProvider (protocol)
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage` |
 | `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision` |
-| `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens` |
+| `UsageInfo` | `prompt_tokens`, `completion_tokens`, `total_tokens`, `cache_creation_tokens`, `cache_read_tokens` |
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
@@ -604,7 +604,10 @@ in tool results. Model capability lookup table covers GPT-5/5.1/5.2/5.3/5.4,
 O-series, and search models (`gpt-5-search-api`) — all with `supports_vision`.
 For search models, injects `web_search_options` and removes the `web_search`
 function tool (the model always searches). Citations from `url_citation`
-annotations are formatted as footnotes. Unknown models (local servers) get
+annotations are formatted as footnotes. Extended prompt cache retention
+(`prompt_cache_retention: "24h"`) is enabled for GPT-5.x models at no
+additional cost. Cached token counts are extracted from
+`usage.prompt_tokens_details.cached_tokens`. Unknown models (local servers) get
 permissive defaults with `supports_vision=False` and use Tavily for web search.
 
 **AnthropicProvider** (`_anthropic.py`): converts OpenAI-format messages to
@@ -618,8 +621,14 @@ Sonnet 4.6. Replaces the `web_search` function tool with Anthropic's native
 `web_search_20250305` server-side tool — Claude decides when to search, the
 API executes it, and results stream back as `server_tool_use` /
 `web_search_tool_result` content blocks (emitted as `info_delta` for UI
-display). The `anthropic` SDK is imported lazily so it remains an optional
-dependency (`pip install turnstone[anthropic]`).
+display). Automatic prompt caching is enabled via top-level `cache_control:
+{"type": "ephemeral"}` — the API places the cache breakpoint on the last
+cacheable block and advances it as conversations grow (90% input cost
+reduction on cache hits, 1.25x write on first turn). Cache metrics
+(`cache_creation_input_tokens`, `cache_read_input_tokens`) are extracted from
+both streaming and non-streaming responses. The `anthropic` SDK is imported
+lazily so it remains an optional dependency (`pip install
+turnstone[anthropic]`).
 
 **Factory functions** (`__init__.py`): `create_provider(name)` returns a
 singleton provider instance (thread-safe). `create_client(name, base_url,

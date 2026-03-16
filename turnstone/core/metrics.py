@@ -64,6 +64,11 @@ class MetricsCollector:
             self._tokens["prompt"] += prompt
             self._tokens["completion"] += completion
 
+    def record_cache_tokens(self, cache_creation: int, cache_read: int) -> None:
+        with self._lock:
+            self._tokens["cache_creation"] += cache_creation
+            self._tokens["cache_read"] += cache_read
+
     def record_tool_call(self, tool_name: str) -> None:
         with self._lock:
             self._tool_calls[tool_name] += 1
@@ -232,7 +237,7 @@ class MetricsCollector:
         # turnstone_tokens_total
         lines.append("# HELP turnstone_tokens_total Total tokens consumed")
         lines.append("# TYPE turnstone_tokens_total counter")
-        for tok_type in ("prompt", "completion"):
+        for tok_type in ("prompt", "completion", "cache_creation", "cache_read"):
             lines.append(f'turnstone_tokens_total{{type="{tok_type}"}} {tokens.get(tok_type, 0)}')
 
         # turnstone_tool_calls_total

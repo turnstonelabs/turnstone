@@ -75,6 +75,8 @@ export interface StatusEvent {
   context_window: number;
   pct: number;
   effort: string;
+  cache_creation_tokens?: number;
+  cache_read_tokens?: number;
 }
 
 export interface PlanReviewEvent {

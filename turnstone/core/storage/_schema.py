@@ -372,6 +372,8 @@ usage_events = sa.Table(
     sa.Column("prompt_tokens", sa.Integer, nullable=False, server_default="0"),
     sa.Column("completion_tokens", sa.Integer, nullable=False, server_default="0"),
     sa.Column("tool_calls_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("cache_creation_tokens", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("cache_read_tokens", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
 )
 

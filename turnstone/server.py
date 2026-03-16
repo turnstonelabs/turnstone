@@ -384,7 +384,10 @@ class WebUI:
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None:
         total_tok = usage["prompt_tokens"] + usage["completion_tokens"]
         pct = total_tok / context_window * 100 if context_window > 0 else 0
+        cache_creation = usage.get("cache_creation_tokens", 0)
+        cache_read = usage.get("cache_read_tokens", 0)
         _metrics.record_tokens(usage["prompt_tokens"], usage["completion_tokens"])
+        _metrics.record_cache_tokens(cache_creation, cache_read)
         _metrics.record_context_ratio(total_tok / context_window if context_window > 0 else 0.0)
         with self._ws_lock:
             self._ws_prompt_tokens += usage["prompt_tokens"]
@@ -402,6 +405,8 @@ class WebUI:
                 "context_window": context_window,
                 "pct": round(pct, 1),
                 "effort": effort,
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
             }
         )
         # Record usage event for governance dashboard
@@ -421,6 +426,8 @@ class WebUI:
                     prompt_tokens=usage["prompt_tokens"],
                     completion_tokens=usage["completion_tokens"],
                     tool_calls_count=tool_count,
+                    cache_creation_tokens=cache_creation,
+                    cache_read_tokens=cache_read,
                 )
         except Exception:
             pass  # Non-critical — never break the response pipeline

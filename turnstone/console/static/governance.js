@@ -1418,6 +1418,13 @@ function _renderGovUsage(summary, breakdown) {
   var completion = s.completion_tokens || 0;
   var total = prompt + completion;
   var tools = s.tool_calls_count || 0;
+  var cacheWrite = s.cache_creation_tokens || 0;
+  var cacheRead = s.cache_read_tokens || 0;
+
+  var cacheZero = cacheWrite === 0 && cacheRead === 0;
+  var cacheCls =
+    "usage-readout usage-readout-secondary" +
+    (cacheZero ? " usage-readout-zero" : "");
 
   var html =
     '<div class="usage-summary">' +
@@ -1433,6 +1440,17 @@ function _renderGovUsage(summary, breakdown) {
     '<div class="usage-readout"><span class="usage-readout-value">' +
     formatCount(tools) +
     '</span><span class="usage-readout-label">tool calls</span></div>' +
+    '<div class="usage-summary-divider"></div>' +
+    '<div class="' +
+    cacheCls +
+    '"><span class="usage-readout-value">' +
+    formatTokens(cacheWrite) +
+    '</span><span class="usage-readout-label">cache write</span></div>' +
+    '<div class="' +
+    cacheCls +
+    '"><span class="usage-readout-value">' +
+    formatTokens(cacheRead) +
+    '</span><span class="usage-readout-label">cache read</span></div>' +
     "</div>";
 
   // Bar chart breakdown

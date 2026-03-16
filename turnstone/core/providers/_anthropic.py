@@ -252,6 +252,10 @@ class AnthropicProvider:
             "messages": converted_msgs,
             caps.token_param: max_tokens,
             "temperature": temperature,
+            # Automatic prompt caching — the API places the cache breakpoint
+            # on the last cacheable block and advances it as conversation grows.
+            # 90% input cost reduction on cache hits; 1.25x write on first turn.
+            "cache_control": {"type": "ephemeral"},
         }
         if system_prompt:
             kwargs["system"] = system_prompt
@@ -584,6 +588,8 @@ class AnthropicProvider:
                         total_tokens=(
                             getattr(u, "input_tokens", 0) + getattr(u, "output_tokens", 0)
                         ),
+                        cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+                        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
@@ -598,6 +604,8 @@ class AnthropicProvider:
                         prompt_tokens=getattr(u, "input_tokens", 0),
                         completion_tokens=0,
                         total_tokens=getattr(u, "input_tokens", 0),
+                        cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+                        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
                     )
 
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
@@ -673,6 +681,8 @@ class AnthropicProvider:
                 prompt_tokens=u.input_tokens,
                 completion_tokens=u.output_tokens,
                 total_tokens=u.input_tokens + u.output_tokens,
+                cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+                cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
             )
 
         return CompletionResult(

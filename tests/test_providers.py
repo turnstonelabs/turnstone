@@ -2184,3 +2184,332 @@ class TestAnthropicVisionConversion:
         assert result[1]["type"] == "image"
         assert result[1]["source"]["media_type"] == "image/jpeg"
         assert result[1]["source"]["data"] == "/9j/4AAQ"
+
+
+# ===========================================================================
+# TestPromptCaching
+# ===========================================================================
+
+
+class TestAnthropicPromptCaching:
+    """Tests for Anthropic prompt caching (cache_control)."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_cache_control_set_in_kwargs(self) -> None:
+        """_build_thinking_and_kwargs includes cache_control: ephemeral."""
+        caps = self.provider.get_capabilities("claude-sonnet-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="medium",
+            extra_params=None,
+            max_tokens=4096,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="You are helpful.",
+            model="claude-sonnet-4-6",
+            tools=None,
+        )
+        assert "cache_control" in kwargs
+        assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_start_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """Cache metrics from message_start flow into UsageInfo."""
+        msg_start = MagicMock()
+        msg_start.type = "message_start"
+        msg_usage = MagicMock()
+        msg_usage.input_tokens = 100
+        msg_usage.cache_creation_input_tokens = 80
+        msg_usage.cache_read_input_tokens = 0
+        msg_start.message = MagicMock()
+        msg_start.message.usage = msg_usage
+
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        events = [msg_start, text_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        start_chunks = [r for r in results if r.usage is not None and r.usage.prompt_tokens == 100]
+        assert len(start_chunks) == 1
+        assert start_chunks[0].usage is not None
+        assert start_chunks[0].usage.cache_creation_tokens == 80
+        assert start_chunks[0].usage.cache_read_tokens == 0
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_message_delta_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """Cache metrics from message_delta flow into UsageInfo."""
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        delta_event = MagicMock()
+        delta_event.type = "message_delta"
+        delta_usage = MagicMock()
+        delta_usage.input_tokens = 0
+        delta_usage.output_tokens = 50
+        delta_usage.cache_creation_input_tokens = 0
+        delta_usage.cache_read_input_tokens = 120
+        delta_event.usage = delta_usage
+        delta_event.delta = MagicMock()
+        delta_event.delta.stop_reason = "end_turn"
+
+        events = [text_event, delta_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        delta_chunks = [r for r in results if r.finish_reason is not None]
+        assert len(delta_chunks) == 1
+        u = delta_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 120
+        assert u.cache_creation_tokens == 0
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_completion_cache_metrics(self, mock_ensure: MagicMock) -> None:
+        """Non-streaming completion extracts cache metrics."""
+        response = MagicMock()
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "Hello"
+        response.content = [text_block]
+        response.stop_reason = "end_turn"
+
+        usage = MagicMock()
+        usage.input_tokens = 200
+        usage.output_tokens = 30
+        usage.cache_creation_input_tokens = 150
+        usage.cache_read_input_tokens = 50
+        response.usage = usage
+
+        client = MagicMock()
+        client.messages.create.return_value = response
+
+        result = self.provider.create_completion(
+            client=client,
+            model="claude-sonnet-4-6",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        u = result.usage
+        assert u is not None
+        assert u.cache_creation_tokens == 150
+        assert u.cache_read_tokens == 50
+
+    @patch("turnstone.core.providers._anthropic._ensure_anthropic")
+    def test_streaming_cache_metrics_missing_gracefully(self, mock_ensure: MagicMock) -> None:
+        """When cache attributes are absent, tokens default to 0."""
+        msg_start = MagicMock()
+        msg_start.type = "message_start"
+        msg_usage = MagicMock(spec=[])  # No attributes at all
+        msg_usage.input_tokens = 50
+        # Deliberately no cache_creation_input_tokens / cache_read_input_tokens
+        del msg_usage.cache_creation_input_tokens
+        del msg_usage.cache_read_input_tokens
+        msg_start.message = MagicMock()
+        msg_start.message.usage = msg_usage
+
+        text_event = _anthropic_event("content_block_delta", delta_type="text_delta", text="Hi")
+
+        events = [msg_start, text_event]
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=iter(events))
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+
+        client = MagicMock()
+        client.messages.stream.return_value = stream_ctx
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        start_chunks = [r for r in results if r.usage is not None]
+        assert len(start_chunks) >= 1
+        u = start_chunks[0].usage
+        assert u is not None
+        assert u.cache_creation_tokens == 0
+        assert u.cache_read_tokens == 0
+
+
+class TestOpenAIPromptCaching:
+    """Tests for OpenAI prompt caching (automatic + extended retention)."""
+
+    def setup_method(self) -> None:
+        self.provider = OpenAIProvider()
+
+    def test_cache_retention_set_for_gpt5(self) -> None:
+        """GPT-5.x models get prompt_cache_retention=24h."""
+        for model in ("gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5-mini", "gpt-5-pro"):
+            kwargs: dict[str, Any] = {}
+            self.provider._apply_cache_retention(kwargs, model)
+            assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"
+
+    def test_cache_retention_not_set_for_non_gpt5(self) -> None:
+        """Non-GPT-5 models do not get cache retention."""
+        for model in ("o3", "o4-mini", "local-model", "gpt-4o"):
+            kwargs: dict[str, Any] = {}
+            self.provider._apply_cache_retention(kwargs, model)
+            assert "prompt_cache_retention" not in kwargs, f"Unexpected retention for {model}"
+
+    def test_streaming_cached_tokens_from_usage(self) -> None:
+        """Streaming usage extracts cached_tokens from prompt_tokens_details."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        ptd = MagicMock()
+        ptd.cached_tokens = 80
+        usage.prompt_tokens_details = ptd
+
+        chunks = [
+            _openai_stream_chunk(content="Hi"),
+            _openai_stream_chunk(empty_choices=True, usage=usage),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        usage_chunks = [r for r in results if r.usage is not None]
+        assert len(usage_chunks) == 1
+        u = usage_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 80
+        assert u.cache_creation_tokens == 0
+
+    def test_completion_cached_tokens(self) -> None:
+        """Non-streaming completion extracts cached_tokens."""
+        response = MagicMock()
+        msg = MagicMock()
+        msg.content = "Hello"
+        msg.tool_calls = None
+        msg.annotations = None
+        choice = MagicMock()
+        choice.message = msg
+        choice.finish_reason = "stop"
+        response.choices = [choice]
+
+        usage = MagicMock()
+        usage.prompt_tokens = 200
+        usage.completion_tokens = 30
+        usage.total_tokens = 230
+        ptd = MagicMock()
+        ptd.cached_tokens = 150
+        usage.prompt_tokens_details = ptd
+        response.usage = usage
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = response
+
+        result = self.provider.create_completion(
+            client=client,
+            model="gpt-5.1",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        u = result.usage
+        assert u is not None
+        assert u.cache_read_tokens == 150
+        assert u.cache_creation_tokens == 0
+
+    def test_streaming_no_prompt_tokens_details(self) -> None:
+        """When prompt_tokens_details is absent, cache_read_tokens defaults to 0."""
+        usage = MagicMock()
+        usage.prompt_tokens = 100
+        usage.completion_tokens = 20
+        usage.total_tokens = 120
+        usage.prompt_tokens_details = None
+
+        chunks = [
+            _openai_stream_chunk(content="Hi"),
+            _openai_stream_chunk(empty_choices=True, usage=usage),
+        ]
+        client = MagicMock()
+        client.chat.completions.create.return_value = iter(chunks)
+
+        results = list(
+            self.provider.create_streaming(
+                client=client,
+                model="gpt-5.1",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        )
+        usage_chunks = [r for r in results if r.usage is not None]
+        assert len(usage_chunks) == 1
+        u = usage_chunks[0].usage
+        assert u is not None
+        assert u.cache_read_tokens == 0
+
+
+class TestUsageInfoCacheFields:
+    """Tests for cache fields on UsageInfo dataclass."""
+
+    def test_default_cache_fields(self) -> None:
+        u = UsageInfo(prompt_tokens=10, completion_tokens=5, total_tokens=15)
+        assert u.cache_creation_tokens == 0
+        assert u.cache_read_tokens == 0
+
+    def test_explicit_cache_fields(self) -> None:
+        u = UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=50,
+            total_tokens=150,
+            cache_creation_tokens=80,
+            cache_read_tokens=20,
+        )
+        assert u.cache_creation_tokens == 80
+        assert u.cache_read_tokens == 20
+
+
+class TestMetricsCacheTokens:
+    """Tests for cache token recording in MetricsCollector."""
+
+    def test_record_cache_tokens(self) -> None:
+        from turnstone.core.metrics import MetricsCollector
+
+        m = MetricsCollector()
+        m.record_cache_tokens(100, 200)
+        m.record_cache_tokens(50, 300)
+        assert m._tokens["cache_creation"] == 150
+        assert m._tokens["cache_read"] == 500
+
+    def test_prometheus_output_includes_cache_tokens(self) -> None:
+        from turnstone.core.metrics import MetricsCollector
+
+        m = MetricsCollector()
+        m.record_tokens(1000, 500)
+        m.record_cache_tokens(800, 200)
+        text = m.generate_text(workstream_states={}, total_workstreams=0)
+        assert 'turnstone_tokens_total{type="cache_creation"} 800' in text
+        assert 'turnstone_tokens_total{type="cache_read"} 200' in text
+        assert 'turnstone_tokens_total{type="prompt"} 1000' in text

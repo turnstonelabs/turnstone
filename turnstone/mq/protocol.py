@@ -251,6 +251,8 @@ class StatusEvent(OutboundEvent):
     context_window: int = 0
     pct: float = 0.0
     effort: str = ""
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass

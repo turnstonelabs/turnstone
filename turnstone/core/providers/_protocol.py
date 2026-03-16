@@ -31,6 +31,9 @@ class UsageInfo:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Prompt caching metrics (provider-specific; 0 when not available)
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
 
 
 @dataclass

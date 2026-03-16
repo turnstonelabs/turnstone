@@ -234,6 +234,21 @@ class OpenAIProvider:
         kwargs["web_search_options"] = {}
         return tools
 
+    # -- prompt cache retention -----------------------------------------------
+
+    @staticmethod
+    def _apply_cache_retention(kwargs: dict[str, Any], model: str) -> None:
+        """Enable 24-hour extended prompt cache retention for GPT-5.x models.
+
+        OpenAI caching is automatic (no code changes for basic caching), but
+        the default TTL is only 5-10 minutes.  Extended retention keeps cached
+        KV tensors for up to 24 hours at no additional cost, which is valuable
+        for workstreams with bursty activity patterns.
+        """
+        # GPT-5, GPT-5.1, GPT-5.2, GPT-5.3, GPT-5.4 and variants
+        if model.startswith("gpt-5"):
+            kwargs["prompt_cache_retention"] = "24h"
+
     # -- tool search ---------------------------------------------------------
 
     def _apply_tool_search(
@@ -282,6 +297,7 @@ class OpenAIProvider:
             "stream_options": {"include_usage": True},
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
+        self._apply_cache_retention(kwargs, model)
         tools = self._apply_web_search(kwargs, caps, tools)
         tools = self._apply_tool_search(caps, tools, deferred_names)
         if tools:
@@ -310,10 +326,16 @@ class OpenAIProvider:
                 ct = getattr(u, "completion_tokens", None)
                 tt = getattr(u, "total_tokens", None)
                 if pt is not None and ct is not None:
+                    # Extract cached_tokens from prompt_tokens_details.
+                    # OpenAI caching is automatic with no write premium, so
+                    # cache_creation_tokens is always 0 (only Anthropic reports it).
+                    ptd = getattr(u, "prompt_tokens_details", None)
+                    cached = getattr(ptd, "cached_tokens", 0) if ptd else 0
                     sc.usage = UsageInfo(
                         prompt_tokens=pt,
                         completion_tokens=ct,
                         total_tokens=tt or (pt + ct),
+                        cache_read_tokens=cached or 0,
                     )
 
             if not chunk.choices:
@@ -387,6 +409,7 @@ class OpenAIProvider:
             "stream": False,
         }
         self._apply_model_params(kwargs, caps, temperature, reasoning_effort)
+        self._apply_cache_retention(kwargs, model)
         tools = self._apply_web_search(kwargs, caps, tools)
         tools = self._apply_tool_search(caps, tools, deferred_names)
         if tools:
@@ -421,11 +444,14 @@ class OpenAIProvider:
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            ptd = getattr(u, "prompt_tokens_details", None)
+            cached = getattr(ptd, "cached_tokens", 0) if ptd else 0
             usage = UsageInfo(
                 prompt_tokens=u.prompt_tokens,
                 completion_tokens=u.completion_tokens,
                 total_tokens=getattr(u, "total_tokens", None)
                 or (u.prompt_tokens + u.completion_tokens),
+                cache_read_tokens=cached or 0,
             )
 
         return CompletionResult(

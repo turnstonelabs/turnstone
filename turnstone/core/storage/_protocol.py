@@ -675,6 +675,8 @@ class StorageBackend(Protocol):
         prompt_tokens: int,
         completion_tokens: int,
         tool_calls_count: int,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> None:
         """Record a usage event (token counts, tool calls for one LLM request)."""
         ...

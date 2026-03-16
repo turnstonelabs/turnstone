@@ -1820,6 +1820,8 @@ class SQLiteBackend:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         tool_calls_count: int = 0,
+        cache_creation_tokens: int = 0,
+        cache_read_tokens: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -1835,6 +1837,8 @@ class SQLiteBackend:
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "tool_calls_count": tool_calls_count,
+                    "cache_creation_tokens": cache_creation_tokens,
+                    "cache_read_tokens": cache_read_tokens,
                     "created": now,
                 },
             )
@@ -1873,7 +1877,8 @@ class SQLiteBackend:
             # No grouping — single summary row
             sql = (
                 f"SELECT SUM(prompt_tokens), SUM(completion_tokens), "
-                f"SUM(tool_calls_count) FROM usage_events WHERE {where}"
+                f"SUM(tool_calls_count), SUM(cache_creation_tokens), "
+                f"SUM(cache_read_tokens) FROM usage_events WHERE {where}"
             )
             with self._engine.connect() as conn:
                 row = conn.execute(sa.text(sql), params).fetchone()
@@ -1883,13 +1888,24 @@ class SQLiteBackend:
                             "prompt_tokens": row[0] or 0,
                             "completion_tokens": row[1] or 0,
                             "tool_calls_count": row[2] or 0,
+                            "cache_creation_tokens": row[3] or 0,
+                            "cache_read_tokens": row[4] or 0,
                         }
                     ]
-                return [{"prompt_tokens": 0, "completion_tokens": 0, "tool_calls_count": 0}]
+                return [
+                    {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "tool_calls_count": 0,
+                        "cache_creation_tokens": 0,
+                        "cache_read_tokens": 0,
+                    }
+                ]
 
         sql = (
             f"SELECT {key_expr} AS key, SUM(prompt_tokens), SUM(completion_tokens), "
-            f"SUM(tool_calls_count) FROM usage_events WHERE {where} "
+            f"SUM(tool_calls_count), SUM(cache_creation_tokens), "
+            f"SUM(cache_read_tokens) FROM usage_events WHERE {where} "
             f"GROUP BY {key_expr} ORDER BY key ASC"
         )
         with self._engine.connect() as conn:
@@ -1900,6 +1916,8 @@ class SQLiteBackend:
                     "prompt_tokens": r[1] or 0,
                     "completion_tokens": r[2] or 0,
                     "tool_calls_count": r[3] or 0,
+                    "cache_creation_tokens": r[4] or 0,
+                    "cache_read_tokens": r[5] or 0,
                 }
                 for r in rows
             ]

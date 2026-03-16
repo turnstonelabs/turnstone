@@ -1449,6 +1449,18 @@
   letter-spacing: 0.08em;
   color: var(--fg-dim);
 }
+/* Secondary readouts (cache stats) — smaller to denote supplementary metrics */
+.usage-readout-secondary .usage-readout-value { font-size: 16px; font-weight: 500; color: var(--fg-dim); }
+.usage-readout-secondary .usage-readout-label { font-size: 9px; }
+/* Dim zero-value secondary readouts to reduce noise */
+.usage-readout-zero { opacity: 0.35; }
+/* Vertical divider between primary and secondary readout groups */
+.usage-summary-divider {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 2px 0;
+}
 
 /* Usage bar chart */
 .usage-chart { padding-top: 4px; }
@@ -1595,7 +1607,9 @@
   .admin-toolbar-filters { flex-wrap: wrap; }
   .admin-toolbar-filters input[type="search"] { width: 120px; }
   .mem-detail-grid { grid-template-columns: 1fr 1fr; }
+  .usage-summary { gap: 14px; }
   .usage-readout-value { font-size: 18px; }
+  .usage-readout-secondary .usage-readout-value { font-size: 14px; }
   .usage-bar-row { grid-template-columns: 70px 1fr 50px; }
   .perm-grid { grid-template-columns: 1fr; }
 }

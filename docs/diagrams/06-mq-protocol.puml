@@ -167,6 +167,8 @@ package "Outbound Events (Bridge → Client)" #E3F2FD {
             + context_window: int
             + pct: float
             + effort: str
+            + cache_creation_tokens: int
+            + cache_read_tokens: int
         }
         class StateChangeEvent {
             type = "state_change"

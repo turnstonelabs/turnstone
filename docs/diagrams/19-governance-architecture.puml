@@ -33,7 +33,7 @@ package "Governance Storage" {
 package "Runtime Enforcement" {
   [evaluate_tool_policies_batch()] as eval
   [WebUI.approve_tools()] as approve
-  [record_usage_event()] as usage
+  [record_usage_event()\n+cache_creation/read_tokens] as usage
   [record_audit()] as audit
 }
 

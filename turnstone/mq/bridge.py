@@ -626,6 +626,8 @@ class Bridge:
                     context_window=data.get("context_window", 0),
                     pct=data.get("pct", 0),
                     effort=data.get("effort", ""),
+                    cache_creation_tokens=data.get("cache_creation_tokens", 0),
+                    cache_read_tokens=data.get("cache_read_tokens", 0),
                 ),
             )
         elif etype == "error":

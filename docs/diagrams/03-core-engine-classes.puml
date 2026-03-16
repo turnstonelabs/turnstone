@@ -84,6 +84,8 @@ class "OpenAIProvider" as OpenAIProv {
     in OpenAI format.
     Search models: web_search_options
     + url_citation annotations.
+    Extended cache: 24h retention
+    for GPT-5.x (free).
     --
     core/providers/_openai.py
 }
@@ -94,6 +96,8 @@ class "AnthropicProvider" as AnthropicProv {
     Adaptive + manual thinking.
     Native web search via
     web_search_20250305 server tool.
+    Auto prompt caching via
+    cache_control: ephemeral.
     Lazy anthropic SDK import.
     --
     core/providers/_anthropic.py

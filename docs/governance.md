@@ -110,9 +110,16 @@ Workstream templates are behavioral profiles applied at workstream creation — 
 Per-LLM-request token and tool call metrics:
 
 - **Recording**: `on_status()` in `WebUI` records a `usage_event` after each
-  LLM response with prompt/completion tokens, tool call count, model, ws_id
+  LLM response with prompt/completion tokens, cache tokens, tool call count,
+  model, ws_id
+- **Prompt caching**: Anthropic automatic caching (`cache_control: ephemeral`)
+  and OpenAI extended retention (`prompt_cache_retention: 24h` for GPT-5.x)
+  are enabled by default. `cache_creation_tokens` and `cache_read_tokens` are
+  tracked per request in `usage_events` and surfaced in the Usage admin tab
 - **Querying**: `GET /v1/api/admin/usage` with `group_by` (day/hour/model/user)
-  and time range filtering
+  and time range filtering — includes cache token aggregates
+- **Prometheus**: `turnstone_tokens_total{type="cache_creation|cache_read"}`
+  counters on `/metrics`
 - **Pruning**: `prune_usage_events(retention_days=90)` and
   `prune_audit_events(retention_days=365)` run automatically via the
   console scheduler's periodic cleanup cycle
@@ -140,7 +147,7 @@ Migration 008 adds 7 tables:
 | `user_roles` | User-to-role assignments (composite PK) |
 | `tool_policies` | Per-tool approve/deny/ask rules |
 | `prompt_templates` | Reusable system message templates |
-| `usage_events` | Per-request token/tool metrics |
+| `usage_events` | Per-request token/tool/cache metrics |
 | `audit_events` | Admin action log |
 
 Also adds `org_id` column to `users` table.

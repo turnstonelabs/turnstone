@@ -1308,6 +1308,8 @@ class ChatSession:
                             "prompt_tokens": chunk.usage.prompt_tokens,
                             "completion_tokens": chunk.usage.completion_tokens,
                             "total_tokens": chunk.usage.total_tokens,
+                            "cache_creation_tokens": chunk.usage.cache_creation_tokens,
+                            "cache_read_tokens": chunk.usage.cache_read_tokens,
                         }
                     else:
                         self._last_usage["prompt_tokens"] = max(
@@ -1319,6 +1321,14 @@ class ChatSession:
                         self._last_usage["total_tokens"] = (
                             self._last_usage["prompt_tokens"]
                             + self._last_usage["completion_tokens"]
+                        )
+                        self._last_usage["cache_creation_tokens"] = max(
+                            self._last_usage.get("cache_creation_tokens", 0),
+                            chunk.usage.cache_creation_tokens,
+                        )
+                        self._last_usage["cache_read_tokens"] = max(
+                            self._last_usage.get("cache_read_tokens", 0),
+                            chunk.usage.cache_read_tokens,
                         )
 
                 if self.debug:
