@@ -839,6 +839,9 @@ class StorageBackend(Protocol):
         auto_approve: bool = False,
         enabled: bool = True,
         created_by: str = "",
+        registry_name: str | None = None,
+        registry_version: str = "",
+        registry_meta: str = "{}",
     ) -> None:
         """Create an MCP server definition. No-op if server_id already exists."""
         ...
@@ -857,6 +860,10 @@ class StorageBackend(Protocol):
 
     def update_mcp_server(self, server_id: str, **fields: Any) -> bool:
         """Update specified fields on an MCP server. Returns True if found."""
+        ...
+
+    def get_mcp_server_by_registry_name(self, registry_name: str) -> dict[str, Any] | None:
+        """Return MCP server dict by registry name or None."""
         ...
 
     def delete_mcp_server(self, server_id: str) -> bool:

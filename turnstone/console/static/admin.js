@@ -1876,6 +1876,7 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "mcp-create-overlay") hideCreateMcpModal();
         else if (overlayId === "mcp-import-overlay") hideImportMcpModal();
         else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
+        else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
       }
     };
   }
@@ -1962,6 +1963,7 @@ document.addEventListener("keydown", function (e) {
     ["edit-wst-overlay", hideEditWsTemplateModal],
     ["wst-history-overlay", hideWstHistoryModal],
     ["memory-detail-overlay", hideMemoryDetailModal],
+    ["mcp-install-overlay", hideInstallMcpModal],
     ["mcp-detail-overlay", hideMcpDetailModal],
     ["mcp-import-overlay", hideImportMcpModal],
     ["mcp-create-overlay", hideCreateMcpModal],
@@ -2650,6 +2652,13 @@ var _mcpImportTrap = null;
 var _mcpImportTrigger = null;
 var _mcpDetailTrap = null;
 var _mcpDetailTrigger = null;
+var _mcpInstallTrap = null;
+var _mcpInstallTrigger = null;
+var _mcpInstallServer = null;
+var _mcpCurrentView = "servers";
+var _registryResults = [];
+var _registryCursor = null;
+var _registryQuery = "";
 
 function loadAdminMcp() {
   authFetch("/v1/api/admin/mcp-servers")
@@ -2712,6 +2721,10 @@ function _renderMcpServers(items) {
       dotClass = "mcp-status-dot error";
       rowClass = "mcp-row-error";
       statusText = "error";
+    } else if (s.enabled && s.source !== "config" && nodeIds.length === 0) {
+      dotClass = "mcp-status-dot connecting";
+      rowClass = "mcp-row-disabled";
+      statusText = "connecting";
     } else {
       dotClass = "mcp-status-dot disabled";
       rowClass = "mcp-row-disabled";
@@ -2731,9 +2744,12 @@ function _renderMcpServers(items) {
       : '<span class="mcp-count-dim">--</span>';
 
     var isConfig = s.source === "config";
+    var isRegistry = !!s.registry_name;
     var nameBadge = isConfig
-      ? ' <span class="scope-badge scope-channel">config</span>'
-      : "";
+      ? ' <span class="scope-badge scope-config">config</span>'
+      : isRegistry
+        ? ' <span class="scope-badge scope-registry">registry</span>'
+        : ' <span class="scope-badge scope-manual">manual</span>';
     var detailAttr = isConfig
       ? 'data-mcp-detail-name="' + escapeHtml(s.name) + '"'
       : 'data-mcp-detail="' + escapeHtml(s.server_id) + '"';
@@ -2762,7 +2778,7 @@ function _renderMcpServers(items) {
       '<span class="admin-col admin-col-mtransport"><span class="mcp-transport-badge ' +
       transportCls +
       '">' +
-      escapeHtml(s.transport) +
+      (s.transport === "streamable-http" ? "remote" : escapeHtml(s.transport)) +
       "</span></span>" +
       '<span class="admin-col admin-col-mtools">' +
       toolsVal +
@@ -3092,7 +3108,42 @@ function _openMcpDetail(s) {
       escapeHtml(s.url || "") +
       "</code></p>";
   }
-  html += "</div></div>";
+  html += "</div>";
+  if (s.registry_name) {
+    html += '<div class="mcp-detail-section"><h3>Registry</h3>';
+    html +=
+      '<p style="font-size:12px;color:var(--fg-dim)">Name: <code>' +
+      escapeHtml(s.registry_name) +
+      "</code></p>";
+    if (s.registry_version) {
+      html +=
+        '<p style="font-size:12px;color:var(--fg-dim)">Version: <code>' +
+        escapeHtml(s.registry_version) +
+        "</code></p>";
+    }
+    try {
+      var meta =
+        typeof s.registry_meta === "string"
+          ? JSON.parse(s.registry_meta)
+          : s.registry_meta || {};
+      if (meta.description) {
+        html +=
+          '<p style="font-size:12px;color:var(--fg-dim)">' +
+          escapeHtml(meta.description) +
+          "</p>";
+      }
+      if (meta.website_url) {
+        html +=
+          '<p style="font-size:12px"><a href="' +
+          escapeHtml(meta.website_url) +
+          '" target="_blank" rel="noopener" style="color:var(--magenta)">' +
+          escapeHtml(meta.website_url) +
+          "</a></p>";
+      }
+    } catch (e) {}
+    html += "</div>";
+  }
+  html += "</div>";
 
   html += '<div class="modal-col">';
   var statusEntries = s.status || {};
@@ -3212,4 +3263,605 @@ function submitImportMcp() {
     .finally(function () {
       document.getElementById("mcp-import-submit").disabled = false;
     });
+}
+
+/* ── MCP Registry ────────────────────────────────────────────────────────── */
+
+function switchMcpView(view) {
+  _mcpCurrentView = view;
+  var btns = document.querySelectorAll(".mcp-view-btn");
+  for (var i = 0; i < btns.length; i++) {
+    var isActive = btns[i].getAttribute("data-mcp-view") === view;
+    btns[i].classList.toggle("active", isActive);
+    btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
+  }
+  document.getElementById("mcp-view-servers").style.display =
+    view === "servers" ? "" : "none";
+  document.getElementById("mcp-view-registry").style.display =
+    view === "registry" ? "" : "none";
+  document.getElementById("mcp-servers-toolbar").style.display =
+    view === "servers" ? "" : "none";
+  if (view === "servers") loadAdminMcp();
+  if (view === "registry") {
+    var q = document.getElementById("mcp-registry-q");
+    if (q) q.focus();
+    if (!_registryResults.length) searchMcpRegistry();
+  }
+}
+
+function searchMcpRegistry(append) {
+  var q = document.getElementById("mcp-registry-q").value.trim();
+  if (!append) {
+    _registryResults = [];
+    _registryCursor = null;
+    _registryQuery = q;
+    var filterEl = document.getElementById("mcp-registry-filter");
+    if (filterEl) filterEl.value = "";
+  }
+  var url = "/v1/api/admin/mcp-registry/search?limit=20";
+  if (_registryQuery) url += "&q=" + encodeURIComponent(_registryQuery);
+  if (append && _registryCursor)
+    url += "&cursor=" + encodeURIComponent(_registryCursor);
+
+  var resultsEl = document.getElementById("mcp-registry-results");
+  if (!append) {
+    resultsEl.innerHTML = '<div class="dashboard-empty">Searching…</div>';
+  }
+  var searchBtn = document.getElementById("mcp-registry-search-btn");
+  var moreBtn = document.getElementById("mcp-registry-more");
+  if (searchBtn) searchBtn.disabled = true;
+  if (moreBtn) moreBtn.disabled = true;
+
+  authFetch(url)
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Search failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      _registryResults = append
+        ? _registryResults.concat(data.servers || [])
+        : data.servers || [];
+      _registryCursor = data.next_cursor || null;
+      _renderRegistryResults();
+    })
+    .catch(function (e) {
+      if (!append) {
+        resultsEl.innerHTML =
+          '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>";
+      }
+    })
+    .finally(function () {
+      if (searchBtn) searchBtn.disabled = false;
+      if (moreBtn) moreBtn.disabled = false;
+    });
+}
+
+function loadMoreRegistry() {
+  if (_registryCursor) searchMcpRegistry(true);
+}
+
+function _applyRegistryFilter() {
+  _renderRegistryResults();
+}
+
+function _renderRegistryResults() {
+  var el = document.getElementById("mcp-registry-results");
+  if (!_registryResults.length) {
+    el.innerHTML = '<div class="dashboard-empty">No servers found</div>';
+    document.getElementById("mcp-registry-pagination").style.display = "none";
+    return;
+  }
+
+  // Client-side type filter
+  var filterEl = document.getElementById("mcp-registry-filter");
+  var typeFilter = filterEl ? filterEl.value : "";
+
+  var html = "";
+  var visibleCount = 0;
+  for (var i = 0; i < _registryResults.length; i++) {
+    var srv = _registryResults[i];
+    var hasRemote = srv.remotes && srv.remotes.length > 0;
+    var pkgTypes = (srv.packages || []).map(function (p) {
+      return p.registry_type;
+    });
+
+    // Apply type filter
+    if (typeFilter === "remote" && !hasRemote) continue;
+    if (typeFilter === "npm" && pkgTypes.indexOf("npm") === -1) continue;
+    if (typeFilter === "pypi" && pkgTypes.indexOf("pypi") === -1) continue;
+    visibleCount++;
+
+    // Action button
+    var srvLabel = escapeHtml(srv.title || srv.name);
+    var actionHtml = "";
+    if (srv.installed && srv.update_available) {
+      actionHtml =
+        '<button class="mcp-install-btn mcp-update-btn" data-reg-install="' +
+        i +
+        '" aria-label="Update ' +
+        srvLabel +
+        '">Update</button>';
+    } else if (srv.installed) {
+      actionHtml = '<span class="mcp-installed-badge">Installed</span>';
+    } else {
+      actionHtml =
+        '<button class="mcp-install-btn" data-reg-install="' +
+        i +
+        '" aria-label="Install ' +
+        srvLabel +
+        '">Install</button>';
+    }
+
+    // Source type badges
+    var sourceBadges = "";
+    if (hasRemote) {
+      sourceBadges +=
+        '<span class="scope-badge mcp-transport-http">remote</span>';
+    }
+    for (var p = 0; p < (srv.packages || []).length; p++) {
+      sourceBadges +=
+        '<span class="scope-badge mcp-transport-stdio">' +
+        escapeHtml(srv.packages[p].registry_type) +
+        "</span>";
+    }
+
+    // Repo link for trust signal
+    var repoLink = "";
+    var repoUrl = (srv.repository || {}).url || "";
+    if (repoUrl) {
+      repoLink =
+        ' <a href="' +
+        escapeHtml(repoUrl) +
+        '" target="_blank" rel="noopener noreferrer" class="mcp-reg-card-repo"' +
+        ' aria-label="Source repository for ' +
+        srvLabel +
+        '"><span aria-hidden="true">\u2197</span></a>';
+    }
+
+    html +=
+      '<div class="mcp-reg-card" role="listitem">' +
+      '<div class="mcp-reg-card-info">' +
+      '<div class="mcp-reg-card-name">' +
+      escapeHtml(srv.title || srv.name) +
+      repoLink +
+      "</div>" +
+      (srv.description
+        ? '<div class="mcp-reg-card-desc">' +
+          escapeHtml(srv.description) +
+          "</div>"
+        : "") +
+      '<div class="mcp-reg-card-meta">' +
+      sourceBadges +
+      "</div></div>" +
+      '<div class="mcp-reg-card-actions">' +
+      (srv.version
+        ? '<span class="mcp-reg-card-version">v' +
+          escapeHtml(srv.version) +
+          "</span>"
+        : "") +
+      actionHtml +
+      "</div></div>";
+  }
+
+  if (!visibleCount && _registryResults.length) {
+    el.innerHTML =
+      '<div class="dashboard-empty">No servers match the selected filter</div>';
+  } else {
+    el.innerHTML = html;
+  }
+
+  // Pagination
+  var pagEl = document.getElementById("mcp-registry-pagination");
+  var moreBtn = document.getElementById("mcp-registry-more");
+  var countEl = document.getElementById("mcp-registry-count");
+  var isFiltered = typeFilter && visibleCount < _registryResults.length;
+  if (_registryCursor) {
+    pagEl.style.display = "";
+    moreBtn.style.display = "";
+    countEl.textContent = isFiltered
+      ? visibleCount +
+        " of " +
+        _registryResults.length +
+        " loaded (more available)"
+      : "Showing " + visibleCount + " results";
+  } else {
+    pagEl.style.display = visibleCount > 0 ? "" : "none";
+    if (moreBtn) moreBtn.style.display = "none";
+    countEl.textContent = isFiltered
+      ? visibleCount + " of " + _registryResults.length + " match filter"
+      : visibleCount + " result" + (visibleCount !== 1 ? "s" : "");
+  }
+
+  // Bind install buttons
+  el.querySelectorAll("[data-reg-install]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var idx = parseInt(this.getAttribute("data-reg-install"), 10);
+      _initiateRegistryInstall(_registryResults[idx]);
+    });
+  });
+}
+
+/* ── Registry Install Flow ───────────────────────────────────────────────── */
+
+function _initiateRegistryInstall(srv) {
+  _mcpInstallServer = srv;
+  var hasRemote = srv.remotes && srv.remotes.length > 0;
+  var hasPackage = srv.packages && srv.packages.length > 0;
+
+  // Check if remote needs configuration
+  var remoteNeedsConfig = false;
+  if (hasRemote) {
+    var remote = srv.remotes[0];
+    for (var hi = 0; hi < (remote.headers || []).length; hi++) {
+      if (remote.headers[hi].is_required) {
+        remoteNeedsConfig = true;
+        break;
+      }
+    }
+    var varKeys = Object.keys(remote.variables || {});
+    for (var vi = 0; vi < varKeys.length; vi++) {
+      if (remote.variables[varKeys[vi]].is_required) {
+        remoteNeedsConfig = true;
+        break;
+      }
+    }
+  }
+
+  // One-click: remote with no config needed and no package alternative
+  if (hasRemote && !remoteNeedsConfig && !hasPackage) {
+    // Disable the clicked Install button for loading feedback
+    var cardBtns = document.querySelectorAll("[data-reg-install]");
+    for (var bi = 0; bi < cardBtns.length; bi++) {
+      var idx = parseInt(cardBtns[bi].getAttribute("data-reg-install"), 10);
+      if (_registryResults[idx] && _registryResults[idx].name === srv.name) {
+        cardBtns[bi].disabled = true;
+        cardBtns[bi].textContent = "Installing\u2026";
+        break;
+      }
+    }
+    _doRegistryInstall(srv.name, "remote", 0, {}, {}, {});
+    return;
+  }
+
+  // Otherwise show the install modal
+  _showInstallMcpModal(srv, hasRemote, hasPackage);
+}
+
+function _showInstallMcpModal(srv, hasRemote, hasPackage) {
+  _mcpInstallTrigger = document.activeElement;
+  var ov = document.getElementById("mcp-install-overlay");
+  ov.style.display = "flex";
+  document.getElementById("mcp-install-error").style.display = "none";
+
+  // Summary
+  document.getElementById("mcp-install-summary").innerHTML =
+    '<div class="mcp-install-summary-name">' +
+    escapeHtml(srv.title || srv.name) +
+    "</div>" +
+    (srv.description
+      ? '<div class="mcp-install-summary-desc">' +
+        escapeHtml(srv.description) +
+        "</div>"
+      : "");
+
+  // Source selector (only if both remote AND package)
+  var srcEl = document.getElementById("mcp-install-source-select");
+  if (hasRemote && hasPackage) {
+    var srcHtml = '<div class="mcp-install-source-group">';
+    srcHtml +=
+      '<label class="mcp-install-source-label">' +
+      '<input type="radio" name="mcp-install-src" value="remote" checked ' +
+      'onchange="_updateInstallFields()"> ' +
+      'Remote <span class="mcp-install-source-type">streamable-http</span>' +
+      "</label>";
+    for (var pi = 0; pi < srv.packages.length; pi++) {
+      srcHtml +=
+        '<label class="mcp-install-source-label">' +
+        '<input type="radio" name="mcp-install-src" value="package-' +
+        pi +
+        '" onchange="_updateInstallFields()"> ' +
+        'Package <span class="mcp-install-source-type">' +
+        escapeHtml(srv.packages[pi].registry_type) +
+        " / " +
+        escapeHtml(srv.packages[pi].identifier) +
+        "</span></label>";
+    }
+    srcHtml += "</div>";
+    srcEl.innerHTML = srcHtml;
+  } else {
+    srcEl.innerHTML = "";
+  }
+
+  _updateInstallFields();
+  _mcpInstallTrap = _installTrap("mcp-install-overlay", "mcp-install-box");
+}
+
+function _updateInstallFields() {
+  var srv = _mcpInstallServer;
+  if (!srv) return;
+  var fieldsEl = document.getElementById("mcp-install-fields");
+  var srcRadio = document.querySelector(
+    'input[name="mcp-install-src"]:checked',
+  );
+  var srcVal = srcRadio ? srcRadio.value : "";
+
+  var source = "remote";
+  var pkgIndex = 0;
+  if (srcVal.startsWith("package-")) {
+    source = "package";
+    pkgIndex = parseInt(srcVal.replace("package-", ""), 10);
+  } else if (!srv.remotes || !srv.remotes.length) {
+    source = "package";
+  }
+
+  var html = "";
+  if (source === "package") {
+    var pkg = srv.packages && srv.packages[pkgIndex];
+    var pkgId = pkg ? pkg.identifier : "";
+    var pkgType = pkg ? pkg.registry_type : "";
+    var runner =
+      pkgType === "npm" ? "npx" : pkgType === "pypi" ? "uvx" : pkgType;
+    html +=
+      '<div class="mcp-registry-notice" role="alert" style="margin-bottom:14px">' +
+      '<span class="mcp-registry-notice-icon" aria-hidden="true">&#9888;</span>' +
+      "This will download and execute <code>" +
+      escapeHtml(pkgId) +
+      "</code> via <code>" +
+      escapeHtml(runner) +
+      "</code> on all cluster nodes. " +
+      "Verify the package source before proceeding.</div>";
+  }
+  if (source === "remote" && srv.remotes && srv.remotes.length > 0) {
+    var remote = srv.remotes[0];
+    // URL variables
+    var varKeys = Object.keys(remote.variables || {});
+    for (var vi = 0; vi < varKeys.length; vi++) {
+      var v = remote.variables[varKeys[vi]];
+      html +=
+        '<label for="mcp-inst-var-' +
+        vi +
+        '">' +
+        escapeHtml(varKeys[vi]) +
+        (v.is_required
+          ? ' <span style="color:var(--red)">*</span>'
+          : ' <span class="label-hint">optional</span>') +
+        "</label>";
+      if (v.choices && v.choices.length) {
+        html +=
+          '<select id="mcp-inst-var-' +
+          vi +
+          '" data-var-name="' +
+          escapeHtml(varKeys[vi]) +
+          '">';
+        if (!v.is_required) html += '<option value="">--</option>';
+        for (var ci = 0; ci < v.choices.length; ci++) {
+          var sel = v.choices[ci] === (v["default"] || "") ? " selected" : "";
+          html +=
+            '<option value="' +
+            escapeHtml(v.choices[ci]) +
+            '"' +
+            sel +
+            ">" +
+            escapeHtml(v.choices[ci]) +
+            "</option>";
+        }
+        html += "</select>";
+      } else {
+        html +=
+          '<input type="text" id="mcp-inst-var-' +
+          vi +
+          '" data-var-name="' +
+          escapeHtml(varKeys[vi]) +
+          '" placeholder="' +
+          escapeHtml(v.description || "") +
+          '" value="' +
+          escapeHtml(v["default"] || "") +
+          '">';
+      }
+    }
+    // Required headers
+    for (var hi = 0; hi < (remote.headers || []).length; hi++) {
+      var h = remote.headers[hi];
+      html +=
+        '<label for="mcp-inst-hdr-' +
+        hi +
+        '">' +
+        escapeHtml(h.name) +
+        (h.is_required
+          ? ' <span style="color:var(--red)">*</span>'
+          : ' <span class="label-hint">optional</span>') +
+        "</label>";
+      html +=
+        '<input type="' +
+        (h.is_secret ? "password" : "text") +
+        '" id="mcp-inst-hdr-' +
+        hi +
+        '" data-hdr-name="' +
+        escapeHtml(h.name) +
+        '" placeholder="' +
+        escapeHtml(h.description || "") +
+        '">';
+    }
+  } else if (source === "package" && srv.packages && srv.packages[pkgIndex]) {
+    var pkg = srv.packages[pkgIndex];
+    var evs = pkg.environment_variables || [];
+    for (var ei = 0; ei < evs.length; ei++) {
+      var ev = evs[ei];
+      html +=
+        '<label for="mcp-inst-env-' +
+        ei +
+        '">' +
+        escapeHtml(ev.name) +
+        (ev.is_required
+          ? ' <span style="color:var(--red)">*</span>'
+          : ' <span class="label-hint">optional</span>') +
+        "</label>";
+      html +=
+        '<input type="' +
+        (ev.is_secret ? "password" : "text") +
+        '" id="mcp-inst-env-' +
+        ei +
+        '" data-env-name="' +
+        escapeHtml(ev.name) +
+        '" placeholder="' +
+        escapeHtml(ev.description || "") +
+        '" value="' +
+        escapeHtml(ev["default"] || "") +
+        '">';
+    }
+  }
+
+  if (!html) {
+    html =
+      '<p style="font-size:12px;color:var(--fg-dim);margin:8px 0">' +
+      "No configuration required — click Install to proceed.</p>";
+  }
+  fieldsEl.innerHTML = html;
+  fieldsEl.setAttribute("data-source", source);
+  fieldsEl.setAttribute("data-pkg-index", String(pkgIndex));
+}
+
+function hideInstallMcpModal() {
+  document.getElementById("mcp-install-overlay").style.display = "none";
+  _mcpInstallTrap = _removeTrap(_mcpInstallTrap);
+  if (_mcpInstallTrigger && _mcpInstallTrigger.focus)
+    _mcpInstallTrigger.focus();
+  _mcpInstallTrigger = null;
+  _mcpInstallServer = null;
+}
+
+function submitInstallMcp() {
+  var srv = _mcpInstallServer;
+  if (!srv) return;
+  var fieldsEl = document.getElementById("mcp-install-fields");
+  var source = fieldsEl.getAttribute("data-source") || "remote";
+  var pkgIndex = parseInt(fieldsEl.getAttribute("data-pkg-index") || "0", 10);
+  var index = source === "remote" ? 0 : pkgIndex;
+
+  var variables = {};
+  fieldsEl.querySelectorAll("[data-var-name]").forEach(function (el) {
+    variables[el.getAttribute("data-var-name")] = el.value;
+  });
+  var headers = {};
+  fieldsEl.querySelectorAll("[data-hdr-name]").forEach(function (el) {
+    if (el.value) headers[el.getAttribute("data-hdr-name")] = el.value;
+  });
+  var env = {};
+  fieldsEl.querySelectorAll("[data-env-name]").forEach(function (el) {
+    if (el.value) env[el.getAttribute("data-env-name")] = el.value;
+  });
+
+  _doRegistryInstall(srv.name, source, index, variables, env, headers);
+}
+
+function _doRegistryInstall(
+  registryName,
+  source,
+  index,
+  variables,
+  env,
+  headers,
+) {
+  var submitBtn = document.getElementById("mcp-install-submit");
+  if (submitBtn) submitBtn.disabled = true;
+
+  authFetch("/v1/api/admin/mcp-registry/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      registry_name: registryName,
+      source: source,
+      index: index,
+      variables: variables,
+      env: env,
+      headers: headers,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Install failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      var overlay = document.getElementById("mcp-install-overlay");
+      if (overlay && overlay.style.display !== "none") {
+        hideInstallMcpModal();
+      }
+      var serverName = data.name || registryName;
+      showToast("Installed " + serverName + " — connecting to nodes\u2026");
+      // Re-search to update installed status
+      if (_mcpCurrentView === "registry" && _registryResults.length) {
+        searchMcpRegistry(false);
+      }
+      // Poll for connection status after a delay
+      if (data.server_id) {
+        _pollInstallStatus(data.server_id, serverName, 0);
+      }
+    })
+    .catch(function (e) {
+      var overlay = document.getElementById("mcp-install-overlay");
+      var errEl = document.getElementById("mcp-install-error");
+      if (errEl && overlay && overlay.style.display !== "none") {
+        errEl.textContent = e.message;
+        errEl.style.display = "";
+      } else {
+        showToast("Install failed: " + e.message);
+      }
+    })
+    .finally(function () {
+      if (submitBtn) submitBtn.disabled = false;
+    });
+}
+
+function _pollInstallStatus(serverId, serverName, attempt) {
+  if (attempt >= 3) return; // give up after ~9s
+  setTimeout(function () {
+    authFetch("/v1/api/admin/mcp-servers/" + encodeURIComponent(serverId))
+      .then(function (r) {
+        return r.ok ? r.json() : null;
+      })
+      .then(function (data) {
+        if (!data) return;
+        var status = data.status || {};
+        var nodeIds = Object.keys(status);
+        var anyConnected = false;
+        var errors = [];
+        for (var i = 0; i < nodeIds.length; i++) {
+          var ns = status[nodeIds[i]];
+          if (ns.connected) anyConnected = true;
+          if (ns.error) errors.push(ns.error);
+        }
+        if (anyConnected) {
+          var tools = 0;
+          for (var j = 0; j < nodeIds.length; j++) {
+            if (status[nodeIds[j]].connected) {
+              tools = status[nodeIds[j]].tools || 0;
+              break;
+            }
+          }
+          var msg = serverName + " connected";
+          if (tools)
+            msg += " (" + tools + " tool" + (tools !== 1 ? "s" : "") + ")";
+          if (errors.length)
+            msg +=
+              ", " +
+              errors.length +
+              " node error" +
+              (errors.length !== 1 ? "s" : "");
+          showToast(msg);
+          if (_mcpCurrentView === "servers") loadAdminMcp();
+        } else if (errors.length) {
+          showToast(serverName + ": " + errors[0]);
+          if (_mcpCurrentView === "servers") loadAdminMcp();
+        } else {
+          _pollInstallStatus(serverId, serverName, attempt + 1);
+        }
+      })
+      .catch(function () {});
+  }, 3000);
 }

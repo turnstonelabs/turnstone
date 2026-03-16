@@ -464,11 +464,21 @@ mcp_servers = sa.Table(
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("registry_name", sa.Text, nullable=True),
+    sa.Column("registry_version", sa.Text, nullable=False, server_default=""),
+    sa.Column("registry_meta", sa.Text, nullable=False, server_default="{}"),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
 
 sa.Index("idx_mcp_servers_enabled", mcp_servers.c.enabled)
+sa.Index(
+    "idx_mcp_servers_registry_name",
+    mcp_servers.c.registry_name,
+    unique=True,
+    sqlite_where=mcp_servers.c.registry_name.isnot(None),
+    postgresql_where=mcp_servers.c.registry_name.isnot(None),
+)
 
 # ---------------------------------------------------------------------------
 # OIDC identity tables

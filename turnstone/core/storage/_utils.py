@@ -59,6 +59,9 @@ MCP_SERVER_MUTABLE = frozenset(
         "env",
         "auto_approve",
         "enabled",
+        "registry_name",
+        "registry_version",
+        "registry_meta",
     }
 )
 VERDICT_MUTABLE = frozenset(

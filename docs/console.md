@@ -420,8 +420,9 @@ The browser maintains a local `clusterState` object that mirrors the cluster sna
 ### 5. Admin Panel
 
 Accessed via the "admin" button in the header (visible when authenticated
-with `approve` scope). Provides user, API token, channel link, and workstream
-template management with 13 tabs (see also [Governance](governance.md) for
+with `approve` scope). Provides user, API token, channel link, MCP server,
+and workstream template management with 14 tabs (see also
+[Governance](governance.md) for
 the Roles, Policies, Templates, WS Templates, Usage, and Audit tabs, and
 [Settings](settings.md) for the database-backed configuration editor):
 
@@ -458,6 +459,22 @@ the Roles, Policies, Templates, WS Templates, Usage, and Audit tabs, and
   removing the channel mapping
 - Admins can force-link users who have not self-linked via `/link` in
   Discord
+
+**MCP Servers tab:**
+
+The tab has two views toggled via a pill control: **Servers** and
+**Registry**.
+
+- **Servers view** -- lists all installed MCP servers with source badges
+  (CONFIG, MANUAL, REGISTRY), transport badges, tool/resource/prompt
+  counts, per-node connection status, and CRUD actions for DB-managed
+  servers
+- **Registry view** -- search the official MCP Registry to discover and
+  install servers. Results show server name, description, version, source
+  type badges (remote/npm/pypi), and Install/Installed/Update buttons.
+  Remote servers without required configuration are installed with one
+  click; servers needing env vars, headers, or URL variables open an
+  install modal for configuration
 
 **Accessibility:**
 

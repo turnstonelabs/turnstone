@@ -167,6 +167,12 @@ export type {
   CreateMcpServerRequest,
   UpdateMcpServerRequest,
   ImportMcpConfigResponse,
+  // MCP registry types
+  RegistryRemoteInfo,
+  RegistryPackageInfo,
+  RegistryServerInfo,
+  RegistrySearchResponse,
+  RegistryInstallRequest,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

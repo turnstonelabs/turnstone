@@ -150,3 +150,69 @@ class TestMcpServerStorage:
         assert s["transport"] == "streamable-http"
         assert s["url"] == "https://example.com/mcp"
         assert "Authorization" in s["headers"]
+
+    # -- Registry columns -------------------------------------------------------
+
+    def test_create_with_registry_columns(self, db: SQLiteBackend) -> None:
+        sid = _make_id()
+        db.create_mcp_server(
+            server_id=sid,
+            name="reg-server",
+            transport="streamable-http",
+            url="https://example.com/mcp",
+            registry_name="io.example/mcp-server",
+            registry_version="1.0.0",
+            registry_meta='{"description":"test"}',
+        )
+        s = db.get_mcp_server(sid)
+        assert s is not None
+        assert s["registry_name"] == "io.example/mcp-server"
+        assert s["registry_version"] == "1.0.0"
+        assert s["registry_meta"] == '{"description":"test"}'
+
+    def test_create_without_registry_columns(self, db: SQLiteBackend) -> None:
+        """Non-registry servers should have None/empty defaults."""
+        sid = _make_id()
+        db.create_mcp_server(server_id=sid, name="plain", transport="stdio")
+        s = db.get_mcp_server(sid)
+        assert s is not None
+        assert s["registry_name"] is None
+        assert s["registry_version"] == ""
+        assert s["registry_meta"] == "{}"
+
+    def test_get_by_registry_name(self, db: SQLiteBackend) -> None:
+        sid = _make_id()
+        db.create_mcp_server(
+            server_id=sid,
+            name="reg-test",
+            transport="stdio",
+            registry_name="io.example/test",
+        )
+        s = db.get_mcp_server_by_registry_name("io.example/test")
+        assert s is not None
+        assert s["server_id"] == sid
+
+    def test_get_by_registry_name_not_found(self, db: SQLiteBackend) -> None:
+        assert db.get_mcp_server_by_registry_name("nonexistent") is None
+
+    def test_null_registry_name_no_conflict(self, db: SQLiteBackend) -> None:
+        """Multiple servers with NULL registry_name should coexist."""
+        db.create_mcp_server(server_id=_make_id(), name="a", transport="stdio")
+        db.create_mcp_server(server_id=_make_id(), name="b", transport="stdio")
+        servers = db.list_mcp_servers()
+        assert len(servers) == 2
+
+    def test_update_registry_columns(self, db: SQLiteBackend) -> None:
+        sid = _make_id()
+        db.create_mcp_server(
+            server_id=sid,
+            name="upgradable",
+            transport="stdio",
+            registry_name="io.example/up",
+            registry_version="1.0.0",
+        )
+        ok = db.update_mcp_server(sid, registry_version="2.0.0")
+        assert ok is True
+        s = db.get_mcp_server(sid)
+        assert s is not None
+        assert s["registry_version"] == "2.0.0"

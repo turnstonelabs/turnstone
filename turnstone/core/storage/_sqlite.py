@@ -2409,6 +2409,9 @@ class SQLiteBackend:
         auto_approve: bool = False,
         enabled: bool = True,
         created_by: str = "",
+        registry_name: str | None = None,
+        registry_version: str = "",
+        registry_meta: str = "{}",
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -2427,6 +2430,9 @@ class SQLiteBackend:
                     "auto_approve": 1 if auto_approve else 0,
                     "enabled": 1 if enabled else 0,
                     "created_by": created_by,
+                    "registry_name": registry_name,
+                    "registry_version": registry_version,
+                    "registry_meta": registry_meta,
                     "created": now,
                     "updated": now,
                 },
@@ -2447,6 +2453,16 @@ class SQLiteBackend:
 
         with self._engine.connect() as conn:
             row = conn.execute(sa.select(mcp_servers).where(mcp_servers.c.name == name)).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "auto_approve", "enabled")
+
+    def get_mcp_server_by_registry_name(self, registry_name: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(mcp_servers).where(mcp_servers.c.registry_name == registry_name)
+            ).fetchone()
             if row is None:
                 return None
             return _row_to_dict(row, "auto_approve", "enabled")

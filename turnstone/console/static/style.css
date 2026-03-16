@@ -1176,7 +1176,7 @@
 #create-template-overlay, #edit-template-overlay,
 #create-wst-overlay, #edit-wst-overlay, #wst-history-overlay,
 #memory-detail-overlay,
-#mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay {
+#mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1893,6 +1893,74 @@
 .admin-action-btn-ghost{background:transparent;color:var(--fg-dim);border:1px solid var(--border-strong)}
 .admin-action-btn-ghost:hover{color:var(--fg);background:var(--bg-highlight)}
 
+/* -- MCP sub-view toggle -------------------------------------------------- */
+.mcp-view-toggle{display:flex;gap:2px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);overflow:hidden}
+.mcp-view-btn{background:var(--bg);color:var(--fg-dim);border:none;font-family:var(--font-display);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:5px 12px;cursor:pointer;transition:background .15s,color .15s}
+.mcp-view-btn:hover{background:var(--bg-highlight);color:var(--fg)}
+.mcp-view-btn.active{background:rgba(192,132,252,.15);color:var(--magenta)}
+.mcp-view-btn:focus-visible{outline:2px solid var(--magenta);outline-offset:-2px}
+
+/* -- MCP source badges ---------------------------------------------------- */
+.scope-config{color:var(--magenta);border-color:rgba(192,132,252,.25)}
+.scope-manual{color:var(--cyan);border-color:rgba(103,232,249,.2)}
+.scope-registry{color:var(--green);border-color:rgba(52,211,153,.2)}
+
+/* -- MCP Registry notice -------------------------------------------------- */
+.mcp-registry-notice{padding:10px 14px;margin-bottom:12px;background:rgba(251,191,36,.06);border:1px solid rgba(251,191,36,.15);border-left:3px solid var(--yellow);border-radius:var(--radius-sm);font-size:11px;line-height:1.5;color:var(--fg-dim)}
+.mcp-registry-notice-icon{color:var(--yellow);font-size:13px;margin-right:6px}
+.mcp-registry-notice a{color:var(--yellow);text-decoration:underline;text-underline-offset:2px}
+.mcp-registry-notice a:hover{color:var(--fg-bright)}
+
+/* -- MCP Registry search -------------------------------------------------- */
+.mcp-registry-search{display:flex;gap:10px;margin-bottom:16px}
+.mcp-registry-search input[type="search"]{flex:1;padding:9px 14px;background:var(--bg);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--fg);font:inherit;font-size:13px;transition:border-color .15s,box-shadow .15s}
+.mcp-registry-search input[type="search"]:focus{border-color:var(--magenta);outline:none;box-shadow:0 0 0 3px rgba(192,132,252,.15)}
+.mcp-registry-search input[type="search"]::placeholder{color:var(--fg-dim);opacity:.8}
+.mcp-registry-search select{padding:9px 30px 9px 10px;background:var(--bg);border:1px solid var(--border-strong);border-radius:var(--radius-sm);color:var(--fg);font:inherit;font-size:12px;min-width:110px;cursor:pointer;appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%238a93ad' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center}
+.mcp-registry-search select:focus{border-color:var(--magenta);outline:none;box-shadow:0 0 0 3px rgba(192,132,252,.15)}
+
+/* -- MCP Registry result cards -------------------------------------------- */
+.mcp-reg-card{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start;padding:14px 16px;background:var(--bg-surface);border:1px solid var(--border);border-left:3px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px;transition:border-color .15s}
+.mcp-reg-card:hover{border-color:var(--border-strong);border-left-color:var(--magenta)}
+.mcp-reg-card-info{min-width:0}
+.mcp-reg-card-name{font-family:var(--font-display);font-size:13px;font-weight:600;color:var(--fg-bright);margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mcp-reg-card-repo{color:var(--fg-dim);text-decoration:none;font-size:11px;margin-left:4px;opacity:.6;transition:opacity .15s}
+.mcp-reg-card-repo:hover{opacity:1;color:var(--magenta)}
+.mcp-reg-card-repo:focus-visible{opacity:1;color:var(--magenta);outline:2px solid var(--magenta);outline-offset:2px}
+.mcp-reg-card-desc{font-size:11px;color:var(--fg-dim);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:4px}
+.mcp-reg-card-meta{display:flex;gap:6px;margin-top:4px;flex-wrap:wrap}
+.mcp-reg-card-meta .scope-badge{font-size:9px}
+.mcp-reg-card-actions{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0}
+.mcp-reg-card-version{font-family:var(--font-mono);font-size:10px;color:var(--fg-dim)}
+
+.mcp-install-btn{background:var(--magenta);color:var(--bg);border:none;border-radius:var(--radius-sm);font-family:var(--font-display);font-size:10px;font-weight:600;padding:5px 14px;cursor:pointer;letter-spacing:.02em;transition:filter .15s;white-space:nowrap}
+.mcp-install-btn:hover{filter:brightness(1.15)}
+.mcp-install-btn:focus-visible{outline:2px solid var(--fg-bright);outline-offset:2px}
+.mcp-install-btn:disabled{opacity:.4;cursor:not-allowed}
+.mcp-install-btn.mcp-update-btn{background:transparent;color:var(--yellow);border:1px solid var(--yellow)}
+.mcp-install-btn.mcp-update-btn:hover{background:rgba(251,191,36,.1);filter:none}
+.mcp-installed-badge{display:inline-block;font-family:var(--font-display);font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:3px 8px;border-radius:2px;background:rgba(52,211,153,.1);color:var(--green);border:1px solid rgba(52,211,153,.2)}
+
+#mcp-registry-pagination{display:flex;align-items:center;padding:12px 0}
+.mcp-registry-count-label{font-size:11px;color:var(--fg-dim);margin-left:10px}
+
+/* -- MCP Install modal ---------------------------------------------------- */
+.mcp-install-summary-name{font-family:var(--font-display);font-size:14px;font-weight:600;color:var(--magenta);margin-bottom:4px}
+.mcp-install-summary-desc{font-size:12px;color:var(--fg-dim);margin-bottom:12px;line-height:1.4}
+.mcp-install-source-group{margin-bottom:14px}
+.mcp-install-source-label{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--border-strong);border-radius:var(--radius-sm);margin-bottom:4px;cursor:pointer;transition:border-color .15s;font-size:12px;color:var(--fg)}
+.mcp-install-source-label:hover{border-color:var(--magenta)}
+.mcp-install-source-label input[type="radio"]{width:auto;margin:0}
+.mcp-install-source-type{font-family:var(--font-mono);font-size:10px;color:var(--fg-dim)}
+
+@media(max-width:700px){
+  .mcp-reg-card{grid-template-columns:1fr;gap:8px}
+  .mcp-reg-card-actions{flex-direction:row;align-items:center}
+  .mcp-registry-search{flex-direction:column}
+  #admin-mcp .admin-toolbar{flex-wrap:wrap;gap:8px}
+  #mcp-servers-toolbar{display:flex;gap:6px;width:100%}
+}
+
 /* ==========================================================================
    OIDC detail panel (inline expansion below user row)
    ========================================================================== */
@@ -2010,4 +2078,7 @@
   .admin-modal input, .admin-modal select { transition: none; }
   .mcp-status-dot.connecting { animation: none; }
   .oidc-detail-panel, .admin-expand-indicator { transition: none; }
+  .mcp-view-btn, .mcp-reg-card, .mcp-install-btn, .mcp-install-source-label { transition: none; }
+  .mcp-registry-search input[type="search"] { transition: none; }
+  .mcp-reg-card-repo { transition: none; }
 }

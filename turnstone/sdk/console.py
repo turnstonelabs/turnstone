@@ -38,6 +38,7 @@ from turnstone.api.console_schemas import (
     NodeDetailResponse,
     OrgInfo,
     PromptTemplateInfo,
+    RegistrySearchResponse,
     RoleInfo,
     SettingInfo,
     ToolPolicyInfo,
@@ -761,6 +762,62 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=ImportMcpConfigResponse,
         )
 
+    # -- MCP registry --------------------------------------------------------
+
+    async def search_mcp_registry(
+        self,
+        q: str = "",
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> RegistrySearchResponse:
+        """Search the MCP Registry for available servers."""
+        params: dict[str, Any] = {}
+        if q:
+            params["q"] = q
+        if limit != 20:
+            params["limit"] = limit
+        if cursor:
+            params["cursor"] = cursor
+        return await self._request(
+            "GET",
+            "/v1/api/admin/mcp-registry/search",
+            params=params,
+            response_model=RegistrySearchResponse,
+        )
+
+    async def install_from_registry(
+        self,
+        registry_name: str,
+        source: str,
+        *,
+        index: int = 0,
+        name: str = "",
+        variables: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> McpServerDetail:
+        """Install an MCP server from the registry."""
+        body: dict[str, Any] = {
+            "registry_name": registry_name,
+            "source": source,
+            "index": index,
+        }
+        if name:
+            body["name"] = name
+        if variables:
+            body["variables"] = variables
+        if env:
+            body["env"] = env
+        if headers:
+            body["headers"] = headers
+        return await self._request(
+            "POST",
+            "/v1/api/admin/mcp-registry/install",
+            json_body=body,
+            response_model=McpServerDetail,
+        )
+
 
 class TurnstoneConsole:
     """Synchronous client for the turnstone console API.
@@ -1182,6 +1239,40 @@ class TurnstoneConsole:
 
     def import_mcp_config(self, config: dict[str, Any]) -> ImportMcpConfigResponse:
         return self._runner.run(self._async.import_mcp_config(config))
+
+    # -- MCP registry --------------------------------------------------------
+
+    def search_mcp_registry(
+        self,
+        q: str = "",
+        *,
+        limit: int = 20,
+        cursor: str | None = None,
+    ) -> RegistrySearchResponse:
+        return self._runner.run(self._async.search_mcp_registry(q, limit=limit, cursor=cursor))
+
+    def install_from_registry(
+        self,
+        registry_name: str,
+        source: str,
+        *,
+        index: int = 0,
+        name: str = "",
+        variables: dict[str, str] | None = None,
+        env: dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> McpServerDetail:
+        return self._runner.run(
+            self._async.install_from_registry(
+                registry_name,
+                source,
+                index=index,
+                name=name,
+                variables=variables,
+                env=env,
+                headers=headers,
+            )
+        )
 
     # -- lifecycle -----------------------------------------------------------
 

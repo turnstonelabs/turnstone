@@ -396,22 +396,54 @@
 
     <div id="admin-mcp" class="admin-panel" role="tabpanel" aria-labelledby="tab-mcp" style="display:none">
       <div class="admin-toolbar">
-        <span class="section-header">MCP SERVERS</span>
-        <button class="admin-action-btn admin-action-btn-ghost" onclick="reloadMcpNodes()" title="Push MCP server config to all cluster nodes and reconnect">Sync to Nodes</button>
-        <button class="admin-action-btn admin-action-btn-ghost" onclick="showImportMcpModal()">Import JSON</button>
-        <button class="admin-action-btn" onclick="showCreateMcpModal()">+ Add Server</button>
+        <span class="section-header">MCP</span>
+        <div class="mcp-view-toggle" role="tablist" aria-label="MCP view">
+          <button class="mcp-view-btn active" data-mcp-view="servers" role="tab" aria-selected="true" aria-controls="mcp-view-servers" onclick="switchMcpView('servers')">Servers</button>
+          <button class="mcp-view-btn" data-mcp-view="registry" role="tab" aria-selected="false" aria-controls="mcp-view-registry" onclick="switchMcpView('registry')">Registry</button>
+        </div>
+        <span id="mcp-servers-toolbar">
+          <button class="admin-action-btn admin-action-btn-ghost" onclick="reloadMcpNodes()" title="Push MCP server config to all cluster nodes and reconnect">Sync to Nodes</button>
+          <button class="admin-action-btn admin-action-btn-ghost" onclick="showImportMcpModal()">Import JSON</button>
+          <button class="admin-action-btn" onclick="showCreateMcpModal()">+ Add Server</button>
+        </span>
       </div>
-      <div class="admin-colheaders mcp-grid" aria-hidden="true">
-        <span class="admin-col admin-col-mname">NAME</span>
-        <span class="admin-col admin-col-mtransport">TRANSPORT</span>
-        <span class="admin-col admin-col-mtools">TOOLS</span>
-        <span class="admin-col admin-col-mres">RES</span>
-        <span class="admin-col admin-col-mprompts">PROMPTS</span>
-        <span class="admin-col admin-col-mstatus">STATUS</span>
-        <span class="admin-col admin-col-mactions">ACTIONS</span>
+      <div id="mcp-view-servers" role="tabpanel">
+        <div class="admin-colheaders mcp-grid" aria-hidden="true">
+          <span class="admin-col admin-col-mname">NAME</span>
+          <span class="admin-col admin-col-mtransport">TRANSPORT</span>
+          <span class="admin-col admin-col-mtools">TOOLS</span>
+          <span class="admin-col admin-col-mres">RES</span>
+          <span class="admin-col admin-col-mprompts">PROMPTS</span>
+          <span class="admin-col admin-col-mstatus">STATUS</span>
+          <span class="admin-col admin-col-mactions">ACTIONS</span>
+        </div>
+        <div id="admin-mcp-table" role="list" aria-label="MCP servers">
+          <div class="dashboard-empty">Loading...</div>
+        </div>
       </div>
-      <div id="admin-mcp-table" role="list" aria-label="MCP servers">
-        <div class="dashboard-empty">Loading...</div>
+      <div id="mcp-view-registry" role="tabpanel" style="display:none">
+        <div class="mcp-registry-notice" role="note">
+          <span class="mcp-registry-notice-icon" aria-hidden="true">&#9432;</span>
+          Servers are community-published via the <a href="https://registry.modelcontextprotocol.io" target="_blank" rel="noopener noreferrer">official MCP Registry</a> and not vetted by Turnstone.<br>
+          <span style="margin-left:19px">Review source repositories before installing.</span>
+        </div>
+        <div class="mcp-registry-search">
+          <input id="mcp-registry-q" type="search" placeholder="Search MCP servers..." autocomplete="off" aria-label="Search registry" onkeydown="if(event.key==='Enter'){event.preventDefault();searchMcpRegistry()}">
+          <select id="mcp-registry-filter" aria-label="Filter by type" onchange="_applyRegistryFilter()">
+            <option value="">All types</option>
+            <option value="remote">Remote only</option>
+            <option value="npm">npm only</option>
+            <option value="pypi">PyPI only</option>
+          </select>
+          <button id="mcp-registry-search-btn" class="admin-action-btn" onclick="searchMcpRegistry()">Search</button>
+        </div>
+        <div id="mcp-registry-results" role="list" aria-label="Registry servers">
+          <div class="dashboard-empty">Search the official MCP Registry to discover and install servers</div>
+        </div>
+        <div id="mcp-registry-pagination" style="display:none">
+          <button id="mcp-registry-more" class="admin-action-btn admin-action-btn-ghost" onclick="loadMoreRegistry()">Load more</button>
+          <span id="mcp-registry-count" class="mcp-registry-count-label"></span>
+        </div>
       </div>
     </div>
 
@@ -1052,6 +1084,20 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div id="mcp-detail-content"></div>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideMcpDetailModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="mcp-install-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="mcp-install-title">
+  <div id="mcp-install-box" class="admin-modal">
+    <h2 id="mcp-install-title">Install MCP Server</h2>
+    <div id="mcp-install-error" role="alert" aria-live="assertive" style="display:none"></div>
+    <div id="mcp-install-summary"></div>
+    <div id="mcp-install-source-select"></div>
+    <div id="mcp-install-fields"></div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideInstallMcpModal()">Cancel</button>
+      <button id="mcp-install-submit" class="modal-submit" onclick="submitInstallMcp()">Install</button>
     </div>
   </div>
 </div>

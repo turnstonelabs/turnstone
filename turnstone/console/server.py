@@ -3127,6 +3127,263 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: MCP Registry
+# ---------------------------------------------------------------------------
+
+
+def _get_registry_url(request: Request) -> str:
+    """Get the MCP Registry URL from DB settings, config.toml, or default."""
+    from turnstone.core.config import load_config
+    from turnstone.core.mcp_registry import DEFAULT_REGISTRY_URL
+
+    # Check database settings first
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage:
+        try:
+            row = storage.get_system_setting("mcp.registry_url")
+            if row:
+                val = json.loads(row["value"])
+                if val:
+                    return str(val)
+        except (KeyError, json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+    # Fall back to config.toml [mcp] section
+    mcp_cfg = load_config("mcp")
+    url = mcp_cfg.get("registry_url", "")
+    if url:
+        return str(url)
+
+    return DEFAULT_REGISTRY_URL
+
+
+async def admin_registry_search(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/mcp-registry/search — search the MCP Registry."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_registry import (
+        MCPRegistryClient,
+        MCPRegistryError,
+        RegistryServer,
+        registry_server_to_dict,
+    )
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    q = str(request.query_params.get("q", "")).strip()
+    try:
+        limit = min(int(request.query_params.get("limit", "20")), 100)
+    except (ValueError, TypeError):
+        limit = 20
+    cursor = request.query_params.get("cursor") or None
+
+    registry_url = _get_registry_url(request)
+
+    async with MCPRegistryClient(base_url=registry_url) as client:
+        try:
+            result = await client.search(q=q, limit=limit, cursor=cursor)
+        except MCPRegistryError as exc:
+            return JSONResponse({"error": f"Registry error: {exc}"}, status_code=502)
+
+    # Deduplicate: keep only isLatest entries, then by name (highest version)
+    # Skip servers with no install source (no remotes and no packages)
+    seen: dict[str, RegistryServer] = {}
+    for srv in result.servers:
+        if srv.meta and not srv.meta.is_latest:
+            continue
+        if not srv.remotes and not srv.packages:
+            continue
+        if srv.name not in seen:
+            seen[srv.name] = srv
+    deduped = list(seen.values())
+
+    # Mark which servers are already installed
+    installed: dict[str, dict[str, Any]] = {}
+    for s in storage.list_mcp_servers():
+        rn = s.get("registry_name")
+        if rn:
+            installed[rn] = s
+
+    servers_out = []
+    for srv in deduped:
+        d = registry_server_to_dict(srv)
+        existing = installed.get(srv.name)
+        if existing:
+            d["installed"] = True
+            d["installed_server_id"] = existing["server_id"]
+            d["installed_version"] = existing.get("registry_version", "")
+            d["update_available"] = existing.get("registry_version", "") != srv.version
+        else:
+            d["installed"] = False
+            d["installed_server_id"] = ""
+            d["installed_version"] = ""
+            d["update_available"] = False
+        servers_out.append(d)
+
+    return JSONResponse(
+        {
+            "servers": servers_out,
+            "total": result.total_count,
+            "next_cursor": result.next_cursor,
+        }
+    )
+
+
+async def admin_registry_install(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/mcp-registry/install — install a server from the registry."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_registry import (
+        MCPRegistryClient,
+        MCPRegistryError,
+        resolve_install_config,
+        sanitize_registry_name,
+    )
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.mcp")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    registry_name = str(body.get("registry_name", "")).strip()
+    if not registry_name:
+        return JSONResponse({"error": "registry_name is required"}, status_code=400)
+
+    source = str(body.get("source", "")).strip()
+    if source not in ("remote", "package"):
+        return JSONResponse({"error": "source must be 'remote' or 'package'"}, status_code=400)
+
+    try:
+        index = int(body.get("index", 0))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "index must be an integer"}, status_code=400)
+    variables = body.get("variables") or {}
+    env_values = body.get("env") or {}
+    header_values = body.get("headers") or {}
+    custom_name = str(body.get("name", "")).strip()
+
+    # Check for duplicates
+    existing = storage.get_mcp_server_by_registry_name(registry_name)
+    if existing:
+        return JSONResponse(
+            {
+                "error": (
+                    f"Registry server '{registry_name}' is already installed "
+                    f"as '{existing['name']}'"
+                )
+            },
+            status_code=409,
+        )
+
+    # Check max servers
+    current = storage.list_mcp_servers()
+    if len(current) >= _MCP_MAX_SERVERS:
+        return JSONResponse({"error": f"Maximum {_MCP_MAX_SERVERS} servers"}, status_code=400)
+
+    # Fetch the specific server from the registry
+    registry_url = _get_registry_url(request)
+    async with MCPRegistryClient(base_url=registry_url) as client:
+        try:
+            result = await client.search(q=registry_name, limit=100)
+        except MCPRegistryError as exc:
+            return JSONResponse({"error": f"Registry error: {exc}"}, status_code=502)
+
+    # Find the exact server by name
+    server = None
+    for s in result.servers:
+        if s.name == registry_name:
+            server = s
+            break
+    if server is None:
+        return JSONResponse(
+            {"error": f"Server '{registry_name}' not found in registry"},
+            status_code=404,
+        )
+
+    # Resolve install configuration
+    try:
+        config = resolve_install_config(server, source, index, variables)
+    except MCPRegistryError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except (IndexError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # Determine server name
+    try:
+        name = custom_name or sanitize_registry_name(registry_name)
+    except MCPRegistryError as exc:
+        return JSONResponse({"error": f"{exc}; provide a custom 'name'"}, status_code=400)
+    if not name or not _MCP_NAME_RE.match(name) or "__" in name:
+        return JSONResponse(
+            {"error": f"Name '{name}' is invalid; provide a custom 'name'"},
+            status_code=400,
+        )
+    if storage.get_mcp_server_by_name(name):
+        return JSONResponse(
+            {"error": f"Server name '{name}' already exists; provide a custom 'name'"},
+            status_code=409,
+        )
+
+    # Merge user-provided env and header values
+    merged_env = config.get("env", {})
+    if isinstance(env_values, dict):
+        merged_env.update(env_values)
+    merged_headers = config.get("headers", {})
+    if isinstance(header_values, dict):
+        merged_headers.update(header_values)
+
+    server_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    storage.create_mcp_server(
+        server_id=server_id,
+        name=name,
+        transport=config["transport"],
+        command=config.get("command", ""),
+        args=json.dumps(config.get("args", [])),
+        url=config.get("url", ""),
+        headers=json.dumps(merged_headers),
+        env=json.dumps(merged_env),
+        auto_approve=False,
+        enabled=True,
+        created_by=audit_uid,
+        registry_name=registry_name,
+        registry_version=config["registry_version"],
+        registry_meta=json.dumps(config["registry_meta"]),
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "mcp_server.registry_install",
+        "mcp_server",
+        server_id,
+        {"name": name, "registry_name": registry_name, "source": source},
+        ip,
+    )
+
+    # Auto-reload nodes for one-click UX
+    await _notify_nodes_mcp_reload(request)
+
+    server_row = storage.get_mcp_server(server_id)
+    return JSONResponse(_mcp_server_to_detail(_mask_mcp_secrets(server_row or {})))
+
+
+# ---------------------------------------------------------------------------
 # Admin: MCP Servers
 # ---------------------------------------------------------------------------
 
@@ -3839,6 +4096,13 @@ def create_app(
                         "/api/admin/settings/{key:path}",
                         admin_delete_setting,
                         methods=["DELETE"],
+                    ),
+                    # System: MCP Registry
+                    Route("/api/admin/mcp-registry/search", admin_registry_search),
+                    Route(
+                        "/api/admin/mcp-registry/install",
+                        admin_registry_install,
+                        methods=["POST"],
                     ),
                     # System: MCP Servers
                     Route("/api/admin/mcp-servers", admin_list_mcp_servers),

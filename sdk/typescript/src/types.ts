@@ -779,6 +779,9 @@ export interface McpServerDetail {
   auto_approve: boolean;
   enabled: boolean;
   created_by: string;
+  registry_name: string | null;
+  registry_version: string;
+  registry_meta: string;
   created: string;
   updated: string;
   status: Record<string, McpServerStatus>;
@@ -816,6 +819,56 @@ export interface ImportMcpConfigResponse {
   imported: string[];
   skipped: string[];
   errors: string[];
+}
+
+// -- Console API: MCP Registry ----------------------------------------------
+
+export interface RegistryRemoteInfo {
+  type: string;
+  url: string;
+  headers: Record<string, unknown>[];
+  variables: Record<string, Record<string, unknown>>;
+}
+
+export interface RegistryPackageInfo {
+  registry_type: string;
+  identifier: string;
+  version: string;
+  transport_type: string;
+  environment_variables: Record<string, unknown>[];
+}
+
+export interface RegistryServerInfo {
+  name: string;
+  description: string;
+  title: string;
+  version: string;
+  website_url: string;
+  repository: Record<string, string>;
+  icons: Record<string, string>[];
+  remotes: RegistryRemoteInfo[];
+  packages: RegistryPackageInfo[];
+  meta: Record<string, unknown>;
+  installed: boolean;
+  installed_server_id: string;
+  installed_version: string;
+  update_available: boolean;
+}
+
+export interface RegistrySearchResponse {
+  servers: RegistryServerInfo[];
+  total: number;
+  next_cursor: string | null;
+}
+
+export interface RegistryInstallRequest {
+  registry_name: string;
+  source: string;
+  index?: number;
+  name?: string;
+  variables?: Record<string, string>;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
 }
 
 // -- Console API: System Settings -------------------------------------------

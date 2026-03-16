@@ -196,6 +196,8 @@ class MCPClientManager:
         if needs_periodic and self._refresh_interval > 0:
             self._refresh_task = asyncio.get_running_loop().create_task(self._periodic_refresh())
 
+    _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
+
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a single MCP server and discover its tools."""
         if "__" in name:
@@ -209,8 +211,11 @@ class MCPClientManager:
         transport = cfg.get("type", "stdio")
         try:
             if transport in ("http", "streamable-http") or "url" in cfg:
-                read, write, _ = await stack.enter_async_context(
-                    streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
+                read, write, _ = await asyncio.wait_for(
+                    stack.enter_async_context(
+                        streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
+                    ),
+                    timeout=self._CONNECT_TIMEOUT,
                 )
             else:
                 # Default: stdio transport
@@ -226,6 +231,13 @@ class MCPClientManager:
                     env=env,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
+        except TimeoutError:
+            log.warning(
+                "MCP server '%s' connection timed out after %ds", name, self._CONNECT_TIMEOUT
+            )
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            raise TimeoutError(f"Connection timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
             await stack.aclose()
             raise
@@ -263,7 +275,12 @@ class MCPClientManager:
 
         self._per_server_stacks[name] = stack
         try:
-            await session.initialize()
+            await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
+        except TimeoutError:
+            self._per_server_stacks.pop(name, None)
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
             self._per_server_stacks.pop(name, None)
             with contextlib.suppress(Exception):

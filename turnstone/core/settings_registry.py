@@ -241,6 +241,16 @@ def _build_registry() -> dict[str, SettingDef]:
             "mcp",
             min_value=0,
         ),
+        SettingDef(
+            "mcp.registry_url",
+            "str",
+            "",
+            "MCP Registry URL (empty = official registry)",
+            "mcp",
+            help="Override the MCP Registry URL for enterprise/private registries. "
+            "Leave empty to use the official registry at registry.modelcontextprotocol.io.",
+            reference_url="https://registry.modelcontextprotocol.io",
+        ),
         # -- ratelimit ------------------------------------------------------
         SettingDef(
             "ratelimit.enabled",

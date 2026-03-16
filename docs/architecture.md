@@ -550,6 +550,17 @@ at connection time (server names with `__` are rejected).
 servers are unaffected. Tool execution errors return error strings to the LLM
 rather than crashing the session.
 
+**Registry discovery:** The console admin panel provides a registry discovery
+surface backed by the official MCP Registry (registry.modelcontextprotocol.io).
+`MCPRegistryClient` (`turnstone/core/mcp_registry.py`) is a standalone httpx
+async client that queries the registry's v0.1 API for server discovery. Search
+results are annotated with installed status by cross-referencing the
+`mcp_servers` table. Installation creates a DB row with `registry_name`,
+`registry_version`, and `registry_meta` columns (migration 019), then triggers
+cluster-wide node reload via `_notify_nodes_mcp_reload()`. The registry URL is
+configurable via the `mcp.registry_url` setting for enterprise/private
+registries.
+
 ### Provider Adapter Layer
 
 > See also: [Core Engine Classes diagram](diagrams/png/03-core-engine-classes.png)

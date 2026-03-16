@@ -110,6 +110,8 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `update_ws_template(template_id, *, name=..., enabled=..., ...)` | `WsTemplateInfo` |
 | | `delete_ws_template(template_id)` | `StatusResponse` |
 | | `list_ws_template_versions(template_id)` | `ListWsTemplateVersionsResponse` |
+| **MCP Registry** | `search_mcp_registry(q="", *, limit=20, cursor=None)` | `RegistrySearchResponse` |
+| | `install_from_registry(registry_name, source, *, index=0, name="", variables=None, env=None, headers=None)` | `McpServerDetail` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |
 | **Auth** | `login(username=..., password=...)` / `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
@@ -227,6 +229,13 @@ await client.login({ username: "alice", password: "s3cret" });
 
 const overview = await client.overview();
 console.log(`Nodes: ${overview.nodes}, Workstreams: ${overview.workstreams}`);
+
+// Search and install from the MCP Registry
+const results = await client.searchMcpRegistry({ q: "github", limit: 10 });
+const server = await client.installFromRegistry({
+  registry_name: results.servers[0].name,
+  source: "remote",
+});
 
 // Stream cluster events
 for await (const event of client.clusterEvents()) {

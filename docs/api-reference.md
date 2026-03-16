@@ -1470,6 +1470,87 @@ Secrets (`env`, `headers` fields) are masked with `***` by default. Use `?reveal
 
 ---
 
+### MCP Registry
+
+#### Search Registry
+
+`GET /v1/api/admin/mcp-registry/search`
+
+Search the official MCP Registry for available servers. Permission: `admin.mcp`.
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `q` | string | `""` | Search query. Empty returns a browsable listing. |
+| `limit` | integer | `20` | Results per page (max 100). |
+| `cursor` | string | — | Opaque cursor for pagination. |
+
+**Response:** `200`
+
+```json
+{
+  "servers": [
+    {
+      "name": "io.example/mcp-server",
+      "description": "...",
+      "title": "Example Server",
+      "version": "1.0.0",
+      "website_url": "https://example.com",
+      "repository": {"url": "...", "source": "github"},
+      "icons": [],
+      "remotes": [{"type": "streamable-http", "url": "...", "headers": [...], "variables": {...}}],
+      "packages": [{"registry_type": "npm", "identifier": "@example/server", "version": "1.0.0", "transport_type": "stdio", "environment_variables": [...]}],
+      "meta": {"status": "active", "is_latest": true},
+      "installed": false,
+      "installed_server_id": "",
+      "installed_version": "",
+      "update_available": false
+    }
+  ],
+  "total": 100,
+  "next_cursor": "abc123"
+}
+```
+
+**Errors:** `502` (registry unreachable).
+
+#### Install from Registry
+
+`POST /v1/api/admin/mcp-registry/install`
+
+Install an MCP server from the registry. Auto-reloads all cluster nodes. Permission: `admin.mcp`.
+
+**Request body:**
+
+```json
+{
+  "registry_name": "io.example/mcp-server",
+  "source": "remote",
+  "index": 0,
+  "name": "",
+  "variables": {},
+  "env": {"API_KEY": "sk-..."},
+  "headers": {"Authorization": "Bearer ..."}
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `registry_name` | string | yes | Server name from registry search results. |
+| `source` | string | yes | `"remote"` (streamable-http) or `"package"` (npm/pypi). |
+| `index` | integer | no (default `0`) | Which remote or package entry to use. |
+| `name` | string | no | Custom server name. Auto-derived from registry name if empty. |
+| `variables` | object | no | Values for URL template `{var}` placeholders. |
+| `env` | object | no | Environment variable values for package servers. |
+| `headers` | object | no | Header values for remote servers. |
+
+**Response:** Same as `POST /v1/api/admin/mcp-servers` (McpServerDetail).
+
+**Errors:** `400` (validation), `404` (not in registry), `409` (already installed or name collision), `502` (registry unreachable).
+
+---
+
 ### `OPTIONS` (any path)
 
 Handles CORS preflight requests.

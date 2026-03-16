@@ -30,6 +30,8 @@ import type {
   ListSettingSchemaResponse,
   ListSettingsResponse,
   McpServerDetail,
+  RegistryInstallRequest,
+  RegistrySearchResponse,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
@@ -458,6 +460,30 @@ export class TurnstoneConsole extends BaseClient {
   ): Promise<ImportMcpConfigResponse> {
     return this.request("POST", "/v1/api/admin/mcp-servers/import", {
       json: { config },
+    });
+  }
+
+  // -- MCP Registry ---------------------------------------------------------
+
+  async searchMcpRegistry(opts?: {
+    q?: string;
+    limit?: number;
+    cursor?: string;
+  }): Promise<RegistrySearchResponse> {
+    const params: Record<string, string> = {};
+    if (opts?.q) params.q = opts.q;
+    if (opts?.limit) params.limit = String(opts.limit);
+    if (opts?.cursor) params.cursor = opts.cursor;
+    return this.request("GET", "/v1/api/admin/mcp-registry/search", {
+      params,
+    });
+  }
+
+  async installFromRegistry(
+    body: RegistryInstallRequest,
+  ): Promise<McpServerDetail> {
+    return this.request("POST", "/v1/api/admin/mcp-registry/install", {
+      json: body,
     });
   }
 }

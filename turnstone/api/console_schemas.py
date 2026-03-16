@@ -589,6 +589,9 @@ class McpServerInfo(BaseModel):
     auto_approve: bool = False
     enabled: bool = True
     created_by: str = ""
+    registry_name: str | None = None
+    registry_version: str = ""
+    registry_meta: str = "{}"
     created: str
     updated: str
 
@@ -650,3 +653,56 @@ class ImportMcpConfigResponse(BaseModel):
 class McpReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Admin: MCP Registry
+# ---------------------------------------------------------------------------
+
+
+class RegistryRemoteInfo(BaseModel):
+    type: str = "streamable-http"
+    url: str = ""
+    headers: list[dict[str, Any]] = Field(default_factory=list)
+    variables: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class RegistryPackageInfo(BaseModel):
+    registry_type: str = ""
+    identifier: str = ""
+    version: str = ""
+    transport_type: str = "stdio"
+    environment_variables: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RegistryServerInfo(BaseModel):
+    name: str
+    description: str = ""
+    title: str = ""
+    version: str = ""
+    website_url: str = ""
+    repository: dict[str, str] = Field(default_factory=dict)
+    icons: list[dict[str, str]] = Field(default_factory=list)
+    remotes: list[RegistryRemoteInfo] = Field(default_factory=list)
+    packages: list[RegistryPackageInfo] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+    installed: bool = False
+    installed_server_id: str = ""
+    installed_version: str = ""
+    update_available: bool = False
+
+
+class RegistrySearchResponse(BaseModel):
+    servers: list[RegistryServerInfo]
+    total: int = 0
+    next_cursor: str | None = None
+
+
+class RegistryInstallRequest(BaseModel):
+    registry_name: str
+    source: str  # "remote" | "package"
+    index: int = 0
+    name: str = ""
+    variables: dict[str, str] = Field(default_factory=dict)
+    env: dict[str, str] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)

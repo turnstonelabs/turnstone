@@ -8,6 +8,7 @@ skinparam participant {
     BackgroundColor<<storage>> #B3E5FC
     BackgroundColor<<server>> #FFE0B2
     BackgroundColor<<ui>> #E8EAF6
+    BackgroundColor<<registry>> #F8BBD0
 }
 
 participant "MCP Server\n(external)" as MCPSrv <<mcp>>
@@ -18,6 +19,9 @@ participant "Server / Console\n(health + UI)" as UI <<server>>
 
 participant "Console Admin UI\n(admin panel)" as Admin <<ui>>
 participant "Database\n(mcp_servers table)" as DB <<storage>>
+
+participant "MCPRegistryClient\n(mcp_registry.py)" as RegClient <<mcp>>
+participant "MCP Registry\n(registry.modelcontextprotocol.io)" as Registry <<registry>>
 
 == Admin-Driven Configuration ==
 
@@ -31,6 +35,28 @@ note right
   - New entries → connect
   - Removed entries → disconnect
   - Changed entries → reconnect
+end note
+
+== Registry Discovery & Install ==
+
+Admin -> UI : GET /v1/api/admin/mcp-registry/search?search=...
+UI -> RegClient : search(q, limit, cursor)
+RegClient -> Registry : GET /v0.1/servers?search=...&latest=true
+Registry --> RegClient : Server entries\n(remotes, packages, meta)
+RegClient --> UI : RegistrySearchResult\n(annotated with installed status)
+UI --> Admin : Search results\n(Install / Installed badges)
+
+Admin -> UI : POST /v1/api/admin/mcp-registry/install
+UI -> DB : create_mcp_server()\n(registry_name, version, meta)
+UI -> MCPMgr : POST /_internal/mcp-reload\n(fan-out to nodes)
+MCPMgr -> MCPMgr : reconcile_sync()
+MCPMgr -> MCPSrv : connect to new server
+
+note over RegClient, Registry
+  MCPRegistryClient is an async httpx client
+  targeting registry.modelcontextprotocol.io/v0.1.
+  resolve_install_config() translates registry
+  remotes/packages into mcp_servers rows.
 end note
 
 == Startup: Connection & Discovery ==

@@ -47,6 +47,8 @@ from turnstone.api.console_schemas import (
     NodeDetailResponse,
     OrgInfo,
     PromptTemplateInfo,
+    RegistryInstallRequest,
+    RegistrySearchResponse,
     RoleInfo,
     SettingInfo,
     SettingSchemaInfo,
@@ -715,6 +717,29 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 404],
         tags=["Admin"],
     ),
+    # --- Admin: MCP Registry ---
+    EndpointSpec(
+        "/v1/api/admin/mcp-registry/search",
+        "GET",
+        "Search the MCP Registry for available servers",
+        response_model=RegistrySearchResponse,
+        query_params=[
+            QueryParam("q", "Search query"),
+            QueryParam("limit", "Max results (default 20, max 100)", schema_type="integer"),
+            QueryParam("cursor", "Pagination cursor for next page"),
+        ],
+        error_codes=[502],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/mcp-registry/install",
+        "POST",
+        "Install an MCP server from the registry",
+        request_model=RegistryInstallRequest,
+        response_model=McpServerDetail,
+        error_codes=[400, 404, 409, 502],
+        tags=["Admin"],
+    ),
     # --- Admin: MCP Servers ---
     EndpointSpec(
         "/v1/api/admin/mcp-servers",
@@ -854,6 +879,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ImportMcpConfigRequest,
     ImportMcpConfigResponse,
     McpReloadResponse,
+    RegistrySearchResponse,
+    RegistryInstallRequest,
     PromptTemplateSummary,
     ListPromptTemplateSummaryResponse,
 ]
