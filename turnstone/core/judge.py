@@ -332,7 +332,7 @@ _HIGH_RULES: list[_HeuristicRule] = [
         recommendation="review",
         tool_pattern="bash",
         arg_patterns=[
-            r"\bcrontab\s+(?!-l\b)",
+            r"\bcrontab\s+(?!-[lhV]\b|--help\b|--version\b)",
             r"\bsystemctl\s+(enable|disable|start|stop|restart|mask|unmask)\b",
             r"\blaunchctl\s+(load|bootstrap|enable)\b",
         ],
@@ -354,8 +354,8 @@ _MEDIUM_RULES: list[_HeuristicRule] = [
         recommendation="review",
         tool_pattern="bash",
         arg_patterns=[
-            r"(curl|wget)\s+\S+.*\|\s*(python3?|node|ruby|perl)\b",
-            r"(curl|wget)\s+\S+.*-O\s*-\s*\|\s*\w",
+            r"(curl|wget)\s+\S+.*\|\s*(python3?|node|ruby|perl|php|jq)\b",
+            r"(curl|wget)\s+\S+.*-O\s*-\s*\|\s*(python3?|node|ruby|perl|php|jq)\b",
         ],
         intent_template="Fetch-and-process pipeline: {arg_snippet}",
         reasoning_template=(
@@ -388,7 +388,9 @@ _MEDIUM_RULES: list[_HeuristicRule] = [
         recommendation="review",
         tool_pattern="bash",
         arg_patterns=[
-            r"\b(az|gcloud|kubectl|terraform|pulumi)\s+(?:\S+\s+)*(apply|create|delete|destroy|scale|deploy|remove)\b",
+            r"\b(az|gcloud)\s+(?:\S+\s+)*(apply|create|delete|destroy|scale|deploy|remove)\b",
+            r"\bkubectl\s+(apply|create|delete|scale|rollout|drain|cordon)\b",
+            r"\b(terraform|pulumi)\s+(apply|destroy|import)\b",
             r"\baws\s+\S+\s+(create|delete|destroy|terminate|put|remove|update|modify)\b",
         ],
         intent_template="Cloud infrastructure mutation: {arg_snippet}",
