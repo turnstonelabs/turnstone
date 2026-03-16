@@ -111,6 +111,7 @@ class MCPClientManager:
         self._db_managed: set[str] = set()
         # Per-server last-error tracking (set on failure, cleared on success)
         self._last_error: dict[str, str] = {}
+        self._MAX_ERROR_LEN = 256
 
         # Per-server tool storage for surgical refresh
         self._per_server_tools: dict[str, list[dict[str, Any]]] = {}
@@ -175,7 +176,7 @@ class MCPClientManager:
                 await self._connect_one(name, cfg)
             except Exception as exc:
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
-                self._last_error[name] = f"{type(exc).__name__}: {exc}"
+                self._set_error(name, f"{type(exc).__name__}: {exc}")
 
         self._connected.set()
 
@@ -247,9 +248,10 @@ class MCPClientManager:
                 elif isinstance(root, mcp_types.PromptListChangedNotification):
                     log.info("Received prompts/list_changed from '%s'", name)
                     await self._refresh_server_prompts(name)
+                self._last_error.pop(name, None)
             except Exception as exc:
                 log.warning("Refresh after notification failed for '%s'", name, exc_info=True)
-                self._last_error[name] = f"Refresh failed: {exc}"
+                self._set_error(name, f"Refresh failed: {exc}")
 
         try:
             session = await stack.enter_async_context(
@@ -466,7 +468,7 @@ class MCPClientManager:
                 results[name] = (added, removed)
             except Exception as exc:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
-                self._last_error[name] = f"Refresh failed: {exc}"
+                self._set_error(name, f"Refresh failed: {exc}")
                 results[name] = ([], [])
 
         # Final sync to clean up templates from servers that are no longer connected
@@ -509,7 +511,7 @@ class MCPClientManager:
                     self._last_error.pop(name, None)
                 except Exception as exc:
                     log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
-                    self._last_error[name] = f"Periodic refresh failed: {exc}"
+                    self._set_error(name, f"Periodic refresh failed: {exc}")
             await asyncio.sleep(self._refresh_interval)
 
     # -- resource refresh ----------------------------------------------------
@@ -1004,6 +1006,11 @@ class MCPClientManager:
 
         log.info("Removed MCP server '%s'", name)
         return was_connected
+
+    def _set_error(self, name: str, msg: str) -> None:
+        """Store a sanitized error string for a server."""
+        clean = msg.replace("\n", " ").replace("\r", "")
+        self._last_error[name] = clean[: self._MAX_ERROR_LEN]
 
     def get_server_status(self, name: str) -> dict[str, Any]:
         """Return live status for a single server, including config details."""
