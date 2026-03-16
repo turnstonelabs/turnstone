@@ -633,14 +633,14 @@ in UIs or discovering available skills before creating a workstream.
 
 ```json
 {
-  "templates": [
+  "skills": [
     {"name": "safety-guidelines", "category": "safety", "is_default": true, "origin": "manual"},
     {"name": "mcp__server__code", "category": "", "is_default": false, "origin": "mcp"}
   ]
 }
 ```
 
-Each template summary:
+Each skill summary:
 
 | Field        | Type   | Description                                          |
 |--------------|--------|------------------------------------------------------|

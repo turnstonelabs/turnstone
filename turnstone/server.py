@@ -1245,6 +1245,12 @@ async def create_workstream(request: Request) -> JSONResponse:
     if skill_data and skill_data.get("model"):
         resolved_model = skill_data["model"]
     resolved_skill: str | None = body_skill if skill_data else None
+    applied_skill_version = 0
+    if skill_data:
+        from turnstone.core.storage import get_storage as _get_storage
+
+        _st = _get_storage()
+        applied_skill_version = len(_st.list_skill_versions(skill_data["template_id"])) + 1
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -1252,7 +1258,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             model=resolved_model,
             skill=resolved_skill,
             skill_id=skill_data["template_id"] if skill_data else "",
-            skill_version=1 if skill_data else 0,
+            skill_version=applied_skill_version,
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -1325,7 +1331,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             # Metadata
             sess._notify_on_complete = skill_data.get("notify_on_complete", "{}")
             sess._applied_skill_id = skill_data["template_id"]
-            sess._applied_skill_version = 1
+            sess._applied_skill_version = applied_skill_version
             if skill_data.get("content"):
                 sess._applied_skill_content = skill_data["content"]
             sess._save_config()
