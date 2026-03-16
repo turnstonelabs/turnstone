@@ -85,20 +85,43 @@ last) and returns the first matching rule. Each rule has:
   argument text (command string for bash, path for file tools, JSON for others)
 - **Risk level, confidence, and recommendation**: Pre-assigned per rule
 
-### Rule tiers
+### Rule tiers (36 rules)
 
 | Tier     | Confidence | Recommendation | Examples |
 |----------|-----------|----------------|----------|
-| Critical | 0.90      | deny           | `rm -rf /`, `mkfs`, `dd if=`, pipe-to-shell, chmod 777 on root, write/edit to `/etc/`, `.ssh/` |
-| High     | 0.80      | review         | `sudo`, `kill -9`, destructive git (`reset --hard`, `push --force`, `clean -f`), DROP TABLE, write/edit secrets (`.env`, `.pem`, `.key`), HTTP mutations, `ssh`/`scp` |
-| Medium   | 0.70      | review         | Package installs (`pip`, `npm`, `apt`, `brew`, `cargo`), `write_file` (default), MCP tool calls, Docker operations |
-| Low      | 0.85      | approve        | `read_file`, `list_directory`, `search`, `recall`, `man`, `use_prompt`, read-only bash commands (`ls`, `cat`, `head`, `grep`, `find`, etc.) |
+| Critical | 0.90      | deny           | `rm -rf /`, `mkfs`, `dd if=`, pipe-to-shell, chmod 777 on root, write/edit to `/etc/` or `.ssh/`, download-then-execute chains (`curl -o file && chmod +x && bash`) |
+| High     | 0.80      | review         | `sudo`, `kill -9`, destructive git, DROP TABLE, write/edit secrets, HTTP mutations, `ssh`/`scp`, credential file access, browser automation + data export, transitive installs (`npx skills add`, `pip install git+`), control plane mutations (`crontab`, `systemctl enable/start/stop`) |
+| Medium   | 0.70      | review         | Content ingestion pipelines (`curl \| python3`), interpreter execution (`python3 script.py`, `node build.js`), cloud CLI mutations (`az/gcloud/aws/kubectl/terraform` with create/delete/destroy verbs), package installs, `write_file`, MCP tools, Docker operations |
+| Low      | 0.85      | approve        | `read_file`, `list_directory`, `search`, `recall`, `man`, `use_prompt`, `tool_search`, `read_resource`, `web_search`, read-only bash (`ls`, `cat`, `head`, `grep`, `find`, etc.) |
 
 When no rule matches, the heuristic returns a default verdict: medium risk,
 0.50 confidence, "review" recommendation.
 
 The bash "read-only" rule handles simple pipelines and command chains by
 splitting on `|`, `&&`, `||`, and `;`, then checking each segment individually.
+
+### Rules derived from audit data
+
+Several rules were calibrated using analysis of 25K public agent skill
+security audits across three independent auditors:
+
+- **`download-exec`**: Two-step download-then-execute chains that bypass the
+  existing `pipe-to-shell` rule. 8% of critical-tier skills use this pattern.
+- **`transitive-install`**: Installing packages from URLs or git repos rather
+  than vetted registries. Socket flags this as supply-chain critical in 36%
+  of dangerous skills.
+- **`browser-data-export`**: Browser automation combined with cookie/session/
+  profile export. OpenClaw treats browser profile access as operator-level
+  capability.
+- **`control-plane-mutation`**: Persistent system changes (crontab, systemd)
+  that outlive the session. OpenClaw denies control-plane tools by default.
+- **`content-ingestion`**: Fetch-and-process pipelines where remote content
+  feeds into an interpreter (Snyk W011 pattern — indirect prompt injection
+  surface).
+- **`interpreter-exec`**: Running a script file whose content hasn't been
+  inspected. Opaque to command-level heuristics.
+- **`cloud-infra-mutation`**: Distinguishes destructive cloud CLI verbs
+  (`create`, `delete`, `destroy`) from read-only ones (`show`, `list`, `get`).
 
 ---
 

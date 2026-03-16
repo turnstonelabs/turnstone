@@ -170,6 +170,22 @@ _CRITICAL_RULES: list[_HeuristicRule] = [
         intent_template="Edit of sensitive system path: {arg_snippet}",
         reasoning_template="Editing system configuration or SSH key paths.",
     ),
+    _HeuristicRule(
+        name="download-exec",
+        risk_level="critical",
+        confidence=0.90,
+        recommendation="deny",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"(curl|wget)\s+.*-o\s+\S+.*&&.*(chmod\s+\+x|bash|sh|python3?|node)(\s|$)",
+            r"(curl|wget)\s+\S+.*&&\s*(bash|sh|python3?|node)(\s|$)",
+        ],
+        intent_template="Download-then-execute chain: {arg_snippet}",
+        reasoning_template=(
+            "Command downloads a remote file then executes it. "
+            "This is a two-step variant of pipe-to-shell."
+        ),
+    ),
 ]
 
 # -- High (confidence 0.80, review) ----------------------------------------
@@ -275,11 +291,112 @@ _HIGH_RULES: list[_HeuristicRule] = [
             "to /etc/passwd or /etc/shadow is a reconnaissance pattern."
         ),
     ),
+    _HeuristicRule(
+        name="browser-data-export",
+        risk_level="high",
+        confidence=0.80,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"(playwright|puppeteer|selenium|browser\.use).*(cookie|session|profile|export|sync|token)",
+            r"(cookie|session|profile|export).*(playwright|puppeteer|selenium|browser\.use)",
+        ],
+        intent_template="Browser automation with data export: {arg_snippet}",
+        reasoning_template=(
+            "Combining browser automation with sensitive data access "
+            "(cookies, sessions, profiles). This is operator-level capability."
+        ),
+    ),
+    _HeuristicRule(
+        name="transitive-install",
+        risk_level="high",
+        confidence=0.80,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"\bnpx\s+skills\s+add\b",
+            r"\bpip\s+install\s+git\+https?://",
+            r"\bnpm\s+install\s+https?://",
+            r"\bpip\s+install\s+--index-url\s",
+        ],
+        intent_template="Package install from untrusted source: {arg_snippet}",
+        reasoning_template=(
+            "Installing packages from URLs or git repos bypasses registry "
+            "vetting. Supply chain risk is significantly higher than registry installs."
+        ),
+    ),
+    _HeuristicRule(
+        name="control-plane-mutation",
+        risk_level="high",
+        confidence=0.80,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"\bcrontab\s+(?!-l\b)",
+            r"\bsystemctl\s+(enable|disable|start|stop|restart|mask|unmask)\b",
+            r"\blaunchctl\s+(load|bootstrap|enable)\b",
+        ],
+        intent_template="Persistent system change: {arg_snippet}",
+        reasoning_template=(
+            "Command modifies cron schedules or systemd/launchd services. "
+            "These changes persist beyond the current session."
+        ),
+    ),
 ]
 
 # -- Medium (confidence 0.70, review) --------------------------------------
 
 _MEDIUM_RULES: list[_HeuristicRule] = [
+    _HeuristicRule(
+        name="content-ingestion",
+        risk_level="medium",
+        confidence=0.70,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"(curl|wget)\s+\S+.*\|\s*(python3?|node|ruby|perl)\b",
+            r"(curl|wget)\s+\S+.*-O\s*-\s*\|\s*\w",
+        ],
+        intent_template="Fetch-and-process pipeline: {arg_snippet}",
+        reasoning_template=(
+            "Fetching remote content and piping it into an interpreter. "
+            "Third-party content can carry prompt injection or malicious payloads."
+        ),
+    ),
+    _HeuristicRule(
+        name="interpreter-exec",
+        risk_level="medium",
+        confidence=0.70,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"\bpython3?\s+\S+\.py\b",
+            r"\bnode\s+\S+\.(js|mjs|ts)\b",
+            r"\bruby\s+\S+\.rb\b",
+            r"\b(ba)?sh\s+\S+\.sh\b",
+        ],
+        intent_template="Script execution: {arg_snippet}",
+        reasoning_template=(
+            "Running an interpreter on a script file whose content has not "
+            "been inspected. The script may contain arbitrary operations."
+        ),
+    ),
+    _HeuristicRule(
+        name="cloud-infra-mutation",
+        risk_level="medium",
+        confidence=0.70,
+        recommendation="review",
+        tool_pattern="bash",
+        arg_patterns=[
+            r"\b(az|gcloud|kubectl|terraform|pulumi)\s+(?:\S+\s+)*(apply|create|delete|destroy|scale|deploy|remove)\b",
+            r"\baws\s+\S+\s+(create|delete|destroy|terminate|put|remove|update|modify)\b",
+        ],
+        intent_template="Cloud infrastructure mutation: {arg_snippet}",
+        reasoning_template=(
+            "Command modifies cloud infrastructure via CLI. "
+            "Distinguish from read-only cloud commands (list, show, get)."
+        ),
+    ),
     _HeuristicRule(
         name="package-install",
         risk_level="medium",
@@ -405,6 +522,36 @@ _LOW_RULES: list[_HeuristicRule] = [
         arg_patterns=[],
         intent_template="MCP prompt: {arg_snippet}",
         reasoning_template="Using an MCP prompt template is a read-only operation.",
+    ),
+    _HeuristicRule(
+        name="tool-search",
+        risk_level="low",
+        confidence=0.85,
+        recommendation="approve",
+        tool_pattern="tool_search",
+        arg_patterns=[],
+        intent_template="Tool search: {arg_snippet}",
+        reasoning_template="Searching available tools is a read-only operation.",
+    ),
+    _HeuristicRule(
+        name="read-resource",
+        risk_level="low",
+        confidence=0.85,
+        recommendation="approve",
+        tool_pattern="read_resource",
+        arg_patterns=[],
+        intent_template="MCP resource read: {arg_snippet}",
+        reasoning_template="Reading an MCP resource is a read-only operation.",
+    ),
+    _HeuristicRule(
+        name="web-search",
+        risk_level="low",
+        confidence=0.85,
+        recommendation="approve",
+        tool_pattern="web_search",
+        arg_patterns=[],
+        intent_template="Web search: {arg_snippet}",
+        reasoning_template="Web search is a read-only query operation.",
     ),
 ]
 

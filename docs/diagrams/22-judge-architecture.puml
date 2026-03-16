@@ -35,18 +35,24 @@ Session -> Judge : evaluate(items, messages, callback)
 
 Judge -> Judge : evaluate_heuristic()\nfor each item
 note right
-  **Rule table (first match wins):**
+  **36 rules (first match wins):**
   Critical (0.90, deny): rm /, mkfs,
     dd, pipe-to-shell, chmod 777 /,
-    write/edit /etc/ .ssh/
+    write/edit /etc/ .ssh/,
+    download-then-execute chains
   High (0.80, review): sudo, kill -9,
     destructive git, DROP TABLE,
-    secrets, HTTP mutations, ssh/scp
-  Medium (0.70, review): pip/npm install,
+    secrets, HTTP mutations, ssh/scp,
+    browser+data-export, transitive
+    install, control-plane mutation
+  Medium (0.70, review): content
+    ingestion, interpreter exec,
+    cloud CLI mutations, pkg install,
     write_file, MCP tools, docker ops
   Low (0.85, approve): read_file,
     list_directory, search, recall,
-    read-only bash (ls, cat, grep...)
+    tool_search, read_resource,
+    web_search, read-only bash
   Default: medium, 0.50, review
 end note
 

@@ -157,7 +157,7 @@ Every tool call that requires human approval is evaluated by an intent validatio
 
 The system uses a two-tier evaluation pipeline:
 
-1. **Heuristic tier** (instant, free) — 23 pattern-based rules classify tool calls by severity. Catches destructive commands (`rm -rf /`, `DROP TABLE`), privilege escalation (`sudo`), credential access, and more. Results appear immediately.
+1. **Heuristic tier** (instant, free) — 36 pattern-based rules classify tool calls by severity. Catches destructive commands (`rm -rf /`, `DROP TABLE`), privilege escalation (`sudo`), credential access, supply chain risks, browser data export, cloud infrastructure mutations, and more. Results appear immediately.
 2. **LLM judge tier** (async) — A full LLM evaluation runs in the background with access to `read_file` and `list_directory` for evidence gathering. The judge can inspect files that a write would overwrite, check directory contents before a delete, and cite specific evidence in its reasoning. Results update the UI progressively when ready.
 
 The judge defaults to the same model as the session (self-consistency) but can be configured to use a separate model — useful when running a small local model for tasks but wanting a commercial model for safety evaluation.
