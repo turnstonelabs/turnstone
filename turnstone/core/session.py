@@ -938,19 +938,29 @@ class ChatSession:
         - Client-side fallback: send visible tools + synthetic tool_search.
 
         Without tool search: return self._tools unchanged.
+
+        Web search gating: ``web_search`` is removed when the model has
+        no native search support and no Tavily API key is configured.
         """
         if self.creative_mode:
             return None
-        if not self._tool_search:
-            return self._tools
-        # Check if provider supports native tool search
         caps = self._get_capabilities()
-        if caps.supports_tool_search:
-            # Provider handles defer_loading — send all tools
-            return self._tools
-        # Client-side fallback: visible tools + search tool
-        visible = self._tool_search.get_visible_tools()
-        return visible + [self._tool_search.get_search_tool_definition()]
+        if not self._tool_search:
+            tools = self._tools
+        else:
+            if caps.supports_tool_search:
+                # Provider handles defer_loading — send all tools
+                tools = self._tools
+            else:
+                # Client-side fallback: visible tools + search tool
+                visible = self._tool_search.get_visible_tools()
+                tools = visible + [self._tool_search.get_search_tool_definition()]
+
+        # Gate web_search: only include when a backend exists
+        if not caps.supports_web_search and not get_tavily_key():
+            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+
+        return tools
 
     def _get_deferred_names(self) -> frozenset[str] | None:
         """Return names of deferred tools for native provider search, or None."""
@@ -2080,8 +2090,15 @@ class ChatSession:
                 return item["call_id"], item["error"]
             if item.get("denied"):
                 return item["call_id"], item.get("denial_msg", "Denied by user")
-            result: tuple[str, str | list[dict[str, Any]]] = item["execute"](item)
-            return result
+            try:
+                result: tuple[str, str | list[dict[str, Any]]] = item["execute"](item)
+                return result
+            except (KeyboardInterrupt, GenerationCancelled):
+                raise
+            except Exception as e:
+                func = item.get("func_name", "unknown")
+                log.warning("tool_exec.failed", tool=func, error=str(e))
+                return item["call_id"], f"Error executing {func}: {e}"
 
         if len(items) == 1:
             results = [run_one(items[0])]
@@ -3693,6 +3710,11 @@ class ChatSession:
         if self._registry and self._registry.agent_model:
             agent_client, agent_model, _ = self._registry.resolve(self._registry.agent_model)
             agent_provider = self._registry.get_provider(self._registry.agent_model)
+
+        # Gate web_search: remove when no backend exists for the agent model
+        agent_caps = agent_provider.get_capabilities(agent_model)
+        if not agent_caps.supports_web_search and not get_tavily_key():
+            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
 
         # Build extra params for agent calls
         agent_extra: dict[str, Any] | None = None

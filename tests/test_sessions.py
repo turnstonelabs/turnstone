@@ -607,3 +607,150 @@ class TestPruneWorkstreams:
         # Config rows should be cleaned up
         assert load_workstream_config("orphan_cfg") == {}
         assert load_workstream_config("stale_cfg") == {}
+
+
+# ── Parallel tool exception isolation ────────────────────────────────
+
+
+class TestParallelToolExceptionIsolation:
+    """Bug #117: one tool raising should not kill the entire batch."""
+
+    def test_exception_in_one_tool_does_not_kill_batch(self, tmp_db, mock_openai_client):
+        from unittest.mock import patch
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="test-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+
+        def succeed(item):
+            return item["call_id"], "ok"
+
+        def fail(item):
+            raise RuntimeError("boom")
+
+        items = [
+            {
+                "call_id": "c1",
+                "func_name": "bash",
+                "execute": succeed,
+                "needs_approval": False,
+                "header": "test",
+                "preview": "",
+            },
+            {
+                "call_id": "c2",
+                "func_name": "math",
+                "execute": fail,
+                "needs_approval": False,
+                "header": "test",
+                "preview": "",
+            },
+        ]
+
+        tool_calls = [
+            {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "c2", "function": {"name": "math", "arguments": "{}"}},
+        ]
+
+        with (
+            patch.object(session, "_prepare_tool", side_effect=items),
+            patch.object(session, "_evaluate_intent"),
+            patch.object(session, "_emit_state"),
+            patch.object(session, "_init_system_messages"),
+            patch.object(session, "_check_cancelled"),
+        ):
+            session.ui.approve_tools.return_value = (True, None)
+            results, _ = session._execute_tools(tool_calls)
+
+        assert results[0] == ("c1", "ok")
+        assert results[1][0] == "c2"
+        assert "Error executing math" in results[1][1]
+        assert "boom" in results[1][1]
+
+
+# ── Web search tool gating ───────────────────────────────────────────
+
+
+class TestWebSearchGating:
+    """Bug #117: web_search should not be offered without a backend."""
+
+    def test_web_search_filtered_when_no_backend(self, tmp_db, mock_openai_client):
+        from unittest.mock import patch
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+
+        caps = ModelCapabilities(supports_web_search=False)
+        with (
+            patch.object(session, "_get_capabilities", return_value=caps),
+            patch("turnstone.core.session.get_tavily_key", return_value=None),
+        ):
+            tools = session._get_active_tools()
+
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "web_search" not in names
+
+    def test_web_search_kept_when_tavily_available(self, tmp_db, mock_openai_client):
+        from unittest.mock import patch
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+
+        caps = ModelCapabilities(supports_web_search=False)
+        with (
+            patch.object(session, "_get_capabilities", return_value=caps),
+            patch("turnstone.core.session.get_tavily_key", return_value="tvly-test-key"),
+        ):
+            tools = session._get_active_tools()
+
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "web_search" in names
+
+    def test_web_search_kept_when_native_support(self, tmp_db, mock_openai_client):
+        from unittest.mock import patch
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="gpt-5-search-api",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+
+        caps = ModelCapabilities(supports_web_search=True)
+        with (
+            patch.object(session, "_get_capabilities", return_value=caps),
+            patch("turnstone.core.session.get_tavily_key", return_value=None),
+        ):
+            tools = session._get_active_tools()
+
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "web_search" in names
