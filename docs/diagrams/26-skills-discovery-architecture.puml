@@ -1,0 +1,88 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+LAYOUT_LEFT_RIGHT()
+
+title Skills Discovery Architecture
+
+skinparam backgroundColor #1e1e2e
+skinparam defaultFontColor #cdd6f4
+skinparam defaultFontName "JetBrains Mono"
+skinparam arrowColor #89b4fa
+skinparam rectangleBorderColor #585b70
+skinparam rectangleBackgroundColor #313244
+skinparam noteBorderColor #585b70
+skinparam noteBackgroundColor #45475a
+skinparam packageBorderColor #585b70
+
+package "External Sources" as ext #181825 {
+  rectangle "skills.sh\nRegistry" as skillssh
+  rectangle "GitHub\nRepositories" as github
+}
+
+package "Console Server" as console #181825 {
+  rectangle "admin_skill_discover\nGET /v1/api/admin/skills/discover" as discover
+  rectangle "admin_skill_install\nPOST /v1/api/admin/skills/install" as install
+  rectangle "_get_discovery_url\nsettings fallback" as settings
+}
+
+package "Core Modules" as core #181825 {
+  rectangle "SkillsShClient\nskill_sources.py" as client
+  rectangle "fetch_skill_from_github\nskill_sources.py" as fetcher
+  rectangle "parse_skill_md\nskill_parser.py" as parser
+  rectangle "scan_skill_content\nstorage/_utils.py" as scanner
+}
+
+package "Storage" as storage #181825 {
+  rectangle "prompt_templates\n(skills)" as skills_table
+  rectangle "skill_resources\n(bundled files)" as resources_table
+  rectangle "system_settings\n(discovery_url)" as settings_table
+}
+
+package "Admin UI" as ui #181825 {
+  rectangle "Skills Tab\nInstalled / Discover pill" as pill
+  rectangle "Discovery View\nsearch + cards" as discoverui
+  rectangle "GitHub Import\nmodal" as importui
+}
+
+' External flow
+discover --> settings : resolve URL
+settings --> settings_table : DB → config → default
+discover --> client : search(query)
+client --> skillssh : GET /api/search
+
+install --> client : resolve_github_url()
+client --> skillssh : GET /api/skills/{id}
+install --> fetcher : fetch SKILL.md + resources
+fetcher --> github : raw.githubusercontent.com
+fetcher --> github : api.github.com/git/trees
+fetcher --> parser : parse frontmatter
+install --> scanner : auto-scan on create
+install --> skills_table : create_prompt_template
+install --> resources_table : create_skill_resource
+
+' UI flow
+pill --> discoverui : switch view
+discoverui --> discover : authFetch()
+importui --> install : POST (github source)
+
+' Annotations
+note right of parser
+  YAML frontmatter → ParsedSkill
+  Anthropic + Hermes tag formats
+  Name validation (lowercase+hyphens)
+end note
+
+note right of fetcher
+  Tries: direct path, root,
+  monorepo skills/{name}/
+  256KB SKILL.md cap
+  Text extensions filter for resources
+end note
+
+note right of scanner
+  4 risk axes (content, supply chain,
+  vulnerability, capability)
+  Auto-triggers on create/update
+end note
+
+@enduml

@@ -1840,6 +1840,7 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "mcp-import-overlay") hideImportMcpModal();
         else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
         else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
+        else if (overlayId === "github-import-overlay") hideGitHubImportModal();
       }
     };
   }
@@ -1927,6 +1928,7 @@ document.addEventListener("keydown", function (e) {
     ["mcp-detail-overlay", hideMcpDetailModal],
     ["mcp-import-overlay", hideImportMcpModal],
     ["mcp-create-overlay", hideCreateMcpModal],
+    ["github-import-overlay", hideGitHubImportModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);
@@ -3243,7 +3245,7 @@ function submitImportMcp() {
 
 function switchMcpView(view) {
   _mcpCurrentView = view;
-  var btns = document.querySelectorAll(".mcp-view-btn");
+  var btns = document.querySelectorAll("#admin-mcp .mcp-view-btn");
   for (var i = 0; i < btns.length; i++) {
     var isActive = btns[i].getAttribute("data-mcp-view") === view;
     btns[i].classList.toggle("active", isActive);

@@ -2286,6 +2286,9 @@ def _skill_to_response(r: dict[str, Any]) -> dict[str, Any]:
         "notify_on_complete": r.get("notify_on_complete", "{}"),
         "enabled": r.get("enabled", True),
         "allowed_tools": r.get("allowed_tools", "[]"),
+        "scan_status": r.get("scan_status", ""),
+        "scan_report": r.get("scan_report", "{}"),
+        "scan_version": r.get("scan_version", ""),
         "created": r.get("created", ""),
         "updated": r.get("updated", ""),
     }
@@ -2824,6 +2827,212 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
             "scan_version": scan_version,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin: Skill Discovery
+# ---------------------------------------------------------------------------
+
+
+def _get_discovery_url(request: Request) -> str:
+    """Get skills discovery URL from DB settings, config.toml, or default."""
+    from turnstone.core.config import load_config
+    from turnstone.core.skill_sources import DEFAULT_DISCOVERY_URL
+
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage:
+        try:
+            row = storage.get_system_setting("skills.discovery_url")
+            if row:
+                val = json.loads(row["value"])
+                if val:
+                    return str(val)
+        except (KeyError, json.JSONDecodeError, TypeError, AttributeError):
+            pass
+    skills_cfg = load_config("skills")
+    url = skills_cfg.get("discovery_url", "")
+    if url:
+        return str(url)
+    return DEFAULT_DISCOVERY_URL
+
+
+async def admin_skill_discover(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills/discover — search external skill registries."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.skill_sources import SkillSourceError, SkillsShClient
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    q = str(request.query_params.get("q", "")).strip()
+    try:
+        limit = max(1, min(int(request.query_params.get("limit", "20")), 100))
+    except (ValueError, TypeError):
+        limit = 20
+
+    discovery_url = _get_discovery_url(request)
+    client = SkillsShClient(base_url=discovery_url)
+    try:
+        listings = await client.search(query=q, limit=limit)
+    except SkillSourceError as exc:
+        return JSONResponse({"error": f"Discovery error: {exc}"}, status_code=502)
+
+    # Mark which skills are already installed (by source_url match)
+    installed_map: dict[str, dict[str, str]] = {}
+    for row in storage.list_installed_skill_urls():
+        installed_map[row["source_url"]] = {
+            "scan_status": row.get("scan_status", ""),
+            "template_id": row.get("template_id", ""),
+        }
+
+    skills_out = []
+    for listing in listings:
+        is_installed = listing.source_url in installed_map if listing.source_url else False
+        entry: dict[str, Any] = {
+            "id": listing.id,
+            "name": listing.name,
+            "description": listing.description,
+            "author": listing.author,
+            "source": listing.source,
+            "source_url": listing.source_url,
+            "install_count": listing.install_count,
+            "tags": listing.tags,
+            "installed": is_installed,
+        }
+        if is_installed and listing.source_url:
+            info = installed_map[listing.source_url]
+            entry["scan_status"] = info["scan_status"]
+            entry["template_id"] = info["template_id"]
+        skills_out.append(entry)
+
+    return JSONResponse({"skills": skills_out})
+
+
+async def admin_skill_install(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills/install — install a skill from external source."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.skill_sources import (
+        SkillNotFoundError,
+        SkillSourceError,
+        SkillsShClient,
+        fetch_skill_from_github,
+    )
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    source = str(body.get("source", "")).strip()
+    if source not in ("skills.sh", "github"):
+        return JSONResponse({"error": "source must be 'skills.sh' or 'github'"}, status_code=400)
+
+    try:
+        if source == "skills.sh":
+            skill_id_param = str(body.get("skill_id", "")).strip()
+            if not skill_id_param:
+                return JSONResponse({"error": "skill_id is required"}, status_code=400)
+
+            discovery_url = _get_discovery_url(request)
+            client = SkillsShClient(base_url=discovery_url)
+            github_url = await client.resolve_github_url(skill_id_param)
+            package = await fetch_skill_from_github(github_url)
+        else:
+            url = str(body.get("url", "")).strip()
+            if not url:
+                return JSONResponse({"error": "url is required"}, status_code=400)
+            package = await fetch_skill_from_github(url)
+    except SkillNotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except SkillSourceError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    # Check for duplicate by source_url
+    source_url = package.listing.source_url
+    if source_url:
+        existing = storage.get_skill_by_source_url(source_url)
+        if existing:
+            return JSONResponse(
+                {"error": f"Skill from '{source_url}' is already installed"},
+                status_code=409,
+            )
+
+    # Check for duplicate by name
+    if storage.get_prompt_template_by_name(package.parsed.name):
+        return JSONResponse(
+            {"error": f"Skill name '{package.parsed.name}' already exists"},
+            status_code=409,
+        )
+
+    import json as _json
+
+    audit_uid, ip = _audit_context(request)
+    skill_id = uuid.uuid4().hex
+    parsed = package.parsed
+    tags_str = _json.dumps(parsed.tags)
+    allowed_tools_str = _json.dumps(parsed.allowed_tools)
+    content = parsed.content[:32768]
+    token_estimate = len(content) // 4 if content else 0
+
+    storage.create_prompt_template(
+        template_id=skill_id,
+        name=parsed.name,
+        category="general",
+        content=content,
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by=audit_uid,
+        origin="source",
+        readonly=True,
+        description=parsed.description,
+        tags=tags_str,
+        source_url=source_url,
+        version=parsed.version,
+        author=parsed.author,
+        activation="named",
+        token_estimate=token_estimate,
+        allowed_tools=allowed_tools_str,
+    )
+
+    # Store bundled resources
+    for path, content in package.resources.items():
+        storage.create_skill_resource(
+            resource_id=uuid.uuid4().hex,
+            skill_id=skill_id,
+            path=path,
+            content=content,
+        )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "skill.install",
+        "skill",
+        skill_id,
+        {"name": parsed.name, "source": source, "source_url": source_url},
+        ip,
+    )
+
+    skill = storage.get_prompt_template(skill_id)
+    return JSONResponse(_skill_to_response(skill))
 
 
 # ---------------------------------------------------------------------------
@@ -4126,6 +4335,13 @@ def create_app(
                         "/api/admin/policies/{policy_id}",
                         admin_delete_policy,
                         methods=["DELETE"],
+                    ),
+                    # Governance: Skill Discovery
+                    Route("/api/admin/skills/discover", admin_skill_discover),
+                    Route(
+                        "/api/admin/skills/install",
+                        admin_skill_install,
+                        methods=["POST"],
                     ),
                     # Governance: Skills
                     Route("/api/admin/skills", admin_list_skills),

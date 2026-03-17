@@ -106,6 +106,8 @@ Both `TurnstoneConsole` (sync) and `AsyncTurnstoneConsole` (async) expose:
 | | `list_schedule_runs(task_id, *, limit=50)` | `ListScheduleRunsResponse` |
 | **MCP Registry** | `search_mcp_registry(q="", *, limit=20, cursor=None)` | `RegistrySearchResponse` |
 | | `install_from_registry(registry_name, source, *, index=0, name="", variables=None, env=None, headers=None)` | `McpServerDetail` |
+| **Skill Discovery** | `discover_skills(q="", *, limit=20)` | `SkillDiscoverResponse` |
+| | `install_skill(source, *, skill_id="", url="")` | `dict` |
 | **Streaming** | `stream_cluster_events()` | `Iterator[ClusterEvent]` |
 | **Auth** | `login(username=..., password=...)` / `login(token="ts_xxx")` | `AuthLoginResponse` |
 | | `logout()` | `StatusResponse` |
@@ -229,6 +231,13 @@ const results = await client.searchMcpRegistry({ q: "github", limit: 10 });
 const server = await client.installFromRegistry({
   registry_name: results.servers[0].name,
   source: "remote",
+});
+
+// Search and install skills from external registries
+const skills = await client.discoverSkills({ q: "code review" });
+const skill = await client.installSkill({
+  source: "github",
+  url: "https://github.com/owner/skill-repo",
 });
 
 // Stream cluster events

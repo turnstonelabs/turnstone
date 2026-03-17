@@ -11,6 +11,11 @@ var _govUsageGroupBy = "day";
 var _govAuditEvents = [];
 var _govAuditTotal = 0;
 var _govAuditOffset = 0;
+var _skillCurrentView = "installed";
+var _skillDiscoverResults = [];
+var _skillDiscoverQuery = "";
+var _giTrapHandler = null;
+var _giTriggerEl = null;
 
 // Trap handler refs for modals
 var _crTrapHandler = null; // create role
@@ -1724,5 +1729,293 @@ function deleteAdminMemory(memoryId, memoryName) {
     })
     .catch(function (e) {
       showToast("Error: " + e.message);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Skill Discovery
+// ---------------------------------------------------------------------------
+
+function switchSkillView(view) {
+  _skillCurrentView = view;
+  var btns = document.querySelectorAll("#admin-skills [data-skill-view]");
+  for (var i = 0; i < btns.length; i++) {
+    var isActive = btns[i].getAttribute("data-skill-view") === view;
+    btns[i].classList.toggle("active", isActive);
+    btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
+    btns[i].setAttribute("tabindex", isActive ? "0" : "-1");
+  }
+  document.getElementById("skill-view-installed").style.display =
+    view === "installed" ? "" : "none";
+  document.getElementById("skill-view-discover").style.display =
+    view === "discover" ? "" : "none";
+  var toolbar = document.getElementById("skill-installed-toolbar");
+  if (toolbar) toolbar.style.display = view === "installed" ? "" : "none";
+
+  if (view === "installed") {
+    loadGovSkills();
+  } else {
+    var q = document.getElementById("skill-discover-q");
+    if (q) q.focus();
+  }
+}
+
+function searchSkillDiscover() {
+  var q = (document.getElementById("skill-discover-q").value || "").trim();
+  _skillDiscoverResults = [];
+  _skillDiscoverQuery = q;
+
+  var el = document.getElementById("skill-discover-results");
+  el.innerHTML = '<div class="dashboard-empty">Searching\u2026</div>';
+
+  var searchBtn = document.getElementById("skill-discover-search-btn");
+  if (searchBtn) searchBtn.disabled = true;
+
+  var url = "/v1/api/admin/skills/discover?limit=20";
+  if (q) url += "&q=" + encodeURIComponent(q);
+
+  authFetch(url)
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Search failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      _skillDiscoverResults = data.skills || [];
+      _renderSkillDiscoverResults();
+    })
+    .catch(function (e) {
+      el.innerHTML =
+        '<div class="dashboard-empty">' + escapeHtml(e.message) + "</div>";
+    })
+    .finally(function () {
+      if (searchBtn) searchBtn.disabled = false;
+    });
+}
+
+function _renderSkillDiscoverResults() {
+  var el = document.getElementById("skill-discover-results");
+  if (!_skillDiscoverResults.length) {
+    el.innerHTML = '<div class="dashboard-empty">No skills found</div>';
+    return;
+  }
+
+  var html = "";
+  for (var i = 0; i < _skillDiscoverResults.length; i++) {
+    var s = _skillDiscoverResults[i];
+    var nameLabel = escapeHtml(s.name || "");
+    var actionHtml;
+    if (s.installed) {
+      var scanBadgeHtml = "";
+      if (s.scan_status) {
+        var scanCls =
+          {
+            safe: "scope-scan-safe",
+            low: "scope-scan-low",
+            medium: "scope-scan-medium",
+            high: "scope-scan-high",
+            critical: "scope-scan-critical",
+          }[s.scan_status] || "";
+        scanBadgeHtml =
+          '<span class="scope-badge ' +
+          scanCls +
+          '" style="margin-right:4px">' +
+          escapeHtml(s.scan_status) +
+          "</span>";
+      }
+      actionHtml =
+        scanBadgeHtml + '<span class="mcp-installed-badge">Installed</span>';
+    } else {
+      actionHtml =
+        '<button class="mcp-install-btn" data-skill-install="' +
+        i +
+        '" aria-label="Install ' +
+        nameLabel +
+        '">Install</button>';
+    }
+
+    // Tags
+    var tagHtml = "";
+    var tags = s.tags || [];
+    for (var t = 0; t < tags.length && t < 4; t++) {
+      tagHtml += '<span class="scope-badge">' + escapeHtml(tags[t]) + "</span>";
+    }
+
+    // Source + install count badge
+    var metaHtml = "";
+    if (s.source) {
+      metaHtml +=
+        '<span class="scope-badge mcp-transport-http">' +
+        escapeHtml(s.source) +
+        "</span>";
+    }
+    if (s.install_count > 0) {
+      metaHtml +=
+        '<span class="mcp-reg-card-version">' +
+        s.install_count.toLocaleString() +
+        " installs</span>";
+    }
+
+    html +=
+      '<div class="mcp-reg-card" role="listitem">' +
+      '<div class="mcp-reg-card-info">' +
+      '<div class="mcp-reg-card-name">' +
+      nameLabel +
+      (s.author
+        ? ' <span class="mcp-reg-card-version">by ' +
+          escapeHtml(s.author) +
+          "</span>"
+        : "") +
+      "</div>" +
+      (s.description
+        ? '<div class="mcp-reg-card-desc">' +
+          escapeHtml(s.description) +
+          "</div>"
+        : "") +
+      '<div class="mcp-reg-card-meta">' +
+      tagHtml +
+      metaHtml +
+      "</div></div>" +
+      '<div class="mcp-reg-card-actions">' +
+      actionHtml +
+      "</div></div>";
+  }
+
+  el.innerHTML = html;
+
+  // Bind install handlers
+  el.querySelectorAll("[data-skill-install]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var idx = parseInt(this.getAttribute("data-skill-install"), 10);
+      installDiscoveredSkill(_skillDiscoverResults[idx]);
+    });
+  });
+}
+
+function installDiscoveredSkill(skill) {
+  if (!skill) return;
+
+  // Disable the button
+  var btns = document.querySelectorAll("[data-skill-install]");
+  for (var i = 0; i < btns.length; i++) {
+    var idx = parseInt(btns[i].getAttribute("data-skill-install"), 10);
+    if (
+      _skillDiscoverResults[idx] &&
+      _skillDiscoverResults[idx].id === skill.id
+    ) {
+      btns[i].disabled = true;
+      btns[i].textContent = "Installing\u2026";
+      break;
+    }
+  }
+
+  var body;
+  if (skill.source === "github") {
+    body = { source: "github", url: skill.source_url };
+  } else {
+    body = { source: "skills.sh", skill_id: skill.id };
+  }
+
+  authFetch("/v1/api/admin/skills/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Install failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
+      showToast("Skill installed: " + (skill.name || skill.id) + tierMsg);
+      // Mark as installed in results with scan data
+      for (var j = 0; j < _skillDiscoverResults.length; j++) {
+        if (_skillDiscoverResults[j].id === skill.id) {
+          _skillDiscoverResults[j].installed = true;
+          _skillDiscoverResults[j].scan_status = data.scan_status || "";
+          break;
+        }
+      }
+      _renderSkillDiscoverResults();
+    })
+    .catch(function (e) {
+      showToast("Error: " + e.message);
+      _renderSkillDiscoverResults();
+    });
+}
+
+function showGitHubImportModal() {
+  _giTriggerEl = document.activeElement;
+  document.getElementById("github-import-overlay").style.display = "";
+  var urlInput = document.getElementById("gi-url");
+  urlInput.value = "";
+  var errEl = document.getElementById("github-import-error");
+  errEl.textContent = "";
+  errEl.style.display = "none";
+  _giTrapHandler = _installTrap("github-import-overlay", "github-import-box");
+  urlInput.focus();
+}
+
+function hideGitHubImportModal() {
+  document.getElementById("github-import-overlay").style.display = "none";
+  _giTrapHandler = _removeTrap(_giTrapHandler);
+  if (_giTriggerEl) {
+    _giTriggerEl.focus();
+    _giTriggerEl = null;
+  }
+}
+
+function submitGitHubImport() {
+  var url = (document.getElementById("gi-url").value || "").trim();
+  var errEl = document.getElementById("github-import-error");
+  if (!url) {
+    errEl.textContent = "URL is required";
+    errEl.style.display = "";
+    return;
+  }
+  if (!/^https?:\/\/github\.com\//i.test(url)) {
+    errEl.textContent = "Must be a GitHub URL";
+    errEl.style.display = "";
+    return;
+  }
+
+  var submitBtn = document.getElementById("gi-submit");
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Installing\u2026";
+  errEl.style.display = "none";
+
+  authFetch("/v1/api/admin/skills/install", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source: "github", url: url }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Install failed");
+        });
+      return r.json();
+    })
+    .then(function (data) {
+      hideGitHubImportModal();
+      var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
+      showToast("Skill installed: " + (data.name || "") + tierMsg);
+      // Refresh if we're on discover view
+      if (_skillCurrentView === "discover") {
+        searchSkillDiscover();
+      }
+    })
+    .catch(function (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = "";
+    })
+    .finally(function () {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Install";
     });
 }

@@ -1693,6 +1693,33 @@ class PostgreSQLBackend:
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
         return self.get_prompt_template_by_name(name)
 
+    def get_skill_by_source_url(self, source_url: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(prompt_templates).where(prompt_templates.c.source_url == source_url)
+            ).fetchone()
+            if row:
+                return _row_to_dict(row, "is_default", "readonly", "auto_approve", "enabled")
+            return None
+
+    def list_installed_skill_urls(self) -> list[dict[str, str]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    prompt_templates.c.source_url,
+                    prompt_templates.c.template_id,
+                    prompt_templates.c.scan_status,
+                ).where(prompt_templates.c.source_url != "")
+            ).fetchall()
+            return [
+                {
+                    "source_url": r[0],
+                    "template_id": r[1],
+                    "scan_status": r[2] or "",
+                }
+                for r in rows
+            ]
+
     # -- Skill resources -------------------------------------------------------
 
     def create_skill_resource(

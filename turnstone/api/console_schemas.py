@@ -307,6 +307,9 @@ class SkillInfo(BaseModel):
     notify_on_complete: str = "{}"
     enabled: bool = True
     allowed_tools: str = "[]"
+    scan_status: str = ""
+    scan_report: str = "{}"
+    scan_version: str = ""
     created: str
     updated: str
 
@@ -646,6 +649,40 @@ class ImportMcpConfigResponse(BaseModel):
 class McpReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Admin: MCP Registry
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Admin: Skill Discovery
+# ---------------------------------------------------------------------------
+
+
+class SkillDiscoverListing(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    author: str = ""
+    source: str = ""
+    source_url: str = ""
+    install_count: int = 0
+    tags: list[str] = Field(default_factory=list)
+    installed: bool = False
+    scan_status: str = ""
+    template_id: str = ""
+
+
+class SkillDiscoverResponse(BaseModel):
+    skills: list[SkillDiscoverListing]
+
+
+class SkillInstallRequest(BaseModel):
+    source: str  # "skills.sh" or "github"
+    skill_id: str = ""  # for skills.sh
+    url: str = ""  # for github
 
 
 # ---------------------------------------------------------------------------

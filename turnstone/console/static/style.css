@@ -1240,7 +1240,8 @@
 #create-policy-overlay, #edit-policy-overlay,
 #create-template-overlay, #edit-template-overlay,
 #memory-detail-overlay,
-#mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay {
+#mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
+#github-import-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -2031,6 +2032,8 @@
   .mcp-registry-search{flex-direction:column}
   #admin-mcp .admin-toolbar{flex-wrap:wrap;gap:8px}
   #mcp-servers-toolbar{display:flex;gap:6px;width:100%}
+  #admin-skills .admin-toolbar{flex-wrap:wrap;gap:8px}
+  #skill-installed-toolbar{display:flex;gap:6px;width:100%}
 }
 
 /* ==========================================================================
