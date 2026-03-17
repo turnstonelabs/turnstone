@@ -3049,7 +3049,19 @@ class ChatSession:
         rows = [r for r in rows if r.get("enabled", True)]
 
         if query:
+            import json as _json
+
             from turnstone.core.bm25 import BM25Index
+
+            def _tags_text(raw: str) -> str:
+                """Parse JSON tags string into space-separated text."""
+                try:
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, list):
+                        return " ".join(str(t) for t in parsed)
+                except (ValueError, TypeError):
+                    pass
+                return raw
 
             # Build corpus from name + description + tags + category
             corpus = [
@@ -3059,7 +3071,7 @@ class ChatSession:
                         [
                             r.get("name", ""),
                             r.get("description", ""),
-                            r.get("tags", ""),
+                            _tags_text(r.get("tags", "[]")),
                             r.get("category", ""),
                         ],
                     )

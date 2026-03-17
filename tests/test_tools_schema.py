@@ -112,6 +112,7 @@ class TestToolsMetadata:
             "watch": "command",
             "read_resource": "uri",
             "use_prompt": "name",
+            "load_skill": "name",
         }
         assert expected == PRIMARY_KEY_MAP
 

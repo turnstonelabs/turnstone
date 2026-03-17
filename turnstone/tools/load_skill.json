@@ -19,5 +19,6 @@
       }
     },
     "required": ["action"]
-  }
+  },
+  "primary_key": "name"
 }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from turnstone.core.tools import BUILTIN_TOOL_NAMES
+from turnstone.core.tools import BUILTIN_TOOL_NAMES, PRIMARY_KEY_MAP
 
 
 class TestToolRegistration:
@@ -26,6 +26,9 @@ class TestToolRegistration:
         names = {t["function"]["name"] for t in TASK_AGENT_TOOLS}
         assert "load_skill" not in names
 
+    def test_has_primary_key(self) -> None:
+        assert PRIMARY_KEY_MAP.get("load_skill") == "name"
+
 
 # ---------------------------------------------------------------------------
 # Helpers — minimal ChatSession mock
@@ -37,8 +40,7 @@ def _make_session(skills: list[dict[str, Any]] | None = None):
     from turnstone.core.session import ChatSession
 
     ui = MagicMock()
-    with patch("turnstone.core.session.resolve_workstream", return_value="ws-test"):
-        session = ChatSession.__new__(ChatSession)
+    session = ChatSession.__new__(ChatSession)
 
     # Minimal state required by the methods under test
     session.ui = ui

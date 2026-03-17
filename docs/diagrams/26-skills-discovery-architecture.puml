@@ -67,7 +67,7 @@ install --> skills_table : create_prompt_template
 install --> resources_table : create_skill_resource
 
 ' Runtime skill loading flow
-loadtool --> skills_table : search (substring match)
+loadtool --> skills_table : search (BM25 ranking)
 loadtool --> setskill : load (name)
 setskill --> loadskills : reload + reinit system messages
 loadskills --> skills_table : get_skill_by_name
