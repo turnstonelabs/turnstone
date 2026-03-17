@@ -6,6 +6,7 @@ from turnstone.core.metacognition import (
     NUDGE_DENIAL,
     NUDGE_RESUME,
     NUDGE_START,
+    NUDGE_TOOL_ERROR,
     detect_completion,
     detect_correction,
     format_nudge,
@@ -263,5 +264,27 @@ class TestFormatNudge:
     def test_start(self):
         assert format_nudge("start") == NUDGE_START
 
+    def test_tool_error(self):
+        assert format_nudge("tool_error") == NUDGE_TOOL_ERROR
+
     def test_invalid(self):
         assert format_nudge("invalid") == ""
+
+
+class TestToolErrorNudge:
+    def test_fires(self):
+        state: dict[str, float] = {}
+        assert should_nudge("tool_error", state, message_count=5, memory_count=3) is True
+
+    def test_cooldown(self):
+        state: dict[str, float] = {}
+        assert should_nudge("tool_error", state, message_count=5, memory_count=3) is True
+        assert should_nudge("tool_error", state, message_count=6, memory_count=3) is False
+
+    def test_not_on_first_message(self):
+        state: dict[str, float] = {}
+        assert should_nudge("tool_error", state, message_count=1, memory_count=3) is False
+
+    def test_not_with_zero_memories(self):
+        state: dict[str, float] = {}
+        assert should_nudge("tool_error", state, message_count=5, memory_count=0) is False

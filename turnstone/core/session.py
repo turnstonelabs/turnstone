@@ -1212,6 +1212,29 @@ class ChatSession:
                             _tname,
                             tool_call_id=tc_id,
                         )
+                # Metacognitive nudge: check memories on tool error
+                if (
+                    self._memory_config.nudges
+                    and any(
+                        isinstance(out, str)
+                        and (
+                            out.startswith("Error")
+                            or " error: " in out[:50]
+                            or out.startswith("Command timed out")
+                            or out.startswith("Unknown tool:")
+                        )
+                        for _, out in results
+                    )
+                    and should_nudge(
+                        "tool_error",
+                        self._metacog_state,
+                        message_count=len(self.messages),
+                        memory_count=self._visible_memory_count(),
+                        cooldown_secs=self._memory_config.nudge_cooldown,
+                    )
+                ):
+                    self._pending_nudge.append(format_nudge("tool_error"))
+                    self._init_system_messages()
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
