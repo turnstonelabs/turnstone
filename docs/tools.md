@@ -511,9 +511,10 @@ pre-configure skills at workstream creation.
   rendering with `{{model}}`/`{{ws_id}}`/`{{node_id}}` variables, system message
   reinitialization, and config persistence. Returns the skill name, description,
   and security scan tier. Warns on high/critical scan status.
-- `search` — Find available skills by query. Uses substring matching on name,
-  description, tags, and category. Returns up to 10 results with name,
-  description, category, scan status, and activation type.
+- `search` — Find available skills by query. Uses BM25 relevance ranking over
+  name, description, tags, and category (same `BM25Index` used by memory
+  relevance and tool search). Returns up to 10 results with name, description,
+  category, scan status, and activation type.
 
 - **Auto-approve**: `load` requires approval (changes session behavior); `search`
   is auto-approved (read-only).

@@ -3049,27 +3049,26 @@ class ChatSession:
         rows = [r for r in rows if r.get("enabled", True)]
 
         if query:
-            terms = query.lower().split()
-            scored: list[tuple[int, dict[str, Any]]] = []
-            for r in rows:
-                score = 0
-                name_val = (r.get("name") or "").lower()
-                desc_val = (r.get("description") or "").lower()
-                tags_val = (r.get("tags") or "").lower()
-                cat_val = (r.get("category") or "").lower()
-                for term in terms:
-                    if term in name_val:
-                        score += 3
-                    if term in desc_val:
-                        score += 2
-                    if term in tags_val:
-                        score += 1
-                    if term in cat_val:
-                        score += 1
-                if score > 0:
-                    scored.append((score, r))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            rows = [r for _, r in scored[:10]]
+            from turnstone.core.bm25 import BM25Index
+
+            # Build corpus from name + description + tags + category
+            corpus = [
+                " ".join(
+                    filter(
+                        None,
+                        [
+                            r.get("name", ""),
+                            r.get("description", ""),
+                            r.get("tags", ""),
+                            r.get("category", ""),
+                        ],
+                    )
+                )
+                for r in rows
+            ]
+            index = BM25Index(corpus)
+            top_indices = index.search(query, k=10)
+            rows = [rows[i] for i in top_indices]
         else:
             rows = rows[:10]
 
