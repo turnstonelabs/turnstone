@@ -187,6 +187,7 @@ export interface SkillInfo {
   notify_on_complete: string;
   enabled: boolean;
   allowed_tools: string;
+  resource_count: number;
   created: string;
   updated: string;
 }
@@ -240,6 +241,25 @@ export interface UpdateSkillRequest {
 
 export interface ListSkillsResponse {
   skills: SkillInfo[];
+}
+
+export interface SkillResourceInfo {
+  resource_id: string;
+  skill_id: string;
+  path: string;
+  content_type: string;
+  size: number;
+  created: string;
+}
+
+export interface ListSkillResourcesResponse {
+  resources: SkillResourceInfo[];
+}
+
+export interface CreateSkillResourceRequest {
+  path: string;
+  content: string;
+  content_type?: string;
 }
 
 // ---------------------------------------------------------------------------

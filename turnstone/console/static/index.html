@@ -95,7 +95,11 @@
           <div class="admin-sidebar-group-label" aria-hidden="true">Governance</div>
           <button id="tab-roles" class="admin-nav" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
           <button id="tab-policies" class="admin-nav" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
+        </div>
+        <div class="admin-sidebar-group" data-group="extensions" role="group" aria-label="Extensions">
+          <div class="admin-sidebar-group-label" aria-hidden="true">Extensions</div>
           <button id="tab-skills" class="admin-nav" data-tab="skills" role="tab" aria-selected="false" aria-controls="admin-skills" tabindex="-1" onclick="switchAdminTab('skills')">Skills</button>
+          <button id="tab-mcp" class="admin-nav" data-tab="mcp" role="tab" aria-selected="false" aria-controls="admin-mcp" tabindex="-1" onclick="switchAdminTab('mcp')">MCP Servers</button>
         </div>
         <div class="admin-sidebar-group" data-group="observe" role="group" aria-label="Observe">
           <div class="admin-sidebar-group-label" aria-hidden="true">Observe</div>
@@ -106,7 +110,6 @@
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
           <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
-          <button id="tab-mcp" class="admin-nav" data-tab="mcp" role="tab" aria-selected="false" aria-controls="admin-mcp" tabindex="-1" onclick="switchAdminTab('mcp')">MCP Servers</button>
         </div>
       </nav>
       <div id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" aria-hidden="true"></div>
@@ -406,7 +409,7 @@
         <span class="section-header">MCP</span>
         <div class="mcp-view-toggle" role="tablist" aria-label="MCP view">
           <button class="mcp-view-btn active" data-mcp-view="servers" role="tab" aria-selected="true" aria-controls="mcp-view-servers" tabindex="0" onclick="switchMcpView('servers')">Servers</button>
-          <button class="mcp-view-btn" data-mcp-view="registry" role="tab" aria-selected="false" aria-controls="mcp-view-registry" tabindex="-1" onclick="switchMcpView('registry')">Registry</button>
+          <button class="mcp-view-btn" data-mcp-view="registry" role="tab" aria-selected="false" aria-controls="mcp-view-registry" tabindex="-1" onclick="switchMcpView('registry')">Discover</button>
         </div>
         <span id="mcp-servers-toolbar">
           <button id="mcp-sync-btn" class="admin-action-btn admin-action-btn-ghost" onclick="reloadMcpNodes()" title="Push MCP server config to all cluster nodes and reconnect">Sync to Nodes</button>
@@ -898,6 +901,19 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <input id="csk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
       <label class="admin-checkbox"><input id="csk-enabled" type="checkbox" checked> Enabled</label>
     </details>
+    <details class="admin-details">
+      <summary>Resources <span class="label-hint">optional bundled files (scripts, references, assets)</span></summary>
+      <div id="ctm-resources-list" role="list" aria-live="polite" aria-label="Pending resources"></div>
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+        <label for="ctm-res-path">Path</label>
+        <input id="ctm-res-path" type="text" placeholder="scripts/setup.sh or references/guide.md">
+        <label for="ctm-res-content-type">Content Type</label>
+        <input id="ctm-res-content-type" type="text" value="text/plain">
+        <label for="ctm-res-content">Content</label>
+        <textarea id="ctm-res-content" rows="4" placeholder="Resource file content"></textarea>
+        <button type="button" class="admin-btn-action" onclick="_addPendingResource()">Add Resource</button>
+      </div>
+    </details>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideCreateTemplateModal()">Cancel</button>
       <button id="ctm-submit" class="modal-submit" onclick="submitCreateTemplate()">Create</button>
@@ -966,6 +982,22 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <div id="etm-scan-report" aria-labelledby="etm-scan-heading"></div>
       <button type="button" id="etm-rescan-btn" class="admin-btn-action" style="margin-top:8px">Re-scan</button>
     </div>
+    <details id="etm-resources-section" class="admin-details">
+      <summary>Resources <span class="label-hint">bundled files for this skill</span></summary>
+      <div id="etm-resources-list" role="list" aria-live="polite" aria-label="Skill resources"></div>
+      <button type="button" id="etm-add-resource-btn" class="admin-btn-action" style="margin-top:8px" onclick="_showAddResourceForm(document.getElementById('etm-id').value)">Add Resource</button>
+      <div id="etm-add-resource-form" style="display:none">
+        <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+          <label for="etm-res-path">Path</label>
+          <input id="etm-res-path" type="text" placeholder="scripts/setup.sh or references/guide.md">
+          <label for="etm-res-content-type">Content Type</label>
+          <input id="etm-res-content-type" type="text" value="text/plain">
+          <label for="etm-res-content">Content</label>
+          <textarea id="etm-res-content" rows="4" placeholder="Resource file content"></textarea>
+          <button type="button" id="etm-res-submit" class="admin-btn-action">Upload</button>
+        </div>
+      </div>
+    </details>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditTemplateModal()">Cancel</button>
       <button id="etm-submit" class="modal-submit" onclick="submitEditTemplate()">Save</button>

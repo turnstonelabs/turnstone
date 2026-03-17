@@ -658,6 +658,14 @@ class StorageBackend(Protocol):
         """Delete all resource files for a skill. Returns count deleted."""
         ...
 
+    def delete_skill_resource_by_path(self, skill_id: str, path: str) -> bool:
+        """Delete a single resource file by skill_id and path. Returns True if found."""
+        ...
+
+    def count_skill_resources_bulk(self, skill_ids: list[str]) -> dict[str, int]:
+        """Count resources per skill in a single query. Returns {skill_id: count}."""
+        ...
+
     # -- Skill versions --------------------------------------------------------
 
     def create_skill_version(

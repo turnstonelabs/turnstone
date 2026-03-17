@@ -347,6 +347,7 @@ class ChatSession:
         # Skill: explicit name overrides is_default skills
         self._skill_name: str | None = skill
         self._skill_content: str | None = None
+        self._skill_resources: dict[str, str] = {}
         self._load_skills()
         self._init_system_messages()
         self._save_config()
@@ -405,6 +406,9 @@ class ChatSession:
             if skill_data:
                 self._skill_content = _render_template(skill_data["content"], context)
                 self._check_skill_budget(skill_data)
+                self._skill_resources = self._load_skill_resources(
+                    skill_data.get("template_id", "")
+                )
                 if skill_data.get("scan_status") in ("high", "critical"):
                     scan_tier = skill_data["scan_status"]
                     log.warning(
@@ -419,6 +423,7 @@ class ChatSession:
             else:
                 log.warning("skill.not_found", name=self._skill_name)
                 self._skill_content = None
+                self._skill_resources = {}
         else:
             defaults = list_default_skills()
             if defaults:
@@ -426,6 +431,7 @@ class ChatSession:
                 self._skill_content = "\n\n".join(parts)
             else:
                 self._skill_content = None
+            self._skill_resources = {}
 
     def set_skill(self, name: str | None) -> None:
         """Set or clear the active skill."""
@@ -443,6 +449,18 @@ class ChatSession:
                 estimate=skill["token_estimate"],
                 context_window=self.context_window,
             )
+
+    def _load_skill_resources(self, skill_id: str) -> dict[str, str]:
+        """Load bundled resources for a skill and return {path: content}."""
+        if not skill_id:
+            return {}
+        try:
+            storage = get_storage()
+            rows = storage.list_skill_resources(skill_id)
+            return {r["path"]: r.get("content", "") for r in rows}
+        except Exception:
+            log.warning("skill_resources.load_failed", skill_id=skill_id, exc_info=True)
+            return {}
 
     # -- MCP tool refresh ----------------------------------------------------
 
@@ -820,6 +838,24 @@ class ChatSession:
                 tpl = tpl[:_MAX_SKILL_CONTENT]
             dev_parts.append("")
             dev_parts.append(tpl)
+            if self._skill_resources:
+                lines = ["<skill-resources>"]
+                total_size = 0
+                for rpath, rcontent in sorted(self._skill_resources.items()):
+                    size_kb = f"{len(rcontent) / 1024:.1f}KB"
+                    total_size += len(rcontent)
+                    lines.append(f"- {rpath} ({size_kb})")
+                if total_size <= 8192:
+                    for rpath, rcontent in sorted(self._skill_resources.items()):
+                        lines.append(f"\n--- {rpath} ---")
+                        lines.append(rcontent)
+                else:
+                    lines.append(
+                        "Resource content omitted (total exceeds 8KB). "
+                        "Resource files are listed above by path and size."
+                    )
+                lines.append("</skill-resources>")
+                dev_parts.append("\n".join(lines))
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)

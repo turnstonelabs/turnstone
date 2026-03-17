@@ -1773,6 +1773,33 @@ class PostgreSQLBackend:
             conn.commit()
             return result.rowcount
 
+    def delete_skill_resource_by_path(self, skill_id: str, path: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(skill_resources).where(
+                    sa.and_(
+                        skill_resources.c.skill_id == skill_id,
+                        skill_resources.c.path == path,
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def count_skill_resources_bulk(self, skill_ids: list[str]) -> dict[str, int]:
+        if not skill_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    skill_resources.c.skill_id,
+                    sa.func.count().label("cnt"),
+                )
+                .where(skill_resources.c.skill_id.in_(skill_ids))
+                .group_by(skill_resources.c.skill_id)
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+
     # -- Skill versions --------------------------------------------------------
 
     def create_skill_version(

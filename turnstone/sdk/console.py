@@ -454,6 +454,33 @@ class AsyncTurnstoneConsole(_BaseClient):
             "DELETE", f"/v1/api/admin/skills/{skill_id}", response_model=StatusResponse
         )
 
+    async def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
+        """List resource files for a skill."""
+        resp = await self._request("GET", f"/v1/api/admin/skills/{skill_id}/resources")
+        resources: list[dict[str, Any]] = resp.get("resources", [])
+        return resources
+
+    async def create_skill_resource(
+        self,
+        skill_id: str,
+        path: str,
+        content: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        """Upload a resource file to a skill."""
+        body: dict[str, Any] = {"path": path, "content": content, "content_type": content_type}
+        return await self._request(
+            "POST", f"/v1/api/admin/skills/{skill_id}/resources", json_body=body
+        )
+
+    async def delete_skill_resource(self, skill_id: str, path: str) -> StatusResponse:
+        """Delete a skill resource by path."""
+        return await self._request(
+            "DELETE",
+            f"/v1/api/admin/skills/{skill_id}/resources/{path}",
+            response_model=StatusResponse,
+        )
+
     # -- governance: usage & audit -------------------------------------------
 
     async def get_usage(
@@ -1039,6 +1066,23 @@ class TurnstoneConsole:
 
     def delete_skill(self, skill_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_skill(skill_id))
+
+    def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
+        return self._runner.run(self._async.list_skill_resources(skill_id))
+
+    def create_skill_resource(
+        self,
+        skill_id: str,
+        path: str,
+        content: str,
+        content_type: str = "text/plain",
+    ) -> dict[str, Any]:
+        return self._runner.run(
+            self._async.create_skill_resource(skill_id, path, content, content_type)
+        )
+
+    def delete_skill_resource(self, skill_id: str, path: str) -> StatusResponse:
+        return self._runner.run(self._async.delete_skill_resource(skill_id, path))
 
     # -- governance: usage & audit -------------------------------------------
 

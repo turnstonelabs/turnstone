@@ -14,6 +14,7 @@ var _govAuditOffset = 0;
 var _skillCurrentView = "installed";
 var _skillDiscoverResults = [];
 var _skillDiscoverQuery = "";
+var _pendingResources = [];
 var _giTrapHandler = null;
 var _giTriggerEl = null;
 
@@ -731,6 +732,15 @@ function _renderGovSkills(items) {
         escapeHtml(t.scan_status) +
         "</span>";
     }
+    var resBadge = "";
+    if (t.resource_count > 0) {
+      resBadge =
+        ' <span class="scope-badge" title="' +
+        t.resource_count +
+        ' bundled resource(s)">' +
+        t.resource_count +
+        " res</span>";
+    }
     var editDisabled = t.readonly ? " disabled" : "";
     var deleteDisabled = t.readonly ? " disabled" : "";
     html +=
@@ -742,6 +752,7 @@ function _renderGovSkills(items) {
       defBadge +
       originBadge +
       scanBadge +
+      resBadge +
       (t.description
         ? '<br><span class="admin-col-subtitle">' +
           escapeHtml(t.description) +
@@ -857,6 +868,9 @@ function showCreateTemplateModal() {
       document.getElementById("csk-allowed-tools").disabled = this.checked;
     });
   document.getElementById("create-template-error").style.display = "none";
+  // Clear resource list
+  _pendingResources = [];
+  _renderPendingResources();
   document.getElementById("ctm-name").focus();
   _ctmTrapHandler = _installTrap(
     "create-template-overlay",
@@ -942,10 +956,36 @@ function submitCreateTemplate() {
         });
       return r.json();
     })
-    .then(function () {
-      hideCreateTemplateModal();
-      showToast("Skill created");
-      loadGovSkills();
+    .then(function (data) {
+      if (_pendingResources.length && data && data.template_id) {
+        var promises = _pendingResources.map(function (res) {
+          return authFetch(
+            "/v1/api/admin/skills/" + data.template_id + "/resources",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(res),
+            },
+          );
+        });
+        Promise.all(promises)
+          .then(function () {
+            hideCreateTemplateModal();
+            showToast(
+              "Skill created with " + _pendingResources.length + " resource(s)",
+            );
+            loadGovSkills();
+          })
+          .catch(function () {
+            hideCreateTemplateModal();
+            showToast("Skill created (some resources failed)");
+            loadGovSkills();
+          });
+      } else {
+        hideCreateTemplateModal();
+        showToast("Skill created");
+        loadGovSkills();
+      }
     })
     .catch(function (e) {
       var el = document.getElementById("create-template-error");
@@ -1111,6 +1151,11 @@ function showEditTemplateModal(tmplId) {
         });
     };
   }
+  // --- Skill Resources ---
+  var resSection = document.getElementById("etm-resources-section");
+  if (resSection) {
+    _loadSkillResources(tmplId, tmpl.readonly || false);
+  }
   _etmTrapHandler = _installTrap("edit-template-overlay", "edit-template-box");
 }
 
@@ -1121,6 +1166,245 @@ function hideEditTemplateModal() {
     _etmTriggerEl.focus();
   }
   _etmTriggerEl = null;
+}
+
+// ---------------------------------------------------------------------------
+// Skill Resources
+// ---------------------------------------------------------------------------
+
+function _loadSkillResources(skillId, readonly) {
+  var container = document.getElementById("etm-resources-list");
+  var addBtn = document.getElementById("etm-add-resource-btn");
+  var addForm = document.getElementById("etm-add-resource-form");
+  if (!container) return;
+  container.innerHTML = '<div class="dashboard-empty">Loading...</div>';
+  if (addBtn) addBtn.style.display = readonly ? "none" : "";
+  if (addForm) addForm.style.display = "none";
+
+  authFetch("/v1/api/admin/skills/" + skillId + "/resources")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      var resources = data.resources || [];
+      if (!resources.length) {
+        container.innerHTML =
+          '<div class="dashboard-empty">No resource files</div>';
+        return;
+      }
+      var html = "";
+      for (var i = 0; i < resources.length; i++) {
+        var res = resources[i];
+        var sizeStr =
+          res.size > 1024
+            ? (res.size / 1024).toFixed(1) + " KB"
+            : res.size + " B";
+        html +=
+          '<div role="listitem" style="display:flex;align-items:center;padding:4px 0;gap:8px">' +
+          '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><code>' +
+          escapeHtml(res.path) +
+          "</code></span>" +
+          '<span style="width:80px;text-align:right;opacity:0.6">' +
+          sizeStr +
+          "</span>" +
+          '<span style="width:60px;text-align:right">' +
+          (readonly
+            ? ""
+            : '<button class="admin-btn-danger" data-del-res="' +
+              escapeHtml(res.path) +
+              '" style="font-size:0.85em" aria-label="Delete resource ' +
+              escapeHtml(res.path) +
+              '">delete</button>') +
+          "</span></div>";
+      }
+      container.innerHTML = html;
+      if (!readonly) {
+        container.querySelectorAll("[data-del-res]").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var path = this.getAttribute("data-del-res");
+            showConfirmModal(
+              "Delete Resource",
+              'Delete "' + path + '"?',
+              "Delete",
+              function () {
+                authFetch(
+                  "/v1/api/admin/skills/" +
+                    skillId +
+                    "/resources/" +
+                    encodeURIComponent(path),
+                  { method: "DELETE" },
+                )
+                  .then(function (r) {
+                    if (!r.ok) throw new Error();
+                    return r.json();
+                  })
+                  .then(function () {
+                    showToast("Resource deleted");
+                    _loadSkillResources(skillId, readonly);
+                    loadGovSkills();
+                    var addBtn = document.getElementById(
+                      "etm-add-resource-btn",
+                    );
+                    if (addBtn) addBtn.focus();
+                  })
+                  .catch(function () {
+                    showToast("Failed to delete resource");
+                  });
+              },
+            );
+          });
+        });
+      }
+    })
+    .catch(function () {
+      container.innerHTML =
+        '<div class="dashboard-empty">Failed to load resources</div>';
+    });
+}
+
+function _showAddResourceForm(skillId) {
+  var form = document.getElementById("etm-add-resource-form");
+  if (!form) return;
+  form.style.display = "";
+  document.getElementById("etm-res-path").value = "";
+  document.getElementById("etm-res-content").value = "";
+  document.getElementById("etm-res-content-type").value = "text/plain";
+  document.getElementById("etm-res-submit").onclick = function () {
+    var path = (document.getElementById("etm-res-path").value || "").trim();
+    var content = document.getElementById("etm-res-content").value || "";
+    var contentType = document.getElementById("etm-res-content-type").value;
+    if (!path || !content) {
+      showToast("Path and content are required");
+      return;
+    }
+    if (
+      !path.startsWith("scripts/") &&
+      !path.startsWith("references/") &&
+      !path.startsWith("assets/")
+    ) {
+      showToast("Path must start with scripts/, references/, or assets/");
+      return;
+    }
+    this.disabled = true;
+    this.textContent = "Uploading\u2026";
+    authFetch("/v1/api/admin/skills/" + skillId + "/resources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: path,
+        content: content,
+        content_type: contentType,
+      }),
+    })
+      .then(function (r) {
+        if (!r.ok)
+          return r.json().then(function (d) {
+            throw new Error(d.error || "Failed");
+          });
+        return r.json();
+      })
+      .then(function () {
+        showToast("Resource added");
+        form.style.display = "none";
+        _loadSkillResources(skillId, false);
+        loadGovSkills();
+      })
+      .catch(function (e) {
+        showToast(e.message || "Failed to add resource");
+      })
+      .finally(function () {
+        var btn = document.getElementById("etm-res-submit");
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Upload";
+        }
+      });
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pending resources (create modal)
+// ---------------------------------------------------------------------------
+
+function _renderPendingResources() {
+  var container = document.getElementById("ctm-resources-list");
+  if (!container) return;
+  if (!_pendingResources.length) {
+    container.innerHTML =
+      '<div class="dashboard-empty">No resource files yet</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < _pendingResources.length; i++) {
+    var r = _pendingResources[i];
+    var sizeStr =
+      r.content.length > 1024
+        ? (r.content.length / 1024).toFixed(1) + " KB"
+        : r.content.length + " B";
+    html +=
+      '<div role="listitem" style="display:flex;align-items:center;padding:4px 0;gap:8px">' +
+      '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><code>' +
+      escapeHtml(r.path) +
+      "</code></span>" +
+      '<span style="width:80px;text-align:right;opacity:0.6">' +
+      sizeStr +
+      "</span>" +
+      '<span style="width:60px;text-align:right">' +
+      '<button class="admin-btn-danger" data-remove-res="' +
+      i +
+      '" style="font-size:0.85em" aria-label="Remove resource ' +
+      escapeHtml(r.path) +
+      '">remove</button>' +
+      "</span></div>";
+  }
+  container.innerHTML = html;
+  container.querySelectorAll("[data-remove-res]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var idx = parseInt(this.getAttribute("data-remove-res"), 10);
+      _pendingResources.splice(idx, 1);
+      _renderPendingResources();
+    });
+  });
+}
+
+function _addPendingResource() {
+  var path = (document.getElementById("ctm-res-path").value || "").trim();
+  var content = document.getElementById("ctm-res-content").value || "";
+  var contentType = document.getElementById("ctm-res-content-type").value;
+  if (!path || !content) {
+    showToast("Path and content are required");
+    return;
+  }
+  if (
+    !path.startsWith("scripts/") &&
+    !path.startsWith("references/") &&
+    !path.startsWith("assets/")
+  ) {
+    showToast("Path must start with scripts/, references/, or assets/");
+    return;
+  }
+  if (
+    _pendingResources.some(function (r) {
+      return r.path === path;
+    })
+  ) {
+    showToast("Resource path already added");
+    return;
+  }
+  if (_pendingResources.length >= 10) {
+    showToast("Maximum 10 resources per skill");
+    return;
+  }
+  _pendingResources.push({
+    path: path,
+    content: content,
+    content_type: contentType,
+  });
+  document.getElementById("ctm-res-path").value = "";
+  document.getElementById("ctm-res-content").value = "";
+  _renderPendingResources();
+  document.getElementById("ctm-res-path").focus();
 }
 
 function submitEditTemplate() {
@@ -1762,6 +2046,10 @@ function switchSkillView(view) {
 
 function searchSkillDiscover() {
   var q = (document.getElementById("skill-discover-q").value || "").trim();
+  if (!q) {
+    showToast("Enter a search query");
+    return;
+  }
   _skillDiscoverResults = [];
   _skillDiscoverQuery = q;
 

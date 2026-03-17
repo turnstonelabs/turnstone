@@ -310,6 +310,7 @@ class SkillInfo(BaseModel):
     scan_status: str = ""
     scan_report: str = "{}"
     scan_version: str = ""
+    resource_count: int = 0
     created: str
     updated: str
 
@@ -381,6 +382,30 @@ class SkillVersionInfo(BaseModel):
 
 class ListSkillVersionsResponse(BaseModel):
     versions: list[SkillVersionInfo]
+
+
+# ---------------------------------------------------------------------------
+# Governance: Skill Resources
+# ---------------------------------------------------------------------------
+
+
+class SkillResourceInfo(BaseModel):
+    resource_id: str
+    skill_id: str
+    path: str
+    content_type: str = "text/plain"
+    size: int = 0
+    created: str
+
+
+class ListSkillResourcesResponse(BaseModel):
+    resources: list[SkillResourceInfo]
+
+
+class CreateSkillResourceRequest(BaseModel):
+    path: str
+    content: str
+    content_type: str = "text/plain"
 
 
 # ---------------------------------------------------------------------------

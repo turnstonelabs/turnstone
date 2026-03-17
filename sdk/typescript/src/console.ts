@@ -21,6 +21,7 @@ import type {
   CreateRoleOptions,
   CreateScheduleRequest,
   CreateSkillRequest,
+  CreateSkillResourceRequest,
   ImportMcpConfigResponse,
   ListAdminMemoriesResponse,
   ListMcpServersResponse,
@@ -28,6 +29,7 @@ import type {
   ListSchedulesResponse,
   ListSettingSchemaResponse,
   ListSettingsResponse,
+  ListSkillResourcesResponse,
   ListSkillsResponse,
   McpServerDetail,
   RegistryInstallRequest,
@@ -35,6 +37,7 @@ import type {
   SkillDiscoverResponse,
   SkillInfo,
   SkillInstallRequest,
+  SkillResourceInfo,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
@@ -291,6 +294,30 @@ export class TurnstoneConsole extends BaseClient {
 
   async deleteSkill(skillId: string): Promise<void> {
     await this.request("DELETE", `/v1/api/admin/skills/${skillId}`);
+  }
+
+  async listSkillResources(skillId: string): Promise<SkillResourceInfo[]> {
+    const resp = await this.request<ListSkillResourcesResponse>(
+      "GET",
+      `/v1/api/admin/skills/${skillId}/resources`,
+    );
+    return resp.resources;
+  }
+
+  async createSkillResource(
+    skillId: string,
+    body: CreateSkillResourceRequest,
+  ): Promise<SkillResourceInfo> {
+    return this.request("POST", `/v1/api/admin/skills/${skillId}/resources`, {
+      json: body,
+    });
+  }
+
+  async deleteSkillResource(skillId: string, path: string): Promise<void> {
+    await this.request(
+      "DELETE",
+      `/v1/api/admin/skills/${skillId}/resources/${encodeURIComponent(path)}`,
+    );
   }
 
   // -- Governance: Usage & Audit ----------------------------------------------

@@ -2248,7 +2248,7 @@ def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], J
     return fields, None
 
 
-def _skill_to_response(r: dict[str, Any]) -> dict[str, Any]:
+def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, Any]:
     """Convert a storage skill dict to a JSON-safe response dict."""
     import contextlib
     import json as _json
@@ -2289,6 +2289,7 @@ def _skill_to_response(r: dict[str, Any]) -> dict[str, Any]:
         "scan_status": r.get("scan_status", ""),
         "scan_report": r.get("scan_report", "{}"),
         "scan_version": r.get("scan_version", ""),
+        "resource_count": resource_count,
         "created": r.get("created", ""),
         "updated": r.get("updated", ""),
     }
@@ -2310,7 +2311,9 @@ async def admin_list_skills(request: Request) -> JSONResponse:
     offset = _parse_int(params, "offset", 0, minimum=0, maximum=100000)
     rows = storage.list_prompt_templates(limit=limit, offset=offset)
     total = storage.count_prompt_templates()
-    skills = [_skill_to_response(r) for r in rows]
+    skill_ids = [r["template_id"] for r in rows]
+    rc_map = storage.count_skill_resources_bulk(skill_ids) if skill_ids else {}
+    skills = [_skill_to_response(r, resource_count=rc_map.get(r["template_id"], 0)) for r in rows]
     return JSONResponse({"skills": skills, "total": total})
 
 
@@ -2330,7 +2333,8 @@ async def admin_get_skill(request: Request) -> JSONResponse:
     skill = storage.get_prompt_template(skill_id)
     if skill is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
-    return JSONResponse(_skill_to_response(skill))
+    rc = len(storage.list_skill_resources(skill_id))
+    return JSONResponse(_skill_to_response(skill, resource_count=rc))
 
 
 async def admin_create_skill(request: Request) -> JSONResponse:
@@ -2830,6 +2834,192 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Skill Resources
+# ---------------------------------------------------------------------------
+
+_ALLOWED_RESOURCE_DIRS = ("scripts/", "references/", "assets/")
+_MAX_RESOURCE_SIZE = 100 * 1024  # 100KB
+_MAX_RESOURCES_PER_SKILL = 10
+
+
+async def admin_list_skill_resources(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills/{skill_id}/resources — list resources."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    skill = storage.get_prompt_template(skill_id)
+    if skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+
+    rows = storage.list_skill_resources(skill_id)
+    resources = [
+        {
+            "resource_id": r.get("resource_id", ""),
+            "skill_id": r.get("skill_id", ""),
+            "path": r.get("path", ""),
+            "content_type": r.get("content_type", "text/plain"),
+            "size": len(r.get("content", "")),
+            "created": r.get("created", ""),
+        }
+        for r in rows
+    ]
+    return JSONResponse({"resources": resources})
+
+
+async def admin_get_skill_resource(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/skills/{skill_id}/resources/{path:path} — get one resource."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    path = request.path_params["path"]
+    resource = storage.get_skill_resource(skill_id, path)
+    if resource is None:
+        return JSONResponse({"error": "Resource not found"}, status_code=404)
+    return JSONResponse(
+        {
+            "resource_id": resource.get("resource_id", ""),
+            "skill_id": resource.get("skill_id", ""),
+            "path": resource.get("path", ""),
+            "content": resource.get("content", ""),
+            "content_type": resource.get("content_type", "text/plain"),
+            "size": len(resource.get("content", "")),
+            "created": resource.get("created", ""),
+        }
+    )
+
+
+async def admin_create_skill_resource(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills/{skill_id}/resources — upload resource."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    skill = storage.get_prompt_template(skill_id)
+    if skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    if skill.get("readonly"):
+        return JSONResponse({"error": "Installed skills are read-only"}, status_code=403)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    path = str(body.get("path", "")).strip()
+    content = str(body.get("content", ""))
+    content_type = str(body.get("content_type", "text/plain")).strip()[:64]
+
+    if not path:
+        return JSONResponse({"error": "path is required"}, status_code=400)
+    # Normalize and reject path traversal
+    import posixpath
+
+    path = posixpath.normpath(path)
+    if ".." in path.split("/") or "\x00" in path:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not any(path.startswith(d.rstrip("/")) for d in _ALLOWED_RESOURCE_DIRS):
+        return JSONResponse(
+            {"error": "path must start with scripts/, references/, or assets/"},
+            status_code=400,
+        )
+    if len(content) > _MAX_RESOURCE_SIZE:
+        return JSONResponse(
+            {"error": f"Resource exceeds {_MAX_RESOURCE_SIZE // 1024}KB limit"},
+            status_code=400,
+        )
+
+    existing = storage.list_skill_resources(skill_id)
+    if len(existing) >= _MAX_RESOURCES_PER_SKILL:
+        return JSONResponse(
+            {"error": f"Maximum {_MAX_RESOURCES_PER_SKILL} resources per skill"},
+            status_code=400,
+        )
+    if storage.get_skill_resource(skill_id, path) is not None:
+        return JSONResponse({"error": "Resource path already exists"}, status_code=409)
+
+    resource_id = uuid.uuid4().hex
+    storage.create_skill_resource(
+        resource_id=resource_id,
+        skill_id=skill_id,
+        path=path,
+        content=content,
+        content_type=content_type,
+    )
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "skill_resource.create", "skill", skill_id, {"path": path}, ip)
+
+    created = storage.get_skill_resource(skill_id, path)
+    return JSONResponse(
+        {
+            "resource_id": resource_id,
+            "skill_id": skill_id,
+            "path": path,
+            "content_type": content_type,
+            "size": len(content),
+            "created": (created or {}).get("created", ""),
+        },
+        status_code=201,
+    )
+
+
+async def admin_delete_skill_resource(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/skills/{skill_id}/resources/{path:path} — delete resource."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    skill = storage.get_prompt_template(skill_id)
+    if skill is None:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+    if skill.get("readonly"):
+        return JSONResponse({"error": "Installed skills are read-only"}, status_code=403)
+
+    path = request.path_params["path"]
+    deleted = storage.delete_skill_resource_by_path(skill_id, path)
+    if not deleted:
+        return JSONResponse({"error": "Resource not found"}, status_code=404)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "skill_resource.delete", "skill", skill_id, {"path": path}, ip)
+
+    return JSONResponse({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # Admin: Skill Discovery
 # ---------------------------------------------------------------------------
 
@@ -2870,6 +3060,8 @@ async def admin_skill_discover(request: Request) -> JSONResponse:
         return err
 
     q = str(request.query_params.get("q", "")).strip()
+    if not q:
+        return JSONResponse({"error": "Search query is required"}, status_code=400)
     try:
         limit = max(1, min(int(request.query_params.get("limit", "20")), 100))
     except (ValueError, TypeError):
@@ -4360,6 +4552,25 @@ def create_app(
                     Route(
                         "/api/admin/skills/{skill_id}/versions",
                         admin_list_skill_versions,
+                    ),
+                    # Governance: Skill Resources
+                    Route(
+                        "/api/admin/skills/{skill_id}/resources",
+                        admin_list_skill_resources,
+                    ),
+                    Route(
+                        "/api/admin/skills/{skill_id}/resources",
+                        admin_create_skill_resource,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/skills/{skill_id}/resources/{path:path}",
+                        admin_get_skill_resource,
+                    ),
+                    Route(
+                        "/api/admin/skills/{skill_id}/resources/{path:path}",
+                        admin_delete_skill_resource,
+                        methods=["DELETE"],
                     ),
                     # Governance: Memories
                     Route("/api/admin/memories", admin_list_memories),
