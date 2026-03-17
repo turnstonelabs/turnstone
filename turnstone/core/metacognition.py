@@ -44,12 +44,19 @@ NUDGE_START = (
     "user's request to find applicable context, preferences, or guidance."
 )
 
+NUDGE_TOOL_ERROR = (
+    "A tool just returned an error. Before retrying, check your memories — "
+    "the user may have given feedback about this tool or error pattern in a "
+    "previous session. Use memory(action='search') to find relevant guidance."
+)
+
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,
     "resume": NUDGE_RESUME,
     "completion": NUDGE_COMPLETION,
     "start": NUDGE_START,
+    "tool_error": NUDGE_TOOL_ERROR,
 }
 
 # ---------------------------------------------------------------------------
@@ -152,6 +159,9 @@ def should_nudge(
         return False
     # Start nudge only on first message
     if nudge_type == "start" and message_count != 1:
+        return False
+    # Tool error nudge only if there are memories to search
+    if nudge_type == "tool_error" and memory_count == 0:
         return False
     # Resume/start nudge only if there are memories to recall
     if nudge_type in ("resume", "start") and memory_count == 0:
