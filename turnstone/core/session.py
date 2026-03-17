@@ -129,6 +129,11 @@ _MAX_SKILL_CONTENT: int = 32768
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
+def _without_tool(tools: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    """Return *tools* with the named tool removed."""
+    return [t for t in tools if t.get("function", {}).get("name") != name]
+
+
 def _render_template(content: str, context: dict[str, str]) -> str:
     """Replace ``{{variable}}`` placeholders in a single pass.
 
@@ -361,17 +366,26 @@ class ChatSession:
     def model_alias(self) -> str | None:
         return self._model_alias
 
-    def _get_capabilities(self) -> ModelCapabilities:
+    def _resolve_capabilities(
+        self,
+        provider: LLMProvider,
+        model: str,
+        alias: str | None = None,
+    ) -> ModelCapabilities:
         """Get model capabilities, applying config.toml overrides if present."""
-        caps = self._provider.get_capabilities(self.model)
-        if self._registry and self._model_alias:
-            cfg: ModelConfig = self._registry.get_config(self._model_alias)
+        caps = provider.get_capabilities(model)
+        if self._registry and alias:
+            cfg: ModelConfig = self._registry.get_config(alias)
             if cfg.capabilities:
                 fields = {f.name for f in dataclasses.fields(type(caps))}
                 overrides = {k: v for k, v in cfg.capabilities.items() if k in fields}
                 if overrides:
                     caps = dataclasses.replace(caps, **overrides)
         return caps
+
+    def _get_capabilities(self) -> ModelCapabilities:
+        """Get capabilities for the current model."""
+        return self._resolve_capabilities(self._provider, self.model, self._model_alias)
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
@@ -958,7 +972,7 @@ class ChatSession:
 
         # Gate web_search: only include when a backend exists
         if not caps.supports_web_search and not get_tavily_key():
-            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+            tools = _without_tool(tools, "web_search")
 
         return tools
 
@@ -3714,16 +3728,10 @@ class ChatSession:
             agent_provider = self._registry.get_provider(self._registry.agent_model)
 
         # Gate web_search: remove when no backend exists for the agent model
-        agent_caps = agent_provider.get_capabilities(agent_model)
-        if self._registry and self._registry.agent_model:
-            agent_cfg: ModelConfig = self._registry.get_config(self._registry.agent_model)
-            if agent_cfg.capabilities:
-                _fields = {f.name for f in dataclasses.fields(type(agent_caps))}
-                _overrides = {k: v for k, v in agent_cfg.capabilities.items() if k in _fields}
-                if _overrides:
-                    agent_caps = dataclasses.replace(agent_caps, **_overrides)
+        agent_alias = self._registry.agent_model if self._registry else None
+        agent_caps = self._resolve_capabilities(agent_provider, agent_model, agent_alias)
         if not agent_caps.supports_web_search and not get_tavily_key():
-            tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+            tools = _without_tool(tools, "web_search")
 
         # Build extra params for agent calls
         agent_extra: dict[str, Any] | None = None
