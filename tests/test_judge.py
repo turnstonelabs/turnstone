@@ -182,7 +182,6 @@ class TestErrorHandling:
         result = judge._evaluate_single(
             _make_item(),
             [{"role": "user", "content": "test"}],
-            MagicMock(),
         )
         assert result is None
 
@@ -215,7 +214,6 @@ class TestErrorHandling:
         result = judge._evaluate_single(
             _make_item(),
             [{"role": "user", "content": "test"}],
-            MagicMock(),
         )
         assert result is None
 
@@ -259,7 +257,6 @@ class TestMultiTurnToolUse:
         verdict = judge._evaluate_single(
             _make_item(),
             [{"role": "user", "content": "test"}],
-            MagicMock(),
         )
         assert verdict is not None
         assert verdict.tier == "llm"
@@ -305,7 +302,6 @@ class TestMultiTurnToolUse:
         judge._evaluate_single(
             _make_item(),
             [{"role": "user", "content": "test"}],
-            MagicMock(),
         )
         # Should have called create_completion exactly _JUDGE_MAX_TURNS times
         assert provider.create_completion.call_count == 5

@@ -131,7 +131,7 @@ def authorize_client(storage: SQLiteBackend, oidc_config: OIDCConfig) -> TestCli
     )
     app.state.oidc_config = oidc_config
     app.state.auth_storage = storage
-    app.state.jwt_secret = "test-jwt-secret"
+    app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
     app.state.jwks_data = {"keys": []}
     app.state.login_limiter = None
     return TestClient(app, raise_server_exceptions=False)
@@ -468,7 +468,7 @@ class TestOIDCCallback:
         )
         app.state.oidc_config = _make_oidc_config()
         app.state.auth_storage = backend
-        app.state.jwt_secret = "secret"
+        app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app.state.jwks_data = {"keys": []}
         app.state.login_limiter = None
 
@@ -492,7 +492,7 @@ class TestOIDCCallback:
         )
         app.state.oidc_config = _make_oidc_config()
         app.state.auth_storage = storage
-        app.state.jwt_secret = "secret"
+        app.state.jwt_secret = "test-jwt-secret-key-padded-32b!!"
         app.state.jwks_data = {"keys": []}
         limiter = LoginRateLimiter(max_attempts=1, window_seconds=300)
         limiter.record("ip:testclient")

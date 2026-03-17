@@ -347,7 +347,6 @@ class ChatSession:
             self._tool_search = ToolSearchManager(
                 self._tools,
                 always_on_names=set(BUILTIN_TOOL_NAMES),
-                threshold=tool_search_threshold,
                 max_results=tool_search_max_results,
             )
         # Skill: explicit name overrides is_default skills
@@ -527,7 +526,6 @@ class ChatSession:
             self._tool_search = ToolSearchManager(
                 self._tools,
                 always_on_names=set(BUILTIN_TOOL_NAMES),
-                threshold=self._tool_search_threshold,
                 max_results=self._tool_search_max_results,
             )
             # Restore previously expanded tools that still exist

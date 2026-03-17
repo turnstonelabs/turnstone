@@ -64,15 +64,12 @@ class ToolSearchManager:
         all_tools: list[dict[str, Any]],
         always_on_names: set[str],
         *,
-        threshold: int = 20,
         max_results: int = 5,
     ) -> None:
-        self._all_tools = all_tools
         self._always_on: list[dict[str, Any]] = []
         self._deferred: list[dict[str, Any]] = []
         self._deferred_by_name: dict[str, dict[str, Any]] = {}
         self._expanded: dict[str, None] = {}  # ordered set (preserves discovery order)
-        self._threshold = threshold
         self._max_results = max_results
 
         for tool in all_tools:
@@ -90,10 +87,6 @@ class ToolSearchManager:
         # Pre-compute server summary for the search tool description
         self._server_hint = _mcp_server_summary(self._deferred)
 
-    def should_activate(self) -> bool:
-        """Return True if tool search should be active (enough tools)."""
-        return len(self._all_tools) > self._threshold
-
     def get_visible_tools(self) -> list[dict[str, Any]]:
         """Return always-on tools + any expanded (discovered) tools."""
         result = list(self._always_on)
@@ -106,10 +99,6 @@ class ToolSearchManager:
     def get_deferred_tools(self) -> list[dict[str, Any]]:
         """Return tools that are currently deferred (not yet discovered)."""
         return [t for t in self._deferred if _tool_name(t) not in self._expanded]
-
-    def get_all_tools(self) -> list[dict[str, Any]]:
-        """Return the full tool list (for native provider modes)."""
-        return list(self._all_tools)
 
     def search(self, query: str) -> list[dict[str, Any]]:
         """Search deferred tools by query, return top-k matches.

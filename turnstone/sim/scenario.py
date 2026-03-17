@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any
 
 from turnstone.mq.broker import RedisBroker
 from turnstone.mq.protocol import SendMessage
@@ -16,15 +16,6 @@ if TYPE_CHECKING:
     from turnstone.sim.metrics import MetricsCollector
 
 log = logging.getLogger("turnstone.sim.scenario")
-
-
-class Scenario(Protocol):
-    async def run(
-        self,
-        cluster: SimCluster,
-        config: SimConfig,
-        metrics: MetricsCollector,
-    ) -> None: ...
 
 
 class SteadyStateScenario:

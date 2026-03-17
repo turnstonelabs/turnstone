@@ -75,7 +75,6 @@ class SimWorkstream:
                 self._set_state("thinking", correlation_id)
                 content, tool_calls = await self._engine.simulate_llm_response(
                     rounds == 0,
-                    self._turn_count,
                 )
                 await self._stream_content(content, correlation_id)
 

@@ -32,7 +32,6 @@ MAX_WATCHES_PER_WS = 5
 MIN_INTERVAL = 10  # seconds
 MAX_INTERVAL = 86_400  # 24 hours
 DEFAULT_MAX_POLLS = 100
-DEFAULT_INTERVAL = 300  # 5 minutes
 MAX_OUTPUT_SIZE = 65_536  # truncate stored/dispatched output at 64 KB
 
 # Safe builtins exposed to condition expressions.

@@ -975,7 +975,7 @@ class IntentJudge:
         """Daemon thread: run LLM judge for each item and invoke callback."""
         for item, h_verdict in zip(items, heuristic_verdicts, strict=True):
             try:
-                llm_verdict = self._evaluate_single(item, messages, h_verdict)
+                llm_verdict = self._evaluate_single(item, messages)
                 # Arbitrate: only callback when LLM upgrades the heuristic
                 if llm_verdict and llm_verdict.confidence > h_verdict.confidence:
                     callback(llm_verdict)
@@ -990,7 +990,6 @@ class IntentJudge:
         self,
         item: dict[str, Any],
         messages: list[dict[str, Any]],
-        heuristic: IntentVerdict,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
         start = time.monotonic()

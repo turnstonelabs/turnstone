@@ -130,7 +130,7 @@ class TestParseScopes:
 
 
 class TestJWT:
-    SECRET = "test-secret-key-for-jwt"
+    SECRET = "test-secret-key-for-jwt-min-32b!"
 
     def test_round_trip(self):
         scopes = frozenset({"read", "write"})
@@ -155,7 +155,7 @@ class TestJWT:
 
     def test_invalid_signature(self):
         token = create_jwt("user1", frozenset({"read"}), "db", self.SECRET)
-        assert validate_jwt(token, "wrong-secret") is None
+        assert validate_jwt(token, "wrong-secret-key-for-jwt-min-32b") is None
 
     def test_malformed_token(self):
         assert validate_jwt("not.a.jwt", self.SECRET) is None
@@ -217,7 +217,7 @@ class TestAuthenticateToken:
         assert result.scopes == frozenset({"read", "write", "approve"})
 
     def test_jwt_token(self):
-        secret = "test-secret"
+        secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("user1", frozenset({"read", "write"}), "db", secret)
         cfg = AuthConfig(enabled=True)
         result = _authenticate_token(jwt_tok, cfg, jwt_secret=secret)
@@ -304,7 +304,7 @@ class TestCheckRequestScopes:
         assert result.has_scope("approve")
 
     def test_jwt_with_scopes(self):
-        secret = "test"
+        secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("u1", frozenset({"read", "write"}), "db", secret)
         cfg = AuthConfig(enabled=True)
         allowed, status, msg, result = check_request(
@@ -319,7 +319,7 @@ class TestCheckRequestScopes:
         assert result.user_id == "u1"
 
     def test_jwt_insufficient_scope(self):
-        secret = "test"
+        secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("u1", frozenset({"read"}), "db", secret)
         cfg = AuthConfig(enabled=True)
         allowed, status, msg, _ = check_request(

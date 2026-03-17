@@ -74,7 +74,7 @@ class TestSimEngine:
 
     def test_llm_response_returns_content(self, engine):
         async def _test():
-            content, tool_calls = await engine.simulate_llm_response(True, 1)
+            content, tool_calls = await engine.simulate_llm_response(True)
             assert isinstance(content, str)
             assert len(content) > 0
             assert isinstance(tool_calls, list)
@@ -85,8 +85,8 @@ class TestSimEngine:
         async def _test():
             e1 = SimEngine(fast_config, rng=random.Random(123))
             e2 = SimEngine(fast_config, rng=random.Random(123))
-            c1, t1 = await e1.simulate_llm_response(True, 1)
-            c2, t2 = await e2.simulate_llm_response(True, 1)
+            c1, t1 = await e1.simulate_llm_response(True)
+            c2, t2 = await e2.simulate_llm_response(True)
             assert c1 == c2
             assert len(t1) == len(t2)
 

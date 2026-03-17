@@ -250,13 +250,11 @@ class "MCPClientManager" as MCPMgr {
 
 ' ToolSearchManager
 class "ToolSearchManager" as ToolSearchMgr {
-    - _all_tools: list[dict]
     - _always_on: list[dict]
     - _deferred: list[dict]
     - _expanded: dict[str, None]
     - _index: BM25Index
     --
-    + should_activate() → bool
     + get_visible_tools() → list[dict]
     + get_deferred_tools() → list[dict]
     + get_expanded_names() → list[str]

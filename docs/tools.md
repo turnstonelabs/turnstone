@@ -591,9 +591,9 @@ CLI flags override the config file:
 
 ### How it works
 
-1. **Threshold check**: At session startup, `ToolSearchManager.should_activate()`
-   counts total tools (built-in + MCP). If the count is below the threshold, tool
-   search stays off and all tools are sent to the model directly.
+1. **Threshold check**: At session startup, if the total tool count (built-in + MCP)
+   is below the threshold, tool search stays off and all tools are sent to the model
+   directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
    - **Always-on** -- the 17 built-in tools (members of `BUILTIN_TOOL_NAMES`).

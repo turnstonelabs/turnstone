@@ -128,16 +128,8 @@ class TestToolSearchManager:
         return ToolSearchManager(
             all_tools,
             always_on_names={"bash", "read_file", "edit_file"},
-            threshold=5,
             max_results=3,
         )
-
-    def test_should_activate_above_threshold(self, manager):
-        assert manager.should_activate()
-
-    def test_should_not_activate_below_threshold(self, builtin_tools):
-        mgr = ToolSearchManager(builtin_tools, always_on_names={"bash", "read_file", "edit_file"})
-        assert not mgr.should_activate()
 
     def test_visible_tools_initially_builtin_only(self, manager):
         visible = manager.get_visible_tools()
@@ -200,9 +192,6 @@ class TestToolSearchManager:
         deferred = manager.get_deferred_tools()
         names = {_tool_name(t) for t in deferred}
         assert "mcp__github__create_issue" not in names
-
-    def test_get_all_tools_returns_everything(self, manager, builtin_tools, mcp_tools):
-        assert len(manager.get_all_tools()) == len(builtin_tools) + len(mcp_tools)
 
     def test_search_tool_definition_format(self, manager):
         defn = manager.get_search_tool_definition()
