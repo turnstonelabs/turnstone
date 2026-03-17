@@ -453,6 +453,28 @@ class ListVerdictsResponse(BaseModel):
     total: int
 
 
+class OutputAssessmentInfo(BaseModel):
+    """Output guard assessment."""
+
+    assessment_id: str
+    ws_id: str
+    call_id: str
+    func_name: str
+    flags: str = "[]"
+    risk_level: str = "none"
+    annotations: str = "[]"
+    output_length: int = 0
+    redacted: int = 0
+    created: str
+
+
+class ListOutputAssessmentsResponse(BaseModel):
+    """Response for output assessment listing."""
+
+    assessments: list[OutputAssessmentInfo]
+    total: int
+
+
 # ---------------------------------------------------------------------------
 # Channels
 # ---------------------------------------------------------------------------

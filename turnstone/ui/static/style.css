@@ -961,6 +961,14 @@ body { position: static; }
   border-color: var(--yellow);
 }
 
+/* Output guard warning */
+.output-warning { padding: 4px 8px; font-size: 11px; border-left: 3px solid; margin: 2px 0 2px 16px; }
+.output-warning-low { border-color: var(--cyan); color: var(--cyan); }
+.output-warning-medium { border-color: var(--yellow); color: var(--yellow); }
+.output-warning-high { border-color: var(--red); color: var(--red); }
+.output-warning-label { font-weight: 600; }
+.output-warning-redacted { color: var(--fg-dim); font-style: italic; }
+
 /* ==========================================================================
    New workstream modal
    ========================================================================== */

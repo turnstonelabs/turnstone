@@ -709,6 +709,23 @@ function _renderGovSkills(items) {
         : "";
     var catBadge =
       '<span class="scope-badge">' + escapeHtml(t.category) + "</span>";
+    var scanBadge = "";
+    if (t.scan_status) {
+      var scanClass =
+        {
+          safe: "scope-scan-safe",
+          low: "scope-scan-low",
+          medium: "scope-scan-medium",
+          high: "scope-scan-high",
+          critical: "scope-scan-critical",
+        }[t.scan_status] || "";
+      scanBadge =
+        ' <span class="scope-badge ' +
+        scanClass +
+        '">' +
+        escapeHtml(t.scan_status) +
+        "</span>";
+    }
     var editDisabled = t.readonly ? " disabled" : "";
     var deleteDisabled = t.readonly ? " disabled" : "";
     html +=
@@ -719,6 +736,7 @@ function _renderGovSkills(items) {
       activationBadge +
       defBadge +
       originBadge +
+      scanBadge +
       (t.description
         ? '<br><span class="admin-col-subtitle">' +
           escapeHtml(t.description) +
@@ -1000,6 +1018,94 @@ function showEditTemplateModal(tmplId) {
       document.getElementById("esk-allowed-tools").disabled = this.checked;
     });
   document.getElementById("edit-template-error").style.display = "none";
+  // Scan report section
+  var scanSection = document.getElementById("etm-scan-section");
+  if (scanSection) {
+    if (tmpl.scan_status) {
+      scanSection.style.display = "";
+      var scanClassMap = {
+        safe: "scope-scan-safe",
+        low: "scope-scan-low",
+        medium: "scope-scan-medium",
+        high: "scope-scan-high",
+        critical: "scope-scan-critical",
+      };
+      var report = {};
+      try {
+        report = JSON.parse(tmpl.scan_report || "{}");
+      } catch (e) {}
+      var scanHtml =
+        '<span class="scope-badge ' +
+        (scanClassMap[tmpl.scan_status] || "") +
+        '">' +
+        escapeHtml(tmpl.scan_status) +
+        "</span>";
+      if (report.composite != null) {
+        scanHtml +=
+          ' <span class="scan-composite">Score: ' +
+          report.composite.toFixed(2) +
+          "</span>";
+      }
+      if (tmpl.scan_version) {
+        scanHtml +=
+          ' <span class="scan-version">v' +
+          escapeHtml(tmpl.scan_version) +
+          "</span>";
+      }
+      var axes = ["content", "supply_chain", "vulnerability", "capability"];
+      for (var ai = 0; ai < axes.length; ai++) {
+        var axis = axes[ai];
+        var d = (report.details || {})[axis] || {};
+        scanHtml +=
+          '<div class="scan-axis"><span class="scan-axis-name">' +
+          escapeHtml(axis.replace(/_/g, " ")) +
+          '</span> <span class="scan-axis-score">' +
+          (d.score != null ? d.score.toFixed(1) : "0.0") +
+          "/4.0</span>";
+        if (d.flags && d.flags.length) {
+          scanHtml +=
+            ' <span class="scan-axis-flags">' +
+            d.flags.map(escapeHtml).join(", ") +
+            "</span>";
+        }
+        scanHtml += "</div>";
+      }
+      document.getElementById("etm-scan-report").innerHTML = scanHtml;
+    } else {
+      scanSection.style.display = "none";
+    }
+  }
+  var rescanBtn = document.getElementById("etm-rescan-btn");
+  if (rescanBtn) {
+    rescanBtn.onclick = function () {
+      rescanBtn.disabled = true;
+      rescanBtn.textContent = "Scanning...";
+      authFetch("/v1/api/admin/skills/" + tmplId + "/rescan", {
+        method: "POST",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Failed");
+          return r.json();
+        })
+        .then(function (data) {
+          showToast("Scan complete: " + (data.scan_status || "unknown"));
+          // Refresh the modal by re-loading skills and re-opening
+          loadGovSkills();
+          // Update current tmpl in memory
+          tmpl.scan_status = data.scan_status;
+          tmpl.scan_report = data.scan_report;
+          tmpl.scan_version = data.scan_version;
+          showEditTemplateModal(tmplId);
+        })
+        .catch(function () {
+          showToast("Re-scan failed");
+        })
+        .finally(function () {
+          rescanBtn.disabled = false;
+          rescanBtn.textContent = "Re-scan";
+        });
+    };
+  }
   _etmTrapHandler = _installTrap("edit-template-overlay", "edit-template-box");
 }
 

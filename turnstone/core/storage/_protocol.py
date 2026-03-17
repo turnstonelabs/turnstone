@@ -796,6 +796,45 @@ class StorageBackend(Protocol):
         """Count intent verdicts matching the filters."""
         ...
 
+    # -- Output assessments ----------------------------------------------------
+
+    def record_output_assessment(
+        self,
+        assessment_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        flags: str,
+        risk_level: str,
+        annotations: str,
+        output_length: int,
+        redacted: bool,
+    ) -> None:
+        """Record an output guard assessment."""
+        ...
+
+    def list_output_assessments(
+        self,
+        ws_id: str = "",
+        risk_level: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """List output assessments with optional filters, ordered by created DESC."""
+        ...
+
+    def count_output_assessments(
+        self,
+        ws_id: str = "",
+        risk_level: str = "",
+        since: str = "",
+        until: str = "",
+    ) -> int:
+        """Count output assessments matching the filters."""
+        ...
+
     # -- System settings -------------------------------------------------------
 
     def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:

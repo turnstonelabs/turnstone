@@ -275,11 +275,16 @@ class TerminalUI(SessionUI):
         risk = assessment.get("risk_level", "none")
         if risk == "none":
             return
-        summary = assessment.get("summary", "")
+        flags = assessment.get("flags", [])
         color = _VERDICT_COLORS.get(risk, YELLOW)
-        print(f"\n  {color}▸ OUTPUT WARNING: {risk.upper()}{RESET}")
-        if summary:
-            print(f"    {summary}")
+        sys.stdout.write(
+            f"\n  {color}⚠ OUTPUT WARNING: {risk.upper()} — {', '.join(flags)}{RESET}\n"
+        )
+        for ann in assessment.get("annotations", []):
+            sys.stdout.write(f"    {ann}\n")
+        if assessment.get("redacted"):
+            sys.stdout.write(f"    {DIM}(credentials redacted from output){RESET}\n")
+        sys.stdout.flush()
 
     def on_rename(self, name: str) -> None:
         pass  # base TerminalUI ignores renames

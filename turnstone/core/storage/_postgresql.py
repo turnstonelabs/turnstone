@@ -16,6 +16,7 @@ from turnstone.core.storage._schema import (
     mcp_servers,
     metadata,
     orgs,
+    output_assessments,
     prompt_templates,
     roles,
     skill_resources,
@@ -1514,7 +1515,7 @@ class PostgreSQLBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Scan skill content for risk signals
-        scan_status, scan_report = _scan_skill_content(content, allowed_tools)
+        scan_status, scan_report, scan_version = _scan_skill_content(content, allowed_tools)
 
         with self._engine.connect() as conn:
             conn.execute(
@@ -1541,6 +1542,7 @@ class PostgreSQLBackend:
                     "allowed_tools": allowed_tools,
                     "scan_status": scan_status,
                     "scan_report": scan_report,
+                    "scan_version": scan_version,
                     "model": model,
                     "auto_approve": 1 if auto_approve else 0,
                     "temperature": temperature,
@@ -1654,9 +1656,12 @@ class PostgreSQLBackend:
                     if allowed_tools is None:
                         allowed_tools = existing.get("allowed_tools", "[]")
             if content is not None:
-                scan_status, scan_report = _scan_skill_content(content, allowed_tools or "[]")
+                scan_status, scan_report, scan_version = _scan_skill_content(
+                    content, allowed_tools or "[]"
+                )
                 fields["scan_status"] = scan_status
                 fields["scan_report"] = scan_report
+                fields["scan_version"] = scan_version
         with self._engine.connect() as conn:
             result = conn.execute(
                 sa.update(prompt_templates)
@@ -2112,6 +2117,85 @@ class PostgreSQLBackend:
                 q = q.where(intent_verdicts.c.created <= until)
             if risk_level:
                 q = q.where(intent_verdicts.c.risk_level == risk_level)
+            row = conn.execute(q).fetchone()
+            return row[0] if row else 0
+
+    # -- Output assessments ----------------------------------------------------
+
+    def record_output_assessment(
+        self,
+        assessment_id: str,
+        ws_id: str,
+        call_id: str,
+        func_name: str,
+        flags: str,
+        risk_level: str,
+        annotations: str,
+        output_length: int,
+        redacted: bool,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                sa.insert(output_assessments),
+                {
+                    "assessment_id": assessment_id,
+                    "ws_id": ws_id,
+                    "call_id": call_id,
+                    "func_name": func_name,
+                    "flags": flags,
+                    "risk_level": risk_level,
+                    "annotations": annotations,
+                    "output_length": output_length,
+                    "redacted": int(redacted),
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def list_output_assessments(
+        self,
+        ws_id: str = "",
+        risk_level: str = "",
+        since: str = "",
+        until: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            q = sa.select(output_assessments).order_by(
+                output_assessments.c.created.desc(),
+                output_assessments.c.assessment_id.desc(),
+            )
+            if ws_id:
+                q = q.where(output_assessments.c.ws_id == ws_id)
+            if risk_level:
+                q = q.where(output_assessments.c.risk_level == risk_level)
+            if since:
+                q = q.where(output_assessments.c.created >= since)
+            if until:
+                q = q.where(output_assessments.c.created <= until)
+            q = q.limit(limit).offset(offset)
+            rows = conn.execute(q).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def count_output_assessments(
+        self,
+        ws_id: str = "",
+        risk_level: str = "",
+        since: str = "",
+        until: str = "",
+    ) -> int:
+        with self._engine.connect() as conn:
+            q = sa.select(sa.func.count()).select_from(output_assessments)
+            if ws_id:
+                q = q.where(output_assessments.c.ws_id == ws_id)
+            if risk_level:
+                q = q.where(output_assessments.c.risk_level == risk_level)
+            if since:
+                q = q.where(output_assessments.c.created >= since)
+            if until:
+                q = q.where(output_assessments.c.created <= until)
             row = conn.execute(q).fetchone()
             return row[0] if row else 0
 

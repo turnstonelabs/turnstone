@@ -397,6 +397,19 @@ class IntentVerdictEvent(OutboundEvent):
 
 
 @dataclass
+class OutputWarningEvent(OutboundEvent):
+    """Output guard warning for tool execution result."""
+
+    type: str = "output_warning"
+    call_id: str = ""
+    func_name: str = ""
+    risk_level: str = "none"
+    flags: str = "[]"
+    annotations: str = "[]"
+    redacted: int = 0
+
+
+@dataclass
 class ConfigChangeEvent(OutboundEvent):
     """System setting changed — nodes should invalidate config cache."""
 
@@ -461,6 +474,7 @@ _OUTBOUND_REGISTRY: dict[str, type[OutboundEvent]] = {
         WorkstreamResumedEvent,
         ClusterStateEvent,
         IntentVerdictEvent,
+        OutputWarningEvent,
         ConfigChangeEvent,
     ]
 }

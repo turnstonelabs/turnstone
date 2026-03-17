@@ -18,7 +18,7 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 - **Multi-node clusters** — generic work load-balances across nodes, directed work routes to a specific server
 - **Cluster dashboard** — real-time view of all nodes and workstreams, reverse proxy for server UIs
 - **Intent validation** — an LLM judge evaluates every tool call before approval, presenting risk assessments and evidence-based recommendations so users can make informed decisions instead of blindly approving raw tool calls
-- **Governance & compliance** — RBAC, OIDC SSO (Okta, Azure AD, Google, Keycloak), tool policies, prompt templates, workstream templates, usage tracking, and append-only audit logs
+- **Governance & compliance** — RBAC, OIDC SSO (Okta, Azure AD, Google, Keycloak), tool policies, skills (reusable behavioral profiles with security scanning), usage tracking, and append-only audit logs
 - **Cluster simulator** — test the stack at scale (up to 1000 nodes) without an LLM backend
 
 Works with any OpenAI-compatible API (vLLM, llama.cpp, NVIDIA NIM) or Anthropic's native Messages API. Supports [MCP](https://modelcontextprotocol.io/) for external tool servers with native deferred tool loading on Anthropic and OpenAI APIs (BM25 fallback for local models).
@@ -145,7 +145,7 @@ Turnstone includes a built-in governance layer for enterprise deployments — ma
 - **RBAC** — 15 granular permissions, 3 built-in roles (admin / operator / viewer), custom roles, privilege escalation prevention
 - **OIDC SSO** — single sign-on via any OpenID Connect provider (Okta, Azure AD, Google, Keycloak); Authorization Code Flow with PKCE, auto-provisioning, claim-based role mapping with demotion propagation; see [docs/oidc.md](docs/oidc.md)
 - **Tool policies** — glob-pattern rules (`allow` / `deny` / `ask`) with priority ordering; automate approvals or lock down dangerous tools
-- **Prompt templates** — reusable system messages with `{{variable}}` substitution and categories
+- **Skills** — reusable behavioral profiles with system prompts, `{{variable}}` substitution, session config (model, temperature, token budget), install-time security scanning, and version history
 - **Usage tracking** — per-request token and tool metrics, aggregation by day / model / user, automatic 90-day pruning
 - **Audit logging** — append-only event trail for all admin mutations, IP-aware, 365-day retention
 

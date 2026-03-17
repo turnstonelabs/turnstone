@@ -1101,6 +1101,10 @@ function handleEvent(evt) {
       updateVerdictBadge(evt);
       break;
 
+    case "output_warning":
+      showOutputWarning(evt);
+      break;
+
     case "approval_resolved":
       resolveInlineApproval(evt.approved, false, evt.feedback, true);
       break;
@@ -1721,6 +1725,36 @@ function appendToolOutputChunk(callId, chunk) {
   el.appendChild(document.createTextNode(stripped));
   el.scrollTop = el.scrollHeight;
   scrollToBottom();
+}
+
+function showOutputWarning(evt) {
+  if (!evt.call_id || evt.risk_level === "none") return;
+  var escapedId = CSS.escape(evt.call_id);
+  var toolDiv = messagesEl.querySelector(
+    '.approval-tool[data-call-id="' + escapedId + '"]',
+  );
+  if (!toolDiv) return;
+  var risk = evt.risk_level || "medium";
+  var flags = evt.flags || [];
+  var warning = document.createElement("div");
+  warning.className = "output-warning output-warning-" + risk;
+  warning.setAttribute("role", "alert");
+  warning.innerHTML =
+    '<span class="output-warning-label">\u26a0 ' +
+    escapeHtml(risk.toUpperCase()) +
+    "</span> " +
+    flags.map(escapeHtml).join(", ");
+  if (evt.redacted) {
+    warning.innerHTML +=
+      ' <span class="output-warning-redacted">(credentials redacted)</span>';
+  }
+  // Insert after tool output if it already exists, otherwise after tool div
+  var nextEl = toolDiv.nextElementSibling;
+  if (nextEl && nextEl.classList.contains("tool-output")) {
+    nextEl.insertAdjacentElement("afterend", warning);
+  } else {
+    toolDiv.insertAdjacentElement("afterend", warning);
+  }
 }
 
 function appendToolOutput(callId, name, output) {

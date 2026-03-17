@@ -1285,6 +1285,71 @@ is on the **console** server and requires the `admin.judge` permission.
 
 ---
 
+### `GET /v1/api/admin/output-assessments` (Console)
+
+List output guard assessments from the `output_assessments` table. This endpoint
+is on the **console** server and requires the `admin.judge` permission.
+
+**Query parameters:**
+
+| Parameter    | Type   | Required | Description                                        |
+|--------------|--------|----------|----------------------------------------------------|
+| `ws_id`      | string | no       | Filter by workstream ID                            |
+| `risk_level` | string | no       | Filter by risk level (`low`/`medium`/`high`)       |
+| `since`      | string | no       | ISO timestamp lower bound                          |
+| `until`      | string | no       | ISO timestamp upper bound                          |
+| `limit`      | int    | no       | Max results (default 100, max 500)                 |
+| `offset`     | int    | no       | Pagination offset (default 0)                      |
+
+**Response:**
+
+```json
+{
+  "assessments": [
+    {
+      "assessment_id": "a1b2c3d4e5f6",
+      "ws_id": "ws-1",
+      "call_id": "call_abc123",
+      "func_name": "bash",
+      "flags": "[\"credential_leak\"]",
+      "risk_level": "high",
+      "annotations": "[\"API key detected (sk-proj-...)\"]",
+      "output_length": 1024,
+      "redacted": 1,
+      "created": "2026-03-16T10:00:00"
+    }
+  ],
+  "total": 7
+}
+```
+
+---
+
+### `POST /v1/api/admin/skills/{skill_id}/rescan` (Console)
+
+Re-scan a skill's content for security signals using the current scanner
+version. Requires the `admin.skills` permission.
+
+**Path parameters:**
+
+| Parameter  | Type   | Description |
+|------------|--------|-------------|
+| `skill_id` | string | Skill (prompt template) ID |
+
+**Response:**
+
+```json
+{
+  "scan_status": "medium",
+  "scan_report": "{\"composite\": 1.75, \"details\": {...}}",
+  "scan_version": "1"
+}
+```
+
+**Error:** `404` if skill not found.
+
+---
+
 ### `GET /v1/api/admin/settings` (Console)
 
 List all settings with their effective values, defaults, and metadata. Requires

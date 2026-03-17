@@ -315,6 +315,7 @@ prompt_templates = sa.Table(
     sa.Column("scan_report", sa.Text, nullable=False, server_default="{}"),  # JSON
     sa.Column("installed_at", sa.Text, nullable=False, server_default=""),
     sa.Column("installed_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("scan_version", sa.Text, nullable=False, server_default=""),
     # Session config (merged from workstream templates)
     sa.Column("model", sa.Text, nullable=False, server_default=""),
     sa.Column("auto_approve", sa.Integer, nullable=False, server_default="0"),
@@ -437,6 +438,29 @@ intent_verdicts = sa.Table(
 sa.Index("idx_intent_verdicts_ws", intent_verdicts.c.ws_id)
 sa.Index("idx_intent_verdicts_created", intent_verdicts.c.created)
 sa.Index("idx_intent_verdicts_risk", intent_verdicts.c.risk_level)
+
+# ---------------------------------------------------------------------------
+# Output assessments — output guard assessment persistence
+# ---------------------------------------------------------------------------
+
+output_assessments = sa.Table(
+    "output_assessments",
+    metadata,
+    sa.Column("assessment_id", sa.Text, primary_key=True),
+    sa.Column("ws_id", sa.Text, nullable=False),
+    sa.Column("call_id", sa.Text, nullable=False),
+    sa.Column("func_name", sa.Text, nullable=False),
+    sa.Column("flags", sa.Text, nullable=False, server_default="[]"),
+    sa.Column("risk_level", sa.Text, nullable=False, server_default="none"),
+    sa.Column("annotations", sa.Text, nullable=False, server_default="[]"),
+    sa.Column("output_length", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("redacted", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("ix_oa_ws_id", output_assessments.c.ws_id)
+sa.Index("ix_oa_created", output_assessments.c.created)
+sa.Index("ix_oa_risk", output_assessments.c.risk_level)
 
 # ---------------------------------------------------------------------------
 # System settings — database-backed configuration

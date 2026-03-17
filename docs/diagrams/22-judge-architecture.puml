@@ -176,11 +176,20 @@ note right
 end note
 
 alt output_warning flags detected
-    Session -> UI : SSE: output_warning\n{call_id, risk_level, flags}
+    Session -> UI : SSE: output_warning\n{call_id, risk_level, flags,\nfunc_name, redacted}
     note right
       Credential values replaced
       with [REDACTED:<type>] before
       output enters conversation.
+      sanitized text excluded from
+      SSE payload (defense in depth).
+    end note
+    UI -> Storage : record_output_assessment()\nfire-and-forget persistence
+    note right
+      Stored: flags, risk_level,
+      annotations, output_length,
+      redacted (bool). Raw tool
+      output is never stored.
     end note
 end
 
@@ -200,8 +209,10 @@ note over Session, Judge
   Credential redaction when judge_config.redact_secrets is true.
 
   **Storage:**
-  intent_verdicts table (migration 012). Verdicts queryable via
-  GET /v1/api/admin/verdicts (requires admin.judge permission).
+  intent_verdicts table (migration 012), output_assessments table
+  (migration 022). Both queryable via admin API endpoints
+  (requires admin.judge permission). Skills store scan_status,
+  scan_report, scan_version for install-time risk assessment.
 end note
 
 @enduml

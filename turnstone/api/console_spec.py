@@ -31,6 +31,7 @@ from turnstone.api.console_schemas import (
     ListChannelUsersResponse,
     ListMcpServersResponse,
     ListOrgsResponse,
+    ListOutputAssessmentsResponse,
     ListRolesResponse,
     ListSettingSchemaResponse,
     ListSettingsResponse,
@@ -43,6 +44,7 @@ from turnstone.api.console_schemas import (
     McpServerDetail,
     NodeDetailResponse,
     OrgInfo,
+    OutputAssessmentInfo,
     RegistryInstallRequest,
     RegistrySearchResponse,
     RoleInfo,
@@ -591,6 +593,28 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ],
         tags=["Admin"],
     ),
+    # --- Admin: Output Guard ---
+    EndpointSpec(
+        "/v1/api/admin/output-assessments",
+        "GET",
+        "Paginated output guard assessments",
+        response_model=ListOutputAssessmentsResponse,
+        query_params=[
+            QueryParam("ws_id", "Filter by workstream"),
+            QueryParam("risk_level", "Filter by risk level", enum=["low", "medium", "high"]),
+            QueryParam("since", "Start timestamp (ISO8601)"),
+            QueryParam("until", "End timestamp (ISO8601)"),
+            QueryParam("limit", "Page size (max 500)", schema_type="integer", default=100),
+            QueryParam("offset", "Pagination offset", schema_type="integer", default=0),
+        ],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/skills/{skill_id}/rescan",
+        "POST",
+        "Re-scan a skill for security signals",
+        tags=["Admin"],
+    ),
     # --- Admin: Memories ---
     EndpointSpec(
         "/v1/api/admin/memories",
@@ -817,6 +841,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListAuditEventsResponse,
     VerdictInfo,
     ListVerdictsResponse,
+    OutputAssessmentInfo,
+    ListOutputAssessmentsResponse,
     AdminMemoryInfo,
     ListAdminMemoriesResponse,
     SettingInfo,

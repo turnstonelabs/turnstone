@@ -156,6 +156,34 @@ class TestSystemInfoDisclosure:
         r = evaluate_output("Found: /home/user/.ssh/id_rsa\n  /home/user/.aws/credentials")
         assert "sensitive_path_disclosure" in r.flags
 
+    def test_credentials_word_in_prose_no_flag(self) -> None:
+        """The word 'credentials' in prose should not trigger sensitive_path_disclosure."""
+        r = evaluate_output(
+            "Enter your credentials to log in. Invalid credentials will be rejected."
+        )
+        assert "sensitive_path_disclosure" not in r.flags
+
+    def test_credentials_path_with_slash_flags(self) -> None:
+        """A path like /credentials should still trigger."""
+        r = evaluate_output("cat /etc/service/credentials")
+        assert "sensitive_path_disclosure" in r.flags
+
+
+class TestEnvSecretFalsePositives:
+    """Verify env-secret detection only checks the key, not the value."""
+
+    def test_secret_in_value_no_flag(self) -> None:
+        """DESCRIPTION=The secret weapon should not trigger env_file_leak."""
+        r = evaluate_output(
+            "APP_NAME=myapp\nDESCRIPTION=The secret weapon\nVERSION=1.0\nDEBUG=true"
+        )
+        assert "env_file_leak" not in r.flags
+
+    def test_secret_in_key_still_flags(self) -> None:
+        """SECRET_KEY=value should still trigger env_file_leak."""
+        r = evaluate_output("APP_NAME=myapp\nSECRET_KEY=abc123\nAPI_TOKEN=xyz789\nDEBUG=true")
+        assert "env_file_leak" in r.flags
+
 
 class TestOutputAssessment:
     """Verify OutputAssessment structure."""

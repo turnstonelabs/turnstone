@@ -921,6 +921,11 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <input id="esk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
       <label class="admin-checkbox"><input id="esk-enabled" type="checkbox" checked> Enabled</label>
     </details>
+    <div id="etm-scan-section" style="display:none" class="admin-field">
+      <span class="admin-field-heading" id="etm-scan-heading">Security Scan</span>
+      <div id="etm-scan-report" aria-labelledby="etm-scan-heading"></div>
+      <button type="button" id="etm-rescan-btn" class="admin-btn-action" style="margin-top:8px">Re-scan</button>
+    </div>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditTemplateModal()">Cancel</button>
       <button id="etm-submit" class="modal-submit" onclick="submitEditTemplate()">Save</button>

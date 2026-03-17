@@ -360,19 +360,70 @@ redact_secrets = true  # auto-redact detected credentials (default)
 
 Configurable at runtime via the admin Settings tab.
 
+### SSE event: `output_warning`
+
+When the output guard detects risk signals, an `output_warning` SSE event is
+emitted to the frontend:
+
+```json
+{
+  "type": "output_warning",
+  "call_id": "call_abc123",
+  "func_name": "bash",
+  "risk_level": "high",
+  "flags": ["credential_leak"],
+  "annotations": ["API key detected (sk-proj-...)"],
+  "output_length": 1024,
+  "redacted": true
+}
+```
+
+The web UI renders this as an inline warning after the tool result. The CLI
+shows a colored terminal warning. The MQ bridge forwards it as an
+`OutputWarningEvent` for console subscribers.
+
+Assessments are persisted to the `output_assessments` table for v2
+calibration. Raw tool output is never stored — only metadata (flags, risk
+level, annotations, output length, redaction status).
+
+### Session-level skill scan warning
+
+When a skill with `scan_status` of `high` or `critical` is loaded into a
+session, a warning is emitted via `on_info`:
+
+```
+⚠ Skill 'my-skill' has scan status: high.
+Review scan report in admin panel before enabling in production.
+```
+
+This ensures operators see a warning even if they missed the scan badge in
+the admin skills tab.
+
 ---
 
-## v2 Calibration Path
+## Data Collection for v2 Calibration
 
-Run v1 with all tools requiring manual approval to build a local verdict
-dataset. The `intent_verdicts` table accumulates `(tool_call, verdict,
-user_decision)` triples over time. In v2, calibration tooling will analyze
-this dataset to:
+All three evaluation systems persist their assessments for future calibration:
+
+| Table | Source | Key columns |
+|-------|--------|-------------|
+| `intent_verdicts` | Intent judge (heuristic + LLM) | `func_name`, `risk_level`, `confidence`, `user_decision` |
+| `output_assessments` | Output guard | `func_name`, `risk_level`, `flags`, `redacted` |
+| `prompt_templates` | Skill scanner | `scan_status`, `scan_report`, `scan_version` |
+
+Run v1 with all tools requiring manual approval to build a local dataset.
+In v2, calibration tooling will analyze this data to:
 
 - Identify tools that are always approved (candidates for auto-approve policies)
-- Detect false positives in heuristic rules
+- Detect false positives in heuristic rules (intent + output guard)
 - Measure LLM judge accuracy against human decisions
 - Recommend policy changes to reduce approval fatigue
+- Tune output guard sensitivity per tool (e.g., `bash` output needs more
+  scrutiny than `read_file`)
+
+Output assessments are queryable via `GET /v1/api/admin/output-assessments`
+(requires `admin.judge` permission). Skills can be re-scanned via
+`POST /v1/api/admin/skills/{id}/rescan` when the scanner is updated.
 
 This data-driven approach means v1 is both useful on its own and a foundation
 for automated policy tuning.

@@ -1447,7 +1447,7 @@ async def admin_list_schedule_runs(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Schedule not found"}, status_code=404)
 
     try:
-        limit = min(int(request.query_params.get("limit", "50")), 200)
+        limit = max(1, min(int(request.query_params.get("limit", "50")), 200))
     except (ValueError, TypeError):
         limit = 50
     runs = storage.list_task_runs(task_id, limit=limit)
@@ -2679,7 +2679,7 @@ async def admin_audit(request: Request) -> JSONResponse:
     since = params.get("since", "")
     until = params.get("until", "")
     try:
-        limit = min(int(params.get("limit", "50")), 200)
+        limit = max(1, min(int(params.get("limit", "50")), 200))
     except (ValueError, TypeError):
         limit = 50
     try:
@@ -2723,7 +2723,7 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
     until = params.get("until", "")
     risk_level = params.get("risk_level", "")
     try:
-        limit = min(int(params.get("limit", "100")), 500)
+        limit = max(1, min(int(params.get("limit", "100")), 500))
     except (ValueError, TypeError):
         limit = 100
     try:
@@ -2747,6 +2747,83 @@ async def admin_list_verdicts(request: Request) -> JSONResponse:
         risk_level=risk_level,
     )
     return JSONResponse({"verdicts": verdicts, "total": total})
+
+
+async def admin_list_output_assessments(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/output-assessments — list output guard assessments."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    params = dict(request.query_params)
+    ws_id = params.get("ws_id", "")
+    risk_level = params.get("risk_level", "")
+    since = params.get("since", "")
+    until = params.get("until", "")
+    try:
+        limit = max(1, min(int(params.get("limit", "100")), 500))
+    except (ValueError, TypeError):
+        limit = 100
+    try:
+        offset = max(int(params.get("offset", "0")), 0)
+    except (ValueError, TypeError):
+        offset = 0
+
+    assessments = storage.list_output_assessments(
+        ws_id=ws_id,
+        risk_level=risk_level,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+    )
+    total = storage.count_output_assessments(
+        ws_id=ws_id, risk_level=risk_level, since=since, until=until
+    )
+    return JSONResponse({"assessments": assessments, "total": total})
+
+
+async def admin_rescan_skill(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/skills/{skill_id}/rescan — re-scan skill security."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.skills")
+    if err:
+        return err
+
+    skill_id = request.path_params["skill_id"]
+    skill = storage.get_prompt_template(skill_id)
+    if not skill:
+        return JSONResponse({"error": "Skill not found"}, status_code=404)
+
+    from turnstone.core.storage._utils import scan_skill_content
+
+    content = skill.get("content", "")
+    allowed_tools = skill.get("allowed_tools", "[]")
+    scan_status, scan_report, scan_version = scan_skill_content(content, allowed_tools)
+    storage.update_prompt_template(
+        skill_id,
+        scan_status=scan_status,
+        scan_report=scan_report,
+        scan_version=scan_version,
+    )
+    return JSONResponse(
+        {
+            "scan_status": scan_status,
+            "scan_report": scan_report,
+            "scan_version": scan_version,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2786,7 +2863,7 @@ async def admin_list_memories(request: Request) -> JSONResponse:
     if err:
         return err
     try:
-        limit = min(int(request.query_params.get("limit", "100")), 200)
+        limit = max(1, min(int(request.query_params.get("limit", "100")), 200))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
 
@@ -2819,7 +2896,7 @@ async def admin_search_memories(request: Request) -> JSONResponse:
     if err:
         return err
     try:
-        limit = min(int(request.query_params.get("limit", "20")), 50)
+        limit = max(1, min(int(request.query_params.get("limit", "20")), 50))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
 
@@ -3178,7 +3255,7 @@ async def admin_registry_search(request: Request) -> JSONResponse:
 
     q = str(request.query_params.get("search", "")).strip()
     try:
-        limit = min(int(request.query_params.get("limit", "20")), 100)
+        limit = max(1, min(int(request.query_params.get("limit", "20")), 100))
     except (ValueError, TypeError):
         limit = 20
     cursor = request.query_params.get("cursor") or None
@@ -4133,6 +4210,12 @@ def create_app(
                     Route("/api/admin/audit", admin_audit),
                     # Governance: Intent Verdicts
                     Route("/api/admin/verdicts", admin_list_verdicts),
+                    Route("/api/admin/output-assessments", admin_list_output_assessments),
+                    Route(
+                        "/api/admin/skills/{skill_id}/rescan",
+                        admin_rescan_skill,
+                        methods=["POST"],
+                    ),
                 ],
             ),
             Route("/health", health),

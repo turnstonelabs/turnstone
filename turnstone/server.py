@@ -510,7 +510,27 @@ class WebUI:
             self._pending_verdicts.append(verdict)
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
+        """Deliver output guard warning to frontend via SSE + persist."""
         self._enqueue({"type": "output_warning", "call_id": call_id, **assessment})
+        # Fire-and-forget persistence
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+            if storage is not None:
+                storage.record_output_assessment(
+                    assessment_id=uuid.uuid4().hex,
+                    ws_id=self.ws_id,
+                    call_id=call_id,
+                    func_name=assessment.get("func_name", ""),
+                    flags=json.dumps(assessment.get("flags", [])),
+                    risk_level=assessment.get("risk_level", "none"),
+                    annotations=json.dumps(assessment.get("annotations", [])),
+                    output_length=assessment.get("output_length", 0),
+                    redacted=assessment.get("redacted", False),
+                )
+        except Exception:
+            log.debug("Failed to persist output assessment", exc_info=True)
 
     def resolve_approval(self, approved: bool, feedback: str | None = None) -> None:
         """Resolve a pending approval, whether triggered by the HTTP handler

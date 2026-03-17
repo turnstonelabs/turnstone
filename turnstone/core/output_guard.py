@@ -51,7 +51,7 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
     r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----",
 )
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql|mysql|mongodb|redis|amqp)://[^@\s]+:[^@\s]+@",
+    r"(?:postgresql|mysql|mongodb|redis|amqp)://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
 _RE_ENV_SECRET_KEY = re.compile(r"SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
@@ -104,7 +104,7 @@ _RE_CLOUD_IDENTITY_DOC = re.compile(
     re.IGNORECASE,
 )
 _RE_SENSITIVE_PATH = re.compile(
-    r"\.env\b|\.ssh/|credentials\b|\.aws/|\.kube/|\.gnupg/"
+    r"\.env\b|\.ssh/|/credentials\b|\.aws/|\.kube/|\.gnupg/"
     r"|id_rsa\b|id_ecdsa\b|\.pem\b",
     re.IGNORECASE,
 )
@@ -136,14 +136,20 @@ class OutputAssessment:
     annotations: list[str] = field(default_factory=list)
     sanitized: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        """Serialize for JSON / SSE transport."""
-        return {
+    def to_dict(self, *, include_sanitized: bool = False) -> dict[str, Any]:
+        """Serialize for JSON / SSE transport.
+
+        ``sanitized`` is excluded by default to prevent accidental leakage
+        of tool output content through SSE or MQ events.
+        """
+        d: dict[str, Any] = {
             "flags": list(self.flags),
             "risk_level": self.risk_level,
             "annotations": list(self.annotations),
-            "sanitized": self.sanitized,
         }
+        if include_sanitized:
+            d["sanitized"] = self.sanitized
+        return d
 
 
 def _clean() -> OutputAssessment:
@@ -212,7 +218,9 @@ def _check_credentials(
         risk = "high"
 
     env_lines = _RE_ENV_SECRET_LINE.findall(text)
-    if len(env_lines) >= 3 and any(_RE_ENV_SECRET_KEY.search(ln) for ln in env_lines):
+    if len(env_lines) >= 3 and any(
+        _RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines
+    ):
         _add_flag(flags, "credential_leak")
         flags.append("env_file_leak")
         ann.append("Output contains .env-style assignments with secret-bearing keys.")
@@ -227,7 +235,7 @@ def _redact_credentials(text: str) -> str:
     result = _RE_PRIVATE_KEY_BLOCK.sub("[REDACTED:private_key]", text)
 
     def _redact_conn(m: re.Match[str]) -> str:
-        return re.sub(r"://([^@\s]+):([^@\s]+)@", r"://\1:[REDACTED:password]@", m.group())
+        return re.sub(r"://([^:@\s]+):([^@\s]+)@", r"://\1:[REDACTED:password]@", m.group())
 
     result = _RE_CONNECTION_STRING.sub(_redact_conn, result)
     for pattern, redact_type in _CREDENTIAL_PATTERNS:

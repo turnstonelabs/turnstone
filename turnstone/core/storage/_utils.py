@@ -54,6 +54,9 @@ SKILL_MUTABLE = frozenset(
         "notify_on_complete",
         "enabled",
         "allowed_tools",
+        "scan_version",
+        "scan_status",
+        "scan_report",
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})
@@ -94,15 +97,15 @@ VERDICT_MUTABLE = frozenset(
 # ---------------------------------------------------------------------------
 
 
-def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str]:
-    """Run the skill scanner and return ``(scan_status, scan_report_json)``.
+def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]:
+    """Run the skill scanner and return ``(scan_status, scan_report_json, scanner_version)``.
 
     Uses a lazy import to avoid circular dependencies.  Silently returns
     empty results on import or scan errors so skill creation is never
     blocked by a scanner bug.
     """
     try:
-        from turnstone.core.skill_scanner import scan_skill
+        from turnstone.core.skill_scanner import SCANNER_VERSION, scan_skill
 
         tools: list[str] | None = None
         if allowed_tools and allowed_tools.strip() != "[]":
@@ -115,10 +118,10 @@ def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str]:
             except (json.JSONDecodeError, TypeError):
                 pass
         result = scan_skill(content, tools)
-        return result.tier, json.dumps(result.to_dict(), ensure_ascii=False)
+        return result.tier, json.dumps(result.to_dict(), ensure_ascii=False), SCANNER_VERSION
     except Exception:
         log.debug("skill_scanner: scan failed", exc_info=True)
-        return "", "{}"
+        return "", "{}", ""
 
 
 # ---------------------------------------------------------------------------

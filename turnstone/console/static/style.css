@@ -967,6 +967,31 @@
 .scope-approve { color: var(--accent); border-color: var(--accent-dim); }
 .scope-channel { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
 .scope-mcp { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
+.scope-deny { color: var(--red); border-color: rgba(255, 80, 80, 0.25); }
+.scope-scan-safe { color: var(--green); border-color: var(--green-glow); }
+.scope-scan-low { color: var(--fg-dim); border-color: var(--border); }
+.scope-scan-medium { color: var(--yellow); border-color: var(--yellow-glow); }
+.scope-scan-high { color: var(--red); border-color: var(--red-glow); }
+.scope-scan-critical { color: var(--red); border-color: var(--red-glow); background: rgba(248, 113, 113, 0.08); }
+
+.admin-field { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+.admin-field-heading {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+  display: block;
+}
+
+.scan-composite { font-size: 11px; color: var(--fg-dim); margin-left: 6px; }
+.scan-version { font-size: 10px; color: var(--fg-dim); margin-left: 6px; }
+.scan-axis { font-size: 11px; padding: 2px 0; color: var(--fg-dim); }
+.scan-axis-name { text-transform: capitalize; display: inline-block; min-width: 100px; }
+.scan-axis-score { font-family: var(--font-mono); }
+.scan-axis-flags { color: var(--yellow); font-size: 10px; }
 
 /* Action buttons */
 .admin-btn-danger {

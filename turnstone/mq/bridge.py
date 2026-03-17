@@ -33,6 +33,7 @@ from turnstone.mq.protocol import (
     IntentVerdictEvent,
     NodeListEvent,
     OutboundEvent,
+    OutputWarningEvent,
     PlanReviewEvent,
     ReasoningEvent,
     StateChangeEvent,
@@ -646,6 +647,19 @@ class Bridge:
                     judge_model=data.get("judge_model", ""),
                     verdict_id=data.get("verdict_id", ""),
                     latency_ms=int(data.get("latency_ms", 0)),
+                ),
+            )
+        elif etype == "output_warning":
+            self._publish_ws(
+                ws_id,
+                OutputWarningEvent(
+                    ws_id=ws_id,
+                    call_id=data.get("call_id", ""),
+                    func_name=data.get("func_name", ""),
+                    risk_level=data.get("risk_level", "none"),
+                    flags=json.dumps(data.get("flags", [])),
+                    annotations=json.dumps(data.get("annotations", [])),
+                    redacted=int(data.get("redacted", False)),
                 ),
             )
         elif etype == "stream_end":
