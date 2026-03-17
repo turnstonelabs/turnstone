@@ -950,36 +950,38 @@ function submitCreateTemplate() {
         .filter(Boolean)
     : [];
   document.getElementById("ctm-submit").disabled = true;
+  var csVersion = (document.getElementById("skill-version").value || "").trim();
+  var createBody = {
+    name: name,
+    category: document.getElementById("ctm-category").value,
+    description: (
+      document.getElementById("skill-description").value || ""
+    ).trim(),
+    tags: JSON.stringify(tagsArray),
+    author: (document.getElementById("skill-author").value || "").trim(),
+    license: (document.getElementById("skill-license").value || "").trim(),
+    compatibility: (
+      document.getElementById("skill-compatibility").value || ""
+    ).trim(),
+    activation: document.getElementById("skill-activation").value,
+    content: content,
+    variables: JSON.stringify(varList),
+    is_default: document.getElementById("ctm-default").checked,
+    model: document.getElementById("csk-model").value.trim(),
+    auto_approve: document.getElementById("csk-auto-approve").checked,
+    temperature: csTemp ? parseFloat(csTemp) : null,
+    reasoning_effort: document.getElementById("csk-reasoning-effort").value,
+    max_tokens: csMaxTok ? parseInt(csMaxTok, 10) : null,
+    token_budget: csBudget ? parseInt(csBudget, 10) : 0,
+    agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
+    allowed_tools: JSON.stringify(csAllowedArr),
+    enabled: document.getElementById("csk-enabled").checked,
+  };
+  if (csVersion) createBody.version = csVersion;
   authFetch("/v1/api/admin/skills", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: name,
-      category: document.getElementById("ctm-category").value,
-      description: (
-        document.getElementById("skill-description").value || ""
-      ).trim(),
-      tags: JSON.stringify(tagsArray),
-      author: (document.getElementById("skill-author").value || "").trim(),
-      version: (document.getElementById("skill-version").value || "").trim(),
-      license: (document.getElementById("skill-license").value || "").trim(),
-      compatibility: (
-        document.getElementById("skill-compatibility").value || ""
-      ).trim(),
-      activation: document.getElementById("skill-activation").value,
-      content: content,
-      variables: JSON.stringify(varList),
-      is_default: document.getElementById("ctm-default").checked,
-      model: document.getElementById("csk-model").value.trim(),
-      auto_approve: document.getElementById("csk-auto-approve").checked,
-      temperature: csTemp ? parseFloat(csTemp) : null,
-      reasoning_effort: document.getElementById("csk-reasoning-effort").value,
-      max_tokens: csMaxTok ? parseInt(csMaxTok, 10) : null,
-      token_budget: csBudget ? parseInt(csBudget, 10) : 0,
-      agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
-      allowed_tools: JSON.stringify(csAllowedArr),
-      enabled: document.getElementById("csk-enabled").checked,
-    }),
+    body: JSON.stringify(createBody),
   })
     .then(function (r) {
       if (!r.ok)
@@ -1552,36 +1554,38 @@ function submitEditTemplate() {
         .filter(Boolean)
     : [];
   document.getElementById("etm-submit").disabled = true;
+  var esVersion = (document.getElementById("etm-version").value || "").trim();
+  var updateBody = {
+    name: document.getElementById("etm-name").value.trim(),
+    category: document.getElementById("etm-category").value,
+    description: (
+      document.getElementById("etm-description").value || ""
+    ).trim(),
+    tags: JSON.stringify(tagsArray),
+    author: (document.getElementById("etm-author").value || "").trim(),
+    license: (document.getElementById("etm-license").value || "").trim(),
+    compatibility: (
+      document.getElementById("etm-compatibility").value || ""
+    ).trim(),
+    activation: document.getElementById("etm-activation").value,
+    content: content,
+    variables: JSON.stringify(varList),
+    is_default: document.getElementById("etm-default").checked,
+    model: document.getElementById("esk-model").value.trim(),
+    auto_approve: document.getElementById("esk-auto-approve").checked,
+    temperature: esTemp ? parseFloat(esTemp) : null,
+    reasoning_effort: document.getElementById("esk-reasoning-effort").value,
+    max_tokens: esMaxTok ? parseInt(esMaxTok, 10) : null,
+    token_budget: esBudget ? parseInt(esBudget, 10) : 0,
+    agent_max_turns: esMaxTurns ? parseInt(esMaxTurns, 10) : null,
+    allowed_tools: JSON.stringify(esAllowedArr),
+    enabled: document.getElementById("esk-enabled").checked,
+  };
+  if (esVersion) updateBody.version = esVersion;
   authFetch("/v1/api/admin/skills/" + id, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: document.getElementById("etm-name").value.trim(),
-      category: document.getElementById("etm-category").value,
-      description: (
-        document.getElementById("etm-description").value || ""
-      ).trim(),
-      tags: JSON.stringify(tagsArray),
-      author: (document.getElementById("etm-author").value || "").trim(),
-      version: (document.getElementById("etm-version").value || "").trim(),
-      license: (document.getElementById("etm-license").value || "").trim(),
-      compatibility: (
-        document.getElementById("etm-compatibility").value || ""
-      ).trim(),
-      activation: document.getElementById("etm-activation").value,
-      content: content,
-      variables: JSON.stringify(varList),
-      is_default: document.getElementById("etm-default").checked,
-      model: document.getElementById("esk-model").value.trim(),
-      auto_approve: document.getElementById("esk-auto-approve").checked,
-      temperature: esTemp ? parseFloat(esTemp) : null,
-      reasoning_effort: document.getElementById("esk-reasoning-effort").value,
-      max_tokens: esMaxTok ? parseInt(esMaxTok, 10) : null,
-      token_budget: esBudget ? parseInt(esBudget, 10) : 0,
-      agent_max_turns: esMaxTurns ? parseInt(esMaxTurns, 10) : null,
-      allowed_tools: JSON.stringify(esAllowedArr),
-      enabled: document.getElementById("esk-enabled").checked,
-    }),
+    body: JSON.stringify(updateBody),
   })
     .then(function (r) {
       if (!r.ok)

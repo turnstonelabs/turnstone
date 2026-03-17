@@ -860,9 +860,7 @@ class ChatSession:
         # Skill catalog: disclose search-activated skills so the model
         # knows they exist (Agent Skills standard progressive disclosure).
         try:
-            search_skills = [
-                s for s in list_skills_by_activation("search") if s.get("enabled", True)
-            ]
+            search_skills = list_skills_by_activation("search", enabled_only=True, limit=30)
         except Exception:
             search_skills = []
         if search_skills:

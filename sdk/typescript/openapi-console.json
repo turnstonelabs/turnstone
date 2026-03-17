@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.7.0",
+    "version": "0.8.2",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -6883,6 +6883,16 @@
             "title": "Allowed Tools",
             "type": "string"
           },
+          "license": {
+            "default": "",
+            "title": "License",
+            "type": "string"
+          },
+          "compatibility": {
+            "default": "",
+            "title": "Compatibility",
+            "type": "string"
+          },
           "scan_status": {
             "default": "",
             "title": "Scan Status",
@@ -7106,6 +7116,16 @@
           "allowed_tools": {
             "default": "[]",
             "title": "Allowed Tools",
+            "type": "string"
+          },
+          "license": {
+            "default": "",
+            "title": "License",
+            "type": "string"
+          },
+          "compatibility": {
+            "default": "",
+            "title": "Compatibility",
             "type": "string"
           }
         },
@@ -7357,6 +7377,30 @@
             ],
             "default": null,
             "title": "Allowed Tools"
+          },
+          "license": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "License"
+          },
+          "compatibility": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Compatibility"
           }
         },
         "title": "UpdateSkillRequest",
