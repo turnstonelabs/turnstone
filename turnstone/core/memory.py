@@ -179,10 +179,17 @@ def list_default_skills(org_id: str = "") -> list[dict[str, Any]]:
         return []
 
 
-def list_skills_by_activation(activation: str) -> list[dict[str, Any]]:
+def list_skills_by_activation(
+    activation: str,
+    *,
+    enabled_only: bool = False,
+    limit: int = 0,
+) -> list[dict[str, Any]]:
     """Return skills filtered by activation value, ordered by name."""
     try:
-        return get_storage().list_skills_by_activation(activation)
+        return get_storage().list_skills_by_activation(
+            activation, enabled_only=enabled_only, limit=limit
+        )
     except Exception:
         return []
 

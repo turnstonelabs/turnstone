@@ -619,7 +619,13 @@ class StorageBackend(Protocol):
         """Count prompt templates, optionally filtered by org_id."""
         ...
 
-    def list_skills_by_activation(self, activation: str) -> list[dict[str, Any]]:
+    def list_skills_by_activation(
+        self,
+        activation: str,
+        *,
+        enabled_only: bool = False,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
         """Return prompt templates filtered by activation value, ordered by name."""
         ...
 

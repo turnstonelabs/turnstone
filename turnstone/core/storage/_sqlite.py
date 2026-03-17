@@ -1707,13 +1707,24 @@ class SQLiteBackend:
             conn.commit()
             return result.rowcount > 0
 
-    def list_skills_by_activation(self, activation: str) -> list[dict[str, Any]]:
+    def list_skills_by_activation(
+        self,
+        activation: str,
+        *,
+        enabled_only: bool = False,
+        limit: int = 0,
+    ) -> list[dict[str, Any]]:
         with self._engine.connect() as conn:
-            rows = conn.execute(
+            q = (
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.activation == activation)
                 .order_by(prompt_templates.c.name)
-            ).fetchall()
+            )
+            if enabled_only:
+                q = q.where(prompt_templates.c.enabled == True)  # noqa: E712
+            if limit > 0:
+                q = q.limit(limit)
+            rows = conn.execute(q).fetchall()
             return [
                 _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
             ]
