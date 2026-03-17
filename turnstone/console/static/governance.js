@@ -769,7 +769,7 @@ function _renderGovSkills(items) {
         " res</span>";
     }
     var editDisabled = t.readonly ? " disabled" : "";
-    var deleteDisabled = t.readonly ? " disabled" : "";
+    var deleteDisabled = "";
     html +=
       '<div class="admin-row" role="listitem">' +
       '<span class="admin-col admin-col-tmcat">' +

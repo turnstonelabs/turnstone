@@ -846,8 +846,8 @@ class TestSkillAPI:
         resp = api_client.delete("/v1/api/admin/skills/missing")
         assert resp.status_code == 404
 
-    def test_delete_skill_readonly_rejected(self, api_client, api_storage):
-        """Deleting a readonly skill returns 403."""
+    def test_delete_skill_readonly_allowed(self, api_client, api_storage):
+        """Deleting a readonly (installed) skill is allowed — uninstall."""
         _create_template(
             api_storage,
             "s1",
@@ -858,7 +858,7 @@ class TestSkillAPI:
             readonly=True,
         )
         resp = api_client.delete("/v1/api/admin/skills/s1")
-        assert resp.status_code == 403
+        assert resp.status_code == 200
 
     def test_skill_field_on_workstream_create(self, api_storage):
         """Console workstream creation accepts 'skill' field in request body."""

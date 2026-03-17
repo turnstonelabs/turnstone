@@ -2555,8 +2555,6 @@ async def admin_delete_skill(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(skill_id)
     if existing is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
-    if existing.get("readonly"):
-        return JSONResponse({"error": "MCP-sourced skills are read-only"}, status_code=403)
 
     storage.delete_skill_resources(skill_id)
     storage.delete_skill_versions(skill_id)
