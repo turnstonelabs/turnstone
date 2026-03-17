@@ -86,6 +86,16 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   capability risk (from `allowed_tools`). Results populate the `scan_status`
   (safe/low/medium/high/critical) and `scan_report` (JSON breakdown) columns.
   These fields are system-managed and cannot be overwritten via the admin API.
+- **Discovery**: External skills can be discovered and installed from registries:
+  - `GET /v1/api/admin/skills/discover?q=...` — search the skills.sh registry
+    (or a custom registry via `skills.discovery_url` setting)
+  - `POST /v1/api/admin/skills/install` — install from skills.sh or GitHub.
+    Fetches the `SKILL.md` file, parses YAML frontmatter, creates a skill with
+    `origin="source"` and `readonly=True`, stores bundled resources.
+  - Admin UI: Skills tab has "Installed" / "Discover" pill toggle.
+    Discovery view has search bar, result cards, and "Import from GitHub" modal.
+  - SDK: `discover_skills(q)` and `install_skill(source, skill_id=..., url=...)`
+    on both Python and TypeScript console clients.
 
 ### Usage Tracking
 

@@ -258,16 +258,41 @@
     <div id="admin-skills" class="admin-panel" role="tabpanel" aria-labelledby="tab-skills" style="display:none">
       <div class="admin-toolbar">
         <span class="section-header" style="margin:0">SKILLS</span>
-        <button class="admin-action-btn" onclick="showCreateTemplateModal()">+ Create skill</button>
+        <div class="mcp-view-toggle" role="tablist" aria-label="Skills view">
+          <button class="mcp-view-btn active" id="skill-tab-installed" data-skill-view="installed" role="tab" aria-selected="true" aria-controls="skill-view-installed" tabindex="0" onclick="switchSkillView('installed')">Installed</button>
+          <button class="mcp-view-btn" id="skill-tab-discover" data-skill-view="discover" role="tab" aria-selected="false" aria-controls="skill-view-discover" tabindex="-1" onclick="switchSkillView('discover')">Discover</button>
+        </div>
+        <span id="skill-installed-toolbar">
+          <button class="admin-action-btn" onclick="showCreateTemplateModal()">+ Create skill</button>
+        </span>
       </div>
-      <div class="admin-colheaders" aria-hidden="true">
-        <span class="admin-col admin-col-tmname">NAME</span>
-        <span class="admin-col admin-col-tmcat">CATEGORY</span>
-        <span class="admin-col admin-col-tmvars">VARIABLES</span>
-        <span class="admin-col admin-col-actions">ACTIONS</span>
+      <!-- Installed view -->
+      <div id="skill-view-installed" role="tabpanel" aria-labelledby="skill-tab-installed">
+        <div class="admin-colheaders" aria-hidden="true">
+          <span class="admin-col admin-col-tmname">NAME</span>
+          <span class="admin-col admin-col-tmcat">CATEGORY</span>
+          <span class="admin-col admin-col-tmvars">VARIABLES</span>
+          <span class="admin-col admin-col-actions">ACTIONS</span>
+        </div>
+        <div id="admin-skills-table" role="list" aria-label="Skills" aria-live="polite">
+          <div class="dashboard-empty">No skills configured</div>
+        </div>
       </div>
-      <div id="admin-skills-table" role="list" aria-label="Skills" aria-live="polite">
-        <div class="dashboard-empty">No skills configured</div>
+      <!-- Discover view -->
+      <div id="skill-view-discover" role="tabpanel" aria-labelledby="skill-tab-discover" style="display:none">
+        <div class="mcp-registry-notice" role="note">
+          <span class="mcp-registry-notice-icon" aria-hidden="true">&#9432;</span>
+          Skills are community-published and not vetted by Turnstone.<br>
+          <span style="margin-left:19px">Review source content before installing.</span>
+        </div>
+        <div class="mcp-registry-search">
+          <input id="skill-discover-q" type="search" placeholder="Search skills..." autocomplete="off" aria-label="Search skills" onkeydown="if(event.key==='Enter'){event.preventDefault();searchSkillDiscover()}">
+          <button id="skill-discover-search-btn" class="admin-action-btn" onclick="searchSkillDiscover()">Search</button>
+          <button class="admin-action-btn admin-action-btn-ghost" onclick="showGitHubImportModal()">Import from GitHub</button>
+        </div>
+        <div id="skill-discover-results" role="list" aria-label="Discovered skills">
+          <div class="dashboard-empty">Search external registries to discover and install skills</div>
+        </div>
       </div>
     </div>
 
@@ -484,6 +509,21 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- GitHub Import Modal -->
+<div id="github-import-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="github-import-title">
+  <div id="github-import-box" class="admin-modal">
+    <h2 id="github-import-title">Import from GitHub</h2>
+    <div id="github-import-error" role="alert" aria-live="assertive"></div>
+    <label for="gi-url">GitHub URL</label>
+    <input id="gi-url" type="url" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false" aria-describedby="gi-url-hint">
+    <p id="gi-url-hint" style="font-size:11px;color:var(--fg-dim);margin:4px 0 12px">Paste a link to a repository or SKILL.md file</p>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideGitHubImportModal()">Cancel</button>
+      <button id="gi-submit" class="modal-submit" onclick="submitGitHubImport()">Install</button>
     </div>
   </div>
 </div>

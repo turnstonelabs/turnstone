@@ -1768,6 +1768,128 @@
         }
       }
     },
+    "/v1/api/admin/skills/discover": {
+      "get": {
+        "summary": "Search external skill registries for available skills",
+        "operationId": "v1_api_admin_skills_discover_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Search query"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            },
+            "description": "Max results (default 20, max 100)"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillDiscoverResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/skills/install": {
+      "post": {
+        "summary": "Install a skill from an external source",
+        "operationId": "v1_api_admin_skills_install_post",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SkillInstallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Error 502",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/skills": {
       "get": {
         "summary": "List skills",
@@ -6280,6 +6402,110 @@
         "title": "RegistryInstallRequest",
         "type": "object"
       },
+      "SkillDiscoverResponse": {
+        "properties": {
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/SkillDiscoverListing"
+            },
+            "title": "Skills",
+            "type": "array"
+          }
+        },
+        "required": [
+          "skills"
+        ],
+        "title": "SkillDiscoverResponse",
+        "type": "object"
+      },
+      "SkillDiscoverListing": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "author": {
+            "default": "",
+            "title": "Author",
+            "type": "string"
+          },
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          },
+          "source_url": {
+            "default": "",
+            "title": "Source Url",
+            "type": "string"
+          },
+          "install_count": {
+            "default": 0,
+            "title": "Install Count",
+            "type": "integer"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "installed": {
+            "default": false,
+            "title": "Installed",
+            "type": "boolean"
+          },
+          "scan_status": {
+            "default": "",
+            "title": "Scan Status",
+            "type": "string"
+          },
+          "template_id": {
+            "default": "",
+            "title": "Template Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "SkillDiscoverListing",
+        "type": "object"
+      },
+      "SkillInstallRequest": {
+        "properties": {
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "skill_id": {
+            "default": "",
+            "title": "Skill Id",
+            "type": "string"
+          },
+          "url": {
+            "default": "",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source"
+        ],
+        "title": "SkillInstallRequest",
+        "type": "object"
+      },
       "SkillInfo": {
         "properties": {
           "template_id": {
@@ -6437,6 +6663,21 @@
           "allowed_tools": {
             "default": "[]",
             "title": "Allowed Tools",
+            "type": "string"
+          },
+          "scan_status": {
+            "default": "",
+            "title": "Scan Status",
+            "type": "string"
+          },
+          "scan_report": {
+            "default": "{}",
+            "title": "Scan Report",
+            "type": "string"
+          },
+          "scan_version": {
+            "default": "",
+            "title": "Scan Version",
             "type": "string"
           },
           "created": {

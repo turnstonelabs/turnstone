@@ -831,6 +831,32 @@ export interface RegistryInstallRequest {
   headers?: Record<string, string>;
 }
 
+// -- Console API: Skill Discovery -------------------------------------------
+
+export interface SkillDiscoverListing {
+  id: string;
+  name: string;
+  description: string;
+  author: string;
+  source: string;
+  source_url: string;
+  install_count: number;
+  tags: string[];
+  installed: boolean;
+  scan_status?: string;
+  template_id?: string;
+}
+
+export interface SkillDiscoverResponse {
+  skills: SkillDiscoverListing[];
+}
+
+export interface SkillInstallRequest {
+  source: string;
+  skill_id?: string;
+  url?: string;
+}
+
 // -- Console API: System Settings -------------------------------------------
 
 export interface SettingInfo {

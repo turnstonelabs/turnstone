@@ -37,6 +37,7 @@ from turnstone.api.console_schemas import (
     RegistrySearchResponse,
     RoleInfo,
     SettingInfo,
+    SkillDiscoverResponse,
     ToolPolicyInfo,
     UsageResponse,
 )
@@ -740,6 +741,46 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=McpServerDetail,
         )
 
+    # -- skill discovery -----------------------------------------------------
+
+    async def discover_skills(
+        self,
+        q: str = "",
+        *,
+        limit: int = 20,
+    ) -> SkillDiscoverResponse:
+        """Search external skill registries for available skills."""
+        params: dict[str, Any] = {}
+        if q:
+            params["q"] = q
+        if limit != 20:
+            params["limit"] = limit
+        return await self._request(
+            "GET",
+            "/v1/api/admin/skills/discover",
+            params=params,
+            response_model=SkillDiscoverResponse,
+        )
+
+    async def install_skill(
+        self,
+        source: str,
+        *,
+        skill_id: str = "",
+        url: str = "",
+    ) -> dict[str, Any]:
+        """Install a skill from an external source."""
+        body: dict[str, Any] = {"source": source}
+        if skill_id:
+            body["skill_id"] = skill_id
+        if url:
+            body["url"] = url
+        return await self._request(
+            "POST",
+            "/v1/api/admin/skills/install",
+            json_body=body,
+        )
+
 
 class TurnstoneConsole:
     """Synchronous client for the turnstone console API.
@@ -1159,6 +1200,25 @@ class TurnstoneConsole:
                 headers=headers,
             )
         )
+
+    # -- skill discovery -----------------------------------------------------
+
+    def discover_skills(
+        self,
+        q: str = "",
+        *,
+        limit: int = 20,
+    ) -> SkillDiscoverResponse:
+        return self._runner.run(self._async.discover_skills(q, limit=limit))
+
+    def install_skill(
+        self,
+        source: str,
+        *,
+        skill_id: str = "",
+        url: str = "",
+    ) -> dict[str, Any]:
+        return self._runner.run(self._async.install_skill(source, skill_id=skill_id, url=url))
 
     # -- lifecycle -----------------------------------------------------------
 

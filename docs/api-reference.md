@@ -1350,6 +1350,74 @@ version. Requires the `admin.skills` permission.
 
 ---
 
+### `GET /v1/api/admin/skills/discover` (Console)
+
+Search external skill registries for available skills. Requires the
+`admin.skills` permission.
+
+**Query parameters:**
+
+| Parameter | Type   | Default | Description |
+|-----------|--------|---------|-------------|
+| `q`       | string | `""`    | Search query |
+| `limit`   | int    | `20`    | Max results (1–100) |
+
+**Response:**
+
+```json
+{
+  "skills": [
+    {
+      "id": "owner/repo/skill-name",
+      "name": "skill-name",
+      "description": "A skill description",
+      "author": "Author Name",
+      "source": "skills.sh",
+      "source_url": "https://github.com/owner/repo",
+      "install_count": 42,
+      "tags": ["coding", "review"],
+      "installed": false
+    }
+  ]
+}
+```
+
+**Error:** `502` if the registry is unreachable.
+
+---
+
+### `POST /v1/api/admin/skills/install` (Console)
+
+Install a skill from an external source (skills.sh registry or GitHub).
+Requires the `admin.skills` permission.
+
+**Request body:**
+
+```json
+{
+  "source": "github",
+  "url": "https://github.com/owner/skill-repo"
+}
+```
+
+Or for skills.sh:
+
+```json
+{
+  "source": "skills.sh",
+  "skill_id": "owner/skill-name"
+}
+```
+
+**Response:** Same as `GET /v1/api/admin/skills/{skill_id}` — the created
+skill object.
+
+**Errors:** `400` invalid source or missing fields, `404` SKILL.md not found,
+`409` skill already installed (duplicate source_url or name), `502` source
+unreachable.
+
+---
+
 ### `GET /v1/api/admin/settings` (Console)
 
 List all settings with their effective values, defaults, and metadata. Requires

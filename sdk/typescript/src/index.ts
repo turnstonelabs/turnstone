@@ -171,6 +171,10 @@ export type {
   RegistryServerInfo,
   RegistrySearchResponse,
   RegistryInstallRequest,
+  // Skill discovery types
+  SkillDiscoverListing,
+  SkillDiscoverResponse,
+  SkillInstallRequest,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

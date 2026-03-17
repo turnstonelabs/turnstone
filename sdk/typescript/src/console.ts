@@ -32,13 +32,15 @@ import type {
   McpServerDetail,
   RegistryInstallRequest,
   RegistrySearchResponse,
+  SkillDiscoverResponse,
+  SkillInfo,
+  SkillInstallRequest,
   NodeDetailResponse,
   NodesOptions,
   OrgInfo,
   RoleInfo,
   ScheduleInfo,
   SettingInfo,
-  SkillInfo,
   StatusResponse,
   ToolPolicyInfo,
   UpdateMcpServerRequest,
@@ -437,6 +439,26 @@ export class TurnstoneConsole extends BaseClient {
     body: RegistryInstallRequest,
   ): Promise<McpServerDetail> {
     return this.request("POST", "/v1/api/admin/mcp-registry/install", {
+      json: body,
+    });
+  }
+
+  // -- Skill Discovery ------------------------------------------------------
+
+  async discoverSkills(opts?: {
+    q?: string;
+    limit?: number;
+  }): Promise<SkillDiscoverResponse> {
+    const params: Record<string, string> = {};
+    if (opts?.q) params.q = opts.q;
+    if (opts?.limit) params.limit = String(opts.limit);
+    return this.request("GET", "/v1/api/admin/skills/discover", {
+      params,
+    });
+  }
+
+  async installSkill(body: SkillInstallRequest): Promise<SkillInfo> {
+    return this.request("POST", "/v1/api/admin/skills/install", {
       json: body,
     });
   }

@@ -424,6 +424,16 @@ def _build_registry() -> dict[str, SettingDef]:
             "private keys, connection strings) are replaced with [REDACTED] markers "
             "before tool output enters the conversation.",
         ),
+        # -- skills ---------------------------------------------------------
+        SettingDef(
+            "skills.discovery_url",
+            "str",
+            "",
+            "Skills discovery API URL (empty = skills.sh)",
+            "skills",
+            help="Override the skills discovery URL for enterprise or private skill registries. "
+            "Leave empty to use the default skills.sh registry.",
+        ),
         # -- memory ---------------------------------------------------------
         SettingDef(
             "memory.relevance_k",

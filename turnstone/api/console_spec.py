@@ -50,7 +50,9 @@ from turnstone.api.console_schemas import (
     RoleInfo,
     SettingInfo,
     SettingSchemaInfo,
+    SkillDiscoverResponse,
     SkillInfo,
+    SkillInstallRequest,
     SkillVersionInfo,
     ToolPolicyInfo,
     UpdateMcpServerRequest,
@@ -483,6 +485,28 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[404],
         tags=["Admin"],
     ),
+    # --- Governance: Skill Discovery ---
+    EndpointSpec(
+        "/v1/api/admin/skills/discover",
+        "GET",
+        "Search external skill registries for available skills",
+        response_model=SkillDiscoverResponse,
+        query_params=[
+            QueryParam("q", "Search query"),
+            QueryParam("limit", "Max results (default 20, max 100)", schema_type="integer"),
+        ],
+        error_codes=[502],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/skills/install",
+        "POST",
+        "Install a skill from an external source",
+        request_model=SkillInstallRequest,
+        response_model=SkillInfo,
+        error_codes=[400, 404, 409, 502],
+        tags=["Admin"],
+    ),
     # --- Governance: Skills ---
     EndpointSpec(
         "/v1/api/admin/skills",
@@ -859,6 +883,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     McpReloadResponse,
     RegistrySearchResponse,
     RegistryInstallRequest,
+    SkillDiscoverResponse,
+    SkillInstallRequest,
     SkillInfo,
     SkillVersionInfo,
     CreateSkillRequest,

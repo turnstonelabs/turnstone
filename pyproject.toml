@@ -35,6 +35,7 @@ dependencies = [
     "structlog>=24.1",
     "PyJWT>=2.8",
     "bcrypt>=4.0",
+    "python-frontmatter>=1.0",
 ]
 
 [project.urls]
@@ -157,6 +158,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["croniter", "croniter.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["frontmatter", "frontmatter.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
