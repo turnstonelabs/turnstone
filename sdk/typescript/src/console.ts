@@ -37,6 +37,7 @@ import type {
   SkillDiscoverResponse,
   SkillInfo,
   SkillInstallRequest,
+  SkillInstallResponse,
   SkillResourceInfo,
   NodeDetailResponse,
   NodesOptions,
@@ -484,7 +485,7 @@ export class TurnstoneConsole extends BaseClient {
     });
   }
 
-  async installSkill(body: SkillInstallRequest): Promise<SkillInfo> {
+  async installSkill(body: SkillInstallRequest): Promise<SkillInstallResponse> {
     return this.request("POST", "/v1/api/admin/skills/install", {
       json: body,
     });

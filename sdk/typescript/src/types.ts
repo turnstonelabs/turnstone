@@ -878,6 +878,17 @@ export interface SkillInstallRequest {
   url?: string;
 }
 
+export interface SkillInstallSkipped {
+  name: string;
+  reason: string;
+}
+
+export interface SkillInstallResponse {
+  installed: SkillInfo[];
+  skipped: SkillInstallSkipped[];
+  total: number;
+}
+
 // -- Console API: System Settings -------------------------------------------
 
 export interface SettingInfo {

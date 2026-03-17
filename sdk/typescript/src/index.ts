@@ -178,6 +178,8 @@ export type {
   SkillDiscoverListing,
   SkillDiscoverResponse,
   SkillInstallRequest,
+  SkillInstallResponse,
+  SkillInstallSkipped,
 } from "./types.js";
 
 // SSE parser (for advanced usage)

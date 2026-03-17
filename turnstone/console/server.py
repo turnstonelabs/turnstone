@@ -3236,18 +3236,19 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         if skill:
             installed.append(_skill_to_response(skill, resource_count=len(package.resources)))
 
-    if len(packages) == 1 and not installed:
-        reason = skipped[0]["reason"] if skipped else "unknown"
+    if not installed and skipped:
+        # All skills were duplicates
         return JSONResponse(
-            {"error": f"Skill '{packages[0].parsed.name}' not installed: {reason}"},
+            {
+                "error": "All skills already installed",
+                "installed": [],
+                "skipped": skipped,
+                "total": len(packages),
+            },
             status_code=409,
         )
 
-    # Single-skill install: return the skill object directly (backward compat)
-    if len(packages) == 1 and installed:
-        return JSONResponse(installed[0])
-
-    # Multi-skill batch: return summary
+    # Consistent envelope for both single and batch installs
     return JSONResponse(
         {
             "installed": installed,

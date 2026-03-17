@@ -711,6 +711,17 @@ class SkillInstallRequest(BaseModel):
     url: str = ""  # for github
 
 
+class SkillInstallSkipped(BaseModel):
+    name: str
+    reason: str
+
+
+class SkillInstallResponse(BaseModel):
+    installed: list[SkillInfo]
+    skipped: list[SkillInstallSkipped] = []
+    total: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Admin: MCP Registry
 # ---------------------------------------------------------------------------

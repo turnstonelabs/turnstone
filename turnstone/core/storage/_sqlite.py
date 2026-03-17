@@ -1813,16 +1813,23 @@ class SQLiteBackend:
     def count_skill_resources_bulk(self, skill_ids: list[str]) -> dict[str, int]:
         if not skill_ids:
             return {}
+        result: dict[str, int] = {}
+        # Chunk to stay under SQLite's max variable limit (999)
+        chunk_size = 900
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(
-                    skill_resources.c.skill_id,
-                    sa.func.count().label("cnt"),
-                )
-                .where(skill_resources.c.skill_id.in_(skill_ids))
-                .group_by(skill_resources.c.skill_id)
-            ).fetchall()
-            return {r[0]: r[1] for r in rows}
+            for i in range(0, len(skill_ids), chunk_size):
+                chunk = skill_ids[i : i + chunk_size]
+                rows = conn.execute(
+                    sa.select(
+                        skill_resources.c.skill_id,
+                        sa.func.count().label("cnt"),
+                    )
+                    .where(skill_resources.c.skill_id.in_(chunk))
+                    .group_by(skill_resources.c.skill_id)
+                ).fetchall()
+                for r in rows:
+                    result[r[0]] = r[1]
+        return result
 
     # -- Skill versions --------------------------------------------------------
 

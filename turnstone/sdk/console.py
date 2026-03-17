@@ -38,7 +38,6 @@ from turnstone.api.console_schemas import (
     RoleInfo,
     SettingInfo,
     SkillDiscoverResponse,
-    SkillInfo,
     ToolPolicyInfo,
     UsageResponse,
 )
@@ -799,8 +798,11 @@ class AsyncTurnstoneConsole(_BaseClient):
         *,
         skill_id: str = "",
         url: str = "",
-    ) -> SkillInfo:
-        """Install a skill from an external source."""
+    ) -> dict[str, Any]:
+        """Install skill(s) from an external source.
+
+        Returns ``{installed: [...], skipped: [...], total: int}``.
+        """
         body: dict[str, Any] = {"source": source}
         if skill_id:
             body["skill_id"] = skill_id
@@ -810,7 +812,6 @@ class AsyncTurnstoneConsole(_BaseClient):
             "POST",
             "/v1/api/admin/skills/install",
             json_body=body,
-            response_model=SkillInfo,
         )
 
 
@@ -1266,7 +1267,7 @@ class TurnstoneConsole:
         *,
         skill_id: str = "",
         url: str = "",
-    ) -> SkillInfo:
+    ) -> dict[str, Any]:
         return self._runner.run(self._async.install_skill(source, skill_id=skill_id, url=url))
 
     # -- lifecycle -----------------------------------------------------------
