@@ -394,6 +394,36 @@ Content.
         result = parse_skill_md(raw)
         assert result.version == "1.0.0"
 
+    def test_null_description_falls_back_to_body(self) -> None:
+        """YAML null description must not produce 'None' string."""
+        raw = """\
+---
+name: null-desc
+description:
+---
+
+First paragraph here.
+"""
+        result = parse_skill_md(raw)
+        assert result.description == "First paragraph here."
+        assert "None" not in result.description
+
+    def test_null_license_and_compatibility(self) -> None:
+        """YAML null license/compatibility must not produce 'None' string."""
+        raw = """\
+---
+name: null-fields
+description: Test
+license:
+compatibility:
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.license == ""
+        assert result.compatibility == ""
+
 
 class TestStandardFieldLengths:
     """Spec caps: description <= 1024, compatibility <= 500."""

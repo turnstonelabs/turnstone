@@ -104,6 +104,20 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
     Discovery view has search bar, result cards, and "Import from GitHub" modal.
   - SDK: `discover_skills(q)` and `install_skill(source, skill_id=..., url=...)`
     on both Python and TypeScript console clients.
+- **Runtime config on installed skills**: Installed (readonly) skills can have
+  their runtime configuration edited — model, temperature, reasoning effort,
+  token budget, max tokens, agent max turns, auto-approve, allowed tools,
+  and enabled flag. The server restricts updates to these fields only via
+  `_SKILL_RUNTIME_CONFIG_FIELDS` filtering; spec/content fields (name,
+  description, tags, license, compatibility, content, activation) remain
+  immutable. The admin UI shows "Save Config" instead of "Save" for these
+  skills. Audit action: `skill.update.config`.
+- **Admin UI**: Create/Edit skill modals use a two-column spec manifest layout
+  (left: Identity / Manifest / Deployment; right: Skill Content editor with
+  monospace font). Runtime Config is a collapsible 3-column grid below.
+  License uses an SPDX identifier dropdown (MIT, Apache-2.0, GPL-3.0, etc.).
+  Installed skills show a cyan origin badge with source URL, spec fields are
+  disabled, and all collapsible sections auto-expand in view mode.
 
 ### Usage Tracking
 

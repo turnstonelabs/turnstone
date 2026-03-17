@@ -862,6 +862,7 @@ class ChatSession:
         try:
             search_skills = list_skills_by_activation("search", enabled_only=True, limit=30)
         except Exception:
+            log.warning("session.skill_catalog_failed", exc_info=True)
             search_skills = []
         if search_skills:
             catalog_lines = ["<available-skills>"]

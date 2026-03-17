@@ -199,7 +199,8 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
             raise ValueError(name_err)
 
     # Description — frontmatter or first paragraph of body
-    description = str(meta.get("description", "")).strip()
+    raw_desc = meta.get("description")
+    description = str(raw_desc).strip() if raw_desc is not None else ""
     if not description and body:
         first_line = body.split("\n")[0].strip()
         # Skip markdown headings
@@ -220,7 +221,8 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         )
         description = description[:_MAX_DESCRIPTION_LEN]
 
-    compatibility = str(meta.get("compatibility", "")).strip()
+    raw_compat = meta.get("compatibility")
+    compatibility = str(raw_compat).strip() if raw_compat is not None else ""
     if len(compatibility) > _MAX_COMPATIBILITY_LEN:
         log.warning(
             "skill_parser.compatibility_truncated",
@@ -238,7 +240,7 @@ def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
         version=_extract_str(meta, "version", default="1.0.0"),
         # Standard uses "allowed-tools" (hyphenated); stored internally as allowed_tools
         allowed_tools=_extract_list(meta, "allowed-tools"),
-        license=str(meta.get("license", "")).strip(),
+        license=_extract_str(meta, "license"),
         compatibility=compatibility,
         raw_frontmatter=meta,
     )

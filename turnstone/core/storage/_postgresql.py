@@ -1697,7 +1697,7 @@ class PostgreSQLBackend:
                 .order_by(prompt_templates.c.name)
             )
             if enabled_only:
-                q = q.where(prompt_templates.c.enabled == True)  # noqa: E712
+                q = q.where(prompt_templates.c.enabled == 1)
             if limit > 0:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
