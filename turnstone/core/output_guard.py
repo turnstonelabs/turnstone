@@ -54,7 +54,10 @@ _RE_CONNECTION_STRING = re.compile(
     r"(?:postgresql|mysql|mongodb|redis|amqp)://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
-_RE_ENV_SECRET_KEY = re.compile(r"SECRET|KEY|TOKEN|PASSWORD|CREDENTIAL", re.IGNORECASE)
+_RE_ENV_SECRET_KEY = re.compile(
+    r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL)(?:_|$)|(?:^|_)KEY(?:_|$)",
+    re.IGNORECASE,
+)
 
 # (pattern, redact_label) — ordered most-specific first for redaction.
 _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -218,8 +221,7 @@ def _check_credentials(
         risk = "high"
 
     env_lines = _RE_ENV_SECRET_LINE.findall(text)
-    secret_env_lines = [ln for ln in env_lines if _RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0])]
-    if secret_env_lines:
+    if any(_RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines):
         _add_flag(flags, "credential_leak")
         flags.append("env_file_leak")
         ann.append("Output contains .env-style assignments with secret-bearing keys.")
