@@ -72,7 +72,7 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 17
+        assert len(TOOLS) == 18
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 9

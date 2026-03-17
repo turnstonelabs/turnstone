@@ -70,6 +70,10 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
 - **Runtime switching**: `/template <name>` to switch, `/template clear` to revert
   to defaults, `/template` to show current. Persisted across resume.
+- **Model-driven loading**: The `load_skill` built-in tool lets the model
+  discover and activate skills mid-conversation. `search` action finds skills
+  by query (auto-approved); `load` action activates by name (requires user
+  approval since it changes session behavior). Main session only.
 - **Categories**: general, engineering, support, custom, mcp
 - **Content limit**: 32 KB per skill (enforced on create/update)
 - **Storage**: `prompt_templates` table (stores skills) with JSON `variables`

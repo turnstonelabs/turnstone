@@ -2129,6 +2129,7 @@ class ChatSession:
             "watch": self._prepare_watch,
             "read_resource": self._prepare_read_resource,
             "use_prompt": self._prepare_use_prompt,
+            "load_skill": self._prepare_load_skill,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -2951,6 +2952,153 @@ class ChatSession:
             "query": query,
             "limit": max(1, min(limit, 50)),
         }
+
+    # -- load_skill prepare/execute --------------------------------------------
+
+    def _prepare_load_skill(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a load_skill action (load or search)."""
+        action = (args.get("action") or "").strip().lower()
+
+        if action == "load":
+            name = (args.get("name") or "").strip()
+            if not name:
+                return {
+                    "call_id": call_id,
+                    "func_name": "load_skill",
+                    "header": "\u2717 load_skill: name is required",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: 'name' is required for load action",
+                }
+            return {
+                "call_id": call_id,
+                "func_name": "load_skill",
+                "header": f"\u2699 load_skill: {name}",
+                "preview": "",
+                "needs_approval": True,
+                "approval_label": f"load_skill__{name}",
+                "execute": self._exec_load_skill,
+                "action": "load",
+                "name": name,
+            }
+
+        if action == "search":
+            query = (args.get("query") or "").strip()
+            return {
+                "call_id": call_id,
+                "func_name": "load_skill",
+                "header": f"\u2699 skill search{': ' + query[:80] if query else ''}",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_load_skill,
+                "action": "search",
+                "query": query,
+            }
+
+        return {
+            "call_id": call_id,
+            "func_name": "load_skill",
+            "header": "\u2717 load_skill: invalid action",
+            "preview": "",
+            "needs_approval": False,
+            "error": f"Error: action must be 'load' or 'search', got '{action}'",
+        }
+
+    def _exec_load_skill(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Execute a load_skill action."""
+        call_id = item["call_id"]
+        action = item["action"]
+
+        if action == "load":
+            name = item["name"]
+            skill_data = get_skill_by_name(name)
+            if not skill_data or not skill_data.get("enabled", True):
+                msg = f"Error: skill '{name}' not found"
+                self.ui.on_tool_result(call_id, "load_skill", msg)
+                return call_id, msg
+
+            if self._skill_name == name:
+                msg = f"Skill '{name}' is already active"
+                self.ui.on_tool_result(call_id, "load_skill", msg)
+                return call_id, msg
+
+            self.set_skill(name)
+
+            desc = skill_data.get("description", "")
+            scan = skill_data.get("scan_status", "")
+            parts = [f"Loaded skill '{name}'"]
+            if desc:
+                parts.append(f"Description: {desc}")
+            if scan:
+                parts.append(f"Security tier: {scan}")
+            msg = "\n".join(parts)
+            self.ui.on_tool_result(call_id, "load_skill", msg)
+            return call_id, msg
+
+        # action == "search"
+        query = item.get("query", "")
+        try:
+            from turnstone.core.storage._registry import get_storage
+
+            rows = get_storage().list_prompt_templates(limit=50)
+        except Exception:
+            log.warning("load_skill.search_storage_error", exc_info=True)
+            rows = []
+
+        # Filter out disabled skills
+        rows = [r for r in rows if r.get("enabled", True)]
+
+        if query:
+            terms = query.lower().split()
+            scored: list[tuple[int, dict[str, Any]]] = []
+            for r in rows:
+                score = 0
+                name_val = (r.get("name") or "").lower()
+                desc_val = (r.get("description") or "").lower()
+                tags_val = (r.get("tags") or "").lower()
+                cat_val = (r.get("category") or "").lower()
+                for term in terms:
+                    if term in name_val:
+                        score += 3
+                    if term in desc_val:
+                        score += 2
+                    if term in tags_val:
+                        score += 1
+                    if term in cat_val:
+                        score += 1
+                if score > 0:
+                    scored.append((score, r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            rows = [r for _, r in scored[:10]]
+        else:
+            rows = rows[:10]
+
+        if not rows:
+            msg = "No skills found" + (f" matching '{query}'" if query else "")
+            self.ui.on_tool_result(call_id, "load_skill", msg)
+            return call_id, msg
+
+        lines = [f"Found {len(rows)} skill(s):", ""]
+        for r in rows:
+            name_val = r.get("name", "")
+            desc_val = r.get("description", "")
+            cat_val = r.get("category", "")
+            scan_val = r.get("scan_status", "")
+            activation = r.get("activation", "named")
+            line = f"- {name_val}"
+            if cat_val:
+                line += f" [{cat_val}]"
+            if scan_val:
+                line += f" ({scan_val})"
+            if activation != "named":
+                line += f" activation={activation}"
+            if desc_val:
+                line += f" — {desc_val[:120]}"
+            lines.append(line)
+
+        msg = "\n".join(lines)
+        self.ui.on_tool_result(call_id, "load_skill", msg)
+        return call_id, msg
 
     # -- MCP tool prepare/execute ----------------------------------------------
 

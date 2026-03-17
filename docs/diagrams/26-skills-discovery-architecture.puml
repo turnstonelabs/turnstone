@@ -2,7 +2,7 @@
 !include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
 LAYOUT_LEFT_RIGHT()
 
-title Skills Discovery Architecture
+title Skills Discovery & Runtime Architecture
 
 skinparam backgroundColor #1e1e2e
 skinparam defaultFontColor #cdd6f4
@@ -32,6 +32,12 @@ package "Core Modules" as core #181825 {
   rectangle "scan_skill_content\nstorage/_utils.py" as scanner
 }
 
+package "Session Runtime" as runtime #181825 {
+  rectangle "load_skill tool\nsession.py" as loadtool
+  rectangle "set_skill()\nsession.py" as setskill
+  rectangle "_load_skills()\nsession.py" as loadskills
+}
+
 package "Storage" as storage #181825 {
   rectangle "prompt_templates\n(skills)" as skills_table
   rectangle "skill_resources\n(bundled files)" as resources_table
@@ -44,9 +50,9 @@ package "Admin UI" as ui #181825 {
   rectangle "GitHub Import\nmodal" as importui
 }
 
-' External flow
+' External discovery flow
 discover --> settings : resolve URL
-settings --> settings_table : DB → config → default
+settings --> settings_table : DB -> config -> default
 discover --> client : search(query)
 client --> skillssh : GET /api/search
 
@@ -60,6 +66,12 @@ install --> scanner : auto-scan on create
 install --> skills_table : create_prompt_template
 install --> resources_table : create_skill_resource
 
+' Runtime skill loading flow
+loadtool --> skills_table : search (substring match)
+loadtool --> setskill : load (name)
+setskill --> loadskills : reload + reinit system messages
+loadskills --> skills_table : get_skill_by_name
+
 ' UI flow
 pill --> discoverui : switch view
 discoverui --> discover : authFetch()
@@ -67,16 +79,15 @@ importui --> install : POST (github source)
 
 ' Annotations
 note right of parser
-  YAML frontmatter → ParsedSkill
+  YAML frontmatter -> ParsedSkill
   Anthropic + Hermes tag formats
   Name validation (lowercase+hyphens)
 end note
 
-note right of fetcher
-  Tries: direct path, root,
-  monorepo skills/{name}/
-  256KB SKILL.md cap
-  Text extensions filter for resources
+note right of loadtool
+  search: auto-approved (read-only)
+  load: requires user approval
+  Main session only (no sub-agents)
 end note
 
 note right of scanner

@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 17 built-in tools plus any number of external MCP tools to the
+turnstone exposes 18 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -492,6 +492,35 @@ data.get("mergedAt") is not None
 
 ---
 
+### load_skill
+
+Discover and activate skills at runtime during a conversation. The model can
+search for available skills and load one by name, replacing the current active
+skill. This enables model-driven skill selection without requiring the user to
+pre-configure skills at workstream creation.
+
+| Parameter | Type   | Required | Description |
+|-----------|--------|----------|-------------|
+| `action`  | string | yes      | `load` or `search`. |
+| `name`    | string | load     | Skill name to activate. |
+| `query`   | string | no       | Search query for finding skills (for `search` action). |
+
+**Actions:**
+
+- `load` — Activate a skill by name. Calls `set_skill()` which handles content
+  rendering with `{{model}}`/`{{ws_id}}`/`{{node_id}}` variables, system message
+  reinitialization, and config persistence. Returns the skill name, description,
+  and security scan tier. Warns on high/critical scan status.
+- `search` — Find available skills by query. Uses substring matching on name,
+  description, tags, and category. Returns up to 10 results with name,
+  description, category, scan status, and activation type.
+
+- **Auto-approve**: `load` requires approval (changes session behavior); `search`
+  is auto-approved (read-only).
+- **Agent availability**: Main session only — not available to plan/task sub-agents.
+
+---
+
 ## Summary Table
 
 | Tool         | Category   | Auto-approve | agent | task_agent | primary_key |
@@ -513,6 +542,7 @@ data.get("mergedAt") is not None
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
 | `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
 | `use_prompt` | MCP        | No           | Yes   | Yes        | `name`      |
+| `load_skill` | Skills     | No (load)    | No    | No         | `name`      |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---

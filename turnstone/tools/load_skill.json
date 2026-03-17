@@ -1,0 +1,23 @@
+{
+  "name": "load_skill",
+  "description": "Load or search for skills. Actions: 'load' activates a skill by name (replaces current skill), 'search' finds available skills by query.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["load", "search"],
+        "description": "Action to perform."
+      },
+      "name": {
+        "type": "string",
+        "description": "Skill name to load (required for 'load' action)."
+      },
+      "query": {
+        "type": "string",
+        "description": "Search query (for 'search' action)."
+      }
+    },
+    "required": ["action"]
+  }
+}
