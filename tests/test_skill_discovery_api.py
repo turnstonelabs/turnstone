@@ -19,7 +19,12 @@ if TYPE_CHECKING:
 from turnstone.console.server import admin_skill_discover, admin_skill_install
 from turnstone.core.auth import AuthResult
 from turnstone.core.skill_parser import ParsedSkill
-from turnstone.core.skill_sources import SkillListing, SkillPackage, SkillSourceError
+from turnstone.core.skill_sources import (
+    SkillListing,
+    SkillNotFoundError,
+    SkillPackage,
+    SkillSourceError,
+)
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -338,6 +343,32 @@ class TestSkillInstall:
             )
 
         assert resp.status_code == 409
+
+    def test_install_not_found(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.side_effect = SkillNotFoundError("SKILL.md not found")
+
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 404
+
+    def test_install_source_error_returns_502(self, client: TestClient) -> None:
+        with patch(
+            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+        ) as mock_fetch:
+            mock_fetch.side_effect = SkillSourceError("connection timeout")
+
+            resp = client.post(
+                "/v1/api/admin/skills/install",
+                json={"source": "github", "url": "https://github.com/owner/repo"},
+            )
+
+        assert resp.status_code == 502
 
     def test_install_permission_denied(self, client_no_perm: TestClient) -> None:
         resp = client_no_perm.post(

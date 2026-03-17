@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from turnstone.core.skill_sources import (
+    SkillNotFoundError,
     SkillSourceError,
     SkillsShClient,
     _parse_github_url,
@@ -199,7 +200,7 @@ class TestFetchSkillFromGithub:
             instance.__aexit__ = AsyncMock(return_value=False)
             mock_client_cls.return_value = instance
 
-            with pytest.raises(SkillSourceError, match="SKILL.md not found"):
+            with pytest.raises(SkillNotFoundError, match="SKILL.md not found"):
                 await fetch_skill_from_github("https://github.com/owner/repo")
 
     @pytest.mark.anyio

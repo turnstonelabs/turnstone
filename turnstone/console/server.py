@@ -2884,13 +2884,11 @@ async def admin_skill_discover(request: Request) -> JSONResponse:
 
     # Mark which skills are already installed (by source_url match)
     installed_map: dict[str, dict[str, str]] = {}
-    for row in storage.list_prompt_templates():
-        src = row.get("source_url", "")
-        if src:
-            installed_map[src] = {
-                "scan_status": row.get("scan_status", ""),
-                "template_id": row.get("template_id", ""),
-            }
+    for row in storage.list_installed_skill_urls():
+        installed_map[row["source_url"]] = {
+            "scan_status": row.get("scan_status", ""),
+            "template_id": row.get("template_id", ""),
+        }
 
     skills_out = []
     for listing in listings:
@@ -2922,6 +2920,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
     from turnstone.core.skill_sources import (
+        SkillNotFoundError,
         SkillSourceError,
         SkillsShClient,
         fetch_skill_from_github,
@@ -2958,6 +2957,8 @@ async def admin_skill_install(request: Request) -> JSONResponse:
             if not url:
                 return JSONResponse({"error": "url is required"}, status_code=400)
             package = await fetch_skill_from_github(url)
+    except SkillNotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
     except SkillSourceError as exc:
         return JSONResponse({"error": str(exc)}, status_code=502)
     except ValueError as exc:
@@ -2966,12 +2967,12 @@ async def admin_skill_install(request: Request) -> JSONResponse:
     # Check for duplicate by source_url
     source_url = package.listing.source_url
     if source_url:
-        for row in storage.list_prompt_templates():
-            if row.get("source_url") == source_url:
-                return JSONResponse(
-                    {"error": f"Skill from '{source_url}' is already installed"},
-                    status_code=409,
-                )
+        existing = storage.get_skill_by_source_url(source_url)
+        if existing:
+            return JSONResponse(
+                {"error": f"Skill from '{source_url}' is already installed"},
+                status_code=409,
+            )
 
     # Check for duplicate by name
     if storage.get_prompt_template_by_name(package.parsed.name):

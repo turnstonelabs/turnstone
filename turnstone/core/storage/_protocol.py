@@ -625,6 +625,14 @@ class StorageBackend(Protocol):
         """Lookup skill (prompt template) by name. Returns dict or None."""
         ...
 
+    def get_skill_by_source_url(self, source_url: str) -> dict[str, Any] | None:
+        """Lookup skill (prompt template) by source_url. Returns dict or None."""
+        ...
+
+    def list_installed_skill_urls(self) -> list[dict[str, str]]:
+        """Return [{source_url, template_id, scan_status}] for skills with non-empty source_url."""
+        ...
+
     # -- Skill resources -------------------------------------------------------
 
     def create_skill_resource(

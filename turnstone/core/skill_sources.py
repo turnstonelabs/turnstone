@@ -62,6 +62,10 @@ class SkillSourceError(Exception):
     """Error communicating with a skill source."""
 
 
+class SkillNotFoundError(SkillSourceError):
+    """Skill definition (SKILL.md) not found at the source."""
+
+
 class SkillsShClient:
     """Async client for the skills.sh discovery API."""
 
@@ -152,21 +156,24 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}"
+    # When branch isn't specified in URL, try main then master
+    branch_explicit = bool(_GITHUB_URL_RE.match(url) and _GITHUB_URL_RE.match(url).group("branch"))  # type: ignore[union-attr]
+    branches_to_try = [branch] if branch_explicit else ["main", "master"]
+
     api_base = f"https://api.github.com/repos/{owner}/{repo}"
 
     # Determine SKILL.md path candidates
+    path = path.rstrip("/")
     candidates: list[str] = []
     if path:
         if path.endswith("SKILL.md"):
             candidates.append(path)
         else:
             candidates.append(f"{path}/SKILL.md")
-            candidates.append(f"{path.rstrip('/')}/SKILL.md")
     candidates.append("SKILL.md")
     # Try skills/{last_segment}/SKILL.md for monorepos
     if path:
-        last_seg = path.rstrip("/").rsplit("/", 1)[-1]
+        last_seg = path.rsplit("/", 1)[-1]
         candidates.append(f"skills/{last_seg}/SKILL.md")
 
     # De-duplicate preserving order
@@ -179,25 +186,31 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
 
     skill_md_content = ""
     skill_md_dir = ""
+    resolved_branch = branch
     async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
-        # Try each candidate
-        for candidate in unique_candidates:
-            try:
-                resp = await client.get(f"{raw_base}/{candidate}")
-                if resp.status_code == 200:
-                    content_len = int(resp.headers.get("content-length", "0"))
-                    if content_len > _MAX_SKILL_MD_SIZE:
-                        continue
-                    skill_md_content = resp.text[:_MAX_SKILL_MD_SIZE]
-                    # Directory containing the SKILL.md
-                    parts = candidate.rsplit("/", 1)
-                    skill_md_dir = parts[0] if len(parts) > 1 else ""
-                    break
-            except httpx.HTTPError:
-                continue
+        # Try each branch × candidate combination
+        for try_branch in branches_to_try:
+            raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{try_branch}"
+            for candidate in unique_candidates:
+                try:
+                    resp = await client.get(f"{raw_base}/{candidate}")
+                    if resp.status_code == 200:
+                        content_len = int(resp.headers.get("content-length", "0"))
+                        if content_len > _MAX_SKILL_MD_SIZE:
+                            continue
+                        skill_md_content = resp.text[:_MAX_SKILL_MD_SIZE]
+                        # Directory containing the SKILL.md
+                        parts = candidate.rsplit("/", 1)
+                        skill_md_dir = parts[0] if len(parts) > 1 else ""
+                        resolved_branch = try_branch
+                        break
+                except httpx.HTTPError:
+                    continue
+            if skill_md_content:
+                break
 
         if not skill_md_content:
-            raise SkillSourceError(
+            raise SkillNotFoundError(
                 f"SKILL.md not found in {owner}/{repo} (tried {unique_candidates})"
             )
 
@@ -205,12 +218,13 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
 
         # Fetch bundled resources via GitHub API tree endpoint
         resources: dict[str, str] = {}
+        raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{resolved_branch}"
         try:
             tree_resp = await client.get(
-                f"{api_base}/git/trees/{branch}",
+                f"{api_base}/git/trees/{resolved_branch}",
                 params={"recursive": "1"},
             )
-            if tree_resp.status_code == 200:
+            if tree_resp.status_code == 200 and len(tree_resp.content) < 2 * 1024 * 1024:
                 tree_data = tree_resp.json()
                 resource_files: list[dict[str, Any]] = []
                 for item in tree_data.get("tree", []):
