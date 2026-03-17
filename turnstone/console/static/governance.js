@@ -2222,13 +2222,14 @@ function installDiscoveredSkill(skill) {
       return r.json();
     })
     .then(function (data) {
-      var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
+      var first = (data.installed && data.installed[0]) || {};
+      var tierMsg = first.scan_status ? " [" + first.scan_status + "]" : "";
       showToast("Skill installed: " + (skill.name || skill.id) + tierMsg);
       // Mark as installed in results with scan data
       for (var j = 0; j < _skillDiscoverResults.length; j++) {
         if (_skillDiscoverResults[j].id === skill.id) {
           _skillDiscoverResults[j].installed = true;
-          _skillDiscoverResults[j].scan_status = data.scan_status || "";
+          _skillDiscoverResults[j].scan_status = first.scan_status || "";
           break;
         }
       }
@@ -2294,28 +2295,27 @@ function submitGitHubImport() {
     })
     .then(function (data) {
       hideGitHubImportModal();
-      if (data.installed) {
-        // Batch response from multi-skill repo
-        var count = data.installed.length;
-        var skipCount = (data.skipped || []).length;
-        var msg;
-        if (count === 0 && skipCount) {
-          msg =
-            "All " +
-            skipCount +
-            " skill" +
-            (skipCount !== 1 ? "s" : "") +
-            " already installed";
-        } else {
-          msg = count + " skill" + (count !== 1 ? "s" : "") + " installed";
-          if (skipCount) msg += " (" + skipCount + " already installed)";
-        }
-        showToast(msg);
+      var count = data.installed.length;
+      var skipCount = (data.skipped || []).length;
+      var msg;
+      if (count === 1 && !skipCount) {
+        var name = data.installed[0].name || "";
+        var tierMsg = data.installed[0].scan_status
+          ? " [" + data.installed[0].scan_status + "]"
+          : "";
+        msg = "Skill installed: " + name + tierMsg;
+      } else if (count === 0 && skipCount) {
+        msg =
+          "All " +
+          skipCount +
+          " skill" +
+          (skipCount !== 1 ? "s" : "") +
+          " already installed";
       } else {
-        // Single skill response (backward compat)
-        var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
-        showToast("Skill installed: " + (data.name || "") + tierMsg);
+        msg = count + " skill" + (count !== 1 ? "s" : "") + " installed";
+        if (skipCount) msg += " (" + skipCount + " already installed)";
       }
+      showToast(msg);
       loadGovSkills();
     })
     .catch(function (e) {

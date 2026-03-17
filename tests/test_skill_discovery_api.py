@@ -245,10 +245,13 @@ class TestSkillInstall:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["name"] == "test-skill"
-        assert data["origin"] == "source"
-        assert data["readonly"] is True
-        assert data["source_url"] == "https://github.com/owner/repo"
+        assert data["total"] == 1
+        assert len(data["installed"]) == 1
+        skill = data["installed"][0]
+        assert skill["name"] == "test-skill"
+        assert skill["origin"] == "source"
+        assert skill["readonly"] is True
+        assert skill["source_url"] == "https://github.com/owner/repo"
 
     def test_install_from_skills_sh(self, client: TestClient) -> None:
         package = _sample_package()
@@ -269,7 +272,7 @@ class TestSkillInstall:
             )
 
         assert resp.status_code == 200
-        assert resp.json()["name"] == "test-skill"
+        assert resp.json()["installed"][0]["name"] == "test-skill"
 
     def test_install_invalid_source(self, client: TestClient) -> None:
         resp = client.post(
@@ -402,7 +405,7 @@ class TestSkillInstall:
             )
 
         assert resp.status_code == 200
-        skill_id = resp.json()["template_id"]
+        skill_id = resp.json()["installed"][0]["template_id"]
         resources = storage.list_skill_resources(skill_id)
         assert len(resources) == 1
         assert resources[0]["path"] == "scripts/setup.sh"

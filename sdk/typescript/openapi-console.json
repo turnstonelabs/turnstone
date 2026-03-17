@@ -1821,7 +1821,7 @@
     },
     "/v1/api/admin/skills/install": {
       "post": {
-        "summary": "Install a skill from an external source",
+        "summary": "Install skill(s) from an external source",
         "operationId": "v1_api_admin_skills_install_post",
         "tags": [
           "Admin"
@@ -1842,7 +1842,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SkillInfo"
+                  "$ref": "#/components/schemas/SkillInstallResponse"
                 }
               }
             }
@@ -2527,7 +2527,7 @@
           }
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Success",
             "content": {
               "application/json": {
@@ -6695,6 +6695,35 @@
         "title": "SkillInstallRequest",
         "type": "object"
       },
+      "SkillInstallResponse": {
+        "properties": {
+          "installed": {
+            "items": {
+              "$ref": "#/components/schemas/SkillInfo"
+            },
+            "title": "Installed",
+            "type": "array"
+          },
+          "skipped": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SkillInstallSkipped"
+            },
+            "title": "Skipped",
+            "type": "array"
+          },
+          "total": {
+            "default": 0,
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "installed"
+        ],
+        "title": "SkillInstallResponse",
+        "type": "object"
+      },
       "SkillInfo": {
         "properties": {
           "template_id": {
@@ -6895,6 +6924,24 @@
           "updated"
         ],
         "title": "SkillInfo",
+        "type": "object"
+      },
+      "SkillInstallSkipped": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "reason"
+        ],
+        "title": "SkillInstallSkipped",
         "type": "object"
       },
       "SkillVersionInfo": {
