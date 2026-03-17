@@ -2097,8 +2097,10 @@ class ChatSession:
                 raise
             except Exception as e:
                 func = item.get("func_name", "unknown")
-                log.warning("tool_exec.failed", tool=func, error=str(e))
-                return item["call_id"], f"Error executing {func}: {e}"
+                msg = f"Error executing {func}: {e}"
+                log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
+                self.ui.on_error(msg)
+                return item["call_id"], msg
 
         if len(items) == 1:
             results = [run_one(items[0])]
@@ -3713,6 +3715,13 @@ class ChatSession:
 
         # Gate web_search: remove when no backend exists for the agent model
         agent_caps = agent_provider.get_capabilities(agent_model)
+        if self._registry and self._registry.agent_model:
+            agent_cfg: ModelConfig = self._registry.get_config(self._registry.agent_model)
+            if agent_cfg.capabilities:
+                _fields = {f.name for f in dataclasses.fields(type(agent_caps))}
+                _overrides = {k: v for k, v in agent_cfg.capabilities.items() if k in _fields}
+                if _overrides:
+                    agent_caps = dataclasses.replace(agent_caps, **_overrides)
         if not agent_caps.supports_web_search and not get_tavily_key():
             tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
 
