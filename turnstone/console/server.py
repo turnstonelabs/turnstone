@@ -2134,6 +2134,24 @@ async def admin_delete_policy(request: Request) -> JSONResponse:
 
 _VALID_ACTIVATIONS = {"named", "default", "search"}
 
+# Fields that may be updated on installed (readonly) skills.
+# These are local runtime configuration — not part of the SKILL.md spec —
+# so they don't compromise the fidelity of an externally-sourced skill.
+_SKILL_RUNTIME_CONFIG_FIELDS = frozenset(
+    {
+        "model",
+        "temperature",
+        "reasoning_effort",
+        "max_tokens",
+        "token_budget",
+        "agent_max_turns",
+        "auto_approve",
+        "allowed_tools",
+        "enabled",
+        "notify_on_complete",
+    }
+)
+
 
 def _parse_skill_session_config(body: dict[str, Any]) -> tuple[dict[str, Any], JSONResponse | None]:
     """Parse and validate session config fields from a skill request body.
@@ -2372,7 +2390,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
     version = str(body.get("version", "1.0.0")).strip()[:64]
-    license_val = str(body.get("license", "")).strip()
+    license_val = str(body.get("license", "")).strip()[:128]
     compatibility = str(body.get("compatibility", "")).strip()[:500]
 
     raw_tags = body.get("tags", [])
@@ -2462,8 +2480,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     existing = storage.get_prompt_template(skill_id)
     if existing is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
-    if existing.get("readonly"):
-        return JSONResponse({"error": "MCP-sourced skills are read-only"}, status_code=403)
+    is_readonly = bool(existing.get("readonly"))
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -2504,7 +2521,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     if "version" in body:
         updates["version"] = str(body["version"]).strip()[:64]
     if "license" in body:
-        updates["license"] = str(body["license"]).strip()
+        updates["license"] = str(body["license"]).strip()[:128]
     if "compatibility" in body:
         updates["compatibility"] = str(body["compatibility"]).strip()[:500]
     if "tags" in body:
@@ -2518,6 +2535,13 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             except (ValueError, TypeError):
                 tag_str = "[]"
             updates["tags"] = tag_str
+
+    # Installed (readonly) skills: restrict updates to runtime config only.
+    # Spec/content fields are locked to preserve external-source fidelity.
+    if is_readonly:
+        updates = {k: v for k, v in updates.items() if k in _SKILL_RUNTIME_CONFIG_FIELDS}
+        if not updates:
+            return JSONResponse({"error": "No runtime config fields to update"}, status_code=400)
 
     # Snapshot current state for version history before applying update
     existing_versions = storage.list_skill_versions(skill_id)
@@ -2536,7 +2560,7 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     record_audit(
         storage,
         audit_uid,
-        "skill.update",
+        "skill.update.config" if is_readonly else "skill.update",
         "skill",
         skill_id,
         updates,

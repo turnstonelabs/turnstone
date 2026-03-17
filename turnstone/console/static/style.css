@@ -1207,6 +1207,138 @@
 .admin-details summary .label-hint { font-weight: 400; }
 .admin-details label:first-of-type { margin-top: 4px; }
 
+/* ==========================================================================
+   Skill Spec Modal — two-column manifest layout
+   Left: Identity / Manifest / Deployment  |  Right: Skill Content
+   ========================================================================== */
+.admin-modal-skill { padding: 28px 28px 24px; }
+
+.skill-spec-body {
+  display: grid;
+  grid-template-columns: 1fr 1.55fr;
+  gap: 0;
+  margin-bottom: 12px;
+}
+
+.skill-spec-col-meta {
+  border-right: 1px solid var(--border);
+  padding-right: 22px;
+}
+
+.skill-spec-col-content {
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+}
+
+.skill-spec-section { margin-bottom: 14px; }
+.skill-spec-section:last-child { margin-bottom: 0; }
+
+/* h3 used for screen-reader heading structure; reset UA defaults */
+h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
+.skill-spec-heading {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  padding-bottom: 5px;
+  margin: 14px 0 6px;
+  border-bottom: 1px solid var(--accent-dim);
+}
+.skill-spec-section:first-child .skill-spec-heading { margin-top: 0; }
+.skill-spec-heading .label-hint {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+  font-size: 10px;
+  opacity: 1;
+}
+
+.skill-spec-section-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.skill-content-area {
+  flex: 1;
+  min-height: 220px;
+  font-family: var(--font-mono) !important;
+  font-size: 11.5px !important;
+  line-height: 1.65 !important;
+}
+
+.skill-vars-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  min-height: 18px;
+}
+
+.skill-vars-label {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.skill-vars-display { font-size: 11px; }
+
+.skill-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px 14px;
+  margin: 4px 0 2px;
+}
+.skill-config-grid > div { min-width: 0; }
+
+/* Origin badge — shown for remotely installed (readonly) skills */
+.skill-origin-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-display);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--cyan);
+  background: rgba(103, 232, 249, 0.07);
+  border: 1px solid rgba(103, 232, 249, 0.18);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
+  margin-bottom: 14px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skill-origin-badge::before {
+  content: "\2193";
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 700px) {
+  .skill-spec-body { grid-template-columns: 1fr; }
+  .skill-spec-col-meta {
+    border-right: none;
+    padding-right: 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 16px;
+    margin-bottom: 16px;
+  }
+  .skill-spec-col-content { padding-left: 0; }
+  .skill-config-grid { grid-template-columns: 1fr 1fr; }
+}
+
 .modal-buttons { display: flex; gap: 10px; margin-top: 20px; }
 .modal-cancel {
   flex: 1;

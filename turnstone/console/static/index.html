@@ -848,67 +848,100 @@ window.TURNSTONE_KB_SHORTCUTS = [
 
 <!-- Create Skill Modal -->
 <div id="create-template-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-template-title">
-  <div id="create-template-box" class="admin-modal admin-modal-wide">
+  <div id="create-template-box" class="admin-modal admin-modal-wide admin-modal-skill">
     <h2 id="create-template-title">Create Skill</h2>
     <div id="create-template-error" role="alert" aria-live="assertive"></div>
-    <label for="ctm-name">Name</label>
-    <input id="ctm-name" type="text" placeholder="e.g. Code Review Agent" autocomplete="off">
-    <label for="ctm-category">Category</label>
-    <select id="ctm-category">
-      <option value="general">General</option>
-      <option value="engineering">Engineering</option>
-      <option value="support">Support</option>
-      <option value="custom">Custom</option>
-    </select>
-    <label for="skill-description">Description</label>
-    <textarea id="skill-description" rows="2" placeholder="Brief description for discovery"></textarea>
-    <label for="skill-tags">Tags</label>
-    <input id="skill-tags" type="text" placeholder="Comma-separated tags">
-    <label for="skill-author">Author</label>
-    <input id="skill-author" type="text" placeholder="Author name">
-    <label for="skill-version">Version</label>
-    <input id="skill-version" type="text" placeholder="1.0.0">
-    <label for="skill-license">License</label>
-    <input id="skill-license" type="text" placeholder="MIT, Apache-2.0, etc.">
-    <label for="skill-compatibility">Compatibility <span class="label-hint">environment requirements, max 500 chars</span></label>
-    <input id="skill-compatibility" type="text" placeholder="Requires git, docker, etc." maxlength="500">
-    <label for="skill-activation">Activation</label>
-    <select id="skill-activation">
-      <option value="named">Named</option>
-      <option value="default">Default (auto-apply)</option>
-      <option value="search">Search (BM25 discoverable)</option>
-    </select>
-    <label for="ctm-content">Content <span class="label-hint">system message text, use {{model}}, {{ws_id}}, {{node_id}} for placeholders</span></label>
-    <textarea id="ctm-content" rows="6" placeholder="You are a code reviewer using {{model}}..."></textarea>
-    <label>Variables <span class="label-hint">auto-detected from content &mdash; available: model, ws_id, node_id</span></label>
-    <div id="ctm-variables" class="label-hint" style="padding:4px 0;min-height:1.2em"></div>
-    <label class="admin-checkbox"><input id="ctm-default" type="checkbox"> Set as default for new workstreams</label>
+    <div class="skill-spec-body">
+      <div class="skill-spec-col skill-spec-col-meta">
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Identity</h3>
+          <label for="ctm-name">Name</label>
+          <input id="ctm-name" type="text" placeholder="e.g. code-review" autocomplete="off">
+          <label for="ctm-category">Category</label>
+          <select id="ctm-category">
+            <option value="general">General</option>
+            <option value="engineering">Engineering</option>
+            <option value="support">Support</option>
+            <option value="custom">Custom</option>
+          </select>
+          <label for="skill-description">Description</label>
+          <textarea id="skill-description" rows="2" placeholder="Brief description for skill discovery"></textarea>
+        </div>
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Manifest</h3>
+          <label for="skill-tags">Tags</label>
+          <input id="skill-tags" type="text" placeholder="python, review, quality">
+          <label for="skill-author">Author</label>
+          <input id="skill-author" type="text" placeholder="Author name">
+          <label for="skill-version">Version</label>
+          <input id="skill-version" type="text" placeholder="1.0.0">
+          <label for="skill-license">License</label>
+          <select id="skill-license">
+            <option value="">— not specified —</option>
+            <option value="MIT">MIT</option>
+            <option value="Apache-2.0">Apache-2.0</option>
+            <option value="GPL-2.0">GPL-2.0</option>
+            <option value="GPL-3.0">GPL-3.0</option>
+            <option value="LGPL-2.1">LGPL-2.1</option>
+            <option value="LGPL-3.0">LGPL-3.0</option>
+            <option value="AGPL-3.0">AGPL-3.0</option>
+            <option value="BSD-2-Clause">BSD-2-Clause</option>
+            <option value="BSD-3-Clause">BSD-3-Clause</option>
+            <option value="ISC">ISC</option>
+            <option value="MPL-2.0">MPL-2.0</option>
+            <option value="Unlicense">Unlicense</option>
+            <option value="Proprietary">Proprietary</option>
+          </select>
+          <label for="skill-compatibility">Compatibility <span class="label-hint">environment requirements, max 500 chars</span></label>
+          <input id="skill-compatibility" type="text" placeholder="Requires git, docker, etc." maxlength="500">
+        </div>
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Deployment</h3>
+          <label for="skill-activation">Activation <span class="label-hint">how models discover this skill</span></label>
+          <select id="skill-activation">
+            <option value="named">Named — explicit /skill invocation</option>
+            <option value="default">Default — auto-applied to every session</option>
+            <option value="search">Search — BM25 discoverable</option>
+          </select>
+          <label class="admin-checkbox"><input id="ctm-default" type="checkbox"> Apply to new workstreams by default</label>
+        </div>
+      </div>
+      <div class="skill-spec-col skill-spec-col-content">
+        <div class="skill-spec-section skill-spec-section-content">
+          <h3 class="skill-spec-heading">Skill Content <span class="label-hint">system message &mdash; {{model}}, {{ws_id}}, {{node_id}}</span></h3>
+          <textarea id="ctm-content" class="skill-content-area" placeholder="You are a code reviewer using {{model}}..."></textarea>
+          <div class="skill-vars-row">
+            <span class="skill-vars-label">Variables</span>
+            <div id="ctm-variables" class="skill-vars-display label-hint"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <details class="admin-details">
-      <summary>Session Config <span class="label-hint">optional &mdash; applied when skill is selected for a workstream</span></summary>
-      <label for="csk-model">Model</label>
-      <input id="csk-model" type="text" placeholder="Default model">
-      <label for="csk-temperature">Temperature</label>
-      <input id="csk-temperature" type="number" step="0.1" min="0" max="2" placeholder="System default">
-      <label for="csk-reasoning-effort">Reasoning Effort</label>
-      <select id="csk-reasoning-effort">
-        <option value="">System default</option>
-        <option value="low">Low</option>
-        <option value="medium">Medium</option>
-        <option value="high">High</option>
-      </select>
-      <label for="csk-max-tokens">Max Tokens</label>
-      <input id="csk-max-tokens" type="number" min="1" placeholder="System default">
-      <label for="csk-token-budget">Token Budget</label>
-      <input id="csk-token-budget" type="number" min="0" placeholder="0 = unlimited">
-      <label for="csk-agent-max-turns">Agent Max Turns</label>
-      <input id="csk-agent-max-turns" type="number" min="1" placeholder="System default">
+      <summary>Runtime Config <span class="label-hint">model, temperature, token limits</span></summary>
+      <div class="skill-config-grid">
+        <div><label for="csk-model">Model</label><input id="csk-model" type="text" placeholder="Default model"></div>
+        <div><label for="csk-temperature">Temperature</label><input id="csk-temperature" type="number" step="0.1" min="0" max="2" placeholder="System default"></div>
+        <div>
+          <label for="csk-reasoning-effort">Reasoning Effort</label>
+          <select id="csk-reasoning-effort">
+            <option value="">System default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+        <div><label for="csk-max-tokens">Max Tokens</label><input id="csk-max-tokens" type="number" min="1" placeholder="System default"></div>
+        <div><label for="csk-token-budget">Token Budget</label><input id="csk-token-budget" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div><label for="csk-agent-max-turns">Agent Max Turns</label><input id="csk-agent-max-turns" type="number" min="1" placeholder="System default"></div>
+      </div>
       <label class="admin-checkbox"><input id="csk-auto-approve" type="checkbox"> Auto-approve all tools</label>
       <label for="csk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="csk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
       <label class="admin-checkbox"><input id="csk-enabled" type="checkbox" checked> Enabled</label>
     </details>
     <details class="admin-details">
-      <summary>Resources <span class="label-hint">optional bundled files (scripts, references, assets)</span></summary>
+      <summary>Resources <span class="label-hint">bundled files (scripts, references, assets)</span></summary>
       <div id="ctm-resources-list" role="list" aria-live="polite" aria-label="Pending resources"></div>
       <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
         <label for="ctm-res-path">Path</label>
@@ -929,61 +962,95 @@ window.TURNSTONE_KB_SHORTCUTS = [
 
 <!-- Edit Skill Modal -->
 <div id="edit-template-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-template-title">
-  <div id="edit-template-box" class="admin-modal admin-modal-wide">
+  <div id="edit-template-box" class="admin-modal admin-modal-wide admin-modal-skill">
     <h2 id="edit-template-title">Edit Skill</h2>
+    <div id="etm-origin-badge" class="skill-origin-badge" style="display:none"></div>
     <div id="edit-template-error" role="alert" aria-live="assertive"></div>
     <input id="etm-id" type="hidden">
-    <label for="etm-name">Name</label>
-    <input id="etm-name" type="text" autocomplete="off">
-    <label for="etm-category">Category</label>
-    <select id="etm-category">
-      <option value="general">General</option>
-      <option value="engineering">Engineering</option>
-      <option value="support">Support</option>
-      <option value="custom">Custom</option>
-    </select>
-    <label for="etm-description">Description</label>
-    <textarea id="etm-description" rows="2" placeholder="Brief description for discovery"></textarea>
-    <label for="etm-tags">Tags</label>
-    <input id="etm-tags" type="text" placeholder="Comma-separated tags">
-    <label for="etm-author">Author</label>
-    <input id="etm-author" type="text" placeholder="Author name">
-    <label for="etm-version">Version</label>
-    <input id="etm-version" type="text" placeholder="1.0.0">
-    <label for="etm-license">License</label>
-    <input id="etm-license" type="text" placeholder="MIT, Apache-2.0, etc.">
-    <label for="etm-compatibility">Compatibility <span class="label-hint">environment requirements, max 500 chars</span></label>
-    <input id="etm-compatibility" type="text" placeholder="Requires git, docker, etc." maxlength="500">
-    <label for="etm-activation">Activation</label>
-    <select id="etm-activation">
-      <option value="named">Named</option>
-      <option value="default">Default (auto-apply)</option>
-      <option value="search">Search (BM25 discoverable)</option>
-    </select>
-    <label for="etm-content">Content</label>
-    <textarea id="etm-content" rows="6"></textarea>
-    <label>Variables <span class="label-hint">auto-detected from content &mdash; available: model, ws_id, node_id</span></label>
-    <div id="etm-variables" class="label-hint" style="padding:4px 0;min-height:1.2em"></div>
-    <label class="admin-checkbox"><input id="etm-default" type="checkbox"> Set as default</label>
+    <div class="skill-spec-body">
+      <div class="skill-spec-col skill-spec-col-meta">
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Identity</h3>
+          <label for="etm-name">Name</label>
+          <input id="etm-name" type="text" autocomplete="off">
+          <label for="etm-category">Category</label>
+          <select id="etm-category">
+            <option value="general">General</option>
+            <option value="engineering">Engineering</option>
+            <option value="support">Support</option>
+            <option value="custom">Custom</option>
+          </select>
+          <label for="etm-description">Description</label>
+          <textarea id="etm-description" rows="2" placeholder="Brief description for skill discovery"></textarea>
+        </div>
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Manifest</h3>
+          <label for="etm-tags">Tags</label>
+          <input id="etm-tags" type="text" placeholder="python, review, quality">
+          <label for="etm-author">Author</label>
+          <input id="etm-author" type="text" placeholder="Author name">
+          <label for="etm-version">Version</label>
+          <input id="etm-version" type="text" placeholder="1.0.0">
+          <label for="etm-license">License</label>
+          <select id="etm-license">
+            <option value="">— not specified —</option>
+            <option value="MIT">MIT</option>
+            <option value="Apache-2.0">Apache-2.0</option>
+            <option value="GPL-2.0">GPL-2.0</option>
+            <option value="GPL-3.0">GPL-3.0</option>
+            <option value="LGPL-2.1">LGPL-2.1</option>
+            <option value="LGPL-3.0">LGPL-3.0</option>
+            <option value="AGPL-3.0">AGPL-3.0</option>
+            <option value="BSD-2-Clause">BSD-2-Clause</option>
+            <option value="BSD-3-Clause">BSD-3-Clause</option>
+            <option value="ISC">ISC</option>
+            <option value="MPL-2.0">MPL-2.0</option>
+            <option value="Unlicense">Unlicense</option>
+            <option value="Proprietary">Proprietary</option>
+          </select>
+          <label for="etm-compatibility">Compatibility <span class="label-hint">environment requirements, max 500 chars</span></label>
+          <input id="etm-compatibility" type="text" placeholder="Requires git, docker, etc." maxlength="500">
+        </div>
+        <div class="skill-spec-section">
+          <h3 class="skill-spec-heading">Deployment</h3>
+          <label for="etm-activation">Activation <span class="label-hint">how models discover this skill</span></label>
+          <select id="etm-activation">
+            <option value="named">Named — explicit /skill invocation</option>
+            <option value="default">Default — auto-applied to every session</option>
+            <option value="search">Search — BM25 discoverable</option>
+          </select>
+          <label class="admin-checkbox"><input id="etm-default" type="checkbox"> Apply to new workstreams by default</label>
+        </div>
+      </div>
+      <div class="skill-spec-col skill-spec-col-content">
+        <div class="skill-spec-section skill-spec-section-content">
+          <h3 class="skill-spec-heading">Skill Content <span class="label-hint">{{model}}, {{ws_id}}, {{node_id}}</span></h3>
+          <textarea id="etm-content" class="skill-content-area"></textarea>
+          <div class="skill-vars-row">
+            <span class="skill-vars-label">Variables</span>
+            <div id="etm-variables" class="skill-vars-display label-hint"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <details class="admin-details">
-      <summary>Session Config <span class="label-hint">applied when skill is selected for a workstream</span></summary>
-      <label for="esk-model">Model</label>
-      <input id="esk-model" type="text" placeholder="Default model">
-      <label for="esk-temperature">Temperature</label>
-      <input id="esk-temperature" type="number" step="0.1" min="0" max="2" placeholder="System default">
-      <label for="esk-reasoning-effort">Reasoning Effort</label>
-      <select id="esk-reasoning-effort">
-        <option value="">System default</option>
-        <option value="low">Low</option>
-        <option value="medium">Medium</option>
-        <option value="high">High</option>
-      </select>
-      <label for="esk-max-tokens">Max Tokens</label>
-      <input id="esk-max-tokens" type="number" min="1" placeholder="System default">
-      <label for="esk-token-budget">Token Budget</label>
-      <input id="esk-token-budget" type="number" min="0" placeholder="0 = unlimited">
-      <label for="esk-agent-max-turns">Agent Max Turns</label>
-      <input id="esk-agent-max-turns" type="number" min="1" placeholder="System default">
+      <summary>Runtime Config <span class="label-hint">model, temperature, token limits</span></summary>
+      <div class="skill-config-grid">
+        <div><label for="esk-model">Model</label><input id="esk-model" type="text" placeholder="Default model"></div>
+        <div><label for="esk-temperature">Temperature</label><input id="esk-temperature" type="number" step="0.1" min="0" max="2" placeholder="System default"></div>
+        <div>
+          <label for="esk-reasoning-effort">Reasoning Effort</label>
+          <select id="esk-reasoning-effort">
+            <option value="">System default</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        </div>
+        <div><label for="esk-max-tokens">Max Tokens</label><input id="esk-max-tokens" type="number" min="1" placeholder="System default"></div>
+        <div><label for="esk-token-budget">Token Budget</label><input id="esk-token-budget" type="number" min="0" placeholder="0 = unlimited"></div>
+        <div><label for="esk-agent-max-turns">Agent Max Turns</label><input id="esk-agent-max-turns" type="number" min="1" placeholder="System default"></div>
+      </div>
       <label class="admin-checkbox"><input id="esk-auto-approve" type="checkbox"> Auto-approve all tools</label>
       <label for="esk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="esk-allowed-tools" type="text" placeholder="bash, read_file, write_file">

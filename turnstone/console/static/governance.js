@@ -1187,13 +1187,37 @@ function showEditTemplateModal(tmplId) {
         });
     };
   }
+  // Reset collapsible state before applying readonly rules (prevents state leak
+  // when switching between readonly and editable skills in the same session)
+  var allDetails = document.querySelectorAll(
+    "#edit-template-box .admin-details",
+  );
+  for (var d = 0; d < allDetails.length; d++) allDetails[d].open = false;
+
   // --- Readonly mode for imported skills ---
   var isReadonly = tmpl.readonly || false;
   var editTitle = document.getElementById("edit-template-title");
   if (editTitle)
     editTitle.textContent = isReadonly ? "View Skill" : "Edit Skill";
+  // Origin badge — show provenance for installed skills
+  var originBadge = document.getElementById("etm-origin-badge");
+  if (originBadge) {
+    if (isReadonly && tmpl.source_url) {
+      originBadge.textContent = "Installed from \u00a0" + tmpl.source_url;
+      originBadge.style.display = "inline-flex";
+    } else if (isReadonly && tmpl.origin && tmpl.origin !== "manual") {
+      originBadge.textContent = "Installed skill";
+      originBadge.style.display = "inline-flex";
+    } else {
+      originBadge.style.display = "none";
+    }
+  }
   var submitBtn = document.getElementById("etm-submit");
-  if (submitBtn) submitBtn.style.display = isReadonly ? "none" : "";
+  if (submitBtn) {
+    submitBtn.style.display = "";
+    submitBtn.textContent = isReadonly ? "Save Config" : "Save";
+  }
+  // Spec/content fields: locked for installed skills (preserve source fidelity)
   [
     "etm-name",
     "etm-category",
@@ -1206,6 +1230,12 @@ function showEditTemplateModal(tmplId) {
     "etm-activation",
     "etm-content",
     "etm-default",
+  ].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) el.disabled = isReadonly;
+  });
+  // Runtime config fields: always editable (local settings, not part of SKILL.md spec)
+  [
     "esk-model",
     "esk-temperature",
     "esk-reasoning-effort",
@@ -1213,15 +1243,17 @@ function showEditTemplateModal(tmplId) {
     "esk-token-budget",
     "esk-agent-max-turns",
     "esk-auto-approve",
-    "esk-allowed-tools",
     "esk-enabled",
   ].forEach(function (id) {
     var el = document.getElementById(id);
-    if (el) el.disabled = isReadonly;
+    if (el) el.disabled = false;
   });
+  // esk-allowed-tools follows auto_approve state, not readonly state
+  var allowedToolsEl = document.getElementById("esk-allowed-tools");
+  if (allowedToolsEl) allowedToolsEl.disabled = tmpl.auto_approve || false;
   var cancelBtn = document.querySelector("#edit-template-box .modal-cancel");
   if (cancelBtn) cancelBtn.textContent = isReadonly ? "Close" : "Cancel";
-  // Auto-expand collapsibles in view mode
+  // Auto-expand Runtime Config collapsible for installed skills so config is visible
   if (isReadonly) {
     var details = document.querySelectorAll(
       "#edit-template-box .admin-details",

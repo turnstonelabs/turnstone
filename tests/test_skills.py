@@ -802,8 +802,8 @@ class TestSkillAPI:
         )
         assert resp.status_code == 404
 
-    def test_update_skill_readonly_rejected(self, api_client, api_storage):
-        """Updating a readonly (MCP-sourced) skill returns 403."""
+    def test_update_skill_readonly_spec_fields_rejected(self, api_client, api_storage):
+        """Updating spec fields on a readonly skill returns 400 (filtered to nothing)."""
         _create_template(
             api_storage,
             "s1",
@@ -815,9 +815,65 @@ class TestSkillAPI:
         )
         resp = api_client.put(
             "/v1/api/admin/skills/s1",
-            json={"description": "hacked"},
+            json={"description": "hacked", "content": "evil"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 400
+        assert "runtime config" in resp.json()["error"].lower()
+
+    def test_update_skill_readonly_runtime_config_allowed(self, api_client, api_storage):
+        """Runtime config fields can be updated on a readonly (installed) skill."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed-skill",
+            "external content",
+            origin="source",
+            readonly=True,
+        )
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"model": "gpt-5", "temperature": 0.5, "enabled": False},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["model"] == "gpt-5"
+        assert data["temperature"] == 0.5
+        assert data["enabled"] is False
+        # Spec fields must remain unchanged
+        assert data["content"] == "external content"
+
+    def test_update_skill_readonly_mixed_body_filters_spec(self, api_client, api_storage):
+        """When JS sends all fields for a readonly skill, spec fields are silently dropped."""
+        _create_template(
+            api_storage,
+            "s1",
+            "installed",
+            "original content",
+            origin="source",
+            readonly=True,
+        )
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            # Simulate what the browser form submits: every field present
+            json={
+                "name": "hacked",
+                "content": "evil content",
+                "description": "tampered",
+                "model": "gpt-5",
+                "enabled": False,
+                "token_budget": 50000,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Config fields updated
+        assert data["model"] == "gpt-5"
+        assert data["enabled"] is False
+        assert data["token_budget"] == 50000
+        # Spec fields unchanged
+        assert data["name"] == "installed"
+        assert data["content"] == "original content"
+        assert data["description"] == ""
 
     def test_update_skill_recomputes_token_estimate(self, api_client, api_storage):
         """Updating content recomputes token_estimate."""
