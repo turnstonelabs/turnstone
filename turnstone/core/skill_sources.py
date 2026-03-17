@@ -6,6 +6,7 @@ and :func:`fetch_skill_from_github` for fetching SKILL.md from GitHub repos.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -120,19 +121,20 @@ class SkillsShClient:
         return url
 
 
-def _parse_github_url(url: str) -> tuple[str, str, str, str]:
-    """Parse a GitHub URL into (owner, repo, branch, path).
+def _parse_github_url(url: str) -> tuple[str, str, str, str, bool]:
+    """Parse a GitHub URL into (owner, repo, branch, path, branch_explicit).
 
-    Returns ("", "", "", "") if URL doesn't match.
+    Returns ("", "", "", "", False) if URL doesn't match.
     """
     m = _GITHUB_URL_RE.match(url)
     if not m:
-        return ("", "", "", "")
+        return ("", "", "", "", False)
     return (
         m.group("owner"),
         m.group("repo"),
         m.group("branch") or "main",
         m.group("path") or "",
+        bool(m.group("branch")),
     )
 
 
@@ -150,8 +152,6 @@ def _find_resource_files(
             if not item_path.startswith(f"{skill_md_dir}/"):
                 continue
             rel_path = item_path[len(skill_md_dir) + 1 :]
-        elif "/" in item_path:
-            continue  # root-level SKILL.md: only root-level resources
         first_seg = rel_path.split("/")[0] if "/" in rel_path else ""
         if first_seg not in _RESOURCE_DIRS:
             continue
@@ -165,21 +165,45 @@ def _find_resource_files(
     return resource_files[:_MAX_RESOURCE_FILES]
 
 
+def _check_rate_limit(resp: httpx.Response) -> None:
+    """Raise SkillSourceError with guidance if GitHub rate limit is hit."""
+    if resp.status_code == 403:
+        remaining = resp.headers.get("x-ratelimit-remaining", "")
+        if remaining == "0":
+            raise SkillSourceError(
+                "GitHub API rate limit exceeded. "
+                "Set TURNSTONE_GITHUB_TOKEN env var for higher limits (5000 req/hr)."
+            )
+    remaining = resp.headers.get("x-ratelimit-remaining", "")
+    if remaining and remaining.isdigit() and int(remaining) < 10:
+        logger.warning("GitHub API rate limit low: %s remaining", remaining)
+
+
+_FETCH_CONCURRENCY = 5
+
+
 async def _fetch_resource_contents(
     client: httpx.AsyncClient,
     raw_base: str,
     resource_files: list[dict[str, str]],
 ) -> dict[str, str]:
-    """Fetch content for a list of resource files."""
-    resources: dict[str, str] = {}
-    for rf in resource_files:
-        try:
-            resp = await client.get(f"{raw_base}/{rf['full_path']}")
-            if resp.status_code == 200:
-                resources[rf["path"]] = resp.text
-        except httpx.HTTPError:
-            continue
-    return resources
+    """Fetch content for a list of resource files (concurrent)."""
+    if not resource_files:
+        return {}
+    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+    async def _fetch_one(rf: dict[str, str]) -> tuple[str, str] | None:
+        async with sem:
+            try:
+                resp = await client.get(f"{raw_base}/{rf['full_path']}")
+                if resp.status_code == 200:
+                    return rf["path"], resp.text
+            except httpx.HTTPError:
+                pass
+        return None
+
+    results = await asyncio.gather(*[_fetch_one(rf) for rf in resource_files])
+    return {path: content for r in results if r is not None for path, content in [r]}
 
 
 async def fetch_skill_from_github(url: str) -> SkillPackage:
@@ -193,7 +217,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
     Uses ``TURNSTONE_GITHUB_TOKEN`` env var for authenticated requests
     (60 → 5000 req/hr rate limit headroom).
     """
-    owner, repo, branch, path = _parse_github_url(url)
+    owner, repo, branch, path, branch_explicit = _parse_github_url(url)
     if not owner:
         raise SkillSourceError(f"Could not parse GitHub URL: {url}")
 
@@ -203,7 +227,6 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
         headers["Authorization"] = f"Bearer {token}"
 
     # When branch isn't specified in URL, try main then master
-    branch_explicit = bool(_GITHUB_URL_RE.match(url) and _GITHUB_URL_RE.match(url).group("branch"))  # type: ignore[union-attr]
     branches_to_try = [branch] if branch_explicit else ["main", "master"]
 
     api_base = f"https://api.github.com/repos/{owner}/{repo}"
@@ -233,7 +256,10 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
     skill_md_content = ""
     skill_md_dir = ""
     resolved_branch = branch
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
+    _timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=_timeout, headers=headers
+    ) as client:
         # Try each branch × candidate combination
         for try_branch in branches_to_try:
             raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{try_branch}"
@@ -241,10 +267,9 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                 try:
                     resp = await client.get(f"{raw_base}/{candidate}")
                     if resp.status_code == 200:
-                        content_len = int(resp.headers.get("content-length", "0"))
-                        if content_len > _MAX_SKILL_MD_SIZE:
+                        if len(resp.content) > _MAX_SKILL_MD_SIZE:
                             continue
-                        skill_md_content = resp.text[:_MAX_SKILL_MD_SIZE]
+                        skill_md_content = resp.text
                         # Directory containing the SKILL.md
                         parts = candidate.rsplit("/", 1)
                         skill_md_dir = parts[0] if len(parts) > 1 else ""
@@ -270,6 +295,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                 f"{api_base}/git/trees/{resolved_branch}",
                 params={"recursive": "1"},
             )
+            _check_rate_limit(tree_resp)
             if tree_resp.status_code == 200 and len(tree_resp.content) < 2 * 1024 * 1024:
                 tree_data = tree_resp.json()
                 rf = _find_resource_files(tree_data.get("tree", []), skill_md_dir)
@@ -304,7 +330,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
 
     Used when a repo-level URL has no root SKILL.md (monorepo pattern).
     """
-    owner, repo, branch, url_path = _parse_github_url(url)
+    owner, repo, branch, url_path, branch_explicit = _parse_github_url(url)
     if not owner:
         raise SkillSourceError(f"Could not parse GitHub URL: {url}")
     url_path = url_path.rstrip("/")
@@ -314,12 +340,14 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    branch_explicit = bool(_GITHUB_URL_RE.match(url) and _GITHUB_URL_RE.match(url).group("branch"))  # type: ignore[union-attr]
     branches_to_try = [branch] if branch_explicit else ["main", "master"]
 
     api_base = f"https://api.github.com/repos/{owner}/{repo}"
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
+    _timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=_timeout, headers=headers
+    ) as client:
         # Find the tree with all SKILL.md files
         tree_data: dict[str, Any] = {}
         resolved_branch = branch
@@ -329,6 +357,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     f"{api_base}/git/trees/{try_branch}",
                     params={"recursive": "1"},
                 )
+                _check_rate_limit(resp)
                 if resp.status_code == 200 and len(resp.content) < 2 * 1024 * 1024:
                     tree_data = resp.json()
                     resolved_branch = try_branch
@@ -360,20 +389,30 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
 
         raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{resolved_branch}"
 
+        # Fetch all SKILL.md files concurrently
+        sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+        async def _fetch_skill_md(p: str) -> tuple[str, str] | None:
+            async with sem:
+                try:
+                    r = await client.get(f"{raw_base}/{p}")
+                    if r.status_code == 200 and len(r.content) <= _MAX_SKILL_MD_SIZE:
+                        return p, r.text
+                except httpx.HTTPError:
+                    pass
+            return None
+
+        md_results = await asyncio.gather(*[_fetch_skill_md(p) for p in skill_md_paths])
+
         packages: list[SkillPackage] = []
-        for skill_md_path in skill_md_paths:
+        for result in md_results:
+            if result is None:
+                continue
+            skill_md_path, content = result
+
             # Determine directory containing this SKILL.md
             parts = skill_md_path.rsplit("/", 1)
             skill_md_dir = parts[0] if len(parts) > 1 else ""
-
-            # Fetch SKILL.md content
-            try:
-                resp = await client.get(f"{raw_base}/{skill_md_path}")
-                if resp.status_code != 200:
-                    continue
-                content = resp.text[:_MAX_SKILL_MD_SIZE]
-            except httpx.HTTPError:
-                continue
 
             # Parse — skip if invalid
             try:
@@ -382,7 +421,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                 logger.debug("Skipping invalid SKILL.md at %s", skill_md_path)
                 continue
 
-            # Collect resources for this skill
+            # Collect resources for this skill (concurrent via helper)
             rf = _find_resource_files(tree_items, skill_md_dir)
             resources = await _fetch_resource_contents(client, raw_base, rf)
 

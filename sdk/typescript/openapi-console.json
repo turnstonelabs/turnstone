@@ -2470,6 +2470,195 @@
         }
       }
     },
+    "/v1/api/admin/skills/{skill_id}/resources": {
+      "get": {
+        "summary": "List resource files for a skill",
+        "operationId": "v1_api_admin_skills_{skill_id}_resources_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSkillResourcesResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Upload a resource file to a skill",
+        "operationId": "v1_api_admin_skills_{skill_id}_resources_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSkillResourceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillResourceInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/skills/{skill_id}/resources/{path}": {
+      "get": {
+        "summary": "Get a single skill resource by path",
+        "operationId": "v1_api_admin_skills_{skill_id}_resources_{path}_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SkillResourceInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a skill resource by path",
+        "operationId": "v1_api_admin_skills_{skill_id}_resources_{path}_delete",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/memories": {
       "get": {
         "summary": "List structured memories",
@@ -6680,6 +6869,11 @@
             "title": "Scan Version",
             "type": "string"
           },
+          "resource_count": {
+            "default": 0,
+            "title": "Resource Count",
+            "type": "integer"
+          },
           "created": {
             "title": "Created",
             "type": "string"
@@ -7151,6 +7345,88 @@
           "versions"
         ],
         "title": "ListSkillVersionsResponse",
+        "type": "object"
+      },
+      "SkillResourceInfo": {
+        "properties": {
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "skill_id": {
+            "title": "Skill Id",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "content": {
+            "default": "",
+            "title": "Content",
+            "type": "string"
+          },
+          "content_type": {
+            "default": "text/plain",
+            "title": "Content Type",
+            "type": "string"
+          },
+          "size": {
+            "default": 0,
+            "title": "Size",
+            "type": "integer"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          }
+        },
+        "required": [
+          "resource_id",
+          "skill_id",
+          "path",
+          "created"
+        ],
+        "title": "SkillResourceInfo",
+        "type": "object"
+      },
+      "CreateSkillResourceRequest": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "content_type": {
+            "default": "text/plain",
+            "title": "Content Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "title": "CreateSkillResourceRequest",
+        "type": "object"
+      },
+      "ListSkillResourcesResponse": {
+        "properties": {
+          "resources": {
+            "items": {
+              "$ref": "#/components/schemas/SkillResourceInfo"
+            },
+            "title": "Resources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "resources"
+        ],
+        "title": "ListSkillResourcesResponse",
         "type": "object"
       },
       "SkillSummary": {

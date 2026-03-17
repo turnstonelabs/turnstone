@@ -2534,7 +2534,8 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     )
 
     updated_skill = storage.get_prompt_template(skill_id)
-    return JSONResponse(_skill_to_response(updated_skill))
+    rc_map = storage.count_skill_resources_bulk([skill_id])
+    return JSONResponse(_skill_to_response(updated_skill, resource_count=rc_map.get(skill_id, 0)))
 
 
 async def admin_delete_skill(request: Request) -> JSONResponse:
@@ -3187,26 +3188,30 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         content = parsed.content[:32768]
         token_estimate = len(content) // 4 if content else 0
 
-        storage.create_prompt_template(
-            template_id=skill_id,
-            name=parsed.name,
-            category="general",
-            content=content,
-            variables="[]",
-            is_default=False,
-            org_id="",
-            created_by=audit_uid,
-            origin="source",
-            readonly=True,
-            description=parsed.description,
-            tags=tags_str,
-            source_url=pkg_source_url,
-            version=parsed.version,
-            author=parsed.author,
-            activation="named",
-            token_estimate=token_estimate,
-            allowed_tools=allowed_tools_str,
-        )
+        try:
+            storage.create_prompt_template(
+                template_id=skill_id,
+                name=parsed.name,
+                category="general",
+                content=content,
+                variables="[]",
+                is_default=False,
+                org_id="",
+                created_by=audit_uid,
+                origin="source",
+                readonly=True,
+                description=parsed.description,
+                tags=tags_str,
+                source_url=pkg_source_url,
+                version=parsed.version,
+                author=parsed.author,
+                activation="named",
+                token_estimate=token_estimate,
+                allowed_tools=allowed_tools_str,
+            )
+        except Exception:
+            skipped.append({"name": parsed.name, "reason": "conflict"})
+            continue
 
         # Store bundled resources
         for res_path, res_content in package.resources.items():
@@ -3229,7 +3234,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
 
         skill = storage.get_prompt_template(skill_id)
         if skill:
-            installed.append(_skill_to_response(skill))
+            installed.append(_skill_to_response(skill, resource_count=len(package.resources)))
 
     if len(packages) == 1 and not installed:
         reason = skipped[0]["reason"] if skipped else "unknown"
