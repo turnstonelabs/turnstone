@@ -20,19 +20,23 @@ class TestParseGitHubUrl:
     """GitHub URL parsing."""
 
     def test_simple_repo(self) -> None:
-        owner, repo, branch, path = _parse_github_url("https://github.com/owner/repo")
+        owner, repo, branch, path, explicit = _parse_github_url("https://github.com/owner/repo")
         assert owner == "owner"
         assert repo == "repo"
         assert branch == "main"
         assert path == ""
+        assert explicit is False
 
     def test_repo_with_branch(self) -> None:
-        owner, repo, branch, path = _parse_github_url("https://github.com/owner/repo/tree/develop")
+        owner, repo, branch, path, explicit = _parse_github_url(
+            "https://github.com/owner/repo/tree/develop"
+        )
         assert branch == "develop"
         assert path == ""
+        assert explicit is True
 
     def test_repo_with_path(self) -> None:
-        owner, repo, branch, path = _parse_github_url(
+        owner, repo, branch, path, _explicit = _parse_github_url(
             "https://github.com/owner/repo/tree/main/skills/code-review"
         )
         assert owner == "owner"
@@ -41,14 +45,14 @@ class TestParseGitHubUrl:
         assert path == "skills/code-review"
 
     def test_blob_url(self) -> None:
-        owner, repo, branch, path = _parse_github_url(
+        owner, repo, branch, path, _explicit = _parse_github_url(
             "https://github.com/owner/repo/blob/main/SKILL.md"
         )
         assert branch == "main"
         assert path == "SKILL.md"
 
     def test_invalid_url(self) -> None:
-        owner, repo, branch, path = _parse_github_url("https://gitlab.com/owner/repo")
+        owner, repo, branch, path, _explicit = _parse_github_url("https://gitlab.com/owner/repo")
         assert owner == ""
 
 
