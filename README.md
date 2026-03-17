@@ -145,7 +145,7 @@ Turnstone includes a built-in governance layer for enterprise deployments — ma
 - **RBAC** — 15 granular permissions, 3 built-in roles (admin / operator / viewer), custom roles, privilege escalation prevention
 - **OIDC SSO** — single sign-on via any OpenID Connect provider (Okta, Azure AD, Google, Keycloak); Authorization Code Flow with PKCE, auto-provisioning, claim-based role mapping with demotion propagation; see [docs/oidc.md](docs/oidc.md)
 - **Tool policies** — glob-pattern rules (`allow` / `deny` / `ask`) with priority ordering; automate approvals or lock down dangerous tools
-- **Skills** — reusable behavioral profiles with system prompts, `{{variable}}` substitution, session config (model, temperature, token budget), install-time security scanning, version history, external discovery (skills.sh / GitHub), and runtime `load_skill` tool for model-driven skill activation
+- **Skills** — reusable behavioral profiles with system prompts, `{{variable}}` substitution, session config (model, temperature, token budget), install-time security scanning, version history, external discovery (skills.sh / GitHub), and runtime `skill` tool for model-driven skill activation
 - **Usage tracking** — per-request token and tool metrics, aggregation by day / model / user, automatic 90-day pruning
 - **Audit logging** — append-only event trail for all admin mutations, IP-aware, 365-day retention
 

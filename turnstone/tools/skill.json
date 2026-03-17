@@ -1,5 +1,5 @@
 {
-  "name": "load_skill",
+  "name": "skill",
   "description": "Load or search for skills. Actions: 'load' activates a skill by name (replaces current skill), 'search' finds available skills by query.",
   "parameters": {
     "type": "object",

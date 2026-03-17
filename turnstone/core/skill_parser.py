@@ -2,18 +2,39 @@
 
 Pure functions, no I/O.  Accepts raw SKILL.md text and returns a
 :class:`ParsedSkill` dataclass.
+
+Compliant with the Agent Skills specification (https://agentskills.io/specification).
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, overload
 
 import frontmatter
 
-# Name validation: lowercase letters, digits, hyphens, max 64 chars
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
+
+# Name validation: lowercase letters, digits, hyphens, max 64 chars.
+# Note: consecutive hyphens checked separately (not expressible in a
+# single character-class regex without a lookahead).
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,62}[a-z0-9]$|^[a-z0-9]$")
+
+# Split allowed-tools on whitespace or commas (standard uses spaces,
+# legacy turnstone format uses commas).  Tool expressions must not
+# contain internal whitespace (e.g. "Bash(git:*)" not "Bash(git: *)").
+_LIST_SPLIT_RE = re.compile(r"[\s,]+")
+
+# Malformed YAML recovery: match a bare ``description:`` line whose
+# value contains an unquoted colon (the most common cross-client issue).
+_BARE_DESC_RE = re.compile(r"^(description:\s*)(.+)$", re.MULTILINE)
+
+# Field length caps from the Agent Skills specification.
+_MAX_DESCRIPTION_LEN = 1024
+_MAX_COMPATIBILITY_LEN = 500
 
 
 @dataclass(frozen=True)
@@ -55,13 +76,39 @@ def _extract_tags(meta: dict[str, Any]) -> list[str]:
     return []
 
 
-def _extract_list(meta: dict[str, Any], key: str) -> list[str]:
-    """Extract a list of strings from frontmatter, with fallback."""
-    val = meta.get(key)
-    if isinstance(val, list):
-        return [str(v) for v in val if v]
-    if isinstance(val, str) and val:
-        return [v.strip() for v in val.split(",") if v.strip()]
+def _extract_str(meta: dict[str, Any], key: str, default: str = "") -> str:
+    """Extract a string field, checking top-level then ``metadata.*`` fallback.
+
+    Handles YAML ``null`` / bare keys gracefully (returns *default*
+    rather than the string ``"None"``).
+    """
+    raw = meta.get(key)
+    val = str(raw).strip() if raw is not None else ""
+    if val:
+        return val
+    # Standard puts author/version under metadata map
+    nested = meta.get("metadata")
+    if isinstance(nested, dict):
+        raw = nested.get(key)
+        val = str(raw).strip() if raw is not None else ""
+        if val:
+            return val
+    return default
+
+
+def _extract_list(meta: dict[str, Any], *keys: str) -> list[str]:
+    """Extract a list of strings from frontmatter.
+
+    Tries each *key* in order (first match wins).  String values are
+    split on whitespace or commas to handle both the Agent Skills
+    standard (space-delimited) and legacy comma-delimited formats.
+    """
+    for key in keys:
+        val = meta.get(key)
+        if isinstance(val, list):
+            return [str(v) for v in val if v]
+        if isinstance(val, str) and val:
+            return [v for v in _LIST_SPLIT_RE.split(val) if v]
     return []
 
 
@@ -71,22 +118,66 @@ def validate_skill_name(name: str) -> str | None:
         return "name is required"
     if len(name) > 64:
         return f"name exceeds 64 characters ({len(name)})"
+    if "--" in name:
+        return "name must not contain consecutive hyphens"
     if not _NAME_RE.match(name):
         return "name must be lowercase alphanumeric with hyphens (e.g. 'code-review')"
     return None
 
 
-def parse_skill_md(raw: str) -> ParsedSkill:
-    """Parse SKILL.md (YAML frontmatter + markdown body).
+def _try_parse_frontmatter(raw: str) -> frontmatter.Post:
+    """Parse YAML frontmatter with a single malformed-YAML retry.
 
-    Handles missing or malformed frontmatter gracefully — returns a
-    ``ParsedSkill`` with defaults for any missing fields.
-
-    Raises ``ValueError`` if ``name`` is missing or invalid.
+    The most common cross-client issue is unquoted description values
+    containing colons (e.g. ``description: Use when: the user asks``).
+    On initial failure, wrap the description value in quotes and retry.
     """
     try:
-        post = frontmatter.loads(raw)
+        return frontmatter.loads(raw)
+    except Exception:
+        pass  # fall through to retry
+
+    # Retry: quote the description line
+    def _quote_desc(m: re.Match[str]) -> str:
+        prefix = m.group(1)
+        value = m.group(2).strip()
+        escaped = value.replace('"', '\\"')
+        return f'{prefix}"{escaped}"'
+
+    fixed = _BARE_DESC_RE.sub(_quote_desc, raw)
+    if fixed != raw:
+        try:
+            return frontmatter.loads(fixed)
+        except Exception:
+            pass
+
+    raise ValueError("Failed to parse SKILL.md YAML frontmatter")
+
+
+@overload
+def parse_skill_md(raw: str, *, lenient: Literal[False] = ...) -> ParsedSkill: ...
+
+
+@overload
+def parse_skill_md(raw: str, *, lenient: Literal[True]) -> ParsedSkill | None: ...
+
+
+def parse_skill_md(raw: str, *, lenient: bool = False) -> ParsedSkill | None:
+    """Parse SKILL.md (YAML frontmatter + markdown body).
+
+    When *lenient* is ``False`` (default — strict mode), raises
+    ``ValueError`` on missing/invalid name or unparseable YAML.
+
+    When *lenient* is ``True`` (for external import / cross-client
+    ingestion), logs warnings and returns ``None`` for unskippable
+    failures instead of raising.
+    """
+    try:
+        post = _try_parse_frontmatter(raw)
     except Exception as exc:
+        if lenient:
+            log.warning("skill_parser.yaml_failed", error=str(exc))
+            return None
         raise ValueError(f"Failed to parse SKILL.md frontmatter: {exc}") from exc
 
     meta: dict[str, Any] = dict(post.metadata)
@@ -96,7 +187,16 @@ def parse_skill_md(raw: str) -> ParsedSkill:
     name = str(meta.get("name", "")).strip().lower()
     name_err = validate_skill_name(name)
     if name_err:
-        raise ValueError(name_err)
+        if lenient:
+            log.warning("skill_parser.name_invalid", name=name, error=name_err)
+            # Try to salvage: strip invalid chars, truncate
+            sanitized = re.sub(r"[^a-z0-9-]", "", name).strip("-")
+            sanitized = re.sub(r"-{2,}", "-", sanitized)[:64].strip("-")
+            if not sanitized or validate_skill_name(sanitized):
+                return None
+            name = sanitized
+        else:
+            raise ValueError(name_err)
 
     # Description — frontmatter or first paragraph of body
     description = str(meta.get("description", "")).strip()
@@ -107,15 +207,38 @@ def parse_skill_md(raw: str) -> ParsedSkill:
             first_line = first_line.lstrip("# ").strip()
         description = first_line[:256]
 
+    if not description and lenient:
+        log.warning("skill_parser.no_description", name=name)
+        return None
+
+    # Spec caps
+    if len(description) > _MAX_DESCRIPTION_LEN:
+        log.warning(
+            "skill_parser.description_truncated",
+            name=name,
+            length=len(description),
+        )
+        description = description[:_MAX_DESCRIPTION_LEN]
+
+    compatibility = str(meta.get("compatibility", "")).strip()
+    if len(compatibility) > _MAX_COMPATIBILITY_LEN:
+        log.warning(
+            "skill_parser.compatibility_truncated",
+            name=name,
+            length=len(compatibility),
+        )
+        compatibility = compatibility[:_MAX_COMPATIBILITY_LEN]
+
     return ParsedSkill(
         name=name,
         description=description,
         content=body,
         tags=_extract_tags(meta),
-        author=str(meta.get("author", "")).strip(),
-        version=str(meta.get("version", "1.0.0")).strip(),
-        allowed_tools=_extract_list(meta, "allowed_tools"),
+        author=_extract_str(meta, "author"),
+        version=_extract_str(meta, "version", default="1.0.0"),
+        # Standard uses "allowed-tools" (hyphenated); stored internally as allowed_tools
+        allowed_tools=_extract_list(meta, "allowed-tools"),
         license=str(meta.get("license", "")).strip(),
-        compatibility=str(meta.get("compatibility", "")).strip(),
+        compatibility=compatibility,
         raw_frontmatter=meta,
     )

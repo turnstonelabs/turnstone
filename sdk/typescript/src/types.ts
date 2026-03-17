@@ -187,6 +187,8 @@ export interface SkillInfo {
   notify_on_complete: string;
   enabled: boolean;
   allowed_tools: string;
+  license: string;
+  compatibility: string;
   resource_count: number;
   created: string;
   updated: string;
@@ -214,6 +216,8 @@ export interface CreateSkillRequest {
   notify_on_complete?: string;
   enabled?: boolean;
   allowed_tools?: string;
+  license?: string;
+  compatibility?: string;
 }
 
 export interface UpdateSkillRequest {
@@ -237,6 +241,8 @@ export interface UpdateSkillRequest {
   notify_on_complete?: string;
   enabled?: boolean;
   allowed_tools?: string;
+  license?: string;
+  compatibility?: string;
 }
 
 export interface ListSkillsResponse {

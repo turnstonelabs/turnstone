@@ -70,7 +70,7 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
 - **Runtime switching**: `/template <name>` to switch, `/template clear` to revert
   to defaults, `/template` to show current. Persisted across resume.
-- **Model-driven loading**: The `load_skill` built-in tool lets the model
+- **Model-driven loading**: The `skill` built-in tool lets the model
   discover and activate skills mid-conversation. `search` action finds skills
   by query (auto-approved); `load` action activates by name (requires user
   approval since it changes session behavior). Main session only.
@@ -83,11 +83,15 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   precedence on name collision. MCP-synced content updates reset `is_default` to
   prevent compromised servers from injecting defaults. Admin UI shows origin badge
   and disables edit/delete for MCP-sourced skills.
+- **Spec fields**: Skills support the full Agent Skills standard frontmatter:
+  `name`, `description`, `license`, `compatibility`, `metadata` (author, version),
+  `allowed-tools`. The `license` and `compatibility` fields are preserved on import
+  and editable in the admin UI. See https://agentskills.io/specification.
 - **Security scanning**: Skills are automatically scanned at creation and update
   time. The scanner evaluates four risk axes: content risk (command execution,
   data exfiltration), supply chain risk (pipe-to-shell, transitive installs),
   vulnerability risk (prompt injection, insecure credentials), and declared
-  capability risk (from `allowed_tools`). Results populate the `scan_status`
+  capability risk (from `allowed-tools` in SKILL.md). Results populate the `scan_status`
   (safe/low/medium/high/critical) and `scan_report` (JSON breakdown) columns.
   These fields are system-managed and cannot be overwritten via the admin API.
 - **Discovery**: External skills can be discovered and installed from registries:

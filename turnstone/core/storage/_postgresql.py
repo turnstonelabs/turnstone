@@ -1508,6 +1508,8 @@ class PostgreSQLBackend:
         notify_on_complete: str = "{}",
         enabled: bool = True,
         allowed_tools: str = "[]",
+        skill_license: str = "",
+        compatibility: str = "",
     ) -> None:
         # Sync is_default from activation when activation is explicitly set
         if activation == "default":
@@ -1540,6 +1542,8 @@ class PostgreSQLBackend:
                     "activation": activation,
                     "token_estimate": token_estimate,
                     "allowed_tools": allowed_tools,
+                    "license": skill_license,
+                    "compatibility": compatibility,
                     "scan_status": scan_status,
                     "scan_report": scan_report,
                     "scan_version": scan_version,

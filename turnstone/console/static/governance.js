@@ -768,7 +768,7 @@ function _renderGovSkills(items) {
         t.resource_count +
         " res</span>";
     }
-    var editDisabled = t.readonly ? " disabled" : "";
+    var editLabel = t.readonly ? "view" : "edit";
     var deleteDisabled = "";
     html +=
       '<div class="admin-row" role="listitem">' +
@@ -794,9 +794,9 @@ function _renderGovSkills(items) {
       '<span class="admin-col admin-col-actions">' +
       '<button class="admin-btn-action" data-edit-tmpl="' +
       escapeHtml(t.template_id) +
-      '"' +
-      editDisabled +
-      ">edit</button>" +
+      '">' +
+      editLabel +
+      "</button>" +
       '<button class="admin-btn-danger" data-delete-tmpl="' +
       escapeHtml(t.template_id) +
       '" data-tmpl-name="' +
@@ -870,6 +870,9 @@ function showCreateTemplateModal() {
   document.getElementById("skill-description").value = "";
   document.getElementById("skill-tags").value = "";
   document.getElementById("skill-author").value = "";
+  document.getElementById("skill-version").value = "";
+  document.getElementById("skill-license").value = "";
+  document.getElementById("skill-compatibility").value = "";
   document.getElementById("skill-activation").value = "named";
   document.getElementById("ctm-content").value = "";
   document.getElementById("ctm-variables").textContent = "(none)";
@@ -888,11 +891,9 @@ function showCreateTemplateModal() {
   document.getElementById("csk-allowed-tools").value = "";
   document.getElementById("csk-allowed-tools").disabled = false;
   document.getElementById("csk-enabled").checked = true;
-  document
-    .getElementById("csk-auto-approve")
-    .addEventListener("change", function () {
-      document.getElementById("csk-allowed-tools").disabled = this.checked;
-    });
+  document.getElementById("csk-auto-approve").onchange = function () {
+    document.getElementById("csk-allowed-tools").disabled = this.checked;
+  };
   document.getElementById("create-template-error").style.display = "none";
   // Clear resource list
   _pendingResources = [];
@@ -960,6 +961,11 @@ function submitCreateTemplate() {
       ).trim(),
       tags: JSON.stringify(tagsArray),
       author: (document.getElementById("skill-author").value || "").trim(),
+      version: (document.getElementById("skill-version").value || "").trim(),
+      license: (document.getElementById("skill-license").value || "").trim(),
+      compatibility: (
+        document.getElementById("skill-compatibility").value || ""
+      ).trim(),
       activation: document.getElementById("skill-activation").value,
       content: content,
       variables: JSON.stringify(varList),
@@ -1052,6 +1058,9 @@ function showEditTemplateModal(tmplId) {
   }
   document.getElementById("etm-tags").value = tagsDisplay;
   document.getElementById("etm-author").value = tmpl.author || "";
+  document.getElementById("etm-version").value = tmpl.version || "";
+  document.getElementById("etm-license").value = tmpl.license || "";
+  document.getElementById("etm-compatibility").value = tmpl.compatibility || "";
   document.getElementById("etm-activation").value = tmpl.activation || "named";
   document.getElementById("etm-content").value = tmpl.content;
   _updateVarsDisplay("etm-content", "etm-variables");
@@ -1086,11 +1095,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("esk-allowed-tools").disabled =
     tmpl.auto_approve || false;
   document.getElementById("esk-enabled").checked = tmpl.enabled !== false;
-  document
-    .getElementById("esk-auto-approve")
-    .addEventListener("change", function () {
-      document.getElementById("esk-allowed-tools").disabled = this.checked;
-    });
+  document.getElementById("esk-auto-approve").onchange = function () {
+    document.getElementById("esk-allowed-tools").disabled = this.checked;
+  };
   document.getElementById("edit-template-error").style.display = "none";
   // Scan report section
   var scanSection = document.getElementById("etm-scan-section");
@@ -1180,12 +1187,59 @@ function showEditTemplateModal(tmplId) {
         });
     };
   }
+  // --- Readonly mode for imported skills ---
+  var isReadonly = tmpl.readonly || false;
+  var editTitle = document.getElementById("edit-template-title");
+  if (editTitle)
+    editTitle.textContent = isReadonly ? "View Skill" : "Edit Skill";
+  var submitBtn = document.getElementById("etm-submit");
+  if (submitBtn) submitBtn.style.display = isReadonly ? "none" : "";
+  [
+    "etm-name",
+    "etm-category",
+    "etm-description",
+    "etm-tags",
+    "etm-author",
+    "etm-version",
+    "etm-license",
+    "etm-compatibility",
+    "etm-activation",
+    "etm-content",
+    "etm-default",
+    "esk-model",
+    "esk-temperature",
+    "esk-reasoning-effort",
+    "esk-max-tokens",
+    "esk-token-budget",
+    "esk-agent-max-turns",
+    "esk-auto-approve",
+    "esk-allowed-tools",
+    "esk-enabled",
+  ].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) el.disabled = isReadonly;
+  });
+  var cancelBtn = document.querySelector("#edit-template-box .modal-cancel");
+  if (cancelBtn) cancelBtn.textContent = isReadonly ? "Close" : "Cancel";
+  // Auto-expand collapsibles in view mode
+  if (isReadonly) {
+    var details = document.querySelectorAll(
+      "#edit-template-box .admin-details",
+    );
+    for (var d = 0; d < details.length; d++) details[d].open = true;
+  }
   // --- Skill Resources ---
   var resSection = document.getElementById("etm-resources-section");
   if (resSection) {
-    _loadSkillResources(tmplId, tmpl.readonly || false);
+    _loadSkillResources(tmplId, isReadonly);
   }
   _etmTrapHandler = _installTrap("edit-template-overlay", "edit-template-box");
+  // Focus management
+  if (isReadonly) {
+    if (cancelBtn) cancelBtn.focus();
+  } else {
+    document.getElementById("etm-name").focus();
+  }
 }
 
 function hideEditTemplateModal() {
@@ -1477,6 +1531,11 @@ function submitEditTemplate() {
       ).trim(),
       tags: JSON.stringify(tagsArray),
       author: (document.getElementById("etm-author").value || "").trim(),
+      version: (document.getElementById("etm-version").value || "").trim(),
+      license: (document.getElementById("etm-license").value || "").trim(),
+      compatibility: (
+        document.getElementById("etm-compatibility").value || ""
+      ).trim(),
       activation: document.getElementById("etm-activation").value,
       content: content,
       variables: JSON.stringify(varList),

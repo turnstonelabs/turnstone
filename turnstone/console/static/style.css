@@ -1166,6 +1166,14 @@
   outline: none;
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+.admin-modal input:disabled, .admin-modal select:disabled, .admin-modal textarea:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: var(--bg-highlight);
+  border-color: var(--border);
+  color: var(--fg-dim);
+}
+.admin-modal label.admin-checkbox input:disabled { opacity: 0.4; }
 .admin-modal input::placeholder, .admin-modal textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
 .admin-modal textarea { resize: vertical; min-height: 40px; }
 .admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; display: none; }

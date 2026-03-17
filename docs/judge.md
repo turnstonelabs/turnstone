@@ -299,7 +299,7 @@ four independent risk axes:
    obfuscation, download-execute chains, executable URLs from untrusted domains
 3. **Vulnerability risk** — prompt injection patterns, insecure credential
    handling, third-party content exposure (indirect prompt injection surface)
-4. **Declared capability risk** — parsed from the skill's `allowed_tools` field.
+4. **Declared capability risk** — parsed from `allowed-tools` in the skill's SKILL.md.
    `Bash(*)` (unrestricted shell) is high risk. `Bash(git:*)` is low.
    Read-only tools are safe.
 

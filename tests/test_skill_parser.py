@@ -18,7 +18,7 @@ description: Automated code review skill
 author: Test Author
 version: 2.0.0
 tags: [python, review, quality]
-allowed_tools: [read_file, list_directory]
+allowed-tools: [read_file, list_directory]
 license: MIT
 compatibility: ">=0.7"
 ---
@@ -187,13 +187,13 @@ Content.
 
 
 class TestAllowedTools:
-    """Verify allowed_tools parsing."""
+    """Verify allowed-tools parsing (Agent Skills standard hyphenated field)."""
 
     def test_list_format(self) -> None:
         raw = """\
 ---
 name: tools-list
-allowed_tools: [bash, read_file]
+allowed-tools: [bash, read_file]
 ---
 
 Content.
@@ -201,11 +201,12 @@ Content.
         result = parse_skill_md(raw)
         assert result.allowed_tools == ["bash", "read_file"]
 
-    def test_csv_format(self) -> None:
+    def test_space_delimited_format(self) -> None:
+        """Standard format per Agent Skills spec."""
         raw = """\
 ---
-name: tools-csv
-allowed_tools: "bash, read_file, write_file"
+name: tools-space
+allowed-tools: "bash read_file write_file"
 ---
 
 Content.
@@ -217,6 +218,19 @@ Content.
         raw = """\
 ---
 name: no-tools
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.allowed_tools == []
+
+    def test_underscore_key_not_read(self) -> None:
+        """allowed_tools (underscore) is not a SKILL.md field — ignored by parser."""
+        raw = """\
+---
+name: legacy-key
+allowed_tools: [bash, read_file]
 ---
 
 Content.
@@ -247,3 +261,269 @@ class TestValidateSkillName:
         assert validate_skill_name("HAS-UPPER") is not None
         assert validate_skill_name("has space") is not None
         assert validate_skill_name("-leading-hyphen") is not None
+
+    def test_consecutive_hyphens_rejected(self) -> None:
+        """Agent Skills spec: consecutive hyphens not allowed."""
+        assert validate_skill_name("foo--bar") is not None
+        assert "consecutive hyphens" in (validate_skill_name("a--b") or "")
+        # Single hyphens are fine
+        assert validate_skill_name("foo-bar") is None
+
+
+# -- Agent Skills Standard Compliance Tests -----------------------------------
+
+
+class TestStandardAllowedTools:
+    """Agent Skills spec: 'allowed-tools' (hyphenated), space-delimited."""
+
+    def test_list_format(self) -> None:
+        raw = """\
+---
+name: standard-tools
+allowed-tools: ["Bash(git:*)", "Bash(jq:*)", "Read"]
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.allowed_tools == ["Bash(git:*)", "Bash(jq:*)", "Read"]
+
+    def test_space_delimited(self) -> None:
+        """Standard format: space-delimited string."""
+        raw = """\
+---
+name: space-tools
+allowed-tools: "Bash(git:*) Bash(jq:*) Read"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.allowed_tools == ["Bash(git:*)", "Bash(jq:*)", "Read"]
+
+    def test_mixed_space_comma_delimiters(self) -> None:
+        raw = """\
+---
+name: mixed-delim
+allowed-tools: "Read, Write Bash"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.allowed_tools == ["Read", "Write", "Bash"]
+
+
+class TestStandardMetadataNesting:
+    """Standard puts author/version under metadata map."""
+
+    def test_metadata_author(self) -> None:
+        raw = """\
+---
+name: nested-author
+description: Test skill
+metadata:
+  author: example-org
+  version: "2.0"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.author == "example-org"
+        assert result.version == "2.0"
+
+    def test_top_level_takes_precedence(self) -> None:
+        raw = """\
+---
+name: precedence
+description: Test skill
+author: top-level
+version: 1.0.0
+metadata:
+  author: nested
+  version: "2.0"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.author == "top-level"
+        assert result.version == "1.0.0"
+
+    def test_metadata_version_only(self) -> None:
+        raw = """\
+---
+name: version-only
+description: Test
+metadata:
+  version: "3.5.1"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.version == "3.5.1"
+        assert result.author == ""
+
+    def test_null_author_uses_default(self) -> None:
+        """YAML null/bare key must not produce the string 'None'."""
+        raw = """\
+---
+name: null-author
+description: Test
+author:
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.author == ""
+        assert result.version == "1.0.0"
+
+    def test_null_version_uses_default(self) -> None:
+        raw = """\
+---
+name: null-version
+description: Test
+version:
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.version == "1.0.0"
+
+
+class TestStandardFieldLengths:
+    """Spec caps: description <= 1024, compatibility <= 500."""
+
+    def test_description_truncated_at_1024(self) -> None:
+        long_desc = "x" * 1200
+        raw = f"""\
+---
+name: long-desc
+description: "{long_desc}"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert len(result.description) == 1024
+
+    def test_compatibility_truncated_at_500(self) -> None:
+        long_compat = "y" * 600
+        raw = f"""\
+---
+name: long-compat
+description: Short
+compatibility: "{long_compat}"
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert len(result.compatibility) == 500
+
+    def test_short_fields_unchanged(self) -> None:
+        raw = """\
+---
+name: short
+description: Brief
+compatibility: Requires git
+---
+
+Content.
+"""
+        result = parse_skill_md(raw)
+        assert result.description == "Brief"
+        assert result.compatibility == "Requires git"
+
+
+class TestLenientMode:
+    """Lenient parsing for cross-client skill ingestion."""
+
+    def test_invalid_name_sanitized(self) -> None:
+        raw = """\
+---
+name: Invalid_Name!
+description: A test skill
+---
+
+Content.
+"""
+        result = parse_skill_md(raw, lenient=True)
+        assert result is not None
+        assert result.name == "invalidname"
+
+    def test_unsalvageable_name_returns_none(self) -> None:
+        raw = """\
+---
+name: "!!!"
+description: A test skill
+---
+
+Content.
+"""
+        assert parse_skill_md(raw, lenient=True) is None
+
+    def test_missing_description_returns_none(self) -> None:
+        raw = """\
+---
+name: no-desc
+---
+"""
+        assert parse_skill_md(raw, lenient=True) is None
+
+    def test_broken_yaml_returns_none(self) -> None:
+        raw = """\
+---
+name: [broken: yaml: {{{
+---
+
+Content.
+"""
+        assert parse_skill_md(raw, lenient=True) is None
+
+    def test_malformed_yaml_colon_in_description_recovers(self) -> None:
+        """Standard recommends retrying unquoted colon values."""
+        raw = """\
+---
+name: colon-desc
+description: Use this skill when: the user asks about PDFs
+---
+
+Content.
+"""
+        result = parse_skill_md(raw, lenient=True)
+        # The frontmatter library may parse this fine, but if not,
+        # the retry mechanism should recover.
+        assert result is not None
+        assert result.name == "colon-desc"
+        assert "PDF" in result.description
+
+    def test_strict_mode_still_raises(self) -> None:
+        """Default strict mode unchanged."""
+        raw = """\
+---
+name: Invalid_Name!
+description: A test skill
+---
+
+Content.
+"""
+        with pytest.raises(ValueError):
+            parse_skill_md(raw)
+
+    def test_consecutive_hyphens_lenient(self) -> None:
+        raw = """\
+---
+name: foo--bar
+description: A test skill
+---
+
+Content.
+"""
+        result = parse_skill_md(raw, lenient=True)
+        assert result is not None
+        assert "--" not in result.name

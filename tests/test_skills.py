@@ -1156,6 +1156,49 @@ class TestSkillSessionConfigApplication:
         parsed_tools = json.loads(tpl["allowed_tools"])
         assert parsed_tools == ["bash", "read_file", "write_file"]
 
+    def test_license_compatibility_roundtrip(self, db):
+        """Agent Skills spec fields license and compatibility round-trip."""
+        db.create_prompt_template(
+            template_id="spec1",
+            name="spec-fields-skill",
+            category="general",
+            content="Spec test.",
+            skill_license="Apache-2.0",
+            compatibility="Requires git, docker, jq",
+        )
+        tpl = db.get_skill_by_name("spec-fields-skill")
+        assert tpl is not None
+        assert tpl["license"] == "Apache-2.0"
+        assert tpl["compatibility"] == "Requires git, docker, jq"
+
+    def test_license_compatibility_default_empty(self, db):
+        """license and compatibility default to empty string."""
+        db.create_prompt_template(
+            template_id="spec2",
+            name="no-spec-fields",
+            category="general",
+            content="No spec fields.",
+        )
+        tpl = db.get_skill_by_name("no-spec-fields")
+        assert tpl is not None
+        assert tpl["license"] == ""
+        assert tpl["compatibility"] == ""
+
+    def test_update_license_compatibility(self, db):
+        """license and compatibility can be updated."""
+        db.create_prompt_template(
+            template_id="spec3",
+            name="updatable-spec",
+            category="general",
+            content="Test.",
+        )
+        db.update_prompt_template("spec3", license="MIT")
+        db.update_prompt_template("spec3", compatibility="Python 3.11+")
+        tpl = db.get_prompt_template("spec3")
+        assert tpl is not None
+        assert tpl["license"] == "MIT"
+        assert tpl["compatibility"] == "Python 3.11+"
+
 
 # ---------------------------------------------------------------------------
 # 7. Migration behavior tests

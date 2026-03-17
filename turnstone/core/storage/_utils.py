@@ -54,6 +54,8 @@ SKILL_MUTABLE = frozenset(
         "notify_on_complete",
         "enabled",
         "allowed_tools",
+        "license",
+        "compatibility",
         "scan_version",
         "scan_status",
         "scan_report",

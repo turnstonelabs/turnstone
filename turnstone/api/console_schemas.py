@@ -307,6 +307,8 @@ class SkillInfo(BaseModel):
     notify_on_complete: str = "{}"
     enabled: bool = True
     allowed_tools: str = "[]"
+    license: str = ""
+    compatibility: str = ""
     scan_status: str = ""
     scan_report: str = "{}"
     scan_version: str = ""
@@ -337,6 +339,8 @@ class CreateSkillRequest(BaseModel):
     notify_on_complete: str = "{}"
     enabled: bool = True
     allowed_tools: str = "[]"
+    license: str = ""
+    compatibility: str = ""
 
 
 class UpdateSkillRequest(BaseModel):
@@ -360,6 +364,8 @@ class UpdateSkillRequest(BaseModel):
     notify_on_complete: str | None = None
     enabled: bool | None = None
     allowed_tools: str | None = None
+    license: str | None = None
+    compatibility: str | None = None
 
 
 class ListSkillsResponse(BaseModel):

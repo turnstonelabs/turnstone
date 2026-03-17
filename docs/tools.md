@@ -492,7 +492,7 @@ data.get("mergedAt") is not None
 
 ---
 
-### load_skill
+### skill
 
 Discover and activate skills at runtime during a conversation. The model can
 search for available skills and load one by name, replacing the current active
@@ -543,7 +543,7 @@ pre-configure skills at workstream creation.
 | `watch`      | Monitor    | No (create)  | No    | No         | `command`   |
 | `read_resource`| MCP      | No           | Yes   | Yes        | `uri`       |
 | `use_prompt` | MCP        | No           | Yes   | Yes        | `name`      |
-| `load_skill` | Skills     | No (load)    | No    | No         | `name`      |
+| `skill`      | Skills     | No (load)    | No    | No         | `name`      |
 | `tool_search`| Search     | Yes          | No    | No         | `query`     |
 
 ---

@@ -579,6 +579,8 @@ class StorageBackend(Protocol):
         notify_on_complete: str = "{}",
         enabled: bool = True,
         allowed_tools: str = "[]",
+        skill_license: str = "",
+        compatibility: str = "",
     ) -> None:
         """Create a prompt template (skill)."""
         ...

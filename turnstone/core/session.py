@@ -39,6 +39,7 @@ from turnstone.core.memory import (
     get_skill_by_name,
     get_workstream_display_name,
     list_default_skills,
+    list_skills_by_activation,
     list_structured_memories,
     list_workstreams_with_history,
     load_messages,
@@ -856,6 +857,29 @@ class ChatSession:
                     )
                 lines.append("</skill-resources>")
                 dev_parts.append("\n".join(lines))
+        # Skill catalog: disclose search-activated skills so the model
+        # knows they exist (Agent Skills standard progressive disclosure).
+        try:
+            search_skills = [
+                s for s in list_skills_by_activation("search") if s.get("enabled", True)
+            ]
+        except Exception:
+            search_skills = []
+        if search_skills:
+            catalog_lines = ["<available-skills>"]
+            for sk in search_skills[:30]:
+                sk_name = _html_escape(sk.get("name", ""))
+                sk_desc = _html_escape(sk.get("description", "")[:200])
+                catalog_lines.append(
+                    f"  <skill><name>{sk_name}</name><description>{sk_desc}</description></skill>"
+                )
+            catalog_lines.append("</available-skills>")
+            catalog_lines.append(
+                "Additional skills are available. When a task matches a skill "
+                "description, ask the user to activate it with `/skill <name>`, "
+                "or use `/skill search <query>` to find relevant skills."
+            )
+            dev_parts.append("\n".join(catalog_lines))
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
@@ -1936,7 +1960,7 @@ class ChatSession:
                 it["func_args"] = {"url": it.get("url", ""), "question": it.get("question", "")}
             elif name == "web_search":
                 it["func_args"] = {"query": it.get("query", ""), "topic": it.get("topic", "")}
-            elif name == "load_skill":
+            elif name == "skill":
                 it["func_args"] = {"action": it.get("action", ""), "name": it.get("name", "")}
             elif name == "watch":
                 it["func_args"] = {
@@ -2203,7 +2227,7 @@ class ChatSession:
             "watch": self._prepare_watch,
             "read_resource": self._prepare_read_resource,
             "use_prompt": self._prepare_use_prompt,
-            "load_skill": self._prepare_load_skill,
+            "skill": self._prepare_skill,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -3027,10 +3051,10 @@ class ChatSession:
             "limit": max(1, min(limit, 50)),
         }
 
-    # -- load_skill prepare/execute --------------------------------------------
+    # -- skill prepare/execute -------------------------------------------------
 
-    def _prepare_load_skill(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a load_skill action (load or search)."""
+    def _prepare_skill(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a skill action (load or search)."""
         action = (args.get("action") or "").strip().lower()
 
         if action == "load":
@@ -3038,20 +3062,20 @@ class ChatSession:
             if not name:
                 return {
                     "call_id": call_id,
-                    "func_name": "load_skill",
-                    "header": "\u2717 load_skill: name is required",
+                    "func_name": "skill",
+                    "header": "\u2717 skill: name is required",
                     "preview": "",
                     "needs_approval": False,
                     "error": "Error: 'name' is required for load action",
                 }
             return {
                 "call_id": call_id,
-                "func_name": "load_skill",
-                "header": f"\u2699 load_skill: {name}",
+                "func_name": "skill",
+                "header": f"\u2699 skill: {name}",
                 "preview": "",
                 "needs_approval": True,
-                "approval_label": f"load_skill__{name}",
-                "execute": self._exec_load_skill,
+                "approval_label": f"skill__{name}",
+                "execute": self._exec_skill,
                 "action": "load",
                 "name": name,
             }
@@ -3060,26 +3084,26 @@ class ChatSession:
             query = (args.get("query") or "").strip()
             return {
                 "call_id": call_id,
-                "func_name": "load_skill",
+                "func_name": "skill",
                 "header": f"\u2699 skill search{': ' + query[:80] if query else ''}",
                 "preview": "",
                 "needs_approval": False,
-                "execute": self._exec_load_skill,
+                "execute": self._exec_skill,
                 "action": "search",
                 "query": query,
             }
 
         return {
             "call_id": call_id,
-            "func_name": "load_skill",
-            "header": "\u2717 load_skill: invalid action",
+            "func_name": "skill",
+            "header": "\u2717 skill: invalid action",
             "preview": "",
             "needs_approval": False,
             "error": f"Error: action must be 'load' or 'search', got '{action}'",
         }
 
-    def _exec_load_skill(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Execute a load_skill action."""
+    def _exec_skill(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Execute a skill action."""
         call_id = item["call_id"]
         action = item["action"]
 
@@ -3088,12 +3112,12 @@ class ChatSession:
             skill_data = get_skill_by_name(name)
             if not skill_data or not skill_data.get("enabled", True):
                 msg = f"Error: skill '{name}' not found"
-                self.ui.on_tool_result(call_id, "load_skill", msg)
+                self.ui.on_tool_result(call_id, "skill", msg)
                 return call_id, msg
 
             if self._skill_name == name:
                 msg = f"Skill '{name}' is already active"
-                self.ui.on_tool_result(call_id, "load_skill", msg)
+                self.ui.on_tool_result(call_id, "skill", msg)
                 return call_id, msg
 
             self.set_skill(name)
@@ -3106,7 +3130,7 @@ class ChatSession:
             if scan:
                 parts.append(f"Security tier: {scan}")
             msg = "\n".join(parts)
-            self.ui.on_tool_result(call_id, "load_skill", msg)
+            self.ui.on_tool_result(call_id, "skill", msg)
             return call_id, msg
 
         # action == "search"
@@ -3116,7 +3140,7 @@ class ChatSession:
 
             rows = get_storage().list_prompt_templates(limit=50)
         except Exception:
-            log.warning("load_skill.search_storage_error", exc_info=True)
+            log.warning("skill.search_storage_error", exc_info=True)
             rows = []
 
         # Filter out disabled skills
@@ -3160,7 +3184,7 @@ class ChatSession:
 
         if not rows:
             msg = "No skills found" + (f" matching '{query}'" if query else "")
-            self.ui.on_tool_result(call_id, "load_skill", msg)
+            self.ui.on_tool_result(call_id, "skill", msg)
             return call_id, msg
 
         lines = [f"Found {len(rows)} skill(s):", ""]
@@ -3182,7 +3206,7 @@ class ChatSession:
             lines.append(line)
 
         msg = "\n".join(lines)
-        self.ui.on_tool_result(call_id, "load_skill", msg)
+        self.ui.on_tool_result(call_id, "skill", msg)
         return call_id, msg
 
     # -- MCP tool prepare/execute ----------------------------------------------

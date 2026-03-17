@@ -33,7 +33,7 @@ package "Core Modules" as core #181825 {
 }
 
 package "Session Runtime" as runtime #181825 {
-  rectangle "load_skill tool\nsession.py" as loadtool
+  rectangle "skill tool\nsession.py" as loadtool
   rectangle "set_skill()\nsession.py" as setskill
   rectangle "_load_skills()\nsession.py" as loadskills
 }
@@ -80,6 +80,7 @@ importui --> install : POST (github source)
 ' Annotations
 note right of parser
   YAML frontmatter -> ParsedSkill
+  allowed-tools (standard) -> allowed_tools (internal)
   Anthropic + Hermes tag formats
   Name validation (lowercase+hyphens)
 end note

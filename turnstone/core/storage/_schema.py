@@ -311,6 +311,8 @@ prompt_templates = sa.Table(
     sa.Column("activation", sa.Text, nullable=False, server_default="named"),
     sa.Column("token_estimate", sa.Integer, nullable=False, server_default="0"),
     sa.Column("allowed_tools", sa.Text, nullable=False, server_default="[]"),  # JSON array
+    sa.Column("license", sa.Text, nullable=False, server_default=""),
+    sa.Column("compatibility", sa.Text, nullable=False, server_default=""),
     sa.Column("scan_status", sa.Text, nullable=False, server_default=""),
     sa.Column("scan_report", sa.Text, nullable=False, server_default="{}"),  # JSON
     sa.Column("installed_at", sa.Text, nullable=False, server_default=""),

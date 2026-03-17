@@ -2286,6 +2286,8 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "notify_on_complete": r.get("notify_on_complete", "{}"),
         "enabled": r.get("enabled", True),
         "allowed_tools": r.get("allowed_tools", "[]"),
+        "license": r.get("license", ""),
+        "compatibility": r.get("compatibility", ""),
         "scan_status": r.get("scan_status", ""),
         "scan_report": r.get("scan_report", "{}"),
         "scan_version": r.get("scan_version", ""),
@@ -2370,6 +2372,8 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     org_id = str(body.get("org_id", "")).strip()[:64]
     author = str(body.get("author", "")).strip()[:256]
     version = str(body.get("version", "1.0.0")).strip()[:64]
+    license_val = str(body.get("license", "")).strip()
+    compatibility = str(body.get("compatibility", "")).strip()[:500]
 
     raw_tags = body.get("tags", [])
     if isinstance(raw_tags, list):
@@ -2418,6 +2422,8 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         tags=tags_str,
         version=version,
         author=author,
+        skill_license=license_val,
+        compatibility=compatibility,
         activation=activation,
         token_estimate=token_estimate,
         **session_fields,
@@ -2497,6 +2503,10 @@ async def admin_update_skill(request: Request) -> JSONResponse:
         updates["author"] = str(body["author"]).strip()[:256]
     if "version" in body:
         updates["version"] = str(body["version"]).strip()[:64]
+    if "license" in body:
+        updates["license"] = str(body["license"]).strip()
+    if "compatibility" in body:
+        updates["compatibility"] = str(body["compatibility"]).strip()[:500]
     if "tags" in body:
         raw_tags = body["tags"]
         if isinstance(raw_tags, list):
@@ -3203,6 +3213,8 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 source_url=pkg_source_url,
                 version=parsed.version,
                 author=parsed.author,
+                skill_license=parsed.license,
+                compatibility=parsed.compatibility,
                 activation="named",
                 token_estimate=token_estimate,
                 allowed_tools=allowed_tools_str,
