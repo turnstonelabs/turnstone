@@ -1367,7 +1367,7 @@
    ========================================================================== */
 #admin-skills .admin-colheaders,
 #admin-skills .admin-row {
-  grid-template-columns: 1.5fr 100px 1fr 140px;
+  grid-template-columns: 100px 1.5fr 100px 120px;
 }
 /* ==========================================================================
    Governance: Audit grid
@@ -1652,7 +1652,7 @@
   #admin-skills .admin-colheaders, #admin-skills .admin-row {
     grid-template-columns: 1fr 100px;
   }
-  .admin-col-tmcat, .admin-col-tmvars { display: none; }
+  .admin-col-tmcat, .admin-col-tmrisk { display: none; }
   #admin-audit .admin-colheaders, #admin-audit .admin-row {
     grid-template-columns: 60px 1fr 100px;
   }

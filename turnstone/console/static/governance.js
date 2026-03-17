@@ -688,13 +688,6 @@ function _renderGovSkills(items) {
   var html = "";
   for (var i = 0; i < items.length; i++) {
     var t = items[i];
-    var vars = "";
-    try {
-      var vlist = JSON.parse(t.variables || "[]");
-      vars = vlist.join(", ");
-    } catch (e) {
-      vars = t.variables;
-    }
     var activationBadge = "";
     var activation = t.activation || "named";
     if (activation === "default") {
@@ -715,7 +708,8 @@ function _renderGovSkills(items) {
         : "";
     var catBadge =
       '<span class="scope-badge">' + escapeHtml(t.category) + "</span>";
-    var scanBadge = "";
+    // Build risk column content with tooltip
+    var riskCell = "";
     if (t.scan_status) {
       var scanClass =
         {
@@ -725,12 +719,45 @@ function _renderGovSkills(items) {
           high: "scope-scan-high",
           critical: "scope-scan-critical",
         }[t.scan_status] || "";
-      scanBadge =
-        ' <span class="scope-badge ' +
+      var scanIcon =
+        {
+          safe: "\u2713 ",
+          low: "",
+          medium: "\u25B2 ",
+          high: "\u25C6 ",
+          critical: "\u26A0 ",
+        }[t.scan_status] || "";
+      var tipParts = [];
+      try {
+        var report = JSON.parse(t.scan_report || "{}");
+        if (report.composite != null) {
+          tipParts.push("Score: " + report.composite.toFixed(2));
+        }
+        var axes = ["content", "supply_chain", "vulnerability", "capability"];
+        for (var ai = 0; ai < axes.length; ai++) {
+          var d = (report.details || {})[axes[ai]] || {};
+          if (d.flags && d.flags.length) {
+            tipParts.push(
+              axes[ai].replace(/_/g, " ") + ": " + d.flags.join(", "),
+            );
+          }
+        }
+      } catch (e) {}
+      var tipText = tipParts.length ? tipParts.join("\n") : t.scan_status;
+      riskCell =
+        '<span class="scope-badge ' +
         scanClass +
-        '">' +
+        '" tabindex="0" role="button" aria-label="Risk: ' +
         escapeHtml(t.scan_status) +
+        (tipParts.length ? ". " + escapeHtml(tipParts.join(". ")) : "") +
+        '" title="' +
+        escapeHtml(tipText) +
+        '">' +
+        escapeHtml(scanIcon + t.scan_status) +
         "</span>";
+    } else {
+      riskCell =
+        '<span class="scope-badge" style="opacity:0.4" title="Not scanned">\u2014</span>';
     }
     var resBadge = "";
     if (t.resource_count > 0) {
@@ -745,13 +772,15 @@ function _renderGovSkills(items) {
     var deleteDisabled = t.readonly ? " disabled" : "";
     html +=
       '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-tmcat">' +
+      catBadge +
+      "</span>" +
       '<span class="admin-col admin-col-tmname">' +
       escapeHtml(t.name) +
       " " +
       activationBadge +
       defBadge +
       originBadge +
-      scanBadge +
       resBadge +
       (t.description
         ? '<br><span class="admin-col-subtitle">' +
@@ -759,12 +788,9 @@ function _renderGovSkills(items) {
           "</span>"
         : "") +
       "</span>" +
-      '<span class="admin-col admin-col-tmcat">' +
-      catBadge +
+      '<span class="admin-col admin-col-tmrisk">' +
+      riskCell +
       "</span>" +
-      '<span class="admin-col admin-col-tmvars"><code>' +
-      escapeHtml(vars || "\u2014") +
-      "</code></span>" +
       '<span class="admin-col admin-col-actions">' +
       '<button class="admin-btn-action" data-edit-tmpl="' +
       escapeHtml(t.template_id) +
