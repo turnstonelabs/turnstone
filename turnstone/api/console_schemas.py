@@ -393,6 +393,7 @@ class SkillResourceInfo(BaseModel):
     resource_id: str
     skill_id: str
     path: str
+    content: str = ""
     content_type: str = "text/plain"
     size: int = 0
     created: str

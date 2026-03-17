@@ -175,10 +175,14 @@ class TestSkillDiscover:
             instance = mock_cls.return_value
             instance.search = AsyncMock(return_value=[])
 
-            resp = client.get("/v1/api/admin/skills/discover")
+            resp = client.get("/v1/api/admin/skills/discover", params={"q": "test"})
 
         assert resp.status_code == 200
         assert resp.json()["skills"] == []
+
+    def test_search_empty_query_rejected(self, client: TestClient) -> None:
+        resp = client.get("/v1/api/admin/skills/discover")
+        assert resp.status_code == 400
 
     def test_search_permission_denied(self, client_no_perm: TestClient) -> None:
         resp = client_no_perm.get("/v1/api/admin/skills/discover")
@@ -345,10 +349,17 @@ class TestSkillInstall:
         assert resp.status_code == 409
 
     def test_install_not_found(self, client: TestClient) -> None:
-        with patch(
-            "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
-        ) as mock_fetch:
+        with (
+            patch(
+                "turnstone.core.skill_sources.fetch_skill_from_github", new_callable=AsyncMock
+            ) as mock_fetch,
+            patch(
+                "turnstone.core.skill_sources.fetch_skills_from_github_repo",
+                new_callable=AsyncMock,
+            ) as mock_batch,
+        ):
             mock_fetch.side_effect = SkillNotFoundError("SKILL.md not found")
+            mock_batch.side_effect = SkillNotFoundError("No SKILL.md files found")
 
             resp = client.post(
                 "/v1/api/admin/skills/install",

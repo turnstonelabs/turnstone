@@ -966,7 +966,10 @@ function submitCreateTemplate() {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(res),
             },
-          );
+          ).then(function (r) {
+            if (!r.ok) throw new Error("Upload failed for " + res.path);
+            return r.json();
+          });
         });
         Promise.all(promises)
           .then(function () {
@@ -1232,7 +1235,7 @@ function _loadSkillResources(skillId, readonly) {
                   "/v1/api/admin/skills/" +
                     skillId +
                     "/resources/" +
-                    encodeURIComponent(path),
+                    path.split("/").map(encodeURIComponent).join("/"),
                   { method: "DELETE" },
                 )
                   .then(function (r) {
@@ -2291,12 +2294,29 @@ function submitGitHubImport() {
     })
     .then(function (data) {
       hideGitHubImportModal();
-      var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
-      showToast("Skill installed: " + (data.name || "") + tierMsg);
-      // Refresh if we're on discover view
-      if (_skillCurrentView === "discover") {
-        searchSkillDiscover();
+      if (data.installed) {
+        // Batch response from multi-skill repo
+        var count = data.installed.length;
+        var skipCount = (data.skipped || []).length;
+        var msg;
+        if (count === 0 && skipCount) {
+          msg =
+            "All " +
+            skipCount +
+            " skill" +
+            (skipCount !== 1 ? "s" : "") +
+            " already installed";
+        } else {
+          msg = count + " skill" + (count !== 1 ? "s" : "") + " installed";
+          if (skipCount) msg += " (" + skipCount + " already installed)";
+        }
+        showToast(msg);
+      } else {
+        // Single skill response (backward compat)
+        var tierMsg = data.scan_status ? " [" + data.scan_status + "]" : "";
+        showToast("Skill installed: " + (data.name || "") + tierMsg);
       }
+      loadGovSkills();
     })
     .catch(function (e) {
       errEl.textContent = e.message;

@@ -136,6 +136,52 @@ def _parse_github_url(url: str) -> tuple[str, str, str, str]:
     )
 
 
+def _find_resource_files(
+    tree_items: list[dict[str, Any]], skill_md_dir: str
+) -> list[dict[str, str]]:
+    """Filter tree items to resource files relative to a SKILL.md directory."""
+    resource_files: list[dict[str, str]] = []
+    for item in tree_items:
+        if item.get("type") != "blob":
+            continue
+        item_path: str = item.get("path", "")
+        rel_path = item_path
+        if skill_md_dir:
+            if not item_path.startswith(f"{skill_md_dir}/"):
+                continue
+            rel_path = item_path[len(skill_md_dir) + 1 :]
+        elif "/" in item_path:
+            continue  # root-level SKILL.md: only root-level resources
+        first_seg = rel_path.split("/")[0] if "/" in rel_path else ""
+        if first_seg not in _RESOURCE_DIRS:
+            continue
+        ext = os.path.splitext(rel_path)[1].lower()
+        if ext not in _TEXT_EXTENSIONS:
+            continue
+        size = item.get("size", 0)
+        if size > _MAX_RESOURCE_SIZE:
+            continue
+        resource_files.append({"path": rel_path, "full_path": item_path})
+    return resource_files[:_MAX_RESOURCE_FILES]
+
+
+async def _fetch_resource_contents(
+    client: httpx.AsyncClient,
+    raw_base: str,
+    resource_files: list[dict[str, str]],
+) -> dict[str, str]:
+    """Fetch content for a list of resource files."""
+    resources: dict[str, str] = {}
+    for rf in resource_files:
+        try:
+            resp = await client.get(f"{raw_base}/{rf['full_path']}")
+            if resp.status_code == 200:
+                resources[rf["path"]] = resp.text
+        except httpx.HTTPError:
+            continue
+    return resources
+
+
 async def fetch_skill_from_github(url: str) -> SkillPackage:
     """Fetch a SKILL.md and bundled resources from a GitHub repository.
 
@@ -226,40 +272,16 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
             )
             if tree_resp.status_code == 200 and len(tree_resp.content) < 2 * 1024 * 1024:
                 tree_data = tree_resp.json()
-                resource_files: list[dict[str, Any]] = []
-                for item in tree_data.get("tree", []):
-                    if item.get("type") != "blob":
-                        continue
-                    item_path: str = item.get("path", "")
-                    # Filter to resource dirs relative to SKILL.md location
-                    rel_path = item_path
-                    if skill_md_dir:
-                        if not item_path.startswith(f"{skill_md_dir}/"):
-                            continue
-                        rel_path = item_path[len(skill_md_dir) + 1 :]
-                    # Check if it's in a resource directory
-                    first_seg = rel_path.split("/")[0] if "/" in rel_path else ""
-                    if first_seg not in _RESOURCE_DIRS:
-                        continue
-                    # Filter to text-safe extensions only
-                    ext = os.path.splitext(rel_path)[1].lower()
-                    if ext not in _TEXT_EXTENSIONS:
-                        continue
-                    size = item.get("size", 0)
-                    if size > _MAX_RESOURCE_SIZE:
-                        continue
-                    resource_files.append({"path": rel_path, "full_path": item_path})
-
-                # Fetch up to MAX files
-                for rf in resource_files[:_MAX_RESOURCE_FILES]:
-                    try:
-                        content_resp = await client.get(f"{raw_base}/{rf['full_path']}")
-                        if content_resp.status_code == 200:
-                            resources[rf["path"]] = content_resp.text
-                    except httpx.HTTPError:
-                        continue
+                rf = _find_resource_files(tree_data.get("tree", []), skill_md_dir)
+                resources = await _fetch_resource_contents(client, raw_base, rf)
         except httpx.HTTPError:
             logger.debug("Failed to fetch resource tree for %s/%s", owner, repo)
+
+    # Build a per-skill source URL pointing to the specific subdirectory
+    if skill_md_dir:
+        specific_url = f"https://github.com/{owner}/{repo}/tree/{resolved_branch}/{skill_md_dir}"
+    else:
+        specific_url = url
 
     listing = SkillListing(
         id=f"{owner}/{repo}/{parsed.name}",
@@ -267,8 +289,117 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
         description=parsed.description,
         author=parsed.author,
         source="github",
-        source_url=url,
+        source_url=specific_url,
         tags=parsed.tags,
     )
 
     return SkillPackage(listing=listing, parsed=parsed, resources=resources)
+
+
+_MAX_SKILLS_PER_REPO = 50
+
+
+async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
+    """Scan a GitHub repo for all SKILL.md files and return each as a package.
+
+    Used when a repo-level URL has no root SKILL.md (monorepo pattern).
+    """
+    owner, repo, branch, url_path = _parse_github_url(url)
+    if not owner:
+        raise SkillSourceError(f"Could not parse GitHub URL: {url}")
+    url_path = url_path.rstrip("/")
+
+    headers: dict[str, str] = {"Accept": "application/vnd.github.v3+json"}
+    token = os.environ.get("TURNSTONE_GITHUB_TOKEN", "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    branch_explicit = bool(_GITHUB_URL_RE.match(url) and _GITHUB_URL_RE.match(url).group("branch"))  # type: ignore[union-attr]
+    branches_to_try = [branch] if branch_explicit else ["main", "master"]
+
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
+        # Find the tree with all SKILL.md files
+        tree_data: dict[str, Any] = {}
+        resolved_branch = branch
+        for try_branch in branches_to_try:
+            try:
+                resp = await client.get(
+                    f"{api_base}/git/trees/{try_branch}",
+                    params={"recursive": "1"},
+                )
+                if resp.status_code == 200 and len(resp.content) < 2 * 1024 * 1024:
+                    tree_data = resp.json()
+                    resolved_branch = try_branch
+                    break
+            except httpx.HTTPError:
+                continue
+
+        if not tree_data:
+            raise SkillSourceError(f"Could not fetch repo tree for {owner}/{repo}")
+
+        # Find all SKILL.md files in the tree (filtered to URL path if provided)
+        skill_md_paths: list[str] = []
+        tree_items = tree_data.get("tree", [])
+        for item in tree_items:
+            if item.get("type") != "blob":
+                continue
+            p: str = item.get("path", "")
+            if not (p.endswith("/SKILL.md") or p == "SKILL.md"):
+                continue
+            if url_path and not p.startswith(f"{url_path}/") and p != url_path:
+                continue
+            skill_md_paths.append(p)
+
+        if not skill_md_paths:
+            raise SkillNotFoundError(f"No SKILL.md files found in {owner}/{repo}")
+
+        # Cap to prevent abuse
+        skill_md_paths = skill_md_paths[:_MAX_SKILLS_PER_REPO]
+
+        raw_base = f"https://raw.githubusercontent.com/{owner}/{repo}/{resolved_branch}"
+
+        packages: list[SkillPackage] = []
+        for skill_md_path in skill_md_paths:
+            # Determine directory containing this SKILL.md
+            parts = skill_md_path.rsplit("/", 1)
+            skill_md_dir = parts[0] if len(parts) > 1 else ""
+
+            # Fetch SKILL.md content
+            try:
+                resp = await client.get(f"{raw_base}/{skill_md_path}")
+                if resp.status_code != 200:
+                    continue
+                content = resp.text[:_MAX_SKILL_MD_SIZE]
+            except httpx.HTTPError:
+                continue
+
+            # Parse — skip if invalid
+            try:
+                parsed = parse_skill_md(content)
+            except ValueError:
+                logger.debug("Skipping invalid SKILL.md at %s", skill_md_path)
+                continue
+
+            # Collect resources for this skill
+            rf = _find_resource_files(tree_items, skill_md_dir)
+            resources = await _fetch_resource_contents(client, raw_base, rf)
+
+            specific_url = (
+                f"https://github.com/{owner}/{repo}/tree/{resolved_branch}/{skill_md_dir}"
+                if skill_md_dir
+                else url
+            )
+            listing = SkillListing(
+                id=f"{owner}/{repo}/{parsed.name}",
+                name=parsed.name,
+                description=parsed.description,
+                author=parsed.author,
+                source="github",
+                source_url=specific_url,
+                tags=parsed.tags,
+            )
+            packages.append(SkillPackage(listing=listing, parsed=parsed, resources=resources))
+
+    return packages

@@ -475,9 +475,12 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     async def delete_skill_resource(self, skill_id: str, path: str) -> StatusResponse:
         """Delete a skill resource by path."""
+        from urllib.parse import quote
+
+        encoded = quote(path, safe="/")
         return await self._request(
             "DELETE",
-            f"/v1/api/admin/skills/{skill_id}/resources/{path}",
+            f"/v1/api/admin/skills/{skill_id}/resources/{encoded}",
             response_model=StatusResponse,
         )
 

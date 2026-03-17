@@ -247,6 +247,7 @@ export interface SkillResourceInfo {
   resource_id: string;
   skill_id: string;
   path: string;
+  content?: string;
   content_type: string;
   size: number;
   created: string;

@@ -316,7 +316,7 @@ export class TurnstoneConsole extends BaseClient {
   async deleteSkillResource(skillId: string, path: string): Promise<void> {
     await this.request(
       "DELETE",
-      `/v1/api/admin/skills/${skillId}/resources/${encodeURIComponent(path)}`,
+      `/v1/api/admin/skills/${skillId}/resources/${path.split("/").map(encodeURIComponent).join("/")}`,
     );
   }
 

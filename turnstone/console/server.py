@@ -2333,8 +2333,8 @@ async def admin_get_skill(request: Request) -> JSONResponse:
     skill = storage.get_prompt_template(skill_id)
     if skill is None:
         return JSONResponse({"error": "Skill not found"}, status_code=404)
-    rc = len(storage.list_skill_resources(skill_id))
-    return JSONResponse(_skill_to_response(skill, resource_count=rc))
+    rc_map = storage.count_skill_resources_bulk([skill_id])
+    return JSONResponse(_skill_to_response(skill, resource_count=rc_map.get(skill_id, 0)))
 
 
 async def admin_create_skill(request: Request) -> JSONResponse:
@@ -2942,7 +2942,7 @@ async def admin_create_skill_resource(request: Request) -> JSONResponse:
     path = posixpath.normpath(path)
     if ".." in path.split("/") or "\x00" in path:
         return JSONResponse({"error": "Invalid path"}, status_code=400)
-    if not any(path.startswith(d.rstrip("/")) for d in _ALLOWED_RESOURCE_DIRS):
+    if not any(path.startswith(d) for d in _ALLOWED_RESOURCE_DIRS):
         return JSONResponse(
             {"error": "path must start with scripts/, references/, or assets/"},
             status_code=400,
@@ -3116,6 +3116,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         SkillSourceError,
         SkillsShClient,
         fetch_skill_from_github,
+        fetch_skills_from_github_repo,
     )
     from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
 
@@ -3143,12 +3144,16 @@ async def admin_skill_install(request: Request) -> JSONResponse:
             discovery_url = _get_discovery_url(request)
             client = SkillsShClient(base_url=discovery_url)
             github_url = await client.resolve_github_url(skill_id_param)
-            package = await fetch_skill_from_github(github_url)
+            packages = [await fetch_skill_from_github(github_url)]
         else:
             url = str(body.get("url", "")).strip()
             if not url:
                 return JSONResponse({"error": "url is required"}, status_code=400)
-            package = await fetch_skill_from_github(url)
+            try:
+                packages = [await fetch_skill_from_github(url)]
+            except SkillNotFoundError:
+                # No root SKILL.md — try scanning for a multi-skill repo
+                packages = await fetch_skills_from_github_repo(url)
     except SkillNotFoundError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     except SkillSourceError as exc:
@@ -3156,75 +3161,95 @@ async def admin_skill_install(request: Request) -> JSONResponse:
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    # Check for duplicate by source_url
-    source_url = package.listing.source_url
-    if source_url:
-        existing = storage.get_skill_by_source_url(source_url)
-        if existing:
-            return JSONResponse(
-                {"error": f"Skill from '{source_url}' is already installed"},
-                status_code=409,
-            )
-
-    # Check for duplicate by name
-    if storage.get_prompt_template_by_name(package.parsed.name):
-        return JSONResponse(
-            {"error": f"Skill name '{package.parsed.name}' already exists"},
-            status_code=409,
-        )
-
     import json as _json
 
     audit_uid, ip = _audit_context(request)
-    skill_id = uuid.uuid4().hex
-    parsed = package.parsed
-    tags_str = _json.dumps(parsed.tags)
-    allowed_tools_str = _json.dumps(parsed.allowed_tools)
-    content = parsed.content[:32768]
-    token_estimate = len(content) // 4 if content else 0
+    installed: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
 
-    storage.create_prompt_template(
-        template_id=skill_id,
-        name=parsed.name,
-        category="general",
-        content=content,
-        variables="[]",
-        is_default=False,
-        org_id="",
-        created_by=audit_uid,
-        origin="source",
-        readonly=True,
-        description=parsed.description,
-        tags=tags_str,
-        source_url=source_url,
-        version=parsed.version,
-        author=parsed.author,
-        activation="named",
-        token_estimate=token_estimate,
-        allowed_tools=allowed_tools_str,
-    )
+    for package in packages:
+        pkg_source_url = package.listing.source_url
 
-    # Store bundled resources
-    for path, content in package.resources.items():
-        storage.create_skill_resource(
-            resource_id=uuid.uuid4().hex,
-            skill_id=skill_id,
-            path=path,
+        # Check for duplicate by source_url
+        if pkg_source_url and storage.get_skill_by_source_url(pkg_source_url):
+            skipped.append({"name": package.parsed.name, "reason": "already installed"})
+            continue
+
+        # Check for duplicate by name
+        if storage.get_prompt_template_by_name(package.parsed.name):
+            skipped.append({"name": package.parsed.name, "reason": "name exists"})
+            continue
+
+        skill_id = uuid.uuid4().hex
+        parsed = package.parsed
+        tags_str = _json.dumps(parsed.tags)
+        allowed_tools_str = _json.dumps(parsed.allowed_tools)
+        content = parsed.content[:32768]
+        token_estimate = len(content) // 4 if content else 0
+
+        storage.create_prompt_template(
+            template_id=skill_id,
+            name=parsed.name,
+            category="general",
             content=content,
+            variables="[]",
+            is_default=False,
+            org_id="",
+            created_by=audit_uid,
+            origin="source",
+            readonly=True,
+            description=parsed.description,
+            tags=tags_str,
+            source_url=pkg_source_url,
+            version=parsed.version,
+            author=parsed.author,
+            activation="named",
+            token_estimate=token_estimate,
+            allowed_tools=allowed_tools_str,
         )
 
-    record_audit(
-        storage,
-        audit_uid,
-        "skill.install",
-        "skill",
-        skill_id,
-        {"name": parsed.name, "source": source, "source_url": source_url},
-        ip,
-    )
+        # Store bundled resources
+        for res_path, res_content in package.resources.items():
+            storage.create_skill_resource(
+                resource_id=uuid.uuid4().hex,
+                skill_id=skill_id,
+                path=res_path,
+                content=res_content,
+            )
 
-    skill = storage.get_prompt_template(skill_id)
-    return JSONResponse(_skill_to_response(skill))
+        record_audit(
+            storage,
+            audit_uid,
+            "skill.install",
+            "skill",
+            skill_id,
+            {"name": parsed.name, "source": source, "source_url": pkg_source_url},
+            ip,
+        )
+
+        skill = storage.get_prompt_template(skill_id)
+        if skill:
+            installed.append(_skill_to_response(skill))
+
+    if len(packages) == 1 and not installed:
+        reason = skipped[0]["reason"] if skipped else "unknown"
+        return JSONResponse(
+            {"error": f"Skill '{packages[0].parsed.name}' not installed: {reason}"},
+            status_code=409,
+        )
+
+    # Single-skill install: return the skill object directly (backward compat)
+    if len(packages) == 1 and installed:
+        return JSONResponse(installed[0])
+
+    # Multi-skill batch: return summary
+    return JSONResponse(
+        {
+            "installed": installed,
+            "skipped": skipped,
+            "total": len(packages),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------

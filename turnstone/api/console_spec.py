@@ -660,7 +660,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Admin"],
     ),
     EndpointSpec(
-        "/v1/api/admin/skills/{skill_id}/resources/{path:path}",
+        "/v1/api/admin/skills/{skill_id}/resources/{path}",
         "GET",
         "Get a single skill resource by path",
         response_model=SkillResourceInfo,
@@ -668,7 +668,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Admin"],
     ),
     EndpointSpec(
-        "/v1/api/admin/skills/{skill_id}/resources/{path:path}",
+        "/v1/api/admin/skills/{skill_id}/resources/{path}",
         "DELETE",
         "Delete a skill resource by path",
         error_codes=[404],
