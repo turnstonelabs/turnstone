@@ -433,7 +433,44 @@ function _submitSetup() {
     .then(function (data) {
       _setBusy(false);
       _storePermissions(data);
-      _onSuccess();
+      if (typeof playBootSequence === "function") {
+        hideLogin();
+        fetch("/health")
+          .then(function (r) {
+            return r.json();
+          })
+          .then(function (h) {
+            var v = (h.versions && h.versions[0]) || "";
+            playBootSequence(
+              {
+                version: v,
+                username: username,
+                displayName: displayName || username,
+                permissions:
+                  typeof data.permissions === "string"
+                    ? data.permissions
+                    : (data.permissions || []).join(", "),
+              },
+              _onSuccess,
+            );
+          })
+          .catch(function () {
+            playBootSequence(
+              {
+                version: "",
+                username: username,
+                displayName: displayName || username,
+                permissions:
+                  typeof data.permissions === "string"
+                    ? data.permissions
+                    : (data.permissions || []).join(", "),
+              },
+              _onSuccess,
+            );
+          });
+      } else {
+        _onSuccess();
+      }
     })
     .catch(function (err) {
       _setBusy(false);
