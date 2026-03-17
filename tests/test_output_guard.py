@@ -184,6 +184,17 @@ class TestEnvSecretFalsePositives:
         r = evaluate_output("APP_NAME=myapp\nSECRET_KEY=abc123\nAPI_TOKEN=xyz789\nDEBUG=true")
         assert "env_file_leak" in r.flags
 
+    def test_single_secret_env_line(self) -> None:
+        """A single AWS_SECRET_ACCESS_KEY=... line should trigger."""
+        r = evaluate_output("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+        assert "env_file_leak" in r.flags
+        assert r.risk_level == "high"
+
+    def test_substring_key_no_false_positive(self) -> None:
+        """MONKEY=banana should not trigger (KEY is a substring, not a segment)."""
+        r = evaluate_output("MONKEY=banana\nTURKEY=gobble\nDONKEY=hee-haw")
+        assert "env_file_leak" not in r.flags
+
 
 class TestOutputAssessment:
     """Verify OutputAssessment structure."""
