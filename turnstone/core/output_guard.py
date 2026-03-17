@@ -218,9 +218,8 @@ def _check_credentials(
         risk = "high"
 
     env_lines = _RE_ENV_SECRET_LINE.findall(text)
-    if len(env_lines) >= 3 and any(
-        _RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines
-    ):
+    secret_env_lines = [ln for ln in env_lines if _RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0])]
+    if secret_env_lines:
         _add_flag(flags, "credential_leak")
         flags.append("env_file_leak")
         ann.append("Output contains .env-style assignments with secret-bearing keys.")
