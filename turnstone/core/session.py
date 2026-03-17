@@ -1123,22 +1123,17 @@ class ChatSession:
                         if isinstance(output, str):
                             output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
                         elif isinstance(output, list):
-                            # Image/structured output — evaluate text parts only.
-                            # If redaction occurs, replace text parts in-place.
-                            _text = " ".join(
-                                p.get("text", "")
-                                for p in output
-                                if isinstance(p, dict) and p.get("type") == "text"
-                            )
-                            if _text:
-                                _sanitized = self._evaluate_output(
-                                    tc_id, _text, _tc_names.get(tc_id, "")
-                                )
-                                if _sanitized != _text:
-                                    for p in output:
-                                        if isinstance(p, dict) and p.get("type") == "text":
-                                            p["text"] = _sanitized
-                                            break
+                            # Image/structured output — evaluate each text part
+                            # independently so credentials in any part get redacted.
+                            for p in output:
+                                if (
+                                    isinstance(p, dict)
+                                    and p.get("type") == "text"
+                                    and p.get("text")
+                                ):
+                                    p["text"] = self._evaluate_output(
+                                        tc_id, p["text"], _tc_names.get(tc_id, "")
+                                    )
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",

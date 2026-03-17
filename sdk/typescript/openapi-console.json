@@ -2240,6 +2240,114 @@
         }
       }
     },
+    "/v1/api/admin/output-assessments": {
+      "get": {
+        "summary": "Paginated output guard assessments",
+        "operationId": "v1_api_admin_output-assessments_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Filter by workstream"
+          },
+          {
+            "name": "risk_level",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            },
+            "description": "Filter by risk level"
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Start timestamp (ISO8601)"
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "End timestamp (ISO8601)"
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100
+            },
+            "description": "Page size (max 500)"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            },
+            "description": "Pagination offset"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListOutputAssessmentsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/skills/{skill_id}/rescan": {
+      "post": {
+        "summary": "Re-scan a skill for security signals",
+        "operationId": "v1_api_admin_skills_{skill_id}_rescan_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "skill_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
     "/v1/api/admin/memories": {
       "get": {
         "summary": "List structured memories",
@@ -5165,6 +5273,87 @@
         "title": "ListVerdictsResponse",
         "type": "object"
       },
+      "OutputAssessmentInfo": {
+        "description": "Output guard assessment.",
+        "properties": {
+          "assessment_id": {
+            "title": "Assessment Id",
+            "type": "string"
+          },
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "func_name": {
+            "title": "Func Name",
+            "type": "string"
+          },
+          "flags": {
+            "default": "[]",
+            "title": "Flags",
+            "type": "string"
+          },
+          "risk_level": {
+            "default": "none",
+            "title": "Risk Level",
+            "type": "string"
+          },
+          "annotations": {
+            "default": "[]",
+            "title": "Annotations",
+            "type": "string"
+          },
+          "output_length": {
+            "default": 0,
+            "title": "Output Length",
+            "type": "integer"
+          },
+          "redacted": {
+            "default": 0,
+            "title": "Redacted",
+            "type": "integer"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          }
+        },
+        "required": [
+          "assessment_id",
+          "ws_id",
+          "call_id",
+          "func_name",
+          "created"
+        ],
+        "title": "OutputAssessmentInfo",
+        "type": "object"
+      },
+      "ListOutputAssessmentsResponse": {
+        "description": "Response for output assessment listing.",
+        "properties": {
+          "assessments": {
+            "items": {
+              "$ref": "#/components/schemas/OutputAssessmentInfo"
+            },
+            "title": "Assessments",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "assessments",
+          "total"
+        ],
+        "title": "ListOutputAssessmentsResponse",
+        "type": "object"
+      },
       "AdminMemoryInfo": {
         "properties": {
           "memory_id": {
@@ -6116,9 +6305,11 @@
             "type": "string"
           },
           "tags": {
-            "default": "[]",
+            "items": {
+              "type": "string"
+            },
             "title": "Tags",
-            "type": "string"
+            "type": "array"
           },
           "variables": {
             "default": "[]",

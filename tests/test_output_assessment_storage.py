@@ -24,7 +24,7 @@ def _make_assessment_kwargs(**overrides):
         "func_name": "bash",
         "flags": '["credential_leak"]',
         "risk_level": "high",
-        "annotations": "{}",
+        "annotations": "[]",
         "output_length": 256,
         "redacted": False,
     }
