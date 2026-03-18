@@ -628,10 +628,14 @@ class ChatSession:
             user_msg = ""
             asst_msg = ""
             for m in self.messages:
+                content = m.get("content") or ""
+                # Handle multi-part content (vision messages)
+                if isinstance(content, list):
+                    content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
                 if m["role"] == "user" and not user_msg:
-                    user_msg = (m.get("content") or "")[:300]
+                    user_msg = content[:300]
                 elif m["role"] == "assistant" and not asst_msg:
-                    asst_msg = (m.get("content") or "")[:200]
+                    asst_msg = content[:200]
                 if user_msg and asst_msg:
                     break
             if not user_msg:
@@ -667,8 +671,9 @@ class ChatSession:
             title = raw.split("\n")[0].strip().strip('"').strip("'")
             if title:
                 update_workstream_title(self._ws_id, title[:80])
+                self.ui.on_rename(title[:80])
         except Exception:
-            pass  # Title generation is non-critical
+            log.debug("Title generation failed for ws=%s", self._ws_id, exc_info=True)
 
     def resume(self, ws_id: str) -> bool:
         """Load messages from a previous workstream and resume it.
