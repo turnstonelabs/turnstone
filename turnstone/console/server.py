@@ -679,17 +679,13 @@ async def _proxy_sse(
 
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
-    # Create async HTTP client for proxy routes
-    headers: dict[str, str] = {}
-    token = app.state.proxy_auth_token
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    app.state.proxy_client = httpx.AsyncClient(timeout=30, headers=headers)
-    # Separate client for SSE streams — longer read timeout, shared connection pool
+    # Create async HTTP clients for proxy routes.  Auth headers are NOT baked
+    # in — _proxy_auth_headers() injects a fresh token per-request so JWTs
+    # auto-rotate via ServiceTokenManager instead of expiring after 1 hour.
+    app.state.proxy_client = httpx.AsyncClient(timeout=30)
     app.state.proxy_sse_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
         limits=httpx.Limits(keepalive_expiry=30),
-        headers=headers,
     )
     # Start scheduler if configured
     scheduler = getattr(app.state, "scheduler", None)
@@ -4863,13 +4859,13 @@ def main() -> None:
             audience=JWT_AUD_SERVER,
             expiry_hours=1,
         )
-        collector_token = collector_token_mgr.token
         log.info("console.collector_jwt_minted")
 
     collector = ClusterCollector(
         broker=broker,
         poll_interval=args.poll_interval,
-        auth_token=collector_token,
+        auth_token=collector_token if collector_token_mgr is None else "",
+        token_manager=collector_token_mgr,
     )
     collector.start()
 
@@ -4907,7 +4903,6 @@ def main() -> None:
             audience=JWT_AUD_SERVER,
             expiry_hours=1,
         )
-        proxy_token = proxy_token_mgr.token
         log.info("console.proxy_jwt_minted")
 
     from turnstone.core.web_helpers import parse_cors_origins
@@ -4920,7 +4915,7 @@ def main() -> None:
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
-        proxy_auth_token=proxy_token,
+        proxy_auth_token=proxy_token if proxy_token_mgr is None else "",
         proxy_token_mgr=proxy_token_mgr,
         cors_origins=cors_origins,
     )

@@ -58,6 +58,7 @@ class ClusterCollector:
         max_poll_workers: int = 50,
         http_timeout: float = 5.0,
         auth_token: str = "",
+        token_manager: Any = None,
     ):
         self._broker = broker
         self._prefix = prefix
@@ -65,16 +66,20 @@ class ClusterCollector:
         self._discovery_interval = discovery_interval
         self._max_poll_workers = max_poll_workers
         self._http_timeout = http_timeout
+        self._token_manager = token_manager
+        # Static auth header — only used when no token_manager is present.
+        # When a token_manager exists, auth is injected per-request via
+        # extra_headers in _poll_all_nodes to avoid stale JWT expiry.
+        self._static_auth: dict[str, str] | None = None
+        if auth_token and token_manager is None:
+            self._static_auth = {"Authorization": f"Bearer {auth_token}"}
 
         self._lock = threading.Lock()
         self._nodes: dict[str, NodeSnapshot] = {}
         self._running = False
         self._threads: list[threading.Thread] = []
         self._poll_pool = ThreadPoolExecutor(max_workers=max_poll_workers)
-        headers = {}
-        if auth_token:
-            headers["Authorization"] = f"Bearer {auth_token}"
-        self._http_client = httpx.Client(timeout=http_timeout, headers=headers)
+        self._http_client = httpx.Client(timeout=http_timeout)
 
         # SSE fan-out to browser clients
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
@@ -236,6 +241,14 @@ class ClusterCollector:
 
     def _poll_all_nodes(self) -> None:
         """Fetch dashboard data from all known nodes in parallel."""
+        # Snapshot current auth header for this poll cycle.  Per-request
+        # headers avoid mutating shared client state (thread-safe).
+        if self._token_manager is not None:
+            poll_headers: dict[str, str] | None = {
+                "Authorization": f"Bearer {self._token_manager.token}"
+            }
+        else:
+            poll_headers = self._static_auth
         with self._lock:
             targets = [
                 (n.node_id, n.server_url)
@@ -246,25 +259,44 @@ class ClusterCollector:
         if not targets:
             return
 
-        futures = {self._poll_pool.submit(self._fetch_node, nid, url): nid for nid, url in targets}
+        futures = {
+            self._poll_pool.submit(self._fetch_node, nid, url, poll_headers): nid
+            for nid, url in targets
+        }
         for future in as_completed(futures):
             nid = futures[future]
             try:
                 dashboard, health = future.result()
                 self._apply_poll(nid, dashboard, health)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (401, 403):
+                    log.warning(
+                        "Auth failure polling node %s: HTTP %d", nid, exc.response.status_code
+                    )
+                else:
+                    log.debug("Failed to poll node %s: HTTP %d", nid, exc.response.status_code)
+                with self._lock:
+                    if nid in self._nodes:
+                        self._nodes[nid].reachable = False
             except Exception:
                 log.debug("Failed to poll node %s", nid)
                 with self._lock:
                     if nid in self._nodes:
                         self._nodes[nid].reachable = False
 
-    def _fetch_node(self, node_id: str, server_url: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _fetch_node(
+        self,
+        node_id: str,
+        server_url: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Fetch /v1/api/dashboard and /health from a single node."""
         base = server_url.rstrip("/")
-        dash_resp = self._http_client.get(f"{base}/v1/api/dashboard")
+        dash_resp = self._http_client.get(f"{base}/v1/api/dashboard", headers=extra_headers)
+        dash_resp.raise_for_status()
         dash_data: dict[str, Any] = dash_resp.json()
         try:
-            health_resp = self._http_client.get(f"{base}/health")
+            health_resp = self._http_client.get(f"{base}/health", headers=extra_headers)
             health_data: dict[str, Any] = health_resp.json()
         except Exception:
             health_data = {}
