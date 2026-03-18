@@ -4859,7 +4859,7 @@ def main() -> None:
             audience=JWT_AUD_SERVER,
             expiry_hours=1,
         )
-        log.info("console.collector_jwt_minted")
+        log.info("console.collector_token_manager_created")
 
     collector = ClusterCollector(
         broker=broker,
@@ -4903,7 +4903,7 @@ def main() -> None:
             audience=JWT_AUD_SERVER,
             expiry_hours=1,
         )
-        log.info("console.proxy_jwt_minted")
+        log.info("console.proxy_token_manager_created")
 
     from turnstone.core.web_helpers import parse_cors_origins
 

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
+    from turnstone.core.auth import ServiceTokenManager
     from turnstone.mq.broker import RedisBroker
 
 log = logging.getLogger("turnstone.console.collector")
@@ -58,7 +59,7 @@ class ClusterCollector:
         max_poll_workers: int = 50,
         http_timeout: float = 5.0,
         auth_token: str = "",
-        token_manager: Any = None,
+        token_manager: ServiceTokenManager | None = None,
     ):
         self._broker = broker
         self._prefix = prefix

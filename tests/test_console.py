@@ -3,7 +3,7 @@
 import asyncio
 import json
 import queue
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -263,6 +263,57 @@ class TestCollectorPolling:
 
         assert q.empty()
         assert len(c._nodes["node-a"].workstreams) == 0
+
+    def test_poll_401_preserves_workstreams_and_marks_unreachable(self):
+        """A 401 from the server must NOT wipe workstream data."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            reachable=True,
+            workstreams={"ws1": {"id": "ws1", "name": "existing", "state": "idle"}},
+        )
+
+        # Mock httpx to return 401
+        import httpx as _httpx
+
+        mock_response = _httpx.Response(
+            401,
+            json={"error": "Unauthorized"},
+            request=_httpx.Request("GET", "http://a:8080/v1/api/dashboard"),
+        )
+
+        with patch.object(c._http_client, "get", return_value=mock_response):
+            c._poll_all_nodes()
+
+        # Workstream data must be preserved, node marked unreachable
+        assert c._nodes["node-a"].reachable is False
+        assert "ws1" in c._nodes["node-a"].workstreams
+        assert c._nodes["node-a"].workstreams["ws1"]["name"] == "existing"
+
+    def test_poll_403_preserves_workstreams(self):
+        """A 403 should also preserve state and mark unreachable."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            reachable=True,
+            workstreams={"ws1": {"id": "ws1", "name": "keep-me", "state": "running"}},
+        )
+
+        import httpx as _httpx
+
+        mock_response = _httpx.Response(
+            403,
+            json={"error": "Forbidden"},
+            request=_httpx.Request("GET", "http://a:8080/v1/api/dashboard"),
+        )
+
+        with patch.object(c._http_client, "get", return_value=mock_response):
+            c._poll_all_nodes()
+
+        assert c._nodes["node-a"].reachable is False
+        assert "ws1" in c._nodes["node-a"].workstreams
 
 
 class TestCollectorEvents:
