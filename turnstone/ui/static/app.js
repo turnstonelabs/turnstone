@@ -600,16 +600,17 @@ function connectContentSSE(wsId) {
             workstreams[ws.id] = { name: ws.name, state: ws.state };
             freshIds[ws.id] = true;
           });
+          // Always re-render tabs since workstreams map was replaced
+          renderTabBar();
           // If current ws_id is stale, switch to first available
           if (currentWsId && !freshIds[currentWsId]) {
             var ids = Object.keys(freshIds);
             if (ids.length) {
-              renderTabBar();
               switchTab(ids[0]);
             } else {
               showDashboard();
-              return;
             }
+            return; // switchTab/showDashboard handles SSE connection
           }
           setTimeout(function () {
             connectContentSSE(currentWsId);
