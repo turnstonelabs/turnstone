@@ -141,6 +141,15 @@ class Bridge:
 
     # -- public entry point --------------------------------------------------
 
+    def _fetch_server_metadata(self) -> None:
+        """Fetch max_ws from server /health (best-effort, non-blocking)."""
+        try:
+            resp = self._http.get("/health")
+            if resp.status_code == 200:
+                self._server_max_ws = resp.json().get("max_ws", 10)
+        except Exception:
+            log.debug("Failed to fetch server metadata", exc_info=True)
+
     def _fetch_node_id(self) -> str:
         """Retrieve node_id from server /health with capped exponential backoff.
 
@@ -180,10 +189,18 @@ class Bridge:
         """Block until shutdown (KeyboardInterrupt)."""
         if not self._node_id:
             self._node_id = self._fetch_node_id()
+        else:
+            # node_id was pre-set — still need to fetch max_ws from server
+            self._fetch_server_metadata()
         from turnstone.core.log import ctx_node_id
 
         ctx_node_id.set(self._node_id)
-        log.info("Bridge starting — node=%s server=%s", self._node_id, self._server_url)
+        log.info(
+            "Bridge starting — node=%s server=%s max_ws=%d",
+            self._node_id,
+            self._server_url,
+            self._server_max_ws,
+        )
         self._recover_workstreams()
 
         heartbeat_t = threading.Thread(

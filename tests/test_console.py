@@ -1050,6 +1050,39 @@ class TestConsoleWorkstreamCreation:
         assert resp.status_code == 200
         assert resp.json()["target_node"] == "pool"
 
+    def test_create_with_resume_ws_directed(self, client_and_broker, mock_collector):
+        """resume_ws is forwarded in directed dispatch."""
+        client, broker = client_and_broker
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "node-a", "resume_ws": "old-ws-id-123"},
+        )
+        assert resp.status_code == 200
+        msg = json.loads(broker.push_inbound.call_args[0][0])
+        assert msg["resume_ws"] == "old-ws-id-123"
+
+    def test_create_with_resume_ws_pool(self, client_and_broker, mock_collector):
+        """resume_ws is forwarded in pool dispatch."""
+        client, broker = client_and_broker
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"node_id": "pool", "resume_ws": "old-ws-id-456"},
+        )
+        assert resp.status_code == 200
+        msg = json.loads(broker.push_inbound.call_args[0][0])
+        assert msg["resume_ws"] == "old-ws-id-456"
+
+    def test_create_with_resume_ws_auto(self, client_and_broker, mock_collector):
+        """resume_ws is forwarded in auto-select dispatch."""
+        client, broker = client_and_broker
+        resp = client.post(
+            "/v1/api/cluster/workstreams/new",
+            json={"resume_ws": "old-ws-id-789"},
+        )
+        assert resp.status_code == 200
+        msg = json.loads(broker.push_inbound.call_args[0][0])
+        assert msg["resume_ws"] == "old-ws-id-789"
+
 
 # ---------------------------------------------------------------------------
 # Proxy tests
