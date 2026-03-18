@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.8.2",
+    "version": "0.8.3",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -4377,6 +4377,12 @@
             "default": "",
             "description": "Skill name (replaces default skills)",
             "title": "Skill",
+            "type": "string"
+          },
+          "resume_ws": {
+            "default": "",
+            "description": "Workstream ID to resume (loads previous conversation)",
+            "title": "Resume Ws",
             "type": "string"
           }
         },

@@ -19,6 +19,7 @@ class TestServerVersioning:
 
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = []
+        mock_mgr.max_workstreams = 10
         app = create_app(
             workstreams=mock_mgr,
             global_queue=queue.Queue(),

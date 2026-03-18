@@ -783,6 +783,7 @@ class TestServerAuth:
         mock_ws.session = mock_session
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
+        mock_mgr.max_workstreams = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,
@@ -1001,6 +1002,7 @@ class TestServerLogin:
         mock_ws.session = mock_session
         mock_mgr = MagicMock()
         mock_mgr.list_all.return_value = [mock_ws]
+        mock_mgr.max_workstreams = 10
 
         app = srv_mod.create_app(
             workstreams=mock_mgr,
@@ -1369,8 +1371,11 @@ class TestCorsConfigurable:
 
         import turnstone.server as srv_mod
 
+        mgr = MagicMock()
+        mgr.list_all.return_value = []
+        mgr.max_workstreams = 10
         app = srv_mod.create_app(
-            workstreams=MagicMock(),
+            workstreams=mgr,
             global_queue=queue.Queue(),
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
@@ -1388,8 +1393,11 @@ class TestCorsConfigurable:
 
         import turnstone.server as srv_mod
 
+        mgr = MagicMock()
+        mgr.list_all.return_value = []
+        mgr.max_workstreams = 10
         app = srv_mod.create_app(
-            workstreams=MagicMock(),
+            workstreams=mgr,
             global_queue=queue.Queue(),
             global_listeners=[],
             global_listeners_lock=threading.Lock(),

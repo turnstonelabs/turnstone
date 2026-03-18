@@ -402,6 +402,7 @@ export interface ConsoleCreateWsRequest {
   model?: string;
   initial_message?: string;
   skill?: string;
+  resume_ws?: string;
 }
 
 export interface ConsoleCreateWsResponse {

@@ -157,8 +157,10 @@ class McpStatus(BaseModel):
 class HealthResponse(BaseModel):
     status: str = Field(examples=["ok", "degraded"])
     version: str = ""
+    node_id: str = ""
     uptime_seconds: float = 0.0
     model: str = ""
+    max_ws: int = Field(default=10, description="Maximum concurrent workstreams")
     workstreams: WorkstreamCounts = WorkstreamCounts()
     backend: BackendStatus | None = None
     mcp: McpStatus | None = None

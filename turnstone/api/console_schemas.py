@@ -137,6 +137,9 @@ class ConsoleCreateWsRequest(BaseModel):
         default="", description="Optional first message sent after creation"
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    resume_ws: str = Field(
+        default="", description="Workstream ID to resume (loads previous conversation)"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):

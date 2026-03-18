@@ -371,6 +371,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_model = body.get("model", "")
     raw_initial_message = body.get("initial_message", "")
     raw_skill = body.get("skill", "")
+    raw_resume_ws = body.get("resume_ws", "")
     if not isinstance(raw_node_id, str):
         raw_node_id = "" if raw_node_id is None else None
     if not isinstance(raw_name, str):
@@ -381,15 +382,20 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_initial_message = "" if raw_initial_message is None else None
     if not isinstance(raw_skill, str):
         raw_skill = "" if raw_skill is None else None
+    if not isinstance(raw_resume_ws, str):
+        raw_resume_ws = "" if raw_resume_ws is None else None
     if (
         raw_node_id is None
         or raw_name is None
         or raw_model is None
         or raw_initial_message is None
         or raw_skill is None
+        or raw_resume_ws is None
     ):
         return JSONResponse(
-            {"error": "node_id, name, model, initial_message, and skill must be strings"},
+            {
+                "error": "node_id, name, model, initial_message, skill, and resume_ws must be strings"
+            },
             status_code=400,
         )
     node_id = raw_node_id
@@ -397,6 +403,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     model = raw_model[:128]
     initial_message = raw_initial_message[:4096]
     skill = raw_skill[:256]
+    resume_ws = raw_resume_ws[:64]
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
@@ -407,6 +414,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             model=model,
             initial_message=initial_message,
             skill=skill,
+            resume_ws=resume_ws,
         )
         broker.push_inbound(msg.to_json())
         log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
@@ -435,6 +443,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         target_node=node_id,
         initial_message=initial_message,
         skill=skill,
+        resume_ws=resume_ws,
     )
     broker.push_inbound(msg.to_json(), node_id=node_id)
 

@@ -85,6 +85,7 @@ class Bridge:
         self._approval_timeout = approval_timeout
         self._prefix = prefix
         self._node_id = node_id  # resolved in run() from server /health
+        self._server_max_ws: int = 10  # resolved in _fetch_node_id() from server /health
         self._heartbeat_ttl = heartbeat_ttl
         self._started_at = time.time()
         self._auth_token = auth_token
@@ -161,6 +162,7 @@ class Bridge:
                 data = resp.json()
                 nid = data.get("node_id", "")
                 if nid:
+                    self._server_max_ws = data.get("max_ws", 10)
                     return str(nid)
                 log.warning("Server /health missing node_id (attempt %d)", attempt)
             except SystemExit:
@@ -879,7 +881,11 @@ class Bridge:
         while self._running:
             self._broker.register_node(
                 self._node_id,
-                {"server_url": self._server_url, "started": self._started_at},
+                {
+                    "server_url": self._server_url,
+                    "started": self._started_at,
+                    "max_ws": self._server_max_ws,
+                },
                 ttl=self._heartbeat_ttl,
             )
             time.sleep(self._heartbeat_ttl / 2)

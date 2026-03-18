@@ -212,6 +212,7 @@ class ClusterCollector:
                     self._nodes[nid].server_url = meta.get(
                         "server_url", self._nodes[nid].server_url
                     )
+                    self._nodes[nid].max_ws = meta.get("max_ws", self._nodes[nid].max_ws)
 
             # Remove nodes whose heartbeats expired
             lost = [nid for nid in self._nodes if nid not in active_ids]

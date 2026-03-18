@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.8.2",
+    "version": "0.8.3",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1559,6 +1559,11 @@
             "title": "Version",
             "type": "string"
           },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          },
           "uptime_seconds": {
             "default": 0.0,
             "title": "Uptime Seconds",
@@ -1568,6 +1573,12 @@
             "default": "",
             "title": "Model",
             "type": "string"
+          },
+          "max_ws": {
+            "default": 10,
+            "description": "Maximum concurrent workstreams",
+            "title": "Max Ws",
+            "type": "integer"
           },
           "workstreams": {
             "$ref": "#/components/schemas/WorkstreamCounts",

@@ -108,6 +108,11 @@ class WorkstreamManager:
         self._last_evicted: Workstream | None = None
 
     @property
+    def max_workstreams(self) -> int:
+        """Configured maximum concurrent workstreams."""
+        return self._max_workstreams
+
+    @property
     def eviction_count(self) -> int:
         """Number of workstreams auto-evicted by ``create()``."""
         return self._evictions

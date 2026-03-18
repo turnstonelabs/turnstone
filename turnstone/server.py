@@ -990,6 +990,7 @@ async def health(request: Request) -> JSONResponse:
         "node_id": getattr(request.app.state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
+        "max_ws": mgr.max_workstreams,
         "workstreams": {"total": len(wss), **states},
         "backend": {
             "status": "up" if backend_ok else "down",
