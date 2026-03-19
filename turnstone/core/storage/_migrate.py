@@ -49,17 +49,42 @@ def _run_with_pg_lock(engine: Any, cfg: Any) -> None:
     Advisory lock ID 7_475_283 (arbitrary, derived from 'turnstone').
     ``pg_advisory_lock`` blocks until the lock is available, so
     concurrent containers wait in line rather than racing.
+
+    Retries with jittered backoff if PostgreSQL is temporarily at
+    max_connections (common during large-cluster startup stampedes).
     """
+    import random
+    import time
+
     import sqlalchemy as sa
     from alembic import command
 
-    with engine.connect() as conn:
-        conn.execute(sa.text("SELECT pg_advisory_lock(7475283)"))
+    max_retries = 10
+    for attempt in range(max_retries):
         try:
-            command.upgrade(cfg, "head")
-        finally:
-            conn.execute(sa.text("SELECT pg_advisory_unlock(7475283)"))
-            conn.commit()
+            with engine.connect() as conn:
+                conn.execute(sa.text("SELECT pg_advisory_lock(7475283)"))
+                try:
+                    command.upgrade(cfg, "head")
+                finally:
+                    conn.execute(sa.text("SELECT pg_advisory_unlock(7475283)"))
+                    conn.commit()
+            return
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "too many clients" not in err_str and "connection" not in err_str:
+                raise
+            if attempt == max_retries - 1:
+                raise
+            delay = min(2**attempt + random.uniform(0, 1), 30)  # noqa: S311
+            log.warning(
+                "PG connection failed (attempt %d/%d), retrying in %.1fs: %s",
+                attempt + 1,
+                max_retries,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
 
 
 def _bootstrap_existing_sqlite(engine: Any, cfg: Any) -> None:

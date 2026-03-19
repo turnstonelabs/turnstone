@@ -278,7 +278,9 @@ def detect_model(
     client: Any,
     log_fn: Any = print,
     provider: str = "openai",
-) -> tuple[str, int | None]:
+    *,
+    fatal: bool = True,
+) -> tuple[str | None, int | None]:
     """Auto-detect the model and context window from the API's models endpoint.
 
     Returns ``(model_id, context_window)`` where *context_window* is
@@ -289,13 +291,20 @@ def detect_model(
     For local single-model servers (vLLM, llama.cpp), uses the first model.
 
     Calls ``log_fn`` for informational messages (defaults to ``print``).
-    Raises ``SystemExit`` on failure.
+
+    When *fatal* is ``True`` (default), raises ``SystemExit`` on failure.
+    When ``False``, returns ``(None, None)`` so the server can start in
+    degraded mode (useful for cluster deployments where the LLM backend
+    may not be available at startup).
     """
     try:
         models = client.models.list()
         if not models.data:
-            log_fn("Error: No models found at server. Use --model to specify.")
-            raise SystemExit(1)
+            if fatal:
+                log_fn("Error: No models found at server. Use --model to specify.")
+                raise SystemExit(1)
+            log_fn("Warning: No models found at server — starting in degraded mode.")
+            return None, None
 
         all_ids = [x.id for x in models.data]
         selected_id = _select_best_model(all_ids, provider)
@@ -321,6 +330,10 @@ def detect_model(
     except SystemExit:
         raise
     except Exception as e:
-        log_fn(f"Error: Could not connect to server: {e}")
-        log_fn("Is the model server running? Start it or use --base-url to point elsewhere.")
-        raise SystemExit(1) from e
+        if fatal:
+            log_fn(f"Error: Could not connect to server: {e}")
+            log_fn("Is the model server running? Start it or use --base-url to point elsewhere.")
+            raise SystemExit(1) from e
+        log_fn(f"Warning: Could not connect to LLM backend: {e}")
+        log_fn("Starting in degraded mode — requests will fail until backend is reachable.")
+        return None, None

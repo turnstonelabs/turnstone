@@ -2107,7 +2107,12 @@ def main() -> None:
     else:
         from turnstone.core.model_registry import detect_model
 
-        model, detected_ctx = detect_model(client, provider=provider_name)
+        model, detected_ctx = detect_model(client, provider=provider_name, fatal=False)
+        if model is None:
+            # LLM backend unreachable — start with a placeholder model name.
+            # The health monitor will report degraded and the circuit breaker
+            # will prevent requests until the backend comes up.
+            model = "unavailable"
 
     # Use detected context window, fall back to ConfigStore override or 32768
     cfg_ctx = config_store.get("model.context_window")

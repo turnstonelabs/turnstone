@@ -80,7 +80,13 @@ class ClusterCollector:
         self._running = False
         self._threads: list[threading.Thread] = []
         self._poll_pool = ThreadPoolExecutor(max_workers=max_poll_workers)
-        self._http_client = httpx.Client(timeout=http_timeout)
+        self._http_client = httpx.Client(
+            timeout=http_timeout,
+            limits=httpx.Limits(
+                max_connections=max_poll_workers + 10,
+                max_keepalive_connections=min(max_poll_workers // 4, 50),
+            ),
+        )
 
         # SSE fan-out to browser clients
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
