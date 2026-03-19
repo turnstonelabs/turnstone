@@ -308,7 +308,7 @@ search_max_results = 5     # max tools returned per search query
 [server]
 host = "0.0.0.0"
 port = 8080
-max_workstreams = 10       # auto-evicts oldest idle when full
+max_workstreams = 50       # auto-evicts oldest idle when full
 
 [redis]
 host = "localhost"
@@ -340,7 +340,7 @@ burst = 20
 backend = "sqlite"     # "sqlite" (default) or "postgresql"
 path = ".turnstone.db" # SQLite file path (relative to working directory)
 # url = "postgresql+psycopg://user:pass@host:5432/turnstone"  # PostgreSQL
-# pool_size = 5        # PostgreSQL connection pool size
+# pool_size = 2        # PostgreSQL connection pool size (per process)
 
 [judge]
 enabled = true         # intent validation for tool approvals (--no-judge to disable)
@@ -404,7 +404,7 @@ Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
 
 **Per-IP rate limiting.** When `[ratelimit].enabled` is true, each client IP is tracked with a token-bucket limiter (`requests_per_second` / `burst`). Rate limiting is applied in `do_GET`/`do_POST` after authentication but before route dispatch. `/health` and `/metrics` are exempt. Requests that exceed the limit receive HTTP 429 with a `Retry-After` header.
 
-**Workstream eviction.** When `WorkstreamManager.create()` would exceed `max_workstreams`, the oldest IDLE workstream is automatically evicted and the `turnstone_workstreams_evicted_total` counter is incremented. Configure via `[server].max_workstreams` (default 10).
+**Workstream eviction.** When `WorkstreamManager.create()` would exceed `max_workstreams`, the oldest IDLE workstream is automatically evicted and the `turnstone_workstreams_evicted_total` counter is incremented. Configure via `[server].max_workstreams` (default 50).
 
 ## Requirements
 

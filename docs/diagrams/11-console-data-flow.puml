@@ -105,7 +105,7 @@ Server -> CC : get_snapshot()
 CC --> Server : ClusterSnapshot\n(full current state)
 
 Server -> CC : register_listener(queue)
-note right : Per-client queue.Queue(maxsize=500)\nSSE via EventSourceResponse + run_in_executor()
+note right : Per-client queue.Queue(maxsize=2000)\nSSE via EventSourceResponse + run_in_executor()
 
 Server -> Browser : data: {"type":"snapshot",...}\n(full state as first SSE event)
 

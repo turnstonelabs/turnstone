@@ -19,7 +19,7 @@ def init_storage(
     *,
     path: str = "",
     url: str = "",
-    pool_size: int = 5,
+    pool_size: int = 2,
     run_migrations: bool = True,
 ) -> StorageBackend:
     """Initialize the storage backend singleton.

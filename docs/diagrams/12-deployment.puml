@@ -56,6 +56,26 @@ node "Docker Host" as host {
             end note
         }
 
+        node "postgres (profile: production)" <<pgautoupgrade>> as pg_node {
+            component [PostgreSQL\nport 5432] as postgres
+            note bottom of postgres
+                Healthcheck: pg_isready
+                Volume: postgres-data
+                Required for cluster
+                  and production profiles
+            end note
+        }
+
+        node "pgbouncer (optional)" <<bitnami/pgbouncer>> as pgb_node {
+            component [PgBouncer\nport 6432] as pgbouncer
+            note bottom of pgbouncer
+                pool_mode: transaction
+                Recommended for clusters
+                  > 50 nodes
+                See docs/pgbouncer.md
+            end note
+        }
+
         node "sim (profile: sim)" <<turnstone image>> as sim_node {
             component [turnstone-sim] as sim
             note bottom of sim
@@ -92,6 +112,11 @@ console --> server : HTTP polling + proxy\n(GET /v1/api/dashboard,\nproxy /node/
 
 sim --> redis : Redis protocol\n(queues + pubsub + keys)
 
+' Database connections (production/cluster profiles)
+server ..> pgbouncer : PostgreSQL\n(pool_size=2)
+console ..> pgbouncer : PostgreSQL\n(auth/admin)
+pgbouncer --> postgres : transaction\npooling
+
 ' Environment variables
 note right of host
     **Environment Variables:**
@@ -99,13 +124,17 @@ note right of host
     • OPENAI_API_KEY — API key
     • REDIS_PASSWORD — Redis auth
     • TURNSTONE_AUTH_TOKEN — API auth
+    • TURNSTONE_DB_URL — PostgreSQL URL
+    • POSTGRES_PASSWORD — DB password
 end note
 
 ' Volumes
 database "redis-data" as rv
 database "turnstone-data" as tv
+database "postgres-data" as pv
 
 redis_node --> rv
 server_node --> tv
+pg_node --> pv
 
 @enduml

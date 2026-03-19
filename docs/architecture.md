@@ -353,7 +353,7 @@ remove the tab immediately. Controlled by `--workstream-idle-timeout` (default:
 
 **Workstream eviction at capacity:** When `WorkstreamManager.create()` would
 exceed `max_workstreams` (configurable via `[server].max_workstreams`, default
-10), the oldest IDLE workstream is automatically evicted to make room. The
+50), the oldest IDLE workstream is automatically evicted to make room. The
 `turnstone_workstreams_evicted_total` counter is incremented on each eviction.
 If no IDLE workstream is available the create request fails as before.
 
@@ -835,10 +835,16 @@ and are the single source of truth for both backends and Alembic migrations.
 backend = "sqlite"                  # "sqlite" | "postgresql"
 path = ".turnstone.db"              # SQLite file path
 url = ""                            # PostgreSQL connection URL
-pool_size = 5                       # PostgreSQL connection pool size
+pool_size = 2                       # PostgreSQL connection pool size (per process)
 ```
 
-Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB_PATH`.
+Environment variables: `TURNSTONE_DB_BACKEND`, `TURNSTONE_DB_URL`, `TURNSTONE_DB_PATH`,
+`TURNSTONE_DB_POOL_SIZE`.
+
+The default pool is intentionally small (2 base + 3 overflow = 5 per process)
+because all database operations are short-burst queries that hold connections for
+milliseconds. For clusters with many nodes sharing a PostgreSQL instance, use
+[PgBouncer](pgbouncer.md) in transaction pooling mode.
 
 ### Persistence and Resume
 

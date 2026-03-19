@@ -134,6 +134,7 @@ class RedisBroker:
             password=password,
             decode_responses=True,
             retry_on_timeout=True,
+            max_connections=200,
         )
         self._redis: _redis_t.Redis[str] = cast(
             "_redis_t.Redis[str]",
@@ -213,9 +214,14 @@ class RedisBroker:
     def list_nodes(self) -> list[dict[str, Any]]:
         pattern = f"{self._prefix}:node:*"
         prefix_len = len(f"{self._prefix}:node:")
+        # Collect all keys first, then batch-fetch with MGET to avoid
+        # N+1 round-trips (1 GET per node).
+        keys = list(self._redis.scan_iter(match=pattern, count=100))
+        if not keys:
+            return []
+        values = self._redis.mget(keys)
         nodes: list[dict[str, Any]] = []
-        for key in self._redis.scan_iter(match=pattern, count=100):
-            raw = self._redis.get(key)
+        for key, raw in zip(keys, values, strict=True):
             if raw:
                 try:
                     meta: dict[str, Any] = json.loads(raw)

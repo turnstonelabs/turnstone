@@ -78,7 +78,7 @@ class WorkstreamManager:
         self,
         session_factory: _SessionFactory,
         *,
-        max_workstreams: int = 10,
+        max_workstreams: int = 50,
         node_id: str | None = None,
     ):
         """

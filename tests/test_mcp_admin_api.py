@@ -550,6 +550,7 @@ def _fake_request(*nodes: dict[str, Any], proxy_client: Any = None) -> MagicMock
     """Build a minimal mock request with collector and proxy_client."""
     collector = MagicMock()
     collector.get_nodes.return_value = (list(nodes), len(nodes))
+    collector.get_all_nodes.side_effect = lambda: collector.get_nodes.return_value[0]
     req = MagicMock()
     req.app.state.collector = collector
     req.app.state.proxy_client = proxy_client or AsyncMock()

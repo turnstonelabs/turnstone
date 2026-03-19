@@ -109,8 +109,11 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 |----------|---------|-------------|
 | `TURNSTONE_DB_BACKEND` | `sqlite` | Storage backend: `sqlite` or `postgresql` |
 | `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql://user:pass@db:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
+| `TURNSTONE_DB_POOL_SIZE` | `2` | PostgreSQL connection pool size per process (default: 2 base + 3 overflow = 5 max) |
 
 The database stores workstream history, user accounts, and API tokens. When using JWT auth, a database backend is required for user storage.
+
+> **Large clusters:** Each turnstone process maintains a small connection pool (5 max). At hundreds of nodes this adds up — use [PgBouncer](pgbouncer.md) in transaction pooling mode between turnstone and PostgreSQL.
 
 > **First-time setup:** After deploying with auth enabled, create an initial admin user by running `turnstone-admin create-user` inside the container:
 >
@@ -150,6 +153,8 @@ POSTGRES_PASSWORD=secret docker compose --profile cluster up
 ```
 
 The default `server` and `bridge` also run alongside the cluster nodes (11 total). All nodes are accessible via the console dashboard at `:8090`.
+
+For production clusters beyond ~50 nodes, add PgBouncer between turnstone services and PostgreSQL. See [PgBouncer Connection Pooling](pgbouncer.md) for Docker Compose and Helm configuration.
 
 ## Volumes
 

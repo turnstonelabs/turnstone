@@ -56,7 +56,7 @@ class ClusterCollector:
         prefix: str = "turnstone",
         poll_interval: float = 10.0,
         discovery_interval: float = 15.0,
-        max_poll_workers: int = 50,
+        max_poll_workers: int = 200,
         http_timeout: float = 5.0,
         auth_token: str = "",
         token_manager: ServiceTokenManager | None = None,
@@ -241,7 +241,12 @@ class ClusterCollector:
             time.sleep(self._poll_interval)
 
     def _poll_all_nodes(self) -> None:
-        """Fetch dashboard data from all known nodes in parallel."""
+        """Fetch dashboard data from all known nodes in parallel.
+
+        Submissions are throttled by the thread pool size to avoid a
+        thundering herd — at most ``max_poll_workers`` concurrent HTTP
+        requests are in flight at any time.
+        """
         # Snapshot current auth header for this poll cycle.  Per-request
         # headers avoid mutating shared client state (thread-safe).
         if self._token_manager is not None:
@@ -458,6 +463,11 @@ class ClusterCollector:
             items.sort(key=lambda n: n["node_id"])
 
         return items[offset : offset + limit], total
+
+    def get_all_nodes(self) -> list[dict[str, Any]]:
+        """Return all nodes without pagination (for fan-out operations)."""
+        nodes, _ = self.get_nodes(sort_by="activity", limit=2**31, offset=0)
+        return nodes
 
     def get_workstreams(
         self,

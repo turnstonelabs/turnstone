@@ -73,7 +73,7 @@ class PostgreSQLBackend:
     """PostgreSQL implementation of the StorageBackend protocol."""
 
     def __init__(
-        self, url: str, pool_size: int = 5, max_overflow: int = 10, *, create_tables: bool = True
+        self, url: str, pool_size: int = 2, max_overflow: int = 3, *, create_tables: bool = True
     ) -> None:
         self._engine = sa.create_engine(
             url,

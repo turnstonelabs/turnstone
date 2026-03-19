@@ -953,6 +953,8 @@ class TestConsoleWorkstreamCreation:
             ],
             2,
         )
+        # get_all_nodes delegates to get_nodes (mirrors real implementation)
+        collector.get_all_nodes.side_effect = lambda: collector.get_nodes.return_value[0]
         return collector
 
     @pytest.fixture()
@@ -1266,47 +1268,49 @@ class TestProxyRewriting:
 class TestPickBestNode:
     """Test the _pick_best_node helper."""
 
+    @staticmethod
+    def _mock_collector(nodes: list) -> MagicMock:
+        collector = MagicMock(spec=ClusterCollector)
+        collector.get_nodes.return_value = (nodes, len(nodes))
+        collector.get_all_nodes.side_effect = lambda: collector.get_nodes.return_value[0]
+        return collector
+
     def test_picks_node_with_most_headroom(self):
         from turnstone.console.server import _pick_best_node
 
-        collector = MagicMock(spec=ClusterCollector)
-        collector.get_nodes.return_value = (
+        collector = self._mock_collector(
             [
                 {"node_id": "busy", "reachable": True, "max_ws": 10, "ws_total": 9},
                 {"node_id": "free", "reachable": True, "max_ws": 10, "ws_total": 2},
                 {"node_id": "mid", "reachable": True, "max_ws": 10, "ws_total": 5},
-            ],
-            3,
+            ]
         )
         assert _pick_best_node(collector) == "free"
 
     def test_skips_unreachable_nodes(self):
         from turnstone.console.server import _pick_best_node
 
-        collector = MagicMock(spec=ClusterCollector)
-        collector.get_nodes.return_value = (
+        collector = self._mock_collector(
             [
                 {"node_id": "down", "reachable": False, "max_ws": 10, "ws_total": 0},
                 {"node_id": "up", "reachable": True, "max_ws": 10, "ws_total": 5},
-            ],
-            2,
+            ]
         )
         assert _pick_best_node(collector) == "up"
 
     def test_returns_empty_when_no_nodes(self):
         from turnstone.console.server import _pick_best_node
 
-        collector = MagicMock(spec=ClusterCollector)
-        collector.get_nodes.return_value = ([], 0)
+        collector = self._mock_collector([])
         assert _pick_best_node(collector) == ""
 
     def test_returns_empty_when_all_unreachable(self):
         from turnstone.console.server import _pick_best_node
 
-        collector = MagicMock(spec=ClusterCollector)
-        collector.get_nodes.return_value = (
-            [{"node_id": "down", "reachable": False, "max_ws": 10, "ws_total": 0}],
-            1,
+        collector = self._mock_collector(
+            [
+                {"node_id": "down", "reachable": False, "max_ws": 10, "ws_total": 0},
+            ]
         )
         assert _pick_best_node(collector) == ""
 

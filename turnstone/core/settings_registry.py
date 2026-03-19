@@ -212,13 +212,40 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "server.max_workstreams",
             "int",
-            10,
+            50,
             "Max concurrent workstreams",
             "server",
             min_value=1,
             restart_required=True,
             help="Maximum number of active conversation threads on this server node. "
-            "When the limit is reached, the oldest idle workstream is evicted to make room.",
+            "When the limit is reached, the oldest idle workstream is evicted to make room. "
+            "Each workstream uses memory proportional to its conversation history.",
+        ),
+        # -- cluster --------------------------------------------------------
+        SettingDef(
+            "cluster.node_fan_out_limit",
+            "int",
+            200,
+            "Max concurrent outbound requests during cluster-wide operations",
+            "cluster",
+            min_value=10,
+            max_value=1000,
+            help="Controls how many nodes the console queries in parallel during "
+            "fan-out operations (watch listing, MCP status, reload notifications). "
+            "Higher values speed up large-cluster admin operations at the cost of "
+            "more concurrent connections.",
+        ),
+        SettingDef(
+            "cluster.mcp_max_servers",
+            "int",
+            200,
+            "Max MCP server definitions in the cluster",
+            "cluster",
+            min_value=1,
+            max_value=2000,
+            help="Hard cap on the total number of MCP server definitions stored in the "
+            "database. Each node only connects to the servers it needs, so this "
+            "limit is on definitions, not active connections.",
         ),
         # -- mcp ------------------------------------------------------------
         SettingDef(

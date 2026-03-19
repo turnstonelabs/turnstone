@@ -980,7 +980,7 @@ def main() -> None:
     db_url = getattr(args, "db_url", None) or os.environ.get("TURNSTONE_DB_URL", "")
     db_path = getattr(args, "db_path", None) or os.environ.get("TURNSTONE_DB_PATH", "")
     db_pool_size = int(
-        getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "5")
+        getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "2")
     )
     init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
 

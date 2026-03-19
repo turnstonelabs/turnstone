@@ -82,6 +82,7 @@ class AsyncRedisBroker:
             password=self._password,
             decode_responses=True,
             retry_on_timeout=True,
+            max_connections=200,
         )
         self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
 
@@ -264,9 +265,16 @@ class AsyncRedisBroker:
         await self._ensure_connected()
         pattern = f"{self._prefix}:node:*"
         prefix_len = len(f"{self._prefix}:node:")
-        nodes: list[dict[str, Any]] = []
+        # Collect all keys first, then batch-fetch with MGET to avoid
+        # N+1 round-trips (1 GET per node).
+        keys: list[str] = []
         async for key in self._r.scan_iter(match=pattern, count=100):
-            raw = await self._r.get(key)
+            keys.append(key)
+        if not keys:
+            return []
+        values = await self._r.mget(keys)
+        nodes: list[dict[str, Any]] = []
+        for key, raw in zip(keys, values, strict=True):
             if raw:
                 try:
                     meta: dict[str, Any] = json.loads(raw)

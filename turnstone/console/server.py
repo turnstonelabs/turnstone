@@ -168,7 +168,7 @@ def _get_server_url(request: Request, node_id: str) -> str | None:
 
 def _pick_best_node(collector: ClusterCollector) -> str:
     """Select the reachable node with the most available capacity."""
-    nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
+    nodes = collector.get_all_nodes()
     best_id = ""
     best_headroom = -1
     for n in nodes:
@@ -252,7 +252,7 @@ async def cluster_snapshot(request: Request) -> JSONResponse:
 
 async def cluster_events_sse(request: Request) -> Response:
     collector: ClusterCollector = request.app.state.collector
-    client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+    client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=2000)
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         loop = asyncio.get_running_loop()
@@ -682,10 +682,15 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Create async HTTP clients for proxy routes.  Auth headers are NOT baked
     # in — _proxy_auth_headers() injects a fresh token per-request so JWTs
     # auto-rotate via ServiceTokenManager instead of expiring after 1 hour.
-    app.state.proxy_client = httpx.AsyncClient(timeout=30)
+    app.state.proxy_client = httpx.AsyncClient(
+        timeout=30,
+        limits=httpx.Limits(max_connections=250, max_keepalive_connections=50),
+    )
     app.state.proxy_sse_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
-        limits=httpx.Limits(keepalive_expiry=30),
+        limits=httpx.Limits(
+            max_connections=1100, max_keepalive_connections=100, keepalive_expiry=30
+        ),
     )
     # Start scheduler if configured
     scheduler = getattr(app.state, "scheduler", None)
@@ -1472,10 +1477,10 @@ async def admin_list_watches(request: Request) -> JSONResponse:
     if err:
         return err
     collector: ClusterCollector = request.app.state.collector
-    nodes, _ = collector.get_nodes(limit=500)
+    nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
-    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
     async def _fetch_node(node: dict[str, Any]) -> list[dict[str, Any]]:
         server_url = (node.get("server_url") or "").rstrip("/")
@@ -1514,9 +1519,22 @@ async def admin_list_watches(request: Request) -> JSONResponse:
 _VALID_WATCH_ID = re.compile(r"^[a-fA-F0-9]+$")
 
 # Max concurrent outbound requests when fanning out to cluster nodes.
-# Sized below the default httpx pool limit (100) to leave headroom for
-# other proxy traffic (UI proxying, SSE streams, etc.).
-_NODE_FAN_OUT_LIMIT = 50
+# Must stay below the httpx pool limit (set in _lifespan) to leave
+# headroom for non-fan-out proxy traffic (UI proxying, SSE streams).
+_NODE_FAN_OUT_LIMIT = 200  # fallback; prefer cluster.node_fan_out_limit from storage
+
+
+def _get_fan_out_limit(request: Request) -> int:
+    """Read cluster.node_fan_out_limit from storage, falling back to the constant."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage:
+        try:
+            row = storage.get_system_setting("cluster.node_fan_out_limit")
+            if row:
+                return int(row["value"])
+        except Exception:
+            pass
+    return _NODE_FAN_OUT_LIMIT
 
 
 async def admin_cancel_watch(request: Request) -> Response:
@@ -3450,13 +3468,13 @@ def _publish_config_change(request: Request, *, key: str, node_id: str, action: 
         return
     headers = _proxy_auth_headers(request)
     with contextlib.suppress(Exception):
-        nodes = collector.get_nodes()
-        for node in nodes.get("nodes", []):
-            url = node.get("url", "")
+        nodes = collector.get_all_nodes()
+        for node in nodes:
+            url = node.get("server_url", "")
             if url:
                 with contextlib.suppress(Exception):
                     httpx.post(
-                        f"{url}/v1/api/_internal/config-reload",
+                        f"{url.rstrip('/')}/v1/api/_internal/config-reload",
                         headers=headers,
                         timeout=5.0,
                     )
@@ -3846,8 +3864,9 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 
     # Check max servers
     current = storage.list_mcp_servers()
-    if len(current) >= _MCP_MAX_SERVERS:
-        return JSONResponse({"error": f"Maximum {_MCP_MAX_SERVERS} servers"}, status_code=400)
+    max_servers = _get_mcp_max_servers(request)
+    if len(current) >= max_servers:
+        return JSONResponse({"error": f"Maximum {max_servers} servers"}, status_code=400)
 
     # Fetch the specific server from the registry
     registry_url = _get_registry_url(request)
@@ -3943,7 +3962,20 @@ async def admin_registry_install(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-_MCP_MAX_SERVERS = 50
+_MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
+
+
+def _get_mcp_max_servers(request: Request) -> int:
+    """Read cluster.mcp_max_servers from storage, falling back to the constant."""
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage:
+        try:
+            row = storage.get_system_setting("cluster.mcp_max_servers")
+            if row:
+                return int(row["value"])
+        except Exception:
+            pass
+    return _MCP_MAX_SERVERS
 
 
 def _mask_mcp_secrets(server: dict[str, Any], reveal: bool = False) -> dict[str, Any]:
@@ -3981,10 +4013,10 @@ async def _collect_mcp_status(
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
     collector: ClusterCollector = request.app.state.collector
-    nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
+    nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
-    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
     async def _fetch(node: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]] | None]:
         node_id = node.get("node_id", "")
@@ -4128,9 +4160,10 @@ async def admin_create_mcp_server(request: Request) -> JSONResponse:
 
     # Check max servers
     existing = storage.list_mcp_servers()
-    if len(existing) >= _MCP_MAX_SERVERS:
+    max_servers = _get_mcp_max_servers(request)
+    if len(existing) >= max_servers:
         return JSONResponse(
-            {"error": f"Maximum {_MCP_MAX_SERVERS} servers"},
+            {"error": f"Maximum {max_servers} servers"},
             status_code=400,
         )
 
@@ -4332,10 +4365,10 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read the mcp_servers DB table and reconcile."""
     collector: ClusterCollector = request.app.state.collector
-    nodes, _ = collector.get_nodes(sort_by="activity", limit=1000, offset=0)
+    nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
-    sem = asyncio.Semaphore(_NODE_FAN_OUT_LIMIT)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
 
     async def _notify(node: dict[str, Any]) -> tuple[str, Any]:
         node_id = node.get("node_id", "")
@@ -4411,6 +4444,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
     errors: list[str] = []
     audit_uid, ip = _audit_context(request)
     current_count = len(storage.list_mcp_servers())
+    max_servers = _get_mcp_max_servers(request)
 
     for srv_name, cfg in servers.items():
         srv_name = str(srv_name).strip()[:64]
@@ -4420,7 +4454,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
         if storage.get_mcp_server_by_name(srv_name):
             skipped.append(srv_name)
             continue
-        if current_count >= _MCP_MAX_SERVERS:
+        if current_count >= max_servers:
             errors.append(f"{srv_name}: max servers reached")
             break
 

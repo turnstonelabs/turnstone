@@ -7,6 +7,7 @@
 #   Production (PG):      DB_BACKEND=postgresql docker compose --profile production up
 #   10-node cluster:      docker compose --profile cluster up
 #   Cluster + DDG:        docker compose --profile ddgCluster up
+#   100-node stress:      docker compose --profile ddgStressCluster up
 #   With simulator:       docker compose --profile sim up
 # =============================================================================
 
@@ -31,6 +32,7 @@ services:
       - production
       - cluster
       - ddgCluster
+      - ddgStressCluster
     environment:
       POSTGRES_DB: turnstone
       POSTGRES_USER: ${POSTGRES_USER:-turnstone}
@@ -261,6 +263,7 @@ services:
     image: python:3.14-slim
     profiles:
       - ddgCluster
+      - ddgStressCluster
     command:
       - sh
       - -c
@@ -542,3 +545,2337 @@ services:
     depends_on:
       server-10: { condition: service_healthy }
       redis: { condition: service_healthy }
+
+  # ===================================================================
+  # 100-node stress cluster (profile: ddgStressCluster)
+  #
+  # 10 groups x 10 nodes = 100 server+bridge pairs.
+  # Groups: alpha, beta, gamma, delta, epsilon, zeta, eta, theta,
+  #         iota, kappa
+  #
+  # Start:  docker compose --profile ddgStressCluster up
+  # ===================================================================
+
+  # -- stress cluster servers ----------------------------------------
+
+  server-alpha-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-alpha-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: alpha-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-beta-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-beta-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: beta-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-gamma-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-gamma-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: gamma-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-delta-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-delta-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: delta-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-epsilon-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-epsilon-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: epsilon-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-zeta-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-zeta-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: zeta-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-eta-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-eta-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: eta-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-theta-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-theta-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: theta-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-iota-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-iota-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: iota-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  server-kappa-1:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-1 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-2:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-2 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-3:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-3 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-4:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-4 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-5:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-5 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-6:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-6 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-7:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-7 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-8:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-8 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-9:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-9 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+  server-kappa-10:
+    <<: *cluster-server
+    profiles: [ddgStressCluster]
+    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: kappa-10 }
+    deploy:
+      resources:
+        limits: { memory: 256M, cpus: '0.25' }
+
+  # -- stress cluster bridges ----------------------------------------
+
+  bridge-alpha-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-alpha-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-alpha-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-alpha-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-beta-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-beta-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-beta-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-beta-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-gamma-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-gamma-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-gamma-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-gamma-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-delta-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-delta-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-delta-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-delta-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-epsilon-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-epsilon-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-epsilon-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-epsilon-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-zeta-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-zeta-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-zeta-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-zeta-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-eta-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-eta-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-eta-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-eta-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-theta-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-theta-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-theta-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-theta-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-iota-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-iota-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-iota-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-iota-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+
+  bridge-kappa-1:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-1:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-1: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-2:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-2:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-2: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-3:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-3:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-3: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-4:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-4:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-4: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-5:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-5:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-5: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-6:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-6:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-6: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-7:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-7:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-7: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-8:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-8:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-8: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-9:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-9:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-9: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }
+  bridge-kappa-10:
+    <<: *cluster-bridge
+    profiles: [ddgStressCluster]
+    command:
+      - turnstone-bridge
+      - --server-url=http://server-kappa-10:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+    depends_on:
+      server-kappa-10: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: '0.1' }

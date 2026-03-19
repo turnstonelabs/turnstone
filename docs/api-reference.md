@@ -554,7 +554,7 @@ Possible `state` values:
 | `error`     | An error occurred                               |
 
 **Fan-out pattern:** Each connected client receives its own bounded queue
-(`maxsize=500`). A dedicated fan-out thread reads from the shared global queue
+(`maxsize=1000`). A dedicated fan-out thread reads from the shared global queue
 and copies each event to every client queue. If a client queue is full, the
 event is silently dropped for that client.
 

@@ -53,10 +53,10 @@ class "SQLiteBackend" as SQLite <<sqlite>> {
 
 class "PostgreSQLBackend" as PG <<postgres>> {
     -_engine: sa.Engine
-    +__init__(url: str, pool_size: int)
+    +__init__(url: str, pool_size: int = 2,\n    max_overflow: int = 3)
     --
     tsvector + ILIKE search
-    Connection pooling
+    Connection pooling (5 max per process)
 }
 
 ' -- Schema --
@@ -151,7 +151,7 @@ note right of Registry
   backend = "sqlite" | "postgresql"
   url = "postgresql+psycopg://..."
   path = ".turnstone.db"
-  pool_size = 5
+  pool_size = 2 (+ 3 overflow)
 end note
 
 note bottom of SQLite
@@ -162,8 +162,9 @@ end note
 
 note bottom of PG
   Production backend.
-  Multi-node / Docker
-  default.
+  Multi-node / Docker default.
+  Use PgBouncer (transaction mode)
+  for clusters > 50 nodes.
 end note
 
 @enduml

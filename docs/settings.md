@@ -60,6 +60,7 @@ storage initialization:
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |
+| `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, refresh_interval, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |

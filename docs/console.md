@@ -69,10 +69,11 @@ All reads and writes to the node/workstream map are protected by a single `threa
 
 ### Scale Considerations
 
-- **10,000 workstreams** at ~500 bytes each = ~5 MB in memory
-- **1,000 nodes** polled in parallel with 50 threads at ~100ms each = ~2 second poll cycle
+- **50,000 workstreams** (1,000 nodes × 50 per node) at ~500 bytes each = ~25 MB in memory
+- **1,000 nodes** polled in parallel — fan-out concurrency is configurable via `cluster.node_fan_out_limit` (default 200), yielding 5 batches at ~100ms each = ~0.5 second poll cycle
 - **Filtering and pagination** run in-memory on the full workstream list — sub-millisecond at this scale
-- **SSE fan-out** uses the same per-client queue pattern as the per-node server — backed-up clients get events dropped, not blocking
+- **SSE fan-out** uses per-client queues (2,000 events) — backed-up clients get events dropped, not blocking
+- **Database** — for clusters sharing PostgreSQL, use [PgBouncer](pgbouncer.md) in transaction pooling mode
 
 ---
 

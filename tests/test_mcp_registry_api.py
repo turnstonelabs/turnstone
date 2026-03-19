@@ -362,7 +362,7 @@ class TestRegistryInstall:
     def test_install_max_servers(self, client: TestClient, storage: SQLiteBackend) -> None:
         import uuid
 
-        for i in range(50):
+        for i in range(200):
             storage.create_mcp_server(
                 server_id=uuid.uuid4().hex,
                 name=f"server-{i}",

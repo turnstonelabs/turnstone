@@ -25,6 +25,7 @@ import textwrap
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -798,10 +799,11 @@ async def events_sse(request: Request) -> Response:
         _metrics.record_sse_connect()
         try:
             loop = asyncio.get_running_loop()
+            executor = request.app.state.sse_executor
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(client_queue.get, timeout=5)
+                        executor, functools.partial(client_queue.get, timeout=5)
                     )
                     if event.get("type") == "ws_closed":
                         return
@@ -817,7 +819,7 @@ async def events_sse(request: Request) -> Response:
 
 async def global_events_sse(request: Request) -> Response:
     """GET /v1/api/events/global — global SSE event stream."""
-    client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=500)
+    client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
     listeners = request.app.state.global_listeners
     listeners_lock = request.app.state.global_listeners_lock
     with listeners_lock:
@@ -827,10 +829,11 @@ async def global_events_sse(request: Request) -> Response:
         _metrics.record_sse_connect()
         try:
             loop = asyncio.get_running_loop()
+            executor = request.app.state.sse_executor
             while True:
                 try:
                     event = await loop.run_in_executor(
-                        None, functools.partial(client_queue.get, timeout=5)
+                        executor, functools.partial(client_queue.get, timeout=5)
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
@@ -1755,6 +1758,9 @@ def _global_fanout_thread(
 @asynccontextmanager
 async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     """Start background threads and handle shutdown."""
+    # Dedicated executor for SSE queue polling so it doesn't compete
+    # with the default asyncio executor (which caps at ~32 workers).
+    app.state.sse_executor = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sse")
     # Start global event fan-out thread
     fanout = threading.Thread(
         target=_global_fanout_thread,
@@ -1817,6 +1823,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         app.state.mcp_client.shutdown()
     if app.state.registry:
         app.state.registry.shutdown()
+    app.state.sse_executor.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -2038,7 +2045,7 @@ def main() -> None:
     db_url = getattr(args, "db_url", None) or os.environ.get("TURNSTONE_DB_URL", "")
     db_path = getattr(args, "db_path", None) or os.environ.get("TURNSTONE_DB_PATH", "")
     db_pool_size = int(
-        getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "5")
+        getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "2")
     )
     init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
 
