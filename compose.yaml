@@ -430,6 +430,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       TURNSTONE_AUTH_TOKEN: ${TURNSTONE_AUTH_TOKEN:-}
       TURNSTONE_JWT_SECRET: ${TURNSTONE_JWT_SECRET:-}
+      TURNSTONE_DB_BACKEND: ${DB_BACKEND:-postgresql}
+      TURNSTONE_DB_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:?}@postgres:5432/turnstone}
     networks: [turnstone-net]
     depends_on:
       server-1: { condition: service_healthy }
