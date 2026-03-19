@@ -8,18 +8,18 @@
 #   openshell sandbox run \
 #     --policy deploy/openshell/turnstone-policy.yaml \
 #     --workdir /project \
-#     -- python -m turnstone.server --host 0.0.0.0 --port 8080
+#     -- python3 -m turnstone.server --host 0.0.0.0 --port 8080
 #
 # For inference routing (keeps real API keys out of the sandbox):
 #   openshell sandbox run \
 #     --policy deploy/openshell/turnstone-policy.yaml \
 #     --inference-routes deploy/openshell/routes.yaml \
 #     --workdir /project \
-#     -- python -m turnstone.server --host 0.0.0.0 --port 8080 \
+#     -- python3 -m turnstone.server --host 0.0.0.0 --port 8080 \
 #         --base-url https://inference.local
 #
 # Note: inference.local is intercepted by the OpenShell proxy before
-# network policy evaluation — no network_policy entry is needed for it.
+# network policy evaluation — no network_policies entry is needed for it.
 #
 # Customization points (search for "CUSTOMIZE"):
 #   - OIDC issuer endpoint
@@ -140,7 +140,6 @@ network_policies:
     binaries:
       - path: /usr/bin/python3*
       - path: /usr/local/bin/python3*
-      - path: /usr/bin/git
 
   mcp_registry:
     name: mcp-registry
@@ -279,11 +278,6 @@ network_policies:
     binaries:
       - path: /usr/bin/curl
       - path: /usr/bin/wget
-      # pip/uv for package installs from bash
-      - path: /usr/bin/pip*
-      - path: /usr/local/bin/pip*
-      - path: /usr/bin/uv
-      - path: /usr/local/bin/uv
 
   # --- Package installation ---
   # pip install / uv add from the bash tool.

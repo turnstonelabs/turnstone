@@ -13,37 +13,37 @@
 #     ...
 #
 # Then start turnstone with:
-#   python -m turnstone.server --base-url https://inference.local
+#   python3 -m turnstone.server --base-url https://inference.local
 #
-# CUSTOMIZE: uncomment and configure the provider(s) you use.
+# CUSTOMIZE: uncomment one of the provider blocks below.
 
-routes: []
+routes:
 
-# --- OpenAI ---
-# - name: inference.local
-#   endpoint: https://api.openai.com/v1
-#   model: gpt-5
-#   provider_type: openai
-#   protocols:
-#     - openai_chat_completions
-#     - model_discovery
-#   api_key_env: OPENAI_API_KEY
+  # --- OpenAI ---
+  # - name: inference.local
+  #   endpoint: https://api.openai.com/v1
+  #   model: gpt-5
+  #   provider_type: openai
+  #   protocols:
+  #     - openai_chat_completions
+  #     - model_discovery
+  #   api_key_env: OPENAI_API_KEY
 
-# --- Anthropic ---
-# - name: inference.local
-#   endpoint: https://api.anthropic.com
-#   model: claude-sonnet-4-6
-#   provider_type: anthropic
-#   protocols:
-#     - anthropic_messages
-#   api_key_env: ANTHROPIC_API_KEY
+  # --- Anthropic ---
+  # - name: inference.local
+  #   endpoint: https://api.anthropic.com
+  #   model: claude-sonnet-4-6
+  #   provider_type: anthropic
+  #   protocols:
+  #     - anthropic_messages
+  #   api_key_env: ANTHROPIC_API_KEY
 
-# --- Local model server (vLLM / llama.cpp) ---
-# No secret resolution needed — local servers typically have no auth.
-# Omit both api_key and api_key_env to skip credential injection.
-# - name: inference.local
-#   endpoint: http://localhost:8000/v1
-#   model: meta-llama/Llama-3.1-70B-Instruct
-#   protocols:
-#     - openai_chat_completions
-#     - model_discovery
+  # --- Local model server (vLLM / llama.cpp) ---
+  # No secret resolution needed — local servers typically have no auth.
+  # Omit both api_key and api_key_env to skip credential injection.
+  # - name: inference.local
+  #   endpoint: http://localhost:8000/v1
+  #   model: meta-llama/Llama-3.1-70B-Instruct
+  #   protocols:
+  #     - openai_chat_completions
+  #     - model_discovery
