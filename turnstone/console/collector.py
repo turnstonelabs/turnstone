@@ -54,10 +54,10 @@ class ClusterCollector:
         self,
         broker: RedisBroker,
         prefix: str = "turnstone",
-        poll_interval: float = 10.0,
+        poll_interval: float = 15.0,
         discovery_interval: float = 15.0,
         max_poll_workers: int = 200,
-        http_timeout: float = 5.0,
+        http_timeout: float = 30.0,
         auth_token: str = "",
         token_manager: ServiceTokenManager | None = None,
     ):
@@ -246,12 +246,26 @@ class ClusterCollector:
                 log.exception("Poll loop error")
             time.sleep(self._poll_interval)
 
+    @staticmethod
+    def _node_jitter(node_id: str, window: float) -> float:
+        """Deterministic per-node delay within a sliding window.
+
+        Uses a Mersenne prime (2^31 - 1) to hash the node_id into a
+        stable offset so each node is polled at a different point in
+        the cycle.  The offset is consistent across restarts for the
+        same node_id, giving an even spread without randomness.
+        """
+        h = hash(node_id) & 0x7FFFFFFF  # positive 31-bit
+        return (h % 2147483647) / 2147483647 * window  # M31 = 2^31 - 1
+
     def _poll_all_nodes(self) -> None:
         """Fetch dashboard data from all known nodes in parallel.
 
         Submissions are throttled by the thread pool size to avoid a
         thundering herd — at most ``max_poll_workers`` concurrent HTTP
-        requests are in flight at any time.
+        requests are in flight at any time.  Each worker sleeps a
+        deterministic per-node jitter (derived from its node_id) to
+        spread requests across the first half of the poll interval.
         """
         # Snapshot current auth header for this poll cycle.  Per-request
         # headers avoid mutating shared client state (thread-safe).
@@ -271,8 +285,18 @@ class ClusterCollector:
         if not targets:
             return
 
+        jitter_window = self._poll_interval / 2
+
+        def _jittered_fetch(
+            nid: str, url: str, headers: dict[str, str] | None
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            delay = self._node_jitter(nid, jitter_window)
+            if delay > 0.1:
+                time.sleep(delay)
+            return self._fetch_node(nid, url, headers)
+
         futures = {
-            self._poll_pool.submit(self._fetch_node, nid, url, poll_headers): nid
+            self._poll_pool.submit(_jittered_fetch, nid, url, poll_headers): nid
             for nid, url in targets
         }
         for future in as_completed(futures):

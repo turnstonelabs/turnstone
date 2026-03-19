@@ -47,8 +47,8 @@ class MockBroker:
 # ---------------------------------------------------------------------------
 
 
-def _make_collector(broker=None, poll_interval=999, discovery_interval=999):
-    """Create a collector with long intervals so threads don't auto-fire."""
+def _make_collector(broker=None, poll_interval=0, discovery_interval=999):
+    """Create a collector with zero poll interval (no jitter delay in tests)."""
     b = broker or MockBroker()
     return ClusterCollector(
         broker=b,
