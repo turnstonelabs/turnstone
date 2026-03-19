@@ -1,0 +1,339 @@
+# OpenShell sandbox policy for Turnstone AI orchestration platform.
+#
+# This policy wraps a turnstone-server process (the primary sandbox target).
+# The bridge, console, and channel gateway are separate processes that would
+# each need their own sandbox with a tailored policy variant.
+#
+# Usage:
+#   openshell sandbox run \
+#     --policy deploy/openshell/turnstone-policy.yaml \
+#     --workdir /project \
+#     -- python -m turnstone.server --host 0.0.0.0 --port 8080
+#
+# For inference routing (keeps real API keys out of the sandbox):
+#   openshell sandbox run \
+#     --policy deploy/openshell/turnstone-policy.yaml \
+#     --inference-routes deploy/openshell/routes.yaml \
+#     --workdir /project \
+#     -- python -m turnstone.server --host 0.0.0.0 --port 8080 \
+#         --base-url https://inference.local
+#
+# Note: inference.local is intercepted by the OpenShell proxy before
+# network policy evaluation — no network_policy entry is needed for it.
+#
+# Customization points (search for "CUSTOMIZE"):
+#   - OIDC issuer endpoint
+#   - Redis host/port (if not localhost)
+#   - MCP HTTP server endpoints
+#   - Additional tool binaries
+#   - web_fetch domain allowlist
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Filesystem: Landlock kernel enforcement
+# ---------------------------------------------------------------------------
+# Static — cannot be changed after sandbox creation.
+# include_workdir adds the --workdir path to read_write automatically.
+
+filesystem_policy:
+  include_workdir: true
+
+  read_only:
+    # Python runtime + installed packages (includes turnstone package)
+    - /usr
+    - /lib
+    - /lib64
+    # System essentials
+    - /etc
+    - /proc
+    - /dev/urandom
+    # Turnstone config (read-only — writes go to database)
+    # CUSTOMIZE: adjust if config lives elsewhere
+    - /home/sandbox/.config/turnstone
+
+  read_write:
+    # Working directory is added via include_workdir
+    # Temp files (bash tool scripts, eval workdirs)
+    - /tmp
+    # Shell redirections (2>/dev/null)
+    - /dev/null
+    # SQLite database (default location is workdir, covered by include_workdir)
+    # Logs
+    - /var/log
+
+landlock:
+  # best_effort: degrade gracefully on kernels without Landlock (< 5.13)
+  # Change to hard_requirement for production hardened deployments
+  compatibility: best_effort
+
+# ---------------------------------------------------------------------------
+# Process: privilege separation
+# ---------------------------------------------------------------------------
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# ---------------------------------------------------------------------------
+# Network: per-endpoint, per-binary allowlisting
+# ---------------------------------------------------------------------------
+# Default-deny. Only listed host:port pairs are reachable.
+# Child processes (MCP servers, bash subcommands) inherit the network
+# namespace — they cannot bypass the proxy.
+
+network_policies:
+
+  # --- LLM API providers ---
+
+  openai_api:
+    name: openai-api
+    endpoints:
+      - host: api.openai.com
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  anthropic_api:
+    name: anthropic-api
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- Web search fallback (Tavily) ---
+
+  tavily_api:
+    name: tavily-search
+    endpoints:
+      - host: api.tavily.com
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- Skill discovery ---
+
+  skills_registry:
+    name: skills-registry
+    endpoints:
+      - host: skills.sh
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  github_api:
+    name: github-api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+      - host: raw.githubusercontent.com
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+      - path: /usr/bin/git
+
+  mcp_registry:
+    name: mcp-registry
+    endpoints:
+      - host: registry.modelcontextprotocol.io
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- OIDC SSO ---
+  # CUSTOMIZE: replace with your identity provider's hostname
+
+  # oidc_provider:
+  #   name: oidc-provider
+  #   endpoints:
+  #     - host: login.example.com
+  #       port: 443
+  #   binaries:
+  #     - path: /usr/bin/python3*
+  #     - path: /usr/local/bin/python3*
+
+  # --- Redis (MQ) ---
+  # CUSTOMIZE: if Redis is not on localhost, add host + allowed_ips.
+  # localhost is blocked by default SSRF protection, so we need allowed_ips.
+
+  redis:
+    name: redis-mq
+    endpoints:
+      - port: 6379
+        allowed_ips:
+          - "127.0.0.1"
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- Discord (channel integration) ---
+  # Uncomment if using turnstone-channel with Discord adapter.
+
+  # discord:
+  #   name: discord
+  #   endpoints:
+  #     - host: discord.com
+  #       port: 443
+  #     - host: gateway.discord.gg
+  #       port: 443
+  #     - host: cdn.discordapp.com
+  #       port: 443
+  #   binaries:
+  #     - path: /usr/bin/python3*
+  #     - path: /usr/local/bin/python3*
+
+  # --- web_fetch tool: curated domain allowlist ---
+  #
+  # This is the hard tradeoff. Turnstone's web_fetch tool lets the LLM
+  # fetch arbitrary public URLs. OpenShell cannot allow "all HTTPS" —
+  # every domain must be enumerated.
+  #
+  # Strategy: allowlist the domains your workloads actually need.
+  # The web_fetch tool will return a connection error for unlisted domains,
+  # which the LLM handles gracefully (it tells the user it can't reach
+  # that site).
+  #
+  # CUSTOMIZE: add domains your workstreams need to fetch from.
+
+  web_fetch_common:
+    name: web-fetch-common
+    endpoints:
+      # Documentation sites
+      - host: "**.readthedocs.io"
+        port: 443
+      - host: docs.python.org
+        port: 443
+      - host: "**.github.io"
+        port: 443
+      # Package registries (metadata lookups)
+      - host: pypi.org
+        port: 443
+      - host: www.npmjs.com
+        port: 443
+      # Stack Overflow / reference
+      - host: stackoverflow.com
+        port: 443
+      - host: "**.stackexchange.com"
+        port: 443
+      # Wikipedia
+      - host: "**.wikipedia.org"
+        port: 443
+    binaries:
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- MCP HTTP servers ---
+  # CUSTOMIZE: add endpoints for any MCP servers using streamable-http
+  # transport. stdio-transport MCP servers need no network entry (they
+  # communicate via stdin/stdout pipes within the sandbox).
+
+  # mcp_http_servers:
+  #   name: mcp-http
+  #   endpoints:
+  #     - host: mcp.internal.example.com
+  #       port: 443
+  #   binaries:
+  #     - path: /usr/bin/python3*
+  #     - path: /usr/local/bin/python3*
+
+  # --- Bash tool: curl/wget ---
+  # The bash tool can run curl/wget. These inherit the network namespace
+  # so they can only reach allowed endpoints. But they need binary entries
+  # to pass the proxy's identity check.
+
+  bash_network_tools:
+    name: bash-network-tools
+    endpoints:
+      # Mirrors web_fetch_common — curl/wget should have the same reach.
+      - host: "**.readthedocs.io"
+        port: 443
+      - host: docs.python.org
+        port: 443
+      - host: "**.github.io"
+        port: 443
+      - host: pypi.org
+        port: 443
+      - host: www.npmjs.com
+        port: 443
+      - host: stackoverflow.com
+        port: 443
+      - host: "**.stackexchange.com"
+        port: 443
+      - host: "**.wikipedia.org"
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/wget
+      # pip/uv for package installs from bash
+      - path: /usr/bin/pip*
+      - path: /usr/local/bin/pip*
+      - path: /usr/bin/uv
+      - path: /usr/local/bin/uv
+
+  # --- Package installation ---
+  # pip install / uv add from the bash tool.
+
+  package_registries:
+    name: package-install
+    endpoints:
+      - host: pypi.org
+        port: 443
+      - host: files.pythonhosted.org
+        port: 443
+      - host: "**.pypi.org"
+        port: 443
+    binaries:
+      - path: /usr/bin/pip*
+      - path: /usr/local/bin/pip*
+      - path: /usr/bin/uv
+      - path: /usr/local/bin/uv
+      - path: /usr/bin/python3*
+      - path: /usr/local/bin/python3*
+
+  # --- Git operations ---
+  # read-only: clone, fetch, pull. No push (L7 enforcement).
+
+  git_operations:
+    name: git-read-only
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+      - host: gitlab.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+    binaries:
+      - path: /usr/bin/git
