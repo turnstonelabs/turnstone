@@ -337,6 +337,7 @@ services:
   # -- cluster servers ------------------------------------------------
 
   server-1: &cluster-server
+    image: turnstone:local
     build: { context: ., dockerfile: Dockerfile }
     profiles: [cluster, ddgCluster]
     command: &cluster-server-cmd
@@ -415,6 +416,7 @@ services:
   # -- cluster bridges ------------------------------------------------
 
   bridge-1: &cluster-bridge
+    image: turnstone:local
     build: { context: ., dockerfile: Dockerfile }
     profiles: [cluster, ddgCluster]
     command:
