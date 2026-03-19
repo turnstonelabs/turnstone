@@ -81,10 +81,10 @@ class ClusterCollector:
         self._threads: list[threading.Thread] = []
         self._poll_pool = ThreadPoolExecutor(max_workers=max_poll_workers)
         self._http_client = httpx.Client(
-            timeout=http_timeout,
+            timeout=httpx.Timeout(connect=10, read=http_timeout, write=5, pool=http_timeout),
             limits=httpx.Limits(
                 max_connections=max_poll_workers + 10,
-                max_keepalive_connections=min(max_poll_workers // 4, 50),
+                max_keepalive_connections=min(max_poll_workers, 200),
             ),
         )
 
