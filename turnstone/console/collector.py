@@ -291,7 +291,7 @@ class ClusterCollector:
                     if nid in self._nodes:
                         self._nodes[nid].reachable = False
             except Exception:
-                log.debug("Failed to poll node %s", nid)
+                log.warning("Failed to poll node %s", nid, exc_info=True)
                 with self._lock:
                     if nid in self._nodes:
                         self._nodes[nid].reachable = False
@@ -311,6 +311,7 @@ class ClusterCollector:
             health_resp = self._http_client.get(f"{base}/health", headers=extra_headers)
             health_data: dict[str, Any] = health_resp.json()
         except Exception:
+            log.debug("Failed to fetch health from %s", node_id, exc_info=True)
             health_data = {}
         return dash_data, health_data
 

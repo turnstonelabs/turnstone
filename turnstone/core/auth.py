@@ -18,7 +18,6 @@ always accessible without authentication.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import hmac
 import json
@@ -1010,7 +1009,7 @@ async def handle_auth_status(request: Request) -> Response:
             users = storage.list_users()
             has_users = len(users) > 0
         except Exception:
-            pass
+            log.warning("Failed to check user existence for auth status", exc_info=True)
 
     # OIDC configuration
     oidc_config = getattr(request.app.state, "oidc_config", None)
@@ -1079,8 +1078,10 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
     except Exception:
         log.error("Failed to assign admin role to first user %s — aborting setup", user_id)
         # Roll back the user creation so setup can be retried
-        with contextlib.suppress(Exception):
+        try:
             storage.delete_user(user_id)
+        except Exception:
+            log.error("Failed to roll back user %s during setup abort", user_id, exc_info=True)
         return JSONResponse(
             {"error": "Failed to assign admin role. Ensure migrations have run."},
             status_code=503,
@@ -1092,8 +1093,10 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
         log.error(
             "First user %s has no permissions after role assignment — aborting setup", user_id
         )
-        with contextlib.suppress(Exception):
+        try:
             storage.delete_user(user_id)
+        except Exception:
+            log.error("Failed to roll back user %s during setup abort", user_id, exc_info=True)
         return JSONResponse(
             {"error": "Failed to load permissions. Ensure migrations have run."},
             status_code=503,
@@ -1229,8 +1232,10 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
             return RedirectResponse("/?oidc_error=Too+many+login+attempts", status_code=302)
 
     # Lazy cleanup of expired pending states
-    with contextlib.suppress(Exception):
+    try:
         storage.cleanup_expired_oidc_states(300)
+    except Exception:
+        log.debug("OIDC state cleanup failed", exc_info=True)
 
     def _record_oidc_failure() -> None:
         if login_limiter is not None:

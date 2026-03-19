@@ -3,11 +3,15 @@
 All functions maintain their existing signatures for consumers (session.py,
 server.py, cli.py). The actual storage implementation lives in
 ``turnstone.core.storage``.
+
+The no-raise contract is preserved — callers never see exceptions from this
+module.  All failures are logged so storage issues are visible in logs
+rather than silently swallowed.
 """
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
@@ -16,6 +20,8 @@ from turnstone.core.storage import get_storage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+log = logging.getLogger(__name__)
 
 
 def normalize_key(key: str) -> str:
@@ -37,7 +43,7 @@ def save_message(
     tool_calls: str | None = None,
 ) -> None:
     """Log a message to the conversations table."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().save_message(
             ws_id,
             role,
@@ -48,6 +54,8 @@ def save_message(
             provider_data,
             tool_calls=tool_calls,
         )
+    except Exception:
+        log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
 
 
 def load_messages(ws_id: str) -> list[dict[str, Any]]:
@@ -55,6 +63,7 @@ def load_messages(ws_id: str) -> list[dict[str, Any]]:
     try:
         return get_storage().load_messages(ws_id)
     except Exception:
+        log.warning("Failed to load messages for ws=%s", ws_id, exc_info=True)
         return []
 
 
@@ -70,22 +79,28 @@ def register_workstream(
     skill_version: int = 0,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().register_workstream(
             ws_id, node_id, name, state, skill_id=skill_id, skill_version=skill_version
         )
+    except Exception:
+        log.warning("Failed to register workstream ws=%s", ws_id, exc_info=True)
 
 
 def update_workstream_state(ws_id: str, state: str) -> None:
     """Update a workstream's state."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().update_workstream_state(ws_id, state)
+    except Exception:
+        log.warning("Failed to update workstream state ws=%s state=%s", ws_id, state, exc_info=True)
 
 
 def update_workstream_name(ws_id: str, name: str) -> None:
     """Update a workstream's display name."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().update_workstream_name(ws_id, name)
+    except Exception:
+        log.warning("Failed to update workstream name ws=%s", ws_id, exc_info=True)
 
 
 def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
@@ -93,6 +108,7 @@ def list_workstreams(node_id: str | None = None, limit: int = 100) -> list[Any]:
     try:
         return get_storage().list_workstreams(node_id, limit)
     except Exception:
+        log.warning("Failed to list workstreams", exc_info=True)
         return []
 
 
@@ -101,6 +117,7 @@ def list_workstreams_with_history(limit: int = 20) -> list[Any]:
     try:
         return get_storage().list_workstreams_with_history(limit)
     except Exception:
+        log.warning("Failed to list workstreams with history", exc_info=True)
         return []
 
 
@@ -109,6 +126,7 @@ def delete_workstream(ws_id: str) -> bool:
     try:
         return get_storage().delete_workstream(ws_id)
     except Exception:
+        log.warning("Failed to delete workstream ws=%s", ws_id, exc_info=True)
         return False
 
 
@@ -120,6 +138,7 @@ def prune_workstreams(
     try:
         orphans, stale = get_storage().prune_workstreams(retention_days)
     except Exception:
+        log.warning("Failed to prune workstreams", exc_info=True)
         return (0, 0)
 
     if log_fn and (orphans or stale):
@@ -140,6 +159,7 @@ def resolve_workstream(alias_or_id: str) -> str | None:
     try:
         return get_storage().resolve_workstream(alias_or_id)
     except Exception:
+        log.warning("Failed to resolve workstream alias=%s", alias_or_id, exc_info=True)
         return None
 
 
@@ -148,8 +168,10 @@ def resolve_workstream(alias_or_id: str) -> str | None:
 
 def save_workstream_config(ws_id: str, config: dict[str, str]) -> None:
     """Persist workstream configuration key/value pairs."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().save_workstream_config(ws_id, config)
+    except Exception:
+        log.warning("Failed to save workstream config ws=%s", ws_id, exc_info=True)
 
 
 def load_workstream_config(ws_id: str) -> dict[str, str]:
@@ -157,6 +179,7 @@ def load_workstream_config(ws_id: str) -> dict[str, str]:
     try:
         return get_storage().load_workstream_config(ws_id)
     except Exception:
+        log.warning("Failed to load workstream config ws=%s", ws_id, exc_info=True)
         return {}
 
 
@@ -168,6 +191,7 @@ def get_skill_by_name(name: str) -> dict[str, Any] | None:
     try:
         return get_storage().get_prompt_template_by_name(name)
     except Exception:
+        log.warning("Failed to get skill name=%s", name, exc_info=True)
         return None
 
 
@@ -176,6 +200,7 @@ def list_default_skills(org_id: str = "") -> list[dict[str, Any]]:
     try:
         return get_storage().list_default_templates(org_id)
     except Exception:
+        log.warning("Failed to list default skills", exc_info=True)
         return []
 
 
@@ -191,6 +216,7 @@ def list_skills_by_activation(
             activation, enabled_only=enabled_only, limit=limit
         )
     except Exception:
+        log.warning("Failed to list skills by activation=%s", activation, exc_info=True)
         return []
 
 
@@ -202,6 +228,7 @@ def set_workstream_alias(ws_id: str, alias: str) -> bool:
     try:
         return get_storage().set_workstream_alias(ws_id, alias)
     except Exception:
+        log.warning("Failed to set alias ws=%s alias=%s", ws_id, alias, exc_info=True)
         return False
 
 
@@ -210,13 +237,16 @@ def get_workstream_display_name(ws_id: str) -> str | None:
     try:
         return get_storage().get_workstream_display_name(ws_id)
     except Exception:
+        log.warning("Failed to get display name ws=%s", ws_id, exc_info=True)
         return None
 
 
 def update_workstream_title(ws_id: str, title: str) -> None:
     """Set or update the auto-generated title for a workstream."""
-    with contextlib.suppress(Exception):
+    try:
         get_storage().update_workstream_title(ws_id, title)
+    except Exception:
+        log.warning("Failed to update title ws=%s", ws_id, exc_info=True)
 
 
 # -- Conversation search -------------------------------------------------------
@@ -227,6 +257,7 @@ def search_history(query: str, limit: int = 20) -> list[Any]:
     try:
         return get_storage().search_history(query, limit)
     except Exception:
+        log.warning("Failed to search history", exc_info=True)
         return []
 
 
@@ -235,6 +266,7 @@ def search_history_recent(limit: int = 20) -> list[Any]:
     try:
         return get_storage().search_history_recent(limit)
     except Exception:
+        log.warning("Failed to search recent history", exc_info=True)
         return []
 
 
@@ -280,6 +312,7 @@ def save_structured_memory(
                 return existing["memory_id"], old_content
             return "", None
     except Exception:
+        log.warning("Failed to save structured memory name=%s", name, exc_info=True)
         return "", None
 
 
@@ -289,6 +322,7 @@ def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "
     try:
         return get_storage().delete_structured_memory(name, scope, scope_id)
     except Exception:
+        log.warning("Failed to delete structured memory name=%s", name, exc_info=True)
         return False
 
 
@@ -297,6 +331,7 @@ def delete_structured_memory_by_id(memory_id: str) -> bool:
     try:
         return get_storage().delete_structured_memory_by_id(memory_id)
     except Exception:
+        log.warning("Failed to delete structured memory id=%s", memory_id, exc_info=True)
         return False
 
 
@@ -312,6 +347,7 @@ def list_structured_memories(
             mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
         )
     except Exception:
+        log.warning("Failed to list structured memories", exc_info=True)
         return []
 
 
@@ -328,6 +364,7 @@ def search_structured_memories(
             query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
         )
     except Exception:
+        log.warning("Failed to search structured memories", exc_info=True)
         return []
 
 
@@ -338,4 +375,5 @@ def count_structured_memories(mem_type: str = "", scope: str = "", scope_id: str
             mem_type=mem_type, scope=scope, scope_id=scope_id
         )
     except Exception:
+        log.warning("Failed to count structured memories", exc_info=True)
         return 0

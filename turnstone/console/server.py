@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import functools
 import html
 import json
@@ -693,7 +692,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             if row:
                 fan_out = int(row["value"])
         except Exception:
-            pass
+            log.warning(
+                "Failed to read cluster.node_fan_out_limit, using default %d",
+                fan_out,
+                exc_info=True,
+            )
     app.state.fan_out_limit = fan_out
     app.state.proxy_client = httpx.AsyncClient(
         timeout=30,
@@ -3476,12 +3479,14 @@ async def _publish_config_change(request: Request) -> None:
 
     async def _notify(url: str) -> None:
         async with sem:
-            with contextlib.suppress(Exception):
+            try:
                 await client.post(
                     f"{url.rstrip('/')}/v1/api/_internal/config-reload",
                     headers=headers,
                     timeout=5.0,
                 )
+            except Exception:
+                log.warning("Config reload failed for %s", url, exc_info=True)
 
     nodes = collector.get_all_nodes()
     tasks = [_notify(n["server_url"]) for n in nodes if n.get("server_url")]
@@ -3983,7 +3988,11 @@ def _get_mcp_max_servers(request: Request) -> int:
             if row:
                 return int(row["value"])
         except Exception:
-            pass
+            log.warning(
+                "Failed to read cluster.mcp_max_servers, using default %d",
+                _MCP_MAX_SERVERS,
+                exc_info=True,
+            )
     return _MCP_MAX_SERVERS
 
 

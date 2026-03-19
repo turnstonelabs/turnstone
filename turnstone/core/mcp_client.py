@@ -1415,7 +1415,7 @@ def create_mcp_client(
             if rows:
                 db_names = {r["name"] for r in rows}
         except Exception:
-            pass
+            log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
     servers = load_mcp_config(config_path, storage=storage)
     if not servers:

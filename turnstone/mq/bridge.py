@@ -9,7 +9,6 @@ Run as: ``turnstone-bridge --server-url http://localhost:8080``
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -800,11 +799,13 @@ class Bridge:
                 with self._lock:
                     self._pending_plan_reviews.pop(ws_id, None)
                 # Best-effort rejection so the server doesn't hang
-                with contextlib.suppress(Exception):
+                try:
                     self._http.post(
                         "/v1/api/plan",
                         json={"feedback": "reject", "ws_id": ws_id},
                     )
+                except Exception:
+                    log.warning("Failed to reject plan for ws=%s", ws_id, exc_info=True)
                 raise
 
         threading.Thread(target=self._run_in_context(_wait_plan), daemon=True).start()
@@ -938,9 +939,11 @@ def _iter_sse_data(resp: httpx.Response) -> Iterator[dict[str, Any]]:
     source = EventSource(resp)
     for sse in source.iter_sse():
         if sse.data:
-            with contextlib.suppress(json.JSONDecodeError):
+            try:
                 data: dict[str, Any] = json.loads(sse.data)
                 yield data
+            except json.JSONDecodeError:
+                log.debug("Skipping malformed SSE data: %.200s", sse.data)
 
 
 # ---------------------------------------------------------------------------

@@ -431,7 +431,7 @@ class WebUI:
                     cache_read_tokens=cache_read,
                 )
         except Exception:
-            pass  # Non-critical — never break the response pipeline
+            log.warning("Failed to record usage event", exc_info=True)
 
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
@@ -1747,7 +1747,7 @@ def _global_fanout_thread(
                 with contextlib.suppress(queue.Full):
                     lq.put_nowait(event)  # drop if a listener is backed up
         except Exception:
-            pass
+            log.debug("Global fan-out error", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

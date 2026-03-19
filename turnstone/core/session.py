@@ -3497,8 +3497,10 @@ class ChatSession:
                     assert proc.stdout is not None
                     for line in proc.stdout:
                         stdout_parts.append(line)
-                        with contextlib.suppress(Exception):
+                        try:
                             self.ui.on_tool_output_chunk(call_id, line)
+                        except Exception:
+                            log.debug("UI callback error during tool output", exc_info=True)
                         # Check cancellation during long-running commands
                         if self._cancel_event.is_set():
                             with contextlib.suppress(OSError, ProcessLookupError):
