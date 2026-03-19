@@ -394,7 +394,7 @@ Idle workstreams are automatically cleaned up after 2 hours (configurable). In m
 - `turnstone_judge_llm_latency_seconds` — LLM judge evaluation latency histogram
 - `turnstone_judge_enabled` — whether the intent validation judge is active (0/1)
 
-Per-workstream metrics are labeled by `ws_id` (bounded to 10 max workstreams).
+Per-workstream metrics are labeled by `ws_id` (bounded by `[server].max_workstreams`).
 
 ### Health & Rate Limiting
 
