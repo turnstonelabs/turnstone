@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import html
 import json
@@ -682,9 +683,23 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Create async HTTP clients for proxy routes.  Auth headers are NOT baked
     # in — _proxy_auth_headers() injects a fresh token per-request so JWTs
     # auto-rotate via ServiceTokenManager instead of expiring after 1 hour.
+    # Size the pool above the fan-out limit to leave headroom for non-fan-out
+    # proxy traffic (UI proxying, SSE streams, etc.).
+    fan_out = _NODE_FAN_OUT_LIMIT
+    storage = getattr(app.state, "auth_storage", None)
+    if storage:
+        try:
+            row = storage.get_system_setting("cluster.node_fan_out_limit")
+            if row:
+                fan_out = int(row["value"])
+        except Exception:
+            pass
     app.state.proxy_client = httpx.AsyncClient(
         timeout=30,
-        limits=httpx.Limits(max_connections=250, max_keepalive_connections=50),
+        limits=httpx.Limits(
+            max_connections=fan_out + 50,
+            max_keepalive_connections=min(fan_out // 4, 100),
+        ),
     )
     app.state.proxy_sse_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
@@ -3453,31 +3468,32 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _publish_config_change(request: Request, *, key: str, node_id: str, action: str) -> None:
-    """Fan out config-reload to all known server nodes (best-effort).
+async def _publish_config_change(request: Request, *, key: str, node_id: str, action: str) -> None:
+    """Fan out config-reload to all known server nodes (best-effort, async).
 
-    Uses the collector's node registry and the existing proxy auth
-    mechanism — no MQ dependency.
+    Uses the collector's node registry, the shared async proxy client,
+    and bounded concurrency via the fan-out semaphore.
     """
-    import contextlib
-
-    import httpx
-
     collector = getattr(request.app.state, "collector", None)
     if not collector:
         return
+    client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
-    with contextlib.suppress(Exception):
-        nodes = collector.get_all_nodes()
-        for node in nodes:
-            url = node.get("server_url", "")
-            if url:
-                with contextlib.suppress(Exception):
-                    httpx.post(
-                        f"{url.rstrip('/')}/v1/api/_internal/config-reload",
-                        headers=headers,
-                        timeout=5.0,
-                    )
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+
+    async def _notify(url: str) -> None:
+        async with sem:
+            with contextlib.suppress(Exception):
+                await client.post(
+                    f"{url.rstrip('/')}/v1/api/_internal/config-reload",
+                    headers=headers,
+                    timeout=5.0,
+                )
+
+    nodes = collector.get_all_nodes()
+    tasks = [_notify(n["server_url"]) for n in nodes if n.get("server_url")]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def admin_list_settings(request: Request) -> JSONResponse:
@@ -3633,7 +3649,7 @@ async def admin_update_setting(request: Request) -> JSONResponse:
         ip,
     )
 
-    _publish_config_change(request, key=key, node_id=node_id, action="set")
+    await _publish_config_change(request, key=key, node_id=node_id, action="set")
 
     return JSONResponse(
         {
@@ -3688,7 +3704,7 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
         ip,
     )
 
-    _publish_config_change(request, key=key, node_id=node_id, action="delete")
+    await _publish_config_change(request, key=key, node_id=node_id, action="delete")
 
     return JSONResponse({"status": "ok", "key": key})
 

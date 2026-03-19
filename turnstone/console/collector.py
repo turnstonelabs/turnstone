@@ -412,9 +412,12 @@ class ClusterCollector:
         }
 
     def get_nodes(
-        self, sort_by: str = "activity", limit: int = 100, offset: int = 0
+        self, sort_by: str = "activity", limit: int | None = 100, offset: int = 0
     ) -> tuple[list[dict[str, Any]], int]:
-        """Return sorted, paginated node list with per-node counts."""
+        """Return sorted, paginated node list with per-node counts.
+
+        Pass ``limit=None`` to return all nodes (no pagination).
+        """
         with self._lock:
             items = []
             for node in self._nodes.values():
@@ -462,11 +465,13 @@ class ClusterCollector:
         elif sort_by == "name":
             items.sort(key=lambda n: n["node_id"])
 
+        if limit is None:
+            return items[offset:], total
         return items[offset : offset + limit], total
 
     def get_all_nodes(self) -> list[dict[str, Any]]:
         """Return all nodes without pagination (for fan-out operations)."""
-        nodes, _ = self.get_nodes(sort_by="activity", limit=2**31, offset=0)
+        nodes, _ = self.get_nodes(sort_by="activity", limit=None)
         return nodes
 
     def get_workstreams(

@@ -229,11 +229,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "Max concurrent outbound requests during cluster-wide operations",
             "cluster",
             min_value=10,
-            max_value=1000,
+            max_value=500,
+            restart_required=True,
             help="Controls how many nodes the console queries in parallel during "
             "fan-out operations (watch listing, MCP status, reload notifications). "
             "Higher values speed up large-cluster admin operations at the cost of "
-            "more concurrent connections.",
+            "more concurrent connections. The httpx proxy pool is sized to match "
+            "this value (requires console restart to take effect).",
         ),
         SettingDef(
             "cluster.mcp_max_servers",

@@ -1823,7 +1823,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         app.state.mcp_client.shutdown()
     if app.state.registry:
         app.state.registry.shutdown()
-    app.state.sse_executor.shutdown(wait=False)
+    app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
