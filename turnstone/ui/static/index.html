@@ -71,7 +71,7 @@
   </div>
 </div>
 
-<div id="messages" role="log" aria-live="polite" aria-label="Chat messages"></div>
+<div id="split-root"></div>
 
 <!-- New workstream modal -->
 <div id="new-ws-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-ws-title">
@@ -104,12 +104,6 @@
   </div>
 </div>
 
-<div id="input-area">
-  <textarea id="input" rows="1" placeholder="Type a message... (Shift+Enter for newline)" aria-label="Message input"></textarea>
-  <button id="send-btn" onclick="sendMessage()">Send</button>
-  <button id="stop-btn" onclick="cancelGeneration()" style="display:none" aria-label="Stop generation">&#9632; Stop</button>
-</div>
-
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 window.TURNSTONE_AUTH_TITLE = "turnstone";
@@ -119,6 +113,12 @@ window.TURNSTONE_KB_SHORTCUTS = [
     { desc: "New workstream", badge: '<span class="kb-key">Ctrl+T</span>' },
     { desc: "Close workstream", badge: '<span class="kb-key">Ctrl+W</span>' },
     { desc: "Switch to tab 1\u20139", badge: '<span class="kb-key">Ctrl+1</span>\u2026<span class="kb-key">9</span>' }
+  ]},
+  { title: "Split panes", keys: [
+    { desc: "Split right", badge: '<span class="kb-key">Ctrl+\\</span>' },
+    { desc: "Split down", badge: '<span class="kb-key">Ctrl+Shift+\\</span>' },
+    { desc: "Close pane", badge: '<span class="kb-key">Ctrl+Shift+W</span>' },
+    { desc: "Cycle pane focus", badge: '<span class="kb-key">Ctrl+Alt+\u2190</span> <span class="kb-key">\u2192</span>' }
   ]},
   { title: "Tool approval", keys: [
     { desc: "Approve", badge: '<span class="kb-key">y</span> / <span class="kb-key">Enter</span>' },

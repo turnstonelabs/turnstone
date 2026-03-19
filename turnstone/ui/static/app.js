@@ -1,38 +1,1607 @@
-const messagesEl = document.getElementById("messages");
-const inputEl = document.getElementById("input");
-const sendBtn = document.getElementById("send-btn");
-const stopBtn = document.getElementById("stop-btn");
-const statusBar = document.getElementById("status-bar");
-const modelName = document.getElementById("model-name");
-const tabBar = document.getElementById("tab-bar");
-const newTabBtn = document.getElementById("new-tab-btn");
+// ===========================================================================
+//  turnstone server UI — app.js
+//  Split-pane layout with per-workstream Pane instances and binary layout tree
+// ===========================================================================
 
-let currentAssistantEl = null;
-let currentReasoningEl = null;
-let isThinking = false;
-let busy = false;
-let pendingApproval = false;
-let approvalBlockEl = null;
+// ===========================================================================
+//  1. Pane class — per-workstream UI state
+// ===========================================================================
 
-function setBusy(b) {
-  busy = b;
-  sendBtn.disabled = b;
-  sendBtn.style.display = b ? "none" : "";
-  stopBtn.style.display = b ? "" : "none";
-  stopBtn.disabled = !b;
+var _paneCounter = 0;
+
+function Pane(wsId) {
+  this.id = "p" + ++_paneCounter;
+  this.wsId = wsId || null;
+  this.evtSource = null;
+  this.el = null;
+  this.headerEl = null;
+  this.messagesEl = null;
+  this.inputEl = null;
+  this.sendBtn = null;
+  this.stopBtn = null;
+  this.currentAssistantEl = null;
+  this.currentReasoningEl = null;
+  this.contentBuffer = "";
+  this.busy = false;
+  this.isThinking = false;
+  this.pendingApproval = false;
+  this.approvalBlockEl = null;
+  this.retryDelay = 1000;
+  this.model = "";
+  this.modelAlias = "";
+  this.statusText = "";
+  this._createDOM();
 }
 
-// --- Workstream state ---
-let workstreams = {}; // ws_id -> {name, state}
-let currentWsId = null;
-let contentEvtSource = null;
-let globalEvtSource = null;
-let contentBuffer = "";
-let contentRetryDelay = 1000;
-let globalRetryDelay = 1000;
-let dashboardVisible = false;
-let _historyNavigation = false; // true while popstate is driving navigation
-let _lastHealth = null;
+Pane.prototype._createDOM = function () {
+  var self = this;
+
+  this.el = document.createElement("div");
+  this.el.className = "pane";
+  this.el.dataset.paneId = this.id;
+
+  // Focus on mousedown (before child clicks)
+  this.el.addEventListener("mousedown", function () {
+    setFocusedPane(self.id);
+  });
+
+  // Right-click context menu for split/close actions
+  this.el.addEventListener("contextmenu", function (e) {
+    // Only show on the pane background, messages, or input area — not on
+    // elements that have their own context menus (text selections, links)
+    var sel = window.getSelection();
+    if (sel && sel.toString().length > 0) return; // let browser handle text selection
+    e.preventDefault();
+    setFocusedPane(self.id);
+    showPaneContextMenu(e.clientX, e.clientY, self.id);
+  });
+
+  // Pane header (visible only in multi-pane mode)
+  this.headerEl = document.createElement("div");
+  this.headerEl.className = "pane-header";
+
+  var wsName = document.createElement("span");
+  wsName.className = "pane-ws-name";
+  wsName.textContent = this.wsId
+    ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
+      this.wsId.substring(0, 8)
+    : "";
+  this.headerEl.appendChild(wsName);
+
+  var actions = document.createElement("div");
+  actions.className = "pane-actions";
+
+  var splitRightBtn = document.createElement("button");
+  splitRightBtn.className = "pane-action-btn";
+  splitRightBtn.title = "Split right";
+  splitRightBtn.setAttribute("aria-label", "Split right");
+  splitRightBtn.textContent = "\u2502";
+  splitRightBtn.onclick = function (e) {
+    e.stopPropagation();
+    splitPane(self.id, "horizontal");
+  };
+  actions.appendChild(splitRightBtn);
+
+  var splitDownBtn = document.createElement("button");
+  splitDownBtn.className = "pane-action-btn";
+  splitDownBtn.title = "Split down";
+  splitDownBtn.setAttribute("aria-label", "Split down");
+  splitDownBtn.textContent = "\u2500";
+  splitDownBtn.onclick = function (e) {
+    e.stopPropagation();
+    splitPane(self.id, "vertical");
+  };
+  actions.appendChild(splitDownBtn);
+
+  var closeBtn = document.createElement("button");
+  closeBtn.className = "pane-action-btn pane-close-btn";
+  closeBtn.title = "Close pane";
+  closeBtn.setAttribute("aria-label", "Close pane");
+  closeBtn.textContent = "\u00d7";
+  closeBtn.onclick = function (e) {
+    e.stopPropagation();
+    if (countLeaves(splitRoot) > 1) closePane(self.id);
+  };
+  actions.appendChild(closeBtn);
+
+  this.headerEl.appendChild(actions);
+  this.el.appendChild(this.headerEl);
+
+  // Messages area
+  this.messagesEl = document.createElement("div");
+  this.messagesEl.className = "pane-messages";
+  this.messagesEl.setAttribute("role", "log");
+  this.messagesEl.setAttribute("aria-live", "polite");
+  this.messagesEl.setAttribute("aria-label", "Chat messages");
+  this.el.appendChild(this.messagesEl);
+
+  // Input area
+  var inputArea = document.createElement("div");
+  inputArea.className = "pane-input-area";
+
+  this.inputEl = document.createElement("textarea");
+  this.inputEl.className = "pane-input";
+  this.inputEl.rows = 1;
+  this.inputEl.placeholder = "Type a message\u2026 (Shift+Enter for newline)";
+  this.inputEl.setAttribute("aria-label", "Message input");
+  this.inputEl.addEventListener("input", function () {
+    self._autoResize();
+  });
+  this.inputEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      self.sendMessage();
+    }
+  });
+  inputArea.appendChild(this.inputEl);
+
+  this.sendBtn = document.createElement("button");
+  this.sendBtn.className = "pane-send";
+  this.sendBtn.textContent = "Send";
+  this.sendBtn.onclick = function () {
+    self.sendMessage();
+  };
+  inputArea.appendChild(this.sendBtn);
+
+  this.stopBtn = document.createElement("button");
+  this.stopBtn.className = "pane-stop";
+  this.stopBtn.style.display = "none";
+  this.stopBtn.textContent = "\u25a0 Stop";
+  this.stopBtn.setAttribute("aria-label", "Stop generation");
+  this.stopBtn.onclick = function () {
+    self.cancelGeneration();
+  };
+  inputArea.appendChild(this.stopBtn);
+
+  this.el.appendChild(inputArea);
+};
+
+Pane.prototype.reset = function () {
+  this.currentAssistantEl = null;
+  this.currentReasoningEl = null;
+  this.contentBuffer = "";
+  this.setBusy(false);
+  this.pendingApproval = false;
+  this.approvalBlockEl = null;
+  this.inputEl.disabled = false;
+};
+
+Pane.prototype.updateWsName = function () {
+  var nameEl = this.headerEl.querySelector(".pane-ws-name");
+  if (nameEl) {
+    nameEl.textContent = this.wsId
+      ? (workstreams[this.wsId] && workstreams[this.wsId].name) ||
+        this.wsId.substring(0, 8)
+      : "";
+  }
+};
+
+Pane.prototype.disconnectSSE = function () {
+  if (this.evtSource) {
+    this.evtSource.close();
+    this.evtSource = null;
+  }
+};
+
+Pane.prototype.setBusy = function (b) {
+  this.busy = b;
+  this.sendBtn.disabled = b;
+  this.sendBtn.style.display = b ? "none" : "";
+  this.stopBtn.style.display = b ? "" : "none";
+  this.stopBtn.disabled = !b;
+};
+
+Pane.prototype.showEmptyState = function () {
+  if (!this.messagesEl.querySelector(".empty-state")) {
+    var el = document.createElement("div");
+    el.className = "empty-state";
+    el.textContent = "Type a message to start";
+    this.messagesEl.appendChild(el);
+  }
+};
+
+Pane.prototype.removeEmptyState = function () {
+  var el = this.messagesEl.querySelector(".empty-state");
+  if (el) el.remove();
+};
+
+Pane.prototype.connectSSE = function (wsId) {
+  var self = this;
+  this.disconnectSSE();
+  this.wsId = wsId;
+
+  this.evtSource = new EventSource(
+    "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
+  );
+
+  this.evtSource.onopen = function () {
+    self.retryDelay = 1000;
+    if (self.id === focusedPaneId) {
+      var statusBar = document.getElementById("status-bar");
+      statusBar.classList.remove("disconnected");
+      statusBar.textContent = self.statusText || "";
+    }
+  };
+
+  this.evtSource.onmessage = function (e) {
+    var data = JSON.parse(e.data);
+    self.handleEvent(data);
+  };
+
+  this.evtSource.onerror = function () {
+    self.evtSource.close();
+    self.evtSource = null;
+    var loginOverlay = document.getElementById("login-overlay");
+    if (loginOverlay && loginOverlay.style.display !== "none") return;
+    if (self.id === focusedPaneId) {
+      var statusBar = document.getElementById("status-bar");
+      statusBar.textContent = "Reconnecting\u2026";
+      statusBar.classList.add("disconnected");
+    }
+    // Only the focused pane refreshes the global workstream list to avoid
+    // race conditions when multiple panes disconnect simultaneously.
+    if (self.id === focusedPaneId) {
+      fetch("/v1/api/workstreams")
+        .then(function (r) {
+          if (r.status === 401) {
+            showLogin();
+            return;
+          }
+          return r.json().then(function (data) {
+            workstreams = {};
+            (data.workstreams || []).forEach(function (ws) {
+              workstreams[ws.id] = { name: ws.name, state: ws.state };
+            });
+            renderTabBar();
+            // Reconnect all disconnected panes, reassigning stale ws_ids
+            for (var pid in panes) {
+              var p = panes[pid];
+              if (p.wsId && !workstreams[p.wsId]) {
+                var ids = Object.keys(workstreams);
+                if (ids.length) {
+                  p.wsId = ids[0];
+                  p.messagesEl.innerHTML = "";
+                  p.showEmptyState();
+                  p.updateWsName();
+                } else {
+                  showDashboard();
+                  return;
+                }
+              }
+              if (pid === focusedPaneId) currentWsId = p.wsId;
+              if (!p.evtSource) {
+                setTimeout(
+                  (function (pp) {
+                    return function () {
+                      pp.connectSSE(pp.wsId);
+                    };
+                  })(p),
+                  self.retryDelay,
+                );
+              }
+            }
+            self.retryDelay = Math.min(self.retryDelay * 2, 30000);
+          });
+        })
+        .catch(function () {
+          setTimeout(function () {
+            self.connectSSE(self.wsId);
+          }, self.retryDelay);
+          self.retryDelay = Math.min(self.retryDelay * 2, 30000);
+        });
+    } else {
+      // Non-focused pane: just retry own connection after delay
+      setTimeout(function () {
+        self.connectSSE(self.wsId);
+      }, self.retryDelay);
+      self.retryDelay = Math.min(self.retryDelay * 2, 30000);
+    }
+  };
+};
+
+Pane.prototype.handleEvent = function (evt) {
+  var self = this;
+  switch (evt.type) {
+    case "thinking_start":
+      this.isThinking = true;
+      this.setBusy(true);
+      this.removeEmptyState();
+      this.addThinkingIndicator();
+      break;
+
+    case "thinking_stop":
+      this.isThinking = false;
+      this.removeThinkingIndicator();
+      break;
+
+    case "reasoning":
+      this.removeThinkingIndicator();
+      if (!this.currentReasoningEl) {
+        this.currentReasoningEl = document.createElement("div");
+        this.currentReasoningEl.className = "msg msg-assistant reasoning";
+        this.messagesEl.appendChild(this.currentReasoningEl);
+      }
+      this.currentReasoningEl.textContent += evt.text;
+      this.scrollToBottom();
+      break;
+
+    case "content":
+      this.removeThinkingIndicator();
+      if (this.currentReasoningEl) {
+        this.currentReasoningEl = null;
+      }
+      if (!this.currentAssistantEl) {
+        this.currentAssistantEl = document.createElement("div");
+        this.currentAssistantEl.className = "msg msg-assistant";
+        this.messagesEl.appendChild(this.currentAssistantEl);
+      }
+      this.contentBuffer += evt.text;
+      this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer);
+      this.scrollToBottom();
+      break;
+
+    case "stream_end":
+      if (this.currentAssistantEl && this.contentBuffer) {
+        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer);
+        postRenderMarkdown(this.currentAssistantEl);
+      }
+      this.currentAssistantEl = null;
+      this.currentReasoningEl = null;
+      this.contentBuffer = "";
+      this.setBusy(false);
+      this.inputEl.focus();
+      this.scrollToBottom(true);
+      break;
+
+    case "tool_info":
+      this.showInlineToolBlock(evt.items, true);
+      break;
+
+    case "approve_request":
+      this.showInlineToolBlock(evt.items, false, evt.judge_pending);
+      break;
+
+    case "intent_verdict":
+      this.updateVerdictBadge(evt);
+      break;
+
+    case "output_warning":
+      this.showOutputWarning(evt);
+      break;
+
+    case "approval_resolved":
+      this.resolveApproval(evt.approved, false, evt.feedback, true);
+      break;
+
+    case "tool_output_chunk":
+      this.appendToolOutputChunk(evt.call_id || "", evt.chunk);
+      break;
+
+    case "tool_result":
+      this.appendToolOutput(evt.call_id || "", evt.name, evt.output);
+      break;
+
+    case "status":
+      this.updateStatus(evt);
+      break;
+
+    case "plan_review":
+      showPlanDialog(evt.content);
+      break;
+
+    case "info":
+      this.addInfoMessage(evt.message);
+      break;
+
+    case "error":
+      this.addErrorMessage(evt.message);
+      this.setBusy(false);
+      break;
+
+    case "busy_error":
+      this.addErrorMessage(evt.message);
+      this.setBusy(false);
+      break;
+
+    case "cancelled":
+      this.currentAssistantEl = null;
+      this.currentReasoningEl = null;
+      this.contentBuffer = "";
+      this.setBusy(false);
+      this.inputEl.focus();
+      this.scrollToBottom(true);
+      break;
+
+    case "connected":
+      this.model = evt.model || "";
+      this.modelAlias = evt.model_alias || evt.model || "";
+      if (this.id === focusedPaneId) {
+        updateHeaderForFocusedPane();
+      }
+      if (evt.skip_permissions) {
+        var existing = document.querySelector(".skip-permissions-warning");
+        if (!existing) {
+          var warn = document.createElement("div");
+          warn.className = "skip-permissions-warning";
+          warn.textContent =
+            "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
+          document.getElementById("header").appendChild(warn);
+        }
+      }
+      break;
+
+    case "history":
+      this.replayHistory(evt.messages);
+      break;
+
+    case "clear_ui":
+      this.messagesEl.innerHTML = "";
+      break;
+  }
+};
+
+Pane.prototype.addThinkingIndicator = function () {
+  if (this.messagesEl.querySelector(".thinking-indicator")) return;
+  var el = document.createElement("div");
+  el.className = "thinking-indicator";
+  el.textContent = "Thinking";
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom();
+};
+
+Pane.prototype.removeThinkingIndicator = function () {
+  var el = this.messagesEl.querySelector(".thinking-indicator");
+  if (el) el.remove();
+};
+
+Pane.prototype.addUserMessage = function (text) {
+  this.removeEmptyState();
+  var el = document.createElement("div");
+  el.className = "msg msg-user";
+  el.textContent = text;
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom(true);
+};
+
+Pane.prototype.replayHistory = function (messages) {
+  var self = this;
+  this.messagesEl.innerHTML = "";
+  if (!messages.length) {
+    this.showEmptyState();
+    return;
+  }
+  var lastToolBlock = null;
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    if (msg.role === "user") {
+      this.addUserMessage(msg.content || "");
+      lastToolBlock = null;
+    } else if (msg.role === "assistant") {
+      if (msg.tool_calls && msg.tool_calls.length) {
+        if (msg.pending) {
+          lastToolBlock = null;
+        } else {
+          var wasDenied = !!msg.denied;
+          var block = document.createElement("div");
+          block.className =
+            "msg approval-block " + (wasDenied ? "denied" : "approved");
+          msg.tool_calls.forEach(function (tc) {
+            var div = document.createElement("div");
+            div.className = "approval-tool";
+            div.dataset.funcName = tc.name;
+            div.dataset.callId = tc.id || "";
+            var nameEl = document.createElement("div");
+            nameEl.className = "tool-name";
+            nameEl.textContent = tc.name;
+            div.appendChild(nameEl);
+            var cmd = document.createElement("div");
+            cmd.className = "tool-cmd";
+            try {
+              var args = JSON.parse(tc.arguments);
+              var preview = Object.values(args)[0] || "";
+              if (tc.name === "bash") {
+                cmd.innerHTML =
+                  '<span class="dollar">$ </span>' +
+                  escapeHtml(String(preview));
+              } else {
+                cmd.textContent = String(preview).substring(0, 200);
+              }
+            } catch (e) {
+              cmd.textContent = tc.arguments.substring(0, 100);
+            }
+            div.appendChild(cmd);
+            block.appendChild(div);
+          });
+          var badge = document.createElement("div");
+          badge.setAttribute("role", "status");
+          if (wasDenied) {
+            badge.className = "approval-badge badge-denied";
+            badge.textContent = "\u2717 denied";
+          } else {
+            badge.className = "approval-badge badge-approved";
+            badge.textContent = "\u2713 approved";
+          }
+          block.appendChild(badge);
+          self.messagesEl.appendChild(block);
+          lastToolBlock = block;
+        }
+      }
+      if (msg.content) {
+        var el = document.createElement("div");
+        el.className = "msg msg-assistant";
+        el.innerHTML = renderMarkdown(msg.content);
+        postRenderMarkdown(el);
+        self.messagesEl.appendChild(el);
+        lastToolBlock = null;
+      }
+    } else if (msg.role === "tool") {
+      if (lastToolBlock) {
+        var stripped = stripAnsi(msg.content || "").trim();
+        var isDenied =
+          msg.denied ||
+          /^Denied by user/.test(stripped) ||
+          /^Blocked/.test(stripped);
+        if (stripped && !isDenied) {
+          var out = document.createElement("div");
+          out.className = "tool-output";
+          out.textContent = stripped;
+          if (stripped.split("\n").length > 10) {
+            makeCollapsible(out);
+          }
+          var bdg = lastToolBlock.querySelector(".approval-badge");
+          if (bdg) lastToolBlock.insertBefore(out, bdg);
+          else lastToolBlock.appendChild(out);
+        }
+      }
+    }
+  }
+  this.scrollToBottom();
+};
+
+Pane.prototype.showInlineToolBlock = function (
+  items,
+  autoApproved,
+  judgePending,
+) {
+  var self = this;
+  var block = document.createElement("div");
+  block.className = "msg approval-block" + (autoApproved ? " approved" : "");
+  if (!autoApproved) {
+    block.setAttribute("role", "alertdialog");
+    block.setAttribute("aria-label", "Tool approval required");
+  }
+
+  // Track the highest-priority recommendation for glow
+  var glowRec = null;
+
+  items.forEach(function (item) {
+    block.appendChild(buildToolDiv(item));
+    // Render verdict badge if present
+    if (item.verdict) {
+      block.insertAdjacentHTML(
+        "beforeend",
+        renderVerdictBadge(item.verdict, judgePending),
+      );
+      var rec = item.verdict.recommendation || "review";
+      if (
+        !glowRec ||
+        rec === "deny" ||
+        (rec === "review" && glowRec === "approve")
+      ) {
+        glowRec = rec;
+      }
+    }
+  });
+
+  if (autoApproved) {
+    var badge = document.createElement("div");
+    badge.setAttribute("role", "status");
+    badge.className = "approval-badge badge-approved";
+    badge.textContent = "\u2713 auto-approved";
+    block.appendChild(badge);
+  } else {
+    var prompt = document.createElement("div");
+    prompt.className = "approval-prompt";
+
+    // Apply verdict glow on initial heuristic verdict
+    if (glowRec) {
+      if (glowRec === "approve") prompt.classList.add("verdict-glow-approve");
+      else if (glowRec === "deny") prompt.classList.add("verdict-glow-deny");
+      else prompt.classList.add("verdict-glow-review");
+    }
+
+    var alwaysNames = items
+      .filter(function (it) {
+        return (
+          it.needs_approval &&
+          it.func_name &&
+          it.func_name !== "__budget_override__" &&
+          !it.error
+        );
+      })
+      .map(function (it) {
+        return it.approval_label || it.func_name;
+      });
+    block.dataset.alwaysNames = JSON.stringify(alwaysNames);
+    var alwaysTitle = alwaysNames.length
+      ? "Always approve " + alwaysNames.join(", ")
+      : "Always approve this tool type";
+
+    var actionsDiv = document.createElement("div");
+    actionsDiv.className = "approval-actions";
+
+    var approveBtn = document.createElement("button");
+    approveBtn.className = "approval-btn btn-approve";
+    approveBtn.innerHTML = '<span class="key">y</span> Approve';
+    approveBtn.onclick = function () {
+      self.resolveApproval(true, false, self.getFeedback());
+    };
+    actionsDiv.appendChild(approveBtn);
+
+    var denyBtn = document.createElement("button");
+    denyBtn.className = "approval-btn btn-deny";
+    denyBtn.innerHTML = '<span class="key">n</span> Deny';
+    denyBtn.onclick = function () {
+      self.resolveApproval(false, false, self.getFeedback());
+    };
+    actionsDiv.appendChild(denyBtn);
+
+    if (alwaysNames.length) {
+      var alwaysBtn = document.createElement("button");
+      alwaysBtn.className = "approval-btn btn-always";
+      alwaysBtn.title = alwaysTitle;
+      alwaysBtn.setAttribute("aria-label", alwaysTitle);
+      alwaysBtn.innerHTML = '<span class="key">a</span> Always';
+      alwaysBtn.onclick = function () {
+        self.resolveApproval(true, true, self.getFeedback());
+      };
+      actionsDiv.appendChild(alwaysBtn);
+    }
+
+    prompt.appendChild(actionsDiv);
+
+    var fbInput = document.createElement("input");
+    fbInput.type = "text";
+    fbInput.className = "approval-feedback-input";
+    fbInput.placeholder = "feedback (optional)";
+    prompt.appendChild(fbInput);
+
+    block.appendChild(prompt);
+    this.pendingApproval = true;
+    this.approvalBlockEl = block;
+    this.inputEl.disabled = true;
+    this.sendBtn.disabled = true;
+    requestAnimationFrame(function () {
+      fbInput.focus();
+    });
+  }
+
+  this.messagesEl.appendChild(block);
+  this.scrollToBottom();
+};
+
+Pane.prototype.resolveApproval = function (
+  approved,
+  always,
+  feedback,
+  skipPost,
+) {
+  if (!this.approvalBlockEl) return;
+  this.pendingApproval = false;
+
+  // Remove prompt
+  var prompt = this.approvalBlockEl.querySelector(".approval-prompt");
+  if (prompt) prompt.remove();
+
+  // Add badge
+  var badge = document.createElement("div");
+  badge.setAttribute("role", "status");
+  if (approved) {
+    badge.className = "approval-badge badge-approved";
+    var label = "\u2713 approved";
+    if (always) {
+      var raw = this.approvalBlockEl.dataset.alwaysNames;
+      var names = raw ? JSON.parse(raw) : [];
+      label = names.length
+        ? "\u2713 always approve " + names.join(", ")
+        : "\u2713 always approve";
+    }
+    badge.textContent = feedback ? label + ": " + feedback : label;
+    this.approvalBlockEl.classList.add("approved");
+  } else {
+    badge.className = "approval-badge badge-denied";
+    badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
+    this.approvalBlockEl.classList.add("denied");
+  }
+  this.approvalBlockEl.appendChild(badge);
+  this.approvalBlockEl = null;
+
+  // Re-enable input
+  this.inputEl.disabled = false;
+  this.sendBtn.disabled = this.busy;
+  this.inputEl.focus();
+
+  // POST to server with ws_id (skip when server already resolved, e.g. timeout)
+  if (!skipPost) {
+    var self = this;
+    authFetch("/v1/api/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        approved: approved,
+        feedback: feedback || null,
+        always: !!always,
+        ws_id: this.wsId,
+      }),
+    }).catch(function (err) {
+      self.addErrorMessage("Connection error: " + err.message);
+    });
+  }
+
+  this.scrollToBottom();
+};
+
+Pane.prototype.getFeedback = function () {
+  if (!this.approvalBlockEl) return null;
+  var inp = this.approvalBlockEl.querySelector(".approval-feedback-input");
+  return inp && inp.value.trim() ? inp.value.trim() : null;
+};
+
+Pane.prototype.appendToolOutputChunk = function (callId, chunk) {
+  if (!chunk) return;
+  var stripped = stripAnsi(chunk);
+  if (!stripped) return;
+
+  var escapedId = callId ? CSS.escape(callId) : "";
+  var el = escapedId
+    ? this.messagesEl.querySelector(
+        '.tool-output-stream[data-call-id="' + escapedId + '"]',
+      )
+    : null;
+  if (!el) {
+    var target = escapedId
+      ? this.messagesEl.querySelector(
+          '.approval-tool[data-call-id="' + escapedId + '"]',
+        )
+      : null;
+    if (!target) {
+      var blocks = this.messagesEl.querySelectorAll(".approval-block");
+      if (!blocks.length) return;
+      var block = blocks[blocks.length - 1];
+      var tools = block.querySelectorAll(
+        '.approval-tool[data-func-name="bash"]',
+      );
+      target = tools.length ? tools[tools.length - 1] : null;
+      if (!target) {
+        var allTools = block.querySelectorAll(".approval-tool");
+        target = allTools.length ? allTools[allTools.length - 1] : null;
+      }
+    }
+    if (!target) return;
+
+    el = document.createElement("pre");
+    el.className = "tool-output tool-output-stream";
+    el.dataset.callId = callId;
+    el.setAttribute("aria-label", "Streaming command output");
+    el.setAttribute("aria-live", "off");
+    el.textContent = "";
+    target.after(el);
+  }
+
+  el.appendChild(document.createTextNode(stripped));
+  el.scrollTop = el.scrollHeight;
+  this.scrollToBottom();
+};
+
+Pane.prototype.appendToolOutput = function (callId, name, output) {
+  var escapedId = callId ? CSS.escape(callId) : "";
+  var target = escapedId
+    ? this.messagesEl.querySelector(
+        '.approval-tool[data-call-id="' + escapedId + '"]',
+      )
+    : null;
+  if (!target) {
+    var blocks = this.messagesEl.querySelectorAll(".approval-block");
+    if (!blocks.length) return;
+    var block = blocks[blocks.length - 1];
+    var tools = block.querySelectorAll(".approval-tool");
+    for (var i = tools.length - 1; i >= 0; i--) {
+      if (tools[i].dataset.funcName === name) {
+        target = tools[i];
+        break;
+      }
+    }
+    if (!target && tools.length) target = tools[tools.length - 1];
+  }
+  if (!target) return;
+
+  // Remove the streaming output element for this tool
+  var streamEl = null;
+  if (escapedId) {
+    streamEl = this.messagesEl.querySelector(
+      '.tool-output-stream[data-call-id="' + escapedId + '"]',
+    );
+  } else {
+    var next = target.nextElementSibling;
+    if (next && next.classList.contains("tool-output-stream")) {
+      streamEl = next;
+    }
+  }
+  if (streamEl) streamEl.remove();
+
+  var stripped = stripAnsi(output || "").trim();
+  if (!stripped) return;
+
+  var out = document.createElement("div");
+  out.className = "tool-output";
+  out.textContent = stripped;
+
+  if (stripped.split("\n").length > 10) {
+    makeCollapsible(out);
+  }
+
+  target.after(out);
+  this.scrollToBottom();
+};
+
+Pane.prototype.showOutputWarning = function (evt) {
+  if (!evt.call_id || evt.risk_level === "none") return;
+  var escapedId = CSS.escape(evt.call_id);
+  var toolDiv = this.messagesEl.querySelector(
+    '.approval-tool[data-call-id="' + escapedId + '"]',
+  );
+  if (!toolDiv) return;
+  var risk = evt.risk_level || "medium";
+  var flags = evt.flags || [];
+  var warning = document.createElement("div");
+  warning.className = "output-warning output-warning-" + risk;
+  warning.setAttribute("role", "alert");
+  warning.innerHTML =
+    '<span class="output-warning-label">\u26a0 ' +
+    escapeHtml(risk.toUpperCase()) +
+    "</span> " +
+    flags.map(escapeHtml).join(", ");
+  if (evt.redacted) {
+    warning.innerHTML +=
+      ' <span class="output-warning-redacted">(credentials redacted)</span>';
+  }
+  var nextEl = toolDiv.nextElementSibling;
+  if (nextEl && nextEl.classList.contains("tool-output")) {
+    nextEl.insertAdjacentElement("afterend", warning);
+  } else {
+    toolDiv.insertAdjacentElement("afterend", warning);
+  }
+};
+
+Pane.prototype.updateVerdictBadge = function (verdict) {
+  if (!verdict || !verdict.call_id) return;
+  var escapedId = CSS.escape(verdict.call_id);
+  var badge = this.messagesEl.querySelector(
+    '.verdict-badge[data-call-id="' + escapedId + '"]',
+  );
+  if (!badge) return;
+
+  var risk = verdict.risk_level || "medium";
+  badge.className = "verdict-badge verdict-" + risk;
+
+  var riskEl = badge.querySelector(".verdict-risk");
+  var recEl = badge.querySelector(".verdict-rec");
+  var confEl = badge.querySelector(".verdict-conf");
+  if (riskEl) riskEl.textContent = risk.toUpperCase();
+  if (recEl) recEl.textContent = verdict.recommendation || "review";
+  if (confEl)
+    confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
+
+  var spinner = badge.querySelector(".verdict-judge-spinner");
+  if (spinner) spinner.remove();
+
+  var detail = badge.nextElementSibling;
+  if (detail && detail.classList.contains("verdict-detail")) {
+    var summaryEl = detail.querySelector(".verdict-summary");
+    var reasonEl = detail.querySelector(".verdict-reasoning");
+    var tierEl = detail.querySelector(".verdict-tier");
+    if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
+    if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
+    if (tierEl)
+      tierEl.textContent =
+        (verdict.tier || "llm") +
+        " tier" +
+        (verdict.judge_model ? " | " + verdict.judge_model : "");
+    var evidenceEl = detail.querySelector(".verdict-evidence");
+    if (verdict.evidence && verdict.evidence.length) {
+      if (!evidenceEl) {
+        evidenceEl = document.createElement("div");
+        evidenceEl.className = "verdict-evidence";
+        var tierDiv = detail.querySelector(".verdict-tier");
+        if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
+        else detail.appendChild(evidenceEl);
+      }
+      evidenceEl.innerHTML = verdict.evidence
+        .map(function (e) {
+          return "<div>\u2022 " + escapeHtml(e) + "</div>";
+        })
+        .join("");
+    } else if (evidenceEl) {
+      evidenceEl.remove();
+    }
+  }
+
+  this.updateVerdictGlow(verdict.recommendation);
+};
+
+Pane.prototype.updateVerdictGlow = function (recommendation) {
+  if (!this.approvalBlockEl) return;
+  var prompt = this.approvalBlockEl.querySelector(".approval-prompt");
+  if (!prompt) return;
+  prompt.classList.remove(
+    "verdict-glow-approve",
+    "verdict-glow-deny",
+    "verdict-glow-review",
+  );
+  if (recommendation === "approve")
+    prompt.classList.add("verdict-glow-approve");
+  else if (recommendation === "deny") prompt.classList.add("verdict-glow-deny");
+  else prompt.classList.add("verdict-glow-review");
+};
+
+Pane.prototype.addInfoMessage = function (text) {
+  var el = document.createElement("div");
+  el.className = "msg msg-info";
+  el.textContent = stripAnsi(text);
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom();
+};
+
+Pane.prototype.addErrorMessage = function (text) {
+  var el = document.createElement("div");
+  el.className = "msg msg-error";
+  el.setAttribute("role", "alert");
+  el.textContent = stripAnsi(text);
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom();
+};
+
+Pane.prototype.updateStatus = function (evt) {
+  var parts = [
+    evt.total_tokens.toLocaleString() +
+      " / " +
+      evt.context_window.toLocaleString() +
+      " tokens (" +
+      evt.pct +
+      "%)",
+  ];
+  if (evt.effort !== "medium") parts.push("reasoning: " + evt.effort);
+  this.statusText = parts.join(" \u00b7 ");
+  if (this.id === focusedPaneId) {
+    document.getElementById("status-bar").textContent = this.statusText;
+  }
+};
+
+Pane.prototype.isNearBottom = function () {
+  return (
+    this.messagesEl.scrollHeight -
+      this.messagesEl.scrollTop -
+      this.messagesEl.clientHeight <
+    80
+  );
+};
+
+Pane.prototype.scrollToBottom = function (force) {
+  if (force || this.isNearBottom()) {
+    this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+  }
+};
+
+Pane.prototype.sendMessage = function () {
+  var text = this.inputEl.value.trim();
+  if (!text || this.busy) return;
+
+  if (text.startsWith("/")) {
+    authFetch("/v1/api/command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: text, ws_id: this.wsId }),
+    });
+    this.addUserMessage(text);
+    this.inputEl.value = "";
+    this._autoResize();
+    return;
+  }
+
+  var self = this;
+  this.setBusy(true);
+  this.addUserMessage(text);
+  this.inputEl.value = "";
+  this._autoResize();
+
+  authFetch("/v1/api/send", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message: text, ws_id: this.wsId }),
+  }).catch(function (err) {
+    self.addErrorMessage("Connection error: " + err.message);
+    self.setBusy(false);
+  });
+};
+
+Pane.prototype.cancelGeneration = function () {
+  if (!this.busy || !this.wsId) return;
+  var self = this;
+  this.stopBtn.disabled = true;
+  authFetch("/v1/api/cancel", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ws_id: this.wsId }),
+  }).catch(function (err) {
+    self.addErrorMessage("Cancel error: " + err.message);
+    self.stopBtn.disabled = false;
+  });
+};
+
+Pane.prototype._autoResize = function () {
+  this.inputEl.style.height = "auto";
+  this.inputEl.style.height = Math.min(this.inputEl.scrollHeight, 200) + "px";
+};
+
+// ===========================================================================
+//  2. Layout tree + rendering
+// ===========================================================================
+
+var panes = {};
+var focusedPaneId = null;
+var splitRoot = null;
+var MAX_PANES = 6;
+
+function getFocusedPane() {
+  return panes[focusedPaneId] || null;
+}
+
+function setFocusedPane(paneId) {
+  if (focusedPaneId === paneId) return;
+  // Remove focused class from old pane
+  if (focusedPaneId && panes[focusedPaneId]) {
+    panes[focusedPaneId].el.classList.remove("focused");
+  }
+  focusedPaneId = paneId;
+  if (panes[paneId]) {
+    panes[paneId].el.classList.add("focused");
+    currentWsId = panes[paneId].wsId;
+    renderTabBar();
+    updateHeaderForFocusedPane();
+  }
+}
+
+function createPane(wsId) {
+  var p = new Pane(wsId);
+  panes[p.id] = p;
+  return p;
+}
+
+function updateHeaderForFocusedPane() {
+  var pane = getFocusedPane();
+  var modelName = document.getElementById("model-name");
+  var statusBar = document.getElementById("status-bar");
+  if (pane) {
+    modelName.textContent = pane.modelAlias || pane.model || "";
+    modelName.title = pane.model || "";
+    statusBar.textContent = pane.statusText || "";
+  }
+}
+
+function updatePaneHeaders() {
+  var root = document.getElementById("split-root");
+  var leafCount = countLeaves(splitRoot);
+  if (leafCount > 1) {
+    root.classList.add("multi-pane");
+  } else {
+    root.classList.remove("multi-pane");
+  }
+}
+
+// --- Tree helpers ---
+
+function findLeafAndParent(node, paneId, parent, childIndex) {
+  if (!node) return null;
+  if (node.type === "leaf") {
+    if (node.pane.id === paneId) {
+      return { node: node, parent: parent, childIndex: childIndex };
+    }
+    return null;
+  }
+  // split
+  for (var i = 0; i < node.children.length; i++) {
+    var result = findLeafAndParent(node.children[i], paneId, node, i);
+    if (result) return result;
+  }
+  return null;
+}
+
+function countLeaves(node) {
+  if (!node) return 0;
+  if (node.type === "leaf") return 1;
+  var count = 0;
+  for (var i = 0; i < node.children.length; i++) {
+    count += countLeaves(node.children[i]);
+  }
+  return count;
+}
+
+function getFirstLeaf(node) {
+  if (!node) return null;
+  if (node.type === "leaf") return node.pane;
+  return getFirstLeaf(node.children[0]);
+}
+
+function replaceNode(tree, target, replacement) {
+  if (tree === target) return replacement;
+  if (tree.type === "split") {
+    for (var i = 0; i < tree.children.length; i++) {
+      if (tree.children[i] === target) {
+        tree.children[i] = replacement;
+        return tree;
+      }
+      var result = replaceNode(tree.children[i], target, replacement);
+      if (result !== tree.children[i]) {
+        tree.children[i] = result;
+        return tree;
+      }
+    }
+  }
+  return tree;
+}
+
+function splitPane(paneId, direction) {
+  if (countLeaves(splitRoot) >= MAX_PANES) return;
+  // Guard: viewport too narrow/short to fit another pane
+  var root = document.getElementById("split-root");
+  var minDim = direction === "horizontal" ? 200 : 150;
+  var available =
+    direction === "horizontal" ? root.clientWidth : root.clientHeight;
+  if (available < minDim * 2 + 4) {
+    showToast("Not enough space to split");
+    return;
+  }
+  var found = findLeafAndParent(splitRoot, paneId, null, -1);
+  if (!found) return;
+
+  // Find a workstream not already shown in any pane
+  var wsIds = Object.keys(workstreams);
+  var newWsId = null;
+  for (var i = 0; i < wsIds.length; i++) {
+    var inUse = false;
+    for (var pid in panes) {
+      if (panes[pid].wsId === wsIds[i]) {
+        inUse = true;
+        break;
+      }
+    }
+    if (!inUse) {
+      newWsId = wsIds[i];
+      break;
+    }
+  }
+  if (!newWsId) {
+    showToast("No unused workstreams \u2014 create one first");
+    return;
+  }
+
+  var newPane = createPane(newWsId);
+  var newLeaf = { type: "leaf", pane: newPane };
+  var newSplit = {
+    type: "split",
+    direction: direction,
+    children: [found.node, newLeaf],
+    ratio: 0.5,
+  };
+
+  splitRoot = replaceNode(splitRoot, found.node, newSplit);
+  renderLayout();
+  setFocusedPane(newPane.id);
+  newPane.showEmptyState();
+  newPane.connectSSE(newWsId);
+}
+
+function closePane(paneId) {
+  if (countLeaves(splitRoot) <= 1) return;
+  var found = findLeafAndParent(splitRoot, paneId, null, -1);
+  if (!found || !found.parent) {
+    // paneId is the root leaf — shouldn't happen if count > 1
+    // but handle: root must be a split
+    if (splitRoot.type === "split") {
+      // Find which child contains our pane
+      for (var ci = 0; ci < splitRoot.children.length; ci++) {
+        var childFound = findLeafAndParent(
+          splitRoot.children[ci],
+          paneId,
+          splitRoot,
+          ci,
+        );
+        if (childFound) {
+          found = childFound;
+          break;
+        }
+      }
+    }
+    if (!found || !found.parent) return;
+  }
+
+  // Sibling is the other child
+  var siblingIdx = found.childIndex === 0 ? 1 : 0;
+  var sibling = found.parent.children[siblingIdx];
+
+  // Replace parent split with sibling
+  splitRoot = replaceNode(splitRoot, found.parent, sibling);
+
+  // Cleanup the closed pane
+  var closedPane = panes[paneId];
+  if (closedPane) {
+    closedPane.disconnectSSE();
+    delete panes[paneId];
+  }
+
+  // If focused pane was closed, focus first available
+  if (focusedPaneId === paneId) {
+    var first = getFirstLeaf(splitRoot);
+    if (first) {
+      focusedPaneId = null; // reset so setFocusedPane triggers
+      setFocusedPane(first.id);
+    }
+  }
+
+  renderLayout();
+}
+
+function renderLayout() {
+  var root = document.getElementById("split-root");
+
+  // Save scroll positions before clearing
+  var scrollPositions = {};
+  for (var pid in panes) {
+    scrollPositions[pid] = panes[pid].messagesEl.scrollTop;
+  }
+
+  // Clear and rebuild
+  root.innerHTML = "";
+  if (splitRoot) {
+    _renderLayoutNode(splitRoot, root);
+  }
+
+  // Restore scroll positions
+  for (var pid2 in panes) {
+    if (scrollPositions[pid2] !== undefined) {
+      panes[pid2].messagesEl.scrollTop = scrollPositions[pid2];
+    }
+  }
+
+  updatePaneHeaders();
+  saveLayout();
+}
+
+function _renderLayoutNode(node, container) {
+  if (node.type === "leaf") {
+    container.appendChild(node.pane.el);
+    return;
+  }
+
+  // split node
+  var splitContainer = document.createElement("div");
+  splitContainer.className = "split-container split-" + node.direction;
+
+  var child0 = document.createElement("div");
+  child0.className = "split-child";
+  child0.style.flex = String(node.ratio);
+  _renderLayoutNode(node.children[0], child0);
+  splitContainer.appendChild(child0);
+
+  var handle = document.createElement("div");
+  handle.className = "split-handle";
+  splitContainer.appendChild(handle);
+
+  var child1 = document.createElement("div");
+  child1.className = "split-child";
+  child1.style.flex = String(1 - node.ratio);
+  _renderLayoutNode(node.children[1], child1);
+  splitContainer.appendChild(child1);
+
+  container.appendChild(splitContainer);
+  setupDragHandle(handle, node, [child0, child1]);
+}
+
+function setupDragHandle(handle, node, children) {
+  handle.addEventListener("pointerdown", function (e) {
+    if (e.button !== 0 && e.pointerType === "mouse") return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("dragging");
+    var startRatio = node.ratio;
+    var container = handle.parentElement;
+    var startPos = node.direction === "horizontal" ? e.clientX : e.clientY;
+    var totalSize =
+      node.direction === "horizontal"
+        ? container.clientWidth
+        : container.clientHeight;
+    document.body.style.cursor =
+      node.direction === "horizontal" ? "col-resize" : "row-resize";
+    document.body.style.userSelect = "none";
+
+    var onMove = function (e2) {
+      var delta =
+        (node.direction === "horizontal" ? e2.clientX : e2.clientY) - startPos;
+      var newRatio = Math.max(
+        0.1,
+        Math.min(0.9, startRatio + delta / totalSize),
+      );
+      node.ratio = newRatio;
+      children[0].style.flex = String(newRatio);
+      children[1].style.flex = String(1 - newRatio);
+    };
+    var onUp = function () {
+      handle.classList.remove("dragging");
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+      handle.removeEventListener("pointercancel", onUp);
+      saveLayout();
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
+  });
+}
+
+// ===========================================================================
+//  3. Layout persistence
+// ===========================================================================
+
+function serializeLayout(node) {
+  if (!node) return null;
+  if (node.type === "leaf") {
+    return { type: "leaf", wsId: node.pane.wsId };
+  }
+  return {
+    type: "split",
+    direction: node.direction,
+    ratio: node.ratio,
+    children: [
+      serializeLayout(node.children[0]),
+      serializeLayout(node.children[1]),
+    ],
+  };
+}
+
+function deserializeLayout(data, _seen) {
+  if (!_seen) _seen = {};
+  if (!data) return null;
+  if (data.type === "leaf") {
+    if (!data.wsId || !workstreams[data.wsId] || _seen[data.wsId]) return null;
+    _seen[data.wsId] = true;
+    var p = createPane(data.wsId);
+    return { type: "leaf", pane: p };
+  }
+  if (data.type === "split") {
+    var left = deserializeLayout(data.children[0], _seen);
+    var right = deserializeLayout(data.children[1], _seen);
+    if (!left && !right) return null;
+    if (!left) return right;
+    if (!right) return left;
+    return {
+      type: "split",
+      direction: data.direction || "horizontal",
+      ratio: data.ratio || 0.5,
+      children: [left, right],
+    };
+  }
+  return null;
+}
+
+function saveLayout() {
+  try {
+    var data = serializeLayout(splitRoot);
+    if (data) {
+      localStorage.setItem("turnstone_split_layout", JSON.stringify(data));
+    }
+  } catch (e) {
+    // localStorage may be unavailable
+  }
+}
+
+function restoreLayout() {
+  try {
+    var raw = localStorage.getItem("turnstone_split_layout");
+    if (!raw) return false;
+    var data = JSON.parse(raw);
+    var tree = deserializeLayout(data);
+    if (!tree) return false;
+    splitRoot = tree;
+    var first = getFirstLeaf(splitRoot);
+    if (first) {
+      setFocusedPane(first.id);
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ===========================================================================
+//  3b. Pane context menu
+// ===========================================================================
+
+var _ctxMenu = null;
+var _ctxCloseHandler = null;
+var _ctxTriggerElement = null;
+
+function showPaneContextMenu(x, y, paneId) {
+  closePaneContextMenu();
+  _ctxTriggerElement = document.activeElement;
+
+  var menu = document.createElement("div");
+  menu.className = "pane-ctx-menu";
+  menu.setAttribute("role", "menu");
+  menu.setAttribute("aria-label", "Pane actions");
+  menu.addEventListener("contextmenu", function (e) {
+    e.preventDefault();
+  });
+
+  var canClose = splitRoot && countLeaves(splitRoot) > 1;
+  // Can split only if under pane limit AND there's an unused workstream
+  var usedWs = {};
+  for (var pid in panes) usedWs[panes[pid].wsId] = true;
+  var hasUnused = Object.keys(workstreams).some(function (id) {
+    return !usedWs[id];
+  });
+  var canSplit = countLeaves(splitRoot) < MAX_PANES && hasUnused;
+
+  var items = [
+    {
+      label: "Split Right",
+      key: "Ctrl+\\",
+      disabled: !canSplit,
+      action: function () {
+        splitPane(paneId, "horizontal");
+      },
+    },
+    {
+      label: "Split Down",
+      key: "Ctrl+Shift+\\",
+      disabled: !canSplit,
+      action: function () {
+        splitPane(paneId, "vertical");
+      },
+    },
+    { separator: true },
+    {
+      label: "Close Pane",
+      key: "Ctrl+Shift+W",
+      disabled: !canClose,
+      action: function () {
+        closePane(paneId);
+      },
+    },
+  ];
+
+  items.forEach(function (item) {
+    if (item.separator) {
+      var sep = document.createElement("div");
+      sep.className = "pane-ctx-sep";
+      sep.setAttribute("role", "separator");
+      menu.appendChild(sep);
+      return;
+    }
+    var btn = document.createElement("button");
+    btn.className = "pane-ctx-item";
+    btn.setAttribute("role", "menuitem");
+    btn.setAttribute("tabindex", "-1");
+    btn.disabled = !!item.disabled;
+    var labelSpan = document.createElement("span");
+    labelSpan.className = "pane-ctx-label";
+    labelSpan.textContent = item.label;
+    btn.appendChild(labelSpan);
+    if (item.key) {
+      var keySpan = document.createElement("span");
+      keySpan.className = "pane-ctx-key";
+      keySpan.textContent = item.key;
+      btn.appendChild(keySpan);
+    }
+    btn.onclick = function () {
+      closePaneContextMenu();
+      item.action();
+    };
+    menu.appendChild(btn);
+  });
+
+  // Position: ensure menu stays within viewport
+  document.body.appendChild(menu);
+  var rect = menu.getBoundingClientRect();
+  var mx = x;
+  var my = y;
+  if (mx + rect.width > window.innerWidth)
+    mx = window.innerWidth - rect.width - 4;
+  if (my + rect.height > window.innerHeight)
+    my = window.innerHeight - rect.height - 4;
+  if (mx < 0) mx = 4;
+  if (my < 0) my = 4;
+  menu.style.left = mx + "px";
+  menu.style.top = my + "px";
+  _ctxMenu = menu;
+
+  // Close on click outside, Escape, Tab; arrow key navigation
+  _ctxCloseHandler = function (e) {
+    if (e.type === "keydown") {
+      if (e.key === "Escape" || e.key === "Tab") {
+        e.preventDefault();
+        closePaneContextMenu();
+      } else if (
+        e.key === "ArrowDown" ||
+        e.key === "ArrowUp" ||
+        e.key === "Home" ||
+        e.key === "End"
+      ) {
+        e.preventDefault();
+        var btns = Array.from(
+          menu.querySelectorAll(".pane-ctx-item:not(:disabled)"),
+        );
+        if (!btns.length) return;
+        var idx = btns.indexOf(document.activeElement);
+        if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
+        else if (e.key === "ArrowUp")
+          btns[(idx - 1 + btns.length) % btns.length].focus();
+        else if (e.key === "Home") btns[0].focus();
+        else if (e.key === "End") btns[btns.length - 1].focus();
+      }
+    } else if (e.type === "mousedown" && !menu.contains(e.target)) {
+      closePaneContextMenu();
+    }
+  };
+  setTimeout(function () {
+    document.addEventListener("mousedown", _ctxCloseHandler);
+    document.addEventListener("keydown", _ctxCloseHandler);
+    // Focus first enabled item
+    var first = menu.querySelector(".pane-ctx-item:not(:disabled)");
+    if (first) first.focus();
+  }, 0);
+}
+
+function closePaneContextMenu() {
+  if (_ctxMenu) {
+    _ctxMenu.remove();
+    _ctxMenu = null;
+  }
+  if (_ctxCloseHandler) {
+    document.removeEventListener("mousedown", _ctxCloseHandler);
+    document.removeEventListener("keydown", _ctxCloseHandler);
+    _ctxCloseHandler = null;
+  }
+  if (_ctxTriggerElement && document.contains(_ctxTriggerElement)) {
+    _ctxTriggerElement.focus();
+    _ctxTriggerElement = null;
+  }
+}
+
+// ===========================================================================
+//  4. Global state
+// ===========================================================================
+
+var workstreams = {};
+var currentWsId = null;
+var globalEvtSource = null;
+var globalRetryDelay = 1000;
+var dashboardVisible = false;
+var _historyNavigation = false;
+var _lastHealth = null;
+
+var STATE_DISPLAY = {
+  running: { symbol: "\u25b8", label: "run" },
+  thinking: { symbol: "\u25cc", label: "think" },
+  attention: { symbol: "\u25c6", label: "attn" },
+  idle: { symbol: "\u00b7", label: "idle" },
+  error: { symbol: "\u2716", label: "err" },
+};
+
+// ===========================================================================
+//  5. Health polling
+// ===========================================================================
 
 function pollHealth() {
   authFetch("/health")
@@ -96,63 +1665,34 @@ function pollHealth() {
 }
 setInterval(pollHealth, 30000);
 
-// --- Shared hooks ---
+// ===========================================================================
+//  6. Auth hooks
+// ===========================================================================
+
 window.onLoginSuccess = function () {
-  authFetch("/v1/api/workstreams")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      data.workstreams.forEach(function (ws) {
-        workstreams[ws.id] = { name: ws.name, state: ws.state };
-      });
-      var wsIds = Object.keys(workstreams);
-      if (wsIds.length) {
-        currentWsId = wsIds[0];
-        renderTabBar();
-      }
-      connectGlobalSSE();
-      var params = new URLSearchParams(location.search);
-      var targetWs = params.get("ws_id");
-      if (targetWs && workstreams[targetWs]) {
-        history.replaceState(
-          { turnstone: "workstream", wsId: targetWs },
-          "",
-          location.pathname,
-        );
-        _historyNavigation = true;
-        try {
-          switchTab(targetWs);
-        } finally {
-          _historyNavigation = false;
-        }
-      } else {
-        if (currentWsId) connectContentSSE(currentWsId);
-        history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
-        showDashboard();
-      }
-    });
+  initWorkstreams();
 };
+
 window.onLogout = function () {
-  if (contentEvtSource) {
-    contentEvtSource.close();
-    contentEvtSource = null;
+  for (var id in panes) {
+    panes[id].disconnectSSE();
+    delete panes[id];
   }
+  splitRoot = null;
+  focusedPaneId = null;
+  workstreams = {};
+  currentWsId = null;
+  document.getElementById("split-root").innerHTML = "";
   if (globalEvtSource) {
     globalEvtSource.close();
     globalEvtSource = null;
   }
 };
 
-// --- Dashboard helpers ---
-var STATE_DISPLAY = {
-  running: { symbol: "\u25b8", label: "run" },
-  thinking: { symbol: "\u25cc", label: "think" },
-  attention: { symbol: "\u25c6", label: "attn" },
-  idle: { symbol: "\u00b7", label: "idle" },
-  error: { symbol: "\u2716", label: "err" },
-};
-// --- Theme hooks ---
+// ===========================================================================
+//  7. Theme + hamburger menu
+// ===========================================================================
+
 function updateThemeMenuItem() {
   var isLight = document.documentElement.dataset.theme === "light";
   document.getElementById("theme-menu-icon").textContent = isLight
@@ -176,7 +1716,6 @@ window.onThemeChange = function () {
 };
 updateThemeMenuItem();
 
-// --- Hamburger menu ---
 function toggleHamburger() {
   var menu = document.getElementById("hamburger-menu");
   var btn = document.getElementById("hamburger-btn");
@@ -184,7 +1723,6 @@ function toggleHamburger() {
   btn.setAttribute("aria-expanded", open ? "true" : "false");
   if (open) {
     updateThemeMenuItem();
-    // Focus first item
     var first = menu.querySelector(".hmenu-item");
     if (first) first.focus();
   }
@@ -203,6 +1741,7 @@ function hamburgerTheme() {
   toggleTheme();
   closeHamburger();
 }
+
 // Close on outside click
 document.addEventListener("click", function (e) {
   var wrap = document.getElementById("hamburger-wrap");
@@ -247,10 +1786,14 @@ document
     }
   });
 
-// === Tab / Workstream management ===
+// ===========================================================================
+//  8. Tab bar
+// ===========================================================================
+
+var tabBar = document.getElementById("tab-bar");
+var newTabBtn = document.getElementById("new-tab-btn");
 
 function renderTabBar() {
-  // Remove existing tabs (keep the + button)
   tabBar.querySelectorAll(".ws-tab").forEach(function (t) {
     t.remove();
   });
@@ -286,7 +1829,6 @@ function renderTabBar() {
     name.textContent = ws.name || wsId.substring(0, 6);
     tab.appendChild(name);
 
-    // Close button (only if more than one tab)
     if (wsIds.length > 1) {
       var close = document.createElement("button");
       close.className = "tab-close";
@@ -306,13 +1848,11 @@ function renderTabBar() {
 function updateTabIndicator(wsId, state, extra) {
   workstreams[wsId] = workstreams[wsId] || {};
   workstreams[wsId].state = state;
-  // Update tab bar indicator
   var tab = tabBar.querySelector('.ws-tab[data-ws-id="' + wsId + '"]');
   if (tab) {
     var ind = tab.querySelector(".tab-indicator");
     if (ind) ind.dataset.state = state;
   }
-  // Update dashboard table row if dashboard is open
   var row = document.querySelector(
     '#dash-ws-table .dash-row[data-ws-id="' + wsId + '"]',
   );
@@ -355,32 +1895,38 @@ function updateTabIndicator(wsId, state, extra) {
 }
 
 function switchTab(wsId) {
-  if (wsId === currentWsId && !dashboardVisible) return;
+  var pane = getFocusedPane();
+  if (!pane) return;
+  if (wsId === pane.wsId && !dashboardVisible) return;
 
-  // Reset current tab state
-  currentAssistantEl = null;
-  currentReasoningEl = null;
-  contentBuffer = "";
-  setBusy(false);
-  pendingApproval = false;
-  approvalBlockEl = null;
-  inputEl.disabled = false;
+  // In multi-pane mode, focus an existing pane showing this ws
+  if (splitRoot && countLeaves(splitRoot) > 1) {
+    for (var pid in panes) {
+      if (panes[pid].wsId === wsId && pid !== focusedPaneId) {
+        setFocusedPane(pid);
+        return;
+      }
+    }
+  }
 
+  pane.reset();
+  pane.wsId = wsId;
   currentWsId = wsId;
-  messagesEl.innerHTML = "";
-  showEmptyState();
+  pane.messagesEl.innerHTML = "";
+  pane.showEmptyState();
+  pane.updateWsName();
   renderTabBar();
-  connectContentSSE(wsId);
+  pane.connectSSE(wsId);
 
-  // Push history entry so back button can retrace tab navigation.
   if (!_historyNavigation) {
     history.pushState({ turnstone: "workstream", wsId: wsId }, "");
   }
 }
 
-// ---------------------------------------------------------------------------
-// New workstream modal
-// ---------------------------------------------------------------------------
+// ===========================================================================
+//  9. New workstream modal
+// ===========================================================================
+
 var _newWsTrapHandler = null;
 
 function newWorkstream() {
@@ -392,18 +1938,15 @@ function showNewWsModal() {
   overlay.style.display = "flex";
   document.body.style.overflow = "hidden";
 
-  // Backdrop click to dismiss
   overlay.onclick = function (e) {
     if (e.target === overlay) hideNewWsModal();
   };
 
-  // Populate model placeholder from header
   var curModel = document.getElementById("model-name").textContent;
   var modelInput = document.getElementById("new-ws-model");
   modelInput.placeholder = curModel || "Default model";
   modelInput.value = "";
 
-  // Populate skill dropdown
   var tplSelect = document.getElementById("new-ws-skill");
   tplSelect.innerHTML = '<option value="">Use defaults</option>';
   authFetch("/v1/api/skills")
@@ -422,10 +1965,9 @@ function showNewWsModal() {
       });
     })
     .catch(function () {
-      /* ignore — defaults still work */
+      /* ignore */
     });
 
-  // Reset form
   document.getElementById("new-ws-name").value = "";
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
@@ -434,11 +1976,9 @@ function showNewWsModal() {
   submitBtn.disabled = false;
   submitBtn.textContent = "Create";
 
-  // Wire buttons
   document.getElementById("new-ws-cancel").onclick = hideNewWsModal;
   submitBtn.onclick = submitNewWs;
 
-  // Focus trap
   _newWsTrapHandler = function (e) {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -537,6 +2077,60 @@ function submitNewWs() {
     });
 }
 
+function _reassignPanesForClosedWs(closedWsId) {
+  var remaining = Object.keys(workstreams);
+  // Collect panes showing the closed ws
+  var affected = [];
+  for (var pid in panes) {
+    if (panes[pid].wsId === closedWsId) affected.push(pid);
+  }
+  if (!affected.length) return;
+
+  // Build set of ws_ids already shown by non-affected panes
+  var usedWsIds = {};
+  for (var pid2 in panes) {
+    if (affected.indexOf(pid2) === -1) usedWsIds[panes[pid2].wsId] = true;
+  }
+
+  for (var i = 0; i < affected.length; i++) {
+    var p = panes[affected[i]];
+    // Find an unused ws_id for this pane
+    var newWsId = null;
+    for (var j = 0; j < remaining.length; j++) {
+      if (!usedWsIds[remaining[j]]) {
+        newWsId = remaining[j];
+        break;
+      }
+    }
+    if (newWsId) {
+      // Reassign pane to an unused workstream
+      p.disconnectSSE();
+      p.wsId = newWsId;
+      p.messagesEl.innerHTML = "";
+      p.showEmptyState();
+      p.updateWsName();
+      p.connectSSE(newWsId);
+      usedWsIds[newWsId] = true;
+    } else if (countLeaves(splitRoot) > 1) {
+      // No unused workstream available — close redundant pane
+      closePane(affected[i]);
+    } else {
+      // Last pane — reassign to first remaining ws (will duplicate, but no choice)
+      p.disconnectSSE();
+      if (remaining.length) {
+        p.wsId = remaining[0];
+        p.messagesEl.innerHTML = "";
+        p.showEmptyState();
+        p.updateWsName();
+        p.connectSSE(remaining[0]);
+      }
+    }
+  }
+  if (focusedPaneId && panes[focusedPaneId]) {
+    currentWsId = panes[focusedPaneId].wsId;
+  }
+}
+
 function closeWorkstream(wsId) {
   authFetch("/v1/api/workstreams/close", {
     method: "POST",
@@ -549,125 +2143,46 @@ function closeWorkstream(wsId) {
     .then(function (data) {
       if (data.status === "ok") {
         delete workstreams[wsId];
-        if (wsId === currentWsId) {
-          var remaining = Object.keys(workstreams);
-          if (remaining.length) switchTab(remaining[0]);
-        } else {
-          renderTabBar();
-        }
+        renderTabBar();
+        _reassignPanesForClosedWs(wsId);
+        if (!Object.keys(workstreams).length) showDashboard();
       }
     });
 }
 
-// === SSE connections ===
+// ===========================================================================
+//  10. Dashboard
+// ===========================================================================
 
-function connectContentSSE(wsId) {
-  if (contentEvtSource) {
-    contentEvtSource.close();
-    contentEvtSource = null;
-  }
-  contentEvtSource = new EventSource(
-    "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
-  );
-  contentEvtSource.onopen = function () {
-    contentRetryDelay = 1000;
-    statusBar.classList.remove("disconnected");
-    statusBar.textContent = "";
-  };
-  contentEvtSource.onmessage = function (e) {
-    var data = JSON.parse(e.data);
-    handleEvent(data);
-  };
-  contentEvtSource.onerror = function () {
-    contentEvtSource.close();
-    contentEvtSource = null;
-    var loginOverlay = document.getElementById("login-overlay");
-    if (loginOverlay && loginOverlay.style.display !== "none") return;
-    statusBar.textContent = "Reconnecting\u2026";
-    statusBar.classList.add("disconnected");
-    // Raw fetch (not authFetch) — need to inspect status before throwing
-    fetch("/v1/api/workstreams")
-      .then(function (r) {
-        if (r.status === 401) {
-          showLogin();
-          return;
-        }
-        return r.json().then(function (data) {
-          // Replace workstream list — IDs may have changed after restart
-          var freshIds = {};
-          workstreams = {};
-          (data.workstreams || []).forEach(function (ws) {
-            workstreams[ws.id] = { name: ws.name, state: ws.state };
-            freshIds[ws.id] = true;
-          });
-          // Always re-render tabs since workstreams map was replaced
-          renderTabBar();
-          // If current ws_id is stale, switch to first available
-          if (currentWsId && !freshIds[currentWsId]) {
-            var ids = Object.keys(freshIds);
-            if (ids.length) {
-              switchTab(ids[0]);
-            } else {
-              showDashboard();
-            }
-            return; // switchTab/showDashboard handles SSE connection
-          }
-          setTimeout(function () {
-            connectContentSSE(currentWsId);
-          }, contentRetryDelay);
-          contentRetryDelay = Math.min(contentRetryDelay * 2, 30000);
-        });
-      })
-      .catch(function () {
-        setTimeout(function () {
-          connectContentSSE(currentWsId);
-        }, contentRetryDelay);
-        contentRetryDelay = Math.min(contentRetryDelay * 2, 30000);
-      });
-  };
-}
-
-function showEmptyState() {
-  if (!messagesEl.querySelector(".empty-state")) {
-    var el = document.createElement("div");
-    el.className = "empty-state";
-    el.textContent = "Type a message to start";
-    messagesEl.appendChild(el);
-  }
-}
-function removeEmptyState() {
-  var el = messagesEl.querySelector(".empty-state");
-  if (el) el.remove();
-}
-
-// --- Dashboard ---
 function showDashboard() {
   dashboardVisible = true;
   closeHamburger();
   document.getElementById("dashboard").classList.add("active");
   document.getElementById("header").inert = true;
   document.getElementById("tab-bar").inert = true;
-  document.getElementById("messages").inert = true;
-  document.getElementById("input-area").inert = true;
+  document.getElementById("split-root").inert = true;
   loadDashboard();
   setTimeout(function () {
     document.getElementById("dashboard-input").focus();
   }, 50);
 }
+
 function hideDashboard() {
   dashboardVisible = false;
   document.getElementById("dashboard").classList.remove("active");
   document.getElementById("header").inert = false;
   document.getElementById("tab-bar").inert = false;
-  document.getElementById("messages").inert = false;
-  document.getElementById("input-area").inert = false;
+  document.getElementById("split-root").inert = false;
   document.getElementById("dashboard-input").value = "";
-  inputEl.focus();
+  var pane = getFocusedPane();
+  if (pane) pane.inputEl.focus();
 }
+
 function toggleDashboard() {
   if (dashboardVisible) hideDashboard();
   else showDashboard();
 }
+
 function loadDashboard() {
   var tableEl = document.getElementById("dash-ws-table");
   tableEl.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
@@ -685,7 +2200,6 @@ function loadDashboard() {
       var wsList = dashData.workstreams || [];
       var agg = dashData.aggregate || {};
       renderDashboardTable(wsList, agg);
-      // Collect active ws IDs for dedup
       var activeWsIds = {};
       wsList.forEach(function (ws) {
         activeWsIds[ws.id] = true;
@@ -701,14 +2215,13 @@ function loadDashboard() {
         '<div class="dashboard-empty">Failed to load</div>';
     });
 }
+
 function renderDashboardTable(wsList, agg) {
-  // Update header summary
   var activeCount = wsList.filter(function (w) {
     return w.state !== "idle";
   }).length;
   document.getElementById("dash-summary").textContent =
     activeCount + " active \u00b7 " + wsList.length + " total";
-  // Render rows
   var table = document.getElementById("dash-ws-table");
   table.innerHTML = "";
   if (!wsList.length) {
@@ -739,11 +2252,9 @@ function renderDashboardTable(wsList, agg) {
       ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
     row.setAttribute("aria-label", ariaLabel);
 
-    // Main line
     var main = document.createElement("div");
     main.className = "dash-row-main";
 
-    // STATE cell
     var stateCell = document.createElement("span");
     stateCell.className = "dash-cell-state";
     stateCell.innerHTML =
@@ -759,39 +2270,33 @@ function renderDashboardTable(wsList, agg) {
       "</span>";
     main.appendChild(stateCell);
 
-    // NAME cell
     var nameCell = document.createElement("span");
     nameCell.className = "dash-cell-name";
     nameCell.textContent = liveName;
     main.appendChild(nameCell);
 
-    // MODEL cell
     var modelCell = document.createElement("span");
     modelCell.className = "dash-cell-model";
     modelCell.textContent = ws.model_alias || ws.model || "";
     if (ws.model) modelCell.title = ws.model;
     main.appendChild(modelCell);
 
-    // NODE cell
     var nodeCell = document.createElement("span");
     nodeCell.className = "dash-cell-node";
     nodeCell.textContent = ws.node || "local";
     if (ws.node) nodeCell.title = ws.node;
     main.appendChild(nodeCell);
 
-    // TASK cell
     var taskCell = document.createElement("span");
     taskCell.className = "dash-cell-task";
     taskCell.textContent = ws.title || "";
     main.appendChild(taskCell);
 
-    // TOKENS cell
     var tokensCell = document.createElement("span");
     tokensCell.className = "dash-cell-tokens";
     tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
     main.appendChild(tokensCell);
 
-    // CTX cell
     var ctxCell = document.createElement("span");
     ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio);
     ctxCell.textContent =
@@ -800,14 +2305,12 @@ function renderDashboardTable(wsList, agg) {
 
     row.appendChild(main);
 
-    // Sub-line (activity)
     var sub = document.createElement("div");
     sub.className = "dash-row-sub";
     if (ws.activity_state === "approval") sub.classList.add("sub-attention");
     sub.textContent = ws.activity || "";
     row.appendChild(sub);
 
-    // Click handler
     row.onclick = function () {
       dashboardSwitchWorkstream(ws.id);
     };
@@ -821,7 +2324,6 @@ function renderDashboardTable(wsList, agg) {
     table.appendChild(row);
   });
   updateDashFooter(agg);
-  // Arrow key navigation between rows
   table.onkeydown = function (e) {
     if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
     e.preventDefault();
@@ -832,6 +2334,7 @@ function renderDashboardTable(wsList, agg) {
     if (e.key === "ArrowUp" && idx > 0) rows[idx - 1].focus();
   };
 }
+
 function updateDashFooter(agg) {
   if (!agg) return;
   var nodesEl = document.getElementById("dash-footer-nodes");
@@ -854,6 +2357,7 @@ function updateDashFooter(agg) {
       ")";
   }
 }
+
 function renderSavedWorkstreams(items) {
   var c = document.getElementById("dashboard-saved-cards");
   c.innerHTML = "";
@@ -890,10 +2394,9 @@ function renderSavedWorkstreams(items) {
     c.appendChild(card);
   });
 }
+
 function formatRelativeTime(iso) {
   if (!iso) return "";
-  // SQLite datetime('now') produces "YYYY-MM-DD HH:MM:SS" (UTC, no timezone marker).
-  // Without a Z suffix JS parses it as local time, breaking relative time for western offsets.
   var s = iso.replace(" ", "T");
   if (!s.endsWith("Z") && !s.includes("+")) s += "Z";
   var d = new Date(s);
@@ -909,12 +2412,14 @@ function formatRelativeTime(iso) {
   if (day < 30) return day + "d ago";
   return d.toLocaleDateString();
 }
+
 function dashboardSwitchWorkstream(wsId) {
   if (workstreams[wsId]) {
     hideDashboard();
     switchTab(wsId);
   } else loadDashboard();
 }
+
 function dashboardResumeSession(wsId) {
   authFetch("/v1/api/workstreams/new", {
     method: "POST",
@@ -930,16 +2435,17 @@ function dashboardResumeSession(wsId) {
       workstreams[data.ws_id] = { name: data.name, state: "idle" };
       switchTab(data.ws_id);
       hideDashboard();
-      // Resume handled atomically by server — history arrives via SSE.
     })
     .catch(function (err) {
       showToast("Failed to resume workstream", "error");
     });
 }
+
 function dashboardNewChat() {
   hideDashboard();
   newWorkstream();
 }
+
 function dashboardSendMessage() {
   var input = document.getElementById("dashboard-input");
   var text = input.value.trim();
@@ -966,15 +2472,21 @@ function dashboardSendMessage() {
       hideDashboard();
       input.disabled = false;
       btn.disabled = false;
-      setBusy(true);
-      addUserMessage(text);
+      var pane = getFocusedPane();
+      if (pane) {
+        pane.setBusy(true);
+        pane.addUserMessage(text);
+      }
       authFetch("/v1/api/send", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, ws_id: data.ws_id }),
       }).catch(function (err) {
-        addErrorMessage("Connection error: " + err.message);
-        setBusy(false);
+        var p = getFocusedPane();
+        if (p) {
+          p.addErrorMessage("Connection error: " + err.message);
+          p.setBusy(false);
+        }
       });
     })
     .catch(function () {
@@ -982,6 +2494,10 @@ function dashboardSendMessage() {
       btn.disabled = false;
     });
 }
+
+// ===========================================================================
+//  11. Global SSE
+// ===========================================================================
 
 function connectGlobalSSE() {
   if (globalEvtSource) {
@@ -1002,7 +2518,6 @@ function connectGlobalSSE() {
         activity_state: data.activity_state,
       });
     } else if (data.type === "ws_activity") {
-      // Live-update dashboard row sub-line
       var row = document.querySelector(
         '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
       );
@@ -1021,6 +2536,10 @@ function connectGlobalSSE() {
         '[data-ws-id="' + data.ws_id + '"] .tab-name',
       );
       if (nameEl) nameEl.textContent = data.name;
+      // Update all panes showing this workstream
+      for (var id in panes) {
+        if (panes[id].wsId === data.ws_id) panes[id].updateWsName();
+      }
     } else if (data.type === "ws_closed") {
       var wsId = data.ws_id;
       delete workstreams[wsId];
@@ -1030,17 +2549,13 @@ function connectGlobalSSE() {
           "Evicted" + (data.name ? ": " + data.name : "") + " (capacity)",
         );
       }
-      if (wsId === currentWsId) {
-        var remaining = Object.keys(workstreams);
-        if (remaining.length) switchTab(remaining[0]);
-        else showDashboard();
-      }
+      _reassignPanesForClosedWs(wsId);
+      if (!Object.keys(workstreams).length) showDashboard();
     }
   };
   globalEvtSource.onerror = function () {
     globalEvtSource.close();
     globalEvtSource = null;
-    // Raw fetch (not authFetch) — need to inspect status before throwing
     fetch("/v1/api/workstreams")
       .then(function (r) {
         if (r.status === 401) {
@@ -1057,291 +2572,11 @@ function connectGlobalSSE() {
   };
 }
 
-function handleEvent(evt) {
-  switch (evt.type) {
-    case "thinking_start":
-      isThinking = true;
-      setBusy(true);
-      removeEmptyState();
-      addThinkingIndicator();
-      break;
-
-    case "thinking_stop":
-      isThinking = false;
-      removeThinkingIndicator();
-      break;
-
-    case "reasoning":
-      removeThinkingIndicator();
-      if (!currentReasoningEl) {
-        currentReasoningEl = document.createElement("div");
-        currentReasoningEl.className = "msg msg-assistant reasoning";
-        messagesEl.appendChild(currentReasoningEl);
-      }
-      currentReasoningEl.textContent += evt.text;
-      scrollToBottom();
-      break;
-
-    case "content":
-      removeThinkingIndicator();
-      if (currentReasoningEl) {
-        currentReasoningEl = null;
-      }
-      if (!currentAssistantEl) {
-        currentAssistantEl = document.createElement("div");
-        currentAssistantEl.className = "msg msg-assistant";
-        messagesEl.appendChild(currentAssistantEl);
-      }
-      contentBuffer += evt.text;
-      currentAssistantEl.innerHTML = renderMarkdown(contentBuffer);
-      scrollToBottom();
-      break;
-
-    case "stream_end":
-      if (currentAssistantEl && contentBuffer) {
-        currentAssistantEl.innerHTML = renderMarkdown(contentBuffer);
-        postRenderMarkdown(currentAssistantEl);
-      }
-      currentAssistantEl = null;
-      currentReasoningEl = null;
-      contentBuffer = "";
-      setBusy(false);
-      inputEl.focus();
-      scrollToBottom(true);
-      break;
-
-    case "tool_info":
-      showInlineToolBlock(evt.items, true);
-      break;
-
-    case "approve_request":
-      showInlineToolBlock(evt.items, false, evt.judge_pending);
-      break;
-
-    case "intent_verdict":
-      updateVerdictBadge(evt);
-      break;
-
-    case "output_warning":
-      showOutputWarning(evt);
-      break;
-
-    case "approval_resolved":
-      resolveInlineApproval(evt.approved, false, evt.feedback, true);
-      break;
-
-    case "tool_output_chunk":
-      appendToolOutputChunk(evt.call_id || "", evt.chunk);
-      break;
-
-    case "tool_result":
-      appendToolOutput(evt.call_id || "", evt.name, evt.output);
-      break;
-
-    case "status":
-      updateStatus(evt);
-      break;
-
-    case "plan_review":
-      showPlanDialog(evt.content);
-      break;
-
-    case "info":
-      addInfoMessage(evt.message);
-      break;
-
-    case "error":
-      addErrorMessage(evt.message);
-      setBusy(false);
-      break;
-
-    case "busy_error":
-      addErrorMessage(evt.message);
-      setBusy(false);
-      break;
-
-    case "cancelled":
-      currentAssistantEl = null;
-      currentReasoningEl = null;
-      contentBuffer = "";
-      setBusy(false);
-      inputEl.focus();
-      scrollToBottom(true);
-      break;
-
-    case "connected":
-      modelName.textContent = evt.model_alias || evt.model || "";
-      modelName.title = evt.model || "";
-      if (evt.skip_permissions) {
-        var existing = document.querySelector(".skip-permissions-warning");
-        if (!existing) {
-          var warn = document.createElement("div");
-          warn.className = "skip-permissions-warning";
-          warn.textContent =
-            "\u26a0 Running with --skip-permissions: all tool calls are auto-approved";
-          document.getElementById("header").appendChild(warn);
-        }
-      }
-      break;
-
-    case "history":
-      replayHistory(evt.messages);
-      break;
-
-    case "clear_ui":
-      messagesEl.innerHTML = "";
-      break;
-  }
-}
-
-function addThinkingIndicator() {
-  if (document.getElementById("thinking")) return;
-  const el = document.createElement("div");
-  el.id = "thinking";
-  el.className = "thinking-indicator";
-  el.textContent = "Thinking";
-  messagesEl.appendChild(el);
-  scrollToBottom();
-}
-
-function removeThinkingIndicator() {
-  const el = document.getElementById("thinking");
-  if (el) el.remove();
-}
-
-function addUserMessage(text) {
-  removeEmptyState();
-  const el = document.createElement("div");
-  el.className = "msg msg-user";
-  el.textContent = text;
-  messagesEl.appendChild(el);
-  scrollToBottom(true);
-}
-
-// --- History replay ---
-
-function replayHistory(messages) {
-  messagesEl.innerHTML = "";
-  if (!messages.length) {
-    showEmptyState();
-    return;
-  }
-  var lastToolBlock = null;
-  for (var i = 0; i < messages.length; i++) {
-    var msg = messages[i];
-    if (msg.role === "user") {
-      addUserMessage(msg.content || "");
-      lastToolBlock = null;
-    } else if (msg.role === "assistant") {
-      if (msg.tool_calls && msg.tool_calls.length) {
-        if (msg.pending) {
-          // Approval still outstanding — skip the approved block here.
-          // The server re-sends approve_request right after history, which
-          // will create the live approval UI.
-          lastToolBlock = null;
-        } else {
-          var wasDenied = !!msg.denied;
-          var block = document.createElement("div");
-          block.className =
-            "msg approval-block " + (wasDenied ? "denied" : "approved");
-          msg.tool_calls.forEach(function (tc) {
-            var div = document.createElement("div");
-            div.className = "approval-tool";
-            div.dataset.funcName = tc.name;
-            div.dataset.callId = tc.id || "";
-            var nameEl = document.createElement("div");
-            nameEl.className = "tool-name";
-            nameEl.textContent = tc.name;
-            div.appendChild(nameEl);
-            var cmd = document.createElement("div");
-            cmd.className = "tool-cmd";
-            try {
-              var args = JSON.parse(tc.arguments);
-              var preview = Object.values(args)[0] || "";
-              if (tc.name === "bash") {
-                cmd.innerHTML =
-                  '<span class="dollar">$ </span>' +
-                  escapeHtml(String(preview));
-              } else {
-                cmd.textContent = String(preview).substring(0, 200);
-              }
-            } catch (e) {
-              cmd.textContent = tc.arguments.substring(0, 100);
-            }
-            div.appendChild(cmd);
-            block.appendChild(div);
-          });
-          var badge = document.createElement("div");
-          badge.setAttribute("role", "status");
-          if (wasDenied) {
-            badge.className = "approval-badge badge-denied";
-            badge.textContent = "\u2717 denied";
-          } else {
-            badge.className = "approval-badge badge-approved";
-            badge.textContent = "\u2713 approved";
-          }
-          block.appendChild(badge);
-          messagesEl.appendChild(block);
-          lastToolBlock = block;
-        }
-      }
-      if (msg.content) {
-        var el = document.createElement("div");
-        el.className = "msg msg-assistant";
-        el.innerHTML = renderMarkdown(msg.content);
-        postRenderMarkdown(el);
-        messagesEl.appendChild(el);
-        lastToolBlock = null;
-      }
-    } else if (msg.role === "tool") {
-      if (lastToolBlock) {
-        var stripped = stripAnsi(msg.content || "").trim();
-        // Skip displaying denied/blocked messages as tool output
-        var isDenied =
-          msg.denied ||
-          /^Denied by user/.test(stripped) ||
-          /^Blocked/.test(stripped);
-        if (stripped && !isDenied) {
-          var out = document.createElement("div");
-          out.className = "tool-output";
-          out.textContent = stripped;
-          if (stripped.split("\n").length > 10) {
-            makeCollapsible(out);
-          }
-          var bdg = lastToolBlock.querySelector(".approval-badge");
-          if (bdg) lastToolBlock.insertBefore(out, bdg);
-          else lastToolBlock.appendChild(out);
-        }
-      }
-    }
-  }
-  scrollToBottom();
-}
-
-function makeCollapsible(el) {
-  el.classList.add("collapsed");
-  el.setAttribute("tabindex", "0");
-  el.setAttribute("role", "button");
-  el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
-  var handler = function () {
-    this.classList.remove("collapsed");
-    this.removeAttribute("tabindex");
-    this.removeAttribute("role");
-    this.removeAttribute("aria-label");
-  };
-  el.addEventListener("click", handler);
-  el.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      handler.call(this);
-    }
-  });
-}
-
-// --- Inline tool/approval blocks ---
+// ===========================================================================
+//  12. Utility functions
+// ===========================================================================
 
 function stripAnsi(s) {
-  // Strip CSI sequences, OSC sequences, and two-byte escapes
   return s.replace(
     /\x1b(?:\[[0-9;?]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[()#][A-Za-z0-9]|.)/g,
     "",
@@ -1349,23 +2584,21 @@ function stripAnsi(s) {
 }
 
 function buildToolDiv(item) {
-  const div = document.createElement("div");
+  var div = document.createElement("div");
   div.className = "approval-tool";
   div.dataset.funcName = item.func_name || "";
   div.dataset.callId = item.call_id || "";
 
-  const name = document.createElement("div");
+  var name = document.createElement("div");
   name.className = "tool-name";
   name.textContent = item.func_name || "";
   if (item.error) name.style.color = "var(--red)";
   div.appendChild(name);
 
-  // Command/header preview
-  const cmd = document.createElement("div");
+  var cmd = document.createElement("div");
   cmd.className = "tool-cmd";
-  const headerText = stripAnsi(item.header || "");
-  // Strip the leading icon + tool name prefix to show just the command
-  const cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
+  var headerText = stripAnsi(item.header || "");
+  var cleaned = headerText.replace(/^[^\s]+\s+\w+:\s*/, "");
   if (item.func_name === "bash" && cleaned) {
     cmd.innerHTML = '<span class="dollar">$ </span>' + escapeHtml(cleaned);
   } else {
@@ -1373,14 +2606,13 @@ function buildToolDiv(item) {
   }
   div.appendChild(cmd);
 
-  // Diff preview for edit_file / write_file
   if (item.preview) {
-    const diff = document.createElement("div");
+    var diff = document.createElement("div");
     diff.className = "tool-diff";
-    const lines = stripAnsi(item.preview).split("\n");
+    var lines = stripAnsi(item.preview).split("\n");
     diff.innerHTML = lines
       .map(function (line) {
-        const trimmed = line.trim();
+        var trimmed = line.trim();
         if (trimmed.startsWith("-"))
           return '<span class="diff-del">' + escapeHtml(line) + "</span>";
         if (trimmed.startsWith("+"))
@@ -1395,14 +2627,6 @@ function buildToolDiv(item) {
 
   return div;
 }
-
-function getFeedback() {
-  if (!approvalBlockEl) return null;
-  var inp = approvalBlockEl.querySelector(".approval-feedback-input");
-  return inp && inp.value.trim() ? inp.value.trim() : null;
-}
-
-// --- Verdict badge helpers ---
 
 function renderVerdictBadge(verdict, judgePending) {
   if (!verdict) return "";
@@ -1470,421 +2694,48 @@ function toggleVerdictDetail(btn) {
   }
 }
 
-function updateVerdictBadge(verdict) {
-  if (!verdict || !verdict.call_id) return;
-  var escapedId = CSS.escape(verdict.call_id);
-  var badge = document.querySelector(
-    '.verdict-badge[data-call-id="' + escapedId + '"]',
-  );
-  if (!badge) return;
-
-  // Update risk level class
-  var risk = verdict.risk_level || "medium";
-  badge.className = "verdict-badge verdict-" + risk;
-
-  // Update content spans
-  var riskEl = badge.querySelector(".verdict-risk");
-  var recEl = badge.querySelector(".verdict-rec");
-  var confEl = badge.querySelector(".verdict-conf");
-  if (riskEl) riskEl.textContent = risk.toUpperCase();
-  if (recEl) recEl.textContent = verdict.recommendation || "review";
-  if (confEl)
-    confEl.textContent = Math.round((verdict.confidence || 0) * 100) + "%";
-
-  // Remove spinner
-  var spinner = badge.querySelector(".verdict-judge-spinner");
-  if (spinner) spinner.remove();
-
-  // Update detail section
-  var detail = badge.nextElementSibling;
-  if (detail && detail.classList.contains("verdict-detail")) {
-    var summaryEl = detail.querySelector(".verdict-summary");
-    var reasonEl = detail.querySelector(".verdict-reasoning");
-    var tierEl = detail.querySelector(".verdict-tier");
-    if (summaryEl) summaryEl.textContent = verdict.intent_summary || "";
-    if (reasonEl) reasonEl.textContent = verdict.reasoning || "";
-    if (tierEl)
-      tierEl.textContent =
-        (verdict.tier || "llm") +
-        " tier" +
-        (verdict.judge_model ? " | " + verdict.judge_model : "");
-    // Update evidence
-    var evidenceEl = detail.querySelector(".verdict-evidence");
-    if (verdict.evidence && verdict.evidence.length) {
-      if (!evidenceEl) {
-        evidenceEl = document.createElement("div");
-        evidenceEl.className = "verdict-evidence";
-        var tierDiv = detail.querySelector(".verdict-tier");
-        if (tierDiv) detail.insertBefore(evidenceEl, tierDiv);
-        else detail.appendChild(evidenceEl);
-      }
-      evidenceEl.innerHTML = verdict.evidence
-        .map(function (e) {
-          return "<div>\u2022 " + escapeHtml(e) + "</div>";
-        })
-        .join("");
-    } else if (evidenceEl) {
-      evidenceEl.remove();
-    }
-  }
-
-  // Update glow on approval buttons
-  updateVerdictGlow(verdict.recommendation);
-}
-
-function updateVerdictGlow(recommendation) {
-  var prompt = document.querySelector(".approval-prompt");
-  if (!prompt) return;
-  prompt.classList.remove(
-    "verdict-glow-approve",
-    "verdict-glow-deny",
-    "verdict-glow-review",
-  );
-  if (recommendation === "approve")
-    prompt.classList.add("verdict-glow-approve");
-  else if (recommendation === "deny") prompt.classList.add("verdict-glow-deny");
-  else prompt.classList.add("verdict-glow-review");
-}
-
-function showInlineToolBlock(items, autoApproved, judgePending) {
-  const block = document.createElement("div");
-  block.className = "msg approval-block" + (autoApproved ? " approved" : "");
-  if (!autoApproved) {
-    block.setAttribute("role", "alertdialog");
-    block.setAttribute("aria-label", "Tool approval required");
-  }
-
-  // Track the highest-priority recommendation for glow
-  var glowRec = null;
-
-  items.forEach(function (item) {
-    block.appendChild(buildToolDiv(item));
-    // Render verdict badge if present
-    if (item.verdict) {
-      block.insertAdjacentHTML(
-        "beforeend",
-        renderVerdictBadge(item.verdict, judgePending),
-      );
-      // Track recommendation for glow (deny > review > approve)
-      var rec = item.verdict.recommendation || "review";
-      if (
-        !glowRec ||
-        rec === "deny" ||
-        (rec === "review" && glowRec === "approve")
-      ) {
-        glowRec = rec;
-      }
+function makeCollapsible(el) {
+  el.classList.add("collapsed");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("role", "button");
+  el.setAttribute("aria-label", "Tool output (collapsed). Activate to expand.");
+  var handler = function () {
+    this.classList.remove("collapsed");
+    this.removeAttribute("tabindex");
+    this.removeAttribute("role");
+    this.removeAttribute("aria-label");
+  };
+  el.addEventListener("click", handler);
+  el.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      handler.call(this);
     }
   });
-
-  if (autoApproved) {
-    const badge = document.createElement("div");
-    badge.setAttribute("role", "status");
-    badge.className = "approval-badge badge-approved";
-    badge.textContent = "\u2713 auto-approved";
-    block.appendChild(badge);
-  } else {
-    const prompt = document.createElement("div");
-    prompt.className = "approval-prompt";
-
-    // Apply verdict glow on initial heuristic verdict
-    if (glowRec) {
-      if (glowRec === "approve") prompt.classList.add("verdict-glow-approve");
-      else if (glowRec === "deny") prompt.classList.add("verdict-glow-deny");
-      else prompt.classList.add("verdict-glow-review");
-    }
-
-    var alwaysNames = items
-      .filter(function (it) {
-        return (
-          it.needs_approval &&
-          it.func_name &&
-          it.func_name !== "__budget_override__" &&
-          !it.error
-        );
-      })
-      .map(function (it) {
-        return it.approval_label || it.func_name;
-      });
-    block.dataset.alwaysNames = JSON.stringify(alwaysNames);
-    var alwaysTitle = alwaysNames.length
-      ? "Always approve " + alwaysNames.join(", ")
-      : "Always approve this tool type";
-    const actions = document.createElement("div");
-    actions.className = "approval-actions";
-    actions.innerHTML =
-      '<button class="approval-btn btn-approve" onclick="resolveInlineApproval(true,false,getFeedback())"><span class="key">y</span> Approve</button>' +
-      '<button class="approval-btn btn-deny" onclick="resolveInlineApproval(false,false,getFeedback())"><span class="key">n</span> Deny</button>' +
-      (alwaysNames.length
-        ? '<button class="approval-btn btn-always" title="' +
-          escapeHtml(alwaysTitle) +
-          '" aria-label="' +
-          escapeHtml(alwaysTitle) +
-          '" onclick="resolveInlineApproval(true,true,getFeedback())"><span class="key">a</span> Always</button>'
-        : "");
-    prompt.appendChild(actions);
-
-    const fbInput = document.createElement("input");
-    fbInput.type = "text";
-    fbInput.className = "approval-feedback-input";
-    fbInput.placeholder = "feedback (optional)";
-    prompt.appendChild(fbInput);
-
-    block.appendChild(prompt);
-    pendingApproval = true;
-    approvalBlockEl = block;
-    inputEl.disabled = true;
-    sendBtn.disabled = true;
-    requestAnimationFrame(function () {
-      fbInput.focus();
-    });
-  }
-
-  messagesEl.appendChild(block);
-  scrollToBottom();
 }
 
-function resolveInlineApproval(approved, always, feedback, skipPost) {
-  if (!approvalBlockEl) return;
-  pendingApproval = false;
+// ===========================================================================
+//  13. Plan review dialog
+// ===========================================================================
 
-  // Remove prompt
-  const prompt = approvalBlockEl.querySelector(".approval-prompt");
-  if (prompt) prompt.remove();
-
-  // Add badge
-  const badge = document.createElement("div");
-  badge.setAttribute("role", "status");
-  if (approved) {
-    badge.className = "approval-badge badge-approved";
-    var label = "\u2713 approved";
-    if (always) {
-      var raw = approvalBlockEl.dataset.alwaysNames;
-      var names = raw ? JSON.parse(raw) : [];
-      label = names.length
-        ? "\u2713 always approve " + names.join(", ")
-        : "\u2713 always approve";
-    }
-    badge.textContent = feedback ? label + ": " + feedback : label;
-    approvalBlockEl.classList.add("approved");
-  } else {
-    badge.className = "approval-badge badge-denied";
-    badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
-    approvalBlockEl.classList.add("denied");
-  }
-  approvalBlockEl.appendChild(badge);
-  approvalBlockEl = null;
-
-  // Re-enable input
-  inputEl.disabled = false;
-  sendBtn.disabled = busy;
-  inputEl.focus();
-
-  // POST to server with ws_id (skip when server already resolved, e.g. timeout)
-  if (!skipPost) {
-    authFetch("/v1/api/approve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        approved: approved,
-        feedback: feedback || null,
-        always: !!always,
-        ws_id: currentWsId,
-      }),
-    }).catch(function (err) {
-      addErrorMessage("Connection error: " + err.message);
-    });
-  }
-
-  scrollToBottom();
-}
-
-function appendToolOutputChunk(callId, chunk) {
-  if (!chunk) return;
-  var stripped = stripAnsi(chunk);
-  if (!stripped) return;
-
-  // Find or create a streaming output element keyed by call_id
-  var escapedId = callId ? CSS.escape(callId) : "";
-  var el = escapedId
-    ? messagesEl.querySelector(
-        '.tool-output-stream[data-call-id="' + escapedId + '"]',
-      )
-    : null;
-  if (!el) {
-    // Primary: find the tool div matching this call_id
-    var target = escapedId
-      ? messagesEl.querySelector(
-          '.approval-tool[data-call-id="' + escapedId + '"]',
-        )
-      : null;
-    if (!target) {
-      // Fallback: last bash tool in last approval-block
-      var blocks = messagesEl.querySelectorAll(".approval-block");
-      if (!blocks.length) return;
-      var block = blocks[blocks.length - 1];
-      var tools = block.querySelectorAll(
-        '.approval-tool[data-func-name="bash"]',
-      );
-      target = tools.length ? tools[tools.length - 1] : null;
-      if (!target) {
-        var allTools = block.querySelectorAll(".approval-tool");
-        target = allTools.length ? allTools[allTools.length - 1] : null;
-      }
-    }
-    if (!target) return;
-
-    el = document.createElement("pre");
-    el.className = "tool-output tool-output-stream";
-    el.dataset.callId = callId;
-    el.setAttribute("aria-label", "Streaming command output");
-    el.setAttribute("aria-live", "off");
-    el.textContent = "";
-    target.after(el);
-  }
-
-  el.appendChild(document.createTextNode(stripped));
-  el.scrollTop = el.scrollHeight;
-  scrollToBottom();
-}
-
-function showOutputWarning(evt) {
-  if (!evt.call_id || evt.risk_level === "none") return;
-  var escapedId = CSS.escape(evt.call_id);
-  var toolDiv = messagesEl.querySelector(
-    '.approval-tool[data-call-id="' + escapedId + '"]',
-  );
-  if (!toolDiv) return;
-  var risk = evt.risk_level || "medium";
-  var flags = evt.flags || [];
-  var warning = document.createElement("div");
-  warning.className = "output-warning output-warning-" + risk;
-  warning.setAttribute("role", "alert");
-  warning.innerHTML =
-    '<span class="output-warning-label">\u26a0 ' +
-    escapeHtml(risk.toUpperCase()) +
-    "</span> " +
-    flags.map(escapeHtml).join(", ");
-  if (evt.redacted) {
-    warning.innerHTML +=
-      ' <span class="output-warning-redacted">(credentials redacted)</span>';
-  }
-  // Insert after tool output if it already exists, otherwise after tool div
-  var nextEl = toolDiv.nextElementSibling;
-  if (nextEl && nextEl.classList.contains("tool-output")) {
-    nextEl.insertAdjacentElement("afterend", warning);
-  } else {
-    toolDiv.insertAdjacentElement("afterend", warning);
-  }
-}
-
-function appendToolOutput(callId, name, output) {
-  var escapedId = callId ? CSS.escape(callId) : "";
-  // Primary: find tool div by call_id
-  var target = escapedId
-    ? messagesEl.querySelector(
-        '.approval-tool[data-call-id="' + escapedId + '"]',
-      )
-    : null;
-  // Fallback: last block, match by func_name
-  if (!target) {
-    const blocks = messagesEl.querySelectorAll(".approval-block");
-    if (!blocks.length) return;
-    const block = blocks[blocks.length - 1];
-    const tools = block.querySelectorAll(".approval-tool");
-    for (let i = tools.length - 1; i >= 0; i--) {
-      if (tools[i].dataset.funcName === name) {
-        target = tools[i];
-        break;
-      }
-    }
-    if (!target && tools.length) target = tools[tools.length - 1];
-  }
-  if (!target) return;
-
-  // Remove the streaming output element for this tool
-  var streamEl = null;
-  if (escapedId) {
-    streamEl = messagesEl.querySelector(
-      '.tool-output-stream[data-call-id="' + escapedId + '"]',
-    );
-  } else {
-    var next = target.nextElementSibling;
-    if (next && next.classList.contains("tool-output-stream")) {
-      streamEl = next;
-    }
-  }
-  if (streamEl) streamEl.remove();
-
-  const stripped = stripAnsi(output || "").trim();
-  if (!stripped) return;
-
-  const out = document.createElement("div");
-  out.className = "tool-output";
-  out.textContent = stripped;
-
-  // Auto-collapse long output (keyboard-accessible)
-  if (stripped.split("\n").length > 10) {
-    makeCollapsible(out);
-  }
-
-  // Insert after the target tool div
-  target.after(out);
-  scrollToBottom();
-}
-
-function addInfoMessage(text) {
-  const el = document.createElement("div");
-  el.className = "msg msg-info";
-  el.textContent = stripAnsi(text);
-  messagesEl.appendChild(el);
-  scrollToBottom();
-}
-
-function addErrorMessage(text) {
-  const el = document.createElement("div");
-  el.className = "msg msg-error";
-  el.setAttribute("role", "alert");
-  el.textContent = stripAnsi(text);
-  messagesEl.appendChild(el);
-  scrollToBottom();
-}
-
-function updateStatus(evt) {
-  let parts = [
-    evt.total_tokens.toLocaleString() +
-      " / " +
-      evt.context_window.toLocaleString() +
-      " tokens (" +
-      evt.pct +
-      "%)",
-  ];
-  if (evt.effort !== "medium") parts.push("reasoning: " + evt.effort);
-  statusBar.textContent = parts.join(" \u00b7 ");
-}
-
-function isNearBottom() {
-  return (
-    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <
-    80
-  );
-}
-function scrollToBottom(force) {
-  if (force || isNearBottom()) {
-    messagesEl.scrollTop = messagesEl.scrollHeight;
-  }
-}
-
-// --- Plan review dialog ---
 var _planContent = "";
+var _planPaneId = null;
+
 function showPlanDialog(content) {
   _planContent = content;
+  _planPaneId = focusedPaneId;
   document.getElementById("plan-content").textContent = content;
   var feedbackEl = document.getElementById("plan-feedback");
   feedbackEl.value = "";
   _updatePlanRejectBtn();
-  inputEl.disabled = true;
-  sendBtn.disabled = true;
+
+  // Disable focused pane input
+  var pane = panes[_planPaneId];
+  if (pane) {
+    pane.inputEl.disabled = true;
+    pane.sendBtn.disabled = true;
+  }
+
   document.getElementById("plan-overlay").classList.add("active");
   setTimeout(function () {
     feedbackEl.focus();
@@ -1906,21 +2757,25 @@ function _updatePlanRejectBtn() {
 }
 
 function resolvePlan(defaultFeedback) {
-  let feedback = document.getElementById("plan-feedback").value.trim();
+  var feedback = document.getElementById("plan-feedback").value.trim();
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
   document.getElementById("plan-overlay").classList.remove("active");
-  inputEl.disabled = false;
-  sendBtn.disabled = false;
-  inputEl.focus();
+
+  var pane = panes[_planPaneId];
+  if (pane) {
+    pane.inputEl.disabled = false;
+    pane.sendBtn.disabled = false;
+    pane.inputEl.focus();
+  }
 
   // Critical: fire the API call first — this unblocks the server.
-  // The inline rendering below is cosmetic and must never prevent it.
+  var wsId = pane ? pane.wsId : currentWsId;
   authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ feedback: feedback, ws_id: currentWsId }),
+    body: JSON.stringify({ feedback: feedback, ws_id: wsId }),
   }).catch(function (err) {
-    addErrorMessage("Connection error: " + err.message);
+    if (pane) pane.addErrorMessage("Connection error: " + err.message);
   });
 
   // Render plan inline in the chat (best-effort)
@@ -1931,16 +2786,20 @@ function resolvePlan(defaultFeedback) {
     _addInlinePlan(_planContent, action, feedback);
   } catch (err) {
     console.error("Failed to render inline plan:", err);
-    addInfoMessage("Plan " + action);
+    if (pane) pane.addInfoMessage("Plan " + action);
   }
 
-  // Show spinner while the model processes the plan result
-  setBusy(true);
-  addThinkingIndicator();
+  if (pane) {
+    pane.setBusy(true);
+    pane.addThinkingIndicator();
+  }
 }
 
 function _addInlinePlan(content, action, feedback) {
   if (!content) return;
+  var pane = panes[_planPaneId];
+  if (!pane) return;
+
   var wrapper = document.createElement("div");
   wrapper.className = "plan-inline";
 
@@ -1950,7 +2809,7 @@ function _addInlinePlan(content, action, feedback) {
     action === "rejected"
       ? "Plan rejected"
       : action === "amending"
-        ? "Plan — amending"
+        ? "Plan \u2014 amending"
         : "Plan approved";
   header.innerHTML =
     '<span class="plan-inline-label plan-' + action + '">' + label + "</span>";
@@ -1980,73 +2839,18 @@ function _addInlinePlan(content, action, feedback) {
     wrapper.appendChild(fb);
   }
 
-  messagesEl.appendChild(wrapper);
-  scrollToBottom();
+  pane.messagesEl.appendChild(wrapper);
+  pane.scrollToBottom();
 }
 
-// --- Send message ---
-function sendMessage() {
-  const text = inputEl.value.trim();
-  if (!text || busy) return;
+// ===========================================================================
+//  14. Keyboard shortcuts
+// ===========================================================================
 
-  if (text.startsWith("/")) {
-    // Slash command
-    authFetch("/v1/api/command", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command: text, ws_id: currentWsId }),
-    });
-    addUserMessage(text);
-    inputEl.value = "";
-    autoResize();
-    return;
-  }
-
-  setBusy(true);
-  addUserMessage(text);
-  inputEl.value = "";
-  autoResize();
-
-  authFetch("/v1/api/send", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text, ws_id: currentWsId }),
-  }).catch(function (err) {
-    addErrorMessage("Connection error: " + err.message);
-    setBusy(false);
-  });
-}
-
-function cancelGeneration() {
-  if (!busy || !currentWsId) return;
-  stopBtn.disabled = true;
-  authFetch("/v1/api/cancel", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: currentWsId }),
-  }).catch(function (err) {
-    addErrorMessage("Cancel error: " + err.message);
-    stopBtn.disabled = false; // Re-enable only on error so user can retry
-  });
-  // On success, button stays disabled until setBusy(false) hides it
-}
-
-// --- Textarea auto-resize and keyboard shortcuts ---
-function autoResize() {
-  inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
-}
-
-inputEl.addEventListener("input", autoResize);
 document
   .getElementById("plan-feedback")
   .addEventListener("input", _updatePlanRejectBtn);
-inputEl.addEventListener("keydown", function (e) {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
-});
+
 document
   .getElementById("dashboard-input")
   .addEventListener("keydown", function (e) {
@@ -2056,11 +2860,11 @@ document
     }
   });
 
-// Keyboard shortcuts for inline approval + plan dialog + tabs
 document.addEventListener("keydown", function (e) {
   // Defer to modal's own keydown handler when new-ws modal is open
   var nwsOverlay = document.getElementById("new-ws-overlay");
   if (nwsOverlay && nwsOverlay.style.display !== "none") return;
+
   // Escape: close hamburger first, then dashboard
   if (
     e.key === "Escape" &&
@@ -2076,12 +2880,17 @@ document.addEventListener("keydown", function (e) {
     hideDashboard();
     return;
   }
+
+  // Get focused pane for approval / busy checks
+  var pane = getFocusedPane();
+
   // Escape: cancel generation when busy
-  if (e.key === "Escape" && busy && !pendingApproval) {
+  if (e.key === "Escape" && pane && pane.busy && !pane.pendingApproval) {
     e.preventDefault();
-    cancelGeneration();
+    pane.cancelGeneration();
     return;
   }
+
   // Ctrl+D: toggle dashboard
   if (e.ctrlKey && e.key === "d") {
     e.preventDefault();
@@ -2102,8 +2911,16 @@ document.addEventListener("keydown", function (e) {
     if (idx < wsIds.length) switchTab(wsIds[idx]);
     return;
   }
-  // Ctrl+W: close current tab
-  if (e.ctrlKey && e.key === "w") {
+  // Ctrl+Shift+W: close pane (must come before Ctrl+W)
+  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "w") {
+    if (splitRoot && countLeaves(splitRoot) > 1) {
+      e.preventDefault();
+      closePane(focusedPaneId);
+    }
+    return;
+  }
+  // Ctrl+W: close current workstream tab
+  if (e.ctrlKey && !e.shiftKey && e.key === "w") {
     if (Object.keys(workstreams).length > 1) {
       e.preventDefault();
       closeWorkstream(currentWsId);
@@ -2111,47 +2928,81 @@ document.addEventListener("keydown", function (e) {
     return;
   }
 
+  // Ctrl+Alt+Arrow: cycle pane focus
+  if (
+    e.ctrlKey &&
+    e.altKey &&
+    (e.key === "ArrowLeft" || e.key === "ArrowRight")
+  ) {
+    e.preventDefault();
+    var paneIds = [];
+    (function collectIds(n) {
+      if (!n) return;
+      if (n.type === "leaf") {
+        paneIds.push(n.pane.id);
+      } else {
+        collectIds(n.children[0]);
+        collectIds(n.children[1]);
+      }
+    })(splitRoot);
+    if (paneIds.length > 1) {
+      var ci = paneIds.indexOf(focusedPaneId);
+      if (e.key === "ArrowRight") ci = (ci + 1) % paneIds.length;
+      else ci = (ci - 1 + paneIds.length) % paneIds.length;
+      setFocusedPane(paneIds[ci]);
+      panes[paneIds[ci]].inputEl.focus();
+    }
+    return;
+  }
+
+  // Ctrl+\: split pane
+  if (e.ctrlKey && e.code === "Backslash") {
+    e.preventDefault();
+    if (e.shiftKey) splitPane(focusedPaneId, "vertical");
+    else splitPane(focusedPaneId, "horizontal");
+    return;
+  }
+
   // Inline approval keybindings
-  if (pendingApproval) {
-    // If typing in the feedback input, let keys through except Enter/Escape
+  if (pane && pane.pendingApproval) {
     var fbInput =
-      approvalBlockEl &&
-      approvalBlockEl.querySelector(".approval-feedback-input");
+      pane.approvalBlockEl &&
+      pane.approvalBlockEl.querySelector(".approval-feedback-input");
     if (fbInput && document.activeElement === fbInput) {
       if (e.key === "Enter") {
         e.preventDefault();
-        resolveInlineApproval(true, false, getFeedback());
+        pane.resolveApproval(true, false, pane.getFeedback());
       } else if (e.key === "Escape") {
         e.preventDefault();
-        resolveInlineApproval(false, false, getFeedback());
+        pane.resolveApproval(false, false, pane.getFeedback());
       }
-      return; // let normal typing pass through
+      return;
     }
     // Not in feedback input — intercept shortcut keys
     e.preventDefault();
     e.stopPropagation();
     if (e.key === "y" || e.key === "Enter") {
-      resolveInlineApproval(true, false, getFeedback());
+      pane.resolveApproval(true, false, pane.getFeedback());
     } else if (e.key === "n" || e.key === "Escape") {
-      resolveInlineApproval(false, false, getFeedback());
+      pane.resolveApproval(false, false, pane.getFeedback());
     } else if (e.key === "a") {
-      resolveInlineApproval(true, true, getFeedback());
+      pane.resolveApproval(true, true, pane.getFeedback());
     } else if (e.key === "d") {
-      // Toggle verdict details panel
-      var details = approvalBlockEl
-        ? approvalBlockEl.querySelectorAll(".verdict-detail")
+      var details = pane.approvalBlockEl
+        ? pane.approvalBlockEl.querySelectorAll(".verdict-detail")
         : [];
       details.forEach(function (d) {
         var isHidden = d.style.display === "none";
         d.style.display = isHidden ? "block" : "none";
-        var btn = d.previousElementSibling
+        var btn2 = d.previousElementSibling
           ? d.previousElementSibling.querySelector(".verdict-expand")
           : null;
-        if (btn) btn.textContent = isHidden ? "hide" : "details";
+        if (btn2) btn2.textContent = isHidden ? "hide" : "details";
       });
     }
     return;
   }
+
   // Plan dialog
   if (document.getElementById("plan-overlay").classList.contains("active")) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -2179,56 +3030,74 @@ document.addEventListener("keydown", function (e) {
   }
 });
 
-// --- Init: fetch workstream list, then connect ---
+// ===========================================================================
+//  15. Init
+// ===========================================================================
+
+function initWorkstreams() {
+  authFetch("/v1/api/workstreams")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      data.workstreams.forEach(function (ws) {
+        workstreams[ws.id] = { name: ws.name, state: ws.state };
+      });
+      connectGlobalSSE();
+      var wsIds = Object.keys(workstreams);
+      if (!wsIds.length) {
+        renderTabBar();
+        showDashboard();
+        return;
+      }
+      if (!Object.keys(panes).length) {
+        if (!restoreLayout()) {
+          var p = createPane(wsIds[0]);
+          splitRoot = { type: "leaf", pane: p };
+          setFocusedPane(p.id);
+        }
+        renderLayout();
+      }
+      renderTabBar();
+      for (var id in panes) {
+        if (!panes[id].evtSource) {
+          panes[id].showEmptyState();
+          panes[id].connectSSE(panes[id].wsId);
+        }
+      }
+      var params = new URLSearchParams(location.search);
+      var targetWs = params.get("ws_id");
+      if (targetWs && workstreams[targetWs]) {
+        history.replaceState(
+          { turnstone: "workstream", wsId: targetWs },
+          "",
+          location.pathname,
+        );
+        _historyNavigation = true;
+        try {
+          switchTab(targetWs);
+        } finally {
+          _historyNavigation = false;
+        }
+      } else {
+        history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
+        showDashboard();
+      }
+    });
+}
+
 initLogin();
 pollHealth();
-authFetch("/v1/api/workstreams")
-  .then(function (r) {
-    return r.json();
-  })
-  .then(function (data) {
-    data.workstreams.forEach(function (ws) {
-      workstreams[ws.id] = { name: ws.name, state: ws.state };
-    });
-    var wsIds = Object.keys(workstreams);
-    if (wsIds.length) {
-      currentWsId = wsIds[0];
-      renderTabBar();
-    }
-    connectGlobalSSE();
-    // Deep linking: check for ?ws_id= query parameter
-    var params = new URLSearchParams(location.search);
-    var targetWs = params.get("ws_id");
-    if (targetWs && workstreams[targetWs]) {
-      history.replaceState(
-        { turnstone: "workstream", wsId: targetWs },
-        "",
-        location.pathname,
-      );
-      // Force switch even if targetWs is already currentWsId — on init
-      // the SSE connection hasn't been established yet.
-      currentWsId = targetWs;
-      messagesEl.innerHTML = "";
-      showEmptyState();
-      renderTabBar();
-      connectContentSSE(targetWs);
-    } else {
-      if (currentWsId) connectContentSSE(currentWsId);
-      history.replaceState({ turnstone: "dashboard" }, "", location.pathname);
-      showDashboard();
-    }
-  });
+initWorkstreams();
 
-// Back/forward button: retrace dashboard → tab1 → tab2 navigation.
+// Back/forward button: retrace dashboard -> tab navigation.
 window.addEventListener("popstate", function (e) {
   _historyNavigation = true;
   try {
     if (e.state && e.state.turnstone === "workstream") {
-      // Navigating to a workstream state (forward, or back between tabs).
       if (dashboardVisible) hideDashboard();
       if (e.state.wsId && workstreams[e.state.wsId]) switchTab(e.state.wsId);
     } else {
-      // Navigating to the dashboard state (back from any workstream).
       if (!dashboardVisible) showDashboard();
     }
   } finally {
