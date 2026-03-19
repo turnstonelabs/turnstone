@@ -44,13 +44,29 @@ Pane.prototype._createDOM = function () {
   this.el.addEventListener("mousedown", function () {
     setFocusedPane(self.id);
   });
+  // Also track keyboard focus moving into this pane (e.g. Tab into textarea)
+  this.el.addEventListener(
+    "focusin",
+    function () {
+      setFocusedPane(self.id);
+    },
+    true,
+  );
 
-  // Right-click context menu for split/close actions
+  // Right-click context menu for split/close actions — skip interactive
+  // elements (textareas, links, buttons) so native copy/paste works
   this.el.addEventListener("contextmenu", function (e) {
-    // Only show on the pane background, messages, or input area — not on
-    // elements that have their own context menus (text selections, links)
+    var tag = e.target.tagName;
+    if (
+      tag === "TEXTAREA" ||
+      tag === "INPUT" ||
+      tag === "A" ||
+      tag === "BUTTON" ||
+      e.target.isContentEditable
+    )
+      return;
     var sel = window.getSelection();
-    if (sel && sel.toString().length > 0) return; // let browser handle text selection
+    if (sel && sel.toString().length > 0) return;
     e.preventDefault();
     setFocusedPane(self.id);
     showPaneContextMenu(e.clientX, e.clientY, self.id);
@@ -1295,6 +1311,21 @@ function _renderLayoutNode(node, container) {
 
   var handle = document.createElement("div");
   handle.className = "split-handle";
+  handle.setAttribute("role", "separator");
+  handle.setAttribute("tabindex", "0");
+  handle.setAttribute(
+    "aria-orientation",
+    node.direction === "horizontal" ? "vertical" : "horizontal",
+  );
+  handle.setAttribute("aria-valuenow", Math.round(node.ratio * 100));
+  handle.setAttribute("aria-valuemin", "10");
+  handle.setAttribute("aria-valuemax", "90");
+  handle.setAttribute(
+    "aria-label",
+    node.direction === "horizontal"
+      ? "Resize panes horizontally"
+      : "Resize panes vertically",
+  );
   splitContainer.appendChild(handle);
 
   var child1 = document.createElement("div");
@@ -1348,6 +1379,23 @@ function setupDragHandle(handle, node, children) {
     handle.addEventListener("pointerup", onUp);
     handle.addEventListener("pointercancel", onUp);
   });
+
+  // Keyboard resizing (arrow keys)
+  handle.addEventListener("keydown", function (e) {
+    var step = e.shiftKey ? 0.1 : 0.02;
+    var delta = 0;
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") delta = step;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") delta = -step;
+    else if (e.key === "Home") delta = -(node.ratio - 0.1);
+    else if (e.key === "End") delta = 0.9 - node.ratio;
+    else return;
+    e.preventDefault();
+    node.ratio = Math.max(0.1, Math.min(0.9, node.ratio + delta));
+    children[0].style.flex = String(node.ratio);
+    children[1].style.flex = String(1 - node.ratio);
+    handle.setAttribute("aria-valuenow", Math.round(node.ratio * 100));
+    saveLayout();
+  });
 }
 
 // ===========================================================================
@@ -1375,6 +1423,7 @@ function deserializeLayout(data, _seen) {
   if (!data) return null;
   if (data.type === "leaf") {
     if (!data.wsId || !workstreams[data.wsId] || _seen[data.wsId]) return null;
+    if (Object.keys(panes).length >= MAX_PANES) return null;
     _seen[data.wsId] = true;
     var p = createPane(data.wsId);
     return { type: "leaf", pane: p };

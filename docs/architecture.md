@@ -100,7 +100,7 @@ turnstone/
       index.html      Single-page app shell (links to CSS and JS)
       style.css       Page-specific UI styles (dashboard, markdown elements, approval blocks)
       renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
-      app.js          Page-specific client-side JavaScript (SSE, workstreams, tool approval)
+      app.js          Split-pane UI (Pane class, binary layout tree, SSE, tool approval)
   tools/
     *.json            15 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
@@ -375,12 +375,19 @@ non-idle background workstreams above the input prompt.
 ### Web Workstreams
 
 - **Tab bar**: Each workstream renders as a tab with a colored state indicator
-  (CSS `@keyframes pulse` animation per state).
-- **Per-tab SSE**: `connectContentSSE(wsId)` opens
-  `/v1/api/events?ws_id=<id>` for the active tab's event stream.
+  (CSS `@keyframes pulse` animation per state). Clicking a tab switches the
+  focused pane's workstream (or focuses an existing pane showing that ws).
+- **Split panes**: The UI supports tiling multiple workstreams side-by-side or
+  stacked via a binary layout tree. Each `Pane` instance encapsulates its own
+  SSE connection, message area, input, and state (busy, approval, streaming).
+  Split via right-click context menu, pane header buttons, or keyboard
+  (`Ctrl+\`, `Ctrl+Shift+\`). Max 6 panes; no duplicate workstreams across panes.
+  Layout persisted to `localStorage`.
+- **Per-pane SSE**: `Pane.connectSSE(wsId)` opens
+  `/v1/api/events?ws_id=<id>` for each pane's event stream independently.
 - **Global SSE**: `connectGlobalSSE()` opens `/v1/api/events/global` which
   receives `ws_state` broadcasts from all workstreams, used to update tab
-  indicators without switching.
+  indicators and pane headers without switching.
 - **New tab / close**: POST `/v1/api/workstreams/new`, POST `/v1/api/workstreams/close`.
 
 ### Thread Safety
@@ -953,6 +960,9 @@ warns if the summary was truncated.
   seeded with `history.replaceState({turnstone: 'dashboard'})` on load. The
   `popstate` listener restores the correct tab or shows the dashboard,
   guarded by `_historyNavigation = true` to prevent re-entrant pushState.
+- **Pane focus**: `mousedown` and `focusin` events on pane containers update
+  `focusedPaneId`. Approval shortcuts (y/n/a) apply to the focused pane.
+  `Ctrl+Alt+Arrow` cycles focus between panes.
 
 ### Eval Resilience
 
