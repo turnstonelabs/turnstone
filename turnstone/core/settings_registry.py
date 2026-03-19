@@ -229,7 +229,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "Max concurrent outbound requests during cluster-wide operations",
             "cluster",
             min_value=10,
-            max_value=500,
+            max_value=1000,
             restart_required=True,
             help="Controls how many nodes the console queries in parallel during "
             "fan-out operations (watch listing, MCP status, reload notifications). "

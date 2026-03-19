@@ -694,6 +694,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 fan_out = int(row["value"])
         except Exception:
             pass
+    app.state.fan_out_limit = fan_out
     app.state.proxy_client = httpx.AsyncClient(
         timeout=30,
         limits=httpx.Limits(
@@ -1540,16 +1541,8 @@ _NODE_FAN_OUT_LIMIT = 200  # fallback; prefer cluster.node_fan_out_limit from st
 
 
 def _get_fan_out_limit(request: Request) -> int:
-    """Read cluster.node_fan_out_limit from storage, falling back to the constant."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage:
-        try:
-            row = storage.get_system_setting("cluster.node_fan_out_limit")
-            if row:
-                return int(row["value"])
-        except Exception:
-            pass
-    return _NODE_FAN_OUT_LIMIT
+    """Return the fan-out limit cached at startup on app.state."""
+    return int(getattr(request.app.state, "fan_out_limit", _NODE_FAN_OUT_LIMIT))
 
 
 async def admin_cancel_watch(request: Request) -> Response:
@@ -3468,7 +3461,7 @@ async def admin_delete_memory(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-async def _publish_config_change(request: Request, *, key: str, node_id: str, action: str) -> None:
+async def _publish_config_change(request: Request) -> None:
     """Fan out config-reload to all known server nodes (best-effort, async).
 
     Uses the collector's node registry, the shared async proxy client,
@@ -3649,7 +3642,7 @@ async def admin_update_setting(request: Request) -> JSONResponse:
         ip,
     )
 
-    await _publish_config_change(request, key=key, node_id=node_id, action="set")
+    await _publish_config_change(request)
 
     return JSONResponse(
         {
@@ -3704,7 +3697,7 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
         ip,
     )
 
-    await _publish_config_change(request, key=key, node_id=node_id, action="delete")
+    await _publish_config_change(request)
 
     return JSONResponse({"status": "ok", "key": key})
 

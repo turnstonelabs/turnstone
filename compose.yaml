@@ -33,6 +33,12 @@ services:
       - cluster
       - ddgCluster
       - ddgStressCluster
+    command:
+      - postgres
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-300}
+      - -c
+      - shared_buffers=128MB
     environment:
       POSTGRES_DB: turnstone
       POSTGRES_USER: ${POSTGRES_USER:-turnstone}
@@ -51,7 +57,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1G
           cpus: '1.0'
     restart: unless-stopped
 
@@ -167,6 +173,8 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:-}
+      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-}
     networks:
       - turnstone-net
     depends_on:
