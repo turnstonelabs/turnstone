@@ -1513,7 +1513,9 @@ def run_optimization(
     if not model:
         from turnstone.core.model_registry import detect_model
 
-        model, _ = detect_model(client)
+        detected, _ = detect_model(client)
+        assert detected is not None  # fatal=True guarantees non-None or SystemExit
+        model = detected
 
     # --- Optimizer model (inherits from test if not specified) ---
     opt_base = optimizer_base_url or base_url

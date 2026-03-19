@@ -752,10 +752,15 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
 
 
 def detect_model(client: Any, provider: str = "openai") -> tuple[str, int | None]:
-    """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`."""
+    """Auto-detect model — delegates to :func:`turnstone.core.model_registry.detect_model`.
+
+    CLI always uses fatal=True, so model is never None.
+    """
     from turnstone.core.model_registry import detect_model as _detect
 
-    return _detect(client, provider=provider)
+    model, ctx = _detect(client, provider=provider)
+    assert model is not None  # fatal=True guarantees non-None or SystemExit
+    return model, ctx
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
