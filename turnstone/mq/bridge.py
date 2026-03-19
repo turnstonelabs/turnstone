@@ -895,7 +895,16 @@ class Bridge:
     # -- heartbeat -----------------------------------------------------------
 
     def _heartbeat_loop(self) -> None:
-        """Periodically register this node in the broker."""
+        """Periodically register this node in the broker.
+
+        An initial jitter (derived from the node_id) staggers heartbeats
+        across cluster nodes so they don't all hit Redis at the same instant.
+        """
+        # Deterministic per-node jitter: spread across first quarter of TTL
+        h = hash(self._node_id) & 0x7FFFFFFF
+        jitter = (h % 2147483647) / 2147483647 * (self._heartbeat_ttl / 4)
+        if jitter > 0.1:
+            time.sleep(jitter)
         while self._running:
             self._broker.register_node(
                 self._node_id,

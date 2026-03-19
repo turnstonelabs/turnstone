@@ -149,7 +149,16 @@ class BackendHealthMonitor:
     # ------------------------------------------------------------------
 
     def _probe_loop(self) -> None:
-        """Background: probe backend every interval."""
+        """Background: probe backend every interval.
+
+        An initial jitter (derived from the PID) staggers probes across
+        cluster nodes so they don't all hit the LLM backend at once.
+        """
+        import os
+
+        # Deterministic per-process jitter: spread across half the interval
+        jitter = ((os.getpid() * 2654435761) & 0x7FFFFFFF) / 0x7FFFFFFF * (self._probe_interval / 2)
+        self._stop_event.wait(jitter)
         while not self._stop_event.is_set():
             self._stop_event.wait(self._probe_interval)
             if self._stop_event.is_set():
