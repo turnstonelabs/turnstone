@@ -696,7 +696,11 @@ class Bridge:
             self._api_approve(ws_id, approved=True)
             return
 
-        tool_names = {it.get("func_name", "") for it in items if it.get("needs_approval")}
+        tool_names = {
+            it.get("approval_label", "") or it.get("func_name", "")
+            for it in items
+            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
+        }
 
         if tool_names and tool_names.issubset(approve_set):
             self._api_approve(ws_id, approved=True)
@@ -732,7 +736,7 @@ class Bridge:
                     self._api_approve(ws_id, approved=approved, feedback=feedback)
                     if always and approved:
                         tool_names = {
-                            it.get("func_name", "")
+                            it.get("approval_label", "") or it.get("func_name", "")
                             for it in items
                             if it.get("needs_approval")
                             and it.get("func_name")

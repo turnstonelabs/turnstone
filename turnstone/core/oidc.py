@@ -10,10 +10,12 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+import ipaddress
 import logging
 import os
 import re
 import secrets
+import socket
 import urllib.parse
 import uuid
 from dataclasses import dataclass, field
@@ -213,6 +215,61 @@ def load_oidc_config() -> OIDCConfig:
 
 
 # ---------------------------------------------------------------------------
+# SSRF validation
+# ---------------------------------------------------------------------------
+
+
+def _is_localhost(hostname: str) -> bool:
+    """Return True if *hostname* refers to the loopback interface."""
+    return hostname in ("localhost", "127.0.0.1", "::1") or hostname.endswith(".localhost")
+
+
+def validate_issuer_url(url: str) -> None:
+    """Validate an OIDC issuer URL to prevent SSRF.
+
+    Rejects:
+    - Non-HTTPS URLs (except localhost for development)
+    - URLs with embedded credentials (userinfo)
+    - Hostnames that resolve to private/internal/loopback IP addresses
+
+    Raises :class:`OIDCError` on validation failure.
+    """
+    parsed = urllib.parse.urlparse(url)
+
+    # Require a hostname.
+    hostname = parsed.hostname
+    if not hostname:
+        raise OIDCError(f"OIDC issuer URL has no hostname: {url}")
+
+    # Reject embedded credentials — redact userinfo from error message.
+    if parsed.username or parsed.password:
+        raise OIDCError("OIDC issuer URL must not contain embedded credentials (userinfo)")
+
+    # Require HTTPS (allow HTTP only for localhost development).
+    if parsed.scheme != "https":
+        if parsed.scheme == "http" and _is_localhost(hostname):
+            pass  # Allow http://localhost for dev
+        else:
+            raise OIDCError(f"OIDC issuer URL must use HTTPS (got {parsed.scheme}://): {url}")
+
+    # Resolve hostname and reject non-globally-routable addresses.
+    try:
+        addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise OIDCError(f"OIDC issuer hostname cannot be resolved: {hostname}") from exc
+
+    for _family, _type, _proto, _canonname, sockaddr in addr_infos:
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+        except ValueError as exc:
+            raise OIDCError(
+                f"OIDC issuer hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
+            ) from exc
+        if not addr.is_global and not _is_localhost(hostname):
+            raise OIDCError(f"OIDC issuer URL resolves to non-public address ({addr}): {url}")
+
+
+# ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
 
@@ -223,6 +280,12 @@ async def discover_oidc(config: OIDCConfig) -> OIDCConfig:
     On failure, logs a warning and returns config with ``enabled=False``.
     """
     if not config.issuer:
+        return dataclasses.replace(config, enabled=False)
+
+    try:
+        validate_issuer_url(config.issuer)
+    except OIDCError as exc:
+        log.warning("OIDC issuer URL rejected: %s", exc)
         return dataclasses.replace(config, enabled=False)
 
     url = config.issuer.rstrip("/") + "/.well-known/openid-configuration"

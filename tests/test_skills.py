@@ -1877,7 +1877,7 @@ class TestSkillConfigAppliedToWorkstream:
         assert ws.ui.auto_approve_tools == set()
 
     def test_skill_lineage_in_workstreams_table(self, _ws_app):
-        """skill_id and skill_version are stored in the workstreams table."""
+        """skill_id and skill_version columns are populated in the workstreams table."""
         import sqlalchemy as sa
 
         from turnstone.core.storage._schema import workstreams
