@@ -1599,6 +1599,7 @@ class TestSkillConfigAppliedToWorkstream:
                 max_tokens=4096,
                 tool_timeout=30,
                 ws_id=ws_id,
+                skill=kwargs.get("skill"),
             )
 
         mgr = WorkstreamManager(_session_factory)
@@ -1801,8 +1802,8 @@ class TestSkillConfigAppliedToWorkstream:
         assert resp.status_code == 400
         assert "not found" in resp.json()["error"].lower()
 
-    def test_zero_token_budget_not_applied(self, _ws_app):
-        """Skill with token_budget=0 does not set a budget on the session."""
+    def test_zero_token_budget_is_noop(self, _ws_app):
+        """Skill with token_budget=0 — handler skips budget application (> 0 guard)."""
         client, mgr, storage = _ws_app
         _create_template(
             storage, "s1", "no-budget-skill", "No budget.", token_budget=0, enabled=True
@@ -1812,12 +1813,11 @@ class TestSkillConfigAppliedToWorkstream:
         assert resp.status_code == 200
         ws = mgr.get(resp.json()["ws_id"])
         assert ws is not None and ws.session is not None
+        # Budget stays at default (0) — the handler's > 0 guard prevents application
         assert ws.session._token_budget == 0
 
-    def test_empty_allowed_tools_not_applied(self, _ws_app):
-        """Skill with allowed_tools='[]' does not set auto_approve_tools."""
-        from turnstone.server import WebUI
-
+    def test_empty_allowed_tools_is_noop(self, _ws_app):
+        """Skill with allowed_tools='[]' — handler skips (empty check)."""
         client, mgr, storage = _ws_app
         _create_template(
             storage, "s1", "no-tools-skill", "No tools.", allowed_tools="[]", enabled=True
@@ -1827,5 +1827,5 @@ class TestSkillConfigAppliedToWorkstream:
         assert resp.status_code == 200
         ws = mgr.get(resp.json()["ws_id"])
         assert ws is not None
-        assert isinstance(ws.ui, WebUI)
+        # auto_approve_tools stays at default (empty set)
         assert ws.ui.auto_approve_tools == set()
