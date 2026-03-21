@@ -164,6 +164,30 @@ class BackendHealthMonitor:
             self._stop_event.wait(self._probe_interval)
             if self._stop_event.is_set():
                 break
+            # When circuit is OPEN, only probe after cooldown expires.
+            with self._lock:
+                if self._state == CircuitState.OPEN:
+                    elapsed = time.monotonic() - self._last_state_change
+                    remaining = self._cooldown - elapsed
+                    if remaining > 0:
+                        # Wait precisely for cooldown rather than skipping
+                        # a full probe_interval (which could overshoot).
+                        self._lock.release()
+                        try:
+                            self._stop_event.wait(remaining)
+                        finally:
+                            self._lock.acquire()
+                        if self._stop_event.is_set():
+                            break
+                    # Transition to HALF_OPEN for the probe.  The background
+                    # probe itself is the single HALF_OPEN request — keep
+                    # _half_open_permit False so concurrent user requests
+                    # are blocked until the probe completes.
+                    self._state = CircuitState.HALF_OPEN
+                    self._half_open_permit = False
+                    self._last_state_change = time.monotonic()
+                    log.info("Circuit breaker HALF_OPEN: cooldown elapsed, probing")
+                    self._update_metrics()
             success = self._probe_once()
             if success:
                 self.record_success()
