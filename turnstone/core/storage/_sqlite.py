@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy import event
 
+from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -61,7 +62,7 @@ from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def _escape_like(s: str) -> str:
@@ -87,8 +88,15 @@ class SQLiteBackend:
         self._engine = sa.create_engine(
             f"sqlite:///{path}",
             pool_pre_ping=True,
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
+
+        @event.listens_for(self._engine, "connect")
+        def _set_wal_mode(dbapi_conn: Any, _connection_record: Any) -> None:
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
         self._fts5_available = False
         if create_tables:
             self._init_schema()
@@ -295,15 +303,16 @@ class SQLiteBackend:
     # -- Workstream config -----------------------------------------------------
 
     def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+        if not config:
+            return
         with self._engine.connect() as conn:
-            for key, value in config.items():
-                conn.execute(
-                    sa.text(
-                        "INSERT OR REPLACE INTO workstream_config "
-                        "(ws_id, key, value) VALUES (:wid, :key, :value)"
-                    ),
-                    {"wid": ws_id, "key": key, "value": value},
-                )
+            conn.execute(
+                sa.text(
+                    "INSERT OR REPLACE INTO workstream_config "
+                    "(ws_id, key, value) VALUES (:wid, :key, :value)"
+                ),
+                [{"wid": ws_id, "key": key, "value": value} for key, value in config.items()],
+            )
             conn.commit()
 
     def load_workstream_config(self, ws_id: str) -> dict[str, str]:

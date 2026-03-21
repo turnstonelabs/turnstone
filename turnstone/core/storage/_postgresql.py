@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sqlalchemy as sa
 
+from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
@@ -61,7 +61,7 @@ from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def _escape_ilike(s: str) -> str:
@@ -229,19 +229,17 @@ class PostgreSQLBackend:
     # -- Workstream config -----------------------------------------------------
 
     def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
+        if not config:
+            return
         with self._engine.connect() as conn:
-            for key, value in config.items():
-                # Upsert: delete + insert
-                conn.execute(
-                    sa.delete(workstream_config).where(
-                        workstream_config.c.ws_id == ws_id,
-                        workstream_config.c.key == key,
-                    )
-                )
-                conn.execute(
-                    sa.insert(workstream_config),
-                    {"ws_id": ws_id, "key": key, "value": value},
-                )
+            conn.execute(
+                sa.text(
+                    "INSERT INTO workstream_config (ws_id, key, value) "
+                    "VALUES (:ws_id, :key, :value) "
+                    "ON CONFLICT (ws_id, key) DO UPDATE SET value = EXCLUDED.value"
+                ),
+                [{"ws_id": ws_id, "key": key, "value": value} for key, value in config.items()],
+            )
             conn.commit()
 
     def load_workstream_config(self, ws_id: str) -> dict[str, str]:

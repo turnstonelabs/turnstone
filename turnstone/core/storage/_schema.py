@@ -41,6 +41,8 @@ conversations = sa.Table(
     sa.Column("tool_calls", sa.Text),
 )
 
+sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
+
 workstreams = sa.Table(
     "workstreams",
     metadata,
