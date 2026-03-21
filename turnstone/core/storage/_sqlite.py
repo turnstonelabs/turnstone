@@ -1635,7 +1635,7 @@ class SQLiteBackend:
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.is_default == 1)
                 .where(prompt_templates.c.enabled == 1)
-                .order_by(prompt_templates.c.name)
+                .order_by(prompt_templates.c.priority, prompt_templates.c.name)
             )
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
