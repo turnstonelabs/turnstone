@@ -586,11 +586,18 @@ class Bridge:
             event_hooks={"request": [self._inject_auth]},
         ) as sse_client:
             while self._running:
+                # Stop if workstream was closed (thread removed from registry)
+                with self._lock:
+                    if ws_id not in self._ws_threads:
+                        return
                 try:
                     with sse_client.stream("GET", f"/v1/api/events?ws_id={ws_id}") as resp:
                         for data in _iter_sse_data(resp):
                             if not self._running:
                                 break
+                            with self._lock:
+                                if ws_id not in self._ws_threads:
+                                    return
                             self._handle_ws_event(ws_id, data)
                 except Exception as exc:
                     if self._running:

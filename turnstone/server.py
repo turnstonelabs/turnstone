@@ -80,7 +80,7 @@ class WebUI:
 
     # Shared global event queue for state-change broadcasts across all
     # workstreams.  Set by main() before any WebUI instances are created.
-    _global_queue: queue.Queue[dict[str, Any]] | None = None
+    _global_queue: queue.Queue[dict[str, Any]] | None = None  # bounded in main()
     _workstream_mgr: WorkstreamManager | None = None
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
@@ -158,7 +158,8 @@ class WebUI:
             elif state == "error":
                 self._ws_turn_content = []
                 self._ws_turn_content_size = 0
-            WebUI._global_queue.put(event)
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(event)
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -166,14 +167,15 @@ class WebUI:
             with self._ws_lock:
                 activity = self._ws_current_activity
                 activity_state = self._ws_activity_state
-            WebUI._global_queue.put(
-                {
-                    "type": "ws_activity",
-                    "ws_id": self.ws_id,
-                    "activity": activity,
-                    "activity_state": activity_state,
-                }
-            )
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(
+                    {
+                        "type": "ws_activity",
+                        "ws_id": self.ws_id,
+                        "activity": activity,
+                        "activity_state": activity_state,
+                    }
+                )
 
     # --- SessionUI protocol ---
 
@@ -312,12 +314,14 @@ class WebUI:
             self._ws_activity_state = "approval"
         self._broadcast_activity()
 
-        # Persist heuristic verdicts and track for user_decision update
-        self._pending_verdicts = []
+        # Persist heuristic verdicts and track for user_decision update.
+        # Build list locally, then assign under lock to avoid racing with
+        # the judge daemon thread's on_intent_verdict() appends.
+        heuristic_verdicts: list[dict[str, Any]] = []
         for item in items:
             hv = item.get("_heuristic_verdict")
             if hv:
-                self._pending_verdicts.append(hv)
+                heuristic_verdicts.append(hv)
                 try:
                     from turnstone.core.storage._registry import get_storage
 
@@ -347,6 +351,9 @@ class WebUI:
                     hv.get("latency_ms", 0),
                 )
 
+        with self._ws_lock:
+            self._pending_verdicts = heuristic_verdicts
+
         # Send approval request and block
         judge_pending = bool(any(it.get("_heuristic_verdict") for it in items))
         self._approval_event.clear()
@@ -356,7 +363,10 @@ class WebUI:
             "judge_pending": judge_pending,
         }
         self._enqueue(self._pending_approval)
-        self._approval_event.wait()
+        if not self._approval_event.wait(timeout=3600):
+            # Approval timed out (e.g., user disconnected). Deny to unblock.
+            self._approval_result = (False, "Approval timed out after 1 hour")
+            log.warning("Approval timed out for ws_id=%s", self.ws_id)
         self._pending_approval = None
         approved, feedback = self._approval_result
 
@@ -436,7 +446,9 @@ class WebUI:
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
         self._enqueue({"type": "plan_review", "content": content})
-        self._plan_event.wait()
+        if not self._plan_event.wait(timeout=3600):
+            log.warning("Plan review timed out for ws_id=%s", self.ws_id)
+            self._plan_result = ""
         return self._plan_result
 
     def on_info(self, message: str) -> None:
@@ -460,7 +472,10 @@ class WebUI:
     def on_rename(self, name: str) -> None:
         """Update the workstream's display name and broadcast to all clients."""
         if WebUI._global_queue is not None:
-            WebUI._global_queue.put({"type": "ws_rename", "ws_id": self.ws_id, "name": name})
+            with contextlib.suppress(queue.Full):
+                WebUI._global_queue.put_nowait(
+                    {"type": "ws_rename", "ws_id": self.ws_id, "name": name}
+                )
 
     def on_intent_verdict(self, verdict: dict[str, Any]) -> None:
         """Deliver LLM judge verdict to frontend via SSE."""
@@ -508,7 +523,8 @@ class WebUI:
             except Exception:
                 log.debug("Failed to update late verdict user_decision", exc_info=True)
         else:
-            self._pending_verdicts.append(verdict)
+            with self._ws_lock:
+                self._pending_verdicts.append(verdict)
 
     def on_output_warning(self, call_id: str, assessment: dict[str, Any]) -> None:
         """Deliver output guard warning to frontend via SSE + persist."""
@@ -546,9 +562,10 @@ class WebUI:
             }
         )
         # Update user_decision on all tracked verdicts (fire-and-forget).
-        # Swap-and-clear to avoid racing with the daemon judge thread.
-        pending = self._pending_verdicts
-        self._pending_verdicts = []
+        # Swap-and-clear under lock to avoid racing with the daemon judge thread.
+        with self._ws_lock:
+            pending = self._pending_verdicts
+            self._pending_verdicts = []
         decision_str = "approved" if approved else "denied"
         self._last_verdict_decision = decision_str
         if pending:
@@ -1092,33 +1109,36 @@ async def send_message(request: Request) -> JSONResponse:
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
-    if ws.worker_thread and ws.worker_thread.is_alive():
-        ui._enqueue(
-            {
-                "type": "busy_error",
-                "message": "Already processing a request. Please wait.",
-            }
-        )
-        return JSONResponse({"status": "busy"})
-    session = ws.session
-    assert session is not None
+    # Atomically check-and-start to prevent two concurrent workers on the
+    # same session (ChatSession.send() is not thread-safe).
+    with ws._lock:
+        if ws.worker_thread and ws.worker_thread.is_alive():
+            ui._enqueue(
+                {
+                    "type": "busy_error",
+                    "message": "Already processing a request. Please wait.",
+                }
+            )
+            return JSONResponse({"status": "busy"})
+        session = ws.session
+        assert session is not None
 
-    def run() -> None:
-        assert ui is not None
-        try:
-            session.send(message)
-        except GenerationCancelled:
-            # Safety net — send() normally handles this internally.
-            ui._enqueue({"type": "stream_end"})
-            ui.on_state_change("idle")
-        except Exception as e:
-            ui.on_error(f"Error: {e}")
-            ui._enqueue({"type": "stream_end"})
-            ui.on_state_change("error")
+        def run() -> None:
+            assert ui is not None
+            try:
+                session.send(message)
+            except GenerationCancelled:
+                # Safety net — send() normally handles this internally.
+                ui._enqueue({"type": "stream_end"})
+                ui.on_state_change("idle")
+            except Exception as e:
+                ui.on_error(f"Error: {e}")
+                ui._enqueue({"type": "stream_end"})
+                ui.on_state_change("error")
 
-    t = threading.Thread(target=run, daemon=True)
-    ws.worker_thread = t
-    t.start()
+        t = threading.Thread(target=run, daemon=True)
+        ws.worker_thread = t
+        t.start()
     _metrics.record_message_sent()
     with ui._ws_lock:
         ui._ws_messages += 1
@@ -2169,7 +2189,7 @@ def main() -> None:
     )
 
     # Set up global event queue for state-change broadcasts
-    global_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+    global_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=10000)
     global_listeners: list[queue.Queue[dict[str, Any]]] = []
     global_listeners_lock = threading.Lock()
     WebUI._global_queue = global_queue
