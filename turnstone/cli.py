@@ -1046,10 +1046,16 @@ def main() -> None:
         storage=_get_storage(),
     )
 
+    # apply_config() merges [judge] config.toml values into args as
+    # judge_base_url, judge_api_key, etc.  Output_guard and redact_secrets
+    # default to True, enabling the heuristic guard even when the LLM judge
+    # is disabled via --no-judge.
     judge_config = JudgeConfig(
         enabled=args.judge_enabled,
         model=args.judge_model,
         provider=args.judge_provider,
+        base_url=getattr(args, "judge_base_url", ""),
+        api_key=getattr(args, "judge_api_key", ""),
         confidence_threshold=args.judge_confidence,
         timeout=args.judge_timeout,
     )
