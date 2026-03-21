@@ -636,6 +636,7 @@ class ChatSession:
 
     def _generate_title(self) -> None:
         """Generate a short title for this session via a background LLM call."""
+        ws_id = self._ws_id  # Capture before async work
         try:
             # Gather first user message and first assistant reply
             user_msg = ""
@@ -686,8 +687,11 @@ class ChatSession:
                 update_workstream_title(self._ws_id, title[:80])
                 self.ui.on_rename(title[:80])
         except Exception:
-            self._title_generated = False
-            log.debug("Title generation failed for ws=%s", self._ws_id, exc_info=True)
+            # Only reset if ws_id hasn't changed (e.g., via /resume) to
+            # avoid re-enabling titling for a different workstream.
+            if self._ws_id == ws_id:
+                self._title_generated = False
+            log.debug("Title generation failed for ws=%s", ws_id, exc_info=True)
 
     def resume(self, ws_id: str) -> bool:
         """Load messages from a previous workstream and resume it.
