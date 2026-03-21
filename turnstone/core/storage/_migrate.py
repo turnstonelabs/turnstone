@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
-log = logging.getLogger(__name__)
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 _MIGRATIONS_DIR = str(Path(__file__).parent / "migrations")
 

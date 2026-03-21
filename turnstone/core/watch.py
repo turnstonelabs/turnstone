@@ -10,19 +10,19 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 import re
 import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.log import get_logger
 from turnstone.core.safety import is_command_blocked, sanitize_command
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants

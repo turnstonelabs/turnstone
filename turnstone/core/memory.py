@@ -11,17 +11,17 @@ rather than silently swallowed.
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
+from turnstone.core.log import get_logger
 from turnstone.core.storage import get_storage
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def normalize_key(key: str) -> str:

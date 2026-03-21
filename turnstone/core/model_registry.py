@@ -7,15 +7,15 @@ resilience when the primary model is unreachable.
 
 from __future__ import annotations
 
-import logging
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from turnstone.core.config import load_config
+from turnstone.core.log import get_logger
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

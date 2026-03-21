@@ -18,10 +18,10 @@ ConfigStore) — it is a standalone tool, not a cluster node.
 
 from __future__ import annotations
 
-import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.log import get_logger
 from turnstone.core.settings_registry import (
     SETTINGS,
     deserialize_value,
@@ -33,7 +33,7 @@ from turnstone.core.settings_registry import (
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 _UNSET: Any = object()
 

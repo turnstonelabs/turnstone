@@ -7,11 +7,12 @@ Thread-safe. Zero external dependencies.
 from __future__ import annotations
 
 import ipaddress
-import logging
 import threading
 import time
 
-log = logging.getLogger(__name__)
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 _NetworkType = ipaddress.IPv4Network | ipaddress.IPv6Network
 

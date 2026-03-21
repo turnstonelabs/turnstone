@@ -21,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import logging
 import os
 import re
 import secrets
@@ -39,7 +38,9 @@ if TYPE_CHECKING:
 
     from turnstone.core.oidc import OIDCConfig
 
-log = logging.getLogger(__name__)
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants

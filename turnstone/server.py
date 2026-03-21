@@ -16,7 +16,6 @@ import asyncio
 import contextlib
 import functools
 import json
-import logging
 import os
 import queue
 import socket
@@ -42,6 +41,7 @@ from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
 from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware
+from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 # Static assets — loaded once at startup from turnstone/ui/static/
 # ---------------------------------------------------------------------------
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"

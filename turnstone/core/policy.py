@@ -7,13 +7,14 @@ a tool should be auto-allowed, denied, or require human approval.
 from __future__ import annotations
 
 import fnmatch
-import logging
 from typing import TYPE_CHECKING
+
+from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def evaluate_tool_policy(

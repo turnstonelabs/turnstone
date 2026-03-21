@@ -149,6 +149,24 @@ def configure_logging(
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
+def _ensure_stdlib_factory() -> None:
+    """Ensure structlog routes through stdlib even before configure_logging().
+
+    Without this, ``structlog.get_logger()`` defaults to ``PrintLogger``
+    which bypasses stdlib handlers (and pytest caplog).  Calling
+    ``configure_logging()`` later overwrites this minimal config.
+    """
+    cfg = structlog.get_config()
+    if not isinstance(cfg.get("logger_factory"), structlog.stdlib.LoggerFactory):
+        structlog.configure(
+            logger_factory=structlog.stdlib.LoggerFactory(),
+            wrapper_class=structlog.stdlib.BoundLogger,
+        )
+
+
+_ensure_stdlib_factory()
+
+
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
     """Return a structlog bound logger backed by the stdlib."""
     result: structlog.stdlib.BoundLogger = structlog.get_logger(name)

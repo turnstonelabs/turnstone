@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from typing import TYPE_CHECKING
+
+from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 _storage: StorageBackend | None = None
 

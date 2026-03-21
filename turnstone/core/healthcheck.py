@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import enum
-import logging
 import threading
 import time
 from typing import TYPE_CHECKING
 
+from turnstone.core.log import get_logger
+
 if TYPE_CHECKING:
     from openai import OpenAI
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class CircuitState(enum.Enum):

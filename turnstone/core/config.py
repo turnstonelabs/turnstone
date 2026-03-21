@@ -6,15 +6,16 @@ Precedence: CLI args > env vars > config file > hardcoded defaults.
 
 from __future__ import annotations
 
-import logging
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.log import get_logger
+
 if TYPE_CHECKING:
     import argparse
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 CONFIG_DIR = Path("~/.config/turnstone").expanduser()
 CONFIG_PATH = CONFIG_DIR / "config.toml"

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import fnmatch
 import json
-import logging
 import os
 import re
 import threading
@@ -20,12 +19,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.log import get_logger
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.providers._protocol import LLMProvider
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Data structures

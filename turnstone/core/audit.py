@@ -7,14 +7,15 @@ call after mutations to create a persistent audit trail.
 from __future__ import annotations
 
 import json
-import logging
 import uuid
 from typing import TYPE_CHECKING, Any
+
+from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 def record_audit(

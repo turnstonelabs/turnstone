@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import json
-import logging
 from typing import Any
 
-log = logging.getLogger(__name__)
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Row helper

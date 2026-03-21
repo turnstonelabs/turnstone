@@ -7,7 +7,6 @@ and :func:`fetch_skill_from_github` for fetching SKILL.md from GitHub repos.
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -16,9 +15,10 @@ from urllib.parse import quote
 
 import httpx
 
+from turnstone.core.log import get_logger
 from turnstone.core.skill_parser import ParsedSkill, parse_skill_md
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 DEFAULT_DISCOVERY_URL = "https://skills.sh"
 
@@ -176,7 +176,7 @@ def _check_rate_limit(resp: httpx.Response) -> None:
             )
     remaining = resp.headers.get("x-ratelimit-remaining", "")
     if remaining and remaining.isdigit() and int(remaining) < 10:
-        logger.warning("GitHub API rate limit low: %s remaining", remaining)
+        log.warning("GitHub API rate limit low: %s remaining", remaining)
 
 
 _FETCH_CONCURRENCY = 5
@@ -301,7 +301,7 @@ async def fetch_skill_from_github(url: str) -> SkillPackage:
                 rf = _find_resource_files(tree_data.get("tree", []), skill_md_dir)
                 resources = await _fetch_resource_contents(client, raw_base, rf)
         except httpx.HTTPError:
-            logger.debug("Failed to fetch resource tree for %s/%s", owner, repo)
+            log.debug("Failed to fetch resource tree for %s/%s", owner, repo)
 
     # Build a per-skill source URL pointing to the specific subdirectory
     if skill_md_dir:
@@ -418,7 +418,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
             try:
                 parsed = parse_skill_md(content)
             except ValueError:
-                logger.debug("Skipping invalid SKILL.md at %s", skill_md_path)
+                log.debug("Skipping invalid SKILL.md at %s", skill_md_path)
                 continue
 
             # Collect resources for this skill (concurrent via helper)

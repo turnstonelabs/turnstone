@@ -11,7 +11,6 @@ import base64
 import dataclasses
 import hashlib
 import ipaddress
-import logging
 import os
 import re
 import secrets
@@ -23,7 +22,9 @@ from typing import Any
 
 import httpx
 
-log = logging.getLogger(__name__)
+from turnstone.core.log import get_logger
+
+log = get_logger(__name__)
 
 # Sentinel password hash for OIDC-provisioned users.
 # Not a valid bcrypt hash -- verify_password() always rejects it.

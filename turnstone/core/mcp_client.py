@@ -22,7 +22,6 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
-import logging
 import os
 import random
 import threading
@@ -41,8 +40,9 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from turnstone.core.config import load_config
+from turnstone.core.log import get_logger
 
-log = logging.getLogger("turnstone.mcp")
+log = get_logger("turnstone.mcp")
 
 _DEFAULT_REFRESH_INTERVAL: float = 14400  # 4 hours
 
