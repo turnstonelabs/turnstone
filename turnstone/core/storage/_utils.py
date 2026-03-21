@@ -59,6 +59,7 @@ SKILL_MUTABLE = frozenset(
         "scan_version",
         "scan_status",
         "scan_report",
+        "priority",
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})

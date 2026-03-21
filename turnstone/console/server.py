@@ -2183,6 +2183,7 @@ _SKILL_RUNTIME_CONFIG_FIELDS = frozenset(
         "allowed_tools",
         "enabled",
         "notify_on_complete",
+        "priority",
     }
 )
 
@@ -2337,6 +2338,7 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "agent_max_turns": r.get("agent_max_turns"),
         "notify_on_complete": r.get("notify_on_complete", "{}"),
         "enabled": r.get("enabled", True),
+        "priority": r.get("priority", 0),
         "allowed_tools": r.get("allowed_tools", "[]"),
         "license": r.get("license", ""),
         "compatibility": r.get("compatibility", ""),
@@ -2451,6 +2453,11 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     if activation == "default":
         is_default = True
 
+    try:
+        priority = max(-1000, min(1000, int(body.get("priority", 0) or 0)))
+    except (ValueError, TypeError):
+        priority = 0
+
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not content:
@@ -2478,6 +2485,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         compatibility=compatibility,
         activation=activation,
         token_estimate=token_estimate,
+        priority=priority,
         **session_fields,
     )
 
@@ -2569,6 +2577,11 @@ async def admin_update_skill(request: Request) -> JSONResponse:
             except (ValueError, TypeError):
                 tag_str = "[]"
             updates["tags"] = tag_str
+    if "priority" in body:
+        try:
+            updates["priority"] = max(-1000, min(1000, int(body["priority"] or 0)))
+        except (ValueError, TypeError):
+            updates["priority"] = 0
 
     # Installed (readonly) skills: restrict updates to runtime config only.
     # Spec/content fields are locked to preserve external-source fidelity.

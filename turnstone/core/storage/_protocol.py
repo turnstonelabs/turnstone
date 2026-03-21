@@ -594,6 +594,7 @@ class StorageBackend(Protocol):
         allowed_tools: str = "[]",
         skill_license: str = "",
         compatibility: str = "",
+        priority: int = 0,
     ) -> None:
         """Create a prompt template (skill)."""
         ...
@@ -639,7 +640,7 @@ class StorageBackend(Protocol):
         enabled_only: bool = False,
         limit: int = 0,
     ) -> list[dict[str, Any]]:
-        """Return prompt templates filtered by activation value, ordered by name."""
+        """Return prompt templates filtered by activation value, ordered by priority then name."""
         ...
 
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:

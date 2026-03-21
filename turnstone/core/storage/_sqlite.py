@@ -1534,6 +1534,7 @@ class SQLiteBackend:
         allowed_tools: str = "[]",
         skill_license: str = "",
         compatibility: str = "",
+        priority: int = 0,
     ) -> None:
         # Sync is_default from activation when activation is explicitly set
         if activation == "default":
@@ -1580,6 +1581,7 @@ class SQLiteBackend:
                     "agent_max_turns": agent_max_turns,
                     "notify_on_complete": notify_on_complete,
                     "enabled": 1 if enabled else 0,
+                    "priority": priority,
                     "created": now,
                     "updated": now,
                 },
@@ -1718,7 +1720,7 @@ class SQLiteBackend:
             q = (
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.activation == activation)
-                .order_by(prompt_templates.c.name)
+                .order_by(prompt_templates.c.priority, prompt_templates.c.name)
             )
             if enabled_only:
                 q = q.where(prompt_templates.c.enabled == 1)

@@ -132,6 +132,7 @@ def _create_template(db, template_id, name, content, **kwargs):
         notify_on_complete=kwargs.get("notify_on_complete", "{}"),
         enabled=kwargs.get("enabled", True),
         allowed_tools=kwargs.get("allowed_tools", "[]"),
+        priority=kwargs.get("priority", 0),
     )
 
 
@@ -293,13 +294,46 @@ class TestSkillStorage:
         assert result == []
 
     def test_list_skills_by_activation_ordered_by_name(self, db):
-        """Results are ordered by name ascending."""
+        """Results are ordered by name ascending when priority is equal."""
         _create_template(db, "s2", "beta-search", "B", activation="search")
         _create_template(db, "s1", "alpha-search", "A", activation="search")
         results = db.list_skills_by_activation("search")
         assert len(results) == 2
         assert results[0]["name"] == "alpha-search"
         assert results[1]["name"] == "beta-search"
+
+    def test_list_skills_by_activation_ordered_by_priority(self, db):
+        """Results are ordered by priority ascending, then name."""
+        _create_template(db, "s1", "style", "S", activation="default", priority=20)
+        _create_template(db, "s2", "safety", "F", activation="default", priority=10)
+        _create_template(db, "s3", "tone", "T", activation="default", priority=10)
+        results = db.list_skills_by_activation("default")
+        assert len(results) == 3
+        assert results[0]["name"] == "safety"
+        assert results[1]["name"] == "tone"
+        assert results[2]["name"] == "style"
+
+    def test_priority_default_is_zero(self, db):
+        """Priority defaults to 0 when not specified."""
+        _create_template(db, "s1", "skill", "content")
+        tpl = db.get_prompt_template("s1")
+        assert tpl is not None
+        assert tpl["priority"] == 0
+
+    def test_priority_roundtrip(self, db):
+        """Priority can be set on create and retrieved."""
+        _create_template(db, "s1", "skill", "content", priority=42)
+        tpl = db.get_prompt_template("s1")
+        assert tpl is not None
+        assert tpl["priority"] == 42
+
+    def test_priority_update(self, db):
+        """Priority can be updated."""
+        _create_template(db, "s1", "skill", "content", priority=10)
+        db.update_prompt_template("s1", priority=99)
+        tpl = db.get_prompt_template("s1")
+        assert tpl is not None
+        assert tpl["priority"] == 99
 
 
 # ---------------------------------------------------------------------------
@@ -1829,3 +1863,48 @@ class TestSkillConfigAppliedToWorkstream:
         assert ws is not None
         # auto_approve_tools stays at default (empty set)
         assert ws.ui.auto_approve_tools == set()
+
+    def test_skill_lineage_in_workstreams_table(self, _ws_app):
+        """skill_id and skill_version are stored in the workstreams table."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import workstreams
+
+        client, _mgr, storage = _ws_app
+        _create_template(storage, "s1", "lineage-skill", "Track me.", enabled=True)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "lineage-skill"})
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+
+        with storage._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.skill_id, workstreams.c.skill_version).where(
+                    workstreams.c.ws_id == ws_id
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "s1"
+        assert row[1] == 1
+
+    def test_no_skill_lineage_when_no_skill(self, _ws_app):
+        """Workstream without a skill has empty skill_id and zero skill_version."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import workstreams
+
+        client, _mgr, storage = _ws_app
+
+        resp = client.post("/v1/api/workstreams/new", json={})
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+
+        with storage._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.skill_id, workstreams.c.skill_version).where(
+                    workstreams.c.ws_id == ws_id
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0] == ""
+        assert row[1] == 0

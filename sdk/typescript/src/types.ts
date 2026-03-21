@@ -186,6 +186,7 @@ export interface SkillInfo {
   agent_max_turns: number | null;
   notify_on_complete: string;
   enabled: boolean;
+  priority: number;
   allowed_tools: string;
   license: string;
   compatibility: string;
@@ -215,6 +216,7 @@ export interface CreateSkillRequest {
   agent_max_turns?: number | null;
   notify_on_complete?: string;
   enabled?: boolean;
+  priority?: number;
   allowed_tools?: string;
   license?: string;
   compatibility?: string;
@@ -240,6 +242,7 @@ export interface UpdateSkillRequest {
   agent_max_turns?: number | null;
   notify_on_complete?: string;
   enabled?: boolean;
+  priority?: number;
   allowed_tools?: string;
   license?: string;
   compatibility?: string;

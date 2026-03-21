@@ -309,6 +309,7 @@ class SkillInfo(BaseModel):
     agent_max_turns: int | None = None
     notify_on_complete: str = "{}"
     enabled: bool = True
+    priority: int = 0
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
@@ -341,6 +342,7 @@ class CreateSkillRequest(BaseModel):
     agent_max_turns: int | None = None
     notify_on_complete: str = "{}"
     enabled: bool = True
+    priority: int = 0
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
@@ -366,6 +368,7 @@ class UpdateSkillRequest(BaseModel):
     agent_max_turns: int | None = None
     notify_on_complete: str | None = None
     enabled: bool | None = None
+    priority: int | None = None
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
