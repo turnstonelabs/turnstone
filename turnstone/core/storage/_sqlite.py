@@ -1031,8 +1031,6 @@ class SQLiteBackend:
             return [dict(r._mapping) for r in rows]
 
     def prune_task_runs(self, retention_days: int = 90) -> int:
-        from datetime import timedelta
-
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
             result = conn.execute(
