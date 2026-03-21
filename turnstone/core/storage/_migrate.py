@@ -35,7 +35,14 @@ def run_migrations(storage: Any, backend: str) -> None:
         _bootstrap_existing_sqlite(engine, cfg)
 
     if backend == "postgresql":
-        _run_with_pg_lock(engine, cfg)
+        try:
+            _run_with_pg_lock(engine, cfg)
+        except Exception as exc:
+            # Non-fatal: the entrypoint script already runs migrations before
+            # the server starts.  If this second attempt fails (lock contention,
+            # transient PG error), the schema is almost certainly already at
+            # head.  Log and continue rather than crashing the server.
+            log.warning("PostgreSQL migration failed (non-fatal): %s", exc)
     else:
         try:
             command.upgrade(cfg, "head")
