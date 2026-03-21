@@ -559,7 +559,7 @@ class TestRegistryInstall:
 
 
 def _mock_request(storage: Any = None, config_store: Any = None) -> MagicMock:
-    """Build a mock Request with app.state.auth_storage."""
+    """Build a mock Request with app.state.auth_storage and app.state.config_store."""
     request = MagicMock()
     request.app.state.auth_storage = storage
     request.app.state.config_store = config_store

@@ -8,6 +8,7 @@ as the single source of truth for the generated OpenAPI spec.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -32,6 +33,14 @@ class StatusResponse(BaseModel):
     """Generic success response."""
 
     status: str = Field(default="ok", examples=["ok"])
+
+
+class DeleteSettingResponse(BaseModel):
+    """DELETE /v1/api/admin/settings/{key} response."""
+
+    status: str = Field(default="ok", examples=["ok"])
+    key: str = Field(description="Dotted setting key that was reset")
+    default: Any = Field(description="Registry default value the setting reverted to")
 
 
 class AuthLoginRequest(BaseModel):

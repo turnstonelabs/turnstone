@@ -82,6 +82,7 @@ from turnstone.api.schemas import (
     CreateTokenRequest,
     CreateTokenResponse,
     CreateUserRequest,
+    DeleteSettingResponse,
     ErrorResponse,
     ListScheduleRunsResponse,
     ListSchedulesResponse,
@@ -751,7 +752,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/admin/settings/{key}",
         "DELETE",
         "Reset a setting to its default value",
-        response_model=StatusResponse,
+        response_model=DeleteSettingResponse,
         query_params=[
             QueryParam("node_id", "Node ID for node-scoped settings"),
         ],
@@ -855,6 +856,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
 _ALL_MODELS: list[type[BaseModel]] = [
     ErrorResponse,
     StatusResponse,
+    DeleteSettingResponse,
     AuthLoginRequest,
     AuthLoginResponse,
     AuthSetupRequest,

@@ -179,7 +179,10 @@ class TestDeleteSetting:
         # Delete it
         r = client.delete("/v1/api/admin/settings/tools.timeout")
         assert r.status_code == 200
-        assert r.json()["status"] == "ok"
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["key"] == "tools.timeout"
+        assert body["default"] == 120  # registry default for tools.timeout
 
     def test_delete_then_list_shows_default(self, client):
         client.put(

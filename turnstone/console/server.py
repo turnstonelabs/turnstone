@@ -3484,6 +3484,12 @@ async def _publish_config_change(request: Request) -> None:
     Uses the collector's node registry, the shared async proxy client,
     and bounded concurrency via the fan-out semaphore.
     """
+    # Reload the console's own ConfigStore so cached values stay fresh
+    # (must happen even when collector is absent — e.g. standalone console)
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        config_store.reload()
+
     collector = getattr(request.app.state, "collector", None)
     if not collector:
         return
@@ -3501,11 +3507,6 @@ async def _publish_config_change(request: Request) -> None:
                 )
             except Exception:
                 log.warning("Config reload failed for %s", url, exc_info=True)
-
-    # Reload the console's own ConfigStore so cached values stay fresh
-    config_store = getattr(request.app.state, "config_store", None)
-    if config_store:
-        config_store.reload()
 
     nodes = collector.get_all_nodes()
     tasks = [_notify(n["server_url"]) for n in nodes if n.get("server_url")]
