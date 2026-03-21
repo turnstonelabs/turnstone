@@ -335,6 +335,18 @@ class TestSkillStorage:
         assert tpl is not None
         assert tpl["priority"] == 99
 
+    def test_list_default_templates_ordered_by_priority(self, db):
+        """list_default_templates() respects priority ordering."""
+        _create_template(db, "s1", "beta", "b", activation="default", priority=10)
+        _create_template(db, "s2", "alpha", "a", activation="default", priority=5)
+        _create_template(db, "s3", "gamma", "g", activation="default", priority=1)
+
+        results = db.list_default_templates()
+        assert len(results) == 3
+        assert results[0]["name"] == "gamma"
+        assert results[1]["name"] == "alpha"
+        assert results[2]["name"] == "beta"
+
 
 # ---------------------------------------------------------------------------
 # 1b. Skill resource storage tests

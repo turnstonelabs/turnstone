@@ -6884,6 +6884,11 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "priority": {
+            "default": 0,
+            "title": "Priority",
+            "type": "integer"
+          },
           "allowed_tools": {
             "default": "[]",
             "title": "Allowed Tools",
@@ -7118,6 +7123,11 @@
             "default": true,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "priority": {
+            "default": 0,
+            "title": "Priority",
+            "type": "integer"
           },
           "allowed_tools": {
             "default": "[]",
@@ -7371,6 +7381,18 @@
             ],
             "default": null,
             "title": "Enabled"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Priority"
           },
           "allowed_tools": {
             "anyOf": [
