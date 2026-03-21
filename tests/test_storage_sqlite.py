@@ -403,16 +403,16 @@ class TestTouchStructuredMemory:
         # updated should stay the same (only last_accessed changes)
         assert mem_after["updated"] == mem_before["updated"]
 
-    def test_facade_deduplicates_keys(self):
-        """The memory.py facade deduplicates before calling storage."""
-        from turnstone.core.memory import touch_structured_memories
+    def test_batch_touch_with_duplicates(self, backend):
+        """Duplicate keys in batch should each increment access_count once."""
+        self._create_memory(backend, name="dup")
 
-        # The facade deduplicates, so even with duplicates in input,
-        # each distinct memory is touched at most once.
-        keys = [("m1", "global", ""), ("m1", "global", "")]
-        seen: set[tuple[str, str, str]] = set()
-        unique = [k for k in keys if k not in seen and not seen.add(k)]  # type: ignore[func-returns-value]
-        assert len(unique) == 1
+        # Two identical keys — storage gets called twice for the same row
+        count = backend.touch_structured_memories([("dup", "global", ""), ("dup", "global", "")])
+        assert count == 2
+
+        mem = backend.get_structured_memory_by_name("dup", "global", "")
+        assert int(mem["access_count"]) == 2
 
 
 # -- Lifecycle -----------------------------------------------------------------
