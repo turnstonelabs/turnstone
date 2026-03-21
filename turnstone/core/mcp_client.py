@@ -162,9 +162,11 @@ class MCPClientManager:
         future = asyncio.run_coroutine_threadsafe(self._connect_all(), self._loop)
         self._connected.wait(timeout=30)
         # Surface any exception from _connect_all (unlikely — per-server errors are caught)
-        if future.done() and future.exception():
-            self._error = str(future.exception())
-            log.error("MCP initialization error: %s", self._error)
+        if future.done() and not future.cancelled():
+            exc = future.exception()
+            if exc:
+                self._error = str(exc)
+                log.error("MCP initialization error: %s", self._error)
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
