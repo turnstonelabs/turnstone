@@ -1555,3 +1555,277 @@ class TestSkillAdminEndpoints:
         )
         assert resp.status_code == 400
         assert "integer" in resp.json()["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 9. Skill session config applied to workstream via server handler
+# ---------------------------------------------------------------------------
+
+
+class TestSkillConfigAppliedToWorkstream:
+    """Verify that skill session config fields are applied to the ChatSession
+    when a workstream is created via the server ``create_workstream`` handler.
+    """
+
+    @pytest.fixture()
+    def _ws_app(self, tmp_path):
+        """Build a minimal Starlette app with the real ``create_workstream``
+        handler, a real ``WorkstreamManager``, and a temp SQLite storage
+        backend.  Returns ``(TestClient, WorkstreamManager, storage)``.
+        """
+        import queue
+        import threading
+
+        import turnstone.core.storage._registry as _reg
+        from turnstone.core.workstream import WorkstreamManager
+        from turnstone.server import create_workstream
+
+        storage = SQLiteBackend(str(tmp_path / "ws_test.db"))
+
+        # Inject the test storage as the global singleton so that
+        # get_storage() / get_skill_by_name() resolve against it.
+        old_storage = _reg._storage
+        _reg._storage = storage
+
+        def _session_factory(
+            ui: Any, model_alias: Any = None, ws_id: Any = None, **kwargs: Any
+        ) -> ChatSession:
+            return ChatSession(
+                client=MagicMock(),
+                model=model_alias or "test-model",
+                ui=ui,
+                instructions=None,
+                temperature=0.5,
+                max_tokens=4096,
+                tool_timeout=30,
+                ws_id=ws_id,
+            )
+
+        mgr = WorkstreamManager(_session_factory)
+
+        routes = [
+            Mount(
+                "/v1",
+                routes=[
+                    Route(
+                        "/api/workstreams/new",
+                        create_workstream,
+                        methods=["POST"],
+                    ),
+                ],
+            ),
+        ]
+        app = Starlette(
+            routes=routes,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.workstreams = mgr
+        app.state.skip_permissions = True
+        app.state.global_queue = queue.Queue()
+        app.state.global_listeners = []
+        app.state.global_listeners_lock = threading.Lock()
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        yield client, mgr, storage
+
+        # Restore original storage singleton.
+        _reg._storage = old_storage
+
+    def test_session_receives_temperature(self, _ws_app):
+        """Skill temperature overrides the session default."""
+        client, mgr, storage = _ws_app
+        _create_template(storage, "s1", "warm-skill", "Be warm.", temperature=0.9, enabled=True)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "warm-skill"})
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+        ws = mgr.get(ws_id)
+        assert ws is not None and ws.session is not None
+        assert ws.session.temperature == 0.9
+
+    def test_session_receives_max_tokens(self, _ws_app):
+        """Skill max_tokens overrides the session default."""
+        client, mgr, storage = _ws_app
+        _create_template(storage, "s1", "token-skill", "Be concise.", max_tokens=1024, enabled=True)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "token-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session.max_tokens == 1024
+
+    def test_session_receives_token_budget(self, _ws_app):
+        """Skill token_budget is applied to the session."""
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "budget-skill", "Stay on budget.", token_budget=50000, enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "budget-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session._token_budget == 50000
+
+    def test_session_receives_reasoning_effort(self, _ws_app):
+        """Skill reasoning_effort is applied to the session."""
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "effort-skill", "Think hard.", reasoning_effort="high", enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "effort-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session.reasoning_effort == "high"
+
+    def test_session_receives_agent_max_turns(self, _ws_app):
+        """Skill agent_max_turns is applied to the session."""
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "turns-skill", "Few turns.", agent_max_turns=3, enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "turns-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session.agent_max_turns == 3
+
+    def test_auto_approve_set_on_ui(self, _ws_app):
+        """Skill auto_approve=True propagates to the WebUI."""
+        from turnstone.server import WebUI
+
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "approve-skill", "Auto approve.", auto_approve=True, enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "approve-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None
+        assert isinstance(ws.ui, WebUI)
+        assert ws.ui.auto_approve is True
+
+    def test_allowed_tools_set_on_ui(self, _ws_app):
+        """Skill allowed_tools are parsed and set as auto_approve_tools on the UI."""
+        from turnstone.server import WebUI
+
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage,
+            "s1",
+            "tools-skill",
+            "Restricted tools.",
+            allowed_tools='["bash", "read_file"]',
+            enabled=True,
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "tools-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None
+        assert isinstance(ws.ui, WebUI)
+        assert ws.ui.auto_approve_tools == {"bash", "read_file"}
+
+    def test_skill_model_overrides_resolved_model(self, _ws_app):
+        """Skill model field overrides the default session model."""
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "model-skill", "Use specific model.", model="gpt-5", enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "model-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session.model == "gpt-5"
+
+    def test_all_session_config_fields_applied(self, _ws_app):
+        """All session config fields from a skill are applied together."""
+        from turnstone.server import WebUI
+
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage,
+            "s1",
+            "full-skill",
+            "Full config skill.",
+            model="gpt-5",
+            temperature=0.8,
+            reasoning_effort="high",
+            max_tokens=2048,
+            token_budget=100000,
+            agent_max_turns=10,
+            auto_approve=True,
+            allowed_tools='["bash", "write_file", "read_file"]',
+            notify_on_complete='{"channel": "discord"}',
+            enabled=True,
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "full-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        sess = ws.session
+        assert sess.model == "gpt-5"
+        assert sess.temperature == 0.8
+        assert sess.reasoning_effort == "high"
+        assert sess.max_tokens == 2048
+        assert sess._token_budget == 100000
+        assert sess.agent_max_turns == 10
+        assert sess._notify_on_complete == '{"channel": "discord"}'
+        assert sess._applied_skill_id == "s1"
+        assert sess._applied_skill_content == "Full config skill."
+        assert isinstance(ws.ui, WebUI)
+        assert ws.ui.auto_approve is True
+        assert ws.ui.auto_approve_tools == {"bash", "write_file", "read_file"}
+
+    def test_disabled_skill_returns_400(self, _ws_app):
+        """Creating a workstream with a disabled skill returns 400."""
+        client, _mgr, storage = _ws_app
+        _create_template(storage, "s1", "disabled-skill", "Disabled.", enabled=False)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "disabled-skill"})
+        assert resp.status_code == 400
+        assert "disabled" in resp.json()["error"].lower()
+
+    def test_unknown_skill_returns_400(self, _ws_app):
+        """Creating a workstream with a nonexistent skill returns 400."""
+        client, _mgr, _storage = _ws_app
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "no-such-skill"})
+        assert resp.status_code == 400
+        assert "not found" in resp.json()["error"].lower()
+
+    def test_zero_token_budget_not_applied(self, _ws_app):
+        """Skill with token_budget=0 does not set a budget on the session."""
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "no-budget-skill", "No budget.", token_budget=0, enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "no-budget-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None and ws.session is not None
+        assert ws.session._token_budget == 0
+
+    def test_empty_allowed_tools_not_applied(self, _ws_app):
+        """Skill with allowed_tools='[]' does not set auto_approve_tools."""
+        from turnstone.server import WebUI
+
+        client, mgr, storage = _ws_app
+        _create_template(
+            storage, "s1", "no-tools-skill", "No tools.", allowed_tools="[]", enabled=True
+        )
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "no-tools-skill"})
+        assert resp.status_code == 200
+        ws = mgr.get(resp.json()["ws_id"])
+        assert ws is not None
+        assert isinstance(ws.ui, WebUI)
+        assert ws.ui.auto_approve_tools == set()
