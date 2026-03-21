@@ -190,6 +190,23 @@
 }
 #new-tab-btn:hover { background: var(--bg-highlight); color: var(--accent); border-color: var(--accent); }
 
+#split-btn {
+  background: none;
+  border: 1px dashed transparent;
+  color: var(--fg-dim);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  padding: 6px 8px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0.35;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+  margin-left: 2px;
+}
+#split-btn:hover { opacity: 1; background: var(--bg-highlight); color: var(--accent); border-color: var(--accent); }
+#split-btn.hidden { display: none; }
+
 /* ==========================================================================
    Split panes
    ========================================================================== */
@@ -1259,7 +1276,7 @@ body { position: static; }
   .tool-output-stream { animation: none; border-left-color: var(--accent); }
   .judge-spinner-dot { animation: none; opacity: 1; }
   .thinking-indicator::after { animation: none; content: '...'; }
-  .ws-tab, .ws-tab .tab-close, #new-tab-btn,
+  .ws-tab, .ws-tab .tab-close, #new-tab-btn, #split-btn,
   .hmenu-item, .dashboard-card,
   .approval-btn, .approval-feedback-input,
   #plan-buttons button, .pane-input-area button,
