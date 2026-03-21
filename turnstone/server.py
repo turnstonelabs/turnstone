@@ -158,8 +158,10 @@ class WebUI:
             elif state == "error":
                 self._ws_turn_content = []
                 self._ws_turn_content_size = 0
-            with contextlib.suppress(queue.Full):
+            try:
                 WebUI._global_queue.put_nowait(event)
+            except queue.Full:
+                log.debug("Global SSE queue full, dropping %s event", event.get("type"))
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -364,9 +366,10 @@ class WebUI:
         }
         self._enqueue(self._pending_approval)
         if not self._approval_event.wait(timeout=3600):
-            # Approval timed out (e.g., user disconnected). Deny to unblock.
-            self._approval_result = (False, "Approval timed out after 1 hour")
+            # Approval timed out (e.g., user disconnected). Deny via
+            # resolve_approval so verdicts and state are updated consistently.
             log.warning("Approval timed out for ws_id=%s", self.ws_id)
+            self.resolve_approval(False, "Approval timed out after 1 hour")
         self._pending_approval = None
         approved, feedback = self._approval_result
 
@@ -509,8 +512,10 @@ class WebUI:
             verdict.get("risk_level", "medium"),
             verdict.get("latency_ms", 0),
         )
-        # If approval already resolved, update user_decision immediately
-        decision = self._last_verdict_decision
+        # If approval already resolved, update user_decision immediately.
+        # Read decision under lock to avoid racing with resolve_approval().
+        with self._ws_lock:
+            decision = self._last_verdict_decision
         if decision:
             try:
                 from turnstone.core.storage._registry import get_storage
@@ -562,12 +567,13 @@ class WebUI:
             }
         )
         # Update user_decision on all tracked verdicts (fire-and-forget).
-        # Swap-and-clear under lock to avoid racing with the daemon judge thread.
+        # Swap-and-clear + set decision under lock to avoid racing with
+        # the daemon judge thread's on_intent_verdict() appends.
+        decision_str = "approved" if approved else "denied"
         with self._ws_lock:
             pending = self._pending_verdicts
             self._pending_verdicts = []
-        decision_str = "approved" if approved else "denied"
-        self._last_verdict_decision = decision_str
+            self._last_verdict_decision = decision_str
         if pending:
             try:
                 from turnstone.core.storage._registry import get_storage

@@ -549,7 +549,12 @@ class ChatSession:
             pending = self._watch_pending
 
             def _enqueue(msg: str) -> None:
-                pending.put({"message": msg})
+                try:
+                    pending.put_nowait({"message": msg})
+                except queue.Full:
+                    log.warning(
+                        "Watch pending queue full, dropping result for ws_id=%s", self._ws_id
+                    )
 
             runner.set_dispatch_fn(self._ws_id, _enqueue)
 
