@@ -558,10 +558,11 @@ class TestRegistryInstall:
 # ---------------------------------------------------------------------------
 
 
-def _mock_request(storage: Any = None) -> MagicMock:
+def _mock_request(storage: Any = None, config_store: Any = None) -> MagicMock:
     """Build a mock Request with app.state.auth_storage."""
     request = MagicMock()
     request.app.state.auth_storage = storage
+    request.app.state.config_store = config_store
     return request
 
 
@@ -569,35 +570,20 @@ class TestGetRegistryUrl:
     """Verify three-tier URL resolution: DB setting -> config.toml -> default."""
 
     def test_returns_db_setting_when_available(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.return_value = {
-            "value": json.dumps("https://custom.registry.example.com"),
-        }
-        request = _mock_request(storage)
+        config_store = MagicMock()
+        config_store.get.return_value = "https://custom.registry.example.com"
+        request = _mock_request(config_store=config_store)
 
         with patch("turnstone.core.config.load_config", return_value={}):
             url = _get_registry_url(request)
 
         assert url == "https://custom.registry.example.com"
-        storage.get_system_setting.assert_called_once_with("mcp.registry_url")
+        config_store.get.assert_called_once_with("mcp.registry_url")
 
-    def test_falls_back_to_config_when_db_has_no_setting(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.return_value = None
-        request = _mock_request(storage)
-
-        with patch(
-            "turnstone.core.config.load_config",
-            return_value={"registry_url": "https://config.registry.example.com"},
-        ):
-            url = _get_registry_url(request)
-
-        assert url == "https://config.registry.example.com"
-
-    def test_falls_back_to_config_when_storage_raises_caught_error(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.side_effect = AttributeError("broken storage")
-        request = _mock_request(storage)
+    def test_falls_back_to_config_when_config_store_returns_empty(self) -> None:
+        config_store = MagicMock()
+        config_store.get.return_value = ""
+        request = _mock_request(config_store=config_store)
 
         with patch(
             "turnstone.core.config.load_config",
@@ -607,53 +593,29 @@ class TestGetRegistryUrl:
 
         assert url == "https://config.registry.example.com"
 
-    def test_uncaught_storage_error_propagates(self) -> None:
-        """Storage errors outside the except tuple are not swallowed."""
-        storage = MagicMock()
-        storage.get_system_setting.side_effect = RuntimeError("DB connection lost")
-        request = _mock_request(storage)
+    def test_falls_back_to_config_when_no_config_store(self) -> None:
+        request = _mock_request()
 
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            pytest.raises(RuntimeError, match="DB connection lost"),
+        with patch(
+            "turnstone.core.config.load_config",
+            return_value={"registry_url": "https://config.registry.example.com"},
         ):
-            _get_registry_url(request)
+            url = _get_registry_url(request)
+
+        assert url == "https://config.registry.example.com"
 
     def test_falls_back_to_default_when_both_unavailable(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.side_effect = KeyError("missing")
-        request = _mock_request(storage)
+        config_store = MagicMock()
+        config_store.get.return_value = ""
+        request = _mock_request(config_store=config_store)
 
         with patch("turnstone.core.config.load_config", return_value={}):
             url = _get_registry_url(request)
 
         assert url == DEFAULT_REGISTRY_URL
 
-    def test_falls_back_to_default_when_no_storage(self) -> None:
-        request = _mock_request(storage=None)
-
-        with patch("turnstone.core.config.load_config", return_value={}):
-            url = _get_registry_url(request)
-
-        assert url == DEFAULT_REGISTRY_URL
-
-    def test_skips_empty_db_value(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.return_value = {"value": json.dumps("")}
-        request = _mock_request(storage)
-
-        with patch(
-            "turnstone.core.config.load_config",
-            return_value={"registry_url": "https://config.example.com"},
-        ):
-            url = _get_registry_url(request)
-
-        assert url == "https://config.example.com"
-
-    def test_skips_malformed_json_in_db(self) -> None:
-        storage = MagicMock()
-        storage.get_system_setting.return_value = {"value": "not-valid-json{"}
-        request = _mock_request(storage)
+    def test_falls_back_to_default_when_no_config_store_or_config(self) -> None:
+        request = _mock_request()
 
         with patch("turnstone.core.config.load_config", return_value={}):
             url = _get_registry_url(request)

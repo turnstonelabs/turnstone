@@ -684,19 +684,22 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # auto-rotate via ServiceTokenManager instead of expiring after 1 hour.
     # Size the pool above the fan-out limit to leave headroom for non-fan-out
     # proxy traffic (UI proxying, SSE streams, etc.).
-    fan_out = _NODE_FAN_OUT_LIMIT
+    #
+    # Build a ConfigStore so console settings reads get type validation and
+    # caching instead of raw storage.get_system_setting() calls.
     storage = getattr(app.state, "auth_storage", None)
+    config_store = None
     if storage:
         try:
-            row = storage.get_system_setting("cluster.node_fan_out_limit")
-            if row:
-                fan_out = int(row["value"])
+            from turnstone.core.config_store import ConfigStore
+
+            config_store = ConfigStore(storage)
         except Exception:
-            log.warning(
-                "Failed to read cluster.node_fan_out_limit, using default %d",
-                fan_out,
-                exc_info=True,
-            )
+            log.warning("Failed to initialise ConfigStore", exc_info=True)
+    app.state.config_store = config_store
+    fan_out = (
+        config_store.get("cluster.node_fan_out_limit") if config_store else _NODE_FAN_OUT_LIMIT
+    )
     app.state.fan_out_limit = fan_out
     app.state.proxy_client = httpx.AsyncClient(
         timeout=30,
@@ -3105,20 +3108,18 @@ async def admin_delete_skill_resource(request: Request) -> JSONResponse:
 
 
 def _get_discovery_url(request: Request) -> str:
-    """Get skills discovery URL from DB settings, config.toml, or default."""
+    """Get skills discovery URL via ConfigStore, config.toml, or default."""
     from turnstone.core.config import load_config
     from turnstone.core.skill_sources import DEFAULT_DISCOVERY_URL
 
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage:
-        try:
-            row = storage.get_system_setting("skills.discovery_url")
-            if row:
-                val = json.loads(row["value"])
-                if val:
-                    return str(val)
-        except (KeyError, json.JSONDecodeError, TypeError, AttributeError):
-            pass
+    # ConfigStore: validated + cached
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        val = config_store.get("skills.discovery_url")
+        if val:
+            return str(val)
+
+    # Fall back to config.toml [skills] section
     skills_cfg = load_config("skills")
     url = skills_cfg.get("discovery_url", "")
     if url:
@@ -3501,6 +3502,11 @@ async def _publish_config_change(request: Request) -> None:
             except Exception:
                 log.warning("Config reload failed for %s", url, exc_info=True)
 
+    # Reload the console's own ConfigStore so cached values stay fresh
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        config_store.reload()
+
     nodes = collector.get_all_nodes()
     tasks = [_notify(n["server_url"]) for n in nodes if n.get("server_url")]
     if tasks:
@@ -3695,7 +3701,7 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
 
     key = request.path_params["key"]
     try:
-        validate_key(key)
+        defn = validate_key(key)
     except ValueError:
         return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
 
@@ -3717,7 +3723,7 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
 
     await _publish_config_change(request)
 
-    return JSONResponse({"status": "ok", "key": key})
+    return JSONResponse({"status": "ok", "key": key, "default": defn.default})
 
 
 # ---------------------------------------------------------------------------
@@ -3726,21 +3732,16 @@ async def admin_delete_setting(request: Request) -> JSONResponse:
 
 
 def _get_registry_url(request: Request) -> str:
-    """Get the MCP Registry URL from DB settings, config.toml, or default."""
+    """Get the MCP Registry URL via ConfigStore, config.toml, or default."""
     from turnstone.core.config import load_config
     from turnstone.core.mcp_registry import DEFAULT_REGISTRY_URL
 
-    # Check database settings first
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage:
-        try:
-            row = storage.get_system_setting("mcp.registry_url")
-            if row:
-                val = json.loads(row["value"])
-                if val:
-                    return str(val)
-        except (KeyError, json.JSONDecodeError, TypeError, AttributeError):
-            pass
+    # ConfigStore: validated + cached
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        val = config_store.get("mcp.registry_url")
+        if val:
+            return str(val)
 
     # Fall back to config.toml [mcp] section
     mcp_cfg = load_config("mcp")
@@ -3993,19 +3994,10 @@ _MCP_MAX_SERVERS = 200  # fallback; prefer cluster.mcp_max_servers from storage
 
 
 def _get_mcp_max_servers(request: Request) -> int:
-    """Read cluster.mcp_max_servers from storage, falling back to the constant."""
-    storage = getattr(request.app.state, "auth_storage", None)
-    if storage:
-        try:
-            row = storage.get_system_setting("cluster.mcp_max_servers")
-            if row:
-                return int(row["value"])
-        except Exception:
-            log.warning(
-                "Failed to read cluster.mcp_max_servers, using default %d",
-                _MCP_MAX_SERVERS,
-                exc_info=True,
-            )
+    """Read cluster.mcp_max_servers via ConfigStore (validated + cached)."""
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        return int(config_store.get("cluster.mcp_max_servers"))
     return _MCP_MAX_SERVERS
 
 

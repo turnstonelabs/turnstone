@@ -2057,10 +2057,12 @@ var _settingsSectionOrder = [
   "session",
   "tools",
   "server",
+  "cluster",
   "mcp",
   "ratelimit",
   "health",
   "judge",
+  "skills",
   "memory",
 ];
 
@@ -2070,10 +2072,12 @@ function _settingsSectionLabel(section) {
     session: "Session",
     tools: "Tools",
     server: "Server",
+    cluster: "Cluster",
     mcp: "MCP",
     ratelimit: "Rate Limiting",
     health: "Health",
     judge: "Judge",
+    skills: "Skills",
     memory: "Memory",
   };
   return labels[section] || section;

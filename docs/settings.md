@@ -51,7 +51,7 @@ connection, Redis, auth secrets, server bind address). These stay in
 | Bridge identity | `[bridge]` | config.toml / env |
 | Console bind | `[console]` | config.toml / env |
 
-**ConfigStore settings** (~40 settings) are loaded from the database after
+**ConfigStore settings** (48 settings) are loaded from the database after
 storage initialization:
 
 | Section | Settings |
@@ -62,9 +62,10 @@ storage initialization:
 | `server` | workstream_idle_timeout, max_workstreams |
 | `cluster` | node_fan_out_limit, mcp_max_servers |
 | `mcp` | config_path, refresh_interval, registry_url |
-| `ratelimit` | enabled, requests_per_second, burst |
+| `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
-| `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools |
+| `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets |
+| `skills` | discovery_url |
 | `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
 
 Settings are addressed by dotted key (e.g. `memory.relevance_k`). Each has a
