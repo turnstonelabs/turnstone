@@ -2426,6 +2426,53 @@ class PostgreSQLBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def touch_structured_memory(self, name: str, scope: str, scope_id: str) -> bool:
+        """Bump last_accessed and increment access_count for a single memory."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(structured_memories)
+                .where(
+                    sa.and_(
+                        structured_memories.c.name == name,
+                        structured_memories.c.scope == scope,
+                        structured_memories.c.scope_id == scope_id,
+                    )
+                )
+                .values(
+                    last_accessed=now,
+                    access_count=structured_memories.c.access_count + 1,
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
+        """Batch-touch multiple memories by (name, scope, scope_id)."""
+        if not keys:
+            return 0
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        total = 0
+        with self._engine.connect() as conn:
+            for name, scope, scope_id in keys:
+                result = conn.execute(
+                    sa.update(structured_memories)
+                    .where(
+                        sa.and_(
+                            structured_memories.c.name == name,
+                            structured_memories.c.scope == scope,
+                            structured_memories.c.scope_id == scope_id,
+                        )
+                    )
+                    .values(
+                        last_accessed=now,
+                        access_count=structured_memories.c.access_count + 1,
+                    )
+                )
+                total += result.rowcount
+            conn.commit()
+        return total
+
     def count_structured_memories(
         self, mem_type: str = "", scope: str = "", scope_id: str = ""
     ) -> int:

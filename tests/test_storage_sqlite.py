@@ -1,5 +1,9 @@
 """Tests for the SQLite storage backend."""
 
+from __future__ import annotations
+
+from typing import Any
+
 import pytest
 
 from turnstone.core.storage import init_storage, reset_storage
@@ -287,6 +291,117 @@ class TestWorkstreams:
         # Columns: ws_id, alias, title, created, updated, count, node_id
         assert rows[0][0] == "ws1"
         assert rows[0][6] == "node-a"
+
+
+# -- Structured memory touch ---------------------------------------------------
+
+
+class TestTouchStructuredMemory:
+    @staticmethod
+    def _create_memory(
+        backend: Any, name: str = "m1", scope: str = "global", scope_id: str = ""
+    ) -> None:
+        import uuid
+
+        backend.create_structured_memory(
+            memory_id=str(uuid.uuid4()),
+            name=name,
+            description="test desc",
+            mem_type="project",
+            scope=scope,
+            scope_id=scope_id,
+            content="test content",
+        )
+
+    def test_touch_bumps_access_count(self, backend):
+        self._create_memory(backend)
+        mem = backend.get_structured_memory_by_name("m1", "global", "")
+        assert mem is not None
+        assert int(mem["access_count"]) == 0
+
+        result = backend.touch_structured_memory("m1", "global", "")
+        assert result is True
+
+        mem = backend.get_structured_memory_by_name("m1", "global", "")
+        assert int(mem["access_count"]) == 1
+
+    def test_touch_updates_last_accessed(self, backend):
+        self._create_memory(backend)
+        mem_before = backend.get_structured_memory_by_name("m1", "global", "")
+        original_accessed = mem_before["last_accessed"]
+
+        backend.touch_structured_memory("m1", "global", "")
+
+        mem_after = backend.get_structured_memory_by_name("m1", "global", "")
+        assert mem_after["last_accessed"] >= original_accessed
+
+    def test_touch_nonexistent_returns_false(self, backend):
+        result = backend.touch_structured_memory("no_such", "global", "")
+        assert result is False
+
+    def test_touch_increments_multiple_times(self, backend):
+        self._create_memory(backend)
+        for _ in range(3):
+            backend.touch_structured_memory("m1", "global", "")
+
+        mem = backend.get_structured_memory_by_name("m1", "global", "")
+        assert int(mem["access_count"]) == 3
+
+    def test_touch_scoped_memory(self, backend):
+        self._create_memory(backend, name="ws_mem", scope="workstream", scope_id="ws-1")
+        backend.touch_structured_memory("ws_mem", "workstream", "ws-1")
+
+        mem = backend.get_structured_memory_by_name("ws_mem", "workstream", "ws-1")
+        assert int(mem["access_count"]) == 1
+
+        # Different scope_id should not match
+        result = backend.touch_structured_memory("ws_mem", "workstream", "ws-other")
+        assert result is False
+
+    def test_batch_touch_multiple(self, backend):
+        self._create_memory(backend, name="a")
+        self._create_memory(backend, name="b")
+        self._create_memory(backend, name="c")
+
+        count = backend.touch_structured_memories(
+            [
+                ("a", "global", ""),
+                ("b", "global", ""),
+                ("c", "global", ""),
+            ]
+        )
+        assert count == 3
+
+        for name in ("a", "b", "c"):
+            mem = backend.get_structured_memory_by_name(name, "global", "")
+            assert int(mem["access_count"]) == 1
+
+    def test_batch_touch_empty_list(self, backend):
+        assert backend.touch_structured_memories([]) == 0
+
+    def test_batch_touch_partial_match(self, backend):
+        self._create_memory(backend, name="exists")
+
+        count = backend.touch_structured_memories(
+            [
+                ("exists", "global", ""),
+                ("missing", "global", ""),
+            ]
+        )
+        assert count == 1
+
+        mem = backend.get_structured_memory_by_name("exists", "global", "")
+        assert int(mem["access_count"]) == 1
+
+    def test_touch_does_not_change_updated(self, backend):
+        self._create_memory(backend)
+        mem_before = backend.get_structured_memory_by_name("m1", "global", "")
+
+        backend.touch_structured_memory("m1", "global", "")
+
+        mem_after = backend.get_structured_memory_by_name("m1", "global", "")
+        # updated should stay the same (only last_accessed changes)
+        assert mem_after["updated"] == mem_before["updated"]
 
 
 # -- Lifecycle -----------------------------------------------------------------

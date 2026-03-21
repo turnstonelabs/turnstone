@@ -368,6 +368,20 @@ def search_structured_memories(
         return []
 
 
+def touch_structured_memories(keys: list[tuple[str, str, str]]) -> int:
+    """Batch-touch memories (bump last_accessed, increment access_count).
+
+    Each key is ``(name, scope, scope_id)``.  Returns count of rows updated.
+    """
+    if not keys:
+        return 0
+    try:
+        return get_storage().touch_structured_memories(keys)
+    except Exception:
+        log.warning("Failed to touch structured memories", exc_info=True)
+        return 0
+
+
 def count_structured_memories(mem_type: str = "", scope: str = "", scope_id: str = "") -> int:
     """Count structured memories with optional type/scope filter."""
     try:
