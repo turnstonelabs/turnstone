@@ -26,10 +26,12 @@ from turnstone.console.server import (
     admin_get_mcp_server,
     admin_import_mcp_config,
     admin_list_mcp_servers,
+    admin_mcp_reload,
     admin_update_mcp_server,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
+from turnstone.server import internal_mcp_reload
 
 # ---------------------------------------------------------------------------
 # Auth middleware variants
@@ -97,6 +99,11 @@ _ROUTES = [
                 methods=["POST"],
             ),
             Route(
+                "/api/admin/mcp-servers/reload",
+                admin_mcp_reload,
+                methods=["POST"],
+            ),
+            Route(
                 "/api/admin/mcp-servers/{server_id}",
                 admin_get_mcp_server,
             ),
@@ -109,6 +116,11 @@ _ROUTES = [
                 "/api/admin/mcp-servers/{server_id}",
                 admin_delete_mcp_server,
                 methods=["DELETE"],
+            ),
+            Route(
+                "/api/_internal/mcp-reload",
+                internal_mcp_reload,
+                methods=["POST"],
             ),
         ],
     ),
@@ -694,3 +706,175 @@ class TestNotifyNodesMcpReload:
         result = await _notify_nodes_mcp_reload(req)
         assert result["n1"] == {"reloaded": 2}
         assert "error" in result["n2"]
+
+
+# ---------------------------------------------------------------------------
+# Console reload endpoint: POST /v1/api/admin/mcp-servers/reload
+# ---------------------------------------------------------------------------
+
+
+class TestAdminMcpReloadEndpoint:
+    """HTTP-level tests for the console reload endpoint."""
+
+    def test_reload_success(self, client: TestClient) -> None:
+        """Reload endpoint returns status ok and fan-out results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={"n1": {"reloaded": 3}},
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {"n1": {"reloaded": 3}}
+
+    def test_reload_empty_cluster(self, client: TestClient) -> None:
+        """Reload with no nodes returns empty results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={},
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["results"] == {}
+
+    def test_reload_permission_denied(self, client_no_perm: TestClient) -> None:
+        """Reload without admin.mcp permission is rejected."""
+        r = client_no_perm.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 403
+        assert "admin.mcp" in r.json()["error"]
+
+    def test_reload_no_storage(self) -> None:
+        """Reload returns 503 when auth_storage is not available."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        # Deliberately omit app.state.auth_storage
+        no_storage_client = TestClient(app, raise_server_exceptions=False)
+        r = no_storage_client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 503
+
+    def test_reload_mixed_node_results(self, client: TestClient) -> None:
+        """Reload propagates per-node errors in results."""
+        with patch(
+            "turnstone.console.server._notify_nodes_mcp_reload",
+            new_callable=AsyncMock,
+            return_value={
+                "n1": {"reloaded": 2},
+                "n2": {"error": "Connection refused"},
+            },
+        ):
+            r = client.post("/v1/api/admin/mcp-servers/reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["results"]["n1"] == {"reloaded": 2}
+        assert "error" in data["results"]["n2"]
+
+
+# ---------------------------------------------------------------------------
+# Node reload endpoint: POST /v1/api/_internal/mcp-reload
+# ---------------------------------------------------------------------------
+
+
+class TestInternalMcpReloadEndpoint:
+    """HTTP-level tests for the node-side MCP reload endpoint."""
+
+    @pytest.fixture()
+    def node_client(self, storage: SQLiteBackend) -> TestClient:
+        """TestClient with an MCP client manager on app.state."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {
+            "added": ["new-srv"],
+            "removed": [],
+            "updated": [],
+        }
+        app.state.mcp_client = mgr
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_reload_calls_reconcile(self, node_client: TestClient, storage: SQLiteBackend) -> None:
+        """Reload endpoint calls reconcile_sync and returns its result."""
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = node_client.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "ok"
+        assert data["added"] == ["new-srv"]
+        assert data["removed"] == []
+        assert data["updated"] == []
+
+    def test_reload_passes_storage_to_reconcile(
+        self,
+        storage: SQLiteBackend,
+    ) -> None:
+        """Verify reconcile_sync receives the storage backend."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {"added": [], "removed": [], "updated": []}
+        app.state.mcp_client = mgr
+        c = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = c.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        mgr.reconcile_sync.assert_called_once_with(storage)
+
+    def test_reload_creates_manager_when_missing(self, storage: SQLiteBackend) -> None:
+        """When mcp_client is absent, a new MCPClientManager is created."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        # No mcp_client on app.state
+        c = TestClient(app, raise_server_exceptions=False)
+        with (
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
+            patch("turnstone.core.mcp_client.MCPClientManager") as mock_cls,
+        ):
+            mock_mgr = MagicMock()
+            mock_mgr.reconcile_sync.return_value = {
+                "added": [],
+                "removed": [],
+                "updated": [],
+            }
+            mock_cls.return_value = mock_mgr
+            r = c.post("/v1/api/_internal/mcp-reload")
+        assert r.status_code == 200
+        mock_cls.assert_called_once_with({})
+        mock_mgr.start.assert_called_once()
+        mock_mgr.reconcile_sync.assert_called_once_with(storage)
+
+    def test_reload_reconcile_result_in_response(self, storage: SQLiteBackend) -> None:
+        """Full reconcile result fields (added/removed/updated) appear in JSON."""
+        app = Starlette(
+            routes=_ROUTES,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.auth_storage = storage
+        mgr = MagicMock()
+        mgr.reconcile_sync.return_value = {
+            "added": ["a"],
+            "removed": ["b"],
+            "updated": ["c"],
+        }
+        app.state.mcp_client = mgr
+        c = TestClient(app, raise_server_exceptions=False)
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
+            r = c.post("/v1/api/_internal/mcp-reload")
+        data = r.json()
+        assert data["added"] == ["a"]
+        assert data["removed"] == ["b"]
+        assert data["updated"] == ["c"]
