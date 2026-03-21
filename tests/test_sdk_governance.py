@@ -117,13 +117,13 @@ def storage(tmp_path: Any) -> SQLiteBackend:
 
 
 @pytest.fixture
-async def sdk_client(storage: SQLiteBackend) -> AsyncTurnstoneConsole:
+async def sdk_client(storage: SQLiteBackend):
     """SDK client wired to a real Starlette app via ASGITransport."""
     app = _make_app()
     app.state.auth_storage = storage
     transport = httpx.ASGITransport(app=app)
-    hc = httpx.AsyncClient(transport=transport, base_url="http://testserver")
-    return AsyncTurnstoneConsole(httpx_client=hc)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as hc:
+        yield AsyncTurnstoneConsole(httpx_client=hc)
 
 
 # ---------------------------------------------------------------------------
