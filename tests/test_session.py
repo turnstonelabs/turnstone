@@ -753,3 +753,40 @@ class TestGetCapabilitiesOverride:
         caps = session._get_capabilities()
         # Default OpenAI provider for unknown model → no vision
         assert caps.supports_vision is False
+
+
+class TestTitleRetry:
+    """_generate_title resets _title_generated on failure."""
+
+    def test_title_generated_reset_on_failure(self, tmp_db):
+        session = _make_session()
+        session._title_generated = True
+        session.messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        # Mock provider to raise
+        session._provider = MagicMock()
+        session._provider.create_completion.side_effect = RuntimeError("API error")
+
+        session._generate_title()
+
+        assert session._title_generated is False
+
+    def test_title_generated_stays_true_on_success(self, tmp_db):
+        session = _make_session()
+        session._title_generated = True
+        session.messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        result = MagicMock()
+        result.content = "Test Title"
+        session._provider = MagicMock()
+        session._provider.create_completion.return_value = result
+
+        with patch("turnstone.core.session.update_workstream_title"):
+            session._generate_title()
+
+        # Flag stays True after successful generation
+        assert session._title_generated is True
