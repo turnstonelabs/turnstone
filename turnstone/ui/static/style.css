@@ -112,6 +112,7 @@
   #hamburger-btn { width: 40px; height: 40px; }
   .hmenu-item { padding: 12px 14px; }
   .ws-tab .tab-close { opacity: 1; padding: 4px 6px; font-size: 16px; }
+  #split-btn { display: none; }
 }
 
 /* ==========================================================================
@@ -126,6 +127,11 @@
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   overflow-x: auto;
+}
+#tab-list {
+  display: flex;
+  align-items: center;
+  gap: 2px;
 }
 #tab-bar::-webkit-scrollbar { height: 3px; }
 #tab-bar::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 2px; }
@@ -192,7 +198,7 @@
 
 #split-btn {
   background: none;
-  border: 1px dashed transparent;
+  border: 1px dashed var(--border);
   color: var(--fg-dim);
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
   padding: 6px 8px;
@@ -200,11 +206,10 @@
   font-family: inherit;
   font-size: 13px;
   line-height: 1;
-  opacity: 0.35;
-  transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
   margin-left: 2px;
 }
-#split-btn:hover { opacity: 1; background: var(--bg-highlight); color: var(--accent); border-color: var(--accent); }
+#split-btn:hover { background: var(--bg-highlight); color: var(--accent); border-color: var(--accent); }
 #split-btn.hidden { display: none; }
 
 /* ==========================================================================

@@ -1873,10 +1873,11 @@ document
 // ===========================================================================
 
 var tabBar = document.getElementById("tab-bar");
+var tabList = document.getElementById("tab-list");
 var newTabBtn = document.getElementById("new-tab-btn");
 
 function renderTabBar() {
-  tabBar.querySelectorAll(".ws-tab").forEach(function (t) {
+  tabList.querySelectorAll(".ws-tab").forEach(function (t) {
     t.remove();
   });
 
@@ -1923,7 +1924,7 @@ function renderTabBar() {
       tab.appendChild(close);
     }
 
-    tabBar.insertBefore(tab, newTabBtn);
+    tabList.appendChild(tab);
   });
 }
 
