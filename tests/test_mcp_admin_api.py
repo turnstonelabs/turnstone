@@ -31,7 +31,6 @@ from turnstone.console.server import (
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
-from turnstone.server import internal_mcp_reload
 
 # ---------------------------------------------------------------------------
 # Auth middleware variants
@@ -117,14 +116,24 @@ _ROUTES = [
                 admin_delete_mcp_server,
                 methods=["DELETE"],
             ),
-            Route(
-                "/api/_internal/mcp-reload",
-                internal_mcp_reload,
-                methods=["POST"],
-            ),
         ],
     ),
 ]
+
+
+def _routes_with_internal() -> list[Mount]:
+    """Routes including the node-side internal endpoint (lazy-imported)."""
+    from turnstone.server import internal_mcp_reload
+
+    return [
+        Mount(
+            "/v1",
+            routes=[
+                *_ROUTES[0].routes,  # type: ignore[union-attr]
+                Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
+            ],
+        ),
+    ]
 
 
 @pytest.fixture
@@ -788,7 +797,7 @@ class TestInternalMcpReloadEndpoint:
     def node_client(self, storage: SQLiteBackend) -> TestClient:
         """TestClient with an MCP client manager on app.state."""
         app = Starlette(
-            routes=_ROUTES,
+            routes=_routes_with_internal(),
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
         app.state.auth_storage = storage
@@ -818,7 +827,7 @@ class TestInternalMcpReloadEndpoint:
     ) -> None:
         """Verify reconcile_sync receives the storage backend."""
         app = Starlette(
-            routes=_ROUTES,
+            routes=_routes_with_internal(),
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
         app.state.auth_storage = storage
@@ -834,7 +843,7 @@ class TestInternalMcpReloadEndpoint:
     def test_reload_creates_manager_when_missing(self, storage: SQLiteBackend) -> None:
         """When mcp_client is absent, a new MCPClientManager is created."""
         app = Starlette(
-            routes=_ROUTES,
+            routes=_routes_with_internal(),
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
         app.state.auth_storage = storage
@@ -860,7 +869,7 @@ class TestInternalMcpReloadEndpoint:
     def test_reload_reconcile_result_in_response(self, storage: SQLiteBackend) -> None:
         """Full reconcile result fields (added/removed/updated) appear in JSON."""
         app = Starlette(
-            routes=_ROUTES,
+            routes=_routes_with_internal(),
             middleware=[Middleware(_InjectAuthMiddleware)],
         )
         app.state.auth_storage = storage
