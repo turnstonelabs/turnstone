@@ -221,6 +221,63 @@ class TestBackendHealthMonitor:
         mon.record_failure()
         assert mon.circuit_state == CircuitState.OPEN  # type: ignore[comparison-overlap]
 
+    def test_probe_loop_autonomous_recovery(
+        self, mock_client: MagicMock, mock_metrics: MagicMock
+    ) -> None:
+        """_probe_loop transitions OPEN → HALF_OPEN → CLOSED without user requests."""
+        # Use very short intervals so the test is fast
+        mon = BackendHealthMonitor(
+            client=mock_client,
+            probe_interval=0.05,
+            probe_timeout=1.0,
+            failure_threshold=1,
+            cooldown=0.1,
+        )
+        # Trip the circuit
+        mon.record_failure()
+        assert mon.circuit_state == CircuitState.OPEN
+
+        # Backend is healthy — probe_once will succeed
+        mock_client.with_options.return_value.models.list.return_value = MagicMock()
+
+        # Start the probe loop and wait for autonomous recovery
+        mon.start()
+        try:
+            import time
+
+            deadline = time.monotonic() + 5.0
+            while mon.circuit_state != CircuitState.CLOSED and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert mon.circuit_state == CircuitState.CLOSED
+            # User requests should flow again without anyone calling acquire_request_permit
+            assert mon.acquire_request_permit() is True
+        finally:
+            mon.stop()
+            if mon._thread:
+                mon._thread.join(timeout=2.0)
+
+    def test_probe_loop_no_user_permit_during_probe(
+        self, mock_client: MagicMock, mock_metrics: MagicMock
+    ) -> None:
+        """While background probe is in HALF_OPEN, user requests are blocked."""
+        mon = BackendHealthMonitor(
+            client=mock_client,
+            probe_interval=0.05,
+            probe_timeout=1.0,
+            failure_threshold=1,
+            cooldown=0.1,
+        )
+        mon.record_failure()
+        assert mon.circuit_state == CircuitState.OPEN
+
+        # Force into HALF_OPEN as the probe loop would
+        with mon._lock:
+            mon._state = CircuitState.HALF_OPEN
+            mon._half_open_permit = False  # probe consumes it
+
+        # User requests should be blocked — only the probe gets through
+        assert mon.acquire_request_permit() is False
+
     def test_stop_thread(self, mock_client: MagicMock) -> None:
         """stop() signals the probe loop to exit."""
         mon = _make_monitor(mock_client)
