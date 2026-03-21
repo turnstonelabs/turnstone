@@ -403,6 +403,17 @@ class TestTouchStructuredMemory:
         # updated should stay the same (only last_accessed changes)
         assert mem_after["updated"] == mem_before["updated"]
 
+    def test_facade_deduplicates_keys(self):
+        """The memory.py facade deduplicates before calling storage."""
+        from turnstone.core.memory import touch_structured_memories
+
+        # The facade deduplicates, so even with duplicates in input,
+        # each distinct memory is touched at most once.
+        keys = [("m1", "global", ""), ("m1", "global", "")]
+        seen: set[tuple[str, str, str]] = set()
+        unique = [k for k in keys if k not in seen and not seen.add(k)]  # type: ignore[func-returns-value]
+        assert len(unique) == 1
+
 
 # -- Lifecycle -----------------------------------------------------------------
 

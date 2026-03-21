@@ -371,12 +371,19 @@ def search_structured_memories(
 def touch_structured_memories(keys: list[tuple[str, str, str]]) -> int:
     """Batch-touch memories (bump last_accessed, increment access_count).
 
-    Each key is ``(name, scope, scope_id)``.  Returns count of rows updated.
+    Each key is ``(name, scope, scope_id)``.  Duplicates are removed so each
+    distinct memory is touched at most once.  Returns count of rows updated.
     """
     if not keys:
         return 0
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[tuple[str, str, str]] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
     try:
-        return get_storage().touch_structured_memories(keys)
+        return get_storage().touch_structured_memories(unique)
     except Exception:
         log.warning("Failed to touch structured memories", exc_info=True)
         return 0

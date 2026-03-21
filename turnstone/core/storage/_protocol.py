@@ -136,7 +136,12 @@ class StorageBackend(Protocol):
         ...
 
     def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
-        """Batch-touch multiple memories. Returns count of rows updated."""
+        """Batch-touch multiple memories.
+
+        Each key is ``(name, scope, scope_id)``.  Callers should deduplicate
+        before calling; each key increments ``access_count`` once per call.
+        Returns count of rows found and updated.
+        """
         ...
 
     def count_structured_memories(
