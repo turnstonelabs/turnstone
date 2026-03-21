@@ -241,9 +241,9 @@ def validate_issuer_url(url: str) -> None:
     if not hostname:
         raise OIDCError(f"OIDC issuer URL has no hostname: {url}")
 
-    # Reject embedded credentials (userinfo).
+    # Reject embedded credentials — redact userinfo from error message.
     if parsed.username or parsed.password:
-        raise OIDCError(f"OIDC issuer URL must not contain credentials: {url}")
+        raise OIDCError("OIDC issuer URL must not contain embedded credentials (userinfo)")
 
     # Require HTTPS (allow HTTP only for localhost development).
     if parsed.scheme != "https":
@@ -252,17 +252,20 @@ def validate_issuer_url(url: str) -> None:
         else:
             raise OIDCError(f"OIDC issuer URL must use HTTPS (got {parsed.scheme}://): {url}")
 
-    # Resolve hostname and check all addresses against private ranges.
+    # Resolve hostname and reject non-globally-routable addresses.
     try:
         addr_infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
         raise OIDCError(f"OIDC issuer hostname cannot be resolved: {hostname}") from exc
 
     for _family, _type, _proto, _canonname, sockaddr in addr_infos:
-        addr = ipaddress.ip_address(sockaddr[0])
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            if _is_localhost(hostname):
-                continue  # Allow loopback for localhost dev
+        try:
+            addr = ipaddress.ip_address(sockaddr[0])
+        except ValueError as exc:
+            raise OIDCError(
+                f"OIDC issuer hostname resolved to invalid IP {sockaddr[0]!r}: {hostname}"
+            ) from exc
+        if not addr.is_global and not _is_localhost(hostname):
             raise OIDCError(f"OIDC issuer URL resolves to non-public address ({addr}): {url}")
 
 

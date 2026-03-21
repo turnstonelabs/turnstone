@@ -340,12 +340,12 @@ class TestValidateIssuerURL:
 
     def test_rejects_embedded_credentials(self):
         """URLs with userinfo (user:pass@host) are rejected."""
-        with pytest.raises(OIDCError, match="must not contain credentials"):
+        with pytest.raises(OIDCError, match="embedded credentials"):
             validate_issuer_url("https://admin:secret@idp.example.com")
 
     def test_rejects_username_only(self):
         """URLs with just a username are rejected."""
-        with pytest.raises(OIDCError, match="must not contain credentials"):
+        with pytest.raises(OIDCError, match="embedded credentials"):
             validate_issuer_url("https://admin@idp.example.com")
 
     def test_rejects_no_hostname(self):
