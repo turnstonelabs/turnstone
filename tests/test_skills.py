@@ -1829,3 +1829,48 @@ class TestSkillConfigAppliedToWorkstream:
         assert ws is not None
         # auto_approve_tools stays at default (empty set)
         assert ws.ui.auto_approve_tools == set()
+
+    def test_skill_lineage_in_workstreams_table(self, _ws_app):
+        """skill_id and skill_version columns are populated in the workstreams table."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import workstreams
+
+        client, _mgr, storage = _ws_app
+        _create_template(storage, "s1", "lineage-skill", "Track me.", enabled=True)
+
+        resp = client.post("/v1/api/workstreams/new", json={"skill": "lineage-skill"})
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+
+        with storage._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.skill_id, workstreams.c.skill_version).where(
+                    workstreams.c.ws_id == ws_id
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "s1"
+        assert row[1] == 1
+
+    def test_no_skill_lineage_when_no_skill(self, _ws_app):
+        """Workstream without a skill has empty skill_id and zero skill_version."""
+        import sqlalchemy as sa
+
+        from turnstone.core.storage._schema import workstreams
+
+        client, _mgr, storage = _ws_app
+
+        resp = client.post("/v1/api/workstreams/new", json={})
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+
+        with storage._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.skill_id, workstreams.c.skill_version).where(
+                    workstreams.c.ws_id == ws_id
+                )
+            ).fetchone()
+        assert row is not None
+        assert row[0] == ""
+        assert row[1] == 0
