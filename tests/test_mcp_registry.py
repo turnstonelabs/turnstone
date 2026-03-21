@@ -398,6 +398,72 @@ class TestResolveInstallConfig:
         config = resolve_install_config(server, "remote", 0)
         assert config["url"] == "https://us-east.example.com/mcp"
 
+    def test_remote_variable_substitution_invalid_scheme(self) -> None:
+        server = RegistryServer(
+            name="io.example/test",
+            version="1.0.0",
+            remotes=[
+                RegistryRemote(
+                    type="streamable-http",
+                    url="{scheme}://evil.example.com/mcp",
+                    variables={
+                        "scheme": RegistryRemoteVariable(is_required=True),
+                    },
+                )
+            ],
+        )
+        with pytest.raises(MCPRegistryError, match="Invalid URL scheme"):
+            resolve_install_config(server, "remote", 0, variables={"scheme": "file"})
+
+    def test_remote_variable_substitution_preserves_valid_scheme(self) -> None:
+        server = RegistryServer(
+            name="io.example/test",
+            version="1.0.0",
+            remotes=[
+                RegistryRemote(
+                    type="streamable-http",
+                    url="https://{host}.example.com/mcp",
+                    variables={
+                        "host": RegistryRemoteVariable(is_required=True),
+                    },
+                )
+            ],
+        )
+        config = resolve_install_config(server, "remote", 0, variables={"host": "api"})
+        assert config["url"] == "https://api.example.com/mcp"
+
+    def test_remote_variable_substitution_missing_hostname(self) -> None:
+        """URL like https:///mcp has valid scheme but no hostname."""
+        server = RegistryServer(
+            name="io.example/test",
+            version="1.0.0",
+            remotes=[
+                RegistryRemote(
+                    type="streamable-http",
+                    url="https:///mcp",
+                )
+            ],
+        )
+        with pytest.raises(MCPRegistryError, match="hostname is missing"):
+            resolve_install_config(server, "remote", 0)
+
+    def test_remote_variable_substitution_embedded_credentials(self) -> None:
+        server = RegistryServer(
+            name="io.example/test",
+            version="1.0.0",
+            remotes=[
+                RegistryRemote(
+                    type="streamable-http",
+                    url="https://{creds}@example.com/mcp",
+                    variables={
+                        "creds": RegistryRemoteVariable(is_required=True),
+                    },
+                )
+            ],
+        )
+        with pytest.raises(MCPRegistryError, match="embedded credentials"):
+            resolve_install_config(server, "remote", 0, variables={"creds": "user:pass"})
+
     def test_remote_no_remotes(self) -> None:
         server = RegistryServer(name="io.example/test", version="1.0.0")
         with pytest.raises(MCPRegistryError, match="no remote"):

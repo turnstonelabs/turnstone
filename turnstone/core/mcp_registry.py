@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -399,6 +400,17 @@ def resolve_install_config(
                 if not value and var_def.is_required:
                     raise MCPRegistryError(f"Required URL variable '{var_name}' not provided")
                 url = url.replace(placeholder, value)
+
+        # Validate URL after substitution to prevent SSRF-style redirection
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise MCPRegistryError(
+                f"Invalid URL scheme '{parsed.scheme}' after variable substitution"
+            )
+        if not parsed.hostname:
+            raise MCPRegistryError("Invalid URL (hostname is missing) after variable substitution")
+        if parsed.username is not None or parsed.password is not None:
+            raise MCPRegistryError("URLs with embedded credentials are not allowed in MCP remotes")
 
         # Build headers dict (required keys only — values provided by user at install time)
         headers: dict[str, str] = {}
