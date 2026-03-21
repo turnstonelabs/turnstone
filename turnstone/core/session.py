@@ -383,13 +383,16 @@ class ChatSession:
                     caps = dataclasses.replace(caps, **overrides)
         return caps
 
-    def _get_capabilities(self) -> ModelCapabilities:
-        """Get capabilities for the current model (cached per model)."""
-        if self._cached_capabilities is None:
-            self._cached_capabilities = self._resolve_capabilities(
-                self._provider, self.model, self._model_alias
-            )
-        return self._cached_capabilities
+    def _get_capabilities(self, provider: Any = None, model: str = "") -> ModelCapabilities:
+        """Get capabilities for a model. Cached for the primary session model."""
+        p = provider or self._provider
+        m = model or self.model
+        # Only use cache for the primary session model — fallback models bypass.
+        if p is self._provider and m == self.model:
+            if self._cached_capabilities is None:
+                self._cached_capabilities = self._resolve_capabilities(p, m, self._model_alias)
+            return self._cached_capabilities
+        return self._resolve_capabilities(p, m, "")
 
     def _save_config(self) -> None:
         """Persist LLM-affecting config so resumed workstreams behave identically."""
