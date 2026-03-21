@@ -22,6 +22,7 @@ from turnstone.core.oidc import (
     load_oidc_config,
     provision_oidc_user,
     validate_id_token,
+    validate_issuer_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -291,6 +292,162 @@ class TestLoadOIDCConfig:
             cfg = load_oidc_config()
 
         assert cfg.redirect_base == "http://localhost:8000"
+
+
+# ---------------------------------------------------------------------------
+# SSRF Validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidateIssuerURL:
+    """Tests for ``validate_issuer_url`` SSRF protection."""
+
+    def test_valid_https_url(self):
+        """Public HTTPS issuer URL passes validation."""
+        # Should not raise -- mock DNS to return a public IP.
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("93.184.216.34", 0)),
+            ],
+        ):
+            validate_issuer_url("https://idp.example.com")
+
+    def test_rejects_http_non_localhost(self):
+        """HTTP is rejected for non-localhost hosts."""
+        with pytest.raises(OIDCError, match="must use HTTPS"):
+            validate_issuer_url("http://idp.example.com")
+
+    def test_allows_http_localhost(self):
+        """HTTP is allowed for localhost (development)."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("127.0.0.1", 0)),
+            ],
+        ):
+            validate_issuer_url("http://localhost:8080")
+
+    def test_allows_http_localhost_subdomain(self):
+        """HTTP is allowed for *.localhost subdomains."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("127.0.0.1", 0)),
+            ],
+        ):
+            validate_issuer_url("http://keycloak.localhost:8080")
+
+    def test_rejects_embedded_credentials(self):
+        """URLs with userinfo (user:pass@host) are rejected."""
+        with pytest.raises(OIDCError, match="must not contain credentials"):
+            validate_issuer_url("https://admin:secret@idp.example.com")
+
+    def test_rejects_username_only(self):
+        """URLs with just a username are rejected."""
+        with pytest.raises(OIDCError, match="must not contain credentials"):
+            validate_issuer_url("https://admin@idp.example.com")
+
+    def test_rejects_no_hostname(self):
+        """URLs without a hostname are rejected."""
+        with pytest.raises(OIDCError, match="no hostname"):
+            validate_issuer_url("https://")
+
+    def test_rejects_private_10_range(self):
+        """Hostnames resolving to 10.x.x.x are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.1", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*10.0.0.1"),
+        ):
+            validate_issuer_url("https://internal.corp.example.com")
+
+    def test_rejects_private_172_range(self):
+        """Hostnames resolving to 172.16-31.x.x are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("172.16.0.1", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*172.16.0.1"),
+        ):
+            validate_issuer_url("https://internal.corp.example.com")
+
+    def test_rejects_private_192_168_range(self):
+        """Hostnames resolving to 192.168.x.x are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.1.1", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*192.168.1.1"),
+        ):
+            validate_issuer_url("https://internal.corp.example.com")
+
+    def test_rejects_loopback_127(self):
+        """Hostnames resolving to 127.x.x.x are rejected (non-localhost host)."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*127.0.0.1"),
+        ):
+            validate_issuer_url("https://evil.example.com")
+
+    def test_rejects_ipv6_loopback(self):
+        """Hostnames resolving to ::1 are rejected (non-localhost host)."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(10, 1, 6, "", ("::1", 0, 0, 0))]),
+            pytest.raises(OIDCError, match="non-public address.*::1"),
+        ):
+            validate_issuer_url("https://evil.example.com")
+
+    def test_rejects_ipv6_private(self):
+        """Hostnames resolving to fc00::/7 are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(10, 1, 6, "", ("fd00::1", 0, 0, 0))]),
+            pytest.raises(OIDCError, match="non-public address.*fd00::1"),
+        ):
+            validate_issuer_url("https://evil.example.com")
+
+    def test_rejects_link_local(self):
+        """Hostnames resolving to link-local addresses are rejected."""
+        with (
+            patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]),
+            pytest.raises(OIDCError, match="non-public address.*169.254.169.254"),
+        ):
+            validate_issuer_url("https://metadata.internal")
+
+    def test_rejects_unresolvable_hostname(self):
+        """DNS resolution failure is rejected."""
+        import socket as _socket
+
+        with (
+            patch("socket.getaddrinfo", side_effect=_socket.gaierror("not found")),
+            pytest.raises(OIDCError, match="cannot be resolved"),
+        ):
+            validate_issuer_url("https://nonexistent.invalid")
+
+    def test_rejects_mixed_addresses(self):
+        """If any resolved address is private, the URL is rejected."""
+        with (
+            patch(
+                "socket.getaddrinfo",
+                return_value=[
+                    (2, 1, 6, "", ("93.184.216.34", 0)),
+                    (2, 1, 6, "", ("10.0.0.1", 0)),
+                ],
+            ),
+            pytest.raises(OIDCError, match="non-public address.*10.0.0.1"),
+        ):
+            validate_issuer_url("https://dual-homed.example.com")
+
+    def test_discover_rejects_ssrf(self):
+        """discover_oidc returns enabled=False when issuer URL fails SSRF check."""
+        config = _make_config(
+            issuer="http://10.0.0.1:8080",
+            authorization_endpoint="",
+            token_endpoint="",
+            userinfo_endpoint="",
+            jwks_uri="",
+        )
+
+        async def _run():
+            result = await discover_oidc(config)
+            assert result.enabled is False
+
+        asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +1026,9 @@ class TestApplyRoleMapping:
 
 
 class TestDiscoverOIDC:
+    # Mock DNS result for a public IP — reused across discovery tests.
+    _PUBLIC_ADDR = [(2, 1, 6, "", ("93.184.216.34", 0))]
+
     def test_discover_oidc_success(self):
         """Mock httpx response, verify endpoints populated."""
         config = _make_config(
@@ -891,7 +1051,10 @@ class TestDiscoverOIDC:
 
         async def _run():
             client = _mock_async_client(lambda url: _async_return(mock_response))
-            with patch("httpx.AsyncClient", return_value=client):
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
                 result = await discover_oidc(config)
 
             assert result.authorization_endpoint == "https://idp.example.com/authorize"
@@ -916,7 +1079,10 @@ class TestDiscoverOIDC:
 
         async def _run():
             client = _mock_async_client(_failing_get)
-            with patch("httpx.AsyncClient", return_value=client):
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
                 result = await discover_oidc(config)
 
             assert result.enabled is False
@@ -954,7 +1120,10 @@ class TestDiscoverOIDC:
 
         async def _run():
             client = _mock_async_client(lambda url: _async_return(mock_response))
-            with patch("httpx.AsyncClient", return_value=client):
+            with (
+                patch("socket.getaddrinfo", return_value=self._PUBLIC_ADDR),
+                patch("httpx.AsyncClient", return_value=client),
+            ):
                 result = await discover_oidc(config)
 
             assert result.enabled is False
