@@ -6,7 +6,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy import event
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
@@ -99,11 +98,17 @@ class SQLiteBackend:
             connect_args={"check_same_thread": False, "timeout": 30},
         )
 
-        @event.listens_for(self._engine, "connect")
-        def _set_wal_mode(dbapi_conn: Any, _connection_record: Any) -> None:
-            cursor = dbapi_conn.cursor()
-            cursor.execute("PRAGMA journal_mode=WAL")
-            cursor.close()
+        # Enable WAL mode for better concurrent read/write performance.
+        @sa.event.listens_for(self._engine, "connect")
+        def _set_wal(dbapi_conn: Any, _rec: Any) -> None:
+            try:
+                cursor = dbapi_conn.execute("PRAGMA journal_mode=WAL")
+                mode = cursor.fetchone()
+                cursor.close()
+                if mode and mode[0] != "wal":
+                    log.warning("SQLite WAL mode not enabled (got %s)", mode[0])
+            except Exception:
+                log.warning("Failed to set SQLite WAL mode", exc_info=True)
 
         self._fts5_available = False
         if create_tables:

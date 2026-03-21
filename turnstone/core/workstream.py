@@ -230,6 +230,9 @@ class WorkstreamManager:
     @staticmethod
     def _cleanup_ui(ws: Workstream) -> None:
         """Unblock pending approval/plan/foreground events on a workstream."""
+        # Cancel any in-flight generation so the worker thread stops promptly.
+        if ws.session and hasattr(ws.session, "cancel"):
+            ws.session.cancel()
         if ws.ui:
             if hasattr(ws.ui, "_approval_event"):
                 ws.ui._approval_result = False, None  # type: ignore[attr-defined]
