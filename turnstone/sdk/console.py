@@ -29,6 +29,8 @@ from turnstone.api.console_schemas import (
     ListRolesResponse,
     ListSettingSchemaResponse,
     ListSettingsResponse,
+    ListSkillResourcesResponse,
+    ListSkillsResponse,
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     McpServerDetail,
@@ -38,6 +40,9 @@ from turnstone.api.console_schemas import (
     RoleInfo,
     SettingInfo,
     SkillDiscoverResponse,
+    SkillInfo,
+    SkillInstallResponse,
+    SkillResourceInfo,
     ToolPolicyInfo,
     UsageResponse,
 )
@@ -431,24 +436,28 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     # -- governance: skills --------------------------------------------------
 
-    async def list_skills(self) -> list[dict[str, Any]]:
+    async def list_skills(self) -> ListSkillsResponse:
         """List all skills."""
-        resp = await self._request("GET", "/v1/api/admin/skills")
-        skills: list[dict[str, Any]] = resp.get("skills", [])
-        return skills
+        return await self._request("GET", "/v1/api/admin/skills", response_model=ListSkillsResponse)
 
-    async def create_skill(self, name: str, content: str, **kwargs: Any) -> dict[str, Any]:
+    async def create_skill(self, name: str, content: str, **kwargs: Any) -> SkillInfo:
         """Create a skill."""
         body: dict[str, Any] = {"name": name, "content": content, **kwargs}
-        return await self._request("POST", "/v1/api/admin/skills", json_body=body)
+        return await self._request(
+            "POST", "/v1/api/admin/skills", json_body=body, response_model=SkillInfo
+        )
 
-    async def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+    async def get_skill(self, skill_id: str) -> SkillInfo:
         """Get a skill by ID."""
-        return await self._request("GET", f"/v1/api/admin/skills/{skill_id}")
+        return await self._request(
+            "GET", f"/v1/api/admin/skills/{skill_id}", response_model=SkillInfo
+        )
 
-    async def update_skill(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+    async def update_skill(self, skill_id: str, **kwargs: Any) -> SkillInfo:
         """Update a skill."""
-        return await self._request("PUT", f"/v1/api/admin/skills/{skill_id}", json_body=kwargs)
+        return await self._request(
+            "PUT", f"/v1/api/admin/skills/{skill_id}", json_body=kwargs, response_model=SkillInfo
+        )
 
     async def delete_skill(self, skill_id: str) -> StatusResponse:
         """Delete a skill."""
@@ -456,11 +465,13 @@ class AsyncTurnstoneConsole(_BaseClient):
             "DELETE", f"/v1/api/admin/skills/{skill_id}", response_model=StatusResponse
         )
 
-    async def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
+    async def list_skill_resources(self, skill_id: str) -> ListSkillResourcesResponse:
         """List resource files for a skill."""
-        resp = await self._request("GET", f"/v1/api/admin/skills/{skill_id}/resources")
-        resources: list[dict[str, Any]] = resp.get("resources", [])
-        return resources
+        return await self._request(
+            "GET",
+            f"/v1/api/admin/skills/{skill_id}/resources",
+            response_model=ListSkillResourcesResponse,
+        )
 
     async def create_skill_resource(
         self,
@@ -468,11 +479,14 @@ class AsyncTurnstoneConsole(_BaseClient):
         path: str,
         content: str,
         content_type: str = "text/plain",
-    ) -> dict[str, Any]:
+    ) -> SkillResourceInfo:
         """Upload a resource file to a skill."""
         body: dict[str, Any] = {"path": path, "content": content, "content_type": content_type}
         return await self._request(
-            "POST", f"/v1/api/admin/skills/{skill_id}/resources", json_body=body
+            "POST",
+            f"/v1/api/admin/skills/{skill_id}/resources",
+            json_body=body,
+            response_model=SkillResourceInfo,
         )
 
     async def delete_skill_resource(self, skill_id: str, path: str) -> StatusResponse:
@@ -801,11 +815,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         *,
         skill_id: str = "",
         url: str = "",
-    ) -> dict[str, Any]:
-        """Install skill(s) from an external source.
-
-        Returns ``{installed: [...], skipped: [...], total: int}``.
-        """
+    ) -> SkillInstallResponse:
+        """Install skill(s) from an external source."""
         body: dict[str, Any] = {"source": source}
         if skill_id:
             body["skill_id"] = skill_id
@@ -815,6 +826,7 @@ class AsyncTurnstoneConsole(_BaseClient):
             "POST",
             "/v1/api/admin/skills/install",
             json_body=body,
+            response_model=SkillInstallResponse,
         )
 
 
@@ -1061,22 +1073,22 @@ class TurnstoneConsole:
 
     # -- governance: skills --------------------------------------------------
 
-    def list_skills(self) -> list[dict[str, Any]]:
+    def list_skills(self) -> ListSkillsResponse:
         return self._runner.run(self._async.list_skills())
 
-    def create_skill(self, name: str, content: str, **kwargs: Any) -> dict[str, Any]:
+    def create_skill(self, name: str, content: str, **kwargs: Any) -> SkillInfo:
         return self._runner.run(self._async.create_skill(name, content, **kwargs))
 
-    def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+    def get_skill(self, skill_id: str) -> SkillInfo:
         return self._runner.run(self._async.get_skill(skill_id))
 
-    def update_skill(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
+    def update_skill(self, skill_id: str, **kwargs: Any) -> SkillInfo:
         return self._runner.run(self._async.update_skill(skill_id, **kwargs))
 
     def delete_skill(self, skill_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_skill(skill_id))
 
-    def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
+    def list_skill_resources(self, skill_id: str) -> ListSkillResourcesResponse:
         return self._runner.run(self._async.list_skill_resources(skill_id))
 
     def create_skill_resource(
@@ -1085,7 +1097,7 @@ class TurnstoneConsole:
         path: str,
         content: str,
         content_type: str = "text/plain",
-    ) -> dict[str, Any]:
+    ) -> SkillResourceInfo:
         return self._runner.run(
             self._async.create_skill_resource(skill_id, path, content, content_type)
         )
@@ -1272,7 +1284,7 @@ class TurnstoneConsole:
         *,
         skill_id: str = "",
         url: str = "",
-    ) -> dict[str, Any]:
+    ) -> SkillInstallResponse:
         return self._runner.run(self._async.install_skill(source, skill_id=skill_id, url=url))
 
     # -- lifecycle -----------------------------------------------------------
