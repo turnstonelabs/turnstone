@@ -1864,7 +1864,6 @@ class ChatSession:
 
         self.ui.on_thinking_start()
         try:
-            _last_err: Exception | None = None
             result: CompletionResult | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
@@ -1885,7 +1884,6 @@ class ChatSession:
                         or attempt == self._MAX_RETRIES
                     ):
                         raise
-                    _last_err = e
                     delay = self._RETRY_BASE_DELAY * (2**attempt)
                     self.ui.on_info(f"[Compact retrying in {delay:.0f}s: {ename}]")
                     time.sleep(delay)
@@ -3698,10 +3696,6 @@ class ChatSession:
             self.ui.on_error(msg)
             return call_id, msg
 
-    # Tools the agent can auto-execute without user approval (read-only).
-    _AGENT_AUTO_TOOLS = AGENT_AUTO_TOOLS
-    _TASK_AUTO_TOOLS = TASK_AUTO_TOOLS
-
     def _run_agent(
         self,
         agent_messages: list[dict[str, Any]],
@@ -3716,7 +3710,7 @@ class ChatSession:
             agent_messages: Pre-built message list (system + developer + user).
             label: Display prefix for progress lines ("agent" or "plan").
             tools: Tool definitions to send to the API. Defaults to AGENT_TOOLS (read-only).
-            auto_tools: Set of tool names the agent may execute. Defaults to _AGENT_AUTO_TOOLS.
+            auto_tools: Set of tool names the agent may execute. Defaults to AGENT_AUTO_TOOLS.
             reasoning_effort: Override reasoning effort for this agent.
 
         Returns:
@@ -3725,7 +3719,7 @@ class ChatSession:
         if tools is None:
             tools = self._agent_tools
         if auto_tools is None:
-            auto_tools = self._AGENT_AUTO_TOOLS
+            auto_tools = AGENT_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
 
         # Resolve agent model and provider: use registry.agent_model if configured
@@ -3930,7 +3924,7 @@ class ChatSession:
                 agent_messages,
                 label="task",
                 tools=self._task_tools,
-                auto_tools=self._TASK_AUTO_TOOLS,
+                auto_tools=TASK_AUTO_TOOLS,
             )
         except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(task interrupted by user)"

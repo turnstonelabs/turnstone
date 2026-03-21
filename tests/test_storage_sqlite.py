@@ -313,51 +313,6 @@ class TestTouchStructuredMemory:
             content="test content",
         )
 
-    def test_touch_bumps_access_count(self, backend):
-        self._create_memory(backend)
-        mem = backend.get_structured_memory_by_name("m1", "global", "")
-        assert mem is not None
-        assert int(mem["access_count"]) == 0
-
-        result = backend.touch_structured_memory("m1", "global", "")
-        assert result is True
-
-        mem = backend.get_structured_memory_by_name("m1", "global", "")
-        assert int(mem["access_count"]) == 1
-
-    def test_touch_updates_last_accessed(self, backend):
-        self._create_memory(backend)
-        mem_before = backend.get_structured_memory_by_name("m1", "global", "")
-        original_accessed = mem_before["last_accessed"]
-
-        backend.touch_structured_memory("m1", "global", "")
-
-        mem_after = backend.get_structured_memory_by_name("m1", "global", "")
-        assert mem_after["last_accessed"] >= original_accessed
-
-    def test_touch_nonexistent_returns_false(self, backend):
-        result = backend.touch_structured_memory("no_such", "global", "")
-        assert result is False
-
-    def test_touch_increments_multiple_times(self, backend):
-        self._create_memory(backend)
-        for _ in range(3):
-            backend.touch_structured_memory("m1", "global", "")
-
-        mem = backend.get_structured_memory_by_name("m1", "global", "")
-        assert int(mem["access_count"]) == 3
-
-    def test_touch_scoped_memory(self, backend):
-        self._create_memory(backend, name="ws_mem", scope="workstream", scope_id="ws-1")
-        backend.touch_structured_memory("ws_mem", "workstream", "ws-1")
-
-        mem = backend.get_structured_memory_by_name("ws_mem", "workstream", "ws-1")
-        assert int(mem["access_count"]) == 1
-
-        # Different scope_id should not match
-        result = backend.touch_structured_memory("ws_mem", "workstream", "ws-other")
-        assert result is False
-
     def test_batch_touch_multiple(self, backend):
         self._create_memory(backend, name="a")
         self._create_memory(backend, name="b")
@@ -392,16 +347,6 @@ class TestTouchStructuredMemory:
 
         mem = backend.get_structured_memory_by_name("exists", "global", "")
         assert int(mem["access_count"]) == 1
-
-    def test_touch_does_not_change_updated(self, backend):
-        self._create_memory(backend)
-        mem_before = backend.get_structured_memory_by_name("m1", "global", "")
-
-        backend.touch_structured_memory("m1", "global", "")
-
-        mem_after = backend.get_structured_memory_by_name("m1", "global", "")
-        # updated should stay the same (only last_accessed changes)
-        assert mem_after["updated"] == mem_before["updated"]
 
     def test_batch_touch_with_duplicates(self, backend):
         """Duplicate keys in batch should each increment access_count once."""

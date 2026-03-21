@@ -11,14 +11,21 @@ import sqlalchemy as sa
 from turnstone.core.storage._schema import (
     api_tokens,
     audit_events,
+    channel_routes,
+    channel_users,
     conversations,
     intent_verdicts,
     mcp_servers,
     metadata,
+    oidc_identities,
+    oidc_pending_states,
     orgs,
     output_assessments,
     prompt_templates,
     roles,
+    scheduled_task_runs,
+    scheduled_tasks,
+    services,
     skill_resources,
     skill_versions,
     structured_memories,
@@ -27,6 +34,7 @@ from turnstone.core.storage._schema import (
     usage_events,
     user_roles,
     users,
+    watches,
     workstream_config,
     workstreams,
 )
@@ -573,7 +581,6 @@ class SQLiteBackend:
             ]
 
     def delete_user(self, user_id: str) -> bool:
-        from turnstone.core.storage._schema import channel_users, oidc_identities
 
         with self._engine.connect() as conn:
             conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
@@ -677,7 +684,6 @@ class SQLiteBackend:
     # -- Channel user mapping ---------------------------------------------------
 
     def create_channel_user(self, channel_type: str, channel_user_id: str, user_id: str) -> None:
-        from turnstone.core.storage._schema import channel_users
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -693,7 +699,6 @@ class SQLiteBackend:
             conn.commit()
 
     def get_channel_user(self, channel_type: str, channel_user_id: str) -> dict[str, str] | None:
-        from turnstone.core.storage._schema import channel_users
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -717,7 +722,6 @@ class SQLiteBackend:
             return None
 
     def list_channel_users_by_user(self, user_id: str) -> list[dict[str, str]]:
-        from turnstone.core.storage._schema import channel_users
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -741,7 +745,6 @@ class SQLiteBackend:
             ]
 
     def delete_channel_user(self, channel_type: str, channel_user_id: str) -> bool:
-        from turnstone.core.storage._schema import channel_users
 
         with self._engine.connect() as conn:
             result = conn.execute(
@@ -758,7 +761,6 @@ class SQLiteBackend:
     def create_channel_route(
         self, channel_type: str, channel_id: str, ws_id: str, node_id: str = ""
     ) -> None:
-        from turnstone.core.storage._schema import channel_routes
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -775,7 +777,6 @@ class SQLiteBackend:
             conn.commit()
 
     def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
-        from turnstone.core.storage._schema import channel_routes
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -801,7 +802,6 @@ class SQLiteBackend:
             return None
 
     def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
-        from turnstone.core.storage._schema import channel_routes
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -824,7 +824,6 @@ class SQLiteBackend:
             return None
 
     def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
-        from turnstone.core.storage._schema import channel_routes
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -850,7 +849,6 @@ class SQLiteBackend:
             ]
 
     def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
-        from turnstone.core.storage._schema import channel_routes
 
         with self._engine.connect() as conn:
             result = conn.execute(
@@ -881,7 +879,6 @@ class SQLiteBackend:
         next_run: str,
         skill: str = "",
     ) -> None:
-        from turnstone.core.storage._schema import scheduled_tasks
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -910,7 +907,6 @@ class SQLiteBackend:
             conn.commit()
 
     def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
-        from turnstone.core.storage._schema import scheduled_tasks
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -921,7 +917,6 @@ class SQLiteBackend:
             return dict(row._mapping)
 
     def list_scheduled_tasks(self) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import scheduled_tasks
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -950,7 +945,6 @@ class SQLiteBackend:
     )
 
     def update_scheduled_task(self, task_id: str, **fields: Any) -> bool:
-        from turnstone.core.storage._schema import scheduled_tasks
 
         fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_TASK_FIELDS}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -971,7 +965,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_scheduled_task(self, task_id: str) -> bool:
-        from turnstone.core.storage._schema import scheduled_task_runs, scheduled_tasks
 
         with self._engine.connect() as conn:
             conn.execute(
@@ -984,7 +977,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_due_tasks(self, now: str) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import scheduled_tasks
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -1010,7 +1002,6 @@ class SQLiteBackend:
         status: str,
         error: str,
     ) -> None:
-        from turnstone.core.storage._schema import scheduled_task_runs
 
         with self._engine.connect() as conn:
             conn.execute(
@@ -1029,7 +1020,6 @@ class SQLiteBackend:
             conn.commit()
 
     def list_task_runs(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import scheduled_task_runs
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -1042,8 +1032,6 @@ class SQLiteBackend:
 
     def prune_task_runs(self, retention_days: int = 90) -> int:
         from datetime import timedelta
-
-        from turnstone.core.storage._schema import scheduled_task_runs
 
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -1068,7 +1056,6 @@ class SQLiteBackend:
         created_by: str,
         next_poll: str,
     ) -> None:
-        from turnstone.core.storage._schema import watches
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -1094,7 +1081,6 @@ class SQLiteBackend:
             conn.commit()
 
     def get_watch(self, watch_id: str) -> dict[str, Any] | None:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             row = conn.execute(sa.select(watches).where(watches.c.watch_id == watch_id)).fetchone()
@@ -1103,7 +1089,6 @@ class SQLiteBackend:
             return dict(row._mapping)
 
     def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -1114,7 +1099,6 @@ class SQLiteBackend:
             return [dict(r._mapping) for r in rows]
 
     def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -1125,7 +1109,6 @@ class SQLiteBackend:
             return [dict(r._mapping) for r in rows]
 
     def list_due_watches(self, now: str) -> list[dict[str, Any]]:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -1154,7 +1137,6 @@ class SQLiteBackend:
     )
 
     def update_watch(self, watch_id: str, **fields: Any) -> bool:
-        from turnstone.core.storage._schema import watches
 
         fields = {k: v for k, v in fields.items() if k in self._UPDATABLE_WATCH_FIELDS}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1168,7 +1150,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_watch(self, watch_id: str) -> bool:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             result = conn.execute(sa.delete(watches).where(watches.c.watch_id == watch_id))
@@ -1176,7 +1157,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_watches_for_ws(self, ws_id: str) -> int:
-        from turnstone.core.storage._schema import watches
 
         with self._engine.connect() as conn:
             result = conn.execute(sa.delete(watches).where(watches.c.ws_id == ws_id))
@@ -1189,8 +1169,6 @@ class SQLiteBackend:
         self, service_type: str, service_id: str, url: str, metadata: str = "{}"
     ) -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-
-        from turnstone.core.storage._schema import services
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         stmt = sqlite_insert(services).values(
@@ -1210,7 +1188,6 @@ class SQLiteBackend:
             conn.commit()
 
     def heartbeat_service(self, service_type: str, service_id: str) -> bool:
-        from turnstone.core.storage._schema import services
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -1226,7 +1203,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
-        from turnstone.core.storage._schema import services
 
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
@@ -1243,7 +1219,6 @@ class SQLiteBackend:
             return [dict(r._mapping) for r in rows]
 
     def deregister_service(self, service_type: str, service_id: str) -> bool:
-        from turnstone.core.storage._schema import services
 
         with self._engine.connect() as conn:
             result = conn.execute(
@@ -2459,27 +2434,6 @@ class SQLiteBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
-    def touch_structured_memory(self, name: str, scope: str, scope_id: str) -> bool:
-        """Bump last_accessed and increment access_count for a single memory."""
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
-            result = conn.execute(
-                sa.update(structured_memories)
-                .where(
-                    sa.and_(
-                        structured_memories.c.name == name,
-                        structured_memories.c.scope == scope,
-                        structured_memories.c.scope_id == scope_id,
-                    )
-                )
-                .values(
-                    last_accessed=now,
-                    access_count=structured_memories.c.access_count + 1,
-                )
-            )
-            conn.commit()
-            return result.rowcount > 0
-
     def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
         """Batch-touch multiple memories by (name, scope, scope_id)."""
         if not keys:
@@ -2727,7 +2681,6 @@ class SQLiteBackend:
     # -- OIDC identity ---------------------------------------------------------
 
     def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
-        from turnstone.core.storage._schema import oidc_identities
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -2745,7 +2698,6 @@ class SQLiteBackend:
             conn.commit()
 
     def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
-        from turnstone.core.storage._schema import oidc_identities
 
         with self._engine.connect() as conn:
             row = conn.execute(
@@ -2772,7 +2724,6 @@ class SQLiteBackend:
             return None
 
     def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
-        from turnstone.core.storage._schema import oidc_identities
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -2787,7 +2738,6 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
-        from turnstone.core.storage._schema import oidc_identities
 
         with self._engine.connect() as conn:
             rows = conn.execute(
@@ -2815,7 +2765,6 @@ class SQLiteBackend:
             ]
 
     def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
-        from turnstone.core.storage._schema import oidc_identities
 
         with self._engine.connect() as conn:
             result = conn.execute(
@@ -2831,7 +2780,6 @@ class SQLiteBackend:
     def create_oidc_pending_state(
         self, state: str, nonce: str, code_verifier: str, audience: str
     ) -> None:
-        from turnstone.core.storage._schema import oidc_pending_states
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._engine.connect() as conn:
@@ -2850,7 +2798,6 @@ class SQLiteBackend:
     def pop_oidc_pending_state(
         self, state: str, max_age_seconds: int = 300
     ) -> dict[str, str] | None:
-        from turnstone.core.storage._schema import oidc_pending_states
 
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
@@ -2884,7 +2831,6 @@ class SQLiteBackend:
             }
 
     def cleanup_expired_oidc_states(self, max_age_seconds: int = 300) -> int:
-        from turnstone.core.storage._schema import oidc_pending_states
 
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
