@@ -1201,11 +1201,7 @@ class ChatSession:
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
                     # Output guard: evaluate tool result before it enters context
-                    if (
-                        self._judge_config
-                        and self._judge_config.enabled
-                        and self._judge_config.output_guard
-                    ):
+                    if self._judge_config and self._judge_config.output_guard:
                         if isinstance(output, str):
                             output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
                         elif isinstance(output, list):

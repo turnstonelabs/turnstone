@@ -14,6 +14,7 @@ import textwrap
 import threading
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.judge import JudgeConfig
 from turnstone.core.session import ChatSession, SessionUI
 from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 from turnstone.ui.colors import (
@@ -1045,6 +1046,14 @@ def main() -> None:
         storage=_get_storage(),
     )
 
+    judge_config = JudgeConfig(
+        enabled=args.judge_enabled,
+        model=args.judge_model,
+        provider=args.judge_provider,
+        confidence_threshold=args.judge_confidence,
+        timeout=args.judge_timeout,
+    )
+
     # ChatSession factory — captures shared config for creating workstreams
     def session_factory(
         ui: SessionUI | None,
@@ -1076,6 +1085,7 @@ def main() -> None:
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
             skill=skill or args.skill or None,
+            judge_config=judge_config,
         )
 
     # Create workstream manager and initial workstream
