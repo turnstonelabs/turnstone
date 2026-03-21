@@ -163,7 +163,11 @@ class TerminalUI(SessionUI):
 
             # Per-tool auto-approve check
             if self.auto_approve_tools:
-                pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+                pending_names = {
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name")
+                }
                 if pending_names and pending_names.issubset(self.auto_approve_tools):
                     return True, None
 
@@ -196,7 +200,11 @@ class TerminalUI(SessionUI):
                     break
 
             if decision in ("a", "always"):
-                tool_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+                tool_names = {
+                    it.get("approval_label", "") or it.get("func_name", "")
+                    for it in pending
+                    if it.get("func_name") and not it.get("error")
+                }
                 tool_names.discard("")
                 tool_names.discard("__budget_override__")
                 self.auto_approve_tools.update(tool_names)
