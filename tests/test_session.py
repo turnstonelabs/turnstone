@@ -790,3 +790,32 @@ class TestTitleRetry:
 
         # Flag stays True after successful generation
         assert session._title_generated is True
+
+    def test_title_skipped_after_resume_changes_ws_id(self, tmp_db):
+        """If ws_id changes (via resume) during title generation, discard the result."""
+        session = _make_session()
+        session._title_generated = True
+        session.messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        original_ws_id = session._ws_id
+        result = MagicMock()
+        result.content = "Test Title"
+        session._provider = MagicMock()
+        session._provider.create_completion.return_value = result
+
+        # Simulate resume() changing ws_id while title generation is in flight
+        def _change_ws_id(*args, **kwargs):
+            session._ws_id = "different-ws-id"
+            return result
+
+        session._provider.create_completion.side_effect = _change_ws_id
+
+        with patch("turnstone.core.session.update_workstream_title") as mock_update:
+            session._generate_title()
+
+        # Title should NOT be applied to the new workstream
+        mock_update.assert_not_called()
+        # Restore for cleanup
+        session._ws_id = original_ws_id

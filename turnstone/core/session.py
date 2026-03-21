@@ -683,8 +683,8 @@ class ChatSession:
             raw = (result.content or "").strip()
             # Take first line, strip quotes
             title = raw.split("\n")[0].strip().strip('"').strip("'")
-            if title:
-                update_workstream_title(self._ws_id, title[:80])
+            if title and self._ws_id == ws_id:
+                update_workstream_title(ws_id, title[:80])
                 self.ui.on_rename(title[:80])
         except Exception:
             # Only reset if ws_id hasn't changed (e.g., via /resume) to
