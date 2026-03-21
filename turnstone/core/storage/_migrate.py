@@ -37,11 +37,11 @@ def run_migrations(storage: Any, backend: str) -> None:
     if backend == "postgresql":
         try:
             _run_with_pg_lock(engine, cfg)
-        except Exception as exc:
-            # Non-fatal: the entrypoint script already runs migrations before
-            # the server starts.  If this second attempt fails (lock contention,
-            # transient PG error), the schema is almost certainly already at
-            # head.  Log and continue rather than crashing the server.
+        except (OSError, EOFError) as exc:
+            # Non-fatal for connection-class errors only (refused, reset,
+            # timeout).  DDL / migration errors still propagate.  The Docker
+            # entrypoint already runs migrations before the server starts, so
+            # this second attempt is a safety net for stampede scenarios.
             log.warning("PostgreSQL migration failed (non-fatal): %s", exc)
     else:
         try:
