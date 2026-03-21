@@ -10,6 +10,7 @@ import pytest
 from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
+    detect_model,
     load_model_registry,
 )
 
@@ -590,3 +591,36 @@ class TestProtocolModel:
         assert isinstance(restored, CreateWorkstreamMessage)
         assert restored.model == "local"
         assert restored.name == "ws1"
+
+
+# ---------------------------------------------------------------------------
+# detect_model — startup timeout
+# ---------------------------------------------------------------------------
+
+
+class TestDetectModelTimeout:
+    def test_uses_short_timeout_and_no_retries(self) -> None:
+        """detect_model() uses with_options(timeout=10, max_retries=0)."""
+        mock_model = MagicMock()
+        mock_model.id = "test-model"
+        mock_model.owned_by = "test"
+
+        fast_client = MagicMock()
+        fast_client.models.list.return_value = MagicMock(data=[mock_model])
+
+        client = MagicMock()
+        client.with_options.return_value = fast_client
+
+        result = detect_model(client, provider="openai")
+        client.with_options.assert_called_once_with(timeout=10.0, max_retries=0)
+        fast_client.models.list.assert_called_once()
+        assert result[0] == "test-model"
+
+    def test_connection_error_non_fatal(self) -> None:
+        """detect_model(fatal=False) returns (None, None) on connection error."""
+        client = MagicMock()
+        client.with_options.return_value = client
+        client.models.list.side_effect = OSError("Connection refused")
+
+        result = detect_model(client, provider="openai", fatal=False)
+        assert result == (None, None)

@@ -35,7 +35,14 @@ def run_migrations(storage: Any, backend: str) -> None:
         _bootstrap_existing_sqlite(engine, cfg)
 
     if backend == "postgresql":
-        _run_with_pg_lock(engine, cfg)
+        try:
+            _run_with_pg_lock(engine, cfg)
+        except (OSError, EOFError) as exc:
+            # Non-fatal for connection-class errors only (refused, reset,
+            # timeout).  DDL / migration errors still propagate.  The Docker
+            # entrypoint already runs migrations before the server starts, so
+            # this second attempt is a safety net for stampede scenarios.
+            log.warning("PostgreSQL migration failed (non-fatal): %s", exc)
     else:
         try:
             command.upgrade(cfg, "head")

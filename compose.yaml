@@ -148,8 +148,8 @@ services:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 15s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
 
   # -------------------------------------------------------------------
@@ -386,8 +386,8 @@ services:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
       interval: 10s
       timeout: 5s
-      retries: 3
-      start_period: 15s
+      retries: 5
+      start_period: 60s
     deploy:
       resources:
         limits: { memory: 384M, cpus: '0.5' }

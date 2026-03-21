@@ -298,7 +298,12 @@ def detect_model(
     may not be available at startup).
     """
     try:
-        models = client.models.list()
+        # Use a short timeout for startup detection — the default OpenAI client
+        # timeout is 600s read which blocks the main thread for minutes when the
+        # backend is unreachable (TCP SYN dropped → kernel retransmit timeout).
+        # Disable retries (default 2) to avoid compounding the delay.
+        fast_client = client.with_options(timeout=10.0, max_retries=0)
+        models = fast_client.models.list()
         if not models.data:
             if fatal:
                 log_fn("Error: No models found at server. Use --model to specify.")
