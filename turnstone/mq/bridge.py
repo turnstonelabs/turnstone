@@ -699,7 +699,7 @@ class Bridge:
         tool_names = {
             it.get("approval_label", "") or it.get("func_name", "")
             for it in items
-            if it.get("needs_approval") and it.get("func_name")
+            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
         }
 
         if tool_names and tool_names.issubset(approve_set):
