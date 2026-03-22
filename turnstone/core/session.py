@@ -31,6 +31,7 @@ import httpx
 
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.judge import JudgeConfig
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -91,7 +92,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from turnstone.core.healthcheck import BackendHealthMonitor
-    from turnstone.core.judge import IntentJudge, JudgeConfig
+    from turnstone.core.judge import IntentJudge
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.providers import (
@@ -247,6 +248,7 @@ class ChatSession:
         judge_config: JudgeConfig | None = None,
         user_id: str = "",
         memory_config: MemoryConfig | None = None,
+        config_store: Any = None,
     ):
         self.client = client
         self.model = model
@@ -282,6 +284,7 @@ class ChatSession:
         self.auto_approve = False
         self._node_id = node_id
         self._user_id = user_id
+        self._config_store = config_store
         self._memory_config = memory_config or MemoryConfig()
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
@@ -365,6 +368,48 @@ class ChatSession:
     @property
     def model_alias(self) -> str | None:
         return self._model_alias
+
+    @property
+    def _mem_cfg(self) -> MemoryConfig:
+        """Live memory config — reads from ConfigStore when available."""
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return self._memory_config
+        return MemoryConfig(
+            relevance_k=cs.get("memory.relevance_k"),
+            fetch_limit=cs.get("memory.fetch_limit"),
+            max_content=cs.get("memory.max_content"),
+            nudge_cooldown=cs.get("memory.nudge_cooldown"),
+            nudges=cs.get("memory.nudges"),
+        )
+
+    @property
+    def _judge_cfg(self) -> JudgeConfig | None:
+        """Live judge behavioral config — reads from ConfigStore when available.
+
+        LLM client fields (model, provider, base_url, api_key) stay frozen
+        from session creation time since changing them would require tearing
+        down and rebuilding the IntentJudge instance.
+        """
+        jc = self._judge_config
+        if jc is None:
+            return None
+        cs = getattr(self, "_config_store", None)
+        if cs is None:
+            return jc
+        return JudgeConfig(
+            enabled=cs.get("judge.enabled"),
+            model=jc.model,
+            provider=jc.provider,
+            base_url=jc.base_url,
+            api_key=jc.api_key,
+            confidence_threshold=cs.get("judge.confidence_threshold"),
+            max_context_ratio=cs.get("judge.max_context_ratio"),
+            timeout=cs.get("judge.timeout"),
+            read_only_tools=cs.get("judge.read_only_tools"),
+            output_guard=cs.get("judge.output_guard"),
+            redact_secrets=cs.get("judge.redact_secrets"),
+        )
 
     def _resolve_capabilities(
         self,
@@ -742,12 +787,12 @@ class ChatSession:
                     self._skill_name = None
             if "notify_on_complete" in config:
                 self._notify_on_complete = config["notify_on_complete"]
-        if self._memory_config.nudges and should_nudge(
+        if self._mem_cfg.nudges and should_nudge(
             "resume",
             self._metacog_state,
             message_count=len(self.messages),
             memory_count=self._visible_memory_count(),
-            cooldown_secs=self._memory_config.nudge_cooldown,
+            cooldown_secs=self._mem_cfg.nudge_cooldown,
         ):
             self._pending_nudge.append(format_nudge("resume"))
         self._init_system_messages()
@@ -917,10 +962,10 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        visible_mems = self._get_visible_memories(limit=self._memory_config.fetch_limit)
+        visible_mems = self._get_visible_memories(limit=self._mem_cfg.fetch_limit)
         if visible_mems:
             context = extract_recent_context(self.messages)
-            relevant = score_memories(visible_mems, context, k=self._memory_config.relevance_k)
+            relevant = score_memories(visible_mems, context, k=self._mem_cfg.relevance_k)
             if relevant:
                 dev_parts.append("")
                 dev_parts.append(build_memory_context(relevant))
@@ -1219,7 +1264,7 @@ class ChatSession:
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
                     # Output guard: evaluate tool result before it enters context
-                    if self._judge_config and self._judge_config.output_guard:
+                    if self._judge_cfg and self._judge_cfg.output_guard:
                         if isinstance(output, str):
                             output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
                         elif isinstance(output, list):
@@ -1278,7 +1323,7 @@ class ChatSession:
                         )
                 # Metacognitive nudge: check memories on tool error
                 if (
-                    self._memory_config.nudges
+                    self._mem_cfg.nudges
                     and any(
                         isinstance(out, str)
                         and (
@@ -1294,7 +1339,7 @@ class ChatSession:
                         self._metacog_state,
                         message_count=len(self.messages),
                         memory_count=self._visible_memory_count(),
-                        cooldown_secs=self._memory_config.nudge_cooldown,
+                        cooldown_secs=self._mem_cfg.nudge_cooldown,
                     )
                 ):
                     self._pending_nudge.append(format_nudge("tool_error"))
@@ -1951,7 +1996,9 @@ class ChatSession:
         """Lazily initialize the intent judge if configured."""
         if self._judge is not None:
             return self._judge
-        if not self._judge_config or not self._judge_config.enabled:
+        if not self._judge_cfg or not self._judge_cfg.enabled:
+            return None
+        if self._judge_config is None:
             return None
         try:
             from turnstone.core.judge import IntentJudge
@@ -2058,11 +2105,7 @@ class ChatSession:
         except Exception:
             log.debug("output_guard.callback_failed", exc_info=True)
 
-        if (
-            assessment.sanitized is not None
-            and self._judge_config
-            and self._judge_config.redact_secrets
-        ):
+        if assessment.sanitized is not None and self._judge_cfg and self._judge_cfg.redact_secrets:
             return assessment.sanitized
         return output
 
@@ -2099,12 +2142,12 @@ class ChatSession:
                         f"Denied by user: {user_feedback}" if user_feedback else "Denied by user"
                     )
             user_feedback = None  # feedback is in the denial_msg
-            if self._memory_config.nudges and should_nudge(
+            if self._mem_cfg.nudges and should_nudge(
                 "denial",
                 self._metacog_state,
                 message_count=len(self.messages),
                 memory_count=self._visible_memory_count(),
-                cooldown_secs=self._memory_config.nudge_cooldown,
+                cooldown_secs=self._mem_cfg.nudge_cooldown,
             ):
                 self._pending_nudge.append(format_nudge("denial"))
                 self._init_system_messages()
@@ -2883,11 +2926,11 @@ class ChatSession:
 
     def _check_metacognitive_nudge(self, user_message: str) -> str | None:
         """Check if a metacognitive nudge should be injected."""
-        if not self._memory_config.nudges:
+        if not self._mem_cfg.nudges:
             return None
         mem_count = self._visible_memory_count()
         msg_count = len(self.messages)
-        cd = self._memory_config.nudge_cooldown
+        cd = self._mem_cfg.nudge_cooldown
 
         if should_nudge(
             "start",
@@ -2935,14 +2978,14 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: both 'name' and 'content' are required for save",
                 }
-            if len(content) > self._memory_config.max_content:
+            if len(content) > self._mem_cfg.max_content:
                 return {
                     "call_id": call_id,
                     "func_name": "memory",
                     "header": "\u2717 memory save: content too large",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: content exceeds {self._memory_config.max_content} character limit",
+                    "error": f"Error: content exceeds {self._mem_cfg.max_content} character limit",
                 }
             description = (args.get("description") or "").strip()
             mem_type = (args.get("type") or "project").strip().lower()

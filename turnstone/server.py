@@ -2280,6 +2280,7 @@ def main() -> None:
             judge_config=live_judge_config,
             user_id=uid,
             memory_config=live_memory_config,
+            config_store=config_store,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

@@ -819,3 +819,67 @@ class TestTitleRetry:
         mock_update.assert_not_called()
         # Restore for cleanup
         session._ws_id = original_ws_id
+
+
+class TestLiveConfigUpdate:
+    """ConfigStore-backed sessions pick up settings changes at point-of-use."""
+
+    def test_memory_config_reads_from_config_store(self, tmp_db):
+        """_mem_cfg returns live values from ConfigStore when present."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.storage._sqlite import SQLiteBackend
+
+        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        cs = ConfigStore(storage)
+        session = _make_session(config_store=cs)
+
+        # Default: relevance_k=5
+        assert session._mem_cfg.relevance_k == 5
+
+        # Admin changes the setting
+        cs.set("memory.relevance_k", 10, changed_by="test")
+        assert session._mem_cfg.relevance_k == 10
+
+    def test_judge_config_reads_from_config_store(self, tmp_db):
+        """_judge_cfg returns live behavioral flags from ConfigStore."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.storage._sqlite import SQLiteBackend
+
+        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        cs = ConfigStore(storage)
+        session = _make_session(
+            judge_config=JudgeConfig(),
+            config_store=cs,
+        )
+
+        # Default: enabled=True
+        assert session._judge_cfg.enabled is True
+
+        # Admin disables the judge
+        cs.set("judge.enabled", False, changed_by="test")
+        assert session._judge_cfg.enabled is False
+
+    def test_judge_client_config_stays_frozen(self, tmp_db):
+        """LLM client fields (model, provider) are frozen from creation time."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.storage._sqlite import SQLiteBackend
+
+        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        cs = ConfigStore(storage)
+        session = _make_session(
+            judge_config=JudgeConfig(model="original-model"),
+            config_store=cs,
+        )
+
+        # Change the model in ConfigStore — should NOT affect the session
+        cs.set("judge.model", "new-model", changed_by="test")
+        assert session._judge_cfg.model == "original-model"
+
+    def test_fallback_to_frozen_without_config_store(self, tmp_db):
+        """Without ConfigStore (CLI mode), frozen config is used."""
+        from turnstone.core.memory_relevance import MemoryConfig
+
+        session = _make_session(memory_config=MemoryConfig(relevance_k=3))
+        assert session._mem_cfg.relevance_k == 3
