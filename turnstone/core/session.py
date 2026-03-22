@@ -91,6 +91,7 @@ log = get_logger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthMonitor
     from turnstone.core.judge import IntentJudge
     from turnstone.core.mcp_client import MCPClientManager
@@ -248,7 +249,7 @@ class ChatSession:
         judge_config: JudgeConfig | None = None,
         user_id: str = "",
         memory_config: MemoryConfig | None = None,
-        config_store: Any = None,
+        config_store: ConfigStore | None = None,
     ):
         self.client = client
         self.model = model
@@ -1998,6 +1999,9 @@ class ChatSession:
             return self._judge
         if not self._judge_cfg or not self._judge_cfg.enabled:
             return None
+        # Frozen config required for IntentJudge init (LLM client fields).
+        # _judge_cfg already returns None when _judge_config is None, but
+        # this guard makes the dependency explicit for type narrowing.
         if self._judge_config is None:
             return None
         try:
