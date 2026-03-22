@@ -2,16 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def db(tmp_path):
-    """Fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
-
 
 def _make_watch_kwargs(**overrides):
     """Build default kwargs for create_watch."""

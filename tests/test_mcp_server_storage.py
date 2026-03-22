@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def db(tmp_path):
-    """Fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
+if TYPE_CHECKING:
+    from turnstone.core.storage._sqlite import SQLiteBackend
 
 
 def _make_id() -> str:

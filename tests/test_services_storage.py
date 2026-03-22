@@ -2,15 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
-
 
 class TestServiceRegistry:
     def test_register_and_list(self, storage):

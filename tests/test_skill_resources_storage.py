@@ -4,16 +4,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture()
-def storage(tmp_path):
-    """Fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
-
 
 class TestDeleteSkillResourceByPath:
     def test_delete_existing(self, storage):

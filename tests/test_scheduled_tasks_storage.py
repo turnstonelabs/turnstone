@@ -4,17 +4,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def db(tmp_path):
-    """Fresh SQLite backend for each test."""
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
-    return backend
-
 
 def _make_task_kwargs(**overrides):
     """Build default kwargs for create_scheduled_task."""

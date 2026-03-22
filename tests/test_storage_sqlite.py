@@ -4,20 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import pytest
-
-from turnstone.core.storage import init_storage, reset_storage
-
-
-@pytest.fixture
-def backend(tmp_path):
-    """Create a fresh SQLiteBackend for each test."""
-    reset_storage()
-    b = init_storage("sqlite", path=str(tmp_path / "test.db"), run_migrations=False)
-    yield b
-    reset_storage()
-
-
 # -- Workstream registration ---------------------------------------------------
 
 

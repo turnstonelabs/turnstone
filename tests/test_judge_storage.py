@@ -4,16 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture()
-def db(tmp_path):
-    """Fresh SQLite backend for each test."""
-    return SQLiteBackend(str(tmp_path / "test.db"))
-
 
 def _make_verdict_kwargs(**overrides):
     """Build default kwargs for create_intent_verdict."""

@@ -2,17 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def db(tmp_path):
-    """Fresh SQLite backend for each test."""
-    backend = SQLiteBackend(str(tmp_path / "test.db"))
-    return backend
-
 
 class TestChannelUserCRUD:
     """Tests for channel_users table operations."""

@@ -1,14 +1,5 @@
 """Tests for structured memory storage backend operations."""
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
-
-
-@pytest.fixture
-def backend(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
-
 
 class TestCreateAndGet:
     def test_create_and_get_by_id(self, backend):
