@@ -31,7 +31,6 @@ import httpx
 
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
-from turnstone.core.judge import JudgeConfig
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
@@ -93,7 +92,7 @@ if TYPE_CHECKING:
 
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthMonitor
-    from turnstone.core.judge import IntentJudge
+    from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
     from turnstone.core.providers import (
@@ -398,6 +397,8 @@ class ChatSession:
         cs = getattr(self, "_config_store", None)
         if cs is None:
             return jc
+        from turnstone.core.judge import JudgeConfig
+
         return JudgeConfig(
             enabled=cs.get("judge.enabled"),
             model=jc.model,
@@ -1994,10 +1995,15 @@ class ChatSession:
     # -- Intent validation --------------------------------------------------------
 
     def _ensure_judge(self) -> IntentJudge | None:
-        """Lazily initialize the intent judge if configured."""
+        """Lazily initialize the intent judge if configured.
+
+        Re-checks the live ``enabled`` flag every call so disabling the
+        judge via admin settings takes immediate effect on existing sessions.
+        """
+        if not self._judge_cfg or not self._judge_cfg.enabled:
+            return None
         if self._judge is not None:
             return self._judge
-        if not self._judge_cfg or not self._judge_cfg.enabled:
             return None
         # Frozen config required for IntentJudge init (LLM client fields).
         # _judge_cfg already returns None when _judge_config is None, but

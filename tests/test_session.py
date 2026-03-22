@@ -877,6 +877,27 @@ class TestLiveConfigUpdate:
         cs.set("judge.model", "new-model", changed_by="test")
         assert session._judge_cfg.model == "original-model"
 
+    def test_judge_disable_after_init_stops_future_use(self, tmp_db):
+        """Disabling judge.enabled after IntentJudge is created returns None."""
+        from turnstone.core.config_store import ConfigStore
+        from turnstone.core.judge import JudgeConfig
+        from turnstone.core.storage._sqlite import SQLiteBackend
+
+        storage = SQLiteBackend(str(tmp_db), create_tables=True)
+        cs = ConfigStore(storage)
+        session = _make_session(
+            judge_config=JudgeConfig(),
+            config_store=cs,
+        )
+
+        # Force judge initialization by setting a mock
+        session._judge = MagicMock()
+        assert session._ensure_judge() is not None
+
+        # Admin disables the judge — cached instance should NOT be returned
+        cs.set("judge.enabled", False, changed_by="test")
+        assert session._ensure_judge() is None
+
     def test_fallback_to_frozen_without_config_store(self, tmp_db):
         """Without ConfigStore (CLI mode), frozen config is used."""
         from turnstone.core.memory_relevance import MemoryConfig
