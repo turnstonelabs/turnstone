@@ -57,6 +57,11 @@ log = logging.getLogger("turnstone.mq.bridge")
 # Server's default safe tools (auto-approved without user confirmation)
 DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "memory", "recall"])
 
+# Resolved tombstones are normally cleaned by ws_state events from the
+# global SSE stream.  If that stream lags, this TTL ensures tombstones
+# don't block legitimate new approvals/plan_reviews indefinitely.
+_TOMBSTONE_TTL = 30.0  # seconds
+
 
 class Bridge:
     """Connects a message broker to turnstone-server's HTTP API.
@@ -105,11 +110,12 @@ class Bridge:
         self._ws_auto_approve: dict[str, bool] = {}
         self._ws_approve_tools: dict[str, set[str]] = {}
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
-        # Tombstone dicts: value is (request_id, resolved).
-        # Entries stay until cleaned up by ws_state/ws_closed events
-        # to prevent TOCTOU races on SSE reconnect.
-        self._pending_approvals: dict[str, tuple[str, bool]] = {}
-        self._pending_plan_reviews: dict[str, tuple[str, bool]] = {}
+        # Tombstone dicts: value is (request_id, resolved_at).
+        # resolved_at == 0.0 means active; > 0 means resolved at that
+        # monotonic time.  Entries stay until cleaned up by ws_state /
+        # ws_closed events (or TTL fallback) to prevent TOCTOU races.
+        self._pending_approvals: dict[str, tuple[str, float]] = {}
+        self._pending_plan_reviews: dict[str, tuple[str, float]] = {}
         self._running = True
 
     @property
@@ -719,12 +725,18 @@ class Bridge:
         # Skip if an approval is already pending (or recently resolved) for
         # this workstream.  Resolved tombstones are cleaned up by ws_state
         # events, preventing TOCTOU races from SSE reconnect re-injection.
+        # TTL fallback: if the global SSE is lagging, allow re-entry after
+        # _TOMBSTONE_TTL seconds so the workstream doesn't hang.
         with self._lock:
-            if ws_id in self._pending_approvals:
-                log.debug("Skipping duplicate approval for ws %s", ws_id)
-                return
+            entry = self._pending_approvals.get(ws_id)
+            if entry is not None:
+                _, resolved_at = entry
+                if not resolved_at or time.monotonic() - resolved_at < _TOMBSTONE_TTL:
+                    log.debug("Skipping duplicate approval for ws %s", ws_id)
+                    return
+                self._pending_approvals.pop(ws_id)
             request_id = uuid.uuid4().hex[:12]
-            self._pending_approvals[ws_id] = (request_id, False)
+            self._pending_approvals[ws_id] = (request_id, 0.0)
 
         # Forward to client — spawn a thread so we don't block SSE consumption
         self._publish_ws(
@@ -768,7 +780,7 @@ class Bridge:
                 with self._lock:
                     entry = self._pending_approvals.get(ws_id)
                     if entry is not None and entry[0] == request_id:
-                        self._pending_approvals[ws_id] = (request_id, True)
+                        self._pending_approvals[ws_id] = (request_id, time.monotonic())
 
         threading.Thread(target=self._run_in_context(_wait_approval), daemon=True).start()
 
@@ -779,12 +791,16 @@ class Bridge:
             # Skip if a plan review is already pending or recently resolved
             # (SSE reconnect guard).  Resolved tombstones are cleaned up by
             # ws_state events, allowing the refinement loop to re-enter.
+            # TTL fallback handles global SSE lag.
             if not auto and ws_id in self._pending_plan_reviews:
-                log.debug("Skipping duplicate plan review for ws %s", ws_id)
-                return
+                _, resolved_at = self._pending_plan_reviews[ws_id]
+                if not resolved_at or time.monotonic() - resolved_at < _TOMBSTONE_TTL:
+                    log.debug("Skipping duplicate plan review for ws %s", ws_id)
+                    return
+                self._pending_plan_reviews.pop(ws_id)
             if not auto:
                 request_id = uuid.uuid4().hex[:12]
-                self._pending_plan_reviews[ws_id] = (request_id, False)
+                self._pending_plan_reviews[ws_id] = (request_id, 0.0)
 
         if auto:
             self._http.post("/v1/api/plan", json={"feedback": "", "ws_id": ws_id})
@@ -808,7 +824,7 @@ class Bridge:
                 with self._lock:
                     entry = self._pending_plan_reviews.get(ws_id)
                     if entry is not None and entry[0] == request_id:
-                        self._pending_plan_reviews[ws_id] = (request_id, True)
+                        self._pending_plan_reviews[ws_id] = (request_id, time.monotonic())
 
             try:
                 raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
@@ -899,10 +915,10 @@ class Bridge:
             # proceed while stale SSE re-injections remain blocked.
             with self._lock:
                 a_entry = self._pending_approvals.get(ws_id)
-                if a_entry is not None and a_entry[1]:
+                if a_entry is not None and a_entry[1] > 0:
                     self._pending_approvals.pop(ws_id, None)
                 p_entry = self._pending_plan_reviews.get(ws_id)
-                if p_entry is not None and p_entry[1]:
+                if p_entry is not None and p_entry[1] > 0:
                     self._pending_plan_reviews.pop(ws_id, None)
 
             # Completion detection — emit for all idle transitions so

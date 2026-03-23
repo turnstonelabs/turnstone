@@ -54,8 +54,8 @@ def _wait_pending_resolved(bridge: Bridge, key: str, attr: str, deadline_s: floa
             entries = getattr(bridge, attr)
             if key not in entries:
                 return True
-            _, resolved = entries[key]
-            if resolved:
+            _, resolved_at = entries[key]
+            if resolved_at > 0:
                 return True
         time.sleep(0.01)
     return False
@@ -323,10 +323,10 @@ class TestPlanReviewRefinementLoop:
 
             _wait_pending_resolved(bridge, "ws-1", "_pending_plan_reviews")
 
-            # Verify tombstone is present
+            # Verify tombstone is present (resolved_at > 0)
             with bridge._lock:
                 assert "ws-1" in bridge._pending_plan_reviews
-                assert bridge._pending_plan_reviews["ws-1"][1] is True
+                assert bridge._pending_plan_reviews["ws-1"][1] > 0
 
             # Step 2: ws_state event cleans up the resolved tombstone
             with (
