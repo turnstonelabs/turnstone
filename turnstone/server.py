@@ -2048,22 +2048,12 @@ def main() -> None:
         metavar="PATH",
         help="Path to MCP server config file (standard mcpServers JSON format)",
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        metavar="PATH",
-        help="Path to config.toml (default: $TURNSTONE_CONFIG or ~/.config/turnstone/config.toml)",
-    )
     from turnstone.core.log import add_log_args
 
     add_log_args(parser)
-    from turnstone.core.config import apply_config, set_config_path
+    from turnstone.core.config import add_config_arg, apply_config
 
-    # Pre-parse to pick up --config before apply_config reads the file
-    pre_args, _ = parser.parse_known_args()
-    if pre_args.config:
-        set_config_path(pre_args.config)
-
+    add_config_arg(parser)
     # Only load bootstrap sections from config.toml — all other settings
     # are managed by ConfigStore (database-backed) after storage init.
     apply_config(parser, ["api", "server", "database"])

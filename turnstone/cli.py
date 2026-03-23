@@ -973,20 +973,9 @@ def main() -> None:
         default=0.7,
         help="Confidence threshold for judge (default: 0.7)",
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        metavar="PATH",
-        help="Path to config.toml (default: $TURNSTONE_CONFIG or ~/.config/turnstone/config.toml)",
-    )
+    from turnstone.core.config import add_config_arg, apply_config
 
-    from turnstone.core.config import apply_config, set_config_path
-
-    # Pre-parse to pick up --config before apply_config reads the file
-    pre_args, _ = parser.parse_known_args()
-    if pre_args.config:
-        set_config_path(pre_args.config)
-
+    add_config_arg(parser)
     apply_config(
         parser,
         ["api", "model", "session", "tools", "console", "auth", "mcp", "database", "judge"],

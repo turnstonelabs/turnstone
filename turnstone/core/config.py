@@ -1,10 +1,10 @@
 """Unified configuration for turnstone.
 
 Loads config.toml and applies values as argparse defaults.
-Precedence: CLI args > env vars > config file > hardcoded defaults.
+Precedence: CLI args > config file > hardcoded defaults.
 
 Config file resolution:
-  1. ``set_config_path(path)`` (called from ``--config`` CLI flag)
+  1. ``--config PATH`` CLI flag (via ``add_config_arg`` pre-parser)
   2. ``$TURNSTONE_CONFIG`` environment variable
   3. ``~/.config/turnstone/config.toml`` (default)
 """
@@ -44,9 +44,10 @@ def _resolve_config_path() -> Path:
 
 
 def set_config_path(path: str) -> None:
-    """Override the config file path.  Must be called before load_config().
+    """Override the config file path.
 
-    Typically called from the ``--config`` CLI flag handler.
+    Invalidates the cache so subsequent ``load_config()`` calls re-read
+    from the new path.  Typically called from ``add_config_arg()``.
     """
     global _config_path, _cache
     _config_path = Path(path).expanduser()
@@ -187,8 +188,6 @@ def get_tavily_key() -> str | None:
 
     Precedence: config.toml [api] tavily_key -> $TAVILY_API_KEY
     """
-    import os
-
     global _tavily_key, _tavily_key_loaded
     if _tavily_key_loaded:
         return _tavily_key
@@ -231,6 +230,29 @@ def apply_config(parser: argparse.ArgumentParser, sections: list[str]) -> None:
                 defaults[argparse_dest] = section_data[config_key]
     if defaults:
         parser.set_defaults(**defaults)
+
+
+def add_config_arg(parser: argparse.ArgumentParser) -> None:
+    """Add ``--config`` to *parser* and resolve the path before returning.
+
+    Uses a separate pre-parser (``add_help=False``) so ``--help`` on the
+    main parser still works and shows config-derived defaults.
+    """
+    import argparse as _ap
+    import sys
+
+    parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="Path to config.toml (default: $TURNSTONE_CONFIG or ~/.config/turnstone/config.toml)",
+    )
+    # Pre-parse only --config without intercepting --help
+    pre = _ap.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre_args, _ = pre.parse_known_args(sys.argv[1:])
+    if pre_args.config:
+        set_config_path(pre_args.config)
 
 
 def warn_migrated_settings() -> None:
