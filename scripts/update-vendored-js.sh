@@ -28,9 +28,19 @@ usage() {
 LIB="$1"
 VERSION="$2"
 
-# Detect current version from pyproject.toml
+# Detect current version from the filesystem (not pyproject.toml, which
+# Renovate may have already updated).  Falls back to pyproject.toml if
+# no directory is found.
 detect_old_version() {
     local pattern="$1"
+    # Look for existing directory: e.g. turnstone/shared_static/katex-0.16.38
+    local dir
+    dir=$(find "${STATIC_DIR}" -maxdepth 1 -type d -name "${pattern}-*" | head -1)
+    if [[ -n "$dir" ]]; then
+        basename "$dir" | sed "s/${pattern}-//"
+        return
+    fi
+    # Fallback to pyproject.toml
     grep -oE "${pattern}-[0-9.]+" pyproject.toml | head -1 | sed "s/${pattern}-//"
 }
 
@@ -51,9 +61,19 @@ update_refs() {
     done
 }
 
+check_same_version() {
+    if [[ "$1" == "$2" ]]; then
+        echo "ERROR: Old version ($1) == new version ($2). Nothing to update."
+        echo "If the old directory was already removed, re-download with:"
+        echo "  rm -rf ${STATIC_DIR}/${3}-${1} && $0 $3 $2"
+        exit 1
+    fi
+}
+
 case "$LIB" in
     katex)
         OLD_VERSION=$(detect_old_version "katex")
+        check_same_version "$OLD_VERSION" "$VERSION" "katex"
         OLD_DIR="${STATIC_DIR}/katex-${OLD_VERSION}"
         NEW_DIR="${STATIC_DIR}/katex-${VERSION}"
 
@@ -87,6 +107,7 @@ case "$LIB" in
 
     hljs)
         OLD_VERSION=$(detect_old_version "hljs")
+        check_same_version "$OLD_VERSION" "$VERSION" "hljs"
         OLD_DIR="${STATIC_DIR}/hljs-${OLD_VERSION}"
         NEW_DIR="${STATIC_DIR}/hljs-${VERSION}"
 
@@ -107,6 +128,7 @@ case "$LIB" in
 
     mermaid)
         OLD_VERSION=$(detect_old_version "mermaid")
+        check_same_version "$OLD_VERSION" "$VERSION" "mermaid"
         OLD_DIR="${STATIC_DIR}/mermaid-${OLD_VERSION}"
         NEW_DIR="${STATIC_DIR}/mermaid-${VERSION}"
 

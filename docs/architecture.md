@@ -91,7 +91,7 @@ turnstone/
     _config.py        Base ChannelConfig dataclass
     discord/          Discord adapter (bot, cog, views, streaming, config)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.16.38/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    katex-0.16.40/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
