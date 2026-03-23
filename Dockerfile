@@ -8,7 +8,7 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
 
-COPY --from=ghcr.io/astral-sh/uv:0.10.11 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /usr/local/bin/uv
 
 # System dependencies for psycopg (PostgreSQL client library)
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libpq5 \
