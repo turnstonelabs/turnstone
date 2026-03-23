@@ -170,6 +170,7 @@ class TerminalUI(SessionUI):
             for item in items:
                 if item.get("error"):
                     sys.stdout.write(f"  {red(item['header'])}\n")
+                    sys.stdout.write(f"  {red(item['error'])}\n")
                 else:
                     sys.stdout.write(f"  {yellow(item['header'])}\n")
                 if item.get("preview"):
