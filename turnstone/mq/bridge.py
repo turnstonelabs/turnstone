@@ -57,11 +57,6 @@ log = logging.getLogger("turnstone.mq.bridge")
 # Server's default safe tools (auto-approved without user confirmation)
 DEFAULT_SAFE_TOOLS = frozenset(["read_file", "search", "man", "memory", "recall"])
 
-# Resolved tombstones are normally cleaned by ws_state events from the
-# global SSE stream.  If that stream lags, this TTL ensures tombstones
-# don't block legitimate new approvals/plan_reviews indefinitely.
-_TOMBSTONE_TTL = 30.0  # seconds
-
 
 class Bridge:
     """Connects a message broker to turnstone-server's HTTP API.
@@ -726,12 +721,13 @@ class Bridge:
         # this workstream.  Resolved tombstones are cleaned up by ws_state
         # events, preventing TOCTOU races from SSE reconnect re-injection.
         # TTL fallback: if the global SSE is lagging, allow re-entry after
-        # _TOMBSTONE_TTL seconds so the workstream doesn't hang.
+        # 3x the approval timeout so the workstream doesn't hang.
         with self._lock:
             entry = self._pending_approvals.get(ws_id)
             if entry is not None:
                 _, resolved_at = entry
-                if not resolved_at or time.monotonic() - resolved_at < _TOMBSTONE_TTL:
+                ttl = 3 * self._approval_timeout
+                if not resolved_at or time.monotonic() - resolved_at < ttl:
                     log.debug("Skipping duplicate approval for ws %s", ws_id)
                     return
                 self._pending_approvals.pop(ws_id)
@@ -794,7 +790,8 @@ class Bridge:
             # TTL fallback handles global SSE lag.
             if not auto and ws_id in self._pending_plan_reviews:
                 _, resolved_at = self._pending_plan_reviews[ws_id]
-                if not resolved_at or time.monotonic() - resolved_at < _TOMBSTONE_TTL:
+                ttl = 3 * self._approval_timeout
+                if not resolved_at or time.monotonic() - resolved_at < ttl:
                     log.debug("Skipping duplicate plan review for ws %s", ws_id)
                     return
                 self._pending_plan_reviews.pop(ws_id)
