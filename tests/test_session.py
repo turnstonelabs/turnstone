@@ -904,3 +904,117 @@ class TestLiveConfigUpdate:
 
         session = _make_session(memory_config=MemoryConfig(relevance_k=3))
         assert session._mem_cfg.relevance_k == 3
+
+
+class TestAgentOutputGuard:
+    """Output guard should evaluate tool results in _run_agent, not just the main loop."""
+
+    def test_agent_loop_calls_evaluate_output(self):
+        """_run_agent passes tool output through _evaluate_output when output_guard is enabled."""
+        from turnstone.core.judge import JudgeConfig
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=True))
+
+        with patch.object(session, "_evaluate_output", wraps=lambda cid, o, fn: o) as mock_eval:
+            # Simulate _run_agent getting a tool call response then a text response
+            call_count = [0]
+
+            def fake_create(**kwargs):
+                call_count[0] += 1
+                resp = MagicMock()
+                if call_count[0] == 1:
+                    # First call: model returns a tool call
+                    choice = MagicMock()
+                    choice.finish_reason = "tool_calls"
+                    tc = MagicMock()
+                    tc.id = "call_1"
+                    tc.function.name = "read_file"
+                    tc.function.arguments = '{"path": "/tmp/test"}'
+                    choice.message.tool_calls = [tc]
+                    choice.message.content = None
+                    resp.choices = [choice]
+                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                else:
+                    # Second call: model returns text (done)
+                    choice = MagicMock()
+                    choice.finish_reason = "stop"
+                    choice.message.tool_calls = None
+                    choice.message.content = "Done"
+                    resp.choices = [choice]
+                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                return resp
+
+            session.client.chat.completions.create = fake_create
+
+            # Mock tool preparation to return a simple output
+            def fake_prepare(tc_dict, **kwargs):
+                return {
+                    "call_id": tc_dict["id"],
+                    "func_name": "read_file",
+                    "needs_approval": False,
+                    "execute": lambda p: ("call_1", "file contents with sk-proj-SECRET123"),
+                }
+
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                session._run_agent(
+                    [{"role": "user", "content": "test"}],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="test",
+                )
+
+            mock_eval.assert_called_once()
+            args = mock_eval.call_args[0]
+            assert args[0] == "call_1"  # call_id
+            assert "sk-proj-SECRET123" in args[1]  # output
+            assert args[2] == "read_file"  # func_name
+
+    def test_agent_loop_skips_guard_when_disabled(self):
+        """_run_agent does not call _evaluate_output when output_guard is disabled."""
+        from turnstone.core.judge import JudgeConfig
+
+        session = _make_session(judge_config=JudgeConfig(output_guard=False))
+
+        with patch.object(session, "_evaluate_output") as mock_eval:
+            call_count = [0]
+
+            def fake_create(**kwargs):
+                call_count[0] += 1
+                resp = MagicMock()
+                if call_count[0] == 1:
+                    choice = MagicMock()
+                    choice.finish_reason = "tool_calls"
+                    tc = MagicMock()
+                    tc.id = "call_1"
+                    tc.function.name = "read_file"
+                    tc.function.arguments = '{"path": "/tmp/test"}'
+                    choice.message.tool_calls = [tc]
+                    choice.message.content = None
+                    resp.choices = [choice]
+                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                else:
+                    choice = MagicMock()
+                    choice.finish_reason = "stop"
+                    choice.message.tool_calls = None
+                    choice.message.content = "Done"
+                    resp.choices = [choice]
+                    resp.usage = MagicMock(prompt_tokens=10, completion_tokens=5)
+                return resp
+
+            session.client.chat.completions.create = fake_create
+
+            def fake_prepare(tc_dict, **kwargs):
+                return {
+                    "call_id": tc_dict["id"],
+                    "func_name": "read_file",
+                    "needs_approval": False,
+                    "execute": lambda p: ("call_1", "safe output"),
+                }
+
+            with patch.object(session, "_prepare_tool", side_effect=fake_prepare):
+                session._run_agent(
+                    [{"role": "user", "content": "test"}],
+                    tools=[{"type": "function", "function": {"name": "read_file"}}],
+                    label="test",
+                )
+
+            mock_eval.assert_not_called()

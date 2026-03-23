@@ -3947,6 +3947,12 @@ class ChatSession:
                     else:
                         output = f"Unknown tool: {tool_name}"
 
+                # Output guard: evaluate before truncation so the guard
+                # sees full output (credentials split by truncation would
+                # evade detection).  Agent outputs are always str.
+                if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
+                    output = self._evaluate_output(tc_dict["id"], output, tool_name)
+
                 # Truncate large tool outputs to avoid blowing context limits.
                 # Agents operate autonomously; they can refine their queries
                 # if truncation loses important detail.
