@@ -63,7 +63,7 @@ class DuckDuckGoClient:
         self._timeout = timeout
 
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
-        from duckduckgo_search import DDGS  # type: ignore[import-not-found]
+        from ddgs import DDGS  # type: ignore[import-not-found]
 
         with DDGS(timeout=int(self._timeout)) as ddgs:
             raw = list(ddgs.text(query, max_results=max_results))
@@ -130,9 +130,9 @@ def _format_ddg(results: list[dict[str, Any]], query: str) -> str:
 
 
 def _ddg_available() -> bool:
-    """Check if duckduckgo-search is installed."""
+    """Check if the ddgs package is installed."""
     try:
-        import duckduckgo_search  # noqa: F401
+        import ddgs  # noqa: F401
 
         return True
     except ImportError:

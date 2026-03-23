@@ -93,7 +93,7 @@ class TestDuckDuckGoClient:
         ]
         mock_module = MagicMock()
         mock_module.DDGS.return_value = mock_ddgs
-        with patch.dict("sys.modules", {"duckduckgo_search": mock_module}):
+        with patch.dict("sys.modules", {"ddgs": mock_module}):
             client = DuckDuckGoClient(timeout=10)
             result = client.search("test query", max_results=3)
         mock_ddgs.text.assert_called_once_with("test query", max_results=3)
