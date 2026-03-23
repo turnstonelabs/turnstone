@@ -308,44 +308,47 @@ class TurnstoneBot:
         elif isinstance(event, ApprovalRequestEvent):
             # Evaluate admin tool policies before auto-approve.
             _policy_handled = False
-            try:
-                from turnstone.core.policy import evaluate_tool_policies_batch
+            if self.storage is not None:
+                try:
+                    from turnstone.core.policy import evaluate_tool_policies_batch
 
-                _tool_names = [
-                    it.get("approval_label", "") or it.get("func_name", "")
-                    for it in event.items
-                    if it.get("needs_approval") and it.get("func_name") and not it.get("error")
-                ]
-                _tool_names = [n for n in _tool_names if n]
-                if _tool_names:
-                    verdicts = await asyncio.to_thread(
-                        evaluate_tool_policies_batch,
-                        self.storage,
-                        _tool_names,
-                    )
-                    if any(v == "deny" for v in verdicts.values()):
-                        denied = [n for n, v in verdicts.items() if v == "deny"]
-                        await self.router.send_approval(
-                            ws_id,
-                            event.correlation_id,
-                            approved=False,
-                            feedback=f"Blocked by tool policy: {', '.join(denied)}",
+                    _tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in event.items
+                        if it.get("needs_approval") and it.get("func_name") and not it.get("error")
+                    ]
+                    _tool_names = [n for n in _tool_names if n]
+                    if _tool_names:
+                        verdicts = await asyncio.to_thread(
+                            evaluate_tool_policies_batch,
+                            self.storage,
+                            _tool_names,
                         )
-                        await thread.send(f"*Tool blocked by admin policy: {', '.join(denied)}*")
-                        _policy_handled = True
-                    elif all(verdicts.get(n) == "allow" for n in _tool_names):
-                        await self.router.send_approval(
-                            ws_id,
-                            event.correlation_id,
-                            approved=True,
-                        )
-                        await thread.send("*Tool approved by policy.*")
-                        _policy_handled = True
-            except Exception:
-                pass  # Best-effort
-            if _policy_handled:
-                pass  # Already handled above
-            elif self.config.auto_approve or self._should_auto_approve(event):
+                        if any(v == "deny" for v in verdicts.values()):
+                            denied = [n for n, v in verdicts.items() if v == "deny"]
+                            await self.router.send_approval(
+                                ws_id,
+                                event.correlation_id,
+                                approved=False,
+                                feedback=f"Blocked by tool policy: {', '.join(denied)}",
+                            )
+                            await thread.send(
+                                f"*Tool blocked by admin policy: {', '.join(denied)}*"
+                            )
+                            _policy_handled = True
+                        elif all(verdicts.get(n) == "allow" for n in _tool_names):
+                            await self.router.send_approval(
+                                ws_id,
+                                event.correlation_id,
+                                approved=True,
+                            )
+                            await thread.send("*Tool approved by policy.*")
+                            _policy_handled = True
+                except Exception:
+                    log.debug("Tool policy evaluation failed for ws %s", ws_id, exc_info=True)
+            if not _policy_handled and (
+                self.config.auto_approve or self._should_auto_approve(event)
+            ):
                 await self.router.send_approval(ws_id, event.correlation_id, approved=True)
                 await thread.send("*Tool auto-approved.*")
             else:

@@ -120,3 +120,26 @@ class TestScrubbedEnv:
 
         assert result["PYTHONPATH"] == "/opt/lib"
         assert result["GOPATH"] == "/home/user/go"
+
+    def test_extra_can_reintroduce_scrubbed_var(self):
+        """extra= intentionally overrides scrubbing (operator-controlled)."""
+        fake_env = {"PATH": "/usr/bin", "OPENAI_API_KEY": "sk-original"}
+        with patch.dict(os.environ, fake_env, clear=True):
+            result = scrubbed_env(extra={"OPENAI_API_KEY": "sk-injected"})
+
+        assert result["OPENAI_API_KEY"] == "sk-injected"
+
+    def test_less_prefix_does_not_leak_secrets(self):
+        """LESS pager vars are safe but LESS_SECRET_TOKEN is not."""
+        fake_env = {
+            "PATH": "/usr/bin",
+            "LESS": "-R",
+            "LESSOPEN": "| lesspipe %s",
+            "LESS_SECRET_TOKEN": "tok-secret",
+        }
+        with patch.dict(os.environ, fake_env, clear=True):
+            result = scrubbed_env()
+
+        assert result["LESS"] == "-R"
+        assert result["LESSOPEN"] == "| lesspipe %s"
+        assert "LESS_SECRET_TOKEN" not in result

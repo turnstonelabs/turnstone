@@ -703,10 +703,6 @@ class Bridge:
             auto = self._ws_auto_approve.get(ws_id, False)
             approve_set = self._ws_approve_tools.get(ws_id, DEFAULT_SAFE_TOOLS)
 
-        if auto:
-            self._api_approve(ws_id, approved=True)
-            return
-
         tool_names = {
             it.get("approval_label", "") or it.get("func_name", "")
             for it in items
@@ -734,7 +730,11 @@ class Bridge:
                         self._api_approve(ws_id, approved=True)
                         return
             except Exception:
-                pass  # Best-effort
+                log.debug("Tool policy evaluation failed for ws %s", ws_id, exc_info=True)
+
+        if auto:
+            self._api_approve(ws_id, approved=True)
+            return
 
         if tool_names and tool_names.issubset(approve_set):
             self._api_approve(ws_id, approved=True)

@@ -37,11 +37,16 @@ _SAFE_NAMES: frozenset[str] = frozenset(
         "SHLVL",
         "MANWIDTH",
         "MAN_KEEP_FORMATTING",
+        "LESS",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "LESSPIPE",
+        "LESSCHARSET",
     }
 )
 
 # Prefixes that are always preserved (locale, XDG, etc.).
-_SAFE_PREFIXES: tuple[str, ...] = ("LC_", "XDG_", "LESS")
+_SAFE_PREFIXES: tuple[str, ...] = ("LC_", "XDG_")
 
 # Substrings that cause a variable to be scrubbed.
 _SECRET_SUBSTRINGS: tuple[str, ...] = (
