@@ -46,16 +46,21 @@ def storage_backend(request, tmp_path):
         )
         backend = init_storage("postgresql", url=pg_url, run_migrations=False)
         yield backend
-        # Clean all tables between tests
-        import sqlalchemy as sa
+        # Truncate all tables between tests — faster than DELETE and resets
+        # autoincrement sequences.  CASCADE handles any future FK constraints.
+        try:
+            import sqlalchemy as sa
 
-        from turnstone.core.storage._schema import metadata as db_metadata
+            from turnstone.core.storage._schema import metadata as db_metadata
 
-        with backend._engine.connect() as conn:
-            for table in reversed(db_metadata.sorted_tables):
-                conn.execute(sa.delete(table))
-            conn.commit()
-        reset_storage()
+            with backend._engine.connect() as conn:
+                table_names = ", ".join(t.name for t in reversed(db_metadata.sorted_tables))
+                conn.execute(sa.text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE"))
+                conn.commit()
+        except Exception:
+            pass  # best-effort cleanup; reset_storage disposes engine
+        finally:
+            reset_storage()
     else:
         db_path = str(tmp_path / "test.db")
         backend = init_storage("sqlite", path=db_path, run_migrations=False)
