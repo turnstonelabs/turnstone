@@ -713,6 +713,29 @@ class Bridge:
             if it.get("needs_approval") and it.get("func_name") and not it.get("error")
         }
 
+        # Evaluate admin tool policies — deny overrides auto-approve.
+        if tool_names:
+            try:
+                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    verdicts = evaluate_tool_policies_batch(storage, list(tool_names))
+                    if any(v == "deny" for v in verdicts.values()):
+                        denied = [n for n, v in verdicts.items() if v == "deny"]
+                        self._api_approve(
+                            ws_id,
+                            approved=False,
+                            feedback=f"Blocked by tool policy: {', '.join(denied)}",
+                        )
+                        return
+                    if all(verdicts.get(n) == "allow" for n in tool_names):
+                        self._api_approve(ws_id, approved=True)
+                        return
+            except Exception:
+                pass  # Best-effort
+
         if tool_names and tool_names.issubset(approve_set):
             self._api_approve(ws_id, approved=True)
             return

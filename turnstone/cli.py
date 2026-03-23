@@ -135,6 +135,36 @@ class TerminalUI(SessionUI):
         """
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
+        # Evaluate admin tool policies (deny/allow/ask) before prompting.
+        if pending:
+            try:
+                from turnstone.core.policy import evaluate_tool_policies_batch
+                from turnstone.core.storage._registry import get_storage
+
+                storage = get_storage()
+                if storage is not None:
+                    tool_names = [
+                        it.get("approval_label", "") or it.get("func_name", "")
+                        for it in pending
+                        if it.get("func_name")
+                    ]
+                    if tool_names:
+                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
+                        for it in pending:
+                            policy_name = it.get("approval_label", "") or it.get("func_name", "")
+                            verdict = verdicts.get(policy_name)
+                            if verdict == "deny":
+                                it["denied"] = True
+                                it["error"] = f"Blocked by tool policy ('{policy_name}')"
+                                it["needs_approval"] = False
+                            elif verdict == "allow":
+                                it["needs_approval"] = False
+                        pending = [
+                            it for it in items if it.get("needs_approval") and not it.get("error")
+                        ]
+            except Exception:
+                pass  # Best-effort — no policy enforcement on error
+
         with self._print_lock:
             # Print all headers, previews, and heuristic verdicts
             for item in items:
