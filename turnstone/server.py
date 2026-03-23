@@ -2277,6 +2277,7 @@ def main() -> None:
             tool_search=config_store.get("tools.search"),
             tool_search_threshold=config_store.get("tools.search_threshold"),
             tool_search_max_results=config_store.get("tools.search_max_results"),
+            web_search_backend=config_store.get("tools.web_search_backend"),
             skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,

@@ -196,6 +196,17 @@ def _build_registry() -> dict[str, SettingDef]:
             min_value=1,
             max_value=50,
         ),
+        SettingDef(
+            "tools.web_search_backend",
+            "str",
+            "",
+            "Web search backend: '' (auto), 'tavily', 'ddg', or 'mcp:server:tool'",
+            "tools",
+            help="Controls which service handles web_search calls when the model lacks native "
+            "search support. Empty string auto-detects (Tavily if key present, else DuckDuckGo "
+            "if installed). 'ddg' uses DuckDuckGo (free, no API key). 'tavily' forces Tavily. "
+            "'mcp:server:tool' routes to an MCP server (e.g. 'mcp:ddg:search').",
+        ),
         # -- server ---------------------------------------------------------
         SettingDef(
             "server.workstream_idle_timeout",

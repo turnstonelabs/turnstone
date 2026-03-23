@@ -101,6 +101,7 @@ if TYPE_CHECKING:
         ModelCapabilities,
         StreamChunk,
     )
+    from turnstone.core.web_search import WebSearchClient
 
 # ---------------------------------------------------------------------------
 # Cancellation support
@@ -249,6 +250,7 @@ class ChatSession:
         user_id: str = "",
         memory_config: MemoryConfig | None = None,
         config_store: ConfigStore | None = None,
+        web_search_backend: str = "",
     ):
         self.client = client
         self.model = model
@@ -340,6 +342,8 @@ class ChatSession:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
+        # Web search backend (pluggable: auto/tavily/ddg/mcp:server:tool)
+        self._web_search_backend = web_search_backend
         # Dynamic tool search: defer MCP tools when tool count is high
         self._tool_search_setting = tool_search
         self._tool_search_threshold = tool_search_threshold
@@ -411,6 +415,26 @@ class ChatSession:
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
             redact_secrets=cs.get("judge.redact_secrets"),
+        )
+
+    def _get_web_search_backend(self) -> str:
+        """Effective web search backend — reads from ConfigStore when available."""
+        cs = getattr(self, "_config_store", None)
+        if cs is not None:
+            val = cs.get("tools.web_search_backend")
+            if val:
+                return str(val)
+        return self._web_search_backend
+
+    def _resolve_search_client(self) -> WebSearchClient | None:
+        """Return a web search client for the configured backend, or None."""
+        from turnstone.core.web_search import resolve_web_search_client
+
+        return resolve_web_search_client(
+            backend=self._get_web_search_backend(),
+            tavily_key=get_tavily_key(),
+            mcp_client=self._mcp_client,
+            timeout=self.tool_timeout,
         )
 
     def _resolve_capabilities(
@@ -1039,7 +1063,7 @@ class ChatSession:
                 tools = visible + [self._tool_search.get_search_tool_definition()]
 
         # Gate web_search: only include when a backend exists
-        if not caps.supports_web_search and not get_tavily_key():
+        if not caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
         return tools
@@ -2769,17 +2793,17 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: no query provided",
             }
-        if not get_tavily_key():
+        if not self._resolve_search_client():
             return {
                 "call_id": call_id,
                 "func_name": "web_search",
-                "header": "\u2717 web_search: no API key",
+                "header": "\u2717 web_search: no backend available",
                 "preview": "",
                 "needs_approval": False,
                 "error": (
-                    "Error: Tavily API key not configured. "
-                    "Set it in ~/.config/turnstone/tavily_key or $TAVILY_API_KEY. "
-                    "Use web_fetch with a direct URL as an alternative."
+                    "Error: No web search backend available. "
+                    "Install duckduckgo-search (`pip install duckduckgo-search`), "
+                    "configure a Tavily API key, or set tools.web_search_backend."
                 ),
             }
         try:
@@ -5007,51 +5031,26 @@ class ChatSession:
         return call_id, answer
 
     def _exec_web_search(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Search the web via Tavily API."""
+        """Search the web via the configured backend (Tavily, DDG, or MCP)."""
         call_id = item["call_id"]
         query = item["query"]
         max_results = item.get("max_results", 5)
         topic = item.get("topic", "general")
-        api_key = get_tavily_key()
 
-        try:
-            resp = httpx.post(
-                "https://api.tavily.com/search",
-                json={
-                    "query": query,
-                    "max_results": max_results,
-                    "topic": topic,
-                    "include_answer": True,
-                },
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=self.tool_timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            msg = f"Tavily search failed: {e}"
+        client = self._resolve_search_client()
+        if not client:
+            msg = "Web search backend not available"
             self.ui.on_error(msg)
             return call_id, msg
 
-        parts: list[str] = []
-        answer = (data.get("answer") or "").strip()
-        if answer:
-            parts.append(f"Answer: {answer}")
-
-        results = data.get("results") or []
-        if results:
-            lines = []
-            for i, r in enumerate(results, 1):
-                title = r.get("title", "")
-                url = r.get("url", "")
-                content = (r.get("content") or "")[:500]
-                lines.append(f"{i}. [{title}]({url})\n   {content}")
-            parts.append("\n".join(lines))
-
-        output = "\n\n".join(parts) if parts else f"No results for '{query}'."
+        try:
+            output = client.search(query, max_results=max_results, topic=topic)
+        except Exception as e:
+            msg = f"Web search failed: {e}"
+            self.ui.on_error(msg)
+            return call_id, msg
 
         self.ui.on_tool_result(call_id, "web_search", output)
-
         return call_id, output
 
     def handle_command(self, cmd_line: str) -> bool:

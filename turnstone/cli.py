@@ -885,6 +885,12 @@ def main() -> None:
         help="Max tools returned per tool search query (default: 5)",
     )
     parser.add_argument(
+        "--web-search-backend",
+        default="",
+        metavar="BACKEND",
+        help="Web search backend: '' (auto), 'tavily', 'ddg', or 'mcp:server:tool'",
+    )
+    parser.add_argument(
         "--resume",
         default=None,
         metavar="WS",
@@ -1099,6 +1105,7 @@ def main() -> None:
             tool_search=args.tool_search,
             tool_search_threshold=args.tool_search_threshold,
             tool_search_max_results=args.tool_search_max_results,
+            web_search_backend=args.web_search_backend,
             skill=skill or args.skill or None,
             judge_config=judge_config,
         )

@@ -51,8 +51,9 @@ console = ["redis>=7.2", "croniter>=3.0"]
 sim = ["redis>=7.2"]
 anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
+ddg = ["duckduckgo-search>=8.0"]
 discord = ["discord.py>=2.4", "redis>=7.2"]
-all = ["turnstone[mq,console,sim,anthropic,postgres,discord]"]
+all = ["turnstone[mq,console,sim,anthropic,postgres,discord,ddg]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"

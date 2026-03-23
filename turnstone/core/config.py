@@ -105,6 +105,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "search": "tool_search",
         "search_threshold": "tool_search_threshold",
         "search_max_results": "tool_search_max_results",
+        "web_search_backend": "web_search_backend",
     },
     "server": {
         "host": "host",
