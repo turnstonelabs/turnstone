@@ -105,8 +105,11 @@ class Bridge:
         self._ws_auto_approve: dict[str, bool] = {}
         self._ws_approve_tools: dict[str, set[str]] = {}
         self._active_sends: dict[str, str] = {}  # ws_id → correlation_id
-        self._pending_approvals: dict[str, str] = {}  # ws_id → request_id
-        self._pending_plan_reviews: dict[str, str] = {}  # ws_id → request_id
+        # Tombstone dicts: value is (request_id, resolved).
+        # Entries stay until cleaned up by ws_state/ws_closed events
+        # to prevent TOCTOU races on SSE reconnect.
+        self._pending_approvals: dict[str, tuple[str, bool]] = {}
+        self._pending_plan_reviews: dict[str, tuple[str, bool]] = {}
         self._running = True
 
     @property
@@ -713,14 +716,15 @@ class Bridge:
             self._api_approve(ws_id, approved=True)
             return
 
-        # Skip if an approval is already pending for this workstream (SSE
-        # reconnects re-inject the pending approval, causing duplicates).
+        # Skip if an approval is already pending (or recently resolved) for
+        # this workstream.  Resolved tombstones are cleaned up by ws_state
+        # events, preventing TOCTOU races from SSE reconnect re-injection.
         with self._lock:
             if ws_id in self._pending_approvals:
                 log.debug("Skipping duplicate approval for ws %s", ws_id)
                 return
             request_id = uuid.uuid4().hex[:12]
-            self._pending_approvals[ws_id] = request_id
+            self._pending_approvals[ws_id] = (request_id, False)
 
         # Forward to client — spawn a thread so we don't block SSE consumption
         self._publish_ws(
@@ -762,7 +766,9 @@ class Bridge:
                     self._api_approve(ws_id, approved=False, feedback="Approval timed out")
             finally:
                 with self._lock:
-                    self._pending_approvals.pop(ws_id, None)
+                    entry = self._pending_approvals.get(ws_id)
+                    if entry is not None and entry[0] == request_id:
+                        self._pending_approvals[ws_id] = (request_id, True)
 
         threading.Thread(target=self._run_in_context(_wait_approval), daemon=True).start()
 
@@ -770,13 +776,15 @@ class Bridge:
         """Handle a plan review request — auto-approve or forward to client."""
         with self._lock:
             auto = self._ws_auto_approve.get(ws_id, False)
-            # Skip if a plan review is already pending (SSE reconnect guard).
+            # Skip if a plan review is already pending or recently resolved
+            # (SSE reconnect guard).  Resolved tombstones are cleaned up by
+            # ws_state events, allowing the refinement loop to re-enter.
             if not auto and ws_id in self._pending_plan_reviews:
                 log.debug("Skipping duplicate plan review for ws %s", ws_id)
                 return
             if not auto:
                 request_id = uuid.uuid4().hex[:12]
-                self._pending_plan_reviews[ws_id] = request_id
+                self._pending_plan_reviews[ws_id] = (request_id, False)
 
         if auto:
             self._http.post("/v1/api/plan", json={"feedback": "", "ws_id": ws_id})
@@ -794,11 +802,14 @@ class Bridge:
         def _wait_plan() -> None:
             try:
                 raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
-                # Clear pending entry *before* posting response so that
-                # a subsequent plan review event (from the refinement
-                # loop) is not skipped by the duplicate guard.
+                # Mark resolved instead of popping — the tombstone blocks
+                # stale SSE re-injections.  Cleanup happens on the next
+                # ws_state event, which arrives before any refinement-loop
+                # plan_review event can be emitted.
                 with self._lock:
-                    self._pending_plan_reviews.pop(ws_id, None)
+                    entry = self._pending_plan_reviews.get(ws_id)
+                    if entry is not None and entry[0] == request_id:
+                        self._pending_plan_reviews[ws_id] = (request_id, True)
                 if raw_resp:
                     resp_msg = InboundMessage.from_json(raw_resp)
                     feedback = getattr(resp_msg, "feedback", "")
@@ -808,7 +819,9 @@ class Bridge:
                     self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
             except Exception:
                 with self._lock:
-                    self._pending_plan_reviews.pop(ws_id, None)
+                    entry = self._pending_plan_reviews.get(ws_id)
+                    if entry is not None and entry[0] == request_id:
+                        self._pending_plan_reviews[ws_id] = (request_id, True)
                 # Best-effort rejection so the server doesn't hang
                 try:
                     self._http.post(
@@ -874,6 +887,17 @@ class Bridge:
                 )
             )
 
+            # Clean up resolved pending tombstones on any state transition.
+            # This allows legitimate new approval/plan_review events to
+            # proceed while stale SSE re-injections remain blocked.
+            with self._lock:
+                a_entry = self._pending_approvals.get(ws_id)
+                if a_entry is not None and a_entry[1]:
+                    self._pending_approvals.pop(ws_id, None)
+                p_entry = self._pending_plan_reviews.get(ws_id)
+                if p_entry is not None and p_entry[1]:
+                    self._pending_plan_reviews.pop(ws_id, None)
+
             # Completion detection — emit for all idle transitions so
             # channel adapters can finalize streaming messages even when
             # the turn was initiated from the server UI (no correlation_id).
@@ -902,6 +926,8 @@ class Bridge:
                 self._ws_auto_approve.pop(ws_id, None)
                 self._ws_approve_tools.pop(ws_id, None)
                 self._active_sends.pop(ws_id, None)
+                self._pending_approvals.pop(ws_id, None)
+                self._pending_plan_reviews.pop(ws_id, None)
 
     # -- heartbeat -----------------------------------------------------------
 

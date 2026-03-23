@@ -20,8 +20,6 @@ import time
 from collections import Counter
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from turnstone.mq.bridge import Bridge
 
 ITERATIONS = 100
@@ -48,12 +46,16 @@ def _approval_items(tool_name: str = "bash") -> list[dict]:
     return [{"func_name": tool_name, "needs_approval": True, "approval_label": tool_name}]
 
 
-def _wait_pending_clear(bridge: Bridge, key: str, attr: str, deadline_s: float = 3.0) -> bool:
-    """Poll until the pending entry is cleared or deadline expires."""
+def _wait_pending_resolved(bridge: Bridge, key: str, attr: str, deadline_s: float = 3.0) -> bool:
+    """Poll until the pending entry is resolved (tombstone) or absent."""
     deadline = time.monotonic() + deadline_s
     while time.monotonic() < deadline:
         with bridge._lock:
-            if key not in getattr(bridge, attr):
+            entries = getattr(bridge, attr)
+            if key not in entries:
+                return True
+            _, resolved = entries[key]
+            if resolved:
                 return True
         time.sleep(0.01)
     return False
@@ -68,12 +70,6 @@ class TestDuplicateApproval:
     """Two threads call _handle_approval for the same ws_id simultaneously.
     Only one should create a pending entry; the other should be skipped."""
 
-    @pytest.mark.xfail(
-        reason="Known race: _wait_approval pops _pending_approvals in finally, "
-        "allowing a concurrent SSE reconnect to slip past the duplicate guard. "
-        "Fix: keep the pending entry until the workstream returns to idle.",
-        strict=False,
-    )
     def test_no_duplicate_approvals(self):
         sent_count = Counter()
 
@@ -99,8 +95,8 @@ class TestDuplicateApproval:
                 assert not t1.is_alive(), "Thread 1 hung"
                 assert not t2.is_alive(), "Thread 2 hung"
 
-                # Wait for spawned _wait_approval threads to finish
-                _wait_pending_clear(bridge, "ws-1", "_pending_approvals")
+                # Wait for spawned _wait_approval threads to resolve
+                _wait_pending_resolved(bridge, "ws-1", "_pending_approvals")
 
                 sent_count[mock_approve.call_count] += 1
 
@@ -119,13 +115,6 @@ class TestDuplicatePlanReview:
     """Two threads call _handle_plan_review simultaneously.
     Only one should create a pending entry."""
 
-    @pytest.mark.xfail(
-        reason="Known race: _wait_plan pops _pending_plan_reviews before posting "
-        "(intentionally, for the refinement loop), but a re-injected SSE event "
-        "during this window creates a second pending entry. "
-        "Fix: use a generation counter instead of presence check.",
-        strict=False,
-    )
     def test_no_duplicate_plan_reviews(self):
         sent_count = Counter()
 
@@ -150,8 +139,8 @@ class TestDuplicatePlanReview:
                 assert not t1.is_alive(), "Thread 1 hung"
                 assert not t2.is_alive(), "Thread 2 hung"
 
-                # Wait for spawned _wait_plan threads to finish
-                _wait_pending_clear(bridge, "ws-1", "_pending_plan_reviews")
+                # Wait for spawned _wait_plan threads to resolve
+                _wait_pending_resolved(bridge, "ws-1", "_pending_plan_reviews")
 
                 sent_count[bridge._http.post.call_count] += 1
 
@@ -263,9 +252,9 @@ class TestApprovalThreadTimeout:
             with patch.object(bridge, "_publish_ws"), patch.object(bridge, "_api_approve"):
                 bridge._handle_approval("ws-1", {"items": _approval_items()})
 
-            # The pending entry should be cleaned up within the timeout
-            cleared = _wait_pending_clear(bridge, "ws-1", "_pending_approvals", deadline_s=3.0)
-            assert cleared, "Approval thread did not exit within expected timeout"
+            # The pending entry should be resolved within the timeout
+            resolved = _wait_pending_resolved(bridge, "ws-1", "_pending_approvals", deadline_s=3.0)
+            assert resolved, "Approval thread did not exit within expected timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +284,7 @@ class TestApprovalDuringClose:
                     bridge._ws_threads.pop("ws-1", None)
                     bridge._ws_auto_approve.pop("ws-1", None)
                     bridge._ws_approve_tools.pop("ws-1", None)
+                    bridge._pending_approvals.pop("ws-1", None)
 
             t1 = threading.Thread(target=_send_approval)
             t2 = threading.Thread(target=_close_ws)
@@ -305,6 +295,7 @@ class TestApprovalDuringClose:
             assert not t1.is_alive(), "Approval thread hung"
             assert not t2.is_alive(), "Close thread hung"
 
-            # Wait for spawned _wait_approval thread to finish
-            cleared = _wait_pending_clear(bridge, "ws-1", "_pending_approvals")
-            assert cleared, "Orphaned pending approval"
+            # Wait for spawned _wait_approval thread to resolve (if close
+            # didn't remove the entry first)
+            resolved = _wait_pending_resolved(bridge, "ws-1", "_pending_approvals")
+            assert resolved, "Orphaned pending approval"
