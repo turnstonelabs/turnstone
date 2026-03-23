@@ -48,6 +48,9 @@ def storage_backend(request, tmp_path):
         yield backend
         # Truncate all tables between tests — faster than DELETE and resets
         # autoincrement sequences.  CASCADE handles any future FK constraints.
+        # NOTE: accesses backend._engine (SQLAlchemy internal) — both SQLite
+        # and PostgreSQL backends expose this.  If a non-SQLAlchemy backend is
+        # ever added, this cleanup will need a protocol-level hook.
         try:
             import sqlalchemy as sa
 
