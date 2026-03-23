@@ -120,8 +120,8 @@ class TestBridgePolicyEnforcement:
                 return_value={"bash": "deny"},
             ),
             patch(
-                "turnstone.core.storage._registry.get_storage",
-                return_value=MagicMock(),
+                "turnstone.core.storage._registry._storage",
+                new=MagicMock(),
             ),
             patch.object(bridge, "_api_approve") as mock_approve,
             patch.object(bridge, "_publish_ws"),
@@ -162,8 +162,8 @@ class TestBridgePolicyEnforcement:
                 return_value={"bash": "deny", "read_file": "allow"},
             ),
             patch(
-                "turnstone.core.storage._registry.get_storage",
-                return_value=MagicMock(),
+                "turnstone.core.storage._registry._storage",
+                new=MagicMock(),
             ),
             patch.object(bridge, "_api_approve") as mock_approve,
             patch.object(bridge, "_publish_ws"),

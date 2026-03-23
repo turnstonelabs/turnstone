@@ -15,18 +15,22 @@ class TestIsSecret:
         assert _is_secret("TURNSTONE_JWT_SECRET") is True
         assert _is_secret("AWS_SECRET_ACCESS_KEY") is True
 
-    def test_pattern_matching(self):
+    def test_suffix_matching(self):
         assert _is_secret("MY_CUSTOM_API_KEY") is True
         assert _is_secret("DB_PASSWORD") is True
         assert _is_secret("AUTH_TOKEN") is True
         assert _is_secret("SERVICE_CREDENTIAL") is True
+        assert _is_secret("GCP_CREDENTIALS") is True
 
     def test_safe_vars_not_secret(self):
         assert _is_secret("PATH") is False
         assert _is_secret("HOME") is False
         assert _is_secret("LANG") is False
 
-    def test_non_secret_vars(self):
+    def test_no_false_positives_on_substring(self):
+        """Suffix matching avoids false positives like MONKEYTYPE."""
+        assert _is_secret("MONKEYTYPE") is False
+        assert _is_secret("KEYBOARD_LAYOUT") is False
         assert _is_secret("PYTHONPATH") is False
         assert _is_secret("EDITOR") is False
         assert _is_secret("GOPATH") is False

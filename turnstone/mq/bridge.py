@@ -713,9 +713,11 @@ class Bridge:
         if tool_names:
             try:
                 from turnstone.core.policy import evaluate_tool_policies_batch
-                from turnstone.core.storage._registry import get_storage
+                from turnstone.core.storage import _registry as _stor_reg
 
-                storage = get_storage()
+                # Use _storage directly — get_storage() auto-initializes
+                # a local SQLite DB which would have no admin policies.
+                storage = _stor_reg._storage
                 if storage is not None:
                     verdicts = evaluate_tool_policies_batch(storage, list(tool_names))
                     if any(v == "deny" for v in verdicts.values()):

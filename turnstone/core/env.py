@@ -48,13 +48,15 @@ _SAFE_NAMES: frozenset[str] = frozenset(
 # Prefixes that are always preserved (locale, XDG, etc.).
 _SAFE_PREFIXES: tuple[str, ...] = ("LC_", "XDG_")
 
-# Substrings that cause a variable to be scrubbed.
-_SECRET_SUBSTRINGS: tuple[str, ...] = (
-    "KEY",
-    "SECRET",
-    "TOKEN",
-    "PASSWORD",
-    "CREDENTIAL",
+# Suffixes that cause a variable to be scrubbed (e.g. *_KEY, *_TOKEN).
+# Suffix matching avoids false positives on MONKEYTYPE, KEYBOARD_LAYOUT, etc.
+_SECRET_SUFFIXES: tuple[str, ...] = (
+    "_KEY",
+    "_SECRET",
+    "_TOKEN",
+    "_PASSWORD",
+    "_CREDENTIAL",
+    "_CREDENTIALS",
 )
 
 # Exact names that are always scrubbed (even if they don't match patterns).
@@ -72,6 +74,8 @@ _EXPLICIT_SCRUB: frozenset[str] = frozenset(
         "AZURE_CLIENT_SECRET",
         "GCP_SERVICE_ACCOUNT_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "DATABASE_URL",
+        "TURNSTONE_DB_URL",
     }
 )
 
@@ -81,7 +85,7 @@ def _is_secret(name: str) -> bool:
     if name in _EXPLICIT_SCRUB:
         return True
     upper = name.upper()
-    return any(sub in upper for sub in _SECRET_SUBSTRINGS)
+    return any(upper.endswith(sfx) for sfx in _SECRET_SUFFIXES)
 
 
 def _is_safe(name: str) -> bool:

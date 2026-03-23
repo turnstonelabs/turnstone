@@ -143,13 +143,13 @@ class TerminalUI(SessionUI):
 
                 storage = get_storage()
                 if storage is not None:
-                    tool_names = [
+                    _policy_names = [
                         it.get("approval_label", "") or it.get("func_name", "")
                         for it in pending
                         if it.get("func_name")
                     ]
-                    if tool_names:
-                        verdicts = evaluate_tool_policies_batch(storage, tool_names)
+                    if _policy_names:
+                        verdicts = evaluate_tool_policies_batch(storage, _policy_names)
                         for it in pending:
                             policy_name = it.get("approval_label", "") or it.get("func_name", "")
                             verdict = verdicts.get(policy_name)
