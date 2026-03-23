@@ -1,11 +1,17 @@
 """Unified configuration for turnstone.
 
-Loads ``~/.config/turnstone/config.toml`` and applies values as argparse defaults.
+Loads config.toml and applies values as argparse defaults.
 Precedence: CLI args > env vars > config file > hardcoded defaults.
+
+Config file resolution:
+  1. ``set_config_path(path)`` (called from ``--config`` CLI flag)
+  2. ``$TURNSTONE_CONFIG`` environment variable
+  3. ``~/.config/turnstone/config.toml`` (default)
 """
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,10 +24,33 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 CONFIG_DIR = Path("~/.config/turnstone").expanduser()
-CONFIG_PATH = CONFIG_DIR / "config.toml"
+_DEFAULT_CONFIG_PATH = CONFIG_DIR / "config.toml"
+
+# Resolved config path — set by set_config_path() or $TURNSTONE_CONFIG
+_config_path: Path | None = None
 
 # Cache: None = not loaded yet, {} = loaded but empty/missing
 _cache: dict[str, Any] | None = None
+
+
+def _resolve_config_path() -> Path:
+    """Return the effective config file path."""
+    if _config_path is not None:
+        return _config_path
+    env = os.environ.get("TURNSTONE_CONFIG", "").strip()
+    if env:
+        return Path(env).expanduser()
+    return _DEFAULT_CONFIG_PATH
+
+
+def set_config_path(path: str) -> None:
+    """Override the config file path.  Must be called before load_config().
+
+    Typically called from the ``--config`` CLI flag handler.
+    """
+    global _config_path, _cache
+    _config_path = Path(path).expanduser()
+    _cache = None  # invalidate cache so next load_config() re-reads
 
 
 def load_config(section: str | None = None) -> dict[str, Any]:
@@ -33,11 +62,12 @@ def load_config(section: str | None = None) -> dict[str, Any]:
     global _cache
     if _cache is None:
         _cache = {}
-        if CONFIG_PATH.is_file():
+        cfg_path = _resolve_config_path()
+        if cfg_path.is_file():
             try:
-                _cache = tomllib.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                _cache = tomllib.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception as exc:
-                log.warning("Failed to parse %s: %s", CONFIG_PATH, exc)
+                log.warning("Failed to parse %s: %s", cfg_path, exc)
     if section:
         result = _cache.get(section, {})
         return result if isinstance(result, dict) else {}
