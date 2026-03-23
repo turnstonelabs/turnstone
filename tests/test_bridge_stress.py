@@ -9,7 +9,8 @@ Races tested:
 2. Duplicate plan review on SSE reconnect (TOCTOU in _pending_plan_reviews)
 3. approve_set stale reference escape during concurrent update
 4. _running flag visibility across threads on shutdown
-5. Workstream closure during blocked pop_response
+5. Approval thread exits within bounded time after timeout
+6. Concurrent approval + workstream close leaves no orphaned state
 """
 
 from __future__ import annotations
@@ -47,6 +48,17 @@ def _approval_items(tool_name: str = "bash") -> list[dict]:
     return [{"func_name": tool_name, "needs_approval": True, "approval_label": tool_name}]
 
 
+def _wait_pending_clear(bridge: Bridge, key: str, attr: str, deadline_s: float = 3.0) -> bool:
+    """Poll until the pending entry is cleared or deadline expires."""
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        with bridge._lock:
+            if key not in getattr(bridge, attr):
+                return True
+        time.sleep(0.01)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Race 1: Duplicate approval on SSE reconnect
 # ---------------------------------------------------------------------------
@@ -67,7 +79,6 @@ class TestDuplicateApproval:
 
         for _ in range(ITERATIONS):
             bridge = _make_bridge()
-            # Make pop_response return immediately (approve)
             bridge._broker.pop_response.return_value = '{"type": "approve", "approved": true}'
             barrier = threading.Barrier(2, timeout=5)
 
@@ -85,9 +96,11 @@ class TestDuplicateApproval:
                 t2.start()
                 t1.join(timeout=5)
                 t2.join(timeout=5)
+                assert not t1.is_alive(), "Thread 1 hung"
+                assert not t2.is_alive(), "Thread 2 hung"
 
-                # Wait for spawned _wait_approval threads
-                time.sleep(0.15)
+                # Wait for spawned _wait_approval threads to finish
+                _wait_pending_clear(bridge, "ws-1", "_pending_approvals")
 
                 sent_count[mock_approve.call_count] += 1
 
@@ -107,9 +120,10 @@ class TestDuplicatePlanReview:
     Only one should create a pending entry."""
 
     @pytest.mark.xfail(
-        reason="Known race: _wait_plan pops _pending_plan_reviews before posting, "
-        "allowing a concurrent SSE reconnect to create a second pending entry. "
-        "Fix: defer pop until after HTTP post completes.",
+        reason="Known race: _wait_plan pops _pending_plan_reviews before posting "
+        "(intentionally, for the refinement loop), but a re-injected SSE event "
+        "during this window creates a second pending entry. "
+        "Fix: use a generation counter instead of presence check.",
         strict=False,
     )
     def test_no_duplicate_plan_reviews(self):
@@ -118,7 +132,7 @@ class TestDuplicatePlanReview:
         for _ in range(ITERATIONS):
             bridge = _make_bridge()
             bridge._broker.pop_response.return_value = (
-                '{"type": "plan_review", "feedback": "looks good"}'
+                '{"type": "plan_feedback", "feedback": "looks good"}'
             )
             barrier = threading.Barrier(2, timeout=5)
 
@@ -133,9 +147,11 @@ class TestDuplicatePlanReview:
                 t2.start()
                 t1.join(timeout=5)
                 t2.join(timeout=5)
+                assert not t1.is_alive(), "Thread 1 hung"
+                assert not t2.is_alive(), "Thread 2 hung"
 
                 # Wait for spawned _wait_plan threads to finish
-                time.sleep(0.15)
+                _wait_pending_clear(bridge, "ws-1", "_pending_plan_reviews")
 
                 sent_count[bridge._http.post.call_count] += 1
 
@@ -157,7 +173,6 @@ class TestApproveSetConsistency:
     def test_approve_set_never_partially_visible(self):
         for _ in range(ITERATIONS):
             bridge = _make_bridge()
-            # Pre-populate with some tools
             with bridge._lock:
                 bridge._ws_approve_tools["ws-1"] = {"read_file", "search"}
 
@@ -182,9 +197,10 @@ class TestApproveSetConsistency:
             t2.start()
             t1.join(timeout=5)
             t2.join(timeout=5)
+            assert not t1.is_alive(), "Reader hung"
+            assert not t2.is_alive(), "Writer hung"
 
             snap = results[0]
-            # snap should be either the old set or the new set — never partial
             assert snap in (
                 {"read_file", "search"},
                 {"read_file", "search", "bash", "write_file"},
@@ -215,11 +231,9 @@ class TestRunningFlagVisibility:
             threads_running.append(t)
             t.start()
 
-        # Let threads spin briefly
         time.sleep(0.01)
         bridge._running = False
 
-        # All threads should exit within 100ms
         for t in threads_running:
             t.join(timeout=1)
             assert not t.is_alive(), "Thread did not observe _running=False"
@@ -228,52 +242,30 @@ class TestRunningFlagVisibility:
 
 
 # ---------------------------------------------------------------------------
-# Race 5: Workstream closure during blocked pop_response
+# Race 5: Approval thread exits within bounded time
 # ---------------------------------------------------------------------------
 
 
-class TestClosureDuringBlockedPop:
-    """When a workstream is closed while an approval thread is blocked on
-    pop_response, the approval thread should not hang indefinitely."""
+class TestApprovalThreadTimeout:
+    """An approval thread blocked on pop_response should exit within the
+    configured approval_timeout, not hang indefinitely."""
 
-    def test_approval_thread_exits_after_ws_closure(self):
-        for _ in range(10):  # fewer iterations — each has a real delay
+    def test_approval_thread_exits_within_timeout(self):
+        for _ in range(10):
             bridge = _make_bridge(approval_timeout=0.5)
 
-            # pop_response blocks for the timeout then returns None
             def _slow_pop(queue_name, timeout=300):
                 time.sleep(min(timeout, 0.5))
                 return None
 
             bridge._broker.pop_response.side_effect = _slow_pop
 
-            # Set up a pending approval that will block
             with patch.object(bridge, "_publish_ws"), patch.object(bridge, "_api_approve"):
                 bridge._handle_approval("ws-1", {"items": _approval_items()})
 
-            # Give the approval thread time to start blocking
-            time.sleep(0.05)
-
-            # Close the workstream (simulates global SSE ws_closed event)
-            with bridge._lock:
-                bridge._ws_threads.pop("ws-1", None)
-                bridge._ws_auto_approve.pop("ws-1", None)
-                bridge._ws_approve_tools.pop("ws-1", None)
-                bridge._active_sends.pop("ws-1", None)
-
-            # The approval thread should finish within the timeout
-            # (0.5s) plus a small buffer — not hang for 3600s
-            deadline = time.monotonic() + 3.0
-            with bridge._lock:
-                still_pending = "ws-1" in bridge._pending_approvals
-
-            # Wait for the pending entry to be cleaned up
-            while still_pending and time.monotonic() < deadline:
-                time.sleep(0.1)
-                with bridge._lock:
-                    still_pending = "ws-1" in bridge._pending_approvals
-
-            assert not still_pending, "Approval thread hung after workstream closure"
+            # The pending entry should be cleaned up within the timeout
+            cleared = _wait_pending_clear(bridge, "ws-1", "_pending_approvals", deadline_s=3.0)
+            assert cleared, "Approval thread did not exit within expected timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +302,9 @@ class TestApprovalDuringClose:
             t2.start()
             t1.join(timeout=5)
             t2.join(timeout=5)
+            assert not t1.is_alive(), "Approval thread hung"
+            assert not t2.is_alive(), "Close thread hung"
 
-            # After both threads complete, pending_approvals should be clean
-            # (the finally block in _wait_approval always pops)
-            time.sleep(0.2)  # allow the spawned approval thread to finish
-            with bridge._lock:
-                assert "ws-1" not in bridge._pending_approvals, "Orphaned pending approval"
+            # Wait for spawned _wait_approval thread to finish
+            cleared = _wait_pending_clear(bridge, "ws-1", "_pending_approvals")
+            assert cleared, "Orphaned pending approval"
