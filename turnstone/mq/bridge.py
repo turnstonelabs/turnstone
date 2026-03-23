@@ -800,16 +800,26 @@ class Bridge:
         )
 
         def _wait_plan() -> None:
-            try:
-                raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
-                # Mark resolved instead of popping — the tombstone blocks
-                # stale SSE re-injections.  Cleanup happens on the next
-                # ws_state event, which arrives before any refinement-loop
-                # plan_review event can be emitted.
+            def _mark_resolved() -> None:
+                # Unlike _wait_approval (which uses finally), we mark
+                # resolved explicitly because it must happen BEFORE the
+                # HTTP POST — the refinement loop needs the tombstone
+                # in place while the server processes feedback.
                 with self._lock:
                     entry = self._pending_plan_reviews.get(ws_id)
                     if entry is not None and entry[0] == request_id:
                         self._pending_plan_reviews[ws_id] = (request_id, True)
+
+            try:
+                raw_resp = self._broker.pop_response(request_id, timeout=self._approval_timeout)
+                # Mark resolved instead of popping — the tombstone blocks
+                # stale SSE re-injections.  Cleanup happens on the next
+                # ws_state event (global SSE), which the server emits
+                # before starting the next LLM turn.  The refinement
+                # plan_review event (per-WS SSE) therefore arrives after
+                # cleanup, assuming global SSE is not delayed by more
+                # than one LLM turn.
+                _mark_resolved()
                 if raw_resp:
                     resp_msg = InboundMessage.from_json(raw_resp)
                     feedback = getattr(resp_msg, "feedback", "")
@@ -818,10 +828,7 @@ class Bridge:
                     log.warning("Plan review timeout for ws %s — rejecting", ws_id)
                     self._http.post("/v1/api/plan", json={"feedback": "reject", "ws_id": ws_id})
             except Exception:
-                with self._lock:
-                    entry = self._pending_plan_reviews.get(ws_id)
-                    if entry is not None and entry[0] == request_id:
-                        self._pending_plan_reviews[ws_id] = (request_id, True)
+                _mark_resolved()
                 # Best-effort rejection so the server doesn't hang
                 try:
                     self._http.post(

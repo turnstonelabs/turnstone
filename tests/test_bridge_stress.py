@@ -280,11 +280,11 @@ class TestApprovalDuringClose:
 
             def _close_ws(bridge=bridge, barrier=barrier):
                 barrier.wait()
-                with bridge._lock:
-                    bridge._ws_threads.pop("ws-1", None)
-                    bridge._ws_auto_approve.pop("ws-1", None)
-                    bridge._ws_approve_tools.pop("ws-1", None)
-                    bridge._pending_approvals.pop("ws-1", None)
+                with (
+                    patch.object(bridge, "_publish_global"),
+                    patch.object(bridge, "_publish_cluster"),
+                ):
+                    bridge._handle_global_event({"type": "ws_closed", "ws_id": "ws-1"})
 
             t1 = threading.Thread(target=_send_approval)
             t2 = threading.Thread(target=_close_ws)
@@ -299,3 +299,53 @@ class TestApprovalDuringClose:
             # didn't remove the entry first)
             resolved = _wait_pending_resolved(bridge, "ws-1", "_pending_approvals")
             assert resolved, "Orphaned pending approval"
+
+
+# ---------------------------------------------------------------------------
+# Race 7: Plan review refinement loop (tombstone → cleanup → re-entry)
+# ---------------------------------------------------------------------------
+
+
+class TestPlanReviewRefinementLoop:
+    """After a plan review is resolved, a ws_state event should clean up the
+    tombstone so the refinement-loop plan_review event is handled correctly."""
+
+    def test_refinement_loop_allows_reentry(self):
+        for _ in range(ITERATIONS):
+            bridge = _make_bridge()
+            bridge._broker.pop_response.return_value = (
+                '{"type": "plan_feedback", "feedback": "refine this"}'
+            )
+
+            # Step 1: first plan review — creates pending entry, resolves it
+            with patch.object(bridge, "_publish_ws"), patch.object(bridge._http, "post"):
+                bridge._handle_plan_review("ws-1", {"content": "plan v1"})
+
+            _wait_pending_resolved(bridge, "ws-1", "_pending_plan_reviews")
+
+            # Verify tombstone is present
+            with bridge._lock:
+                assert "ws-1" in bridge._pending_plan_reviews
+                assert bridge._pending_plan_reviews["ws-1"][1] is True
+
+            # Step 2: ws_state event cleans up the resolved tombstone
+            with (
+                patch.object(bridge, "_publish_ws"),
+                patch.object(bridge, "_publish_global"),
+                patch.object(bridge, "_publish_cluster"),
+            ):
+                bridge._handle_global_event(
+                    {"type": "ws_state", "ws_id": "ws-1", "state": "working"}
+                )
+
+            with bridge._lock:
+                assert "ws-1" not in bridge._pending_plan_reviews
+
+            # Step 3: refinement plan_review arrives — should create new entry
+            with patch.object(bridge, "_publish_ws"), patch.object(bridge._http, "post"):
+                bridge._handle_plan_review("ws-1", {"content": "plan v2"})
+
+            _wait_pending_resolved(bridge, "ws-1", "_pending_plan_reviews")
+
+            with bridge._lock:
+                assert "ws-1" in bridge._pending_plan_reviews
