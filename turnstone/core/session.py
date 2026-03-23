@@ -1046,7 +1046,8 @@ class ChatSession:
         Without tool search: return self._tools unchanged.
 
         Web search gating: ``web_search`` is removed when the model has
-        no native search support and no Tavily API key is configured.
+        no native search support and no search backend is available
+        (Tavily, DDG, or MCP — see ``_resolve_search_client``).
         """
         if self.creative_mode:
             return None
@@ -3823,7 +3824,7 @@ class ChatSession:
         # Gate web_search: remove when no backend exists for the agent model
         agent_alias = self._registry.agent_model if self._registry else None
         agent_caps = self._resolve_capabilities(agent_provider, agent_model, agent_alias)
-        if not agent_caps.supports_web_search and not get_tavily_key():
+        if not agent_caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
         # Build extra params for agent calls

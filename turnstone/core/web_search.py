@@ -65,7 +65,7 @@ class DuckDuckGoClient:
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
         from duckduckgo_search import DDGS  # type: ignore[import-not-found]
 
-        with DDGS() as ddgs:
+        with DDGS(timeout=int(self._timeout)) as ddgs:
             raw = list(ddgs.text(query, max_results=max_results))
         return _format_ddg(raw, query)
 
@@ -79,10 +79,15 @@ class MCPSearchClient:
         self._timeout = timeout
 
     def search(self, query: str, max_results: int = 5, **kwargs: Any) -> str:
+        import math
+
         args: dict[str, Any] = {"query": query}
         if max_results != 5:
             args["max_results"] = max_results
-        return self._mcp.call_tool_sync(self._tool, args, timeout=int(self._timeout))
+        topic = kwargs.get("topic")
+        if topic:
+            args["topic"] = topic
+        return self._mcp.call_tool_sync(self._tool, args, timeout=max(1, math.ceil(self._timeout)))
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +172,13 @@ def resolve_web_search_client(
                 return MCPSearchClient(mcp_client, prefixed, timeout=timeout)
         return None
 
-    # Auto-detect: Tavily > DDG > None
-    if tavily_key:
-        return TavilyClient(tavily_key, timeout=timeout)
-    if _ddg_available():
-        return DuckDuckGoClient(timeout=timeout)
+    if backend == "":
+        # Auto-detect: Tavily > DDG > None
+        if tavily_key:
+            return TavilyClient(tavily_key, timeout=timeout)
+        if _ddg_available():
+            return DuckDuckGoClient(timeout=timeout)
+        return None
+
+    log.warning("Unknown web_search_backend %r — web search disabled", backend)
     return None

@@ -83,18 +83,22 @@ class TestTavilyClient:
 
 
 class TestDuckDuckGoClient:
-    def test_search_calls_ddgs(self):
+    def test_integration_via_mock_ddgs(self):
+        """Patch the duckduckgo_search import inside DuckDuckGoClient.search."""
         mock_ddgs = MagicMock()
         mock_ddgs.__enter__ = MagicMock(return_value=mock_ddgs)
         mock_ddgs.__exit__ = MagicMock(return_value=False)
         mock_ddgs.text.return_value = [
-            {"title": "DDG", "href": "https://ddg.co", "body": "Search engine"},
+            {"title": "DDG Result", "href": "https://ddg.co", "body": "Found it"},
         ]
-        with patch("turnstone.core.web_search.DuckDuckGoClient.search") as mock_search:
-            mock_search.return_value = "[DDG](https://ddg.co)\n   Search engine"
+        mock_module = MagicMock()
+        mock_module.DDGS.return_value = mock_ddgs
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_module}):
             client = DuckDuckGoClient(timeout=10)
-            result = client.search("test query")
-        assert "DDG" in result
+            result = client.search("test query", max_results=3)
+        mock_ddgs.text.assert_called_once_with("test query", max_results=3)
+        assert "[DDG Result](https://ddg.co)" in result
+        assert "Found it" in result
 
 
 class TestMCPSearchClient:
@@ -102,9 +106,11 @@ class TestMCPSearchClient:
         mcp = MagicMock()
         mcp.call_tool_sync.return_value = "MCP search results"
         client = MCPSearchClient(mcp, "mcp__ddg__search", timeout=30)
-        result = client.search("test", max_results=3)
+        result = client.search("test", max_results=3, topic="news")
         mcp.call_tool_sync.assert_called_once_with(
-            "mcp__ddg__search", {"query": "test", "max_results": 3}, timeout=30
+            "mcp__ddg__search",
+            {"query": "test", "max_results": 3, "topic": "news"},
+            timeout=30,
         )
         assert result == "MCP search results"
 
@@ -162,4 +168,8 @@ class TestResolveClient:
 
     def test_mcp_backend_no_client(self):
         client = resolve_web_search_client("mcp:ddg:search", tavily_key=None, mcp_client=None)
+        assert client is None
+
+    def test_unknown_backend_returns_none(self):
+        client = resolve_web_search_client("typo_backend", tavily_key="key")
         assert client is None
