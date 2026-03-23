@@ -226,7 +226,9 @@ class MCPClientManager:
                     log.warning("MCP server '%s' has no command configured", name)
                     await stack.aclose()
                     return
-                env = {**os.environ, **cfg.get("env", {})}
+                from turnstone.core.env import scrubbed_env
+
+                env = scrubbed_env(extra=cfg.get("env", {}))
                 params = StdioServerParameters(
                     command=command,
                     args=cfg.get("args", []),

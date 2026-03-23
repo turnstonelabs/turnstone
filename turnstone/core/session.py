@@ -3548,12 +3548,15 @@ class ChatSession:
                 f.write(command)
                 script_path = f.name
             try:
+                from turnstone.core.env import scrubbed_env
+
                 proc = subprocess.Popen(
                     ["bash", script_path],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
                     start_new_session=True,
+                    env=scrubbed_env(),
                 )
                 # Drain stderr in background thread to avoid pipe deadlock
                 stderr_lines: list[str] = []
@@ -3742,6 +3745,8 @@ class ChatSession:
         call_id = item["call_id"]
         pattern, path = item["pattern"], item["path"]
         try:
+            from turnstone.core.env import scrubbed_env
+
             result = subprocess.run(
                 [
                     "grep",
@@ -3758,6 +3763,7 @@ class ChatSession:
                 capture_output=True,
                 text=True,
                 timeout=self.tool_timeout,
+                env=scrubbed_env(),
             )
             output = result.stdout.strip()
             if result.returncode == 1:
@@ -4914,12 +4920,14 @@ class ChatSession:
 
         text = ""
         try:
+            from turnstone.core.env import scrubbed_env
+
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 timeout=10,
-                env={**os.environ, "MANWIDTH": "80", "MAN_KEEP_FORMATTING": "0"},
+                env=scrubbed_env(extra={"MANWIDTH": "80", "MAN_KEEP_FORMATTING": "0"}),
             )
             if result.returncode == 0 and result.stdout.strip():
                 # Strip formatting: backspace overstrikes and ANSI escapes
@@ -4932,6 +4940,7 @@ class ChatSession:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    env=scrubbed_env(),
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     text = result.stdout

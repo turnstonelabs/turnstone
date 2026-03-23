@@ -392,6 +392,8 @@ class WatchRunner:
 
     def _run_command(self, command: str) -> tuple[str, int]:
         """Run a shell command and return (stdout, exit_code)."""
+        from turnstone.core.env import scrubbed_env
+
         try:
             proc = subprocess.run(
                 command,
@@ -400,6 +402,7 @@ class WatchRunner:
                 text=True,
                 timeout=self._tool_timeout,
                 start_new_session=True,
+                env=scrubbed_env(),
             )
             output = proc.stdout
             if proc.stderr:
