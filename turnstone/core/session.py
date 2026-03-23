@@ -2803,7 +2803,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": (
                     "Error: No web search backend available. "
-                    "Install duckduckgo-search (`pip install duckduckgo-search`), "
+                    "Install the ddg extra (`pip install turnstone[ddg]`), "
                     "configure a Tavily API key, or set tools.web_search_backend."
                 ),
             }

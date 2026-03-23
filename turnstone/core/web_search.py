@@ -3,7 +3,7 @@
 ``web_search`` is an abstract capability with swappable clients:
 
 * **TavilyClient** — paid, high quality, requires API key
-* **DuckDuckGoClient** — free, no API key, uses ``duckduckgo-search``
+* **DuckDuckGoClient** — free, no API key, uses ``ddgs``
 
 Auto-detection (default): Tavily if key present, else DDG if installed,
 else ``None`` (tool removed from tool list).

@@ -84,7 +84,7 @@ class TestTavilyClient:
 
 class TestDuckDuckGoClient:
     def test_integration_via_mock_ddgs(self):
-        """Patch the duckduckgo_search import inside DuckDuckGoClient.search."""
+        """Patch the ddgs import inside DuckDuckGoClient.search."""
         mock_ddgs = MagicMock()
         mock_ddgs.__enter__ = MagicMock(return_value=mock_ddgs)
         mock_ddgs.__exit__ = MagicMock(return_value=False)
