@@ -423,6 +423,7 @@ class Bridge:
             model=model,
             resume_ws=resume_ws,
             skill=skill,
+            user_id=user_id,
         )
         # Send initial_message only when no workstream was actually resumed.
         # Use the server's `resumed` response (not just the intent) so that
@@ -491,6 +492,7 @@ class Bridge:
         model: str = "",
         resume_ws: str = "",
         skill: str = "",
+        user_id: str = "",
     ) -> tuple[str, bool]:
         """Create a workstream on the server.  Returns (ws_id, resumed)."""
         try:
@@ -501,6 +503,8 @@ class Bridge:
                 payload["resume_ws"] = resume_ws
             if skill:
                 payload["skill"] = skill
+            if user_id:
+                payload["user_id"] = user_id
             resp = self._http.post(
                 "/v1/api/workstreams/new",
                 json=payload,
