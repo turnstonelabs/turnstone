@@ -776,6 +776,7 @@ def _run_iteration_parallel(
     context_window: int,
     test_timeout: int,
     parallel: int,
+    prompt_variants: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Run all test cases in parallel using ProcessPoolExecutor."""
     # Build work items for every (case, run) combination
@@ -783,14 +784,20 @@ def _run_iteration_parallel(
     for case in cases:
         case_id = case["id"]
         case_n = case.get("n_runs", n_runs)
+        variants = (prompt_variants or {}).get(case_id)
         for run_idx in range(case_n):
+            # Select prompt variant for this run (cycle through variants)
+            if variants and len(variants) > 1:
+                run_case = {**case, "user_prompt": variants[run_idx % len(variants)]}
+            else:
+                run_case = case
             work_items.append(
                 {
                     "base_url": base_url,
                     "api_key": api_key,
                     "model": model,
                     "system_prompt": system_prompt,
-                    "case": case,
+                    "case": run_case,
                     "case_id": case_id,
                     "run_idx": run_idx,
                     "temperature": temperature,
@@ -917,6 +924,7 @@ def _run_iteration(
     parallel: int = 1,
     base_url: str = "",
     api_key: str = "",
+    prompt_variants: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Run all test cases n_runs times and score them."""
     if parallel > 1 and base_url:
@@ -933,6 +941,7 @@ def _run_iteration(
             context_window=context_window,
             test_timeout=test_timeout,
             parallel=parallel,
+            prompt_variants=prompt_variants,
         )
 
     case_results: dict[str, Any] = {}
@@ -956,12 +965,25 @@ def _run_iteration(
             log_prefix = f"      [{run_idx + 1}/{case_n}]"
             run_tokens = 0
 
+            # Select prompt variant for this run (cycle through variants)
+            variants = (prompt_variants or {}).get(case_id)
+            if variants and len(variants) > 1:
+                variant_idx = run_idx % len(variants)
+                run_case = {**case, "user_prompt": variants[variant_idx]}
+                if verbose:
+                    _log(
+                        f"{log_prefix}  variant {variant_idx}: {variants[variant_idx][:80]}...",
+                        dim=True,
+                    )
+            else:
+                run_case = case
+
             try:
                 run_result = _run_single_test(
                     client=client,
                     model=model,
                     system_prompt=system_prompt,
-                    case=case,
+                    case=run_case,
                     temperature=temperature,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
@@ -980,6 +1002,8 @@ def _run_iteration(
                 score_result["tool_sequence"] = [t["tool"] for t in run_result["tool_log"]]
                 score_result["tool_args"] = [{t["tool"]: t["args"]} for t in run_result["tool_log"]]
                 score_result["elapsed"] = run_result.get("elapsed", 0)
+                if run_case is not case:
+                    score_result["prompt_variant"] = run_case["user_prompt"]
                 run_tokens = sum(run_result.get("usage", {}).values())
 
                 # Detect JSON dumped into final channel (tool call not made)
@@ -1092,6 +1116,97 @@ def _run_iteration(
 # ─── Prompt optimizer ────────────────────────────────────────────────────────
 
 
+DIVERSIFIER_SYSTEM = """\
+You generate paraphrased variations of user prompts for a tool-use \
+evaluation harness. Each variation must preserve the EXACT SAME INTENT \
+— the same task, same expected outcome, same level of specificity — \
+but use different phrasing, vocabulary, sentence structure, or tone.
+
+Rules:
+- Preserve the core action the user is asking for. If the original \
+says "fix the typo in config.py", all variants must ask to fix a \
+typo in config.py.
+- Vary along these dimensions: formality (casual ↔ formal), \
+directness (imperative ↔ descriptive), verbosity (terse ↔ detailed), \
+framing (command ↔ question ↔ description of need).
+- Do NOT change the expected tool behavior. If the original implies \
+using bash, the variant must also imply bash.
+- Do NOT add new requirements, constraints, or context not in the \
+original.
+- Each variant should be a single message, roughly similar length \
+to the original.
+
+Output a JSON array of strings, one per variant. No commentary, \
+no markdown fences, just the JSON array.\
+"""
+
+
+ANALYST_SYSTEM = """\
+You are a test failure analyst for an LLM tool-use evaluation harness. \
+You receive test results showing how a coding assistant performed \
+against expected tool call sequences.
+
+Your job: identify SEMANTIC PATTERNS across failures and successes — \
+not just what failed, but WHY, and what the failures have in common.
+
+You have access to `math` (Python with numpy/scipy/collections) and \
+`bash` tools. Use them to compute statistics, build confusion matrices, \
+analyze tool co-occurrence, or quantify patterns — don't just eyeball \
+the data.
+
+## Analysis Framework
+
+### 1. Failure Mode Patterns
+Look across all failing runs and identify shared root causes:
+- Does the model treat certain phrasings as conversation vs action?
+- Are there tool confusion pairs (e.g., always picks write_file over edit_file)?
+- Do failures cluster around implicit vs explicit instructions?
+- Are there complexity thresholds where the model breaks down?
+
+### 2. Success/Failure Contrast
+Compare passing and failing cases to isolate what makes the difference:
+- What do passing prompts have that failing ones lack?
+- Do passing cases use action verbs while failing ones describe goals?
+- Is there a pattern in prompt length, specificity, or structure?
+
+### 3. Consistency Signals
+For each failing case, classify:
+- Systematic (0% pass): the prompt is fundamentally missing an instruction
+- Flaky (1-79% pass): the prompt is ambiguous — wording nudge needed
+- Marginal (80-99%): minor edge case — low priority
+
+### 4. Actionable Diagnosis
+For each pattern found, state:
+- What the model is doing wrong (observed behavior)
+- Why it's doing it (root cause hypothesis)
+- What prompt change would fix it (specific, concrete)
+
+## Output Format
+
+```
+## Failure Patterns
+- [Pattern 1]: [which cases] — [observed behavior] because [root cause]
+- [Pattern 2]: ...
+
+## Success/Failure Contrast
+[What distinguishes passing from failing cases]
+
+## Consistency
+- Systematic: [case_ids] — [what's missing]
+- Flaky: [case_ids] — [what's ambiguous]
+- Marginal: [case_ids] — [edge case description]
+
+## Recommended Fixes (priority order)
+1. [Highest impact fix]: addresses [N] cases — [specific instruction to add/change]
+2. [Next fix]: ...
+```
+
+Be concise. Focus on patterns, not individual case narratives. \
+The optimizer that reads your output needs actionable signal, \
+not lengthy explanations.\
+"""
+
+
 OPTIMIZER_SYSTEM = """\
 You are a prompt optimizer. You receive a developer prompt (instructions \
 for a coding assistant on how to use its tools) and test results \
@@ -1117,18 +1232,11 @@ WHAT YOU CANNOT CHANGE:
 - The overall structure (system prompt for a coding assistant).
 - Phrasing tied to 100% pass rate cases.
 
-FAILURE MODE DIAGNOSIS:
-- If the assistant responded with only text (no tool call) → add a \
-rule: "ALWAYS call a tool. Never respond with only text."
-- If write_file was used instead of edit_file for a small change → add: \
-"Use edit_file for modifying existing files. Only use write_file for \
-new files."
-- If create_plan() was not called for a complex task → add: "When asked to \
-think through a problem, call create_plan(goal='...')."
-- If the assistant searched for a file before creating it → add: \
-"When told to create a new file, use write_file directly."
-- If the tool sequence is correct but arguments are wrong → adjust \
-the example arguments, not the tool selection logic.
+FAILURE ANALYSIS: The input includes a "Failure Analysis" section \
+produced by a separate analyst agent. It identifies semantic patterns \
+across failures, contrasts them with successes, and recommends specific \
+fixes in priority order. Use this to guide your edits — address the \
+highest-priority patterns first.
 
 STYLE: direct imperative sentences. One instruction per line. \
 Concrete tool call examples where helpful.
@@ -1186,6 +1294,130 @@ guidance that isn't working. Stay under 150% of the input length.
 
 Output ONLY the modified optimizer instructions.\
 """
+
+
+def _diversify_prompts(
+    client: Any,
+    model: str,
+    cases: list[dict[str, Any]],
+    n_variants: int,
+    provider: LLMProvider | None = None,
+) -> dict[str, list[str]]:
+    """Generate paraphrased prompt variants for each test case.
+
+    Returns {case_id: [variant1, variant2, ...]}. The original
+    user_prompt is always included as the first variant.
+    """
+    prov = provider or create_provider("openai")
+    result: dict[str, list[str]] = {}
+
+    for ci, case in enumerate(cases):
+        cid = case["id"]
+        original = case["user_prompt"]
+
+        if n_variants <= 1:
+            result[cid] = [original]
+            continue
+
+        # Use cached variants if present in the test case
+        cached = case.get("user_prompts")
+        if cached and isinstance(cached, list) and len(cached) >= n_variants:
+            result[cid] = cached[:n_variants]
+            print(
+                f"  {DIM}[{ci + 1}/{len(cases)}] {cid}...{RESET}"
+                f" {CYAN}{len(result[cid])} cached{RESET}"
+            )
+            continue
+
+        # Partial cache: keep existing variants, only generate the delta
+        existing: list[str] = []
+        if cached and isinstance(cached, list):
+            existing = cached
+
+        needed = n_variants - max(len(existing), 1)  # original is always slot 0
+        if needed <= 0:
+            result[cid] = (existing or [original])[:n_variants]
+            print(
+                f"  {DIM}[{ci + 1}/{len(cases)}] {cid}...{RESET}"
+                f" {CYAN}{len(result[cid])} cached{RESET}"
+            )
+            continue
+
+        print(f"  {DIM}[{ci + 1}/{len(cases)}] {cid}...{RESET}", end="", flush=True)
+        # Generate only the missing variants
+        existing_json = json.dumps(existing[1:]) if len(existing) > 1 else "[]"
+        user_content = f"Original prompt: {json.dumps(original)}\n\n"
+        if len(existing) > 1:
+            user_content += f"Existing variations (do NOT repeat these): {existing_json}\n\n"
+        user_content += (
+            f"Generate {needed} new paraphrased variations of the original prompt. "
+            f"Output a JSON array of {needed} strings."
+        )
+
+        try:
+            cr = prov.create_completion(
+                client=client,
+                model=model,
+                messages=[
+                    {"role": "system", "content": DIVERSIFIER_SYSTEM},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=2048,
+                temperature=0.8,
+                reasoning_effort="low",
+            )
+            raw = (cr.content or "").strip()
+            # Strip reasoning tags
+            raw = re.sub(
+                r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
+                "",
+                raw,
+                flags=re.DOTALL,
+            ).strip()
+            # Strip markdown fences
+            fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
+            if fence_match:
+                raw = fence_match.group(1).strip()
+
+            new_variants = json.loads(raw)
+            if isinstance(new_variants, list) and all(isinstance(v, str) for v in new_variants):
+                # Merge existing + new, then deduplicate
+                base = existing if existing else [original]
+                seen: set[str] = {v.strip().lower() for v in base}
+                unique: list[str] = list(base)
+                dupes = 0
+                for v in new_variants[:needed]:
+                    key = v.strip().lower()
+                    if key in seen:
+                        dupes += 1
+                    else:
+                        seen.add(key)
+                        unique.append(v)
+                result[cid] = unique
+                dupe_note = f", {dupes} dupes removed" if dupes else ""
+                short_note = (
+                    f" {YELLOW}(< {n_variants} requested, will cycle){RESET}"
+                    if len(unique) < n_variants
+                    else ""
+                )
+                print(f" {GREEN}{len(unique)} unique{dupe_note}{RESET}{short_note}")
+            else:
+                result[cid] = [original]
+                print(f" {YELLOW}parse error, using original{RESET}")
+        except Exception as e:
+            _log(f"\n  Diversifier failed for {cid}: {e}", dim=True)
+            result[cid] = [original]
+
+    # Summary statistics
+    total_variants = sum(len(v) for v in result.values())
+    cases_with_variants = sum(1 for v in result.values() if len(v) > 1)
+    avg_variants = total_variants / len(result) if result else 0
+    print(
+        f"  {total_variants} total variants across {cases_with_variants} cases"
+        f" (avg {avg_variants:.1f}/case)"
+    )
+
+    return result
 
 
 def _observe_and_update_optimizer(
@@ -1303,6 +1535,310 @@ def _observe_and_update_optimizer(
     return result
 
 
+def _classify_failure(
+    run: dict[str, Any],
+    expected_actions: list[dict[str, Any]],
+) -> str:
+    """Classify a failed run into a failure mode bucket."""
+    tools = run.get("tool_sequence", [])
+    if run.get("json_dump"):
+        return "json_dump"
+    if not tools:
+        return "no_tool_call"
+    detail = run.get("detail", "")
+    if "timed out" in detail.lower():
+        return "timeout"
+    if detail.startswith("Error:"):
+        return "error"
+
+    unmatched = run.get("unmatched", [])
+    extra = run.get("extra_tools", [])
+    matched = run.get("matched", [])
+
+    if not unmatched and extra:
+        return "extra_tools"
+
+    # Check for tool substitution — expected one tool, got a different one
+    expected_names = {expected_actions[i]["tool"] for i in unmatched if i < len(expected_actions)}
+    actual_names = set(tools)
+    if expected_names and not expected_names & actual_names:
+        return "wrong_tool"
+
+    # Check if right tools were called but args didn't match
+    if matched and unmatched:
+        unmatched_expected = {
+            expected_actions[i]["tool"] for i in unmatched if i < len(expected_actions)
+        }
+        if unmatched_expected & actual_names:
+            return "wrong_args"
+
+    return "missing_tool"
+
+
+def _build_failure_analysis(
+    iteration_result: dict[str, Any],
+    test_cases: list[dict[str, Any]],
+) -> str:
+    """Build a semantic failure analysis summary across all cases."""
+    # Classify every failed run
+    mode_cases: dict[str, list[str]] = {}  # mode -> [case_id, ...]
+    mode_details: dict[str, list[str]] = {}  # mode -> [detail strings]
+    consistency: dict[str, str] = {}  # case_id -> systematic|flaky|marginal
+
+    for case_id, case_result in iteration_result["cases"].items():
+        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        expected = case_def.get("expected_actions", []) if case_def else []
+        pr = case_result["pass_rate"]
+
+        if pr == 1.0:
+            continue
+
+        # Consistency classification
+        if pr == 0:
+            consistency[case_id] = "systematic"
+        elif pr < 0.8:
+            consistency[case_id] = "flaky"
+        else:
+            consistency[case_id] = "marginal"
+
+        for run in case_result["runs"]:
+            if run.get("pass"):
+                continue
+            mode = _classify_failure(run, expected)
+            mode_cases.setdefault(mode, [])
+            if case_id not in mode_cases[mode]:
+                mode_cases[mode].append(case_id)
+
+            # Build a detail string for tool substitution cases
+            if mode == "wrong_tool":
+                expected_names = [
+                    expected[i]["tool"] for i in run.get("unmatched", []) if i < len(expected)
+                ]
+                actual = run.get("tool_sequence", [])
+                detail = f"{case_id}: expected {expected_names}, got {actual}"
+                mode_details.setdefault(mode, []).append(detail)
+
+    if not mode_cases:
+        return ""
+
+    # Build the summary
+    lines: list[str] = []
+
+    # Failure mode summary
+    mode_labels = {
+        "no_tool_call": "Text-only response (no tool call made)",
+        "wrong_tool": "Wrong tool selected",
+        "missing_tool": "Missing required tool in sequence",
+        "wrong_args": "Right tool, wrong arguments",
+        "extra_tools": "Correct sequence but unnecessary extra calls",
+        "timeout": "Timed out",
+        "error": "Tool execution error",
+        "json_dump": "Tool call emitted as JSON text instead of function call",
+    }
+    for mode, cases in sorted(mode_cases.items(), key=lambda x: -len(x[1])):
+        label = mode_labels.get(mode, mode)
+        lines.append(f"- {label}: {', '.join(cases)}")
+        for detail in (mode_details.get(mode, []))[:3]:
+            lines.append(f"    {detail}")
+
+    # Consistency summary
+    systematic = [c for c, v in consistency.items() if v == "systematic"]
+    flaky = [c for c, v in consistency.items() if v == "flaky"]
+    marginal = [c for c, v in consistency.items() if v == "marginal"]
+
+    if systematic or flaky or marginal:
+        lines.append("")
+        if systematic:
+            lines.append(
+                f"Systematic failures (always fail, need new instruction): {', '.join(systematic)}"
+            )
+        if flaky:
+            lines.append(
+                f"Flaky failures (sometimes pass, prompt is ambiguous): {', '.join(flaky)}"
+            )
+        if marginal:
+            lines.append(f"Marginal failures (mostly pass, minor edge case): {', '.join(marginal)}")
+
+    return "\n".join(lines)
+
+
+_ANALYST_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "math",
+            "description": (
+                "Execute Python code for analysis. Available: numpy, scipy, "
+                "collections, itertools, math, json, re. Use print() for output. "
+                "Example: print(numpy.mean([0.8, 0.6, 1.0]))"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python code to execute."},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a bash command. Use for jq, awk, sort, uniq, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Bash command to execute."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+]
+
+
+def _exec_analyst_tool(name: str, arguments: str) -> str:
+    """Execute a tool call from the analyst agent."""
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError:
+        return f"Invalid JSON arguments: {arguments[:200]}"
+
+    if name == "math":
+        from turnstone.core.sandbox import execute_math_sandboxed
+
+        output, is_error = execute_math_sandboxed(args.get("code", ""), timeout=15.0)
+        return output[:4000]
+    elif name == "bash":
+        import subprocess
+
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", args.get("command", "")],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            output = proc.stdout + proc.stderr
+            return output[:4000] or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out after 15s"
+    return f"Unknown tool: {name}"
+
+
+def _run_analyst(
+    client: Any,
+    model: str,
+    test_cases: list[dict[str, Any]],
+    iteration_result: dict[str, Any],
+    provider: LLMProvider | None = None,
+) -> str:
+    """Run the analyst agent to produce a semantic failure analysis.
+
+    Multi-turn agent with math and bash tools for computing statistics.
+    Phase 1 of the two-phase optimization: analyst diagnoses patterns,
+    then optimizer uses the diagnosis to modify the prompt.
+    """
+    # Build structured input: per-case results with rule-based pre-analysis
+    case_parts: list[str] = []
+    for case_id, case_result in iteration_result["cases"].items():
+        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        if not case_def:
+            continue
+        pr = case_result["pass_rate"]
+        status = "PASS" if pr == 1.0 else "WEAK" if pr >= 0.5 else "FAIL"
+
+        part = (
+            f"[{status}] {case_id} (pass_rate={pr:.0%})\n"
+            f"  User prompt: {case_def['user_prompt']}\n"
+            f"  Expected tools: {json.dumps(case_def.get('expected_actions', []))}\n"
+            f"  Actual sequences: "
+            f"{[r.get('tool_sequence', []) for r in case_result['runs']]}"
+        )
+
+        # Add per-run failure classifications
+        expected = case_def.get("expected_actions", [])
+        failed_runs = [r for r in case_result["runs"] if not r.get("pass")]
+        if failed_runs:
+            modes = [_classify_failure(r, expected) for r in failed_runs]
+            part += f"\n  Failure modes: {modes}"
+
+        case_parts.append(part)
+
+    # Include rule-based pre-analysis as a starting point
+    rule_analysis = _build_failure_analysis(iteration_result, test_cases)
+
+    user_content = "## Test Results\n" + "\n\n".join(case_parts)
+    if rule_analysis:
+        user_content += f"\n\n## Rule-Based Pre-Analysis\n{rule_analysis}"
+    user_content += (
+        "\n\nAnalyze the semantic patterns across these results. "
+        "Focus on WHY failures happen and what passing cases have in common. "
+        "Use the math or bash tools if you need to compute statistics, "
+        "build confusion matrices, or analyze distributions."
+    )
+
+    prov = provider or create_provider("openai")
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": ANALYST_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Multi-turn loop: let the analyst call tools up to 5 rounds
+    max_turns = 5
+    for _turn in range(max_turns):
+        cr = prov.create_completion(
+            client=client,
+            model=model,
+            messages=messages,
+            tools=_ANALYST_TOOLS,
+            max_tokens=4096,
+            temperature=0.3,
+            reasoning_effort="medium",
+        )
+
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "content": cr.content or None,
+        }
+        if cr.tool_calls:
+            assistant_msg["tool_calls"] = cr.tool_calls[:5]
+        messages.append(assistant_msg)
+
+        if not cr.tool_calls:
+            break
+
+        # Execute tool calls
+        for tc in assistant_msg["tool_calls"]:
+            func_name = tc["function"]["name"]
+            output = _exec_analyst_tool(func_name, tc["function"]["arguments"])
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": output,
+                }
+            )
+
+    # Extract final text response
+    result = ""
+    for msg in reversed(messages):
+        if msg["role"] == "assistant" and msg.get("content"):
+            result = msg["content"]
+            break
+
+    # Strip reasoning tags if present
+    result = re.sub(
+        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>",
+        "",
+        result,
+        flags=re.DOTALL,
+    ).strip()
+
+    return result
+
+
 def _propose_prompt_modification(
     client: Any,
     model: str,
@@ -1313,6 +1849,7 @@ def _propose_prompt_modification(
     optimizer_system: str = OPTIMIZER_SYSTEM,
     provider: LLMProvider | None = None,
     parent_scores: dict[str, float] | None = None,
+    analyst_output: str = "",
 ) -> str:
     """Use the model to propose a new prompt based on evaluation results."""
     # Build summary of results
@@ -1364,6 +1901,11 @@ def _propose_prompt_modification(
             + "\n\n".join(failing)
             + "\n\n"
         )
+
+    # Failure analysis from analyst agent (phase 1)
+    if analyst_output:
+        user_content += f"## Failure Analysis (from analyst)\n{analyst_output}\n\n"
+
     user_content += (
         f"## Score History\n{history_text}\n\n"
         "Make the MINIMUM change needed to fix failing tests without "
@@ -1555,11 +2097,25 @@ def _print_summary_table(iter_result: dict[str, Any]) -> None:
     )
 
 
-def _append_summary_tsv(path: str, iter_result: dict[str, Any], case_ids: list[str]) -> None:
+def _append_summary_tsv(
+    path: str,
+    iter_result: dict[str, Any],
+    case_ids: list[str],
+    cumulative_tokens: int = 0,
+    node_score: float = 0.0,
+) -> None:
     """Append one row per iteration to a TSV summary file."""
     write_header = not os.path.exists(path) or os.path.getsize(path) == 0
     agg = iter_result.get("aggregate", {})
     per_case = agg.get("per_case_pass_rates", {})
+
+    # Compute iteration elapsed from individual run times
+    iter_elapsed = sum(
+        r.get("elapsed", 0)
+        for cr in iter_result.get("cases", {}).values()
+        for r in cr.get("runs", [])
+    )
+    prompt_len = len(iter_result.get("prompt", ""))
 
     with open(path, "a") as f:
         if write_header:
@@ -1571,18 +2127,28 @@ def _append_summary_tsv(path: str, iter_result: dict[str, Any], case_ids: list[s
                 "runs",
                 "json_dumps",
                 "tree_node",
+                "node_score",
+                "elapsed_s",
+                "prompt_len",
+                "iter_tokens",
+                "cumul_tokens",
             ] + [f"case:{cid}" for cid in case_ids]
             f.write("\t".join(cols) + "\n")
 
         vals = [
             str(iter_result.get("iteration", "")),
             iter_result.get("timestamp", ""),
-            f"{agg.get('overall_pass_rate', 0):.2f}",
-            f"{agg.get('overall_avg_score', 0):.2f}",
+            f"{agg.get('overall_pass_rate', 0):.4f}",
+            f"{agg.get('overall_avg_score', 0):.4f}",
             str(agg.get("total_runs", 0)),
             str(agg.get("json_dumps", 0)),
             str(iter_result.get("tree_node_id", "")),
-        ] + [f"{per_case.get(cid, 0):.2f}" for cid in case_ids]
+            f"{node_score:.4f}",
+            f"{iter_elapsed:.1f}",
+            str(prompt_len),
+            str(agg.get("total_tokens", 0)),
+            str(cumulative_tokens),
+        ] + [f"{per_case.get(cid, 0):.4f}" for cid in case_ids]
         f.write("\t".join(vals) + "\n")
 
 
@@ -1610,6 +2176,12 @@ def run_optimization(
     optimizer_model: str | None = None,
     observer_base_url: str | None = None,
     observer_model: str | None = None,
+    analyst_base_url: str | None = None,
+    analyst_model: str | None = None,
+    diversifier_base_url: str | None = None,
+    diversifier_model: str | None = None,
+    diversify: int = 0,
+    save_variants: bool = False,
     explore_constant: float = 1.414,
 ) -> dict[str, Any]:
     """Main optimization loop with UCB tree search.
@@ -1658,11 +2230,33 @@ def run_optimization(
     obs_key = os.environ.get(obs_key_env, opt_key)
     obs_client, obs_provider = _make_client_and_provider(obs_base, obs_key)
 
-    # Log role assignments if any differ from the test model
-    if opt_model != model or opt_base != base_url:
-        _log(f"  Optimizer: {opt_model} @ {opt_base}", dim=True)
+    # --- Analyst model (inherits from optimizer if not specified) ---
+    ana_base = analyst_base_url or opt_base
+    ana_model = analyst_model or opt_model
+    ana_key_env = (
+        "ANTHROPIC_API_KEY" if _detect_provider(ana_base) == "anthropic" else "OPENAI_API_KEY"
+    )
+    ana_key = os.environ.get(ana_key_env, opt_key)
+    ana_client, ana_provider = _make_client_and_provider(ana_base, ana_key)
+
+    # --- Diversifier model (inherits from optimizer if not specified) ---
+    div_base = diversifier_base_url or opt_base
+    div_model = diversifier_model or opt_model
+    div_key_env = (
+        "ANTHROPIC_API_KEY" if _detect_provider(div_base) == "anthropic" else "OPENAI_API_KEY"
+    )
+    div_key = os.environ.get(div_key_env, opt_key)
+    div_client, div_provider = _make_client_and_provider(div_base, div_key)
+
+    # Log role assignments
+    _log(f"  Test model:  {model} @ {base_url}", dim=True)
+    _log(f"  Optimizer:   {opt_model} @ {opt_base}", dim=True)
     if obs_model != opt_model or obs_base != opt_base:
-        _log(f"  Observer:  {obs_model} @ {obs_base}", dim=True)
+        _log(f"  Observer:    {obs_model} @ {obs_base}", dim=True)
+    if ana_model != opt_model or ana_base != opt_base:
+        _log(f"  Analyst:     {ana_model} @ {ana_base}", dim=True)
+    if diversify > 0 and (div_model != opt_model or div_base != opt_base):
+        _log(f"  Diversifier: {div_model} @ {div_base}", dim=True)
 
     # Load test cases
     with open(test_file) as f:
@@ -1678,6 +2272,12 @@ def run_optimization(
     # Precedence: CLI arg (non-None) > tests.json defaults > code default (3)
     resolved_n_runs: int = n_runs if n_runs is not None else int(defaults.get("n_runs", 3))
 
+    total_runs = sum(c.get("n_runs", resolved_n_runs) for c in cases)
+    print(
+        f"  {len(cases)} cases, {resolved_n_runs} runs/case ({total_runs} total), "
+        f"max {max_iterations} iterations"
+    )
+
     # Holdout split — holdout cases are evaluated but excluded from optimizer feedback
     holdout_ids: set[str] = {c["id"] for c in cases if c.get("holdout", False)}
     training_count = len(cases) - len(holdout_ids)
@@ -1687,6 +2287,11 @@ def run_optimization(
             dim=True,
         )
         holdout_ids = set()
+    elif holdout_ids:
+        _log(
+            f"  Holdout: {len(holdout_ids)} cases ({', '.join(sorted(holdout_ids))})",
+            dim=True,
+        )
 
     # Get initial prompt
     if initial_prompt is None:
@@ -1731,6 +2336,8 @@ def run_optimization(
             "optimizer_base_url": opt_base,
             "observer_model": obs_model,
             "observer_base_url": obs_base,
+            "analyst_model": ana_model,
+            "analyst_base_url": ana_base,
             "started": datetime.now().isoformat(),
             "test_suite": test_file,
             "n_runs_default": resolved_n_runs,
@@ -1744,6 +2351,52 @@ def run_optimization(
     tsv_path = os.path.splitext(output_file)[0] + ".tsv"
     case_ids = [c["id"] for c in cases]
 
+    # Diversify prompts — generate paraphrased variants before the loop
+    # Auto-detect: if any case has cached user_prompts, use them even without --diversify
+    prompt_variants: dict[str, list[str]] | None = None
+    if diversify == 0:
+        cached_variants = {
+            c["id"]: c["user_prompts"]
+            for c in cases
+            if isinstance(c.get("user_prompts"), list) and len(c["user_prompts"]) > 1
+        }
+        if cached_variants:
+            prompt_variants = cached_variants
+            total_v = sum(len(v) for v in cached_variants.values())
+            print(
+                f"\n  Using cached variants for {len(cached_variants)} cases"
+                f" ({total_v} total prompts)"
+            )
+
+    if diversify > 0:
+        print(f"\nGenerating {diversify} prompt variants per case...")
+        prompt_variants = _diversify_prompts(
+            client=div_client,
+            model=div_model,
+            cases=cases,
+            n_variants=diversify,
+            provider=div_provider,
+        )
+        results["meta"]["diversify"] = diversify
+        results["meta"]["prompt_variants"] = prompt_variants
+
+        # Save variants back to test suite JSON for caching
+        if save_variants:
+            updated = False
+            for case in cases:
+                cid = case["id"]
+                variants = prompt_variants.get(cid, [])
+                if len(variants) > 1 and case.get("user_prompts") != variants:
+                    case["user_prompts"] = variants
+                    updated = True
+            if updated:
+                suite["cases"] = cases
+                with open(test_file, "w") as f:
+                    json.dump(suite, f, indent=2)
+                    f.write("\n")
+                print(f"  Saved variants to {test_file}")
+
+    cumulative_tokens = 0
     suite_t0 = time.monotonic()
 
     for iteration in range(max_iterations):
@@ -1760,8 +2413,16 @@ def run_optimization(
         selected_id = _ucb_select(nodes, explore_constant)
         selected = nodes[selected_id]
 
+        tree_info = f"node {selected_id}"
+        if selected.visit_count > 0:
+            tree_info += f", score={selected.score:.0%}, visits={selected.visit_count}"
+        else:
+            tree_info += ", unvisited"
+        if len(nodes) > 1:
+            tree_info += f", tree={len(nodes)} nodes"
+
         print(f"\n{'=' * 60}")
-        print(f"Iteration {iteration} (node {selected_id}, visits={selected.visit_count})")
+        print(f"Iteration {iteration} ({tree_info})")
         print(f"{'=' * 60}")
 
         iter_result = _run_iteration(
@@ -1780,6 +2441,7 @@ def run_optimization(
             parallel=parallel,
             base_url=base_url,
             api_key=api_key,
+            prompt_variants=prompt_variants,
         )
         iter_result["iteration"] = iteration
         iter_result["prompt"] = selected.prompt
@@ -1790,6 +2452,7 @@ def run_optimization(
 
         # Update node score (rolling mean)
         new_score = _compute_holdout_score(iter_result, holdout_ids)
+        old_score = selected.score
         if selected.visit_count == 0:
             selected.score = new_score
         else:
@@ -1797,6 +2460,14 @@ def run_optimization(
                 selected.visit_count + 1
             )
         selected.visit_count += 1
+        if selected.visit_count > 1:
+            _log(
+                f"  Node {selected_id} score: {old_score:.0%} → {selected.score:.0%}"
+                f" (this eval: {new_score:.0%})",
+                dim=True,
+            )
+
+        cumulative_tokens += iter_result.get("aggregate", {}).get("total_tokens", 0)
 
         results["iterations"].append(iter_result)
 
@@ -1806,7 +2477,13 @@ def run_optimization(
             json.dump(results, f, indent=2)
 
         _print_summary_table(iter_result)
-        _append_summary_tsv(tsv_path, iter_result, case_ids)
+        _append_summary_tsv(
+            tsv_path,
+            iter_result,
+            case_ids,
+            cumulative_tokens=cumulative_tokens,
+            node_score=selected.score,
+        )
 
         # Check if all passing
         agg = iter_result["aggregate"]
@@ -1854,6 +2531,28 @@ def run_optimization(
                 holdout_ids,
             )
 
+            # Phase 1: Analyst diagnoses semantic patterns
+            analyst_output = ""
+            if opt_result["aggregate"].get("overall_pass_rate", 0) < 1.0:
+                print("\nAnalyzing failures...")
+                try:
+                    analyst_output = _run_analyst(
+                        client=ana_client,
+                        model=ana_model,
+                        test_cases=opt_cases,
+                        iteration_result=opt_result,
+                        provider=ana_provider,
+                    )
+                    if analyst_output:
+                        _log(f"  Analyst:\n{analyst_output}", dim=True)
+                except Exception as e:
+                    _log(f"  Analyst failed: {e}", dim=True)
+
+            # Store analyst output before optimizer (survives optimizer failure)
+            if analyst_output:
+                iter_result["analyst"] = analyst_output
+
+            # Phase 2: Optimizer modifies prompt using analyst diagnosis
             print("\nOptimizing prompt...")
             try:
                 new_prompt = _propose_prompt_modification(
@@ -1866,6 +2565,7 @@ def run_optimization(
                     optimizer_system=current_optimizer_system,
                     provider=opt_provider,
                     parent_scores=parent_scores,
+                    analyst_output=analyst_output,
                 )
             except Exception as e:
                 _log(f"  Prompt modification failed: {e}", dim=True)
@@ -1889,6 +2589,11 @@ def run_optimization(
                 nodes[next_node_id] = child
                 selected.children.append(next_node_id)
                 iter_result["tree_child_id"] = next_node_id
+                _log(
+                    f"  Created node {next_node_id} (child of {selected_id},"
+                    f" tree={len(nodes)} nodes)",
+                    dim=True,
+                )
                 next_node_id += 1
 
                 # Re-write with tree update and diff
@@ -1968,6 +2673,37 @@ def main() -> None:
         "--observer-base-url",
         default=None,
         help="Base URL for observer model (default: same as --optimizer-base-url)",
+    )
+    parser.add_argument(
+        "--analyst-model",
+        default=None,
+        help="Model for failure analysis (default: same as --optimizer-model)",
+    )
+    parser.add_argument(
+        "--analyst-base-url",
+        default=None,
+        help="Base URL for analyst model (default: same as --optimizer-base-url)",
+    )
+    parser.add_argument(
+        "--diversifier-model",
+        default=None,
+        help="Model for prompt diversification (default: same as --optimizer-model)",
+    )
+    parser.add_argument(
+        "--diversifier-base-url",
+        default=None,
+        help="Base URL for diversifier model (default: same as --optimizer-base-url)",
+    )
+    parser.add_argument(
+        "--diversify",
+        type=int,
+        default=0,
+        help="Generate N prompt variants per test case (0=disabled, includes original)",
+    )
+    parser.add_argument(
+        "--save-variants",
+        action="store_true",
+        help="Save generated variants back to test suite JSON for caching",
     )
     parser.add_argument(
         "--prompt",
@@ -2090,6 +2826,12 @@ def main() -> None:
         optimizer_model=args.optimizer_model,
         observer_base_url=args.observer_base_url,
         observer_model=args.observer_model,
+        analyst_base_url=args.analyst_base_url,
+        analyst_model=args.analyst_model,
+        diversifier_base_url=args.diversifier_base_url,
+        diversifier_model=args.diversifier_model,
+        diversify=args.diversify,
+        save_variants=args.save_variants,
         explore_constant=args.explore_constant,
     )
 

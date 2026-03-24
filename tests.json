@@ -1,5 +1,5 @@
 {
-  "description": "turnstone behavior tests — tool selection, sequencing, and multi-step reasoning",
+  "description": "turnstone behavior tests \u2014 tool selection, sequencing, and multi-step reasoning",
   "defaults": {
     "n_runs": 5,
     "max_turns": 15
@@ -8,35 +8,121 @@
     {
       "id": "read-before-edit",
       "description": "Must read_file before edit_file on the same path",
-      "user_prompt": "Fix the typo in config.py — change 'recieve' to 'receive'",
+      "user_prompt": "Fix the typo in config.py \u2014 change 'recieve' to 'receive'",
       "setup": {
         "files": {
           "config.py": "# Config module\ndef recieve_data(source):\n    \"\"\"Recieve data from source.\"\"\"\n    return source.read()\n"
         }
       },
       "expected_actions": [
-        { "tool": "read_file", "args": { "path": "config.py" } },
-        { "tool": "edit_file", "args": { "path": "config.py" } }
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "config.py"
+          }
+        },
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "config.py"
+          }
+        }
       ],
-      "match_mode": "ordered_subset"
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Fix the typo in config.py \u2014 change 'recieve' to 'receive'",
+        "In config.py, correct the misspelling of 'recieve' to 'receive'",
+        "Please update config.py by replacing 'recieve' with the correct spelling 'receive'",
+        "There's a typo in config.py: 'recieve' should be 'receive'. Please fix it.",
+        "Could you change 'recieve' to 'receive' in config.py?",
+        "Go ahead and fix 'recieve' \u2192 'receive' in config.py",
+        "I need the word 'recieve' corrected to 'receive' in the file config.py",
+        "config.py has a spelling error \u2014 'recieve' needs to be changed to 'receive'",
+        "Kindly rectify the typographical error in config.py, replacing 'recieve' with 'receive'",
+        "Hey, swap 'recieve' for 'receive' in config.py",
+        "The file config.py contains a misspelling: please replace 'recieve' with 'receive'",
+        "Fix the spelling mistake in config.py where 'recieve' is used instead of 'receive'",
+        "Would you mind fixing 'recieve' to 'receive' in config.py?",
+        "Replace the incorrectly spelled 'recieve' with 'receive' in config.py",
+        "In the file config.py, the word 'recieve' is misspelled and should read 'receive' \u2014 please correct it",
+        "Correct 'recieve' to 'receive' in config.py",
+        "config.py: change 'recieve' to 'receive'",
+        "There's a typo \u2014 'recieve' in config.py ought to be 'receive'. Can you fix that?",
+        "I noticed 'recieve' in config.py. It should be 'receive'. Please make the fix.",
+        "Update the spelling of 'recieve' to 'receive' within config.py"
+      ]
     },
     {
       "id": "write-file-not-bash",
       "description": "Use write_file for file creation, not bash echo/cat",
       "user_prompt": "Create a file called hello.py that prints hello world",
       "expected_actions": [
-        { "tool": "write_file", "args_pattern": { "path": "hello\\.py" } }
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "hello\\.py"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Create a file called hello.py that prints hello world",
+        "Make a hello.py file that outputs hello world",
+        "Please write a Python file named hello.py which prints hello world",
+        "I need a file called hello.py that prints hello world",
+        "Could you create hello.py with code that prints hello world?",
+        "Write hello.py \u2014 it should print hello world",
+        "Generate a hello.py file that outputs \"hello world\"",
+        "I'd like you to create a file named hello.py that prints hello world",
+        "Set up a file called hello.py to print hello world",
+        "Kindly produce a hello.py file whose purpose is to print hello world",
+        "hello.py \u2014 create it, should print hello world",
+        "Would you mind creating a hello.py that prints hello world?",
+        "I need you to write a hello.py file that will print hello world",
+        "Create hello.py containing code to print hello world",
+        "Please make a Python file hello.py that prints hello world to the console",
+        "Draft a file named hello.py that outputs hello world when run",
+        "Put together a hello.py script that prints hello world",
+        "Can you create a file hello.py that prints hello world?",
+        "Write a file called hello.py with a print statement for hello world",
+        "I want a hello.py file created that prints hello world"
+      ]
     },
     {
       "id": "bash-for-commands",
       "description": "Use bash for running system commands",
       "user_prompt": "What Python version is installed?",
       "expected_actions": [
-        { "tool": "bash", "args_pattern": { "command": "python" } }
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "python"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "What Python version is installed?",
+        "Check which version of Python is currently installed",
+        "Can you tell me the installed Python version?",
+        "python --version please",
+        "I need to know what version of Python is on this system",
+        "Which Python version do we have?",
+        "Could you look up the Python version that's installed here?",
+        "Determine the currently installed Python version",
+        "What's the Python version on this machine?",
+        "Please check the Python version",
+        "I'm curious about the installed Python version \u2014 can you find out?",
+        "Show me the Python version",
+        "Find out what Python version is available",
+        "What version of Python do we have installed?",
+        "Kindly verify which version of Python is present on the system",
+        "python version?",
+        "I'd like to know the Python version installed on this system",
+        "Would you mind checking what Python version is installed?",
+        "Tell me the Python version",
+        "Report the installed Python version on this machine"
+      ]
     },
     {
       "id": "search-for-patterns",
@@ -49,13 +135,40 @@
         }
       },
       "expected_actions": [
-        { "tool": "search", "args_pattern": { "query": "test_" } }
+        {
+          "tool": "search",
+          "args_pattern": {
+            "query": "test_"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Find all functions that start with 'test_' in the project",
+        "List every function in the project whose name begins with 'test_'",
+        "I need to locate all functions prefixed with 'test_' across the project",
+        "Could you search the project for any functions starting with 'test_'?",
+        "Show me all the test_ prefixed functions in this project",
+        "Hunt down every function that has a 'test_' prefix in the codebase",
+        "I'm looking for all functions named test_* throughout the project",
+        "Search the entire project for functions whose names start with test_",
+        "What functions beginning with 'test_' exist in this project?",
+        "Please identify all functions with the 'test_' prefix in the project files",
+        "Grep the project for all function definitions starting with 'test_'",
+        "Give me a list of all test_ functions defined anywhere in the project",
+        "Can you find every function declaration that starts with 'test_' in the project?",
+        "Scan the project codebase and return all functions prefixed with test_",
+        "I'd like to see all functions in the project that begin with 'test_'",
+        "Go through the project and locate each function starting with 'test_'",
+        "Pull up all function definitions matching the test_ prefix across the project",
+        "Which functions in the project have names that start with 'test_'?",
+        "Enumerate all test_-prefixed function definitions in the project",
+        "Look through the project and find any function whose name starts with test_"
+      ]
     },
     {
       "id": "multi-file-edit",
-      "description": "Read and edit multiple files — must read before editing each, and edit both",
+      "description": "Read and edit multiple files \u2014 must read before editing each, and edit both",
       "user_prompt": "Change the default port from 8000 to 9000 in both server.py and config.py",
       "setup": {
         "files": {
@@ -64,12 +177,42 @@
         }
       },
       "expected_actions": [
-        { "tool": "read_file" },
-        { "tool": "read_file" },
-        { "tool": "edit_file" },
-        { "tool": "edit_file" }
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "edit_file"
+        },
+        {
+          "tool": "edit_file"
+        }
       ],
-      "match_mode": "ordered_subset"
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Change the default port from 8000 to 9000 in both server.py and config.py",
+        "Update the default port to 9000 instead of 8000 in server.py and config.py",
+        "Could you modify the port number from 8000 to 9000 in both config.py and server.py?",
+        "Please replace port 8000 with 9000 in server.py and config.py",
+        "I need the default port switched from 8000 to 9000 in both server.py and config.py",
+        "In server.py and config.py, the default port should be changed from 8000 to 9000",
+        "Swap out port 8000 for 9000 in config.py and server.py",
+        "Would you mind updating the default port value from 8000 to 9000 across both server.py and config.py?",
+        "The default port in server.py and config.py needs to be 9000 instead of 8000 \u2014 please make that change",
+        "Go ahead and change 8000 to 9000 for the default port in both server.py and config.py",
+        "Kindly adjust the default port configuration from 8000 to 9000 in the files server.py and config.py",
+        "Port change needed: 8000 \u2192 9000 in server.py and config.py",
+        "Both server.py and config.py currently use port 8000 as the default \u2014 update them to use 9000",
+        "Set the default port to 9000 (currently 8000) in server.py and config.py",
+        "I'd like the default port modified from 8000 to 9000 in both config.py and server.py",
+        "Replace the 8000 port default with 9000 in both server.py and config.py please",
+        "Can you switch the default port number to 9000 from 8000 in server.py as well as config.py?",
+        "Make the default port 9000 rather than 8000 in server.py and config.py",
+        "In both config.py and server.py, please update the default port \u2014 it should be 9000 not 8000",
+        "Modify server.py and config.py so the default port is 9000 instead of the current 8000"
+      ]
     },
     {
       "id": "search-then-edit",
@@ -83,39 +226,159 @@
         }
       },
       "expected_actions": [
-        { "tool": "search", "args_pattern": { "query": "MAX_RETRIES" } },
-        { "tool": "read_file" },
-        { "tool": "edit_file", "args_pattern": { "old_string": "3" } }
+        {
+          "tool": "search",
+          "args_pattern": {
+            "query": "MAX_RETRIES"
+          }
+        },
+        {
+          "tool": "read_file"
+        },
+        {
+          "tool": "edit_file",
+          "args_pattern": {
+            "old_string": "3"
+          }
+        }
       ],
-      "match_mode": "ordered_subset"
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Find where MAX_RETRIES is defined and change it from 3 to 5",
+        "Locate the definition of MAX_RETRIES and update its value from 3 to 5",
+        "Could you search for where MAX_RETRIES is defined and modify it from 3 to 5?",
+        "I need MAX_RETRIES changed from 3 to 5 \u2014 find where it's defined and update it",
+        "Please find the MAX_RETRIES definition and bump it from 3 to 5",
+        "Hunt down MAX_RETRIES in the codebase and change its value from 3 to 5",
+        "Where is MAX_RETRIES set to 3? Change it to 5.",
+        "Search the code for the MAX_RETRIES definition and alter it from 3 to 5",
+        "I'd like you to locate MAX_RETRIES (currently 3) and set it to 5 instead",
+        "Go find MAX_RETRIES and switch it from 3 to 5",
+        "The constant MAX_RETRIES is defined somewhere as 3 \u2014 find it and change it to 5",
+        "Track down the MAX_RETRIES definition and increase it from 3 to 5",
+        "Would you mind finding where MAX_RETRIES is set and updating the value from 3 to 5?",
+        "Grep for MAX_RETRIES, find its definition, and change the value from 3 to 5",
+        "MAX_RETRIES needs to be 5 instead of 3. Find where it's defined and make the change.",
+        "Look up the definition of MAX_RETRIES and replace 3 with 5",
+        "Can you find the spot where MAX_RETRIES is defined as 3 and update it to 5?",
+        "Identify the location of the MAX_RETRIES definition and change its value to 5 from 3",
+        "I need you to search for MAX_RETRIES, which is currently set to 3, and change it to 5",
+        "Find the MAX_RETRIES constant and adjust it \u2014 it should be 5, not 3"
+      ]
     },
     {
       "id": "bash-git-log",
       "description": "Use bash for git commands, not other tools",
       "user_prompt": "Show me the git log for the last 5 commits",
       "expected_actions": [
-        { "tool": "bash", "args_pattern": { "command": "git\\s+log" } }
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "git\\s+log"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Show me the git log for the last 5 commits",
+        "Display the 5 most recent git commits",
+        "Can you pull up the git log limited to the last five commits?",
+        "I need to see the git log showing only the previous 5 commits",
+        "git log for the 5 latest commits, please",
+        "Would you mind showing me the last five entries in the git log?",
+        "Print out the most recent 5 commits from the git log",
+        "I'd like to review the git log \u2014 just the last 5 commits",
+        "Show the recent 5 commit history using git log",
+        "Could you display the git commit history for the past five commits?",
+        "Fetch the git log, but only the 5 newest commits",
+        "Let me see the five most recent commits in the git log",
+        "Please retrieve the last 5 entries from git log",
+        "I want to check the git log limited to 5 recent commits",
+        "Run git log and show me just the latest five commits",
+        "Pull up the commit log from git for the last 5 changes",
+        "Mind grabbing the git log? Just the last five commits though",
+        "Give me a view of the 5 most recent git log entries",
+        "Show me the history of the last five commits via git log",
+        "I'd appreciate seeing the git log restricted to the previous 5 commits"
+      ]
     },
     {
       "id": "write-then-run",
       "description": "Create a script and run it to verify it works",
       "user_prompt": "Create a Python script called fib.py that prints the first 10 Fibonacci numbers, then run it to verify",
       "expected_actions": [
-        { "tool": "write_file", "args_pattern": { "path": "fib\\.py" } },
-        { "tool": "bash", "args_pattern": { "command": "python" } }
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "fib\\.py"
+          }
+        },
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "python"
+          }
+        }
       ],
-      "match_mode": "ordered_subset"
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Create a Python script called fib.py that prints the first 10 Fibonacci numbers, then run it to verify",
+        "Write a Python file named fib.py that outputs the first 10 Fibonacci numbers, and execute it to confirm it works",
+        "Please make fib.py \u2013 a Python script printing the first ten Fibonacci numbers \u2013 then run it to check the output",
+        "I need a Python script fib.py that prints the first 10 Fibonacci numbers. Execute it afterwards to verify correctness.",
+        "Could you create fib.py to display the first 10 Fibonacci numbers in Python, and then run it to make sure it works?",
+        "Draft a script called fib.py in Python that outputs the first ten Fibonacci numbers, then execute it to validate",
+        "Hey, write me a fib.py that prints the first 10 Fibonacci numbers and run it so we can see it works",
+        "Generate a Python program fib.py which prints the initial 10 Fibonacci numbers, and verify by running it",
+        "Kindly produce a Python script named fib.py to print the first 10 Fibonacci numbers, then execute the script to confirm its output",
+        "Make a file fib.py containing Python code to print the first 10 Fibonacci numbers. Then run it to verify.",
+        "I'd like you to write fib.py, a Python script that displays the first ten Fibonacci numbers, and test it by running it",
+        "Put together a Python script fib.py that prints out the first 10 Fibonacci numbers, then go ahead and run it to check",
+        "Create fib.py with Python code for printing the first 10 Fibonacci numbers and execute it to see the results",
+        "Would you mind writing a Python script called fib.py that prints the first 10 Fibonacci numbers? Please run it too to verify.",
+        "Write fib.py in Python to output the first ten Fibonacci numbers. Run the script to ensure it's correct.",
+        "Compose a Python file fib.py that will print the first 10 Fibonacci numbers when executed, and then run it to verify the output",
+        "fib.py \u2014 create this Python script to print the first 10 Fibonacci numbers, and execute it to confirm it's working properly",
+        "Can you set up a Python script named fib.py that prints the first 10 Fibonacci numbers and then run it for verification?",
+        "Please author a Python program in fib.py to display the first ten Fibonacci numbers, followed by running it to check",
+        "Whip up fib.py to print the first 10 Fibonacci numbers using Python, then run it to make sure everything checks out"
+      ]
     },
     {
       "id": "no-bash-for-file-write",
-      "description": "Should NOT use bash (echo/cat/heredoc) to create files — only write_file",
+      "description": "Should NOT use bash (echo/cat/heredoc) to create files \u2014 only write_file",
       "user_prompt": "Create a new file called README.md with a title and description of this project",
       "expected_actions": [
-        { "tool": "write_file", "args_pattern": { "path": "README" } }
+        {
+          "tool": "write_file",
+          "args_pattern": {
+            "path": "README"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Create a new file called README.md with a title and description of this project",
+        "Make a README.md file that includes a project title and description",
+        "I need a README.md created with a title and a brief description of the project",
+        "Please generate a README.md file containing the project's title and description",
+        "Could you set up a README.md with a title and project description?",
+        "Write a README.md that has a title and describes this project",
+        "Go ahead and create README.md \u2014 it should have a title and a description of the project",
+        "I'd like you to produce a new README.md file featuring a project title and description",
+        "Kindly establish a README.md file incorporating both a title and a description for this project",
+        "Spin up a README.md with a project title and description in it",
+        "Draft a README.md file that provides a title and description for the project",
+        "Would you mind creating a README.md that contains a title and project description?",
+        "Set up a new file named README.md and include a title along with a project description",
+        "I want a README.md file \u2014 put a title and a description of the project in it",
+        "Create README.md and populate it with a title and a description of this project",
+        "Add a new README.md to the project with an appropriate title and description",
+        "Can you make a README.md that gives the project a title and description?",
+        "Put together a README.md file with a heading and a description of what this project is about",
+        "Initialize a README.md containing a project title and a short description",
+        "Generate a new file called README.md \u2014 include a title and overview of the project"
+      ]
     },
     {
       "id": "plan-before-refactor",
@@ -126,8 +389,34 @@
           "app.py": "import sqlite3\nfrom flask import Flask, jsonify\n\napp = Flask(__name__)\nDB = 'data.db'\n\ndef get_db():\n    return sqlite3.connect(DB)\n\n@app.route('/users')\ndef list_users():\n    db = get_db()\n    users = db.execute('SELECT * FROM users').fetchall()\n    db.close()\n    return jsonify(users)\n\n@app.route('/users/<int:uid>')\ndef get_user(uid):\n    db = get_db()\n    user = db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone()\n    db.close()\n    return jsonify(user)\n\nif __name__ == '__main__':\n    app.run(port=8000)\n"
         }
       },
-      "expected_actions": [{ "tool": "create_plan" }],
-      "match_mode": "subset"
+      "expected_actions": [
+        {
+          "tool": "create_plan"
+        }
+      ],
+      "match_mode": "subset",
+      "user_prompts": [
+        "I need to refactor this codebase to separate the database layer from the API layer. Use the plan tool to think through the approach before making any changes.",
+        "Please use the plan tool to think through how to refactor this codebase, separating the database layer from the API layer, before making any changes.",
+        "Before touching any code, use the plan tool to outline an approach for decoupling the database layer from the API layer in this codebase.",
+        "I'd like to split the DB layer and API layer apart in this codebase. Think through the strategy using the plan tool first, then proceed.",
+        "Could you refactor this code to decouple the database and API layers? Start by using the plan tool to reason through the approach before changing anything.",
+        "Hey, I need the database layer pulled apart from the API layer in this codebase. Use the plan tool to map out the approach before diving in.",
+        "The database and API layers in this codebase need to be separated. Please leverage the plan tool to think it through before implementing changes.",
+        "Use the plan tool first to strategize, then refactor this codebase so that the database layer is cleanly separated from the API layer.",
+        "I want the DB layer and API layer in this codebase to be independent. Plan out the refactoring approach using the plan tool before making edits.",
+        "This codebase has its database and API layers tangled together. Use the plan tool to think through a separation strategy before modifying anything.",
+        "Would you mind using the plan tool to devise a refactoring plan for separating the database layer from the API layer in this codebase? Don't change code until you've planned.",
+        "Refactor this code so the DB layer is decoupled from the API layer. But first, use the plan tool to carefully consider the approach.",
+        "I'm looking to have the database concerns separated from the API concerns in this codebase. Think through it with the plan tool before making any modifications.",
+        "Before implementing anything, use the plan tool to plan how to refactor this codebase into separate database and API layers.",
+        "Can you separate the database layer from the API layer here? Please use the plan tool to reason about the approach prior to any code changes.",
+        "Time to decouple the DB and API layers in this codebase. Start with the plan tool to think through the strategy, then make changes.",
+        "I need this codebase restructured so the database layer doesn't mix with the API layer. Use the plan tool to work out the approach first.",
+        "Think through a refactoring plan using the plan tool for separating the database and API layers in this codebase, then execute the changes.",
+        "The goal is to isolate the database layer from the API layer in this codebase. Use the plan tool to figure out the best approach before writing any code.",
+        "Please plan out (using the plan tool) how to cleanly separate the database layer from the API layer in this codebase before making any actual changes."
+      ]
     },
     {
       "id": "edit-not-rewrite",
@@ -139,10 +428,42 @@
         }
       },
       "expected_actions": [
-        { "tool": "read_file", "args": { "path": "utils.py" } },
-        { "tool": "edit_file", "args": { "path": "utils.py" } }
+        {
+          "tool": "read_file",
+          "args": {
+            "path": "utils.py"
+          }
+        },
+        {
+          "tool": "edit_file",
+          "args": {
+            "path": "utils.py"
+          }
+        }
       ],
-      "match_mode": "ordered_subset"
+      "match_mode": "ordered_subset",
+      "user_prompts": [
+        "Add a docstring to the process_data function in utils.py",
+        "Please add a docstring to the process_data function in utils.py",
+        "Could you write a docstring for process_data in utils.py?",
+        "Insert a docstring into the process_data function found in utils.py",
+        "I need a docstring added to process_data in utils.py",
+        "Put a docstring on the process_data function in utils.py",
+        "The process_data function in utils.py is missing a docstring \u2014 please add one",
+        "Would you mind adding a docstring to process_data in utils.py?",
+        "In utils.py, the process_data function needs a docstring",
+        "Add documentation via a docstring to the process_data function within utils.py",
+        "Go ahead and give process_data in utils.py a proper docstring",
+        "I'd like you to add a docstring to the process_data function in utils.py",
+        "utils.py's process_data function lacks a docstring \u2014 can you add one?",
+        "Write a docstring for the process_data function located in utils.py",
+        "Kindly include a docstring in the process_data function in utils.py",
+        "Can you throw a docstring onto process_data in utils.py?",
+        "The function process_data in utils.py should have a docstring \u2014 please add it",
+        "Give the process_data function in utils.py a docstring",
+        "Hey, add a docstring to process_data over in utils.py",
+        "I require a docstring to be added to the process_data function defined in utils.py"
+      ]
     },
     {
       "id": "bash-run-tests",
@@ -154,45 +475,180 @@
         }
       },
       "expected_actions": [
-        { "tool": "bash", "args_pattern": { "command": "pytest|python.*test" } }
+        {
+          "tool": "bash",
+          "args_pattern": {
+            "command": "pytest|python.*test"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Run the tests",
+        "Execute the test suite",
+        "Please go ahead and run the tests",
+        "Could you run the tests for me?",
+        "I need the tests to be run",
+        "Kick off the tests",
+        "Let's run the tests",
+        "Fire up the tests",
+        "Go ahead and execute the tests",
+        "I'd like you to run the tests",
+        "Run all tests please",
+        "Would you mind running the tests?",
+        "Time to run the tests",
+        "Please execute the tests",
+        "Trigger the test run",
+        "I want to run the tests",
+        "Can you run the tests?",
+        "Launch the tests",
+        "Kindly run the test suite",
+        "Run the tests for me"
+      ]
     },
     {
       "id": "web-fetch-url",
       "description": "Use web_fetch when asked to retrieve content from a URL",
       "user_prompt": "Fetch the contents of https://example.com and summarize what's on the page",
       "expected_actions": [
-        { "tool": "web_fetch", "args_pattern": { "url": "example\\.com" } }
+        {
+          "tool": "web_fetch",
+          "args_pattern": {
+            "url": "example\\.com"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Fetch the contents of https://example.com and summarize what's on the page",
+        "Go to https://example.com and give me a summary of what you find there",
+        "Could you pull up https://example.com and tell me what the page is about?",
+        "Retrieve the content from https://example.com, then provide a summary of it",
+        "I need you to grab https://example.com and summarize its contents for me",
+        "Please access https://example.com and give me an overview of the page",
+        "What's on https://example.com? Fetch it and summarize for me.",
+        "Download the page at https://example.com and provide a brief summary",
+        "I'd like a summary of whatever is at https://example.com \u2014 please fetch it first",
+        "Hit https://example.com and let me know what's there in summary form",
+        "Kindly retrieve the webpage https://example.com and offer a concise summary of its content",
+        "Pull the contents of https://example.com and break down what the page contains",
+        "Can you load https://example.com and give me the gist of it?",
+        "Get https://example.com and tell me what it says",
+        "Grab the page from https://example.com, then summarize what you see",
+        "I'm curious about https://example.com \u2014 fetch it and summarize the contents please",
+        "Would you mind fetching https://example.com and providing a summary of the page?",
+        "Access the content at https://example.com and write a short summary",
+        "Read https://example.com and give me a rundown of what's on that page",
+        "Check out https://example.com for me and summarize what the page contains"
+      ]
     },
     {
       "id": "man-page-lookup",
       "description": "Use man tool to look up command documentation",
       "user_prompt": "Look up the man page for tar and tell me what the --xattrs flag does",
       "expected_actions": [
-        { "tool": "man", "args_pattern": { "page": "tar" } }
+        {
+          "tool": "man",
+          "args_pattern": {
+            "page": "tar"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Look up the man page for tar and tell me what the --xattrs flag does",
+        "What does the --xattrs flag do in tar? Check the man page for me.",
+        "Could you pull up the man page for tar and explain the --xattrs option?",
+        "I need to know what --xattrs does in tar \u2014 can you check the man page?",
+        "Check tar's man page and let me know the purpose of the --xattrs flag.",
+        "Please consult the tar man page and describe what the --xattrs flag is for.",
+        "Hey, look at the tar man page real quick \u2014 what's --xattrs do?",
+        "I'd like you to read the tar man page and summarize the --xattrs option for me.",
+        "Would you mind checking the man page for tar to find out what --xattrs means?",
+        "Look into the tar manual and explain the --xattrs flag to me.",
+        "What's the --xattrs option in tar? Please reference the man page.",
+        "Refer to the tar man page and tell me about the --xattrs flag.",
+        "Can you check what --xattrs does by looking at tar's man page?",
+        "Pull up the manual for tar and describe the --xattrs flag, please.",
+        "I'm curious about tar's --xattrs flag \u2014 could you look it up in the man page?",
+        "Consult the man page for tar and give me a rundown on --xattrs.",
+        "Open the tar man page and find out what the --xattrs option does.",
+        "From the tar man page, what is the function of --xattrs?",
+        "Mind looking up --xattrs in the tar man page and explaining it?",
+        "Review tar's manual entry and tell me what --xattrs is used for."
+      ]
     },
     {
       "id": "math-calculation",
       "description": "Use the math tool for precise calculations, not bash or mental math",
       "user_prompt": "What is 2^64 - 1? Use the math tool to calculate it precisely.",
       "expected_actions": [
-        { "tool": "math", "args_pattern": { "code": "2.*64" } }
+        {
+          "tool": "math",
+          "args_pattern": {
+            "code": "2.*64"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "What is 2^64 - 1? Use the math tool to calculate it precisely.",
+        "Calculate 2^64 - 1 for me using the math tool, please.",
+        "I need the exact value of 2^64 - 1. Please use the math tool.",
+        "Could you use the math tool to compute 2^64 minus 1 precisely?",
+        "Use the math tool to tell me what 2^64 - 1 equals.",
+        "I'm curious: what's 2^64 - 1? Compute it with the math tool.",
+        "Please precisely determine 2^64 - 1 via the math tool.",
+        "Mind using the math tool to figure out 2^64 - 1 exactly?",
+        "I'd like to know the precise result of 2^64 - 1 \u2014 use the math tool for this.",
+        "Leverage the math tool to give me an exact answer for 2^64 - 1.",
+        "What does 2^64 - 1 evaluate to? Please use the math tool to get the precise answer.",
+        "Kindly employ the math tool to calculate the exact value of 2 to the power of 64, minus 1.",
+        "Hey, what's 2^64 - 1? Hit the math tool for an exact number.",
+        "Using the math tool, compute 2^64 - 1 with full precision.",
+        "I need the math tool to work out 2^64 - 1. What's the result?",
+        "Would you mind calculating 2^64 - 1 precisely with the math tool?",
+        "Give me the exact result of 2^64 - 1, calculated using the math tool.",
+        "Two to the sixty-fourth power minus one \u2014 what is it? Use the math tool to find out.",
+        "Can you determine 2^64 - 1 exactly? Please rely on the math tool for this computation.",
+        "Precisely compute 2**64 - 1 using the math tool and share the result."
+      ]
     },
     {
       "id": "web-search-query",
       "description": "Use web_search for general knowledge lookups, not web_fetch",
       "user_prompt": "Search the web for the current population of Tokyo",
       "expected_actions": [
-        { "tool": "web_search", "args_pattern": { "query": "Tokyo" } }
+        {
+          "tool": "web_search",
+          "args_pattern": {
+            "query": "Tokyo"
+          }
+        }
       ],
-      "match_mode": "subset"
+      "match_mode": "subset",
+      "user_prompts": [
+        "Search the web for the current population of Tokyo",
+        "What's Tokyo's current population? Look it up on the web.",
+        "Could you do a web search to find out how many people currently live in Tokyo?",
+        "Please search online for Tokyo's present-day population.",
+        "I need you to look up the current population of Tokyo on the web.",
+        "Find me Tokyo's current population via a web search.",
+        "Web search: what is the current population of Tokyo?",
+        "I'd like to know Tokyo's current population\u2014can you search the web for that?",
+        "Look up how many people live in Tokyo right now using a web search.",
+        "Do a web search for the population of Tokyo as of now.",
+        "Search the internet to find Tokyo's current population figure.",
+        "Would you mind searching the web to determine Tokyo's present population?",
+        "I'm curious about Tokyo's current population. Please search the web for it.",
+        "Kindly perform a web search regarding the current population of Tokyo.",
+        "Pull up the current population of Tokyo from the web.",
+        "Go ahead and search online for how many people are in Tokyo currently.",
+        "Query the web for Tokyo's population at present.",
+        "Can you find the current population of Tokyo through a web search?",
+        "Use the web to look up what Tokyo's population is right now.",
+        "Search for the latest population count of Tokyo on the web."
+      ]
     }
   ]
 }
