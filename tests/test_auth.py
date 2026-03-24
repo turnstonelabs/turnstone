@@ -1237,6 +1237,52 @@ class TestJWTAudienceIssuer:
         result = validate_jwt(token, self.SECRET, audience="")
         assert result is not None
 
+    def test_create_jwt_expiry_seconds(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import create_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, expiry_seconds=300)
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert payload["exp"] - payload["iat"] == 300
+
+    def test_create_jwt_expiry_seconds_overrides_hours(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import create_jwt
+
+        token = create_jwt(
+            "user1",
+            frozenset({"read"}),
+            "test",
+            self.SECRET,
+            expiry_hours=24,
+            expiry_seconds=60,
+        )
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        # expiry_seconds takes precedence over expiry_hours
+        assert payload["exp"] - payload["iat"] == 60
+
+    def test_create_jwt_expiry_seconds_rejects_zero(self):
+        import pytest
+
+        from turnstone.core.auth import create_jwt
+
+        with pytest.raises(ValueError, match="expiry_seconds must be positive"):
+            create_jwt("user1", frozenset({"read"}), "test", self.SECRET, expiry_seconds=0)
+
+    def test_create_jwt_expiry_seconds_rejects_negative(self):
+        import pytest
+
+        from turnstone.core.auth import create_jwt
+
+        with pytest.raises(ValueError, match="expiry_seconds must be positive"):
+            create_jwt("user1", frozenset({"read"}), "test", self.SECRET, expiry_seconds=-1)
+
 
 class TestServiceTokenManager:
     SECRET = "test-secret-that-is-at-least-32-chars"

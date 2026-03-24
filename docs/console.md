@@ -365,7 +365,7 @@ SSE streams (`/v1/api/events`, `/v1/api/events/global`) are proxied as raw byte 
 
 ### Authentication
 
-The proxy forwards the user's JWT to upstream server nodes — it extracts the token from the incoming request's cookie (or `Authorization` header) and adds it as a `Bearer` header on the proxied request.  Since all services share the same `TURNSTONE_JWT_SECRET`, the user's JWT is valid on every node without re-authentication.  The console's own auth middleware also checks proxy routes — `POST` requests to proxy write endpoints (`/v1/api/send`, `/v1/api/approve`, etc.) require `write` scope, preventing read-only tokens from escalating via proxy.  The static `--auth-token` / `proxy_auth_token` is used as a fallback when no user JWT is present.
+The proxy mints a short-lived (5-minute) JWT per request carrying the real user's `user_id`, `scopes`, and `permissions` with `aud: turnstone-server`.  The user's console JWT (`aud: turnstone-console`) cannot be forwarded directly — it would be rejected by the server's audience validation — so the console re-signs a new server-audience JWT from the validated `AuthResult`.  This preserves audit attribution (the upstream server sees the real user, not a service identity) and enforces scope narrowing as defense in depth (a read-only console user's proxied request carries only `read` scope).  The JWT `src` claim is set to `"console-proxy"` for audit traceability.  When no user context is available (auth disabled), the proxy falls back to a `ServiceTokenManager` with service identity `console-proxy`.  The static `--auth-token` / `proxy_auth_token` is used as a final fallback.
 
 ---
 

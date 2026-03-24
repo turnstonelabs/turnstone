@@ -457,14 +457,30 @@ without any database.
 ### Proxy auth forwarding
 
 When the console proxies requests to server nodes (via `/node/{id}/...`
-routes), it uses a dedicated **service proxy token** with
-`aud: turnstone-server` and `write` scope.  The user's console JWT
-(which has `aud: turnstone-console`) is **not** forwarded — it would be
-rejected by the server's audience validation.
+routes), it mints a **short-lived user-scoped JWT** with
+`aud: turnstone-server` carrying the real user's `user_id`, `scopes`,
+and `permissions`.  The user's console JWT (which has
+`aud: turnstone-console`) is **not** forwarded directly — it would be
+rejected by the server's audience validation.  Instead, the console
+re-signs a new JWT targeted at the server audience.
 
-The proxy token is managed by a `ServiceTokenManager` that auto-rotates
-1-hour JWTs, refreshing at 80% of lifetime.  If `--auth-token` is
-provided, that static token is used instead.
+Each proxied request gets a fresh JWT (5-minute expiry).  This ensures:
+
+- **Audit attribution** — the upstream server records the real user in
+  `ctx_user_id` and audit events, not a generic service identity.
+- **Scope narrowing** — a read-only console user's proxied request
+  carries only `read` scope, not the full `{read, write, approve}` set.
+  The server enforces this as defense in depth.
+- **Permission forwarding** — granular RBAC permissions from the
+  console JWT are carried through to the server.
+
+The JWT `src` claim is set to `"console-proxy"`, allowing servers to
+distinguish proxied requests from direct logins in audit logs.
+
+When no user context is available (auth disabled, or internal requests),
+the proxy falls back to a `ServiceTokenManager` with service identity
+`console-proxy` and full scopes.  If `--auth-token` is provided, that
+static token is used as a final fallback.
 
 ### Service-to-service authentication
 
@@ -475,7 +491,7 @@ auto-rotating JWTs when communicating with server nodes:
 |---------|----------|-------|----------|---------|
 | Bridge | `bridge` | `approve` | `turnstone-server` | Tool approval proxy, message relay |
 | Console collector | `console-collector` | `read` | `turnstone-server` | Node health polling |
-| Console proxy | `console-proxy` | `write` | `turnstone-server` | Proxied API calls |
+| Console proxy (fallback) | `console-proxy` | `approve` | `turnstone-server` | Proxied API calls when no user context |
 | Channel notify | `system` | `write` | `turnstone-channel` | Notification delivery to channel gateway |
 
 Service tokens use 1-hour expiry with automatic refresh via

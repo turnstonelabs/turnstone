@@ -1700,6 +1700,155 @@ class TestSSEProxy:
 
 
 # ---------------------------------------------------------------------------
+# Proxy auth header propagation
+# ---------------------------------------------------------------------------
+
+
+class TestProxyAuthHeaders:
+    """Verify _proxy_auth_headers mints user-scoped JWTs for proxy requests."""
+
+    SECRET = "test-secret-that-is-at-least-32-chars"
+
+    def _make_request(
+        self, *, auth_result=None, jwt_secret="", proxy_token_mgr=None, proxy_auth_token=""
+    ):
+        """Build a minimal fake request for _proxy_auth_headers."""
+
+        class _State:
+            pass
+
+        class _AppState:
+            pass
+
+        class _App:
+            state = _AppState()
+
+        class _Request:
+            state = _State()
+            app = _App()
+
+        req = _Request()
+        req.state.auth_result = auth_result
+        req.app.state.jwt_secret = jwt_secret
+        req.app.state.proxy_token_mgr = proxy_token_mgr
+        req.app.state.proxy_auth_token = proxy_auth_token
+        return req
+
+    def test_mints_user_jwt(self):
+        """Real user auth_result → JWT with correct sub, scopes, src, aud, permissions."""
+        import jwt as pyjwt
+
+        from turnstone.console.server import _proxy_auth_headers
+        from turnstone.core.auth import JWT_AUD_SERVER, AuthResult
+
+        auth = AuthResult(
+            user_id="alice",
+            scopes=frozenset({"read", "write"}),
+            token_source="jwt",
+            permissions=frozenset({"admin.users"}),
+        )
+        req = self._make_request(auth_result=auth, jwt_secret=self.SECRET)
+        headers = _proxy_auth_headers(req)
+
+        assert "Authorization" in headers
+        token = headers["Authorization"].removeprefix("Bearer ")
+        payload = pyjwt.decode(token, self.SECRET, algorithms=["HS256"], audience=JWT_AUD_SERVER)
+        assert payload["sub"] == "alice"
+        assert set(payload["scopes"].split(",")) == {"read", "write"}
+        assert payload["src"] == "console-proxy"
+        assert payload["aud"] == JWT_AUD_SERVER
+        assert payload["permissions"] == "admin.users"
+
+    def test_narrows_scopes(self):
+        """Read-only user → JWT carries only read scope, not full {read,write,approve}."""
+        import jwt as pyjwt
+
+        from turnstone.console.server import _proxy_auth_headers
+        from turnstone.core.auth import JWT_AUD_SERVER, AuthResult
+
+        auth = AuthResult(
+            user_id="viewer",
+            scopes=frozenset({"read"}),
+            token_source="jwt",
+        )
+        req = self._make_request(auth_result=auth, jwt_secret=self.SECRET)
+        headers = _proxy_auth_headers(req)
+
+        token = headers["Authorization"].removeprefix("Bearer ")
+        payload = pyjwt.decode(token, self.SECRET, algorithms=["HS256"], audience=JWT_AUD_SERVER)
+        assert payload["scopes"] == "read"
+
+    def test_short_expiry(self):
+        """Minted JWT expires in 300 seconds, not hours."""
+        import jwt as pyjwt
+
+        from turnstone.console.server import _proxy_auth_headers
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="alice",
+            scopes=frozenset({"read"}),
+            token_source="jwt",
+        )
+        req = self._make_request(auth_result=auth, jwt_secret=self.SECRET)
+        headers = _proxy_auth_headers(req)
+
+        token = headers["Authorization"].removeprefix("Bearer ")
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert payload["exp"] - payload["iat"] == 300
+
+    def test_fallback_no_user(self):
+        """No auth_result → falls back to ServiceTokenManager."""
+        from turnstone.console.server import _proxy_auth_headers
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="console-proxy",
+            scopes=frozenset({"read", "write", "approve"}),
+            source="console",
+            secret=self.SECRET,
+        )
+        req = self._make_request(proxy_token_mgr=mgr)
+        headers = _proxy_auth_headers(req)
+
+        assert "Authorization" in headers
+        assert headers["Authorization"] == f"Bearer {mgr.token}"
+
+    def test_fallback_no_secret(self):
+        """auth_result present but empty jwt_secret → falls back to ServiceTokenManager."""
+        from turnstone.console.server import _proxy_auth_headers
+        from turnstone.core.auth import AuthResult, ServiceTokenManager
+
+        auth = AuthResult(
+            user_id="alice",
+            scopes=frozenset({"read"}),
+            token_source="jwt",
+        )
+        mgr = ServiceTokenManager(
+            user_id="console-proxy",
+            scopes=frozenset({"read", "write", "approve"}),
+            source="console",
+            secret=self.SECRET,
+        )
+        req = self._make_request(auth_result=auth, jwt_secret="", proxy_token_mgr=mgr)
+        headers = _proxy_auth_headers(req)
+
+        # Should use ServiceTokenManager, not mint a user JWT
+        assert headers["Authorization"] == f"Bearer {mgr.token}"
+
+    def test_fallback_static_token(self):
+        """No auth_result, no ServiceTokenManager → uses static proxy_auth_token."""
+        from turnstone.console.server import _proxy_auth_headers
+
+        req = self._make_request(proxy_auth_token="static-tok-123")
+        headers = _proxy_auth_headers(req)
+
+        assert headers == {"Authorization": "Bearer static-tok-123"}
+
+
+# ---------------------------------------------------------------------------
 # Collector — MCP aggregation in get_overview()
 # ---------------------------------------------------------------------------
 

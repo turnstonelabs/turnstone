@@ -329,18 +329,22 @@ def create_jwt(
     expiry_hours: int = 24,
     audience: str = "",
     permissions: frozenset[str] = frozenset(),
+    expiry_seconds: int | None = None,
 ) -> str:
     """Create a signed JWT with user identity, scopes, and permissions."""
     import jwt
 
+    if expiry_seconds is not None and expiry_seconds <= 0:
+        raise ValueError("expiry_seconds must be positive")
     now = int(time.time())
+    ttl = expiry_seconds if expiry_seconds is not None else expiry_hours * 3600
     payload: dict[str, Any] = {
         "sub": user_id,
         "scopes": ",".join(sorted(scopes)),
         "src": source,
         "iss": JWT_ISSUER,
         "iat": now,
-        "exp": now + expiry_hours * 3600,
+        "exp": now + ttl,
     }
     if audience:
         payload["aud"] = audience

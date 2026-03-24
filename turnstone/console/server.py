@@ -37,7 +37,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
-from turnstone.core.auth import JWT_AUD_CONSOLE, AuthMiddleware
+from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, AuthMiddleware, create_jwt
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -133,15 +133,36 @@ _CONSOLE_PROXY_STYLE = "<style>.dashboard-overlay{top:32px!important}</style>"
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 
+_PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
+
 
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
     """Build auth headers for proxied requests to upstream servers.
 
-    Uses the service proxy token (``JWT_AUD_SERVER``) so the upstream node
-    accepts the request.  The user's console-audience JWT is *not* forwarded
-    — it would be rejected by the server's audience validation.
+    Mints a short-lived JWT carrying the real user's identity and scopes
+    so the upstream server records correct audit attribution and enforces
+    scope narrowing.  Falls back to the ServiceTokenManager when no user
+    context is available.
     """
-    # Prefer the auto-rotating ServiceTokenManager when available
+    auth_result = getattr(getattr(request, "state", None), "auth_result", None)
+    jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
+
+    if auth_result is not None and auth_result.user_id and jwt_secret:
+        token = create_jwt(
+            user_id=auth_result.user_id,
+            scopes=auth_result.scopes,
+            source="console-proxy",
+            secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
+            permissions=auth_result.permissions,
+            expiry_seconds=_PROXY_JWT_EXPIRY_SECONDS,
+        )
+        return {"Authorization": f"Bearer {token}"}
+
+    # Fallback: service identity (no user context).
+    # When auth is disabled on the console, auth_result is None, so all proxied
+    # requests use the full-privilege service identity.  This is safe only when
+    # the upstream server also has auth disabled.
     mgr = getattr(request.app.state, "proxy_token_mgr", None)
     if mgr is not None:
         return dict(mgr.bearer_header)
