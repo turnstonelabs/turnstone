@@ -155,9 +155,6 @@ def _fmt_args(args: dict[str, Any], max_len: int = 80) -> str:
     return out
 
 
-# ─── Stdout suppression ──────────────────────────────────────────────────────
-
-
 # ─── Headless session ────────────────────────────────────────────────────────
 
 
@@ -2203,10 +2200,11 @@ def _apply_tool_overrides(
     tools: list[dict[str, Any]],
     overrides: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Apply description overrides to a tool list. Returns a new list.
+    """Apply description overrides to a tool list.
 
-    Only modifies 'description' fields (top-level and per-parameter).
-    Never mutates the input list or the module-level TOOLS constant.
+    Returns the original list when overrides is empty, otherwise a new list
+    with deep-copied entries for modified tools (unmodified tools are shared).
+    Never mutates the input tools or the module-level TOOLS constant.
     """
     if not overrides:
         return tools
@@ -2807,7 +2805,7 @@ def run_optimization(
             new_tool_overrides = selected.tool_overrides
             if optimize_tools and not _has_wrong_tool_failures(opt_result, opt_cases):
                 _log("  Tool optimizer skipped (no tool confusion detected)", dim=True)
-            if optimize_tools and _has_wrong_tool_failures(opt_result, opt_cases):
+            elif optimize_tools:
                 print("\nOptimizing tool descriptions...")
                 try:
                     new_tool_overrides = _propose_tool_overrides(
