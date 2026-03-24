@@ -61,6 +61,7 @@ package "Inbound Messages (Client → Bridge)" as InPkg #FFF3E0 {
         + target_node: str = ""
         + initial_message: str = ""
         + skill: str = ""
+        + user_id: str = ""
     }
 
     class CloseWorkstreamMessage {

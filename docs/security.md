@@ -499,6 +499,17 @@ Service tokens use 1-hour expiry with automatic refresh via
 httpx event hooks to ensure rotated tokens are picked up on SSE
 reconnects.
 
+### User identity in MQ-dispatched workstreams
+
+When the console creates a workstream via MQ (the normal path), the
+authenticated user's `user_id` is embedded in the
+`CreateWorkstreamMessage`.  The bridge forwards this `user_id` in the
+HTTP payload when calling the server's `POST /v1/api/workstreams/new`.
+The server accepts a `user_id` from the request body **only when the
+caller is a trusted service** — identified by `token_source` matching
+`bridge`, `console-proxy`, or `console`.  Regular API callers cannot
+override `user_id`; the server always uses their JWT identity.
+
 Note that the channel gateway uses a distinct JWT audience
 (`turnstone-channel`) from the server (`turnstone-server`) and console
 (`turnstone-console`).  A server-scoped JWT cannot authenticate to the

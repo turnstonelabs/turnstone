@@ -154,7 +154,7 @@ activate Server #FFECB3
 Server -> CC : _pick_best_node() or\nget_node_detail(node_id)
 CC --> Server : node validated
 
-Server -> Server : Build CreateWorkstreamMessage\n{target_node:"nodeA", name:"new-task"}
+Server -> Server : Build CreateWorkstreamMessage\n{target_node:"nodeA", name:"new-task",\nuser_id: from auth_result}
 
 Server -> Redis : RPUSH turnstone:inbound:nodeA\n(directed queue)
 Server --> Browser : {status:"ok", correlation_id:"abc",\ntarget_node:"nodeA"}
@@ -163,7 +163,8 @@ deactivate Server
 note right of Redis
   Bridge on Node-A picks up the
   message from its directed queue,
-  POSTs to /v1/api/workstreams/new,
+  POSTs to /v1/api/workstreams/new
+  (forwarding user_id in payload),
   registers ownership, publishes
   ws_created to cluster channel.
 end note
