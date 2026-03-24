@@ -176,4 +176,15 @@ note bottom of SH
   Both share JWT signing secret
 end note
 
+note left of JWT
+  **Console Proxy Token Minting**
+  When proxying requests to server nodes:
+  1. Console AuthMiddleware validates user JWT (aud: turnstone-console)
+  2. Proxy mints new JWT (aud: turnstone-server)
+     with real user_id, scopes, permissions
+  3. src: "console-proxy" for audit traceability
+  4. 5-minute expiry (fresh per request)
+  5. Fallback: ServiceTokenManager if no user context
+end note
+
 @enduml
