@@ -538,6 +538,10 @@ def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:
         score_result["tool_sequence"] = [t["tool"] for t in run_result["tool_log"]]
         score_result["tool_args"] = [{t["tool"]: t["args"]} for t in run_result["tool_log"]]
         score_result["elapsed"] = run_result.get("elapsed", 0)
+        # Record which prompt variant was used (if diversified)
+        original = params.get("original_user_prompt", "")
+        if original and case["user_prompt"] != original:
+            score_result["prompt_variant"] = case["user_prompt"]
         run_tokens = sum(run_result.get("usage", {}).values())
 
         # Detect JSON dumped into final channel (tool call not made)
@@ -559,7 +563,7 @@ def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:
             "matched": [],
             "unmatched": list(range(len(case.get("expected_actions", [])))),
             "extra_tools": [],
-            "detail": f"Error: {e}",
+            "detail": f"Subprocess error: {e}",
             "tool_sequence": [],
             "tool_args": [],
             "elapsed": 0,
@@ -805,6 +809,7 @@ def _run_iteration_parallel(
                     "reasoning_effort": reasoning_effort,
                     "context_window": context_window,
                     "test_timeout": test_timeout,
+                    "original_user_prompt": case["user_prompt"],
                 }
             )
 
@@ -1322,7 +1327,13 @@ def _diversify_prompts(
         # Use cached variants if present in the test case
         cached = case.get("user_prompts")
         if cached and isinstance(cached, list) and len(cached) >= n_variants:
-            result[cid] = cached[:n_variants]
+            # Ensure original is always at slot 0
+            variants = cached[:n_variants]
+            if variants[0] != original:
+                variants = [v for v in variants if v != original]
+                variants.insert(0, original)
+                variants = variants[:n_variants]
+            result[cid] = variants
             print(
                 f"  {DIM}[{ci + 1}/{len(cases)}] {cid}...{RESET}"
                 f" {CYAN}{len(result[cid])} cached{RESET}"
@@ -1332,7 +1343,9 @@ def _diversify_prompts(
         # Partial cache: keep existing variants, only generate the delta
         existing: list[str] = []
         if cached and isinstance(cached, list):
-            existing = cached
+            # Ensure original is at slot 0
+            existing = [v for v in cached if v != original]
+            existing.insert(0, original)
 
         needed = n_variants - max(len(existing), 1)  # original is always slot 0
         if needed <= 0:
@@ -1546,9 +1559,12 @@ def _classify_failure(
     if not tools:
         return "no_tool_call"
     detail = run.get("detail", "")
-    if "timed out" in detail.lower():
+    lower_detail = detail.lower()
+    if "timed out" in lower_detail:
         return "timeout"
-    if detail.startswith("Error:"):
+    if "skipped" in lower_detail:
+        return "skipped"
+    if detail.startswith("Error:") or lower_detail.startswith("subprocess error:"):
         return "error"
 
     unmatched = run.get("unmatched", [])
@@ -1580,13 +1596,15 @@ def _build_failure_analysis(
     test_cases: list[dict[str, Any]],
 ) -> str:
     """Build a semantic failure analysis summary across all cases."""
+    case_index = {c["id"]: c for c in test_cases}
+
     # Classify every failed run
     mode_cases: dict[str, list[str]] = {}  # mode -> [case_id, ...]
     mode_details: dict[str, list[str]] = {}  # mode -> [detail strings]
     consistency: dict[str, str] = {}  # case_id -> systematic|flaky|marginal
 
     for case_id, case_result in iteration_result["cases"].items():
-        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        case_def = case_index.get(case_id)
         expected = case_def.get("expected_actions", []) if case_def else []
         pr = case_result["pass_rate"]
 
@@ -1633,6 +1651,7 @@ def _build_failure_analysis(
         "extra_tools": "Correct sequence but unnecessary extra calls",
         "timeout": "Timed out",
         "error": "Tool execution error",
+        "skipped": "Skipped (fast-fail)",
         "json_dump": "Tool call emitted as JSON text instead of function call",
     }
     for mode, cases in sorted(mode_cases.items(), key=lambda x: -len(x[1])):
@@ -1741,9 +1760,10 @@ def _run_analyst(
     then optimizer uses the diagnosis to modify the prompt.
     """
     # Build structured input: per-case results with rule-based pre-analysis
+    case_index = {c["id"]: c for c in test_cases}
     case_parts: list[str] = []
     for case_id, case_result in iteration_result["cases"].items():
-        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        case_def = case_index.get(case_id)
         if not case_def:
             continue
         pr = case_result["pass_rate"]
@@ -1853,9 +1873,10 @@ def _propose_prompt_modification(
 ) -> str:
     """Use the model to propose a new prompt based on evaluation results."""
     # Build summary of results
+    case_index = {c["id"]: c for c in test_cases}
     summary_parts: list[str] = []
     for case_id, case_result in iteration_result["cases"].items():
-        case_def = next((c for c in test_cases if c["id"] == case_id), None)
+        case_def = case_index.get(case_id)
         if not case_def:
             continue
         pr = case_result["pass_rate"]
@@ -2103,18 +2124,12 @@ def _append_summary_tsv(
     case_ids: list[str],
     cumulative_tokens: int = 0,
     node_score: float = 0.0,
+    wall_time: float = 0.0,
 ) -> None:
     """Append one row per iteration to a TSV summary file."""
     write_header = not os.path.exists(path) or os.path.getsize(path) == 0
     agg = iter_result.get("aggregate", {})
     per_case = agg.get("per_case_pass_rates", {})
-
-    # Compute iteration elapsed from individual run times
-    iter_elapsed = sum(
-        r.get("elapsed", 0)
-        for cr in iter_result.get("cases", {}).values()
-        for r in cr.get("runs", [])
-    )
     prompt_len = len(iter_result.get("prompt", ""))
 
     with open(path, "a") as f:
@@ -2144,7 +2159,7 @@ def _append_summary_tsv(
             str(agg.get("json_dumps", 0)),
             str(iter_result.get("tree_node_id", "")),
             f"{node_score:.4f}",
-            f"{iter_elapsed:.1f}",
+            f"{wall_time:.1f}",
             str(prompt_len),
             str(agg.get("total_tokens", 0)),
             str(cumulative_tokens),
@@ -2425,6 +2440,7 @@ def run_optimization(
         print(f"Iteration {iteration} ({tree_info})")
         print(f"{'=' * 60}")
 
+        iter_t0 = time.monotonic()
         iter_result = _run_iteration(
             client=client,
             model=model,
@@ -2477,12 +2493,14 @@ def run_optimization(
             json.dump(results, f, indent=2)
 
         _print_summary_table(iter_result)
+        iter_wall = time.monotonic() - iter_t0
         _append_summary_tsv(
             tsv_path,
             iter_result,
             case_ids,
             cumulative_tokens=cumulative_tokens,
             node_score=selected.score,
+            wall_time=iter_wall,
         )
 
         # Check if all passing
