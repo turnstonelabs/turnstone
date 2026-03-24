@@ -1280,6 +1280,16 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
+    # Trusted services (bridge, console-proxy) may forward the real user_id
+    # in the request body when creating workstreams on behalf of a user.
+    trusted_sources = {"bridge", "console-proxy", "console"}
+    if (
+        body.get("user_id")
+        and isinstance(body["user_id"], str)
+        and auth is not None
+        and auth.token_source in trusted_sources
+    ):
+        uid = body["user_id"]
     body_skill = body.get("skill", "")
     resume_ws_id = body.get("resume_ws", "")
     # Resolve skill — applies content + session config (model, temperature, etc.)

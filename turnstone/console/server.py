@@ -428,6 +428,9 @@ async def create_workstream(request: Request) -> JSONResponse:
 
     from turnstone.mq.protocol import CreateWorkstreamMessage
 
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = getattr(auth, "user_id", "") or ""
+
     # General pool — push to shared queue, any bridge picks it up
     if node_id == "pool":
         msg = CreateWorkstreamMessage(
@@ -436,6 +439,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             initial_message=initial_message,
             skill=skill,
             resume_ws=resume_ws,
+            user_id=uid,
         )
         broker.push_inbound(msg.to_json())
         log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
@@ -465,6 +469,7 @@ async def create_workstream(request: Request) -> JSONResponse:
         initial_message=initial_message,
         skill=skill,
         resume_ws=resume_ws,
+        user_id=uid,
     )
     broker.push_inbound(msg.to_json(), node_id=node_id)
 
