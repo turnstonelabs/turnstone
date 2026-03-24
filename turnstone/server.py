@@ -1280,9 +1280,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
-    # Trusted services (bridge, console-proxy) may forward the real user_id
-    # in the request body when creating workstreams on behalf of a user.
-    trusted_sources = {"bridge", "console-proxy", "console"}
+    # Trusted services (bridge, console) may forward the real user_id in the
+    # request body when creating workstreams on behalf of a user.  Only service
+    # identities are trusted — end-user tokens (including console-proxy tokens
+    # that carry the real user's identity) must not override user_id.
+    trusted_sources = {"bridge", "console"}
     if (
         body.get("user_id")
         and isinstance(body["user_id"], str)

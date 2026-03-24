@@ -1849,6 +1849,87 @@ class TestProxyAuthHeaders:
 
 
 # ---------------------------------------------------------------------------
+# Server: trusted user_id forwarding on create_workstream
+# ---------------------------------------------------------------------------
+
+
+class TestCreateWorkstreamUserIdTrust:
+    """Verify that only trusted service tokens can forward user_id in create_workstream."""
+
+    def _extract_uid(self, body: dict, auth_result) -> str:
+        """Replicate the trust check from server.py:create_workstream."""
+        auth = auth_result
+        uid: str = getattr(auth, "user_id", "") or ""
+        trusted_sources = {"bridge", "console"}
+        if (
+            body.get("user_id")
+            and isinstance(body["user_id"], str)
+            and auth is not None
+            and auth.token_source in trusted_sources
+        ):
+            uid = body["user_id"]
+        return uid
+
+    def test_bridge_can_forward_user_id(self):
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="bridge",
+            scopes=frozenset({"approve"}),
+            token_source="bridge",
+        )
+        uid = self._extract_uid({"user_id": "real-user-abc"}, auth)
+        assert uid == "real-user-abc"
+
+    def test_console_service_can_forward_user_id(self):
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="console",
+            scopes=frozenset({"approve"}),
+            token_source="console",
+        )
+        uid = self._extract_uid({"user_id": "real-user-abc"}, auth)
+        assert uid == "real-user-abc"
+
+    def test_console_proxy_user_cannot_override_user_id(self):
+        """End-user tokens via console-proxy must NOT override user_id."""
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="real-user-abc",
+            scopes=frozenset({"read", "write"}),
+            token_source="console-proxy",
+        )
+        uid = self._extract_uid({"user_id": "impersonated-user"}, auth)
+        # Should use JWT identity, NOT the body override
+        assert uid == "real-user-abc"
+
+    def test_direct_user_cannot_override_user_id(self):
+        """Direct JWT login must NOT override user_id."""
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="real-user-abc",
+            scopes=frozenset({"read", "write"}),
+            token_source="password",
+        )
+        uid = self._extract_uid({"user_id": "impersonated-user"}, auth)
+        assert uid == "real-user-abc"
+
+    def test_no_body_user_id_uses_jwt(self):
+        from turnstone.core.auth import AuthResult
+
+        auth = AuthResult(
+            user_id="bridge",
+            scopes=frozenset({"approve"}),
+            token_source="bridge",
+        )
+        uid = self._extract_uid({"name": "test-ws"}, auth)
+        assert uid == "bridge"
+
+
+# ---------------------------------------------------------------------------
 # Collector — MCP aggregation in get_overview()
 # ---------------------------------------------------------------------------
 
