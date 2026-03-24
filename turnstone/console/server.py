@@ -2774,6 +2774,16 @@ async def admin_usage(request: Request) -> JSONResponse:
         group_by=group_by,
     )
 
+    # Resolve user_id hex → username for display when grouped by user
+    if group_by == "user" and breakdown:
+        uid_to_name: dict[str, str] = {}
+        for u in storage.list_users():
+            uid_to_name[u["user_id"]] = u.get("username") or u["user_id"]
+        for row in breakdown:
+            raw_key = row.get("key", "")
+            if raw_key and raw_key in uid_to_name:
+                row["key"] = uid_to_name[raw_key]
+
     return JSONResponse({"summary": summary, "breakdown": breakdown})
 
 
@@ -2817,6 +2827,16 @@ async def admin_audit(request: Request) -> JSONResponse:
         since=since,
         until=until,
     )
+
+    # Resolve user_id hex → username for display
+    if events:
+        uid_to_name: dict[str, str] = {}
+        for u in storage.list_users():
+            uid_to_name[u["user_id"]] = u.get("username") or u["user_id"]
+        for ev in events:
+            raw_uid = ev.get("user_id", "")
+            if raw_uid and raw_uid in uid_to_name:
+                ev["username"] = uid_to_name[raw_uid]
 
     return JSONResponse({"events": events, "total": total})
 

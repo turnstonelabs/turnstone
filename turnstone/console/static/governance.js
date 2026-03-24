@@ -1838,7 +1838,9 @@ function _renderGovAudit(events, total) {
       _relativeTime(ev.timestamp) +
       "</span>" +
       '<span class="admin-col admin-col-auser">' +
-      escapeHtml(ev.user_id ? ev.user_id.slice(0, 8) : "\u2014") +
+      escapeHtml(
+        ev.username || (ev.user_id ? ev.user_id.slice(0, 8) : "\u2014"),
+      ) +
       "</span>" +
       '<span class="admin-col admin-col-aaction"><span class="' +
       actionCls +
