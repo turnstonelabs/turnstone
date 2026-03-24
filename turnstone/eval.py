@@ -14,7 +14,6 @@ Usage:
 import argparse
 import contextlib
 import difflib
-import io
 import json
 import math
 import os
@@ -161,13 +160,22 @@ def _fmt_args(args: dict[str, Any], max_len: int = 80) -> str:
 
 @contextlib.contextmanager
 def _suppress_stdout() -> Iterator[None]:
-    """Redirect stdout to devnull temporarily."""
-    old = sys.stdout
-    sys.stdout = io.StringIO()
+    """Redirect stdout to /dev/null at the file-descriptor level.
+
+    This is thread-safe unlike sys.stdout reassignment — the fd-level
+    redirect only affects writes to the actual fd 1, and restoring it
+    does not race with other threads' print() calls.
+    """
+    stdout_fd = sys.stdout.fileno()
+    saved_fd = os.dup(stdout_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, stdout_fd)
+    os.close(devnull)
     try:
         yield
     finally:
-        sys.stdout = old
+        os.dup2(saved_fd, stdout_fd)
+        os.close(saved_fd)
 
 
 # ─── Headless session ────────────────────────────────────────────────────────
