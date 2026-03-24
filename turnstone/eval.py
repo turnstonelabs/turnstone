@@ -12,7 +12,7 @@ Usage:
 """
 
 import argparse
-import contextlib
+import copy
 import difflib
 import json
 import math
@@ -23,7 +23,6 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -73,6 +72,7 @@ class EvolutionNode:
     node_id: int
     parent_id: int | None
     prompt: str
+    tool_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     score: float = 0.0
     visit_count: int = 0
     children: list[int] = field(default_factory=list)
@@ -155,29 +155,6 @@ def _fmt_args(args: dict[str, Any], max_len: int = 80) -> str:
     return out
 
 
-# ─── Stdout suppression ──────────────────────────────────────────────────────
-
-
-@contextlib.contextmanager
-def _suppress_stdout() -> Iterator[None]:
-    """Redirect stdout to /dev/null at the file-descriptor level.
-
-    This is thread-safe unlike sys.stdout reassignment — the fd-level
-    redirect only affects writes to the actual fd 1, and restoring it
-    does not race with other threads' print() calls.
-    """
-    stdout_fd = sys.stdout.fileno()
-    saved_fd = os.dup(stdout_fd)
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, stdout_fd)
-    os.close(devnull)
-    try:
-        yield
-    finally:
-        os.dup2(saved_fd, stdout_fd)
-        os.close(saved_fd)
-
-
 # ─── Headless session ────────────────────────────────────────────────────────
 
 
@@ -206,6 +183,7 @@ class HeadlessSession(ChatSession):
         auto_compact_pct: float = 0.8,
         agent_max_turns: int = -1,
         tool_truncation: int = 0,
+        tool_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(
             client=client,
@@ -225,6 +203,7 @@ class HeadlessSession(ChatSession):
         self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
         self._total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
+        self._eval_tools = _apply_tool_overrides(TOOLS, tool_overrides) if tool_overrides else TOOLS
         if system_prompt_override is not None:
             self._override_system_prompt(system_prompt_override)
 
@@ -271,7 +250,7 @@ class HeadlessSession(ChatSession):
                 client=self.client,
                 model=self.model,
                 messages=msgs,
-                tools=TOOLS,
+                tools=self._eval_tools,
                 max_tokens=self.max_tokens,
                 temperature=self.temperature,
                 reasoning_effort=self.reasoning_effort,
@@ -323,9 +302,9 @@ class HeadlessSession(ChatSession):
                 names = [tc["function"]["name"] for tc in result.tool_calls]
                 _log(f"{log_prefix}  turn {turn}: tools -> {names}")
 
-            # Execute tools with stdout suppressed
-            with _suppress_stdout():
-                results, _ = self._execute_tools(assistant_msg["tool_calls"])
+            # Execute tools (NullUI discards session output; tools return
+            # results as strings, not via stdout)
+            results, _ = self._execute_tools(assistant_msg["tool_calls"])
 
             for tc, (tc_id, raw_output) in zip(assistant_msg["tool_calls"], results, strict=False):
                 # Flatten list content (image tool results) to text for logging
@@ -393,6 +372,7 @@ def _run_single_test(
     verbose: bool = False,
     log_prefix: str = "",
     test_timeout: int = 300,
+    tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run a single test case once in an isolated temp directory.
 
@@ -423,24 +403,29 @@ def _run_single_test(
 
         os.chdir(workdir)
 
-        session = HeadlessSession(
-            client=client,
-            model=model,
-            system_prompt_override=system_prompt,
-            instructions=None,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tool_timeout=30,
-            reasoning_effort=reasoning_effort,
-            context_window=context_window,
-            tool_truncation=2000,
-        )
-
         max_turns = case.get("max_turns", 15)
         # Retry on transient API errors to avoid poisoning eval scores
         tool_log: list[dict[str, Any]] = []
+        final_content = ""
+        message_count = 0
+        total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
         _last_err: Exception | None = None
         for _attempt in range(3):
+            # Create session inside the loop so retries get a fresh one
+            # and timed-out orphan threads don't pin the old session in memory
+            session = HeadlessSession(
+                client=client,
+                model=model,
+                system_prompt_override=system_prompt,
+                instructions=None,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tool_timeout=30,
+                reasoning_effort=reasoning_effort,
+                context_window=context_window,
+                tool_truncation=2000,
+                tool_overrides=tool_overrides,
+            )
             executor: ThreadPoolExecutor | None = None
             try:
                 executor = ThreadPoolExecutor(max_workers=1)
@@ -454,24 +439,29 @@ def _run_single_test(
                 try:
                     tool_log = future.result(timeout=test_timeout)
                 except FuturesTimeoutError:
-                    # shutdown(wait=False) lets the TimeoutError propagate
-                    # immediately instead of blocking until the thread finishes.
-                    # The orphaned thread will eventually exit on its own.
-                    # Note: threads cannot be force-killed in CPython. In the
-                    # parallel path this is moot since each test runs in a
-                    # subprocess that can be terminated. The serial path
-                    # accepts the leak as a trade-off for simpler code.
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = None
+                    # Clear session ref so orphan thread is the only holder
+                    session = None  # type: ignore[assignment]
                     raise TimeoutError(f"Test timed out after {test_timeout}s") from None
                 else:
                     executor.shutdown(wait=False)
                     executor = None
+
+                # Extract results before releasing session
+                for msg in reversed(session.messages):
+                    if msg["role"] == "assistant" and msg.get("content"):
+                        final_content = msg["content"]
+                        break
+                message_count = len(session.messages)
+                total_usage = session.total_usage
+                session = None  # type: ignore[assignment]  # release memory
                 break
             except TimeoutError:
                 raise
             except Exception as _e:
                 _last_err = _e
+                session = None  # type: ignore[assignment]
                 if _attempt < 2:
                     time.sleep(2**_attempt)
             finally:
@@ -480,19 +470,13 @@ def _run_single_test(
         else:
             raise _last_err or RuntimeError("send_headless failed after 3 attempts")
 
-        final_content = ""
-        for msg in reversed(session.messages):
-            if msg["role"] == "assistant" and msg.get("content"):
-                final_content = msg["content"]
-                break
-
         elapsed = time.monotonic() - t0
         return {
             "tool_log": tool_log,
             "final_content": final_content,
-            "message_count": len(session.messages),
+            "message_count": message_count,
             "elapsed": round(elapsed, 1),
-            "usage": session.total_usage,
+            "usage": total_usage,
         }
     finally:
         reset_storage()
@@ -527,6 +511,7 @@ def _run_and_score_subprocess(params: dict[str, Any]) -> dict[str, Any]:
             verbose=False,
             log_prefix="",
             test_timeout=params["test_timeout"],
+            tool_overrides=params.get("tool_overrides"),
         )
 
         score_result = score_run(
@@ -781,6 +766,7 @@ def _run_iteration_parallel(
     test_timeout: int,
     parallel: int,
     prompt_variants: dict[str, list[str]] | None = None,
+    tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run all test cases in parallel using ProcessPoolExecutor."""
     # Build work items for every (case, run) combination
@@ -810,6 +796,7 @@ def _run_iteration_parallel(
                     "context_window": context_window,
                     "test_timeout": test_timeout,
                     "original_user_prompt": case["user_prompt"],
+                    "tool_overrides": tool_overrides,
                 }
             )
 
@@ -930,6 +917,7 @@ def _run_iteration(
     base_url: str = "",
     api_key: str = "",
     prompt_variants: dict[str, list[str]] | None = None,
+    tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run all test cases n_runs times and score them."""
     if parallel > 1 and base_url:
@@ -947,6 +935,7 @@ def _run_iteration(
             test_timeout=test_timeout,
             parallel=parallel,
             prompt_variants=prompt_variants,
+            tool_overrides=tool_overrides,
         )
 
     case_results: dict[str, Any] = {}
@@ -996,6 +985,7 @@ def _run_iteration(
                     verbose=verbose,
                     log_prefix=log_prefix,
                     test_timeout=test_timeout,
+                    tool_overrides=tool_overrides,
                 )
 
                 score_result = score_run(
@@ -1859,6 +1849,184 @@ def _run_analyst(
     return result
 
 
+TOOL_OPTIMIZER_SYSTEM = """\
+You are a tool description optimizer for an LLM coding assistant. You \
+receive the current tool definitions and test results showing where the \
+assistant picked the wrong tool.
+
+GOAL: Modify tool descriptions so the assistant picks the correct tool \
+for each task. Make MINIMAL, TARGETED changes.
+
+WHAT YOU CAN CHANGE:
+- The top-level "description" field on each tool.
+- The "description" field on individual parameters.
+
+WHAT YOU CANNOT CHANGE:
+- Tool names, parameter names, types, or required fields.
+- The number of tools or their parameter schemas.
+
+PRINCIPLES:
+- When two tools are confused, clarify the BOUNDARY between them. \
+State when to use each one and when NOT to.
+- Add negative guidance ("Do NOT use this for X") when confusion \
+is systematic.
+- Keep descriptions concise. Every word should help tool selection.
+- Preserve accurate descriptions of what the tool actually does.
+- Do not invent capabilities a tool does not have.
+
+OUTPUT FORMAT: A JSON object mapping tool names to override objects. \
+Only include tools you are modifying. Each override object can have:
+- "description": new top-level description string
+- "parameters": object mapping parameter names to new description strings
+
+Example:
+{"bash": {"description": "Execute a bash command. For running programs, \
+git, and system commands. Do NOT use for reading files (use read_file) \
+or searching code (use search)."}}
+
+Output ONLY the JSON object. No commentary outside the JSON.\
+"""
+
+
+def _has_wrong_tool_failures(
+    iter_result: dict[str, Any],
+    test_cases: list[dict[str, Any]],
+) -> bool:
+    """Check if any failures involve tool confusion (wrong tool selected)."""
+    case_index = {c["id"]: c for c in test_cases}
+    for case_id, case_result in iter_result["cases"].items():
+        if case_result["pass_rate"] == 1.0:
+            continue
+        case_def = case_index.get(case_id)
+        expected = case_def.get("expected_actions", []) if case_def else []
+        for run in case_result["runs"]:
+            if not run.get("pass") and _classify_failure(run, expected) == "wrong_tool":
+                return True
+    return False
+
+
+def _propose_tool_overrides(
+    client: Any,
+    model: str,
+    current_tools: list[dict[str, Any]],
+    current_overrides: dict[str, dict[str, Any]],
+    test_cases: list[dict[str, Any]],
+    iteration_result: dict[str, Any],
+    analyst_output: str,
+    provider: LLMProvider | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Propose tool description overrides based on failure analysis.
+
+    Returns a merged override dict (current + new changes).
+    """
+    # Build effective tool descriptions for display
+    effective_tools = _apply_tool_overrides(current_tools, current_overrides)
+    tool_parts: list[str] = []
+    for tool in effective_tools:
+        fn = tool["function"]
+        params = fn.get("parameters", {}).get("properties", {})
+        param_descs = ", ".join(f"{k}: {v.get('description', '')}" for k, v in params.items())
+        tool_parts.append(f"- {fn['name']}: {fn['description']}")
+        if param_descs:
+            tool_parts.append(f"    params: {param_descs}")
+
+    # Collect only wrong_tool failures
+    case_index = {c["id"]: c for c in test_cases}
+    confusion_parts: list[str] = []
+    for case_id, case_result in iteration_result["cases"].items():
+        if case_result["pass_rate"] == 1.0:
+            continue
+        case_def = case_index.get(case_id)
+        expected = case_def.get("expected_actions", []) if case_def else []
+        for run in case_result["runs"]:
+            if run.get("pass"):
+                continue
+            if _classify_failure(run, expected) == "wrong_tool" and case_def:
+                expected_names = [
+                    expected[i]["tool"] for i in run.get("unmatched", []) if i < len(expected)
+                ]
+                actual = run.get("tool_sequence", [])
+                confusion_parts.append(
+                    f"- {case_id}: expected {expected_names}, got {actual}\n"
+                    f"    prompt: {case_def['user_prompt']}"
+                )
+
+    user_content = "## Current Tool Descriptions\n" + "\n".join(tool_parts) + "\n\n"
+    if current_overrides:
+        user_content += (
+            f"## Active Overrides\nAlready modified: {', '.join(sorted(current_overrides))}\n\n"
+        )
+    user_content += "## Tool Confusion Failures\n" + "\n".join(confusion_parts) + "\n\n"
+    if analyst_output:
+        user_content += f"## Analyst Diagnosis\n{analyst_output}\n\n"
+    user_content += (
+        "Modify the MINIMUM tool descriptions needed to resolve the confusion. "
+        "Output ONLY a JSON override object."
+    )
+
+    prov = provider or create_provider("openai")
+    cr = prov.create_completion(
+        client=client,
+        model=model,
+        messages=[
+            {"role": "system", "content": TOOL_OPTIMIZER_SYSTEM},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=4096,
+        temperature=0.3,
+        reasoning_effort="medium",
+    )
+
+    raw = (cr.content or "").strip()
+    # Strip reasoning tags
+    raw = re.sub(
+        r"<(?:think|reasoning)>.*?</(?:think|reasoning)>", "", raw, flags=re.DOTALL
+    ).strip()
+    # Strip markdown fences
+    fence_match = re.search(r"```[^\n]*\n(.*?)```", raw, re.DOTALL)
+    if fence_match:
+        raw = fence_match.group(1).strip()
+
+    try:
+        new_overrides = json.loads(raw)
+    except json.JSONDecodeError:
+        _log(f"  Tool optimizer returned invalid JSON: {raw[:200]}", dim=True)
+        return current_overrides
+
+    if not isinstance(new_overrides, dict):
+        return current_overrides
+
+    # Validate: only allow known tool names, only description/parameters keys
+    valid_names = {t["function"]["name"] for t in current_tools}
+    validated: dict[str, dict[str, Any]] = {}
+    for name, override in new_overrides.items():
+        if name not in valid_names or not isinstance(override, dict):
+            continue
+        clean: dict[str, Any] = {}
+        if "description" in override and isinstance(override["description"], str):
+            clean["description"] = override["description"]
+        if "parameters" in override and isinstance(override["parameters"], dict):
+            clean["parameters"] = {
+                k: v for k, v in override["parameters"].items() if isinstance(v, str)
+            }
+        if clean:
+            validated[name] = clean
+
+    # Merge: new overrides take precedence, deep-merge parameters
+    merged = {**current_overrides}
+    for name, override in validated.items():
+        if name in merged:
+            existing = merged[name]
+            combined = {**existing, **override}
+            if "parameters" in existing and "parameters" in override:
+                combined["parameters"] = {**existing["parameters"], **override["parameters"]}
+            merged[name] = combined
+        else:
+            merged[name] = override
+
+    return merged
+
+
 def _propose_prompt_modification(
     client: Any,
     model: str,
@@ -1870,6 +2038,7 @@ def _propose_prompt_modification(
     provider: LLMProvider | None = None,
     parent_scores: dict[str, float] | None = None,
     analyst_output: str = "",
+    tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Use the model to propose a new prompt based on evaluation results."""
     # Build summary of results
@@ -1926,6 +2095,15 @@ def _propose_prompt_modification(
     # Failure analysis from analyst agent (phase 1)
     if analyst_output:
         user_content += f"## Failure Analysis (from analyst)\n{analyst_output}\n\n"
+
+    if tool_overrides:
+        user_content += (
+            "## Note: Tool Descriptions Modified\n"
+            "The tool optimizer has customized descriptions for: "
+            f"{', '.join(sorted(tool_overrides))}. "
+            "You do not need to add workarounds for tool confusion already "
+            "addressed by the modified descriptions.\n\n"
+        )
 
     user_content += (
         f"## Score History\n{history_text}\n\n"
@@ -2004,7 +2182,7 @@ def _ucb_select(nodes: dict[int, EvolutionNode], c: float) -> int:
 
 def _node_to_dict(node: EvolutionNode) -> dict[str, Any]:
     """Serialize an EvolutionNode for JSON output."""
-    return {
+    d: dict[str, Any] = {
         "node_id": node.node_id,
         "parent_id": node.parent_id,
         "prompt": node.prompt,
@@ -2013,6 +2191,39 @@ def _node_to_dict(node: EvolutionNode) -> dict[str, Any]:
         "children": node.children,
         "iteration": node.iteration,
     }
+    if node.tool_overrides:
+        d["tool_overrides"] = node.tool_overrides
+    return d
+
+
+def _apply_tool_overrides(
+    tools: list[dict[str, Any]],
+    overrides: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply description overrides to a tool list.
+
+    Returns the original list when overrides is empty, otherwise a new list
+    with deep-copied entries for modified tools (unmodified tools are shared).
+    Never mutates the input tools or the module-level TOOLS constant.
+    """
+    if not overrides:
+        return tools
+    result = []
+    for tool in tools:
+        name = tool["function"]["name"]
+        if name not in overrides:
+            result.append(tool)
+            continue
+        t = copy.deepcopy(tool)
+        ov = overrides[name]
+        if "description" in ov:
+            t["function"]["description"] = ov["description"]
+        for param, desc in ov.get("parameters", {}).items():
+            props = t["function"].get("parameters", {}).get("properties", {})
+            if param in props:
+                props[param]["description"] = desc
+        result.append(t)
+    return result
 
 
 def _filter_for_optimizer(
@@ -2147,6 +2358,7 @@ def _append_summary_tsv(
                 "prompt_len",
                 "iter_tokens",
                 "cumul_tokens",
+                "tool_changes",
             ] + [f"case:{cid}" for cid in case_ids]
             f.write("\t".join(cols) + "\n")
 
@@ -2163,6 +2375,7 @@ def _append_summary_tsv(
             str(prompt_len),
             str(agg.get("total_tokens", 0)),
             str(cumulative_tokens),
+            str(len(iter_result.get("tool_overrides", {}))),
         ] + [f"{per_case.get(cid, 0):.4f}" for cid in case_ids]
         f.write("\t".join(vals) + "\n")
 
@@ -2197,6 +2410,10 @@ def run_optimization(
     diversifier_model: str | None = None,
     diversify: int = 0,
     save_variants: bool = False,
+    optimize_tools: bool = False,
+    tool_optimizer_base_url: str | None = None,
+    tool_optimizer_model: str | None = None,
+    save_tools: bool = False,
     explore_constant: float = 1.414,
 ) -> dict[str, Any]:
     """Main optimization loop with UCB tree search.
@@ -2263,6 +2480,15 @@ def run_optimization(
     div_key = os.environ.get(div_key_env, opt_key)
     div_client, div_provider = _make_client_and_provider(div_base, div_key)
 
+    # --- Tool optimizer model (inherits from optimizer if not specified) ---
+    tool_opt_base = tool_optimizer_base_url or opt_base
+    tool_opt_model = tool_optimizer_model or opt_model
+    tool_opt_key_env = (
+        "ANTHROPIC_API_KEY" if _detect_provider(tool_opt_base) == "anthropic" else "OPENAI_API_KEY"
+    )
+    tool_opt_key = os.environ.get(tool_opt_key_env, opt_key)
+    tool_opt_client, tool_opt_provider = _make_client_and_provider(tool_opt_base, tool_opt_key)
+
     # Log role assignments
     _log(f"  Test model:  {model} @ {base_url}", dim=True)
     _log(f"  Optimizer:   {opt_model} @ {opt_base}", dim=True)
@@ -2272,6 +2498,8 @@ def run_optimization(
         _log(f"  Analyst:     {ana_model} @ {ana_base}", dim=True)
     if diversify > 0 and (div_model != opt_model or div_base != opt_base):
         _log(f"  Diversifier: {div_model} @ {div_base}", dim=True)
+    if optimize_tools and (tool_opt_model != opt_model or tool_opt_base != opt_base):
+        _log(f"  Tool opt:    {tool_opt_model} @ {tool_opt_base}", dim=True)
 
     # Load test cases
     with open(test_file) as f:
@@ -2458,6 +2686,7 @@ def run_optimization(
             base_url=base_url,
             api_key=api_key,
             prompt_variants=prompt_variants,
+            tool_overrides=selected.tool_overrides or None,
         )
         iter_result["iteration"] = iteration
         iter_result["prompt"] = selected.prompt
@@ -2465,6 +2694,8 @@ def run_optimization(
         iter_result["optimizer_system"] = current_optimizer_system
         iter_result["timestamp"] = datetime.now().isoformat()
         iter_result["tree_node_id"] = selected_id
+        if selected.tool_overrides:
+            iter_result["tool_overrides"] = selected.tool_overrides
 
         # Update node score (rolling mean)
         new_score = _compute_holdout_score(iter_result, holdout_ids)
@@ -2570,7 +2801,37 @@ def run_optimization(
             if analyst_output:
                 iter_result["analyst"] = analyst_output
 
-            # Phase 2: Optimizer modifies prompt using analyst diagnosis
+            # Phase 2: Tool optimizer (when enabled and tool confusion detected)
+            new_tool_overrides = selected.tool_overrides
+            if optimize_tools and not _has_wrong_tool_failures(opt_result, opt_cases):
+                _log("  Tool optimizer skipped (no tool confusion detected)", dim=True)
+            elif optimize_tools:
+                print("\nOptimizing tool descriptions...")
+                try:
+                    new_tool_overrides = _propose_tool_overrides(
+                        client=tool_opt_client,
+                        model=tool_opt_model,
+                        current_tools=TOOLS,
+                        current_overrides=selected.tool_overrides,
+                        test_cases=opt_cases,
+                        iteration_result=opt_result,
+                        analyst_output=analyst_output,
+                        provider=tool_opt_provider,
+                    )
+                    if new_tool_overrides != selected.tool_overrides:
+                        added_tools = set(new_tool_overrides) - set(selected.tool_overrides)
+                        modified_tools = set(new_tool_overrides) & set(selected.tool_overrides)
+                        parts = []
+                        if added_tools:
+                            parts.append(f"added: {', '.join(sorted(added_tools))}")
+                        if modified_tools:
+                            parts.append(f"updated: {', '.join(sorted(modified_tools))}")
+                        _log(f"  Tool overrides: {'; '.join(parts)}", dim=True)
+                        iter_result["tool_overrides"] = new_tool_overrides
+                except Exception as e:
+                    _log(f"  Tool optimization failed: {e}", dim=True)
+
+            # Phase 3: Prompt optimizer modifies prompt using analyst diagnosis
             print("\nOptimizing prompt...")
             try:
                 new_prompt = _propose_prompt_modification(
@@ -2584,23 +2845,29 @@ def run_optimization(
                     provider=opt_provider,
                     parent_scores=parent_scores,
                     analyst_output=analyst_output,
+                    tool_overrides=new_tool_overrides or None,
                 )
             except Exception as e:
                 _log(f"  Prompt modification failed: {e}", dim=True)
                 continue
 
-            if new_prompt != selected.prompt:
+            prompt_changed = new_prompt != selected.prompt
+            tools_changed = new_tool_overrides != selected.tool_overrides
+
+            if prompt_changed:
                 diff = _simple_diff(selected.prompt, new_prompt)
                 print(f"Prompt modified ({len(selected.prompt)} -> {len(new_prompt)} chars)")
                 if diff:
                     print(diff)
                 iter_result["prompt_diff"] = diff
 
+            if prompt_changed or tools_changed:
                 # Add child node to evolution tree
                 child = EvolutionNode(
                     node_id=next_node_id,
                     parent_id=selected_id,
                     prompt=new_prompt,
+                    tool_overrides=new_tool_overrides,
                     iteration=iteration,
                     optimizer_system=current_optimizer_system,
                 )
@@ -2619,7 +2886,7 @@ def run_optimization(
                 with open(output_file, "w") as f:
                     json.dump(results, f, indent=2)
             else:
-                print("Optimizer returned identical prompt. Stopping.")
+                print("No changes to prompt or tool descriptions. Stopping.")
                 break
 
     # Report best node
@@ -2632,6 +2899,29 @@ def run_optimization(
         f"\nBest node: {best_node.node_id} "
         f"(score={best_node.score:.2%}, visits={best_node.visit_count})"
     )
+    if best_node.tool_overrides:
+        print(f"  Tool overrides: {', '.join(sorted(best_node.tool_overrides))}")
+
+    # Save optimized tool descriptions back to JSON files
+    if save_tools and best_node.tool_overrides:
+        from turnstone.core.tools import _TOOLS_DIR
+
+        for tool_name, override in best_node.tool_overrides.items():
+            tool_path = _TOOLS_DIR / f"{tool_name}.json"
+            if not tool_path.exists():
+                continue
+            with open(tool_path) as f:
+                tool_json = json.load(f)
+            if "description" in override:
+                tool_json["description"] = override["description"]
+            for param, desc in override.get("parameters", {}).items():
+                if param in tool_json.get("parameters", {}).get("properties", {}):
+                    tool_json["parameters"]["properties"][param]["description"] = desc
+            with open(tool_path, "w") as f:
+                json.dump(tool_json, f, indent=2)
+                f.write("\n")
+            print(f"  Saved: {tool_path}")
+
     print(f"Results written to {output_file}")
     return results
 
@@ -2722,6 +3012,26 @@ def main() -> None:
         "--save-variants",
         action="store_true",
         help="Save generated variants back to test suite JSON for caching",
+    )
+    parser.add_argument(
+        "--optimize-tools",
+        action="store_true",
+        help="Enable tool description optimization alongside prompt optimization",
+    )
+    parser.add_argument(
+        "--tool-optimizer-model",
+        default=None,
+        help="Model for tool description optimization (default: same as --optimizer-model)",
+    )
+    parser.add_argument(
+        "--tool-optimizer-base-url",
+        default=None,
+        help="Base URL for tool optimizer model (default: same as --optimizer-base-url)",
+    )
+    parser.add_argument(
+        "--save-tools",
+        action="store_true",
+        help="Write optimized tool descriptions back to turnstone/tools/*.json",
     )
     parser.add_argument(
         "--prompt",
@@ -2850,6 +3160,10 @@ def main() -> None:
         diversifier_model=args.diversifier_model,
         diversify=args.diversify,
         save_variants=args.save_variants,
+        optimize_tools=args.optimize_tools,
+        tool_optimizer_base_url=args.tool_optimizer_base_url,
+        tool_optimizer_model=args.tool_optimizer_model,
+        save_tools=args.save_tools,
         explore_constant=args.explore_constant,
     )
 
