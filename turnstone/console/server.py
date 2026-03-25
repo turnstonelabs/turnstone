@@ -769,8 +769,25 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     "OIDC JWKS prefetch failed — will retry on first login",
                     exc_info=True,
                 )
+    # TLS: init CA, issue console certs, start renewal
+    tls_mgr = getattr(app.state, "tls_manager", None)
+    if tls_mgr is not None:
+        import socket
+
+        try:
+            if not tls_mgr.ca_initialized:
+                await tls_mgr.init_ca()
+            hostname = socket.getfqdn()
+            await tls_mgr.issue_console_certs([hostname, "localhost", "127.0.0.1"])
+            tls_mgr.start_renewal()
+        except Exception:
+            log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
+
     yield
     # Shutdown
+    tls_mgr = getattr(app.state, "tls_manager", None)
+    if tls_mgr is not None:
+        await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
     await app.state.proxy_sse_client.aclose()
@@ -4581,6 +4598,58 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# TLS endpoints
+# ---------------------------------------------------------------------------
+
+
+async def tls_ca_cert(request: Request) -> Response:
+    """GET /v1/api/admin/tls/ca.pem — Download CA root certificate."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    mgr = getattr(request.app.state, "tls_manager", None)
+    if mgr is None or not mgr.ca_initialized:
+        return JSONResponse({"error": "TLS not enabled"}, status_code=404)
+    return Response(
+        content=mgr.get_root_cert_pem(),
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": "attachment; filename=turnstone-ca.pem"},
+    )
+
+
+async def tls_ca_status(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/tls/ca — CA status."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    mgr = getattr(request.app.state, "tls_manager", None)
+    if mgr is None or not mgr.ca_initialized:
+        return JSONResponse({"enabled": False})
+    from turnstone.console.tls import _CA_CN
+
+    certs = mgr.list_certs()
+    return JSONResponse(
+        {
+            "enabled": True,
+            "ca_cn": _CA_CN,
+            "cert_count": len(certs),
+            "certs": [
+                {
+                    "domain": c.domain,
+                    "issued_at": c.issued_at.isoformat(),
+                    "expires_at": c.expires_at.isoformat(),
+                }
+                for c in certs
+            ],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -4595,6 +4664,7 @@ def create_app(
     proxy_auth_token: str = "",
     proxy_token_mgr: Any = None,
     cors_origins: list[str] | None = None,
+    tls_manager: Any = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -4817,6 +4887,9 @@ def create_app(
                         admin_rescan_skill,
                         methods=["POST"],
                     ),
+                    # TLS / ACME
+                    Route("/api/admin/tls/ca", tls_ca_status),
+                    Route("/api/admin/tls/ca.pem", tls_ca_cert),
                 ],
             ),
             Route("/health", health),
@@ -4842,6 +4915,13 @@ def create_app(
     app.state.auth_storage = auth_storage
     app.state.proxy_auth_token = proxy_auth_token
     app.state.proxy_token_mgr = proxy_token_mgr
+    app.state.tls_manager = tls_manager
+
+    # Mount ACME responder if TLS is enabled
+    if tls_manager is not None and tls_manager.ca_initialized:
+        from starlette.routing import Mount as RouteMount
+
+        app.routes.insert(0, RouteMount("/acme", app=tls_manager.get_responder()))
 
     from turnstone.core.auth import LoginRateLimiter
 

@@ -157,7 +157,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/api/auth/oidc/callback",
     }
 )
-PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
+PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
