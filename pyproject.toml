@@ -53,7 +53,8 @@ anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
 ddg = ["ddgs>=9.0"]
 discord = ["discord.py>=2.4", "redis>=7.2"]
-all = ["turnstone[mq,console,sim,anthropic,postgres,discord,ddg]"]
+tls = ["lacme>=1.0.1"]
+all = ["turnstone[mq,console,sim,anthropic,postgres,discord,ddg,tls]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
@@ -167,6 +168,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["ddgs", "ddgs.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["lacme", "lacme.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

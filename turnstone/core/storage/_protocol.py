@@ -952,6 +952,49 @@ class StorageBackend(Protocol):
         """Delete an MCP server definition. Returns True if existed."""
         ...
 
+    # -- TLS / ACME (lacme Store) ----------------------------------------------
+
+    def save_tls_account_key(self, key_id: str, key_pem: str) -> None:
+        """Persist an ACME account private key."""
+        ...
+
+    def load_tls_account_key(self, key_id: str) -> str | None:
+        """Load an ACME account key PEM by ID. Returns None if not found."""
+        ...
+
+    def save_tls_ca(self, name: str, cert_pem: str, key_pem: str) -> None:
+        """Persist a CA root certificate and key."""
+        ...
+
+    def load_tls_ca(self, name: str) -> dict[str, Any] | None:
+        """Load CA cert+key by name. Returns dict with cert_pem, key_pem or None."""
+        ...
+
+    def save_tls_cert(
+        self,
+        domain: str,
+        cert_pem: str,
+        fullchain_pem: str,
+        key_pem: str,
+        issued_at: str,
+        expires_at: str,
+        meta: str | None = None,
+    ) -> None:
+        """Persist an issued certificate (upsert by domain)."""
+        ...
+
+    def load_tls_cert(self, domain: str) -> dict[str, Any] | None:
+        """Load certificate by domain. Returns dict or None."""
+        ...
+
+    def list_tls_certs(self) -> list[dict[str, Any]]:
+        """List all stored certificates."""
+        ...
+
+    def delete_tls_cert(self, domain: str) -> bool:
+        """Delete a certificate by domain. Returns True if existed."""
+        ...
+
     # -- Lifecycle -------------------------------------------------------------
 
     def close(self) -> None:

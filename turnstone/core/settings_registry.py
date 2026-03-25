@@ -528,6 +528,29 @@ def _build_registry() -> dict[str, SettingDef]:
             "information from conversations into long-term memory. This helps the AI "
             "remember context across separate conversations.",
         ),
+        # -- tls ----------------------------------------------------------------
+        SettingDef(
+            "tls.enabled",
+            "bool",
+            False,
+            "Enable mTLS for inter-service communication",
+            "tls",
+            restart_required=True,
+            help="When enabled, the console runs an internal Certificate Authority and "
+            "ACME server. All cluster services (servers, bridge, channels) auto-provision "
+            "short-lived certificates for mutual TLS. Requires lacme: pip install turnstone[tls]",
+        ),
+        SettingDef(
+            "tls.acme_directory",
+            "str",
+            "",
+            "External ACME CA URL for the console's frontend HTTPS cert",
+            "tls",
+            restart_required=True,
+            help="Set to a public ACME directory URL (e.g. https://acme-v02.api.letsencrypt.org/"
+            "directory) to get a publicly trusted certificate for the console's HTTPS endpoint. "
+            "Leave empty to self-issue from the internal CA (use when behind a reverse proxy).",
+        ),
     ]
     return {d.key: d for d in defs}
 
@@ -543,7 +566,7 @@ BOOTSTRAP_SECTIONS: frozenset[str] = frozenset(
         "auth",
         "bridge",
         "console",
-    }
+    },
 )
 
 

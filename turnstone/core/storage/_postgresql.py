@@ -30,6 +30,9 @@ from turnstone.core.storage._schema import (
     skill_versions,
     structured_memories,
     system_settings,
+    tls_account_keys,
+    tls_ca,
+    tls_certificates,
     tool_policies,
     usage_events,
     user_roles,
@@ -2804,6 +2807,108 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount
+
+    # -- TLS / ACME ------------------------------------------------------------
+
+    def save_tls_account_key(self, key_id: str, key_pem: str) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = pg_insert(tls_account_keys).values(id=key_id, key_pem=key_pem, created=now)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["id"],
+            set_={"key_pem": key_pem},
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def load_tls_account_key(self, key_id: str) -> str | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(tls_account_keys.c.key_pem).where(tls_account_keys.c.id == key_id)
+            ).first()
+            return row[0] if row else None
+
+    def save_tls_ca(self, name: str, cert_pem: str, key_pem: str) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = pg_insert(tls_ca).values(name=name, cert_pem=cert_pem, key_pem=key_pem, created=now)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["name"],
+            set_={"cert_pem": cert_pem, "key_pem": key_pem},
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def load_tls_ca(self, name: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(sa.select(tls_ca).where(tls_ca.c.name == name)).first()
+            if not row:
+                return None
+            return _row_to_dict(row)
+
+    def save_tls_cert(
+        self,
+        domain: str,
+        cert_pem: str,
+        fullchain_pem: str,
+        key_pem: str,
+        issued_at: str,
+        expires_at: str,
+        meta: str | None = None,
+    ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(tls_certificates).values(
+            domain=domain,
+            cert_pem=cert_pem,
+            fullchain_pem=fullchain_pem,
+            key_pem=key_pem,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            meta=meta,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["domain"],
+            set_={
+                "cert_pem": cert_pem,
+                "fullchain_pem": fullchain_pem,
+                "key_pem": key_pem,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "meta": meta,
+            },
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def load_tls_cert(self, domain: str) -> dict[str, Any] | None:
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(tls_certificates).where(tls_certificates.c.domain == domain)
+            ).first()
+            if not row:
+                return None
+            return _row_to_dict(row)
+
+    def list_tls_certs(self) -> list[dict[str, Any]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(tls_certificates).order_by(tls_certificates.c.domain)
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
+
+    def delete_tls_cert(self, domain: str) -> bool:
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(tls_certificates).where(tls_certificates.c.domain == domain)
+            )
+            conn.commit()
+            return result.rowcount > 0
 
     # -- Lifecycle -------------------------------------------------------------
 

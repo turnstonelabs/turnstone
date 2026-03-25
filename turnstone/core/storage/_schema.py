@@ -547,3 +547,34 @@ oidc_pending_states = sa.Table(
     sa.Column("audience", sa.Text, nullable=False),
     sa.Column("created_at", sa.Text, nullable=False),
 )
+
+# ── TLS / ACME (lacme integration) ──────────────────────────────────────────
+
+tls_account_keys = sa.Table(
+    "tls_account_keys",
+    metadata,
+    sa.Column("id", sa.Text, primary_key=True),
+    sa.Column("key_pem", sa.Text, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+tls_ca = sa.Table(
+    "tls_ca",
+    metadata,
+    sa.Column("name", sa.Text, primary_key=True),
+    sa.Column("cert_pem", sa.Text, nullable=False),
+    sa.Column("key_pem", sa.Text, nullable=False),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+tls_certificates = sa.Table(
+    "tls_certificates",
+    metadata,
+    sa.Column("domain", sa.Text, primary_key=True),
+    sa.Column("cert_pem", sa.Text, nullable=False),
+    sa.Column("fullchain_pem", sa.Text, nullable=False),
+    sa.Column("key_pem", sa.Text, nullable=False),
+    sa.Column("issued_at", sa.Text, nullable=False),
+    sa.Column("expires_at", sa.Text, nullable=False),
+    sa.Column("meta", sa.Text, nullable=True),
+)

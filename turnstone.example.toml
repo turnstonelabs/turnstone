@@ -1,0 +1,124 @@
+# turnstone.toml — shared bootstrap configuration
+#
+# This file is read once at startup. Values here are overridden by
+# environment variables, which are in turn overridden by CLI flags.
+#
+# All sections are optional. Missing sections use binary defaults.
+# Config file location precedence:
+#   1. --config flag
+#   2. $TURNSTONE_CONFIG env var
+#   3. ~/.config/turnstone/config.toml
+
+# --- LLM API (turnstone, node, eval) ---
+
+[api]
+# base_url = ""                # API endpoint; empty = binary default
+# api_key = ""                 # env: OPENAI_API_KEY or ANTHROPIC_API_KEY
+
+# --- Default Model (turnstone, node, eval) ---
+
+[model]
+# name = ""                    # Model ID; empty = provider default (gpt-5 / claude-sonnet-4)
+# temperature = 0.0            # 0 = provider default
+# reasoning_effort = ""        # "low", "medium", "high", "max"
+# context_window = 0           # 0 = auto-detect from provider capabilities
+# max_tokens = 0               # 0 = provider default
+
+# --- Named Models (turnstone, node, eval) ---
+# Define model aliases with per-model overrides. Useful for local model
+# servers or mixing providers. Reference by name with --model flag.
+#
+# [models.local]
+# name = "llama-3-70b"
+# provider = "openai"
+# base_url = "http://localhost:8000/v1"
+# context_window = 8192
+#
+# [models.local.capabilities]
+# supports_vision = false
+# supports_web_search = false
+#
+# [models.claude]
+# name = "claude-opus-4-6"
+# provider = "anthropic"
+
+# --- Database (turnstone, node, console) ---
+
+[database]
+# url = ""                     # postgres://user:pass@host/db or /path/to.db
+                               # env: TURNSTONE_DB_URL
+# SSL params (passed through to SQLAlchemy connection):
+# sslmode = "prefer"           # disable, allow, prefer, require, verify-ca, verify-full
+# sslrootcert = ""             # path to CA cert for verify-ca/verify-full
+# sslcert = ""                 # path to client cert (mTLS)
+# sslkey = ""                  # path to client key (mTLS)
+
+# --- Redis (bridge, console, channel) ---
+
+[redis]
+# url = ""                     # redis://host:6379/0 or rediss://host:6380/0
+                               # env: TURNSTONE_REDIS_URL
+# TLS params (passed through to Redis connection):
+# tls = false                  # enable TLS (also auto-enabled by rediss:// scheme)
+# tls_ca = ""                  # path to CA cert
+# tls_cert = ""                # path to client cert (mTLS)
+# tls_key = ""                 # path to client key (mTLS)
+
+# --- Auth (node, console) ---
+
+[auth]
+# enabled = true               # env: TURNSTONE_AUTH_ENABLED
+# jwt_secret = ""              # HS256 signing secret (min 32 bytes recommended)
+                               # env: TURNSTONE_JWT_SECRET
+# token = ""                   # Static config token for full access
+                               # env: TURNSTONE_AUTH_TOKEN
+
+# --- Logging (turnstone, node, console) ---
+
+[log]
+# level = ""                   # "debug", "info", "warn", "error"
+                               # empty = binary default (warn for CLI, info for servers)
+                               # env: TURNSTONE_LOG_LEVEL
+# json = false                 # JSON output; auto-enabled when stderr is not a TTY
+
+# --- Session (turnstone, node) ---
+
+[session]
+# instructions = ""            # Default system message
+# compact_max_tokens = 32768   # Max tokens for context compaction summary
+# auto_compact_pct = 0.8       # Trigger compaction at this % of context window
+
+# --- Tools (turnstone, node) ---
+
+[tools]
+# timeout = 120                # Tool execution timeout in seconds
+# skip_permissions = false     # Auto-approve all tool calls
+
+# --- Judge (turnstone, node) ---
+
+[judge]
+# enabled = true               # Enable intent validation
+# confidence_threshold = 0.7   # Minimum confidence for heuristic verdicts
+# output_guard = true          # Scan tool output for security signals
+# redact_secrets = true        # Redact detected credentials in output
+
+# --- Memory (turnstone, node) ---
+
+[memory]
+# relevance_k = 5              # Top-K memories for context injection
+# fetch_limit = 50             # Max memories to fetch for ranking
+# max_content = 32768          # Max memory content size in chars
+# nudge_cooldown = 300         # Min seconds between metacognitive nudges
+# nudges = true                # Enable memory nudges
+
+# --- MCP (turnstone, node) ---
+
+[mcp]
+# config_path = ""             # Path to MCP servers config file (JSON)
+# refresh_interval = 14400     # Refresh interval in seconds (default: 4h)
+
+# --- Server (node, console) ---
+
+[server]
+# max_workstreams = 50         # Maximum concurrent workstreams per node
+                               # env: TURNSTONE_MAX_WORKSTREAMS

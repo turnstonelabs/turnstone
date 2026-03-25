@@ -983,6 +983,19 @@ wheels = [
 ]
 
 [[package]]
+name = "lacme"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/85/3f/0371df0b8c5d92697234893ec90168983d86a6608cadae01f287b9093aa9/lacme-1.0.1.tar.gz", hash = "sha256:d90f919f7eb98e6569d05acc9e8e86006540356d9c1321cb7dd868352965201f", size = 196508, upload-time = "2026-03-25T21:42:25.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/e4/fe7d02c95f20c4212683456da605125a28463d3838a77cbcab4234c63015/lacme-1.0.1-py3-none-any.whl", hash = "sha256:3ceb598c4044378d55f91ca661d5fab1366739711ca05f8e3f8143904a04a1a9", size = 70062, upload-time = "2026-03-25T21:42:24.023Z" },
+]
+
+[[package]]
 name = "librt"
 version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2347,6 +2360,7 @@ all = [
     { name = "croniter" },
     { name = "ddgs" },
     { name = "discord-py" },
+    { name = "lacme" },
     { name = "psycopg", extra = ["binary"] },
     { name = "redis" },
 ]
@@ -2383,6 +2397,9 @@ test = [
     { name = "pytest" },
     { name = "pytest-cov" },
 ]
+tls = [
+    { name = "lacme" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -2395,6 +2412,7 @@ requires-dist = [
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.4" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx-sse", specifier = ">=0.4" },
+    { name = "lacme", marker = "extra == 'tls'", specifier = ">=1.0.1" },
     { name = "mcp", specifier = ">=1.6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "openai", specifier = ">=2.24" },
@@ -2413,11 +2431,11 @@ requires-dist = [
     { name = "sse-starlette", specifier = ">=2.0" },
     { name = "starlette", specifier = ">=0.45" },
     { name = "structlog", specifier = ">=24.1" },
-    { name = "turnstone", extras = ["mq", "console", "sim", "anthropic", "postgres", "discord", "ddg"], marker = "extra == 'all'" },
+    { name = "turnstone", extras = ["mq", "console", "sim", "anthropic", "postgres", "discord", "ddg", "tls"], marker = "extra == 'all'" },
     { name = "types-redis", marker = "extra == 'dev'", specifier = ">=4.6" },
     { name = "uvicorn", specifier = ">=0.34" },
 ]
-provides-extras = ["test", "dev", "mq", "console", "sim", "anthropic", "postgres", "ddg", "discord", "all"]
+provides-extras = ["test", "dev", "mq", "console", "sim", "anthropic", "postgres", "ddg", "discord", "tls", "all"]
 
 [[package]]
 name = "types-cffi"
