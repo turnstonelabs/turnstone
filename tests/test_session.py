@@ -214,7 +214,7 @@ class TestPlanExec:
                         "id": tc_id,
                         "type": "function",
                         "function": {
-                            "name": "create_plan",
+                            "name": "plan_agent",
                             "arguments": json.dumps({"goal": prior_prompt}),
                         },
                     }
@@ -250,7 +250,7 @@ class TestPlanExec:
             m for m in messages if m["role"] == "assistant" and m.get("tool_calls")
         ]
         assert len(assistant_with_tc) == 1
-        assert assistant_with_tc[0]["tool_calls"][0]["function"]["name"] == "create_plan"
+        assert assistant_with_tc[0]["tool_calls"][0]["function"]["name"] == "plan_agent"
 
         # The real tool result is forwarded with its original content
         tool_msgs = [m for m in messages if m["role"] == "tool"]
@@ -463,7 +463,7 @@ class TestPlanRefinement:
         with patch.object(session, "_refine_plan", side_effect=fake_refine):
             items = [
                 {
-                    "func_name": "create_plan",
+                    "func_name": "plan_agent",
                     "call_id": "c1",
                     "prompt": "add auth",
                 }
@@ -576,7 +576,7 @@ class TestPlanRefinement:
         msgs = captured["messages"]
         assert msgs[0]["role"] == "system"
         assert msgs[1]["role"] == "assistant"
-        assert msgs[1]["tool_calls"][0]["function"]["name"] == "create_plan"
+        assert msgs[1]["tool_calls"][0]["function"]["name"] == "plan_agent"
         assert msgs[2]["role"] == "tool"
         assert msgs[2]["content"] == self.GOOD_PLAN
         assert msgs[3]["role"] == "user"

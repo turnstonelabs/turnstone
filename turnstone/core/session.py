@@ -867,17 +867,34 @@ class ChatSession:
             ]
         else:
             dev_parts = [
+                "You are an expert software engineer. You solve problems "
+                "by reading code, making targeted edits, and running commands. "
                 "Always respond with tool calls, not just text.\n\n"
                 "TOOL PATTERNS:\n\n"
                 "Modify existing file → read_file then edit_file:\n"
                 "   read_file(path='config.py') → "
                 "edit_file(path='config.py')\n\n"
-                "Create new file → write_file:\n"
-                "   write_file(path='hello.py', content='...')\n\n"
+                "Modify multiple files → read_file then edit_file each:\n"
+                "   read_file(path='a.py') → edit_file(path='a.py') → "
+                "read_file(path='b.py') → edit_file(path='b.py')\n\n"
+                "Create new file → write_file (generate reasonable "
+                "content even if the request is vague):\n"
+                "   write_file(path='hello.py', content='...')\n"
+                "   write_file(path='README.md', "
+                "content='# Project\\nDescription.')\n\n"
+                "Create a file then run it → write_file then bash:\n"
+                "   write_file(path='fib.py', content='...') → "
+                "bash(command='python fib.py')\n\n"
                 "Find something across files → search:\n"
                 "   search(query='test_')\n\n"
-                "Plan, design, or think through an approach → create_plan:\n"
-                "   create_plan(goal='refactor database from API')\n\n"
+                "Find and modify → search then read_file then edit_file:\n"
+                "   search(query='MAX_RETRIES') → "
+                "read_file(path='found.py') → "
+                "edit_file(path='found.py')\n\n"
+                "Plan, think through, or strategize → plan_agent:\n"
+                "   plan_agent(goal='refactor database layer "
+                "from monolith to service')\n"
+                "   plan_agent(goal='restructure auth module')\n\n"
                 "Run a command, git, or tests → bash:\n"
                 "   bash(command='git log -5')\n"
                 "   bash(command='pytest')\n\n"
@@ -885,8 +902,9 @@ class ChatSession:
                 "   web_fetch(url='https://example.com')\n\n"
                 "Search the web for information → web_search:\n"
                 "   web_search(query='current population of Tokyo')\n\n"
-                "Look up documentation → man:\n"
-                "   man(page='tar')",
+                "Look up command flags or documentation → man:\n"
+                "   man(page='tar')\n"
+                "   man(page='grep')",
             ]
         # Tool search hint (client-side mode only — native mode needs no hint)
         if self._tool_search:
@@ -2090,8 +2108,10 @@ class ChatSession:
                 }
             elif name == "notify":
                 it["func_args"] = {"message": it.get("message", "")[:200]}
-            elif name == "task":
+            elif name == "task_agent":
                 it["func_args"] = {"prompt": it.get("prompt", "")[:200]}
+            elif name == "plan_agent":
+                it["func_args"] = {"goal": it.get("prompt", "")[:200]}
             elif it.get("mcp_args"):
                 it["func_args"] = it["mcp_args"]
 
@@ -2219,7 +2239,7 @@ class ChatSession:
         # feedback the plan agent re-runs and the revised plan is shown
         # again, up to _MAX_PLAN_REFINEMENTS rounds.
         for i, item in enumerate(items):
-            if item.get("func_name") != "create_plan" or item.get("error") or item.get("denied"):
+            if item.get("func_name") != "plan_agent" or item.get("error") or item.get("denied"):
                 continue
 
             cid, output = results[i]
@@ -2344,8 +2364,8 @@ class ChatSession:
             "web_fetch": self._prepare_web_fetch,
             "web_search": self._prepare_web_search,
             "tool_search": self._prepare_tool_search,
-            "task": self._prepare_task,
-            "create_plan": self._prepare_plan,
+            "task_agent": self._prepare_task,
+            "plan_agent": self._prepare_plan,
             "memory": self._prepare_memory,
             "recall": self._prepare_recall,
             "notify": self._prepare_notify,
@@ -2877,8 +2897,8 @@ class ChatSession:
         if not prompt:
             return {
                 "call_id": call_id,
-                "func_name": "task",
-                "header": "\u2717 task: empty prompt",
+                "func_name": "task_agent",
+                "header": "\u2717 task_agent: empty prompt",
                 "preview": "",
                 "needs_approval": False,
                 "error": "Error: empty prompt",
@@ -2886,11 +2906,11 @@ class ChatSession:
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         return {
             "call_id": call_id,
-            "func_name": "task",
-            "header": "\u2699 task (autonomous agent)",
+            "func_name": "task_agent",
+            "header": "\u2699 task_agent (autonomous agent)",
             "preview": f"    {DIM}{preview_text}{RESET}",
             "needs_approval": True,
-            "approval_label": "task",
+            "approval_label": "task_agent",
             "execute": self._exec_task,
             "prompt": prompt,
         }
@@ -2901,8 +2921,8 @@ class ChatSession:
         if not goal:
             return {
                 "call_id": call_id,
-                "func_name": "create_plan",
-                "header": "\u2717 create_plan: empty goal",
+                "func_name": "plan_agent",
+                "header": "\u2717 plan_agent: empty goal",
                 "preview": "",
                 "needs_approval": False,
                 "error": "Error: empty goal",
@@ -2910,11 +2930,11 @@ class ChatSession:
         preview_text = goal[:300] + ("..." if len(goal) > 300 else "")
         return {
             "call_id": call_id,
-            "func_name": "create_plan",
-            "header": "\u2699 create_plan (planning agent)",
+            "func_name": "plan_agent",
+            "header": "\u2699 plan_agent (planning agent)",
             "preview": f"    {DIM}{preview_text}{RESET}",
             "needs_approval": True,
-            "approval_label": "create_plan",
+            "approval_label": "plan_agent",
             "execute": self._exec_plan,
             "prompt": goal,
         }
@@ -3920,7 +3940,7 @@ class ChatSession:
                 tool_name = tc_dict["function"]["name"]
 
                 # Guard 1: block recursive agent calls.
-                if tool_name in ("task", "create_plan"):
+                if tool_name in ("task_agent", "plan_agent"):
                     output = "Error: agents cannot spawn further agents"
                 # Guard 2: tool not in this agent's API tool list.
                 elif tool_name not in tool_names:
@@ -4123,7 +4143,7 @@ class ChatSession:
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
-                    if tc.get("function", {}).get("name") == "create_plan":
+                    if tc.get("function", {}).get("name") == "plan_agent":
                         tc_id = tc["id"]
                         for j in range(i + 1, len(self.messages)):
                             if (
@@ -4217,7 +4237,7 @@ class ChatSession:
                         "id": tc_id,
                         "type": "function",
                         "function": {
-                            "name": "create_plan",
+                            "name": "plan_agent",
                             "arguments": json.dumps({"goal": original_goal}),
                         },
                     }

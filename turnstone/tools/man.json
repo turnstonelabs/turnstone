@@ -1,6 +1,6 @@
 {
   "name": "man",
-  "description": "Read a man page. Use this instead of bash('man ...') or web_search. Returns the full formatted manual entry.",
+  "description": "Read a man page. Questions about command flags, options, or usage are tool-use tasks — use man, not memory. Use this to look up, check, or explain a command's flags, options, or usage — e.g. 'What does --xattrs do in tar?' → man(page='tar'). Use this instead of bash('man ...') or web_search for command documentation.",
   "parameters": {
     "type": "object",
     "properties": {
