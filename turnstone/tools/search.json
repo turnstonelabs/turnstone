@@ -1,6 +1,6 @@
 {
   "name": "search",
-  "description": "Search file contents for a regex pattern. Returns matching lines with file paths and line numbers. Searches recursively when path is a directory.",
+  "description": "Search file contents for a regex pattern. Returns matching lines with file paths and line numbers. Searches recursively when path is a directory. 'Find', 'locate', or 'grep' requests are tool-use tasks — use search, not memory. Use as the first step when you need to find where something is defined — e.g. search(query='def test_'). When filenames are already known, use read_file directly instead. When the task requires modifying code, follow up with read_file and edit_file — search results alone don't satisfy edit_file's read_file prerequisite.",
   "parameters": {
     "type": "object",
     "properties": {

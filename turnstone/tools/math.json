@@ -1,6 +1,6 @@
 {
   "name": "math",
-  "description": "Execute Python code for math/computation. Code MUST use print() to produce output. Available: sympy, numpy, scipy (with scipy.special, scipy.optimize, scipy.integrate, scipy.linalg), math, fractions, itertools, functools, collections, decimal, operator, random, re, string. Common sympy names (symbols, solve, simplify, expand, factor, sqrt, Rational, Matrix, integrate, diff, etc.) are pre-imported. Example: x = symbols('x'); print(solve(x**2 - 4, x))",
+  "description": "Execute Python code for math/computation. Use this for any arithmetic, algebra, or numerical task — e.g. math(code='print(2**64 - 1)'). Code must use print() to produce output. Available: sympy, numpy, scipy (with scipy.special, scipy.optimize, scipy.integrate, scipy.linalg), math, fractions, itertools, functools, collections, decimal, operator, random, re, string. Common sympy names (symbols, solve, simplify, expand, factor, sqrt, Rational, Matrix, integrate, diff, etc.) are pre-imported. Example: x = symbols('x'); print(solve(x**2 - 4, x))",
   "parameters": {
     "type": "object",
     "properties": {

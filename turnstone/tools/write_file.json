@@ -1,6 +1,6 @@
 {
   "name": "write_file",
-  "description": "Write content to a file, creating it if needed. Overwrites existing content.",
+  "description": "Create or overwrite a file. Call this immediately when asked to create, generate, or make a new file — no need to search or read_file first. Write reasonable content right away even if the request is vague. When content is unspecified, generate plausible content from the filename and request — e.g. write_file(path='README.md', content='# Project Name\\nA brief description.'). Prefer this over bash with echo/cat/heredoc for file creation. For modifying existing files, use edit_file instead.",
   "parameters": {
     "type": "object",
     "properties": {

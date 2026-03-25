@@ -22,6 +22,7 @@ import shutil
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -35,6 +36,9 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import init_storage, reset_storage
 from turnstone.core.tools import PRIMARY_KEY_MAP, TOOLS
+
+# Tools that require MCP servers — excluded from headless eval
+_MCP_ONLY_TOOLS = frozenset({"read_resource", "use_prompt"})
 
 # ─── Provider auto-detection ──────────────────────────────────────────────────
 
@@ -202,8 +206,13 @@ class HeadlessSession(ChatSession):
         )
         self.tool_call_log: list[dict[str, Any]] = []
         self.auto_approve = True
+        self._cancelled = threading.Event()
         self._total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
-        self._eval_tools = _apply_tool_overrides(TOOLS, tool_overrides) if tool_overrides else TOOLS
+        # Filter MCP-only tools that can't work in headless mode
+        base_tools = [t for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS]
+        self._eval_tools = (
+            _apply_tool_overrides(base_tools, tool_overrides) if tool_overrides else base_tools
+        )
         if system_prompt_override is not None:
             self._override_system_prompt(system_prompt_override)
 
@@ -240,11 +249,17 @@ class HeadlessSession(ChatSession):
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
 
         for turn in range(max_turns):
+            if self._cancelled.is_set():
+                break
+
             if verbose:
                 _log(f"{log_prefix}  turn {turn}: calling API...", dim=True)
 
             t0 = time.monotonic()
             msgs = self._full_messages()
+
+            if self._cancelled.is_set():
+                break
 
             result = self._provider.create_completion(
                 client=self.client,
@@ -411,10 +426,15 @@ def _run_single_test(
         total_usage: dict[str, int] = {"prompt": 0, "completion": 0}
         _last_err: Exception | None = None
         for _attempt in range(3):
-            # Create session inside the loop so retries get a fresh one
-            # and timed-out orphan threads don't pin the old session in memory
+            # Per-attempt client with request-level timeout so httpx aborts
+            # the HTTP request itself — no zombie connections on the server.
+            run_client = OpenAI(
+                base_url=client.base_url,
+                api_key=client.api_key,
+                timeout=float(test_timeout),
+            )
             session = HeadlessSession(
-                client=client,
+                client=run_client,
                 model=model,
                 system_prompt_override=system_prompt,
                 instructions=None,
@@ -439,12 +459,14 @@ def _run_single_test(
                 try:
                     tool_log = future.result(timeout=test_timeout)
                 except FuturesTimeoutError:
+                    session._cancelled.set()
+                    run_client.close()
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = None
-                    # Clear session ref so orphan thread is the only holder
                     session = None  # type: ignore[assignment]
                     raise TimeoutError(f"Test timed out after {test_timeout}s") from None
                 else:
+                    run_client.close()
                     executor.shutdown(wait=False)
                     executor = None
 
@@ -461,6 +483,7 @@ def _run_single_test(
                 raise
             except Exception as _e:
                 _last_err = _e
+                run_client.close()
                 session = None  # type: ignore[assignment]
                 if _attempt < 2:
                     time.sleep(2**_attempt)
@@ -1174,7 +1197,9 @@ For each failing case, classify:
 For each pattern found, state:
 - What the model is doing wrong (observed behavior)
 - Why it's doing it (root cause hypothesis)
-- What prompt change would fix it (specific, concrete)
+- What pattern or example could demonstrate the right behavior \
+(prefer "show" over "tell" — a concrete tool chain example teaches \
+better than a rule like "always do X")
 
 ## Output Format
 
@@ -1192,102 +1217,78 @@ For each pattern found, state:
 - Marginal: [case_ids] — [edge case description]
 
 ## Recommended Fixes (priority order)
-1. [Highest impact fix]: addresses [N] cases — [specific instruction to add/change]
+1. [Highest impact fix]: addresses [N] cases — [pattern/example to add or adjust]
 2. [Next fix]: ...
 ```
 
 Be concise. Focus on patterns, not individual case narratives. \
 The optimizer that reads your output needs actionable signal, \
-not lengthy explanations.\
+not lengthy explanations. Frame fixes as patterns/examples to add, \
+not imperative rules (avoid suggesting "ALWAYS", "NEVER", "MUST").\
 """
 
 
 OPTIMIZER_SYSTEM = """\
-You are a prompt optimizer. You receive a developer prompt (instructions \
-for a coding assistant on how to use its tools) and test results \
-showing how well the assistant followed them.
+You are a prompt optimizer. You receive a developer prompt that \
+teaches a coding assistant how to use its tools, along with test \
+results showing which tool-selection patterns the assistant gets \
+right and wrong.
 
-GOAL: Make targeted, minimal changes so more tests pass. One fix per \
-failing test case — do NOT rewrite the whole prompt.
+Your job: edit the prompt so more tests pass.
 
-KEEP / DISCARD RULE:
-- Any phrasing associated with a 100% pass rate test: KEEP VERBATIM.
-- For failing tests: diagnose why the assistant chose wrong, then add \
-or adjust the MINIMUM phrasing needed to fix that specific failure.
-- If removing a line yields equal or better results, remove it. \
-Simpler is always better at equal scores.
+Style — the prompt teaches through patterns and examples, not rules:
+- Good: "Plan a refactor → plan_agent:\\n   plan_agent(goal='...')"
+- Bad: "You MUST call plan_agent. NEVER skip it. ALWAYS use it."
+- If the current prompt contains imperative rules (MUST, NEVER, \
+ALWAYS, ABSOLUTE RULE, etc.), replace them with a pattern that \
+demonstrates the right behavior. Rules are noise — examples teach.
 
-WHAT YOU CAN CHANGE:
-- Add imperative instructions for specific tool-choice scenarios.
-- Reword unclear directives that cause the wrong tool to be selected.
-- Add concrete examples like bash(command='git log -5').
+Approach:
+- Study the analyst's failure diagnosis (included in the input) and \
+address the highest-priority patterns first.
+- For each failing case, trace why the assistant picked the wrong \
+tool, then add or adjust a pattern that demonstrates the right \
+choice.
+- Leave phrasing that drives 100%-pass cases alone.
+- Remove lines that aren't pulling their weight. Shorter prompts \
+that score the same are better prompts.
+- Stay within 130% of the original prompt length.
 
-WHAT YOU CANNOT CHANGE:
-- The list of available tools or their schemas.
-- The overall structure (system prompt for a coding assistant).
-- Phrasing tied to 100% pass rate cases.
-
-FAILURE ANALYSIS: The input includes a "Failure Analysis" section \
-produced by a separate analyst agent. It identifies semantic patterns \
-across failures, contrasts them with successes, and recommends specific \
-fixes in priority order. Use this to guide your edits — address the \
-highest-priority patterns first.
-
-STYLE: direct imperative sentences. One instruction per line. \
-Concrete tool call examples where helpful.
-
-LENGTH: no longer than 130% of the original prompt's length.
-
-Output ONLY the modified prompt. No commentary, no fences.\
+Output the modified prompt only. No commentary, no fences.\
 """
 
 
 OBSERVER_SYSTEM = """\
-You edit the optimizer's instructions shown below. The optimizer takes \
-a developer prompt and test results, then modifies the prompt to score \
-higher. Your job: tune the optimizer's instructions so it does a \
-better job.
+You tune the optimizer's instructions. The optimizer edits a developer \
+prompt to improve tool-selection test scores. Your output replaces \
+the optimizer's instructions — stay at the meta level (how the \
+optimizer should work, not the prompt itself).
 
-Your output replaces the optimizer's instructions. It must stay at \
-the same level — telling the optimizer HOW to modify prompts, not \
-modifying prompts yourself.
+Read the iteration history and look for trends:
+- Improving → small refinements only.
+- Plateau (same score 2+ iters) → the optimizer is stuck. Remove \
+ineffective guidance and try a different angle.
+- Regression → the last change hurt. Steer the optimizer away from \
+that kind of edit.
+- Oscillation → edits are too broad. Push toward smaller, more \
+targeted changes.
 
-Example of the right level (abbreviated):
-\"\"\"
-You are a prompt optimizer. You receive a developer prompt and test \
-results...
-GOAL: Make targeted, minimal changes so more tests pass...
-KEEP / DISCARD RULE: Any phrasing tied to 100% pass rate: keep...
-FAILURE MODE DIAGNOSIS: If text-only response → add "always call \
-a tool"...
-STYLE: direct imperative sentences...
-\"\"\"
+If scores haven't improved for 3+ iterations, nudge the optimizer \
+toward more structural changes — reordering sections, pruning dead \
+weight, or replacing rules with concrete tool chain examples.
 
-TREND ANALYSIS — look for these patterns:
-- Improving: the optimizer's approach is working. Make small \
-refinements only.
-- Plateau (same score for 2+ iterations): the optimizer is stuck. \
-Remove ineffective guidance and try a different strategy.
-- Regression (score dropped): the last change hurt. Instruct the \
-optimizer to revert that type of change and try something else.
-- Oscillation (score goes up/down): the optimizer is making changes \
-that are too broad. Tell it to make smaller, more targeted edits.
+Core principle: the developer prompt teaches by showing patterns \
+(e.g., "Find and modify → search then read_file then edit_file"), \
+not by stating rules (e.g., "always search before editing"). If the \
+optimizer is producing rules, steer it back toward examples.
 
-ESCALATION: If scores have not improved for 3+ iterations, instruct \
-the optimizer to try more radical approaches — restructure sections, \
-change the instruction style, or add/remove entire categories of \
-guidance.
+You can adjust: which failure modes to prioritize, whether to add \
+patterns or simplify, length guidance, and diagnosis-to-fix mappings.
 
-SCOPE — you can adjust:
-- Which failure modes the optimizer should prioritize.
-- Whether it should add examples, restructure, or simplify.
-- Length and style guidance.
-- Diagnosis-to-fix mappings.
+Make 2-3 targeted edits. Remove guidance that isn't working. Stay \
+under 150% of the input length.
 
-Make 2-3 targeted edits based on the iteration history. Remove \
-guidance that isn't working. Stay under 150% of the input length.
-
-Output ONLY the modified optimizer instructions.\
+Output the modified optimizer instructions only.\
 """
 
 
@@ -1365,7 +1366,7 @@ def _diversify_prompts(
                     {"role": "system", "content": DIVERSIFIER_SYSTEM},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=2048,
+                max_tokens=8192,
                 temperature=0.8,
                 reasoning_effort="low",
             )
@@ -1477,7 +1478,20 @@ def _observe_and_update_optimizer(
         has_bullets = "- " in prompt or "* " in prompt
         has_numbers = bool(re.search(r"^\d+\.", prompt, re.MULTILINE))
         has_headers = "**" in prompt or "##" in prompt
+        has_rules = bool(
+            re.search(
+                r"(?i)(always|never|do not|must|rule|important)",
+                prompt,
+            )
+        )
+        has_patterns = "→" in prompt
         notes: list[str] = []
+        if has_rules and not has_patterns:
+            notes.append("rule-heavy, few patterns")
+        elif has_rules and has_patterns:
+            notes.append("mixed rules and patterns")
+        elif has_patterns:
+            notes.append("pattern-based")
         if has_bullets or has_numbers:
             notes.append("used bullet/numbered lists")
         if has_headers:
@@ -1494,7 +1508,7 @@ def _observe_and_update_optimizer(
     user_content = (
         f"## Optimizer Instructions (edit these)\n"
         f"```\n{optimizer_system}\n```\n\n"
-        f"## What the Optimizer Produced (do NOT mimic this)\n"
+        f"## What the Optimizer Produced (style observations, not content to copy)\n"
         + "\n".join(behavior_notes)
         + "\n\n## Iteration History\n"
         + "\n".join(parts)
@@ -1508,7 +1522,7 @@ def _observe_and_update_optimizer(
             {"role": "system", "content": OBSERVER_SYSTEM},
             {"role": "user", "content": user_content},
         ],
-        max_tokens=2048,
+        max_tokens=8192,
         temperature=0.3,
         reasoning_effort="low",
     )
@@ -1742,6 +1756,8 @@ def _run_analyst(
     test_cases: list[dict[str, Any]],
     iteration_result: dict[str, Any],
     provider: LLMProvider | None = None,
+    optimize_tools: bool = False,
+    tool_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     """Run the analyst agent to produce a semantic failure analysis.
 
@@ -1779,9 +1795,45 @@ def _run_analyst(
     # Include rule-based pre-analysis as a starting point
     rule_analysis = _build_failure_analysis(iteration_result, test_cases)
 
-    user_content = "## Test Results\n" + "\n\n".join(case_parts)
+    # Always show available tool names so the analyst doesn't hallucinate
+    # about missing tools
+    tool_names = sorted(
+        t["function"]["name"] for t in TOOLS if t["function"]["name"] not in _MCP_ONLY_TOOLS
+    )
+    user_content = f"## Available Tools\n{', '.join(tool_names)}\n\n"
+    user_content += "## Test Results\n" + "\n\n".join(case_parts)
     if rule_analysis:
         user_content += f"\n\n## Rule-Based Pre-Analysis\n{rule_analysis}"
+
+    if optimize_tools:
+        # Include current tool descriptions (with any overrides applied)
+        effective_tools = _apply_tool_overrides(TOOLS, tool_overrides) if tool_overrides else TOOLS
+        tool_index = {t["function"]["name"]: t for t in effective_tools}
+        # Collect tools that appear in expected or actual sequences
+        relevant_names: set[str] = set()
+        for case_id, case_result in iteration_result["cases"].items():
+            case_def = case_index.get(case_id)
+            if not case_def:
+                continue
+            for action in case_def.get("expected_actions", []):
+                if isinstance(action, str):
+                    relevant_names.add(action)
+                elif isinstance(action, dict):
+                    tool_name = action.get("tool")
+                    if isinstance(tool_name, str):
+                        relevant_names.add(tool_name)
+            for run in case_result["runs"]:
+                for tool_name in run.get("tool_sequence", []):
+                    relevant_names.add(tool_name)
+        tool_parts: list[str] = []
+        for name in sorted(relevant_names):
+            tool = tool_index.get(name)
+            if tool:
+                desc = tool["function"].get("description", "")
+                tool_parts.append(f"**{name}**: {desc}")
+        if tool_parts:
+            user_content += "\n\n## Current Tool Descriptions\n" + "\n\n".join(tool_parts)
+
     user_content += (
         "\n\nAnalyze the semantic patterns across these results. "
         "Focus on WHY failures happen and what passing cases have in common. "
@@ -1789,9 +1841,20 @@ def _run_analyst(
         "build confusion matrices, or analyze distributions."
     )
 
+    analyst_system = ANALYST_SYSTEM
+    if optimize_tools:
+        analyst_system += (
+            "\n\nFOCUS: Tool description optimization mode. The system prompt "
+            "is frozen — your recommendations should target tool descriptions "
+            "and schemas, not system prompt wording. Analyze:\n"
+            "- Which tools are confused with each other and why\n"
+            "- What description changes would disambiguate them\n"
+            "- Whether parameter names/descriptions mislead the model"
+        )
+
     prov = provider or create_provider("openai")
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": ANALYST_SYSTEM},
+        {"role": "system", "content": analyst_system},
         {"role": "user", "content": user_content},
     ]
 
@@ -1803,7 +1866,7 @@ def _run_analyst(
             model=model,
             messages=messages,
             tools=_ANALYST_TOOLS,
-            max_tokens=4096,
+            max_tokens=8192,
             temperature=0.3,
             reasoning_effort="medium",
         )
@@ -1888,23 +1951,6 @@ Output ONLY the JSON object. No commentary outside the JSON.\
 """
 
 
-def _has_wrong_tool_failures(
-    iter_result: dict[str, Any],
-    test_cases: list[dict[str, Any]],
-) -> bool:
-    """Check if any failures involve tool confusion (wrong tool selected)."""
-    case_index = {c["id"]: c for c in test_cases}
-    for case_id, case_result in iter_result["cases"].items():
-        if case_result["pass_rate"] == 1.0:
-            continue
-        case_def = case_index.get(case_id)
-        expected = case_def.get("expected_actions", []) if case_def else []
-        for run in case_result["runs"]:
-            if not run.get("pass") and _classify_failure(run, expected) == "wrong_tool":
-                return True
-    return False
-
-
 def _propose_tool_overrides(
     client: Any,
     model: str,
@@ -1972,7 +2018,7 @@ def _propose_tool_overrides(
             {"role": "system", "content": TOOL_OPTIMIZER_SYSTEM},
             {"role": "user", "content": user_content},
         ],
-        max_tokens=4096,
+        max_tokens=8192,
         temperature=0.3,
         reasoning_effort="medium",
     )
@@ -2081,13 +2127,13 @@ def _propose_prompt_modification(
     user_content = f"## Current Prompt\n```\n{current_prompt}\n```\n\n"
     if passing:
         user_content += (
-            "## Passing Tests (DO NOT change phrasing that drives these)\n"
+            "## Passing Tests (leave the phrasing that drives these alone)\n"
             + "\n\n".join(passing)
             + "\n\n"
         )
     if failing:
         user_content += (
-            "## Failing Tests (diagnose each, make ONE targeted fix per case)\n"
+            "## Failing Tests (diagnose each, one targeted fix per case)\n"
             + "\n\n".join(failing)
             + "\n\n"
         )
@@ -2107,8 +2153,8 @@ def _propose_prompt_modification(
 
     user_content += (
         f"## Score History\n{history_text}\n\n"
-        "Make the MINIMUM change needed to fix failing tests without "
-        "breaking passing ones. Output ONLY the modified prompt text."
+        "Fix failing tests without breaking passing ones. "
+        "Output the modified prompt text only."
     )
 
     prov = provider or create_provider("openai")
@@ -2791,6 +2837,8 @@ def run_optimization(
                         test_cases=opt_cases,
                         iteration_result=opt_result,
                         provider=ana_provider,
+                        optimize_tools=optimize_tools,
+                        tool_overrides=selected.tool_overrides or None,
                     )
                     if analyst_output:
                         _log(f"  Analyst:\n{analyst_output}", dim=True)
@@ -2801,11 +2849,9 @@ def run_optimization(
             if analyst_output:
                 iter_result["analyst"] = analyst_output
 
-            # Phase 2: Tool optimizer (when enabled and tool confusion detected)
+            # Phase 2: Tool description optimizer
             new_tool_overrides = selected.tool_overrides
-            if optimize_tools and not _has_wrong_tool_failures(opt_result, opt_cases):
-                _log("  Tool optimizer skipped (no tool confusion detected)", dim=True)
-            elif optimize_tools:
+            if optimize_tools:
                 print("\nOptimizing tool descriptions...")
                 try:
                     new_tool_overrides = _propose_tool_overrides(
@@ -2827,29 +2873,50 @@ def run_optimization(
                         if modified_tools:
                             parts.append(f"updated: {', '.join(sorted(modified_tools))}")
                         _log(f"  Tool overrides: {'; '.join(parts)}", dim=True)
+
+                        # Show description diffs for each changed tool
+                        base_index = {t["function"]["name"]: t for t in TOOLS}
+                        prev_overrides = selected.tool_overrides or {}
+                        for tname in sorted(set(new_tool_overrides) | set(prev_overrides)):
+                            base_desc = (
+                                base_index.get(tname, {}).get("function", {}).get("description", "")
+                            )
+                            old_desc = prev_overrides.get(tname, {}).get("description", base_desc)
+                            new_desc = new_tool_overrides.get(tname, {}).get(
+                                "description", base_desc
+                            )
+                            if old_desc != new_desc:
+                                print(f"\n  {BOLD}{tname}{RESET}:")
+                                print(f"    {DIM}old: {old_desc}{RESET}")
+                                print(f"    new: {new_desc}")
+
                         iter_result["tool_overrides"] = new_tool_overrides
                 except Exception as e:
                     _log(f"  Tool optimization failed: {e}", dim=True)
+                    if optimize_tools:
+                        continue
 
-            # Phase 3: Prompt optimizer modifies prompt using analyst diagnosis
-            print("\nOptimizing prompt...")
-            try:
-                new_prompt = _propose_prompt_modification(
-                    client=opt_client,
-                    model=opt_model,
-                    current_prompt=selected.prompt,
-                    test_cases=opt_cases,
-                    iteration_result=opt_result,
-                    history=results["iterations"],
-                    optimizer_system=current_optimizer_system,
-                    provider=opt_provider,
-                    parent_scores=parent_scores,
-                    analyst_output=analyst_output,
-                    tool_overrides=new_tool_overrides or None,
-                )
-            except Exception as e:
-                _log(f"  Prompt modification failed: {e}", dim=True)
-                continue
+            # Phase 3: Prompt optimizer (skipped in --optimize-tools mode)
+            new_prompt = selected.prompt
+            if not optimize_tools:
+                print("\nOptimizing prompt...")
+                try:
+                    new_prompt = _propose_prompt_modification(
+                        client=opt_client,
+                        model=opt_model,
+                        current_prompt=selected.prompt,
+                        test_cases=opt_cases,
+                        iteration_result=opt_result,
+                        history=results["iterations"],
+                        optimizer_system=current_optimizer_system,
+                        provider=opt_provider,
+                        parent_scores=parent_scores,
+                        analyst_output=analyst_output,
+                        tool_overrides=new_tool_overrides or None,
+                    )
+                except Exception as e:
+                    _log(f"  Prompt modification failed: {e}", dim=True)
+                    continue
 
             prompt_changed = new_prompt != selected.prompt
             tools_changed = new_tool_overrides != selected.tool_overrides
@@ -3016,7 +3083,8 @@ def main() -> None:
     parser.add_argument(
         "--optimize-tools",
         action="store_true",
-        help="Enable tool description optimization alongside prompt optimization",
+        help="Optimize tool descriptions only (freeze system prompt). "
+        "Useful after system prompt optimization plateaus",
     )
     parser.add_argument(
         "--tool-optimizer-model",
