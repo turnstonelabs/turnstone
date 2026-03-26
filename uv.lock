@@ -984,15 +984,15 @@ wheels = [
 
 [[package]]
 name = "lacme"
-version = "1.0.1"
+version = "1.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/85/3f/0371df0b8c5d92697234893ec90168983d86a6608cadae01f287b9093aa9/lacme-1.0.1.tar.gz", hash = "sha256:d90f919f7eb98e6569d05acc9e8e86006540356d9c1321cb7dd868352965201f", size = 196508, upload-time = "2026-03-25T21:42:25.638Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2f/b7/aadbf032c95e61d83242b8e27a25853fdc19685747f4bd78968962271c8a/lacme-1.0.2.tar.gz", hash = "sha256:3059a39cee454f612869bf9e419d4e6f279a35e8ce9e6c130cc1b7721704ea4a", size = 199743, upload-time = "2026-03-26T00:42:02.581Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3a/e4/fe7d02c95f20c4212683456da605125a28463d3838a77cbcab4234c63015/lacme-1.0.1-py3-none-any.whl", hash = "sha256:3ceb598c4044378d55f91ca661d5fab1366739711ca05f8e3f8143904a04a1a9", size = 70062, upload-time = "2026-03-25T21:42:24.023Z" },
+    { url = "https://files.pythonhosted.org/packages/9f/a3/8e9495ee920e4c4a945ef2f0e4266dd4968a1511e630184990499f12025d/lacme-1.0.2-py3-none-any.whl", hash = "sha256:5bf7b859deddc8aab47619c8e165b85f4ff730bf0c0b9463789b5b01c51d9177", size = 71836, upload-time = "2026-03-26T00:42:00.797Z" },
 ]
 
 [[package]]
@@ -2412,7 +2412,7 @@ requires-dist = [
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.4" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "httpx-sse", specifier = ">=0.4" },
-    { name = "lacme", marker = "extra == 'tls'", specifier = ">=1.0.1" },
+    { name = "lacme", marker = "extra == 'tls'", specifier = ">=1.0.2" },
     { name = "mcp", specifier = ">=1.6" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "openai", specifier = ">=2.24" },

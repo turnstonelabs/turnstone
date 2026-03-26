@@ -4950,20 +4950,12 @@ def create_app(
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
 
-    # Mount ACME responder and CA cert endpoint if TLS is enabled
-    if tls_manager is not None and tls_manager.ca_initialized:
+    # Mount ACME responder whenever a TLS manager is configured.
+    # ACMEResponder (lacme 1.0.2+) serves /ca.pem natively.
+    if tls_manager is not None:
         from starlette.routing import Mount as RouteMount
-        from starlette.routing import Route as RouteRoute
 
-        # CA cert endpoint BEFORE mount so it's matched first
-        async def _acme_ca_pem(request: Request) -> Response:
-            mgr = getattr(request.app.state, "tls_manager", None)
-            if mgr is None or not mgr.ca_initialized:
-                return JSONResponse({"error": "TLS not enabled"}, status_code=404)
-            return Response(content=mgr.get_root_cert_pem(), media_type="application/x-pem-file")
-
-        app.routes.insert(0, RouteRoute("/acme/ca.pem", _acme_ca_pem))
-        app.routes.insert(1, RouteMount("/acme", app=tls_manager.get_responder()))
+        app.routes.insert(0, RouteMount("/acme", app=tls_manager.get_responder()))
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -5147,7 +5139,11 @@ def main() -> None:
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 
-                tls_mgr = TLSManager(auth_storage, config_store=_cs, port=args.port)
+                tls_mgr = TLSManager(auth_storage, config_store=_cs)
+                # Init CA before create_app so ACME responder can be mounted
+                import asyncio
+
+                asyncio.run(tls_mgr.init_ca())
                 console_url = f"https://{args.host}:{args.port}"
                 log.info("TLS enabled")
         except ImportError:

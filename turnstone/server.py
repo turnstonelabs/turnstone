@@ -2445,7 +2445,6 @@ def main() -> None:
         try:
             import asyncio
             import socket
-            import tempfile
 
             from turnstone.core.tls import TLSClient
 
@@ -2461,39 +2460,20 @@ def main() -> None:
             asyncio.run(tls_client.init())
             bundle = tls_client.bundle
             if bundle:
-                # Write PEM to temp files for uvicorn (restricted permissions)
-                _tls_temp_files: list[str] = []
+                from lacme.mtls import write_pem_files_persistent
 
-                def _write_pem(data: bytes, suffix: str = ".pem") -> str:
-                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-                        f.write(data)
-                        name = f.name
-                    os.chmod(name, 0o600)
-                    _tls_temp_files.append(name)
-                    return name
-
-                ssl_kwargs["ssl_certfile"] = _write_pem(bundle.fullchain_pem)
-                ssl_kwargs["ssl_keyfile"] = _write_pem(bundle.key_pem)
+                pem_paths = write_pem_files_persistent(
+                    bundle,
+                    ca_pem=tls_client.ca_pem,
+                )
+                ssl_kwargs.update(pem_paths.as_uvicorn_kwargs())
                 if tls_client.ca_pem:
-                    ssl_kwargs["ssl_ca_certs"] = _write_pem(tls_client.ca_pem)
                     import ssl as _ssl
 
                     ssl_kwargs["ssl_cert_reqs"] = _ssl.CERT_REQUIRED
 
                 # Store client on app state for lifespan renewal
                 app.state.tls_client = tls_client
-
-                # Clean up temp files on exit
-                import atexit
-
-                def _cleanup_tls_files() -> None:
-                    import contextlib
-
-                    for path in _tls_temp_files:
-                        with contextlib.suppress(OSError):
-                            os.unlink(path)
-
-                atexit.register(_cleanup_tls_files)
                 log.info("TLS enabled — serving HTTPS")
             else:
                 log.warning("TLS enabled but no cert available")
