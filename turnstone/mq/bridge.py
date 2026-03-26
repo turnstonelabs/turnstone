@@ -1140,12 +1140,11 @@ def main() -> None:
     tls_cert: tuple[str, str] | None = None
     if os.environ.get("TURNSTONE_TLS_ENABLED", "").lower() in ("true", "1", "yes"):
         try:
-            from turnstone.core.tls import TLSClient
-
             import asyncio
             import socket
 
             from turnstone.core.storage import init_storage
+            from turnstone.core.tls import TLSClient
 
             db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
             db_url = os.environ.get("TURNSTONE_DB_URL", "")

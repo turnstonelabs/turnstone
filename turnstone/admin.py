@@ -155,10 +155,9 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
         print("lacme not installed. Run: pip install turnstone[tls]", file=sys.stderr)
         sys.exit(1)
 
+    import contextlib
     import os
     from pathlib import Path
-
-    import contextlib
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
