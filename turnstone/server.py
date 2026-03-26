@@ -2096,7 +2096,17 @@ def main() -> None:
     db_pool_size = int(
         getattr(args, "db_pool_size", None) or os.environ.get("TURNSTONE_DB_POOL_SIZE", "2")
     )
-    init_storage(db_backend, path=db_path, url=db_url, pool_size=db_pool_size)
+    init_storage(
+        db_backend,
+        path=db_path,
+        url=db_url,
+        pool_size=db_pool_size,
+        sslmode=getattr(args, "db_sslmode", None) or os.environ.get("TURNSTONE_DB_SSLMODE", ""),
+        sslrootcert=getattr(args, "db_sslrootcert", None)
+        or os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
+        sslcert=getattr(args, "db_sslcert", None) or os.environ.get("TURNSTONE_DB_SSLCERT", ""),
+        sslkey=getattr(args, "db_sslkey", None) or os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+    )
 
     # Server-owned node identity (needed before ConfigStore for node_id scoping)
     def _default_node_id() -> str:

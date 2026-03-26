@@ -58,6 +58,11 @@ def main() -> None:
         help="HTTP server port (default: $TURNSTONE_CHANNEL_PORT or 8091)",
     )
 
+    # -- TLS -----------------------------------------------------------------
+    parser.add_argument("--ssl-certfile", default=None, help="SSL certificate file for HTTPS")
+    parser.add_argument("--ssl-keyfile", default=None, help="SSL private key file")
+    parser.add_argument("--ssl-ca-certs", default=None, help="SSL CA certs for client verification")
+
     # -- Auth ----------------------------------------------------------------
     parser.add_argument(
         "--auth-token",
@@ -189,7 +194,8 @@ def main() -> None:
                     advertise_host = socket.gethostname()
                 else:
                     advertise_host = args.http_host
-                advertise_url = f"http://{advertise_host}:{args.http_port}"
+                scheme = "https" if args.ssl_certfile else "http"
+                advertise_url = f"{scheme}://{advertise_host}:{args.http_port}"
             service_url = advertise_url
 
             # Register in service registry
@@ -213,6 +219,12 @@ def main() -> None:
             ssl_certfile = getattr(args, "ssl_certfile", None)
             ssl_keyfile = getattr(args, "ssl_keyfile", None)
             ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
+            if bool(ssl_certfile) != bool(ssl_keyfile):
+                print(
+                    "Both --ssl-certfile and --ssl-keyfile are required for TLS",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
             uv_config = uvicorn.Config(
                 channel_app,
