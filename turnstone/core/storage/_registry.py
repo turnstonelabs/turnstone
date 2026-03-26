@@ -57,9 +57,9 @@ def init_storage(
             msg = "PostgreSQL backend requires a connection URL (db_url)"
             raise ValueError(msg)
         # Append SSL params to URL if provided (validated + encoded)
-        _VALID_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
-        if sslmode and sslmode not in _VALID_SSLMODES:
-            msg = f"Invalid sslmode: {sslmode!r} (expected one of {sorted(_VALID_SSLMODES)})"
+        valid_sslmodes = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+        if sslmode and sslmode not in valid_sslmodes:
+            msg = f"Invalid sslmode: {sslmode!r} (expected one of {sorted(valid_sslmodes)})"
             raise ValueError(msg)
         ssl_params = {
             k: v
