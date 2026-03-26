@@ -64,6 +64,7 @@ function showAdmin() {
     audit: "admin.audit",
     memories: "admin.memories",
     settings: "admin.settings",
+    tls: "admin.settings",
     mcp: "admin.mcp",
   };
   if (perms) {
@@ -193,6 +194,7 @@ function switchAdminTab(tab) {
     "audit",
     "memories",
     "settings",
+    "tls",
     "mcp",
   ];
   for (var p = 0; p < panels.length; p++) {
@@ -215,6 +217,7 @@ function switchAdminTab(tab) {
   }
   if (tab === "memories") loadAdminMemories();
   if (tab === "settings") loadSettings();
+  if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
 
   // Update breadcrumb with active tab label
@@ -2082,6 +2085,180 @@ function _settingsSectionLabel(section) {
   };
   return labels[section] || section;
 }
+
+// ---------------------------------------------------------------------------
+// TLS tab
+// ---------------------------------------------------------------------------
+
+function loadTlsCerts() {
+  var statusEl = document.getElementById("tls-ca-status");
+  var listEl = document.getElementById("tls-cert-list");
+  if (!statusEl || !listEl) return;
+
+  // Fetch CA status and cert list in parallel
+  Promise.all([
+    authFetch("/v1/api/admin/tls/ca").then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    }),
+    authFetch("/v1/api/admin/tls/certs").then(function (r) {
+      if (!r.ok) return { certs: [] };
+      return r.json();
+    }),
+  ])
+    .then(function (results) {
+      var data = results[0];
+      var certData = results[1];
+      while (statusEl.firstChild) statusEl.removeChild(statusEl.firstChild);
+      while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+
+      if (!data.enabled) {
+        var msg = document.createElement("div");
+        msg.className = "dashboard-empty";
+        msg.textContent =
+          "TLS is not enabled. Set tls.enabled = true in Settings.";
+        statusEl.appendChild(msg);
+        return;
+      }
+
+      // CA status bar
+      var bar = document.createElement("div");
+      bar.className = "tls-ca-bar";
+      var caLabel = document.createElement("span");
+      caLabel.textContent = "CA: " + data.ca_cn;
+      var countLabel = document.createElement("span");
+      countLabel.textContent = "Certificates: " + data.cert_count;
+      bar.appendChild(caLabel);
+      bar.appendChild(countLabel);
+      statusEl.appendChild(bar);
+
+      var certs = certData.certs || [];
+      if (certs.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "dashboard-empty";
+        empty.textContent = "No certificates issued yet.";
+        listEl.appendChild(empty);
+        return;
+      }
+
+      // Cert rows
+      certs.forEach(function (c) {
+        var row = document.createElement("div");
+        row.className = "admin-row";
+        row.setAttribute("role", "listitem");
+
+        var colDomain = document.createElement("span");
+        colDomain.className = "admin-col";
+        colDomain.textContent = c.domain;
+
+        var colSans = document.createElement("span");
+        colSans.className = "admin-col";
+        colSans.textContent = (c.domains || [c.domain]).join(", ");
+
+        var colIssued = document.createElement("span");
+        colIssued.className = "admin-col";
+        colIssued.textContent = (c.issued_at || "")
+          .slice(0, 16)
+          .replace("T", " ");
+
+        var colExpires = document.createElement("span");
+        colExpires.className = "admin-col";
+        var expires = new Date(c.expires_at);
+        var isExpired = expires < new Date();
+        colExpires.textContent =
+          (isExpired ? "EXPIRED " : "") +
+          (c.expires_at || "").slice(0, 16).replace("T", " ");
+        if (isExpired) colExpires.style.color = "var(--red)";
+
+        var colActions = document.createElement("span");
+        colActions.className = "admin-col admin-col-actions";
+        var renewBtn = document.createElement("button");
+        renewBtn.className = "admin-btn-action";
+        renewBtn.textContent = "Renew";
+        renewBtn.setAttribute(
+          "aria-label",
+          "Renew certificate for " + c.domain,
+        );
+        renewBtn.onclick = function () {
+          tlsRenewCert(c.domain);
+        };
+        var deleteBtn = document.createElement("button");
+        deleteBtn.className = "admin-btn-danger";
+        deleteBtn.textContent = "Delete";
+        deleteBtn.setAttribute(
+          "aria-label",
+          "Delete certificate for " + c.domain,
+        );
+        deleteBtn.onclick = function () {
+          tlsDeleteCert(c.domain);
+        };
+        colActions.appendChild(renewBtn);
+        colActions.appendChild(deleteBtn);
+
+        row.appendChild(colDomain);
+        row.appendChild(colSans);
+        row.appendChild(colIssued);
+        row.appendChild(colExpires);
+        row.appendChild(colActions);
+        listEl.appendChild(row);
+      });
+    })
+    .catch(function () {
+      while (statusEl.firstChild) statusEl.removeChild(statusEl.firstChild);
+      while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+      var errMsg = document.createElement("div");
+      errMsg.className = "dashboard-empty";
+      errMsg.textContent = "Failed to load TLS status";
+      statusEl.appendChild(errMsg);
+    });
+}
+
+function tlsRenewCert(domain) {
+  showConfirmModal(
+    "Renew Certificate",
+    "Force renew certificate for \u2018" + domain + "\u2019?",
+    "Renew",
+    function () {
+      authFetch(
+        "/v1/api/admin/tls/certs/" + encodeURIComponent(domain) + "/renew",
+        { method: "POST" },
+      )
+        .then(function (r) {
+          if (!r.ok) throw new Error("Renew failed");
+          showToast("Certificate renewed for " + domain);
+          loadTlsCerts();
+        })
+        .catch(function () {
+          showToast("Failed to renew certificate", "error");
+        });
+    },
+  );
+}
+
+function tlsDeleteCert(domain) {
+  showConfirmModal(
+    "Delete Certificate",
+    "Delete certificate for \u2018" + domain + "\u2019? This cannot be undone.",
+    "Delete",
+    function () {
+      authFetch("/v1/api/admin/tls/certs/" + encodeURIComponent(domain), {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error("Delete failed");
+          showToast("Certificate deleted for " + domain);
+          loadTlsCerts();
+        })
+        .catch(function () {
+          showToast("Failed to delete certificate", "error");
+        });
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Settings tab
+// ---------------------------------------------------------------------------
 
 function loadSettings() {
   var el = document.getElementById("admin-settings-content");

@@ -107,9 +107,9 @@ class StorageStore:
         rows = self._storage.list_tls_certs()
         return [self._row_to_bundle(r) for r in rows]
 
-    def delete_cert(self, domain: str) -> None:
+    def delete_cert(self, domain: str) -> bool:
         """Delete a stored certificate bundle by domain."""
-        self._storage.delete_tls_cert(domain)
+        return self._storage.delete_tls_cert(domain)
 
     def _row_to_bundle(self, row: dict[str, Any]) -> Any:
         """Convert a storage row dict to a lacme CertBundle."""

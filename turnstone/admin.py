@@ -142,6 +142,186 @@ def _cmd_revoke_token(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# TLS commands
+# ---------------------------------------------------------------------------
+
+
+def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
+    """Initialize CA and issue certs offline."""
+    try:
+        from lacme import CertificateAuthority, FileStore
+    except ImportError:
+        print("lacme not installed. Run: pip install turnstone[tls]", file=sys.stderr)
+        sys.exit(1)
+
+    import os
+    from pathlib import Path
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(out_dir, 0o700)  # Restrict access — contains CA private key
+
+    store = FileStore(str(out_dir))
+    ca = CertificateAuthority(store)
+    ca.init(cn="Turnstone CA", validity_days=3650)
+    print(f"CA initialized in {out_dir} (permissions: 0700)")
+
+    # Write CA cert to a well-known location
+    ca_cert_path = out_dir / "ca.pem"
+    ca_cert_path.write_bytes(ca.root_cert_pem)
+    os.chmod(ca_cert_path, 0o644)
+    print(f"CA cert: {ca_cert_path}")
+
+    # Issue certs for requested domains
+    for domain in args.issue:
+        bundle = ca.issue([domain], validity_hours=48)
+        store.save_cert(bundle)
+        cert_dir = out_dir / "certs" / domain
+        print(f"Issued: {domain} -> {cert_dir}")
+
+    print(f"\nBootstrap complete. {len(args.issue)} cert(s) issued.")
+    print(f"CA and certs written to: {out_dir}")
+
+
+def _cmd_tls_issue(args: argparse.Namespace) -> None:
+    """Request a cert from the console's ACME endpoint."""
+    try:
+        from lacme import SyncClient
+    except ImportError:
+        print("lacme not installed. Run: pip install turnstone[tls]", file=sys.stderr)
+        sys.exit(1)
+
+    import os
+    from pathlib import Path
+
+    console_url = args.console_url
+    if not console_url:
+        console_url = _discover_console_url()
+
+    domains = [args.domain] + args.san
+    directory_url = f"{console_url}/acme/directory"
+    print(f"Requesting cert for {domains} from {directory_url}")
+
+    client = SyncClient(
+        directory_url=directory_url,
+        allow_insecure=True,
+    )
+    bundle = client.issue(domains)
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "cert.pem").write_bytes(bundle.cert_pem)
+    (out_dir / "fullchain.pem").write_bytes(bundle.fullchain_pem)
+    (out_dir / "key.pem").write_bytes(bundle.key_pem)
+    os.chmod(out_dir / "key.pem", 0o600)
+
+    print(f"Certificate written to {out_dir}/")
+    print("  cert.pem      (leaf certificate)")
+    print("  fullchain.pem (cert + chain)")
+    print("  key.pem       (private key, 0600)")
+
+
+def _cmd_tls_ca_cert(args: argparse.Namespace) -> None:
+    """Download the CA root certificate from the console."""
+    import httpx
+
+    console_url = args.console_url
+    if not console_url:
+        console_url = _discover_console_url()
+
+    # Use plain HTTP for bootstrap (node may not have CA cert yet)
+    # WARNING: This is trust-on-first-use (TOFU) — verify the fingerprint
+    base = console_url.replace("https://", "http://")
+    url = f"{base}/acme/ca.pem"
+    print(f"Fetching CA cert from {url}")
+    print("WARNING: Fetching over plain HTTP — verify the fingerprint below")
+
+    resp = httpx.get(url)
+    resp.raise_for_status()
+
+    # Show fingerprint for out-of-band verification
+    import hashlib
+
+    fingerprint = hashlib.sha256(resp.content).hexdigest()
+    print(f"CA cert SHA-256: {fingerprint}")
+
+    from pathlib import Path
+
+    Path(args.out).write_bytes(resp.content)
+    print(f"CA cert written to {args.out}")
+
+
+def _cmd_tls_list(args: argparse.Namespace) -> None:
+    """List certificates from the console."""
+    import httpx
+
+    console_url = args.console_url
+    if not console_url:
+        console_url = _discover_console_url()
+
+    url = f"{console_url}/v1/api/admin/tls/certs"
+    headers = {}
+    token = getattr(args, "auth_token", "") or _get_config_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = httpx.get(url, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+
+    certs = data.get("certs", [])
+    if not certs:
+        print("No certificates issued.")
+        return
+
+    print(f"{'DOMAIN':<30s} {'ISSUED':<22s} {'EXPIRES':<22s}")
+    print("-" * 74)
+    for c in certs:
+        print(f"{c['domain']:<30s} {c['issued_at']:<22s} {c['expires_at']:<22s}")
+
+
+def _get_config_token() -> str:
+    """Try to load auth token from config.toml or environment."""
+    token = os.environ.get("TURNSTONE_AUTH_TOKEN", "")
+    if token:
+        return token
+    try:
+        from turnstone.core.config import load_config
+
+        cfg = load_config("auth")
+        return str(cfg.get("token", ""))
+    except Exception:
+        return ""
+
+
+def _discover_console_url() -> str:
+    """Discover console URL from the services table."""
+    from turnstone.core.storage import get_storage
+
+    try:
+        storage = get_storage()
+    except Exception:
+        print(
+            "No storage configured. Use --console-url or run from a "
+            "directory with a turnstone database.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    consoles = storage.list_services("console", max_age_seconds=3600)
+    if not consoles:
+        print(
+            "No console found in services table. Use --console-url explicitly.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return consoles[0]["url"]
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
     """Entry point for turnstone-admin CLI."""
     parser = argparse.ArgumentParser(
@@ -171,6 +351,35 @@ def main() -> None:
     p_rt = sub.add_parser("revoke-token", help="Revoke an API token")
     p_rt.add_argument("--token-id", required=True, help="Token ID to revoke")
 
+    # TLS subcommands
+    p_bootstrap = sub.add_parser(
+        "tls-bootstrap",
+        help="Initialize CA and issue certs offline (no running console needed)",
+    )
+    p_bootstrap.add_argument("--out", required=True, help="Output directory for PEM files")
+    p_bootstrap.add_argument(
+        "--issue",
+        action="append",
+        default=[],
+        help="Domain to issue cert for (repeatable)",
+    )
+
+    p_issue = sub.add_parser("tls-issue", help="Request cert from console ACME")
+    p_issue.add_argument("domain", help="Primary domain for the certificate")
+    p_issue.add_argument("--san", action="append", default=[], help="Additional SAN (repeatable)")
+    p_issue.add_argument("--out", default=".", help="Output directory for PEM files")
+    p_issue.add_argument(
+        "--console-url", default="", help="Console URL (discovered from DB if empty)"
+    )
+
+    p_cacert = sub.add_parser("tls-ca-cert", help="Download CA root certificate")
+    p_cacert.add_argument("--out", default="ca.pem", help="Output file path")
+    p_cacert.add_argument("--console-url", default="", help="Console URL")
+
+    p_tlslist = sub.add_parser("tls-list", help="List issued certificates")
+    p_tlslist.add_argument("--console-url", default="", help="Console URL")
+    p_tlslist.add_argument("--auth-token", default="", help="Auth token for admin API")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -182,5 +391,9 @@ def main() -> None:
         "list-users": _cmd_list_users,
         "list-tokens": _cmd_list_tokens,
         "revoke-token": _cmd_revoke_token,
+        "tls-bootstrap": _cmd_tls_bootstrap,
+        "tls-issue": _cmd_tls_issue,
+        "tls-ca-cert": _cmd_tls_ca_cert,
+        "tls-list": _cmd_tls_list,
     }
     dispatch[args.command](args)

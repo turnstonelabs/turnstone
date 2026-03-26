@@ -110,6 +110,7 @@
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
           <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
+          <button id="tab-tls" class="admin-nav" data-tab="tls" role="tab" aria-selected="false" aria-controls="admin-tls" tabindex="-1" onclick="switchAdminTab('tls')">TLS</button>
         </div>
       </nav>
       <div id="admin-sidebar-backdrop" class="admin-sidebar-backdrop" aria-hidden="true"></div>
@@ -400,6 +401,24 @@
         <a href="/docs#/System:%20Settings" target="_blank" rel="noopener" class="settings-docs-link" title="Settings API reference">docs</a>
       </div>
       <div id="admin-settings-content">
+        <div class="dashboard-empty">Loading&hellip;</div>
+      </div>
+    </div>
+
+    <!-- TLS Tab -->
+    <div id="admin-tls" class="admin-panel" role="tabpanel" aria-labelledby="tab-tls" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">TLS / CERTIFICATES</span>
+      </div>
+      <div id="tls-ca-status"></div>
+      <div class="admin-colheaders admin-colheaders-tls" aria-hidden="true">
+        <span class="admin-col">DOMAIN</span>
+        <span class="admin-col">SANS</span>
+        <span class="admin-col">ISSUED</span>
+        <span class="admin-col">EXPIRES</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="tls-cert-list" role="list" aria-label="TLS certificates" aria-live="polite">
         <div class="dashboard-empty">Loading&hellip;</div>
       </div>
     </div>

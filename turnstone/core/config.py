@@ -125,6 +125,10 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "port": "redis_port",
         "password": "redis_password",
         "db": "redis_db",
+        "tls": "redis_tls",
+        "tls_ca": "redis_tls_ca",
+        "tls_cert": "redis_tls_cert",
+        "tls_key": "redis_tls_key",
     },
     "console": {
         "host": "host",
@@ -157,6 +161,10 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "url": "db_url",
         "path": "db_path",
         "pool_size": "db_pool_size",
+        "sslmode": "db_sslmode",
+        "sslrootcert": "db_sslrootcert",
+        "sslcert": "db_sslcert",
+        "sslkey": "db_sslkey",
     },
     "judge": {
         "enabled": "judge_enabled",

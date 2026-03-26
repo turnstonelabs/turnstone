@@ -4680,6 +4680,74 @@ async def tls_ca_status(request: Request) -> JSONResponse:
     )
 
 
+async def tls_list_certs(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/tls/certs — List issued certificates."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    mgr = getattr(request.app.state, "tls_manager", None)
+    if mgr is None or not mgr.ca_initialized:
+        return JSONResponse({"certs": []})
+    certs = mgr.list_certs()
+    return JSONResponse(
+        {
+            "certs": [
+                {
+                    "domain": c.domain,
+                    "domains": list(c.domains),
+                    "issued_at": c.issued_at.isoformat(),
+                    "expires_at": c.expires_at.isoformat(),
+                }
+                for c in certs
+            ],
+        },
+    )
+
+
+async def tls_renew_cert(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/tls/certs/{domain}/renew — Force cert renewal."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    mgr = getattr(request.app.state, "tls_manager", None)
+    if mgr is None or not mgr.ca_initialized:
+        return JSONResponse({"error": "TLS not enabled"}, status_code=404)
+    domain = request.path_params["domain"]
+    try:
+        bundle = mgr.renew_cert(domain)
+        return JSONResponse(
+            {
+                "domain": bundle.domain,
+                "issued_at": bundle.issued_at.isoformat(),
+                "expires_at": bundle.expires_at.isoformat(),
+            },
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def tls_delete_cert(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/tls/certs/{domain} — Delete a certificate."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    mgr = getattr(request.app.state, "tls_manager", None)
+    if mgr is None or not mgr.ca_initialized:
+        return JSONResponse({"error": "TLS not enabled"}, status_code=404)
+    domain = request.path_params["domain"]
+    if not mgr.delete_cert(domain):
+        return JSONResponse({"error": f"No cert for {domain}"}, status_code=404)
+    return JSONResponse({"deleted": domain})
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -4922,6 +4990,17 @@ def create_app(
                     # TLS / ACME
                     Route("/api/admin/tls/ca", tls_ca_status),
                     Route("/api/admin/tls/ca.pem", tls_ca_cert),
+                    Route("/api/admin/tls/certs", tls_list_certs),
+                    Route(
+                        "/api/admin/tls/certs/{domain}/renew",
+                        tls_renew_cert,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/tls/certs/{domain}",
+                        tls_delete_cert,
+                        methods=["DELETE"],
+                    ),
                 ],
             ),
             Route("/health", health),

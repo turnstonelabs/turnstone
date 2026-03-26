@@ -122,11 +122,24 @@ class RedisBroker:
         prefix: str = "turnstone",
         password: str | None = None,
         response_ttl: int = 600,
+        ssl: bool = False,
+        ssl_ca_certs: str | None = None,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
     ) -> None:
         import redis
 
         self._prefix = prefix
         self._response_ttl = response_ttl
+        ssl_kwargs: dict[str, Any] = {}
+        if ssl:
+            ssl_kwargs["ssl"] = True
+            if ssl_ca_certs:
+                ssl_kwargs["ssl_ca_certs"] = ssl_ca_certs
+            if ssl_certfile:
+                ssl_kwargs["ssl_certfile"] = ssl_certfile
+            if ssl_keyfile:
+                ssl_kwargs["ssl_keyfile"] = ssl_keyfile
         self._pool: _redis_t.ConnectionPool = redis.ConnectionPool(
             host=host,
             port=port,
@@ -135,6 +148,7 @@ class RedisBroker:
             decode_responses=True,
             retry_on_timeout=True,
             max_connections=200,
+            **ssl_kwargs,
         )
         self._redis: _redis_t.Redis[str] = cast(
             "_redis_t.Redis[str]",
@@ -256,7 +270,7 @@ class RedisBroker:
 
 
 def add_redis_args(parser: Any) -> None:
-    """Add ``--redis-host``, ``--redis-port``, ``--redis-password``, ``--redis-db``."""
+    """Add Redis CLI arguments including TLS options."""
     import os
 
     parser.add_argument(
@@ -281,6 +295,27 @@ def add_redis_args(parser: Any) -> None:
         default=0,
         help="Redis DB number (default: %(default)s)",
     )
+    parser.add_argument("--redis-tls", action="store_true", help="Enable Redis TLS")
+    parser.add_argument("--redis-tls-ca", default=None, help="Redis CA cert path")
+    parser.add_argument("--redis-tls-cert", default=None, help="Redis client cert path")
+    parser.add_argument("--redis-tls-key", default=None, help="Redis client key path")
+
+
+def _redis_tls_kwargs(args: Any) -> dict[str, Any]:
+    """Extract Redis TLS kwargs from parsed args."""
+    kwargs: dict[str, Any] = {}
+    if getattr(args, "redis_tls", False):
+        kwargs["ssl"] = True
+        ca = getattr(args, "redis_tls_ca", None)
+        if ca:
+            kwargs["ssl_ca_certs"] = ca
+        cert = getattr(args, "redis_tls_cert", None)
+        if cert:
+            kwargs["ssl_certfile"] = cert
+        key = getattr(args, "redis_tls_key", None)
+        if key:
+            kwargs["ssl_keyfile"] = key
+    return kwargs
 
 
 def broker_from_args(args: Any) -> RedisBroker:
@@ -290,6 +325,7 @@ def broker_from_args(args: Any) -> RedisBroker:
         port=args.redis_port,
         db=args.redis_db,
         password=args.redis_password,
+        **_redis_tls_kwargs(args),
     )
 
 
@@ -302,4 +338,5 @@ def async_broker_from_args(args: Any) -> Any:
         port=args.redis_port,
         db=args.redis_db,
         password=args.redis_password,
+        **_redis_tls_kwargs(args),
     )

@@ -948,6 +948,19 @@
   grid-template-columns: 100px 1fr 100px 80px;
 }
 
+/* TLS grid: DOMAIN | SANS | ISSUED | EXPIRES | ACTIONS */
+#admin-tls .admin-colheaders,
+#admin-tls .admin-row {
+  grid-template-columns: 160px 1fr 130px 150px 120px;
+}
+.tls-ca-bar {
+  display: flex;
+  gap: 2rem;
+  margin-bottom: 0.75rem;
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+
 /* Scope badges */
 .scope-badge {
   display: inline-block;

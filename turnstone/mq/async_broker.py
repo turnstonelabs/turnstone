@@ -47,6 +47,10 @@ class AsyncRedisBroker:
         prefix: str = "turnstone",
         password: str | None = None,
         response_ttl: int = 600,
+        ssl: bool = False,
+        ssl_ca_certs: str | None = None,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -54,6 +58,15 @@ class AsyncRedisBroker:
         self._password = password
         self._prefix = prefix
         self._response_ttl = response_ttl
+        self._ssl_kwargs: dict[str, Any] = {}
+        if ssl:
+            self._ssl_kwargs["ssl"] = True
+            if ssl_ca_certs:
+                self._ssl_kwargs["ssl_ca_certs"] = ssl_ca_certs
+            if ssl_certfile:
+                self._ssl_kwargs["ssl_certfile"] = ssl_certfile
+            if ssl_keyfile:
+                self._ssl_kwargs["ssl_keyfile"] = ssl_keyfile
         self._redis: _aredis_t.Redis[str] | None = None
         self._pubsub: _aredis_t.client.PubSub | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -82,6 +95,7 @@ class AsyncRedisBroker:
             password=self._password,
             decode_responses=True,
             retry_on_timeout=True,
+            **self._ssl_kwargs,
             max_connections=200,
         )
         self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)

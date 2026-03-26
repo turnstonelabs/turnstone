@@ -315,6 +315,28 @@ class TLSManager:
         """List all stored certificate bundles."""
         return self._store.list_certs()
 
+    def renew_cert(self, domain: str) -> Any:
+        """Force-renew a certificate by domain. Returns the new bundle."""
+        if self._ca is None:
+            raise RuntimeError("CA not initialized")
+        existing = self._store.load_cert(domain)
+        if existing is None:
+            raise ValueError(f"No certificate for {domain}")
+        # Issue new cert first, then delete old (safe if issuance fails)
+        bundle = self._ca.issue(list(existing.domains))
+        self._store.delete_cert(domain)
+        self._store.save_cert(bundle)
+        # Update in-memory bundles if this is the console's own cert
+        if self._internal_bundle and bundle.domain == self._internal_bundle.domain:
+            self._internal_bundle = bundle
+        if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
+            self._frontend_bundle = bundle
+        return bundle
+
+    def delete_cert(self, domain: str) -> bool:
+        """Delete a certificate by domain."""
+        return self._store.delete_cert(domain)
+
     @property
     def ca_initialized(self) -> bool:
         return self._ca is not None
