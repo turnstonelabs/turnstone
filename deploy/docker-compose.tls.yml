@@ -1,0 +1,67 @@
+# TLS overlay — enables mTLS across the turnstone cluster.
+#
+# Usage (overlay — requires a base compose.yaml defining
+# console, server, bridge, and redis services):
+#   docker compose -f compose.yaml -f deploy/docker-compose.tls.yml up
+#
+# The tls-init service bootstraps a CA and issues certs for Redis.
+# All turnstone services auto-provision their own certs via the
+# console's ACME endpoint.
+#
+# NOTE: Redis TLS wiring (--redis-tls flags on services) and
+# PostgreSQL TLS are not yet fully connected. See PROGRESS.md
+# tech debt items for status.
+
+services:
+  # Bootstrap: create CA + Redis certs before anything starts
+  tls-init:
+    build: .
+    command: >
+      turnstone-admin tls-bootstrap
+        --out /certs
+        --issue redis
+    volumes:
+      - tls-certs:/certs
+    restart: "no"
+
+  # Console: runs the internal CA + ACME server
+  console:
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - tls-certs:/certs:ro
+
+  # Server nodes: auto-provision certs via console ACME
+  server:
+    depends_on:
+      console:
+        condition: service_healthy
+    volumes:
+      - tls-certs:/certs:ro
+
+  # Bridge: mTLS to server
+  bridge:
+    depends_on:
+      console:
+        condition: service_healthy
+    volumes:
+      - tls-certs:/certs:ro
+
+  # Redis: TLS with certs from bootstrap
+  redis:
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - tls-certs:/certs:ro
+    command: >
+      redis-server
+        --tls-port 6379
+        --port 0
+        --tls-cert-file /certs/certs/redis/cert.pem
+        --tls-key-file /certs/certs/redis/key.pem
+        --tls-ca-cert-file /certs/ca.pem
+
+volumes:
+  tls-certs:

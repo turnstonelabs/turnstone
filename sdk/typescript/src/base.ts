@@ -1,6 +1,15 @@
 import { TurnstoneAPIError } from "./errors.js";
 import { parseSSEStream } from "./sse.js";
 
+export interface TlsOptions {
+  /** Path to CA certificate PEM file (Node.js only). */
+  caCert?: string;
+  /** Path to client certificate PEM file for mTLS (Node.js only). */
+  clientCert?: string;
+  /** Path to client key PEM file for mTLS (Node.js only). */
+  clientKey?: string;
+}
+
 export interface ClientOptions {
   /** Server base URL (e.g. "http://localhost:8080"). */
   baseUrl: string;
@@ -8,6 +17,13 @@ export interface ClientOptions {
   token?: string;
   /** Custom fetch implementation (defaults to globalThis.fetch). */
   fetch?: typeof globalThis.fetch;
+  /**
+   * TLS certificate paths for documentation and tooling.
+   * The SDK does not read these directly — pass a custom `fetch`
+   * configured with your runtime's TLS agent (e.g. Node.js https.Agent).
+   * See docs/tls.md for examples.
+   */
+  tls?: TlsOptions;
 }
 
 export interface RequestOptions {

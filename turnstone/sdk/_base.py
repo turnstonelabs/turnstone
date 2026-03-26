@@ -25,12 +25,18 @@ class _BaseClient:
         token: str = "",
         timeout: float = 30.0,
         httpx_client: httpx.AsyncClient | None = None,
+        ca_cert: str | None = None,
+        client_cert: str | None = None,
+        client_key: str | None = None,
     ) -> None:
         """Initialise the client.
 
-        When *httpx_client* is provided it is used directly and *base_url*,
-        *token*, and *timeout* are ignored — configure headers and base URL
-        on the injected client instead.
+        When *httpx_client* is provided it is used directly and all other
+        params are ignored — configure headers, base URL, and TLS on the
+        injected client instead.
+
+        For mTLS, pass *ca_cert* (CA bundle path), *client_cert* and
+        *client_key* (client certificate + key paths).
         """
         headers: dict[str, str] = {}
         if token:
@@ -39,8 +45,19 @@ class _BaseClient:
             self._client = httpx_client
             self._owns_client = False
         else:
+            tls_kwargs: dict[str, Any] = {}
+            if ca_cert:
+                tls_kwargs["verify"] = ca_cert
+            if client_cert or client_key:
+                if not (client_cert and client_key):
+                    raise ValueError("Both client_cert and client_key must be provided for mTLS")
+                tls_kwargs["cert"] = (client_cert, client_key)
             self._client = httpx.AsyncClient(
-                base_url=base_url, timeout=timeout, headers=headers, follow_redirects=True
+                base_url=base_url,
+                timeout=timeout,
+                headers=headers,
+                follow_redirects=True,
+                **tls_kwargs,
             )
             self._owns_client = True
 

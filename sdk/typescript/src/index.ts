@@ -19,7 +19,7 @@
 // Clients
 export { TurnstoneServer } from "./server.js";
 export { TurnstoneConsole } from "./console.js";
-export type { ClientOptions } from "./base.js";
+export type { ClientOptions, TlsOptions } from "./base.js";
 
 // Errors
 export { TurnstoneAPIError } from "./errors.js";

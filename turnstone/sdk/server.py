@@ -60,8 +60,19 @@ class AsyncTurnstoneServer(_BaseClient):
         token: str = "",
         timeout: float = 30.0,
         httpx_client: httpx.AsyncClient | None = None,
+        ca_cert: str | None = None,
+        client_cert: str | None = None,
+        client_key: str | None = None,
     ) -> None:
-        super().__init__(base_url=base_url, token=token, timeout=timeout, httpx_client=httpx_client)
+        super().__init__(
+            base_url=base_url,
+            token=token,
+            timeout=timeout,
+            httpx_client=httpx_client,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
 
     # -- workstream management -----------------------------------------------
 
@@ -395,9 +406,19 @@ class TurnstoneServer:
         base_url: str = "http://localhost:8080",
         token: str = "",
         timeout: float = 30.0,
+        ca_cert: str | None = None,
+        client_cert: str | None = None,
+        client_key: str | None = None,
     ) -> None:
         self._runner = _SyncRunner()
-        self._async = AsyncTurnstoneServer(base_url=base_url, token=token, timeout=timeout)
+        self._async = AsyncTurnstoneServer(
+            base_url=base_url,
+            token=token,
+            timeout=timeout,
+            ca_cert=ca_cert,
+            client_cert=client_cert,
+            client_key=client_key,
+        )
 
     # -- workstream management -----------------------------------------------
 
