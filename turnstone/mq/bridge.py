@@ -78,6 +78,8 @@ class Bridge:
         heartbeat_ttl: int = 60,
         auth_token: str = "",
         token_manager: Any = None,
+        tls_verify: Any = True,
+        tls_cert: tuple[str, str] | None = None,
     ) -> None:
         self._server_url = server_url.rstrip("/")
         self._broker = broker or RedisBroker()
@@ -89,6 +91,8 @@ class Bridge:
         self._started_at = time.time()
         self._auth_token = auth_token
         self._token_manager = token_manager  # ServiceTokenManager (auto-rotating)
+        self._tls_verify = tls_verify  # CA cert path or ssl.SSLContext or True
+        self._tls_cert = tls_cert  # (cert_path, key_path) for mTLS
 
         # Shared httpx client for short-lived POST requests (main thread only).
         # Auth headers refreshed per-request via event hook so auto-rotating
@@ -97,6 +101,8 @@ class Bridge:
             base_url=self._server_url,
             timeout=30,
             event_hooks={"request": [self._inject_auth]},
+            verify=self._tls_verify,
+            cert=self._tls_cert,
         )
 
         # Protected by _lock — accessed from main, global SSE, and per-ws SSE threads
@@ -592,6 +598,8 @@ class Bridge:
             base_url=self._server_url,
             timeout=None,
             event_hooks={"request": [self._inject_auth]},
+            verify=self._tls_verify,
+            cert=self._tls_cert,
         ) as sse_client:
             while self._running:
                 # Stop if workstream was closed (thread removed from registry)
@@ -903,6 +911,8 @@ class Bridge:
             base_url=self._server_url,
             timeout=None,
             event_hooks={"request": [self._inject_auth]},
+            verify=self._tls_verify,
+            cert=self._tls_cert,
         ) as sse_client:
             while self._running:
                 try:

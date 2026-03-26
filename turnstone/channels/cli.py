@@ -209,11 +209,19 @@ def main() -> None:
                     except Exception:
                         log.exception("channel.heartbeat_failed")
 
+            # TLS: use cert files if available (from bootstrap or TLSClient)
+            ssl_certfile = getattr(args, "ssl_certfile", None)
+            ssl_keyfile = getattr(args, "ssl_keyfile", None)
+            ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
+
             uv_config = uvicorn.Config(
                 channel_app,
                 host=args.http_host,
                 port=args.http_port,
                 log_level="warning",
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
+                ssl_ca_certs=ssl_ca_certs,
             )
             server = uvicorn.Server(uv_config)
 

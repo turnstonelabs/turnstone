@@ -727,18 +727,25 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         config_store.get("cluster.node_fan_out_limit") if config_store else _NODE_FAN_OUT_LIMIT
     )
     app.state.fan_out_limit = fan_out
+    # Build mTLS context for proxy clients if TLS is enabled
+    _tls_mgr = getattr(app.state, "tls_manager", None)
+    _proxy_ssl = _tls_mgr.get_client_ssl_context() if _tls_mgr and _tls_mgr.ca_initialized else None
+    _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
+
     app.state.proxy_client = httpx.AsyncClient(
         timeout=30,
         limits=httpx.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
         ),
+        verify=_proxy_verify,
     )
     app.state.proxy_sse_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
         limits=httpx.Limits(
             max_connections=1100, max_keepalive_connections=100, keepalive_expiry=30
         ),
+        verify=_proxy_verify,
     )
     # Start scheduler if configured
     scheduler = getattr(app.state, "scheduler", None)
@@ -769,6 +776,28 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     "OIDC JWKS prefetch failed — will retry on first login",
                     exc_info=True,
                 )
+    # Register console in service registry so other services can discover it
+    console_url = getattr(app.state, "console_url", "")
+    _console_heartbeat_task: Any = None
+    if console_url and storage:
+        try:
+            storage.register_service("console", "console", console_url)
+
+            # Periodic heartbeat to keep the registration alive
+            import asyncio
+
+            async def _console_heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        storage.heartbeat_service("console", "console")
+                    except Exception:
+                        log.warning("console.heartbeat_failed", exc_info=True)
+
+            _console_heartbeat_task = asyncio.create_task(_console_heartbeat())
+        except Exception:
+            log.warning("Failed to register console service", exc_info=True)
+
     # TLS: init CA, issue console certs, start renewal
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
@@ -779,12 +808,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 await tls_mgr.init_ca()
             hostname = socket.getfqdn()
             await tls_mgr.issue_console_certs([hostname, "localhost", "127.0.0.1"])
-            tls_mgr.start_renewal()
+            await tls_mgr.start_renewal()
         except Exception:
             log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
 
     yield
     # Shutdown
+    if _console_heartbeat_task is not None:
+        _console_heartbeat_task.cancel()
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         await tls_mgr.stop_renewal()
@@ -4665,6 +4696,7 @@ def create_app(
     proxy_token_mgr: Any = None,
     cors_origins: list[str] | None = None,
     tls_manager: Any = None,
+    console_url: str = "",
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -4915,13 +4947,23 @@ def create_app(
     app.state.auth_storage = auth_storage
     app.state.proxy_auth_token = proxy_auth_token
     app.state.proxy_token_mgr = proxy_token_mgr
+    app.state.console_url = console_url
     app.state.tls_manager = tls_manager
 
-    # Mount ACME responder if TLS is enabled
+    # Mount ACME responder and CA cert endpoint if TLS is enabled
     if tls_manager is not None and tls_manager.ca_initialized:
         from starlette.routing import Mount as RouteMount
+        from starlette.routing import Route as RouteRoute
 
-        app.routes.insert(0, RouteMount("/acme", app=tls_manager.get_responder()))
+        # CA cert endpoint BEFORE mount so it's matched first
+        async def _acme_ca_pem(request: Request) -> Response:
+            mgr = getattr(request.app.state, "tls_manager", None)
+            if mgr is None or not mgr.ca_initialized:
+                return JSONResponse({"error": "TLS not enabled"}, status_code=404)
+            return Response(content=mgr.get_root_cert_pem(), media_type="application/x-pem-file")
+
+        app.routes.insert(0, RouteRoute("/acme/ca.pem", _acme_ca_pem))
+        app.routes.insert(1, RouteMount("/acme", app=tls_manager.get_responder()))
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -5094,6 +5136,25 @@ def main() -> None:
 
     cors_origins = parse_cors_origins()
 
+    # TLS: initialize manager if enabled
+    tls_mgr = None
+    console_url = f"http://{args.host}:{args.port}"
+    if auth_storage:
+        try:
+            from turnstone.core.config_store import ConfigStore
+
+            _cs = ConfigStore(auth_storage)
+            if _cs.get("tls.enabled"):
+                from turnstone.console.tls import TLSManager
+
+                tls_mgr = TLSManager(auth_storage, config_store=_cs, port=args.port)
+                console_url = f"https://{args.host}:{args.port}"
+                log.info("TLS enabled")
+        except ImportError:
+            log.warning("TLS enabled but lacme not installed — pip install turnstone[tls]")
+        except Exception:
+            log.warning("TLS initialization failed", exc_info=True)
+
     app = create_app(
         collector=collector,
         broker=broker,
@@ -5103,9 +5164,11 @@ def main() -> None:
         proxy_auth_token=proxy_token if proxy_token_mgr is None else "",
         proxy_token_mgr=proxy_token_mgr,
         cors_origins=cors_origins,
+        tls_manager=tls_mgr,
+        console_url=console_url,
     )
 
-    log.info("Console starting on http://%s:%s", args.host, args.port)
+    log.info("Console starting on %s", console_url)
     if auth_config.enabled:
         log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
     print("Press Ctrl+C to stop.")

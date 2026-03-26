@@ -55,6 +55,7 @@ class TLSManager:
         self,
         storage: StorageBackend,
         config_store: ConfigStore | None = None,
+        port: int = 8080,
     ) -> None:
         lacme = _require_lacme()
 
@@ -62,10 +63,13 @@ class TLSManager:
 
         self._store = StorageStore(storage)
         self._config_store = config_store
+        self._port = port
         self._event_dispatcher = lacme.EventDispatcher()
         self._ca: Any | None = None
         self._responder: Any | None = None
         self._renewal_task: Any | None = None
+        self._renewal_manager: Any | None = None
+        self._renewal_client: Any | None = None
         self._internal_bundle: Any | None = None
         self._frontend_bundle: Any | None = None
 
@@ -226,8 +230,12 @@ class TLSManager:
 
     # -- Auto-renewal ----------------------------------------------------------
 
-    def start_renewal(self) -> None:
-        """Start background auto-renewal for all stored certificates."""
+    async def start_renewal(self) -> None:
+        """Start background auto-renewal for all stored certificates.
+
+        Creates a lacme Client pointed at the console's own ACME endpoint
+        (localhost loopback) for cert renewal requests.
+        """
         if self._ca is None:
             raise RuntimeError("CA not initialized")
         lacme = _require_lacme()
@@ -239,26 +247,38 @@ class TLSManager:
             if self._frontend_bundle and bundle.domain == self._frontend_bundle.domain:
                 self._frontend_bundle = bundle
 
-        manager = lacme.RenewalManager(
-            client=None,  # Uses CA directly for internal certs
+        # Create a client pointed at our own ACME endpoint for renewal
+        directory_url = f"http://localhost:{self._port}/acme/directory"
+        client = lacme.Client(
+            directory_url=directory_url,
+            store=self._store,
+            event_dispatcher=self._event_dispatcher,
+            allow_insecure=True,  # localhost loopback
+        )
+        await client.__aenter__()
+
+        self._renewal_manager = lacme.RenewalManager(
+            client=client,
             store=self._store,
             interval_hours=_RENEW_INTERVAL_HOURS,
             days_before_expiry=_RENEW_BEFORE_EXPIRY_DAYS,
             on_renewed=_on_renewed,
             event_dispatcher=self._event_dispatcher,
         )
-        self._renewal_task = manager.start()
+        self._renewal_task = self._renewal_manager.start()
+        self._renewal_client = client
         log.info(
             "tls.renewal.started",
             interval_hours=_RENEW_INTERVAL_HOURS,
+            directory=directory_url,
         )
 
     async def stop_renewal(self) -> None:
-        """Stop the background renewal task."""
-        if self._renewal_task is not None:
-            import asyncio
-            import contextlib
+        """Stop the background renewal task and close the ACME client."""
+        import asyncio
+        import contextlib
 
+        if self._renewal_task is not None:
             self._renewal_task.cancel()
             try:
                 with contextlib.suppress(asyncio.CancelledError):
@@ -266,6 +286,11 @@ class TLSManager:
             except Exception:
                 log.exception("tls.renewal.stop_error")
             self._renewal_task = None
+        # Close the loopback ACME client
+        if self._renewal_client is not None:
+            with contextlib.suppress(Exception):
+                await self._renewal_client.__aexit__(None, None, None)
+            self._renewal_client = None
 
     # -- SSL contexts ----------------------------------------------------------
 

@@ -18,7 +18,6 @@ import functools
 import json
 import os
 import queue
-import socket
 import sys
 import textwrap
 import threading
@@ -1851,8 +1850,19 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     "OIDC JWKS prefetch failed — will retry on first login",
                     exc_info=True,
                 )
+    # TLS: start auto-renewal if client was initialized
+    tls_client = getattr(app.state, "tls_client", None)
+    if tls_client is not None:
+        try:
+            await tls_client.start_renewal()
+        except Exception:
+            log.warning("TLS auto-renewal startup failed", exc_info=True)
+
     yield
     # Shutdown
+    tls_client = getattr(app.state, "tls_client", None)
+    if tls_client is not None:
+        await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
     if app.state.health_monitor:
@@ -2428,11 +2438,73 @@ def main() -> None:
         )
     log.info("Max workstreams: %s", config_store.get("server.max_workstreams"))
     log.info("Node ID: %s", _node_id)
+
+    # TLS: request cert from console ACME if enabled
+    ssl_kwargs: dict[str, Any] = {}
+    if config_store.get("tls.enabled"):
+        try:
+            import asyncio
+            import socket
+            import tempfile
+
+            from turnstone.core.tls import TLSClient
+
+            hostname = socket.getfqdn()
+            hostnames = [hostname, "localhost", "127.0.0.1"]
+            # Only add bind host if it's a concrete address
+            if args.host not in ("0.0.0.0", "::", ""):
+                hostnames.append(args.host)
+            tls_client = TLSClient(
+                storage=get_storage(),
+                hostnames=hostnames,
+            )
+            asyncio.run(tls_client.init())
+            bundle = tls_client.bundle
+            if bundle:
+                # Write PEM to temp files for uvicorn (restricted permissions)
+                _tls_temp_files: list[str] = []
+
+                def _write_pem(data: bytes, suffix: str = ".pem") -> str:
+                    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+                        f.write(data)
+                        name = f.name
+                    os.chmod(name, 0o600)
+                    _tls_temp_files.append(name)
+                    return name
+
+                ssl_kwargs["ssl_certfile"] = _write_pem(bundle.fullchain_pem)
+                ssl_kwargs["ssl_keyfile"] = _write_pem(bundle.key_pem)
+                if tls_client.ca_pem:
+                    ssl_kwargs["ssl_ca_certs"] = _write_pem(tls_client.ca_pem)
+                    import ssl as _ssl
+
+                    ssl_kwargs["ssl_cert_reqs"] = _ssl.CERT_REQUIRED
+
+                # Store client on app state for lifespan renewal
+                app.state.tls_client = tls_client
+
+                # Clean up temp files on exit
+                import atexit
+
+                def _cleanup_tls_files() -> None:
+                    import contextlib
+
+                    for path in _tls_temp_files:
+                        with contextlib.suppress(OSError):
+                            os.unlink(path)
+
+                atexit.register(_cleanup_tls_files)
+                log.info("TLS enabled — serving HTTPS")
+            else:
+                log.warning("TLS enabled but no cert available")
+        except Exception:
+            log.warning("TLS initialization failed — serving plain HTTP", exc_info=True)
+
     print("Press Ctrl+C to stop.")
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", **ssl_kwargs)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,8 @@ class ClusterCollector:
         http_timeout: float = 30.0,
         auth_token: str = "",
         token_manager: ServiceTokenManager | None = None,
+        tls_verify: Any = True,
+        tls_cert: tuple[str, str] | None = None,
     ):
         self._broker = broker
         self._prefix = prefix
@@ -86,6 +88,8 @@ class ClusterCollector:
                 max_connections=max_poll_workers + 10,
                 max_keepalive_connections=min(max_poll_workers, 200),
             ),
+            verify=tls_verify,
+            cert=tls_cert,
         )
 
         # SSE fan-out to browser clients
