@@ -853,6 +853,10 @@ If you used read_file to check a target, cite what you found."""
 # ---------------------------------------------------------------------------
 
 
+class _ExecutorPoisonedError(Exception):
+    """Raised when a timeout leaves the executor's worker thread stuck."""
+
+
 class IntentJudge:
     """Session-scoped LLM judge for intent validation.
 
@@ -912,18 +916,12 @@ class IntentJudge:
             self._model = session_model
             self._judge_context_window = context_window
 
-        # Executor for timeout-guarded API calls (1 thread — judge is serial)
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
-
-    def shutdown(self) -> None:
-        """Release the executor thread pool."""
-        self._executor.shutdown(wait=False, cancel_futures=True)
-
     def evaluate(
         self,
         items: list[dict[str, Any]],
         messages: list[dict[str, Any]],
         callback: Callable[[IntentVerdict], None],
+        cancel_event: threading.Event | None = None,
     ) -> list[IntentVerdict]:
         """Evaluate tool calls. Returns heuristic verdicts immediately.
 
@@ -936,6 +934,10 @@ class IntentJudge:
                 ``func_args``, ``approval_label``, ``call_id``).
             messages: Conversation history (OpenAI message format).
             callback: Called with each LLM verdict (or timeout/error fallback).
+            cancel_event: When set, the daemon judge thread abandons
+                remaining work.  Callers should set this after the user
+                has already made an approval decision so the judge does
+                not keep consuming inference resources.
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -958,7 +960,7 @@ class IntentJudge:
         # Spawn daemon thread for LLM judge
         thread = threading.Thread(
             target=self._run_judge,
-            args=(items, messages, heuristic_verdicts, callback),
+            args=(items, messages, heuristic_verdicts, callback, cancel_event),
             daemon=True,
             name="intent-judge",
         )
@@ -972,25 +974,44 @@ class IntentJudge:
         messages: list[dict[str, Any]],
         heuristic_verdicts: list[IntentVerdict],
         callback: Callable[[IntentVerdict], None],
+        cancel_event: threading.Event | None = None,
     ) -> None:
         """Daemon thread: run LLM judge for each item and invoke callback."""
-        for item, h_verdict in zip(items, heuristic_verdicts, strict=True):
-            try:
-                llm_verdict = self._evaluate_single(item, messages)
-                # Arbitrate: only callback when LLM upgrades the heuristic
-                if llm_verdict and llm_verdict.confidence > h_verdict.confidence:
-                    callback(llm_verdict)
-                # else: heuristic already delivered, no duplicate callback
-            except Exception:
-                log.exception(
-                    "Judge evaluation failed for %s",
-                    item.get("func_name", "?"),
-                )
+        # Evaluation-scoped executor — avoids sharing mutable state with
+        # other daemon threads from concurrent evaluate() calls.
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
+        try:
+            for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
+                if cancel_event and cancel_event.is_set():
+                    log.debug("judge.cancelled", remaining=len(items) - idx)
+                    return
+                try:
+                    llm_verdict = self._evaluate_single(item, messages, cancel_event, executor)
+                    if cancel_event and cancel_event.is_set():
+                        return
+                    # Arbitrate: only callback when LLM upgrades the heuristic
+                    if llm_verdict and llm_verdict.confidence > h_verdict.confidence:
+                        callback(llm_verdict)
+                    # else: heuristic already delivered, no duplicate callback
+                except _ExecutorPoisonedError:
+                    # Timeout left the worker stuck — replace the executor
+                    # so subsequent items don't queue behind it.
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
+                except Exception:
+                    log.exception(
+                        "Judge evaluation failed for %s",
+                        item.get("func_name", "?"),
+                    )
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _evaluate_single(
         self,
         item: dict[str, Any],
         messages: list[dict[str, Any]],
+        cancel_event: threading.Event | None,
+        executor: ThreadPoolExecutor,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
         start = time.monotonic()
@@ -1020,6 +1041,9 @@ class IntentJudge:
         result = None  # will hold the last CompletionResult
 
         for turn in range(_JUDGE_MAX_TURNS):
+            if cancel_event and cancel_event.is_set():
+                return None
+
             turn_start = time.monotonic()
 
             is_last_turn = turn == _JUDGE_MAX_TURNS - 1
@@ -1043,7 +1067,7 @@ class IntentJudge:
             # 10 minutes — far too long for an advisory judge on local models.
             per_call_timeout = max(timeout_budget, 5.0)  # at least 5s
             try:
-                future = self._executor.submit(
+                future = executor.submit(
                     self._provider.create_completion,
                     client=self._client,
                     model=self._model,
@@ -1053,17 +1077,24 @@ class IntentJudge:
                     temperature=0.0,
                     reasoning_effort="medium",
                 )
-                result = future.result(timeout=per_call_timeout)
+                # Poll in 1s increments so we notice cancellation promptly
+                # instead of blocking for the full per_call_timeout.
+                deadline = time.monotonic() + per_call_timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if cancel_event and cancel_event.is_set():
+                        future.cancel()
+                        return None
+                    if remaining <= 0:
+                        raise TimeoutError
+                    try:
+                        result = future.result(timeout=min(remaining, 1.0))
+                        break
+                    except TimeoutError:
+                        pass  # loop back to check remaining/cancel
             except TimeoutError:
                 log.warning("Judge LLM call timed out on turn %d (%.0fs)", turn, per_call_timeout)
-                # Abandon the lingering API call and replace the executor so
-                # subsequent items in the batch don't queue behind it.
-                self._executor.shutdown(wait=False, cancel_futures=True)
-                self._executor = ThreadPoolExecutor(
-                    max_workers=1,
-                    thread_name_prefix="judge-api",
-                )
-                return None
+                raise _ExecutorPoisonedError from None
             except Exception:
                 log.exception("Judge LLM call failed on turn %d", turn)
                 return None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -179,10 +180,13 @@ class TestErrorHandling:
         provider = _make_mock_provider(side_effect=RuntimeError("API error"))
         judge = _make_judge(provider)
 
-        result = judge._evaluate_single(
-            _make_item(),
-            [{"role": "user", "content": "test"}],
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "test"}],
+                cancel_event=None,
+                executor=pool,
+            )
         assert result is None
 
     def test_provider_error_heuristic_still_returned(self):
@@ -211,10 +215,13 @@ class TestErrorHandling:
         result_mock.content = ""
 
         judge = _make_judge(provider)
-        result = judge._evaluate_single(
-            _make_item(),
-            [{"role": "user", "content": "test"}],
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "test"}],
+                cancel_event=None,
+                executor=pool,
+            )
         assert result is None
 
 
@@ -254,10 +261,13 @@ class TestMultiTurnToolUse:
         provider.create_completion.side_effect = [turn1, turn2]
 
         judge = _make_judge(provider)
-        verdict = judge._evaluate_single(
-            _make_item(),
-            [{"role": "user", "content": "test"}],
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            verdict = judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "test"}],
+                cancel_event=None,
+                executor=pool,
+            )
         assert verdict is not None
         assert verdict.tier == "llm"
         assert provider.create_completion.call_count == 2
@@ -299,10 +309,13 @@ class TestMultiTurnToolUse:
         ]
 
         judge = _make_judge(provider)
-        judge._evaluate_single(
-            _make_item(),
-            [{"role": "user", "content": "test"}],
-        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "test"}],
+                cancel_event=None,
+                executor=pool,
+            )
         # Should have called create_completion exactly _JUDGE_MAX_TURNS times
         assert provider.create_completion.call_count == 5
 

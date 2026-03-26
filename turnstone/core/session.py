@@ -319,6 +319,7 @@ class ChatSession:
         # Intent validation judge (lazy-initialized)
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
+        self._judge_cancel_event: threading.Event | None = None
         # MCP tool integration: merge external tools with built-in
         self._mcp_client = mcp_client
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
@@ -639,8 +640,8 @@ class ChatSession:
 
     def close(self) -> None:
         """Release resources (listener registrations, etc.)."""
-        if self._judge is not None:
-            self._judge.shutdown()
+        if self._judge_cancel_event is not None:
+            self._judge_cancel_event.set()
         if self._mcp_client and self._mcp_refresh_cb:
             self._mcp_client.remove_listener(self._mcp_refresh_cb)
             self._mcp_refresh_cb = None
@@ -2074,20 +2075,24 @@ class ChatSession:
     def _evaluate_intent(
         self,
         items: list[dict[str, Any]],
-    ) -> None:
+    ) -> threading.Event | None:
         """Run intent validation on pending approval items.
 
         Attaches heuristic verdicts to items immediately.  Spawns the
         async LLM judge that delivers final verdicts via UI callback.
+
+        Returns a cancel event that, when set, tells the daemon judge
+        thread to abandon remaining work.  Callers should set this
+        after the user has made an approval decision.
         """
         judge = self._ensure_judge()
         if not judge:
-            return
+            return None
 
         # Only evaluate items that need approval and aren't errors
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
         if not pending:
-            return
+            return None
 
         # Build func_args from tool-specific item keys so the heuristic
         # engine can pattern-match on argument content.
@@ -2125,15 +2130,19 @@ class ChatSession:
             except Exception:
                 log.debug("judge.verdict_delivery_failed", exc_info=True)
 
+        cancel_event = threading.Event()
         heuristic_verdicts = judge.evaluate(
             pending,
             list(self.messages),  # snapshot — daemon thread must not see mutations
             callback=_on_verdict,
+            cancel_event=cancel_event,
         )
 
         # Attach heuristic verdicts to items for the approval UI
         for item, verdict in zip(pending, heuristic_verdicts, strict=True):
             item["_heuristic_verdict"] = verdict.to_dict()
+
+        return cancel_event
 
     def _evaluate_output(self, call_id: str, output: str, func_name: str) -> str:
         """Run the output guard on tool result text.
@@ -2184,12 +2193,20 @@ class ChatSession:
         # Phase 1: prepare all tool calls
         items = [self._prepare_tool(tc) for tc in tool_calls]
 
-        # Intent validation (advisory, non-blocking)
-        self._evaluate_intent(items)
+        # Intent validation (advisory, non-blocking).
+        # Cancel any prior judge thread before spawning a new one.
+        if self._judge_cancel_event is not None:
+            self._judge_cancel_event.set()
+        judge_cancel = self._evaluate_intent(items)
+        self._judge_cancel_event = judge_cancel  # track for close()
 
         # Phase 2: approve via UI
         self._emit_state("attention")
-        approved, user_feedback = self.ui.approve_tools(items)
+        try:
+            approved, user_feedback = self.ui.approve_tools(items)
+        finally:
+            if judge_cancel:
+                judge_cancel.set()  # user decided (or disconnected) — stop judge
         self._emit_state("running")
         if not approved:
             # Mark all pending items as denied
