@@ -286,7 +286,7 @@ class TLSManager:
         _require_lacme()
         from lacme.mtls import server_ssl_context
 
-        return server_ssl_context(
+        return server_ssl_context(  # type: ignore[no-any-return]
             cert_pem=self._frontend_bundle.fullchain_pem,
             key_pem=self._frontend_bundle.key_pem,
             ca_cert_pem=self.get_root_cert_pem(),
@@ -303,7 +303,7 @@ class TLSManager:
         _require_lacme()
         from lacme.mtls import client_ssl_context
 
-        return client_ssl_context(
+        return client_ssl_context(  # type: ignore[no-any-return]
             cert_pem=self._internal_bundle.cert_pem,
             key_pem=self._internal_bundle.key_pem,
             ca_cert_pem=self.get_root_cert_pem(),

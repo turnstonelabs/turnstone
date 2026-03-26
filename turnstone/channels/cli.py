@@ -219,6 +219,12 @@ def main() -> None:
             ssl_certfile = getattr(args, "ssl_certfile", None)
             ssl_keyfile = getattr(args, "ssl_keyfile", None)
             ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
+            if bool(ssl_certfile) != bool(ssl_keyfile):
+                print(
+                    "Both --ssl-certfile and --ssl-keyfile are required for TLS",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
             uv_config = uvicorn.Config(
                 channel_app,

@@ -4790,25 +4790,26 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
     deployments to configure settings before the admin UI is available.
 
     Only seeds known settings from the registry to avoid storing garbage.
+    Uses config_store.set() for proper validation, serialization, and
+    cache invalidation.
     """
-    from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
+    from turnstone.core.settings_registry import SETTINGS
 
-    for key, defn in SETTINGS.items():
+    for key in SETTINGS:
         env_name = "TURNSTONE_" + key.replace(".", "_").upper()
         env_val = os.environ.get(env_name)
         if env_val is None:
             continue
-        # Only seed if not already stored
+        # Only seed if not already stored (check raw storage to avoid
+        # config_store cache, which may not reflect DB state yet)
         existing = storage.get_system_setting(key)
         if existing is not None:
             continue
         try:
-            # validate_value handles string-to-type coercion
-            validated = validate_value(key, env_val)
-            storage.set_system_setting(key, serialize_value(validated))
-            log.info("config.seeded_from_env", key=key, env=env_name)
+            config_store.set(key, env_val, changed_by="env")
+            log.info("config.seeded_from_env: %s from %s", key, env_name)
         except Exception:
-            log.warning("config.seed_failed", key=key, env=env_name, exc_info=True)
+            log.warning("config.seed_failed: %s from %s", key, env_name, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
