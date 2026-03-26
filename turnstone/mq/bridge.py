@@ -1145,7 +1145,7 @@ def main() -> None:
             import asyncio
             import socket
 
-            from turnstone.core.storage import get_storage, init_storage
+            from turnstone.core.storage import init_storage
 
             db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
             db_url = os.environ.get("TURNSTONE_DB_URL", "")

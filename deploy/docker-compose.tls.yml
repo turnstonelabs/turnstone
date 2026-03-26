@@ -134,9 +134,7 @@ services:
         fi
         exec redis-server $$ARGS
     healthcheck:
-      test: ["CMD", "redis-cli", "--tls",
-             "--cacert", "/certs/ca.pem",
-             "ping"]
+      test: ["CMD-SHELL", "redis-cli --tls --cacert /certs/ca.pem ${REDIS_PASSWORD:+-a $REDIS_PASSWORD} ping"]
       interval: 5s
       timeout: 3s
       retries: 5
