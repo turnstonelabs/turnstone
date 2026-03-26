@@ -809,6 +809,29 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             hostname = socket.getfqdn()
             await tls_mgr.issue_console_certs([hostname, "localhost", "127.0.0.1"])
             await tls_mgr.start_renewal()
+            # Re-create proxy clients with mTLS context now that certs are ready
+            client_ctx = tls_mgr.get_client_ssl_context()
+            if client_ctx:
+                await app.state.proxy_client.aclose()
+                await app.state.proxy_sse_client.aclose()
+                app.state.proxy_client = httpx.AsyncClient(
+                    timeout=30,
+                    limits=httpx.Limits(
+                        max_connections=app.state.fan_out_limit + 50,
+                        max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
+                    ),
+                    verify=client_ctx,
+                )
+                app.state.proxy_sse_client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=5, read=30, write=5, pool=5),
+                    limits=httpx.Limits(
+                        max_connections=1100,
+                        max_keepalive_connections=100,
+                        keepalive_expiry=30,
+                    ),
+                    verify=client_ctx,
+                )
+                log.info("tls.proxy_clients.upgraded")
         except Exception:
             log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
 
@@ -816,6 +839,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Shutdown
     if _console_heartbeat_task is not None:
         _console_heartbeat_task.cancel()
+    # Deregister console from services table
+    if console_url and storage:
+        try:
+            storage.deregister_service("console", "console")
+        except Exception:
+            log.debug("console.deregister_failed", exc_info=True)
     tls_mgr = getattr(app.state, "tls_manager", None)
     if tls_mgr is not None:
         await tls_mgr.stop_renewal()
@@ -4749,6 +4778,40 @@ async def tls_delete_cert(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# ConfigStore env seeding
+# ---------------------------------------------------------------------------
+
+
+def _seed_config_from_env(config_store: Any, storage: Any) -> None:
+    """Seed ConfigStore settings from environment variables.
+
+    Checks for ``TURNSTONE_{SECTION}_{KEY}`` env vars and writes them
+    to ConfigStore if they aren't already set. This allows container
+    deployments to configure settings before the admin UI is available.
+
+    Only seeds known settings from the registry to avoid storing garbage.
+    """
+    from turnstone.core.settings_registry import SETTINGS, serialize_value, validate_value
+
+    for key, defn in SETTINGS.items():
+        env_name = "TURNSTONE_" + key.replace(".", "_").upper()
+        env_val = os.environ.get(env_name)
+        if env_val is None:
+            continue
+        # Only seed if not already stored
+        existing = storage.get_system_setting(key)
+        if existing is not None:
+            continue
+        try:
+            # validate_value handles string-to-type coercion
+            validated = validate_value(key, env_val)
+            storage.set_system_setting(key, serialize_value(validated))
+            log.info("config.seeded_from_env", key=key, env=env_name)
+        except Exception:
+            log.warning("config.seed_failed", key=key, env=env_name, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -5182,7 +5245,15 @@ def main() -> None:
         db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
         db_url = os.environ.get("TURNSTONE_DB_URL", "")
         db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-        auth_storage = init_storage(db_backend, path=db_path, url=db_url)
+        auth_storage = init_storage(
+            db_backend,
+            path=db_path,
+            url=db_url,
+            sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
+            sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
+            sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
+            sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+        )
     except Exception:
         log.info("Console storage not available — admin API disabled, JWT-only auth")
 
@@ -5215,6 +5286,8 @@ def main() -> None:
             from turnstone.core.config_store import ConfigStore
 
             _cs = ConfigStore(auth_storage)
+            # Seed ConfigStore from env vars (TURNSTONE_{SECTION}_{KEY})
+            _seed_config_from_env(_cs, auth_storage)
             if _cs.get("tls.enabled"):
                 from turnstone.console.tls import TLSManager
 

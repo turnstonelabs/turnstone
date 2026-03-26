@@ -214,7 +214,7 @@ class TLSClient:
         _require_lacme()
         from lacme.mtls import server_ssl_context
 
-        return server_ssl_context(  # type: ignore[no-any-return]
+        return server_ssl_context(
             cert_pem=self._bundle.fullchain_pem,
             key_pem=self._bundle.key_pem,
             ca_cert_pem=self._ca_pem,
@@ -227,7 +227,7 @@ class TLSClient:
         _require_lacme()
         from lacme.mtls import client_ssl_context
 
-        return client_ssl_context(  # type: ignore[no-any-return]
+        return client_ssl_context(
             cert_pem=self._bundle.cert_pem,
             key_pem=self._bundle.key_pem,
             ca_cert_pem=self._ca_pem,

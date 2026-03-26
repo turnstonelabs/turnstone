@@ -184,3 +184,51 @@ def test_database_ssl_config_map():
     assert "sslrootcert" in db_map
     assert "sslcert" in db_map
     assert "sslkey" in db_map
+
+
+# ── Auth enforcement ──────────────────────────────────────────────────────────
+
+
+def test_tls_endpoints_require_auth(tls_manager):
+    """TLS admin endpoints return 401 without auth."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from turnstone.console.server import tls_ca_status, tls_list_certs
+
+    # No auth middleware — request.state.auth_result will be missing
+    app = Starlette(
+        routes=[
+            Route("/ca", tls_ca_status),
+            Route("/certs", tls_list_certs),
+        ]
+    )
+    app.state.tls_manager = tls_manager
+
+    client = TestClient(app)
+    resp = client.get("/ca")
+    assert resp.status_code == 401
+
+    resp = client.get("/certs")
+    assert resp.status_code == 401
+
+
+# ── SDK TLS params ────────────────────────────────────────────────────────────
+
+
+def test_sdk_client_cert_requires_both():
+    """SDK raises ValueError if only one of client_cert/client_key provided."""
+    from turnstone.sdk._base import _BaseClient
+
+    with pytest.raises(ValueError, match="Both client_cert and client_key"):
+        _BaseClient(
+            base_url="http://localhost:8080",
+            client_cert="/path/to/cert.pem",
+        )
+
+    with pytest.raises(ValueError, match="Both client_cert and client_key"):
+        _BaseClient(
+            base_url="http://localhost:8080",
+            client_key="/path/to/key.pem",
+        )

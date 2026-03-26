@@ -843,6 +843,39 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400],
         tags=["Admin"],
     ),
+    # --- Admin: TLS / ACME ---
+    EndpointSpec(
+        "/v1/api/admin/tls/ca",
+        "GET",
+        "CA status: initialization state, CN, cert count, cert inventory",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/tls/ca.pem",
+        "GET",
+        "Download CA root certificate (PEM format)",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/tls/certs",
+        "GET",
+        "List all issued TLS certificates",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/tls/certs/{domain}/renew",
+        "POST",
+        "Force-renew a certificate by domain",
+        error_codes=[404, 500],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/tls/certs/{domain}",
+        "DELETE",
+        "Delete a certificate by domain",
+        error_codes=[404],
+        tags=["Admin"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",

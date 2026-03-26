@@ -22,6 +22,10 @@ def init_storage(
     url: str = "",
     pool_size: int = 2,
     run_migrations: bool = True,
+    sslmode: str = "",
+    sslrootcert: str = "",
+    sslcert: str = "",
+    sslkey: str = "",
 ) -> StorageBackend:
     """Initialize the storage backend singleton.
 
@@ -52,6 +56,26 @@ def init_storage(
         if not url:
             msg = "PostgreSQL backend requires a connection URL (db_url)"
             raise ValueError(msg)
+        # Append SSL params to URL if provided (validated + encoded)
+        _VALID_SSLMODES = {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+        if sslmode and sslmode not in _VALID_SSLMODES:
+            msg = f"Invalid sslmode: {sslmode!r} (expected one of {sorted(_VALID_SSLMODES)})"
+            raise ValueError(msg)
+        ssl_params = {
+            k: v
+            for k, v in {
+                "sslmode": sslmode,
+                "sslrootcert": sslrootcert,
+                "sslcert": sslcert,
+                "sslkey": sslkey,
+            }.items()
+            if v
+        }
+        if ssl_params:
+            from urllib.parse import urlencode
+
+            sep = "&" if "?" in url else "?"
+            url += sep + urlencode(ssl_params)
         _storage = PostgreSQLBackend(url, pool_size=pool_size, create_tables=create_tables)
         log.info("Storage initialized: PostgreSQL")
 
