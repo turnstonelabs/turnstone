@@ -160,7 +160,10 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    os.chmod(out_dir, 0o700)  # Restrict access — contains CA private key
+    try:
+        os.chmod(out_dir, 0o700)  # Restrict access — contains CA private key
+    except PermissionError:
+        pass  # Docker volumes may not support chmod
 
     store = FileStore(str(out_dir))
     ca = CertificateAuthority(store)
@@ -170,7 +173,10 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
     # Write CA cert to a well-known location
     ca_cert_path = out_dir / "ca.pem"
     ca_cert_path.write_bytes(ca.root_cert_pem)
-    os.chmod(ca_cert_path, 0o644)
+    try:
+        os.chmod(ca_cert_path, 0o644)
+    except PermissionError:
+        pass
     print(f"CA cert: {ca_cert_path}")
 
     # Issue certs for requested domains

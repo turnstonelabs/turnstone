@@ -131,15 +131,15 @@ class RedisBroker:
 
         self._prefix = prefix
         self._response_ttl = response_ttl
-        ssl_kwargs: dict[str, Any] = {}
+        pool_kwargs: dict[str, Any] = {}
         if ssl:
-            ssl_kwargs["ssl"] = True
+            pool_kwargs["connection_class"] = redis.SSLConnection
             if ssl_ca_certs:
-                ssl_kwargs["ssl_ca_certs"] = ssl_ca_certs
+                pool_kwargs["ssl_ca_certs"] = ssl_ca_certs
             if ssl_certfile:
-                ssl_kwargs["ssl_certfile"] = ssl_certfile
+                pool_kwargs["ssl_certfile"] = ssl_certfile
             if ssl_keyfile:
-                ssl_kwargs["ssl_keyfile"] = ssl_keyfile
+                pool_kwargs["ssl_keyfile"] = ssl_keyfile
         self._pool: _redis_t.ConnectionPool = redis.ConnectionPool(
             host=host,
             port=port,
@@ -148,7 +148,7 @@ class RedisBroker:
             decode_responses=True,
             retry_on_timeout=True,
             max_connections=200,
-            **ssl_kwargs,
+            **pool_kwargs,
         )
         self._redis: _redis_t.Redis[str] = cast(
             "_redis_t.Redis[str]",
@@ -324,7 +324,7 @@ def broker_from_args(args: Any) -> RedisBroker:
         host=args.redis_host,
         port=args.redis_port,
         db=args.redis_db,
-        password=args.redis_password,
+        password=args.redis_password or None,
         **_redis_tls_kwargs(args),
     )
 
@@ -337,6 +337,6 @@ def async_broker_from_args(args: Any) -> Any:
         host=args.redis_host,
         port=args.redis_port,
         db=args.redis_db,
-        password=args.redis_password,
+        password=args.redis_password or None,
         **_redis_tls_kwargs(args),
     )

@@ -2085,6 +2085,8 @@ def main() -> None:
 
     configure_logging_from_args(args, "server")
 
+    import socket
+
     # Initialize storage backend
     from turnstone.core.storage import init_storage
 
@@ -2454,7 +2456,6 @@ def main() -> None:
     if config_store.get("tls.enabled"):
         try:
             import asyncio
-            import socket
 
             from turnstone.core.tls import TLSClient
 

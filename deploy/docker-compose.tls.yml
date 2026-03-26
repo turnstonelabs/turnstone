@@ -1,8 +1,7 @@
 # TLS overlay — enables mTLS across the turnstone cluster.
 #
-# Usage (overlay — requires a base compose.yaml defining
-# console, server, bridge, and redis services):
-#   docker compose -f compose.yaml -f deploy/docker-compose.tls.yml up
+# Usage (requires base compose.yaml with production profile):
+#   docker compose -f compose.yaml -f deploy/docker-compose.tls.yml --profile production up
 #
 # The tls-init service bootstraps a CA and issues a cert for Redis.
 # All turnstone services auto-provision their own certs via the
@@ -10,14 +9,22 @@
 
 services:
   # Bootstrap: create CA + Redis cert before anything starts
+  # Runs as root to create directories in the volume, then
+  # chowns to the turnstone user so services can read certs.
   tls-init:
     build: .
-    command: >
-      turnstone-admin tls-bootstrap
-        --out /certs
-        --issue redis
+    user: root
+    command:
+      - sh
+      - -c
+      - |
+        turnstone-admin tls-bootstrap --out /certs --issue redis
+        chmod -R a+r /certs
+        find /certs -type d -exec chmod a+rx {} +
     volumes:
       - tls-certs:/certs
+    networks:
+      - turnstone-net
     restart: "no"
 
   # Console: runs the internal CA + ACME server
@@ -29,26 +36,47 @@ services:
       - tls-certs:/certs:ro
     environment:
       TURNSTONE_TLS_ENABLED: "true"
+      TURNSTONE_CONSOLE_URL: "http://console:8090"
+    command:
+      - turnstone-console
+      - --host=0.0.0.0
+      - --port=8090
+      - --redis-host=redis
+      - --redis-port=6379
+      - --poll-interval=${CONSOLE_POLL_INTERVAL:-10}
+      - --redis-tls
+      - --redis-tls-ca=/certs/ca.pem
 
-  # Server nodes: auto-provision certs via console ACME
+  # Server: auto-provisions certs via console ACME, serves HTTPS
   server:
     depends_on:
       console:
         condition: service_healthy
     volumes:
       - tls-certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "https://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
-  # Bridge: mTLS to server, Redis TLS
+  # Bridge: add Redis TLS flags to the existing command
   bridge:
     depends_on:
       console:
         condition: service_healthy
     volumes:
       - tls-certs:/certs:ro
-    command: >
-      turnstone-bridge
-        --redis-tls
-        --redis-tls-ca /certs/ca.pem
+    command:
+      - turnstone-bridge
+      - --server-url=http://server:8080
+      - --redis-host=redis
+      - --redis-port=6379
+      - --heartbeat-ttl=${HEARTBEAT_TTL:-60}
+      - --approval-timeout=${APPROVAL_TIMEOUT:-3600}
+      - --redis-tls
+      - --redis-tls-ca=/certs/ca.pem
 
   # Redis: TLS with certs from bootstrap
   redis:
@@ -57,18 +85,22 @@ services:
         condition: service_completed_successfully
     volumes:
       - tls-certs:/certs:ro
-    command: >
-      redis-server
-        --tls-port 6379
-        --port 0
-        --tls-cert-file /certs/certs/redis/cert.pem
-        --tls-key-file /certs/certs/redis/key.pem
-        --tls-ca-cert-file /certs/ca.pem
+    command:
+      - sh
+      - -c
+      - |
+        ARGS="--tls-port 6379 --port 0 \
+          --tls-cert-file /certs/certs/redis/cert.pem \
+          --tls-key-file /certs/certs/redis/key.pem \
+          --tls-ca-cert-file /certs/ca.pem \
+          --tls-auth-clients no"
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          ARGS="$$ARGS --requirepass $$REDIS_PASSWORD"
+        fi
+        exec redis-server $$ARGS
     healthcheck:
       test: ["CMD", "redis-cli", "--tls",
              "--cacert", "/certs/ca.pem",
-             "--cert", "/certs/certs/redis/cert.pem",
-             "--key", "/certs/certs/redis/key.pem",
              "ping"]
       interval: 5s
       timeout: 3s

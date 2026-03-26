@@ -143,12 +143,15 @@ class TLSClient:
 
         # Request new cert via ACME (plain HTTP for initial request)
         lacme = _require_lacme()
+        from lacme.challenges.http01 import HTTP01Handler
+
         directory_url = f"{self._console_url}/acme/directory"
 
         async with lacme.Client(
             directory_url=directory_url,
             store=self._store,
             event_dispatcher=self._event_dispatcher,
+            challenge_handler=HTTP01Handler(),
             allow_insecure=True,
         ) as client:
             self._bundle = await client.issue(self._hostnames)
@@ -165,11 +168,14 @@ class TLSClient:
             self._bundle = bundle
             log.info("tls.cert.renewed", domain=bundle.domain)
 
+        from lacme.challenges.http01 import HTTP01Handler
+
         directory_url = f"{self._console_url}/acme/directory"
         client = lacme.Client(
             directory_url=directory_url,
             store=self._store,
             event_dispatcher=self._event_dispatcher,
+            challenge_handler=HTTP01Handler(),
             allow_insecure=True,
         )
         await client.__aenter__()
