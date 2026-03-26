@@ -110,7 +110,10 @@ class ClusterCollector:
             verify=tls_verify,
             cert=tls_cert,
         )
-        old.close()
+        # Don't close old client — concurrent _fetch_node() threads may still
+        # be using it.  It will be GC'd once all references are released, and
+        # the current client is closed in stop().
+        del old
 
     # -- lifecycle -----------------------------------------------------------
 

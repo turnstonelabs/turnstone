@@ -8,9 +8,9 @@
 # console's ACME endpoint.
 
 services:
-  # Bootstrap: create CA + Redis cert before anything starts
-  # Runs as root to create directories in the volume, then
-  # chowns to the turnstone user so services can read certs.
+  # Bootstrap: create CA + Redis cert before anything starts.
+  # Runs as root to create directories in the volume, then chowns
+  # to turnstone:turnstone with restrictive perms (keys 0600).
   tls-init:
     build: .
     user: root
@@ -18,9 +18,12 @@ services:
       - sh
       - -c
       - |
+        set -e
         turnstone-admin tls-bootstrap --out /certs --issue redis
-        chmod -R a+r /certs
-        find /certs -type d -exec chmod a+rx {} +
+        chown -R turnstone:turnstone /certs
+        find /certs -type d -exec chmod 750 {} +
+        find /certs -type f -name '*key.pem' -exec chmod 600 {} +
+        find /certs -type f ! -name '*key.pem' -exec chmod 640 {} +
     volumes:
       - tls-certs:/certs
     networks:
@@ -134,7 +137,7 @@ services:
         fi
         exec redis-server $$ARGS
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli --tls --cacert /certs/ca.pem ${REDIS_PASSWORD:+-a $REDIS_PASSWORD} ping"]
+      test: ["CMD-SHELL", "if [ -n \"$$REDIS_PASSWORD\" ]; then redis-cli --tls --cacert /certs/ca.pem -a $$REDIS_PASSWORD ping; else redis-cli --tls --cacert /certs/ca.pem ping; fi"]
       interval: 5s
       timeout: 3s
       retries: 5
