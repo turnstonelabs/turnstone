@@ -166,7 +166,7 @@ def _cmd_tls_bootstrap(args: argparse.Namespace) -> None:
         pass  # Docker volumes may not support chmod
 
     store = FileStore(str(out_dir))
-    ca = CertificateAuthority(store)
+    ca = CertificateAuthority(store, name="turnstone")
     ca.init(cn="Turnstone CA", validity_days=3650)
     print(f"CA initialized in {out_dir} (permissions: 0700)")
 

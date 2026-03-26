@@ -23,6 +23,7 @@ log = structlog.get_logger(__name__)
 
 # Hardcoded defaults — no operator config needed
 _CA_CN = "Turnstone CA"
+_CA_NAME = "turnstone"  # Store key for save_ca/load_ca
 _CA_VALIDITY_DAYS = 3650  # 10 years
 _CERT_VALIDITY_HOURS = 48
 _RENEW_INTERVAL_HOURS = 24
@@ -117,15 +118,50 @@ class TLSManager:
     async def init_ca(self) -> None:
         """Initialize the internal Certificate Authority.
 
-        Loads an existing CA from storage or generates a new root key+cert.
+        If a bootstrap CA exists on disk (from tls-bootstrap), imports it
+        into the database store first so the console uses the same CA that
+        signed the infrastructure certs.
         """
         lacme = _require_lacme()
+
+        # Import bootstrap CA from well-known volume path if not already in DB
+        self._import_bootstrap_ca()
+
         self._ca = lacme.CertificateAuthority(
             self._store,
+            name=_CA_NAME,
             event_dispatcher=self._event_dispatcher,
         )
         self._ca.init(cn=_CA_CN, validity_days=_CA_VALIDITY_DAYS)
         log.info("tls.ca.initialized", cn=_CA_CN)
+
+    def _import_bootstrap_ca(self) -> None:
+        """Import a bootstrap CA from /certs into the database store.
+
+        The tls-bootstrap CLI writes the CA to a FileStore at /certs.
+        On first boot, the console imports it so all services share
+        the same trust root.
+        """
+        import os
+        from pathlib import Path
+
+        # Check if bootstrap CA exists and DB CA doesn't
+        bootstrap_dir = Path(os.environ.get("TURNSTONE_TLS_BOOTSTRAP_DIR", "/certs"))
+        ca_dir = bootstrap_dir / "ca" / _CA_NAME
+        ca_cert_file = ca_dir / "cert.pem"
+        ca_key_file = ca_dir / "key.pem"
+
+        if not ca_cert_file.exists() or not ca_key_file.exists():
+            return  # No bootstrap CA found
+
+        existing = self._store.load_ca(_CA_NAME)
+        if existing is not None:
+            return  # Already imported
+
+        cert_pem = ca_cert_file.read_bytes()
+        key_pem = ca_key_file.read_bytes()
+        self._store.save_ca(_CA_NAME, cert_pem, key_pem)
+        log.info("tls.ca.imported_from_bootstrap", path=str(ca_dir))
 
     def get_responder(self) -> ASGIApp:
         """Return the ACME responder ASGI app for mounting."""

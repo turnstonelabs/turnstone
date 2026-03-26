@@ -18,14 +18,8 @@ def main() -> None:
 
     url = sys.argv[1]
     try:
-        import ssl
-
-        ctx = ssl.create_default_context()
-        if url.startswith("https://"):
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
         req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
             if data.get("status") in ("ok", "degraded"):
                 sys.exit(0)

@@ -1135,6 +1135,46 @@ def main() -> None:
         )
         log.info("bridge.jwt_minted")
 
+    # TLS: request cert from console ACME if enabled
+    tls_verify: Any = True
+    tls_cert: tuple[str, str] | None = None
+    if os.environ.get("TURNSTONE_TLS_ENABLED", "").lower() in ("true", "1", "yes"):
+        try:
+            from turnstone.core.tls import TLSClient
+
+            import asyncio
+            import socket
+
+            from turnstone.core.storage import get_storage, init_storage
+
+            db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
+            db_url = os.environ.get("TURNSTONE_DB_URL", "")
+            db_path = os.environ.get("TURNSTONE_DB_PATH", "")
+            storage = init_storage(db_backend, path=db_path, url=db_url)
+
+            hostname = socket.getfqdn()
+            hostnames = [hostname, "localhost", "127.0.0.1"]
+            extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
+            if extra_sans:
+                hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
+            tls_client = TLSClient(
+                storage=storage,
+                hostnames=hostnames,
+            )
+            asyncio.run(tls_client.init())
+            ssl_ctx = tls_client.get_client_ssl_context()
+            if ssl_ctx:
+                # SSLContext has both CA (verify server) and client cert
+                # (present to server) loaded — full mTLS in one object
+                tls_verify = ssl_ctx
+                if args.server_url.startswith("http://"):
+                    args.server_url = args.server_url.replace("http://", "https://")
+                log.info("bridge.tls.enabled: %s", args.server_url)
+        except ImportError:
+            log.warning("TLS enabled but lacme not installed")
+        except Exception:
+            log.warning("bridge.tls.init_failed", exc_info=True)
+
     bridge = Bridge(
         server_url=args.server_url,
         broker=broker,
@@ -1143,6 +1183,8 @@ def main() -> None:
         heartbeat_ttl=args.heartbeat_ttl,
         auth_token=auth_token,
         token_manager=token_manager,
+        tls_verify=tls_verify,
+        tls_cert=tls_cert,
     )
     bridge.run()
 

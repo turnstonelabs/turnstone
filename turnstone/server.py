@@ -2464,6 +2464,10 @@ def main() -> None:
             # Only add bind host if it's a concrete address
             if args.host not in ("0.0.0.0", "::", ""):
                 hostnames.append(args.host)
+            # Additional SANs from env (e.g. Docker service name)
+            extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
+            if extra_sans:
+                hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,

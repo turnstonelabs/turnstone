@@ -807,7 +807,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             if not tls_mgr.ca_initialized:
                 await tls_mgr.init_ca()
             hostname = socket.getfqdn()
-            await tls_mgr.issue_console_certs([hostname, "localhost", "127.0.0.1"])
+            cert_hostnames = [hostname, "localhost", "127.0.0.1"]
+            extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
+            if extra_sans:
+                cert_hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
+            await tls_mgr.issue_console_certs(cert_hostnames)
             await tls_mgr.start_renewal()
             # Re-create proxy clients with mTLS context now that certs are ready
             client_ctx = tls_mgr.get_client_ssl_context()
@@ -831,6 +835,8 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                     ),
                     verify=client_ctx,
                 )
+                # Upgrade collector httpx client for mTLS node polling
+                app.state.collector.upgrade_tls(tls_verify=client_ctx)
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
             log.warning("TLS initialization failed — continuing without TLS", exc_info=True)

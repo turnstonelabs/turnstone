@@ -96,6 +96,22 @@ class ClusterCollector:
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
 
+    def upgrade_tls(self, tls_verify: Any = True, tls_cert: tuple[str, str] | None = None) -> None:
+        """Replace the httpx client with one using mTLS context."""
+        old = self._http_client
+        self._http_client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=10, read=self._http_timeout, write=5, pool=self._http_timeout
+            ),
+            limits=httpx.Limits(
+                max_connections=self._max_poll_workers + 10,
+                max_keepalive_connections=min(self._max_poll_workers, 200),
+            ),
+            verify=tls_verify,
+            cert=tls_cert,
+        )
+        old.close()
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
