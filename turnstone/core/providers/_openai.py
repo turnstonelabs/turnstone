@@ -273,6 +273,29 @@ class OpenAIProvider:
                 result.append(tool)
         return result
 
+    # -- message sanitisation ------------------------------------------------
+
+    @staticmethod
+    def _sanitize_messages(
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Ensure assistant messages always have ``content`` or ``tool_calls``.
+
+        OpenAI-compatible APIs reject assistant messages that have neither.
+        This is a defensive catch-all; the upstream layers should already
+        guarantee well-formed messages.
+        """
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("content") is None
+                and not msg.get("tool_calls")
+            ):
+                msg = {**msg, "content": ""}
+            out.append(msg)
+        return out
+
     # -- streaming -----------------------------------------------------------
 
     def create_streaming(
@@ -289,6 +312,7 @@ class OpenAIProvider:
         deferred_names: frozenset[str] | None = None,
     ) -> Iterator[StreamChunk]:
         caps = self.get_capabilities(model)
+        messages = self._sanitize_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -402,6 +426,7 @@ class OpenAIProvider:
         deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         caps = self.get_capabilities(model)
+        messages = self._sanitize_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,

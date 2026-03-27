@@ -152,7 +152,7 @@ def reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
             messages.append({"role": "user", "content": content or ""})
 
         elif role == "assistant":
-            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
             if provider_data:
                 with contextlib.suppress(json.JSONDecodeError, TypeError):
                     msg["_provider_content"] = json.loads(provider_data)

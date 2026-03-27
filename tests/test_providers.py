@@ -140,6 +140,34 @@ class TestOpenAIProvider:
     def test_provider_name(self) -> None:
         assert self.provider.provider_name == "openai"
 
+    # -- _sanitize_messages ---------------------------------------------------
+
+    def test_sanitize_messages_none_content_no_tool_calls(self) -> None:
+        msgs = [{"role": "assistant", "content": None}]
+        assert self.provider._sanitize_messages(msgs) == [{"role": "assistant", "content": ""}]
+
+    def test_sanitize_messages_none_content_with_tool_calls(self) -> None:
+        msgs = [{"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]}]
+        result = self.provider._sanitize_messages(msgs)
+        assert result[0]["content"] is None
+        assert result[0]["tool_calls"] == [{"id": "1"}]
+
+    def test_sanitize_messages_empty_string_passthrough(self) -> None:
+        msgs = [{"role": "assistant", "content": ""}]
+        assert self.provider._sanitize_messages(msgs) == msgs
+
+    def test_sanitize_messages_non_assistant_unchanged(self) -> None:
+        msgs = [{"role": "user", "content": None}]
+        result = self.provider._sanitize_messages(msgs)
+        assert result[0]["content"] is None
+
+    def test_sanitize_messages_does_not_mutate_original(self) -> None:
+        original = {"role": "assistant", "content": None}
+        self.provider._sanitize_messages([original])
+        assert original["content"] is None
+
+    # -- convert_tools --------------------------------------------------------
+
     def test_convert_tools_passthrough(self) -> None:
         tools = [
             {

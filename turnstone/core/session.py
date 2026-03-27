@@ -1670,7 +1670,7 @@ class ChatSession:
             self.ui.on_stream_end()
             partial: dict[str, Any] = {"role": "assistant"}
             partial_content = "".join(content_parts)
-            partial["content"] = partial_content or None
+            partial["content"] = partial_content or ""
             # Deliberately omit tool_calls — they are incomplete
             if provider_blocks:
                 partial["_provider_content"] = provider_blocks
@@ -1701,10 +1701,7 @@ class ChatSession:
         msg: dict[str, Any] = {"role": "assistant"}
 
         content = "".join(content_parts)
-        if content:
-            msg["content"] = content
-        else:
-            msg["content"] = None
+        msg["content"] = content or ""
 
         if tool_calls_acc:
             msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
@@ -4251,7 +4248,7 @@ class ChatSession:
             {"role": "system", "content": self._plan_system_content()},
             {
                 "role": "assistant",
-                "content": None,
+                "content": "",
                 "tool_calls": [
                     {
                         "id": tc_id,
