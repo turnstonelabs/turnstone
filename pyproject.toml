@@ -79,7 +79,7 @@ include = [
   "turnstone/console/static/*.js",
   "turnstone/shared_static/*.css",
   "turnstone/shared_static/*.js",
-  "turnstone/shared_static/katex-0.16.42/**/*",
+  "turnstone/shared_static/katex-0.16.43/**/*",
   "turnstone/shared_static/hljs-11.11.1/**/*",
   "turnstone/shared_static/mermaid-11.13.0/**/*",
   "turnstone/sdk/py.typed",
