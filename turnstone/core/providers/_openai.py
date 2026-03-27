@@ -8,6 +8,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+@staticmethod
+def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure every assistant message has content or tool_calls.
+
+    OpenAI-compatible APIs reject assistant messages with neither.
+    This can happen when replaying a conversation where the model
+    responded with only a tool call and content was stored as None.
+    """
+    result = []
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            has_content = msg.get("content") is not None
+            has_tool_calls = bool(msg.get("tool_calls"))
+            if not has_content and not has_tool_calls:
+                msg = {**msg, "content": ""}
+        result.append(msg)
+    return result
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -289,6 +307,7 @@ class OpenAIProvider:
         deferred_names: frozenset[str] | None = None,
     ) -> Iterator[StreamChunk]:
         caps = self.get_capabilities(model)
+        messages = self._sanitize_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -402,6 +421,7 @@ class OpenAIProvider:
         deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         caps = self.get_capabilities(model)
+        messages = self._sanitize_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
