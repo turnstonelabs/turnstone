@@ -755,3 +755,150 @@ class TestWebSearchGating:
 
         names = [t.get("function", {}).get("name") for t in tools]
         assert "web_search" in names
+
+
+class TestMCPToolGating:
+    """MCP tools should not be offered when no MCP servers provide them."""
+
+    def test_mcp_tools_filtered_without_mcp_client(self, tmp_db, mock_openai_client):
+        """read_resource and use_prompt excluded when no MCP client."""
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+        assert session._mcp_client is None
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" not in names
+        assert "use_prompt" not in names
+
+    def test_read_resource_filtered_when_no_resources(self, tmp_db, mock_openai_client):
+        """read_resource excluded when MCP client has no resources."""
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.resource_count = 0
+        mcp_client.prompt_count = 2
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+        )
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" not in names
+        assert "use_prompt" in names
+
+    def test_use_prompt_filtered_when_no_prompts(self, tmp_db, mock_openai_client):
+        """use_prompt excluded when MCP client has no prompts."""
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.resource_count = 3
+        mcp_client.prompt_count = 0
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+        )
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "use_prompt" not in names
+        assert "read_resource" in names
+
+    def test_mcp_tools_kept_when_servers_have_both(self, tmp_db, mock_openai_client):
+        """Both tools present when MCP client has resources and prompts."""
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.resource_count = 1
+        mcp_client.prompt_count = 1
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+        )
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" in names
+        assert "use_prompt" in names
+
+    def test_mcp_tools_filtered_with_tool_search_active(self, tmp_db, mock_openai_client):
+        """Gating applies even when tool_search is active (client-side path)."""
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.resource_count = 0
+        mcp_client.prompt_count = 0
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+            tool_search="on",
+        )
+        assert session._tool_search is not None
+
+        tools = session._get_active_tools()
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" not in names
+        assert "use_prompt" not in names
+
+    def test_mcp_tools_filtered_with_native_tool_search(self, tmp_db, mock_openai_client):
+        """Gating applies when provider handles tool search natively."""
+        from unittest.mock import patch
+
+        from turnstone.core.providers._protocol import ModelCapabilities
+
+        mcp_client = MagicMock()
+        mcp_client.get_tools.return_value = []
+        mcp_client.resource_count = 0
+        mcp_client.prompt_count = 0
+
+        session = ChatSession(
+            client=mock_openai_client,
+            model="local-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+            mcp_client=mcp_client,
+            tool_search="on",
+        )
+
+        caps = ModelCapabilities(supports_tool_search=True)
+        with patch.object(session, "_get_capabilities", return_value=caps):
+            tools = session._get_active_tools()
+
+        names = [t.get("function", {}).get("name") for t in tools]
+        assert "read_resource" not in names
+        assert "use_prompt" not in names

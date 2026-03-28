@@ -1070,6 +1070,9 @@ class ChatSession:
         Web search gating: ``web_search`` is removed when the model has
         no native search support and no search backend is available
         (Tavily, DDG, or MCP — see ``_resolve_search_client``).
+
+        MCP tool gating: ``read_resource`` is removed when no MCP servers
+        expose resources; ``use_prompt`` is removed when none expose prompts.
         """
         if self.creative_mode:
             return None
@@ -1088,6 +1091,12 @@ class ChatSession:
         # Gate web_search: only include when a backend exists
         if not caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
+
+        # Gate MCP tools: only include when relevant MCP servers are connected
+        if not self._mcp_client or not self._mcp_client.resource_count:
+            tools = _without_tool(tools, "read_resource")
+        if not self._mcp_client or not self._mcp_client.prompt_count:
+            tools = _without_tool(tools, "use_prompt")
 
         return tools
 
