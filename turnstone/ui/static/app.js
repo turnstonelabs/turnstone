@@ -394,7 +394,12 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "tool_result":
-      this.appendToolOutput(evt.call_id || "", evt.name, evt.output);
+      this.appendToolOutput(
+        evt.call_id || "",
+        evt.name,
+        evt.output,
+        evt.is_error,
+      );
       break;
 
     case "status":
@@ -557,9 +562,13 @@ Pane.prototype.replayHistory = function (messages) {
           msg.denied ||
           /^Denied by user/.test(stripped) ||
           /^Blocked/.test(stripped);
+        var isToolError =
+          msg.is_error ||
+          /^Error[:. \n]|^Command timed out|^Search timed out/.test(stripped);
         if (stripped && !isDenied) {
           var out = document.createElement("div");
-          out.className = "tool-output";
+          out.className =
+            "tool-output" + (isToolError ? " tool-output-error" : "");
           out.textContent = stripped;
           if (stripped.split("\n").length > 10) {
             makeCollapsible(out);
@@ -567,6 +576,14 @@ Pane.prototype.replayHistory = function (messages) {
           var bdg = lastToolBlock.querySelector(".approval-badge");
           if (bdg) lastToolBlock.insertBefore(out, bdg);
           else lastToolBlock.appendChild(out);
+        }
+        if (isToolError && !lastToolBlock.classList.contains("denied")) {
+          lastToolBlock.classList.add("error");
+          var errorBdg = lastToolBlock.querySelector(".approval-badge");
+          if (errorBdg) {
+            errorBdg.className = "approval-badge badge-error";
+            errorBdg.textContent = "\u2717 error";
+          }
         }
       }
     }
@@ -809,7 +826,7 @@ Pane.prototype.appendToolOutputChunk = function (callId, chunk) {
   this.scrollToBottom();
 };
 
-Pane.prototype.appendToolOutput = function (callId, name, output) {
+Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var escapedId = callId ? CSS.escape(callId) : "";
   var target = escapedId
     ? this.messagesEl.querySelector(
@@ -848,9 +865,27 @@ Pane.prototype.appendToolOutput = function (callId, name, output) {
   var stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
 
+  // Detect error by flag or content prefix
+  var hasError =
+    isError ||
+    /^Error[:. \n]|^Command timed out|^Search timed out/.test(stripped);
+
   var out = document.createElement("div");
-  out.className = "tool-output";
+  out.className = "tool-output" + (hasError ? " tool-output-error" : "");
   out.textContent = stripped;
+
+  // Mark the parent approval block as errored
+  if (hasError) {
+    var parentBlock = target.closest(".approval-block");
+    if (parentBlock && !parentBlock.classList.contains("denied")) {
+      parentBlock.classList.add("error");
+      var badge = parentBlock.querySelector(".approval-badge");
+      if (badge) {
+        badge.className = "approval-badge badge-error";
+        badge.textContent = "\u2717 error";
+      }
+    }
+  }
 
   if (stripped.split("\n").length > 10) {
     makeCollapsible(out);

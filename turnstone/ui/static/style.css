@@ -685,6 +685,7 @@ body { position: static; }
   font-size: 12px;
 }
 .approval-block.approved { border-left-color: var(--green); }
+.approval-block.error { border-left-color: var(--red); }
 .approval-block.denied { border-left-color: var(--red); }
 .approval-block.denied .approval-tool { opacity: 0.55; }
 .approval-block.denied .approval-tool .tool-name { color: var(--muted); }
@@ -746,6 +747,7 @@ body { position: static; }
 .approval-feedback-input::placeholder { color: var(--fg-dim); }
 .approval-badge { padding: 6px 12px; font-size: 12px; font-weight: 600; border-top: 1px solid var(--border); overflow-wrap: break-word; word-break: break-word; }
 .approval-badge.badge-approved { color: var(--green); }
+.approval-badge.badge-error { color: var(--red); }
 .approval-badge.badge-denied { color: var(--red); }
 .tool-output {
   padding: 8px 12px;
@@ -757,6 +759,7 @@ body { position: static; }
   max-height: 300px;
   overflow-y: auto;
 }
+.tool-output-error { color: var(--red); }
 .tool-output-stream {
   border-left: 2px solid var(--accent);
   max-height: 400px;

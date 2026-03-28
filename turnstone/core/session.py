@@ -2231,6 +2231,9 @@ class ChatSession:
             item: dict[str, Any],
         ) -> tuple[str, str | list[dict[str, Any]]]:
             if item.get("error"):
+                self.ui.on_tool_result(
+                    item["call_id"], item.get("func_name", "unknown"), item["error"]
+                )
                 return item["call_id"], item["error"]
             if item.get("denied"):
                 return item["call_id"], item.get("denial_msg", "Denied by user")
@@ -2243,7 +2246,7 @@ class ChatSession:
                 func = item.get("func_name", "unknown")
                 msg = f"Error executing {func}: {e}"
                 log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
-                self.ui.on_error(msg)
+                self.ui.on_tool_result(item["call_id"], func, msg)
                 return item["call_id"], msg
 
         if len(items) == 1:
@@ -3669,11 +3672,11 @@ class ChatSession:
 
         except subprocess.TimeoutExpired:
             msg = f"Command timed out after {self.tool_timeout}s"
-            self.ui.on_error(msg)
+            self.ui.on_tool_result(call_id, "bash", msg)
             return call_id, msg
         except Exception as e:
             msg = f"Error executing command: {e}"
-            self.ui.on_error(msg)
+            self.ui.on_tool_result(call_id, "bash", msg)
             return call_id, msg
 
     def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
@@ -3693,10 +3696,14 @@ class ChatSession:
                 all_lines = f.readlines()
         except FileNotFoundError:
             self._read_files.discard(resolved)
-            return call_id, f"Error: {path} not found"
+            msg = f"Error: {path} not found"
+            self.ui.on_tool_result(call_id, "read_file", msg)
+            return call_id, msg
         except Exception as e:
             self._read_files.discard(resolved)
-            return call_id, f"Error reading {path}: {e}"
+            msg = f"Error reading {path}: {e}"
+            self.ui.on_tool_result(call_id, "read_file", msg)
+            return call_id, msg
 
         self._read_files.add(resolved)
         total_lines = len(all_lines)
@@ -3732,7 +3739,9 @@ class ChatSession:
                 size = os.path.getsize(path)
             except OSError as e:
                 self._read_files.discard(resolved)
-                return call_id, f"Error: {path}: {e}"
+                msg = f"Error: {path}: {e}"
+                self.ui.on_tool_result(call_id, "read_file", msg)
+                return call_id, msg
             self._read_files.add(resolved)
             desc = f"image (no vision, {size:,} bytes)"
             self.ui.on_tool_result(call_id, "read_file", desc)
@@ -3746,19 +3755,25 @@ class ChatSession:
                 raw = f.read()
         except FileNotFoundError:
             self._read_files.discard(resolved)
-            return call_id, f"Error: {path} not found"
+            msg = f"Error: {path} not found"
+            self.ui.on_tool_result(call_id, "read_file", msg)
+            return call_id, msg
         except Exception as e:
             self._read_files.discard(resolved)
-            return call_id, f"Error reading {path}: {e}"
+            msg = f"Error reading {path}: {e}"
+            self.ui.on_tool_result(call_id, "read_file", msg)
+            return call_id, msg
 
         if len(raw) > _IMAGE_SIZE_CAP:
             self._read_files.discard(resolved)
             size_mb = len(raw) / (1024 * 1024)
             cap_mb = _IMAGE_SIZE_CAP / (1024 * 1024)
-            return call_id, (
+            msg = (
                 f"Error: image {path} is {size_mb:.1f} MB, "
                 f"exceeds {cap_mb:.0f} MB limit for vision."
             )
+            self.ui.on_tool_result(call_id, "read_file", msg)
+            return call_id, msg
 
         self._read_files.add(resolved)
         b64data = base64.b64encode(raw).decode("ascii")
@@ -3823,11 +3838,11 @@ class ChatSession:
 
         except subprocess.TimeoutExpired:
             msg = f"Search timed out after {self.tool_timeout}s"
-            self.ui.on_error(msg)
+            self.ui.on_tool_result(call_id, "search", msg)
             return call_id, msg
         except Exception as e:
-            msg = f"Search error: {e}"
-            self.ui.on_error(msg)
+            msg = f"Error: search failed: {e}"
+            self.ui.on_tool_result(call_id, "search", msg)
             return call_id, msg
 
     def _run_agent(
@@ -4375,9 +4390,13 @@ class ChatSession:
                 return call_id, msg
 
         except Exception as e:
-            return call_id, f"Error: {e}"
+            msg = f"Error: {e}"
+            self.ui.on_tool_result(call_id, "memory", msg)
+            return call_id, msg
 
-        return call_id, "Error: unexpected action"
+        msg = "Error: unexpected action"
+        self.ui.on_tool_result(call_id, "memory", msg)
+        return call_id, msg
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search conversation history."""
@@ -4886,7 +4905,9 @@ class ChatSession:
             self.ui.on_tool_result(call_id, "write_file", msg)
             return call_id, msg
         except Exception as e:
-            return call_id, f"Error writing {path}: {e}"
+            msg = f"Error writing {path}: {e}"
+            self.ui.on_tool_result(call_id, "write_file", msg)
+            return call_id, msg
 
     def _exec_edit_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Replace an exact string in a file (re-reads to avoid TOCTOU).
@@ -4906,17 +4927,17 @@ class ChatSession:
                 content = f.read()
             occurrences = find_occurrences(content, old_string)
             if len(occurrences) == 0:
-                return (
-                    call_id,
-                    f"Error: old_string no longer found in {path} (file changed)",
-                )
+                msg = f"Error: old_string no longer found in {path} (file changed)"
+                self.ui.on_tool_result(call_id, "edit_file", msg)
+                return call_id, msg
             if len(occurrences) > 1 and near_line is None:
                 line_list = ", ".join(str(ln) for ln in occurrences)
-                return (
-                    call_id,
+                msg = (
                     f"Error: old_string found {len(occurrences)} times "
-                    f"at lines {line_list} (file changed)",
+                    f"at lines {line_list} (file changed)"
                 )
+                self.ui.on_tool_result(call_id, "edit_file", msg)
+                return call_id, msg
             if near_line is not None and len(occurrences) > 1:
                 # Replace only the occurrence nearest to near_line
                 idx = pick_nearest(content, old_string, near_line)
@@ -4929,7 +4950,9 @@ class ChatSession:
             self.ui.on_tool_result(call_id, "edit_file", msg)
             return call_id, msg
         except Exception as e:
-            return call_id, f"Error writing {path}: {e}"
+            msg = f"Error writing {path}: {e}"
+            self.ui.on_tool_result(call_id, "edit_file", msg)
+            return call_id, msg
 
     def _exec_math(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute Python code in sandboxed subprocess."""
@@ -4937,11 +4960,9 @@ class ChatSession:
         output, is_error = execute_math_sandboxed(code, timeout=self.tool_timeout)
         output = self._truncate_output(output)
 
-        self.ui.on_tool_result(call_id, "math", output)
-
-        if is_error:
-            return call_id, f"Error:\n{output}"
-        return call_id, output if output else "(no output)"
+        result_msg = f"Error:\n{output}" if is_error else output if output else "(no output)"
+        self.ui.on_tool_result(call_id, "math", result_msg)
+        return call_id, result_msg
 
     def _exec_man(self, item: dict[str, Any]) -> tuple[str, str]:
         """Look up a man or info page."""
@@ -4986,9 +5007,13 @@ class ChatSession:
                     self.ui.on_tool_result(call_id, "man", msg)
                     return call_id, msg
         except FileNotFoundError:
-            return call_id, "Error: man command not available"
+            msg = "Error: man command not available"
+            self.ui.on_tool_result(call_id, "man", msg)
+            return call_id, msg
         except subprocess.TimeoutExpired:
-            return call_id, "Error: man page lookup timed out"
+            msg = "Error: man page lookup timed out"
+            self.ui.on_tool_result(call_id, "man", msg)
+            return call_id, msg
 
         text = self._truncate_output(text)
 
@@ -5019,16 +5044,16 @@ class ChatSession:
                 text = text[: 10 * 1024 * 1024]
 
         except httpx.HTTPStatusError as e:
-            msg = f"Fetch failed: HTTP {e.response.status_code}"
-            self.ui.on_error(msg)
+            msg = f"Error: fetch failed: HTTP {e.response.status_code}"
+            self.ui.on_tool_result(call_id, "web_fetch", msg)
             return call_id, msg
         except (httpx.RequestError, ValueError) as e:
-            msg = f"Fetch failed: {e}"
-            self.ui.on_error(msg)
+            msg = f"Error: fetch failed: {e}"
+            self.ui.on_tool_result(call_id, "web_fetch", msg)
             return call_id, msg
         except Exception as e:
             msg = f"Error fetching URL: {e}"
-            self.ui.on_error(msg)
+            self.ui.on_tool_result(call_id, "web_fetch", msg)
             return call_id, msg
 
         if not text.strip():
@@ -5092,15 +5117,15 @@ class ChatSession:
 
         client = self._resolve_search_client()
         if not client:
-            msg = "Web search backend not available"
-            self.ui.on_error(msg)
+            msg = "Error: web search backend not available"
+            self.ui.on_tool_result(call_id, "web_search", msg)
             return call_id, msg
 
         try:
             output = client.search(query, max_results=max_results, topic=topic)
         except Exception as e:
-            msg = f"Web search failed: {e}"
-            self.ui.on_error(msg)
+            msg = f"Error: web search failed: {e}"
+            self.ui.on_tool_result(call_id, "web_search", msg)
             return call_id, msg
 
         self.ui.on_tool_result(call_id, "web_search", output)
