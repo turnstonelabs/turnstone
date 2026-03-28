@@ -4,6 +4,7 @@ from turnstone.core.metacognition import (
     NUDGE_COMPLETION,
     NUDGE_CORRECTION,
     NUDGE_DENIAL,
+    NUDGE_REPEAT,
     NUDGE_RESUME,
     NUDGE_START,
     NUDGE_TOOL_ERROR,
@@ -288,3 +289,22 @@ class TestToolErrorNudge:
     def test_not_with_zero_memories(self):
         state: dict[str, float] = {}
         assert should_nudge("tool_error", state, message_count=5, memory_count=0) is False
+
+
+class TestRepeatNudge:
+    def test_format(self):
+        assert format_nudge("repeat") == NUDGE_REPEAT
+
+    def test_fires(self):
+        state: dict[str, float] = {}
+        assert should_nudge("repeat", state, message_count=5) is True
+
+    def test_cooldown(self):
+        state: dict[str, float] = {}
+        assert should_nudge("repeat", state, message_count=5) is True
+        assert should_nudge("repeat", state, message_count=6) is False
+
+    def test_no_memory_requirement(self):
+        """Repeat nudge should fire even with zero memories."""
+        state: dict[str, float] = {}
+        assert should_nudge("repeat", state, message_count=5, memory_count=0) is True

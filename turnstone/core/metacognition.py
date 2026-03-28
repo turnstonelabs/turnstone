@@ -50,6 +50,13 @@ NUDGE_TOOL_ERROR = (
     "previous session. Use memory(action='search') to find relevant guidance."
 )
 
+NUDGE_REPEAT = (
+    "You just called the same tool with the same arguments as a previous "
+    "call in this conversation. Repeating the exact same action will produce "
+    "the same result. Stop and reconsider your approach — try a different "
+    "tool, different arguments, or ask the user for clarification."
+)
+
 _NUDGE_MAP: dict[str, str] = {
     "correction": NUDGE_CORRECTION,
     "denial": NUDGE_DENIAL,
@@ -57,6 +64,7 @@ _NUDGE_MAP: dict[str, str] = {
     "completion": NUDGE_COMPLETION,
     "start": NUDGE_START,
     "tool_error": NUDGE_TOOL_ERROR,
+    "repeat": NUDGE_REPEAT,
 }
 
 # ---------------------------------------------------------------------------

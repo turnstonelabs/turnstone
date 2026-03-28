@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import contextlib
 import dataclasses
+import hashlib
 import json
 import mimetypes
 import os
@@ -313,6 +314,8 @@ class ChatSession:
         # Metacognitive nudges: ephemeral prompts for proactive memory use
         self._metacog_state: dict[str, float] = {}
         self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
+        # Repeat detection: track recent tool call signatures
+        self._recent_tool_sigs: set[str] = set()
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg: dict[str, Any] | None = None
@@ -780,6 +783,7 @@ class ChatSession:
         self._ws_id = ws_id
         self.messages = messages
         self._read_files.clear()
+        self._recent_tool_sigs.clear()
         self._last_usage = None
         self._title_generated = True  # don't re-title resumed workstreams
         self._msg_tokens = [
@@ -1323,6 +1327,47 @@ class ChatSession:
                 # Execute tool calls (potentially in parallel)
                 self._emit_state("running")
                 results, user_feedback = self._execute_tools(tool_calls)
+
+                # Repeat detection: warn when a tool is called with identical args.
+                # Skip error outputs — retrying a failed tool is valid.
+                # Skip JSON outputs (MCP structured results) — appending
+                # text would corrupt the payload.
+                _tc_by_id = {c["id"]: c for c in tool_calls}
+                _repeat_detected = False
+                _error_prefixes = ("Error", "JSON parse error", "Unknown tool", "Command timed out")
+                for i, (tc_id, output) in enumerate(results):
+                    tc = _tc_by_id.get(tc_id)
+                    if tc and isinstance(output, str) and not output.startswith(_error_prefixes):
+                        raw = tc["function"]["name"] + ":" + tc["function"]["arguments"]
+                        sig = hashlib.sha256(raw.encode()).hexdigest()
+                        is_json = output.lstrip().startswith(("{", "["))
+                        if sig in self._recent_tool_sigs:
+                            _repeat_detected = True
+                            if not is_json:
+                                output += (
+                                    "\n\n⚠ Warning: this is an identical repeat of a "
+                                    "previous tool call. The result is the same. "
+                                    "Try a different approach."
+                                )
+                                results[i] = (tc_id, output)
+                            self.ui.on_info(
+                                f"{GRAY}[repeat: {tc['function']['name']}() "
+                                f"called with same arguments]{RESET}"
+                            )
+                        self._recent_tool_sigs.add(sig)
+                if _repeat_detected:
+                    # Reset so the model gets a clean slate after the warning.
+                    # If it repeats again, a new warning fires.
+                    self._recent_tool_sigs.clear()
+                    if self._mem_cfg.nudges and should_nudge(
+                        "repeat",
+                        self._metacog_state,
+                        message_count=len(self.messages),
+                        cooldown_secs=self._mem_cfg.nudge_cooldown,
+                    ):
+                        self._pending_nudge.append(("repeat", format_nudge("repeat")))
+                        self._init_system_messages()
+
                 # Map tool_call_id → tool name for logging
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
                 for tc_id, output in results:
@@ -2036,6 +2081,7 @@ class ChatSession:
         self.messages = [summary_user, summary_asst]
         # File contents are gone after compaction — force re-read before edit_file
         self._read_files.clear()
+        self._recent_tool_sigs.clear()
 
         # Rebuild token table
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
@@ -5231,6 +5277,7 @@ class ChatSession:
         elif cmd == "/clear":
             self.messages.clear()
             self._read_files.clear()
+            self._recent_tool_sigs.clear()
             self._last_usage = None
             self._msg_tokens = []
             self.ui.on_info("Context cleared (messages preserved in database).")
@@ -5240,6 +5287,7 @@ class ChatSession:
 
             self.messages.clear()
             self._read_files.clear()
+            self._recent_tool_sigs.clear()
             self._last_usage = None
             self._msg_tokens = []
             self._ws_id = uuid.uuid4().hex
