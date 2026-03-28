@@ -393,6 +393,10 @@ class WebUI:
             output.startswith("Error")
             or output.startswith("Command timed out")
             or output.startswith("Search timed out")
+            or output.startswith("Unknown tool:")
+            or output.startswith("JSON parse error:")
+            or output.startswith("MCP prompt timed out")
+            or output.startswith("MCP prompt error")
         )
         event: dict[str, Any] = {
             "type": "tool_result",
@@ -647,6 +651,10 @@ def _build_history(
                     content.startswith("Error")
                     or content.startswith("Command timed out")
                     or content.startswith("Search timed out")
+                    or content.startswith("Unknown tool:")
+                    or content.startswith("JSON parse error:")
+                    or content.startswith("MCP prompt timed out")
+                    or content.startswith("MCP prompt error")
                 ):
                     entry["is_error"] = True
         history.append(entry)

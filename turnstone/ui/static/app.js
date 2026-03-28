@@ -564,7 +564,9 @@ Pane.prototype.replayHistory = function (messages) {
           /^Blocked/.test(stripped);
         var isToolError =
           msg.is_error ||
-          /^Error[:. \n]|^Command timed out|^Search timed out/.test(stripped);
+          /^Error[:. \n]|^Command timed out|^Search timed out|^Unknown tool:|^JSON parse error:|^MCP prompt /.test(
+            stripped,
+          );
         if (stripped && !isDenied) {
           var out = document.createElement("div");
           out.className =
@@ -868,7 +870,9 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   // Detect error by flag or content prefix
   var hasError =
     isError ||
-    /^Error[:. \n]|^Command timed out|^Search timed out/.test(stripped);
+    /^Error[:. \n]|^Command timed out|^Search timed out|^Unknown tool:|^JSON parse error:|^MCP prompt /.test(
+      stripped,
+    );
 
   var out = document.createElement("div");
   out.className = "tool-output" + (hasError ? " tool-output-error" : "");
