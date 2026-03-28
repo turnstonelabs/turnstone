@@ -1368,3 +1368,130 @@ class TestShutdownCleanup:
         assert mgr.get_prompts() == []
         assert mgr._resource_map == {}
         assert mgr._prompt_map == {}
+
+
+# ---------------------------------------------------------------------------
+# TCP probe and unreachable server handling
+# ---------------------------------------------------------------------------
+
+
+class TestTCPProbe:
+    """MCPClientManager._tcp_probe should fail fast on unreachable servers."""
+
+    def test_tcp_probe_unreachable_raises_connection_error(self):
+        """Unreachable host raises ConnectionError, not TimeoutError."""
+        mgr = MCPClientManager({})
+
+        async def _run():
+            with pytest.raises(ConnectionError, match="unreachable"):
+                await mgr._tcp_probe("test-server", "http://127.0.0.1:1")
+
+        asyncio.run(_run())
+
+    def test_tcp_probe_parses_url_correctly(self):
+        """Port and host are extracted from the URL."""
+        mgr = MCPClientManager({})
+
+        async def _run():
+            # Non-routable port — should fail with ConnectionError
+            with pytest.raises(ConnectionError):
+                await mgr._tcp_probe("srv", "https://127.0.0.1:1/mcp")
+
+        asyncio.run(_run())
+
+    def test_tcp_probe_default_port_http(self):
+        """Default port 80 used for http:// URLs without explicit port."""
+        mgr = MCPClientManager({})
+
+        async def _run():
+            # Will fail (nothing on port 80), but should not crash on parsing
+            with pytest.raises(ConnectionError):
+                await mgr._tcp_probe("srv", "http://127.0.0.1")
+
+        asyncio.run(_run())
+
+    def test_tcp_probe_dns_failure(self):
+        """Unresolvable hostname raises ConnectionError."""
+        mgr = MCPClientManager({})
+
+        async def _run():
+            with pytest.raises(ConnectionError):
+                await mgr._tcp_probe("srv", "http://this.host.does.not.exist.invalid:8080/mcp")
+
+        asyncio.run(_run())
+
+
+class TestConnectOneUnreachable:
+    """_connect_one should handle unreachable HTTP servers gracefully."""
+
+    def test_unreachable_http_server_raises_connection_error(self):
+        """Unreachable HTTP MCP server raises ConnectionError without spinning."""
+        mgr = MCPClientManager({})
+        mgr._loop = asyncio.new_event_loop()
+
+        async def _run():
+            with pytest.raises(ConnectionError, match="unreachable"):
+                await mgr._connect_one(
+                    "bad-server",
+                    {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/mcp",
+                    },
+                )
+
+        mgr._loop.run_until_complete(_run())
+        mgr._loop.close()
+
+        # Server should NOT be in sessions (connection failed)
+        assert "bad-server" not in mgr._sessions
+
+    def test_connect_all_continues_after_unreachable_server(self):
+        """_connect_all logs error and continues to next server."""
+        mgr = MCPClientManager(
+            {
+                "bad": {"type": "http", "url": "http://127.0.0.1:1/mcp"},
+            }
+        )
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(mgr._connect_all())
+        loop.close()
+
+        assert "bad" not in mgr._sessions
+        assert "bad" in mgr._last_error
+
+
+class TestSafeCloseStack:
+    """_safe_close_stack should suppress errors from broken anyio scopes."""
+
+    def test_suppresses_runtime_error(self):
+        """RuntimeError from broken cancel scope is suppressed."""
+
+        async def _run():
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+
+            # Simulate a broken close that raises RuntimeError
+            async def _broken_close():
+                raise RuntimeError("Attempted to exit cancel scope in a different task")
+
+            stack.aclose = _broken_close
+            # Should not raise
+            await MCPClientManager._safe_close_stack(stack)
+
+        asyncio.run(_run())
+
+    def test_suppresses_cancelled_error(self):
+        """CancelledError during close is suppressed."""
+
+        async def _run():
+            stack = AsyncExitStack()
+            await stack.__aenter__()
+
+            async def _cancel_close():
+                raise asyncio.CancelledError()
+
+            stack.aclose = _cancel_close
+            await MCPClientManager._safe_close_stack(stack)
+
+        asyncio.run(_run())

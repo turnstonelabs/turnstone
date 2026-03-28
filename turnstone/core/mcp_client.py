@@ -176,6 +176,8 @@ class MCPClientManager:
         for name, cfg in self._server_configs.items():
             try:
                 await self._connect_one(name, cfg)
+            except asyncio.CancelledError:
+                raise  # propagate so the background task can be cleanly stopped
             except Exception as exc:
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"{type(exc).__name__}: {exc}")
@@ -199,6 +201,49 @@ class MCPClientManager:
             self._refresh_task = asyncio.get_running_loop().create_task(self._periodic_refresh())
 
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
+    _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
+
+    async def _tcp_probe(self, name: str, url: str) -> None:
+        """Fast TCP connect check before entering the MCP transport context.
+
+        Fails fast when the server is unreachable, avoiding the anyio
+        cancel-scope orphan bug that causes 100% CPU spin.
+        """
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise ConnectionError(f"MCP server '{name}' has invalid URL (no hostname): {url}")
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            raise ConnectionError(f"MCP server '{name}' has invalid port in URL: {url}") from None
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=self._TCP_PROBE_TIMEOUT,
+            )
+            writer.close()
+            await writer.wait_closed()
+        except (TimeoutError, OSError) as exc:
+            raise ConnectionError(
+                f"MCP server '{name}' unreachable at {host}:{port}: {exc}"
+            ) from None
+
+    @staticmethod
+    async def _safe_close_stack(stack: AsyncExitStack) -> None:
+        """Close an AsyncExitStack, suppressing errors from broken anyio scopes.
+
+        Called from exception handlers — must not raise, otherwise cleanup
+        errors could mask the original exception.  CancelledError is caught
+        explicitly because it is the primary failure mode (stray cancel from
+        broken anyio scope) and is BaseException, not Exception.
+        """
+        try:
+            await asyncio.wait_for(stack.aclose(), timeout=5)
+        except (Exception, asyncio.CancelledError):
+            log.debug("Error closing AsyncExitStack; ignoring", exc_info=True)
 
     async def _connect_one(self, name: str, cfg: dict[str, Any]) -> None:
         """Connect to a single MCP server and discover its tools."""
@@ -213,6 +258,13 @@ class MCPClientManager:
         transport = cfg.get("type", "stdio")
         try:
             if transport in ("http", "streamable-http") or "url" in cfg:
+                # Pre-flight TCP check: fail fast before entering the anyio
+                # task group in streamablehttp_client.  An immediate connect
+                # failure (ECONNREFUSED) inside the anyio context causes a
+                # CancelledError that escapes asyncio.wait_for and leaves
+                # orphaned cancel-scope tasks spinning at 100% CPU.
+                await self._tcp_probe(name, cfg["url"])
+
                 read, write, _ = await asyncio.wait_for(
                     stack.enter_async_context(
                         streamablehttp_client(url=cfg["url"], headers=cfg.get("headers"))
@@ -235,15 +287,25 @@ class MCPClientManager:
                     env=env,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
+        except asyncio.CancelledError:
+            # Stray CancelledError from broken anyio cancel scope — treat as
+            # connection failure.  But if the task is genuinely being cancelled
+            # (shutdown), re-raise so we don't block teardown.
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                await self._safe_close_stack(stack)
+                raise
+            log.warning("MCP server '%s' connection failed (anyio cancel)", name)
+            await self._safe_close_stack(stack)
+            raise TimeoutError(f"Connection failed for '{name}'") from None
         except TimeoutError:
             log.warning(
                 "MCP server '%s' connection timed out after %ds", name, self._CONNECT_TIMEOUT
             )
-            with contextlib.suppress(Exception):
-                await stack.aclose()
+            await self._safe_close_stack(stack)
             raise TimeoutError(f"Connection timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
-            await stack.aclose()
+            await self._safe_close_stack(stack)
             raise
 
         # Register notification handler — dispatches tool, resource, and
@@ -274,21 +336,27 @@ class MCPClientManager:
                 ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
             )
         except Exception:
-            await stack.aclose()
+            await self._safe_close_stack(stack)
             raise
 
         self._per_server_stacks[name] = stack
         try:
             await asyncio.wait_for(session.initialize(), timeout=self._CONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            self._per_server_stacks.pop(name, None)
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                await self._safe_close_stack(stack)
+                raise
+            await self._safe_close_stack(stack)
+            raise TimeoutError(f"MCP handshake failed for '{name}'") from None
         except TimeoutError:
             self._per_server_stacks.pop(name, None)
-            with contextlib.suppress(Exception):
-                await stack.aclose()
+            await self._safe_close_stack(stack)
             raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
             self._per_server_stacks.pop(name, None)
-            with contextlib.suppress(Exception):
-                await stack.aclose()
+            await self._safe_close_stack(stack)
             raise
         self._sessions[name] = session
 
@@ -873,8 +941,7 @@ class MCPClientManager:
 
             async def _close_all_stacks() -> None:
                 for stack in self._per_server_stacks.values():
-                    with contextlib.suppress(Exception):
-                        await stack.aclose()
+                    await self._safe_close_stack(stack)
 
             future = asyncio.run_coroutine_threadsafe(_close_all_stacks(), self._loop)
             try:
@@ -984,10 +1051,7 @@ class MCPClientManager:
                 self._sessions.pop(name, None)
                 stack = self._per_server_stacks.pop(name, None)
                 if stack is not None:
-                    try:
-                        await asyncio.wait_for(stack.aclose(), timeout=10)
-                    except (TimeoutError, Exception):
-                        log.warning("Timed out closing MCP server '%s', forcing cleanup", name)
+                    await self._safe_close_stack(stack)
                 # Clean up per-server state (on the event loop thread)
                 self._per_server_tools.pop(name, None)
                 self._per_server_resources.pop(name, None)
