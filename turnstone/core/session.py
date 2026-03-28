@@ -312,7 +312,7 @@ class ChatSession:
         self._watch_dispatch_depth = 0
         # Metacognitive nudges: ephemeral prompts for proactive memory use
         self._metacog_state: dict[str, float] = {}
-        self._pending_nudge: list[str] = []
+        self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg: dict[str, Any] | None = None
@@ -821,7 +821,7 @@ class ChatSession:
             memory_count=self._visible_memory_count(),
             cooldown_secs=self._mem_cfg.nudge_cooldown,
         ):
-            self._pending_nudge.append(format_nudge("resume"))
+            self._pending_nudge.append(("resume", format_nudge("resume")))
         self._init_system_messages()
         return True
 
@@ -1023,9 +1023,14 @@ class ChatSession:
                 "Use memory(action='search') or memory(action='list') for more."
             )
         if self._pending_nudge:
-            for nudge in self._pending_nudge:
+            types = []
+            for nudge_type, nudge_text in self._pending_nudge:
                 dev_parts.append("")
-                dev_parts.append(nudge)
+                dev_parts.append(nudge_text)
+                types.append(nudge_type)
+            # Surface nudge activity to the user so they can see
+            # the metacognitive prompts being applied.
+            self.ui.on_info(f"{GRAY}[metacognition: nudge injected — {', '.join(types)}]{RESET}")
             self._pending_nudge.clear()
         new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
         # Atomic swap — readers see either old or new, never partial
@@ -1400,7 +1405,7 @@ class ChatSession:
                         cooldown_secs=self._mem_cfg.nudge_cooldown,
                     )
                 ):
-                    self._pending_nudge.append(format_nudge("tool_error"))
+                    self._pending_nudge.append(("tool_error", format_nudge("tool_error")))
                     self._init_system_messages()
                 # Inject user feedback from approval prompt (e.g. "y, use full path")
                 if user_feedback:
@@ -1713,6 +1718,7 @@ class ChatSession:
         msg["content"] = content or ""
 
         if tool_calls_acc:
+            self._ensure_tool_call_ids(tool_calls_acc)
             msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
 
         # Store raw provider content blocks for multi-turn preservation
@@ -2230,7 +2236,7 @@ class ChatSession:
                 memory_count=self._visible_memory_count(),
                 cooldown_secs=self._mem_cfg.nudge_cooldown,
             ):
-                self._pending_nudge.append(format_nudge("denial"))
+                self._pending_nudge.append(("denial", format_nudge("denial")))
                 self._init_system_messages()
 
         # Phase 3: execute (check cancellation before starting)
@@ -2334,10 +2340,23 @@ class ChatSession:
 
         return results, user_feedback
 
+    @staticmethod
+    def _ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, Any]]) -> None:
+        """Fill in missing tool call IDs with synthetic UUIDs.
+
+        Some local servers (llama.cpp, older vLLM) omit or leave the id
+        blank; an empty tool_call_id corrupts subsequent turns because
+        the matching tool-result message can't reference the call.
+        """
+        items = tool_calls.values() if isinstance(tool_calls, dict) else tool_calls
+        for tc in items:
+            if not tc.get("id"):
+                tc["id"] = f"call_{uuid.uuid4().hex}"
+
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
-        func_name = tc["function"]["name"]
+        func_name = tc["function"]["name"].strip()
         raw_args = tc["function"]["arguments"]
 
         try:
@@ -2373,13 +2392,32 @@ class ChatSession:
                     args = {pk: raw_args}
             if args is None:
                 preview = raw_args[:4000] + ("..." if len(raw_args) > 4000 else "")
+                # Surface to user so they can see what the model produced
+                self.ui.on_error(
+                    f"Malformed tool call from model: {func_name}() — "
+                    f"could not parse arguments as JSON.\n"
+                    f"  Raw: {raw_args[:200]}"
+                )
+                # Build a hint for the model including expected parameter
+                # names so it can self-correct on retry.
+                expected = PRIMARY_KEY_MAP.get(func_name, "")
+                hint = (
+                    f' Expected valid JSON, e.g. {{"{expected}": "..."}}'
+                    if expected
+                    else " Arguments must be valid JSON."
+                )
                 return {
                     "call_id": call_id,
                     "func_name": func_name,
                     "header": f"\u2717 {func_name}: {exc}",
                     "preview": f"    {RED}{preview}{RESET}",
                     "needs_approval": False,
-                    "error": f"JSON parse error: {exc}\nRaw arguments: {raw_args[:500]}",
+                    "error": (
+                        f"JSON parse error for tool '{func_name}': {exc}\n"
+                        f"Raw arguments: {raw_args[:500]}\n"
+                        f"{hint}\n"
+                        f"Please retry with correctly formatted JSON arguments."
+                    ),
                 }
 
         preparers = {
@@ -2408,13 +2446,21 @@ class ChatSession:
             # Check if this is an MCP tool
             if self._mcp_client and self._mcp_client.is_mcp_tool(func_name):
                 return self._prepare_mcp_tool(call_id, func_name, args)
+            self.ui.on_error(f"Model called unknown tool: {func_name!r}")
+            available = list(preparers)
+            if self._mcp_client:
+                available.extend(sorted(self._mcp_client._tool_map))
             return {
                 "call_id": call_id,
                 "func_name": func_name,
                 "header": f"\u2717 Unknown tool: {func_name}",
                 "preview": "",
                 "needs_approval": False,
-                "error": f"Unknown tool: {func_name}",
+                "error": (
+                    f"Unknown tool: {func_name!r}. "
+                    f"Available tools: {', '.join(available)}. "
+                    f"Use one of the listed tool names exactly."
+                ),
             }
         assert args is not None  # guaranteed by the early return on args is None above
         return preparer(call_id, args)
@@ -3008,8 +3054,11 @@ class ChatSession:
             n += count_structured_memories(scope="user", scope_id=self._user_id)
         return n
 
-    def _check_metacognitive_nudge(self, user_message: str) -> str | None:
-        """Check if a metacognitive nudge should be injected."""
+    def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
+        """Check if a metacognitive nudge should be injected.
+
+        Returns (nudge_type, nudge_text) or None.
+        """
         if not self._mem_cfg.nudges:
             return None
         mem_count = self._visible_memory_count()
@@ -3023,7 +3072,7 @@ class ChatSession:
             memory_count=mem_count,
             cooldown_secs=cd,
         ):
-            return format_nudge("start")
+            return ("start", format_nudge("start"))
 
         if detect_correction(user_message) and should_nudge(
             "correction",
@@ -3032,7 +3081,7 @@ class ChatSession:
             memory_count=mem_count,
             cooldown_secs=cd,
         ):
-            return format_nudge("correction")
+            return ("correction", format_nudge("correction"))
 
         if detect_completion(user_message) and should_nudge(
             "completion",
@@ -3041,7 +3090,7 @@ class ChatSession:
             memory_count=mem_count,
             cooldown_secs=cd,
         ):
-            return format_nudge("completion")
+            return ("completion", format_nudge("completion"))
 
         return None
 
@@ -3965,6 +4014,7 @@ class ChatSession:
                 "content": result.content or "",
             }
             if result.tool_calls:
+                self._ensure_tool_call_ids(result.tool_calls)
                 msg_dict["tool_calls"] = result.tool_calls
             agent_messages.append(msg_dict)
 
@@ -3978,7 +4028,7 @@ class ChatSession:
             tool_names = {t["function"]["name"] for t in tools}
             for tc_dict in result.tool_calls:
                 self._check_cancelled()
-                tool_name = tc_dict["function"]["name"]
+                tool_name = tc_dict["function"]["name"].strip()
 
                 # Guard 1: block recursive agent calls.
                 if tool_name in ("task_agent", "plan_agent"):

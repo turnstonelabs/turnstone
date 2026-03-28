@@ -401,6 +401,64 @@ class TestSessionIntegration:
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
         assert "Unknown tool" in prepared["error"]
+        # Error lists available tools so the model can self-correct
+        assert "bash" in prepared["error"]
+        # Surfaces warning to user
+        session.ui.on_error.assert_called_once()
+        assert "nonexistent" in session.ui.on_error.call_args[0][0]
+
+    def test_prepare_tool_strips_whitespace_from_name(self, tmp_db):
+        """Local models may produce tool names with leading/trailing whitespace."""
+        session = self._make_session(mcp_client=None)
+        tc = {
+            "id": "call_strip",
+            "function": {"name": "  bash\n", "arguments": '{"command": "echo hi"}'},
+        }
+        prepared = session._prepare_tool(tc)
+        assert prepared["func_name"] == "bash"
+        assert "error" not in prepared
+
+    def test_prepare_tool_malformed_json_surfaces_error(self, tmp_db):
+        """Malformed JSON args should surface a warning to the user and
+        give the model a hint about expected format."""
+        session = self._make_session(mcp_client=None)
+        tc = {
+            "id": "call_bad",
+            "function": {"name": "bash", "arguments": "{command: echo hi}"},
+        }
+        prepared = session._prepare_tool(tc)
+        assert "error" in prepared
+        assert "JSON parse error" in prepared["error"]
+        assert "command" in prepared["error"]  # hint about expected key
+        assert "Please retry" in prepared["error"]
+        # User-facing warning
+        session.ui.on_error.assert_called_once()
+        assert "Malformed tool call" in session.ui.on_error.call_args[0][0]
+
+    def test_ensure_tool_call_ids_dict(self, tmp_db):
+        """_ensure_tool_call_ids fills empty IDs on streaming-style dict."""
+        from turnstone.core.session import ChatSession
+
+        tool_calls_acc = {
+            0: {"id": "", "function": {"name": "bash", "arguments": "{}"}},
+            1: {"id": "", "function": {"name": "read_file", "arguments": "{}"}},
+        }
+        ChatSession._ensure_tool_call_ids(tool_calls_acc)
+        ids = [tc["id"] for tc in tool_calls_acc.values()]
+        assert all(id_.startswith("call_") for id_ in ids)
+        assert len(set(ids)) == 2  # unique
+
+    def test_ensure_tool_call_ids_list(self, tmp_db):
+        """_ensure_tool_call_ids fills empty IDs on list (agent path)."""
+        from turnstone.core.session import ChatSession
+
+        tool_calls = [
+            {"id": None, "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "call_existing", "function": {"name": "bash", "arguments": "{}"}},
+        ]
+        ChatSession._ensure_tool_call_ids(tool_calls)
+        assert tool_calls[0]["id"].startswith("call_")
+        assert tool_calls[1]["id"] == "call_existing"  # preserved
 
     def test_mcp_command_no_client(self, tmp_db):
         session = self._make_session(mcp_client=None)
