@@ -1718,13 +1718,7 @@ class ChatSession:
         msg["content"] = content or ""
 
         if tool_calls_acc:
-            # Ensure every tool call has a non-empty ID.  Some local
-            # servers (llama.cpp, older vLLM) omit or leave the id blank;
-            # an empty tool_call_id corrupts subsequent turns because the
-            # matching tool-result message can't reference the call.
-            for tc in tool_calls_acc.values():
-                if not tc.get("id"):
-                    tc["id"] = f"call_{uuid.uuid4().hex}"
+            self._ensure_tool_call_ids(tool_calls_acc)
             msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
 
         # Store raw provider content blocks for multi-turn preservation
@@ -2346,6 +2340,19 @@ class ChatSession:
 
         return results, user_feedback
 
+    @staticmethod
+    def _ensure_tool_call_ids(tool_calls: list[dict[str, Any]] | dict[int, dict[str, Any]]) -> None:
+        """Fill in missing tool call IDs with synthetic UUIDs.
+
+        Some local servers (llama.cpp, older vLLM) omit or leave the id
+        blank; an empty tool_call_id corrupts subsequent turns because
+        the matching tool-result message can't reference the call.
+        """
+        items = tool_calls.values() if isinstance(tool_calls, dict) else tool_calls
+        for tc in items:
+            if not tc.get("id"):
+                tc["id"] = f"call_{uuid.uuid4().hex}"
+
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
@@ -2440,7 +2447,9 @@ class ChatSession:
             if self._mcp_client and self._mcp_client.is_mcp_tool(func_name):
                 return self._prepare_mcp_tool(call_id, func_name, args)
             self.ui.on_error(f"Model called unknown tool: {func_name!r}")
-            available = ", ".join(preparers)
+            available = list(preparers)
+            if self._mcp_client:
+                available.extend(sorted(self._mcp_client._tool_map))
             return {
                 "call_id": call_id,
                 "func_name": func_name,
@@ -2449,7 +2458,7 @@ class ChatSession:
                 "needs_approval": False,
                 "error": (
                     f"Unknown tool: {func_name!r}. "
-                    f"Available tools: {available}. "
+                    f"Available tools: {', '.join(available)}. "
                     f"Use one of the listed tool names exactly."
                 ),
             }
@@ -4005,11 +4014,7 @@ class ChatSession:
                 "content": result.content or "",
             }
             if result.tool_calls:
-                # Ensure every tool call has a non-empty ID (same
-                # fixup as _stream_response for local servers).
-                for tc in result.tool_calls:
-                    if not tc.get("id"):
-                        tc["id"] = f"call_{uuid.uuid4().hex}"
+                self._ensure_tool_call_ids(result.tool_calls)
                 msg_dict["tool_calls"] = result.tool_calls
             agent_messages.append(msg_dict)
 
