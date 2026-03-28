@@ -162,11 +162,14 @@ class AsyncTurnstoneServer(_BaseClient):
             response_model=StatusResponse,
         )
 
-    async def cancel(self, ws_id: str) -> StatusResponse:
+    async def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
+        body: dict[str, object] = {"ws_id": ws_id}
+        if force:
+            body["force"] = True
         return await self._request(
             "POST",
             "/v1/api/cancel",
-            json_body={"ws_id": ws_id},
+            json_body=body,
             response_model=StatusResponse,
         )
 
@@ -473,8 +476,8 @@ class TurnstoneServer:
     def command(self, *, ws_id: str, command: str) -> StatusResponse:
         return self._runner.run(self._async.command(ws_id=ws_id, command=command))
 
-    def cancel(self, ws_id: str) -> StatusResponse:
-        return self._runner.run(self._async.cancel(ws_id))
+    def cancel(self, ws_id: str, *, force: bool = False) -> StatusResponse:
+        return self._runner.run(self._async.cancel(ws_id, force=force))
 
     # -- streaming -----------------------------------------------------------
 

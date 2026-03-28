@@ -41,6 +41,11 @@ class CommandRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     ws_id: str = Field(description="Target workstream ID")
+    force: bool = Field(
+        default=False,
+        description="Force cancel: abandon the stuck worker thread immediately. "
+        "Use when cooperative cancel has not resolved within a few seconds.",
+    )
 
 
 class CreateWorkstreamRequest(BaseModel):

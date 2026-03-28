@@ -40,11 +40,22 @@ running --> error : Exception during\ntool execution
 
 error --> thinking : New send() call\n_emit_state("thinking")
 
-thinking --> idle : cancel() called\n_emit_state("idle")
+thinking --> idle : cancel() called\nstream aborted\n_emit_state("idle")
 
 running --> idle : cancel() called\n_emit_state("idle")
 
 attention --> idle : cancel() unblocks\napproval/plan wait\n_emit_state("idle")
+
+note left of idle
+  **Cancel escalation:**
+  1. **Cooperative**: cancel() sets event + closes
+     SDK stream → worker exits at next checkpoint
+  2. **Force**: force=true abandons the worker
+     thread, emits stream_end immediately.
+     Orphaned thread still kills subprocesses
+     but skips message mutations (generation
+     counter prevents stale writes).
+end note
 
 note right of thinking
   **Emitted via:**

@@ -459,6 +459,7 @@ class AnthropicProvider:
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        cancel_ref: list[Any] | None = None,
     ) -> Iterator[StreamChunk]:
         _ensure_anthropic()
         caps = self.get_capabilities(model)
@@ -477,6 +478,8 @@ class AnthropicProvider:
         )
 
         with client.messages.stream(**kwargs) as stream:
+            if cancel_ref is not None:
+                cancel_ref.append(stream)
             yield from self._iter_anthropic_stream(stream)
 
     def _iter_anthropic_stream(self, stream: Any) -> Iterator[StreamChunk]:

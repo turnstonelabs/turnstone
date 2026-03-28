@@ -125,8 +125,15 @@ class LLMProvider(Protocol):
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        cancel_ref: list[Any] | None = None,
     ) -> Iterator[StreamChunk]:
-        """Create a streaming request, yielding normalized StreamChunks."""
+        """Create a streaming request, yielding normalized StreamChunks.
+
+        If *cancel_ref* is provided the provider appends the underlying SDK
+        stream object (which has a ``.close()`` method) before yielding the
+        first chunk.  The caller can then close it from another thread to
+        abort a blocked HTTP read immediately.
+        """
         ...
 
     def create_completion(

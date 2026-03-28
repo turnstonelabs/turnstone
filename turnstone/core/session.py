@@ -117,6 +117,35 @@ class GenerationCancelled(BaseException):
     """
 
 
+class _CancelRef(list[Any]):
+    """List proxy used for ``ChatSession._cancel_ref``.
+
+    Providers call ``cancel_ref.append(stream_handle)`` inside a generator
+    body — the generator body doesn't execute until the first ``next()`` call,
+    i.e. just before the first chunk is yielded.  By overriding ``append`` we
+    update ``ChatSession._cancel_stream`` eagerly at that moment.  If
+    cancellation was already requested before the first chunk arrived (e.g.
+    the model was slow to start responding), the stream is closed immediately
+    so the blocked ``for chunk in stream`` iteration is unblocked.
+    """
+
+    __slots__ = ("_session",)
+
+    def __init__(self, session: ChatSession) -> None:
+        super().__init__()
+        self._session = session
+
+    def append(self, stream: Any) -> None:
+        super().append(stream)
+        self._session._cancel_stream = stream
+        # If cancel was requested before the first chunk arrived (the worker
+        # thread is blocked inside the provider generator waiting for the HTTP
+        # response), close the stream immediately to unblock it.
+        if self._session._cancel_event.is_set():
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
 # Image extensions handled as vision content (SVG excluded — it's XML text)
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
@@ -318,6 +347,11 @@ class ChatSession:
         self._recent_tool_sigs: set[str] = set()
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
+        self._cancel_ref: _CancelRef = _CancelRef(self)  # provider appends SDK stream here
+        self._cancel_stream: Any = None  # closeable SDK stream handle
+        self._generation: int = 0  # monotonic counter; orphaned threads skip cleanup
+        self._active_procs: set[subprocess.Popen[str]] = set()  # for force-kill
+        self._procs_lock = threading.Lock()
         self._cancelled_partial_msg: dict[str, Any] | None = None
         # Intent validation judge (lazy-initialized)
         self._judge_config: JudgeConfig | None = judge_config
@@ -1173,6 +1207,8 @@ class ChatSession:
         prov = provider or self._provider
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
+            self._check_cancelled()
+            self._cancel_ref.clear()  # discard stale handle from prior attempt
             try:
                 return prov.create_streaming(
                     client=client,
@@ -1184,6 +1220,7 @@ class ChatSession:
                     reasoning_effort=self.reasoning_effort,
                     extra_params=self._provider_extra_params(provider=prov),
                     deferred_names=self._get_deferred_names(),
+                    cancel_ref=self._cancel_ref,
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -1205,10 +1242,35 @@ class ChatSession:
         while the worker thread is inside ``send()``.
         """
         self._cancel_event.set()
+        # Close the underlying SDK stream to unblock the iteration
+        # immediately.  Without this the worker thread stays blocked in
+        # ``for chunk in stream`` until the next SSE chunk arrives from
+        # the LLM provider (can be seconds during extended thinking).
+        s = self._cancel_stream
+        if s is not None:
+            with contextlib.suppress(Exception):
+                s.close()
+        # Kill all tracked subprocesses (bash tool).  This is the
+        # last line of defense — ensures destructive commands are
+        # stopped even if the worker thread is stuck.
+        with self._procs_lock:
+            procs = list(self._active_procs)
+        for proc in procs:
+            if proc.poll() is not None:
+                continue  # already exited
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                with contextlib.suppress(OSError, ProcessLookupError):
+                    proc.kill()
 
-    def _check_cancelled(self) -> None:
-        """Raise ``GenerationCancelled`` if cancellation has been requested."""
+    def _check_cancelled(self, my_generation: int = 0) -> None:
+        """Raise ``GenerationCancelled`` if cancellation has been requested
+        or if this thread belongs to an orphaned generation (force cancel).
+        """
         if self._cancel_event.is_set():
+            raise GenerationCancelled()
+        if my_generation and my_generation != self._generation:
             raise GenerationCancelled()
 
     # -- Main generation loop ------------------------------------------------
@@ -1234,7 +1296,12 @@ class ChatSession:
             self._budget_exhausted = False
             self._budget_warned = False
         self._notify_count = 0
-        self._cancel_event.clear()
+        self._generation += 1
+        my_generation = self._generation
+        # Fresh cancel event per generation.  The old event object stays
+        # set for any abandoned thread — _exec_bash captures a local
+        # reference so subprocesses from old generations are still killed.
+        self._cancel_event = threading.Event()
         self._cancelled_partial_msg = None
         self.messages.append({"role": "user", "content": user_input})
         self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
@@ -1248,7 +1315,7 @@ class ChatSession:
 
         try:
             while True:
-                self._check_cancelled()
+                self._check_cancelled(my_generation)
                 msgs = self._full_messages()
 
                 if self.debug:
@@ -1258,9 +1325,18 @@ class ChatSession:
                 self.ui.on_thinking_start()
                 try:
                     stream = self._create_stream_with_retry(msgs)
-                    assistant_msg = self._stream_response(stream)
+                    assistant_msg = self._stream_response(stream, my_generation)
                 finally:
+                    # Only clear if this generation is still active —
+                    # an orphaned thread must not clobber a newer stream.
+                    if self._generation == my_generation:
+                        self._cancel_stream = None
+                        self._cancel_ref.clear()
                     self.ui.on_thinking_stop()
+
+                # Bail if this generation was superseded (force cancel).
+                if self._generation != my_generation:
+                    return
 
                 self._update_token_table(assistant_msg)
                 self.messages.append(assistant_msg)
@@ -1314,6 +1390,8 @@ class ChatSession:
                             f"\n[Auto-compacting: prompt exceeds {pct_display}% of context window]"
                         )
                         self._compact_messages(auto=True)
+                        # Update status bar with post-compaction token counts
+                        self._print_status_line()
                     # Auto-title session after first exchange
                     if not self._title_generated:
                         self._title_generated = True
@@ -1327,6 +1405,10 @@ class ChatSession:
                 # Execute tool calls (potentially in parallel)
                 self._emit_state("running")
                 results, user_feedback = self._execute_tools(tool_calls)
+
+                # Bail if generation was superseded during tool execution.
+                if self._generation != my_generation:
+                    return
 
                 # Repeat detection: warn when a tool is called with identical args.
                 # Skip error outputs — retrying a failed tool is valid.
@@ -1457,6 +1539,10 @@ class ChatSession:
                     self.messages.append({"role": "user", "content": user_feedback})
                     self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
         except GenerationCancelled:
+            # If a newer send() has started (force cancel), this thread is
+            # orphaned — skip all message mutations and state changes.
+            if self._generation != my_generation:
+                return
             # Cooperative cancellation — preserve partial content if available.
             if self._cancelled_partial_msg:
                 # _stream_response was interrupted — save partial assistant msg
@@ -1485,7 +1571,8 @@ class ChatSession:
                     self.messages.pop()
                     if self._msg_tokens:
                         self._msg_tokens.pop()
-            self._cancel_event.clear()
+            # No need to clear _cancel_event — it's replaced per-generation
+            # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
             self._emit_state("idle")
             # Do NOT re-raise — return normally so server worker thread
@@ -1530,7 +1617,9 @@ class ChatSession:
     _THINK_CLOSE_TAGS = ("</think>", "</reasoning>")
     _MAX_TAG_LEN = max(len(t) for t in _THINK_OPEN_TAGS + _THINK_CLOSE_TAGS)
 
-    def _stream_response(self, stream: Iterator[StreamChunk]) -> dict[str, Any]:
+    def _stream_response(
+        self, stream: Iterator[StreamChunk], my_generation: int = 0
+    ) -> dict[str, Any]:
         """Stream response, dispatching tokens to the UI as they arrive.
 
         Handles two reasoning delivery mechanisms:
@@ -1621,7 +1710,13 @@ class ChatSession:
         finish_reason = None
         try:
             for chunk in stream:
-                self._check_cancelled()
+                # _cancel_stream is set eagerly by _CancelRef.append() when the
+                # provider creates the SDK stream handle (before the first chunk
+                # is returned).  This fallback handles providers that use a
+                # plain list for cancel_ref (e.g. some test fakes).
+                if self._cancel_ref and self._cancel_stream is None:
+                    self._cancel_stream = self._cancel_ref[0]
+                self._check_cancelled(my_generation)
                 # Track finish_reason (e.g. "stop", "length", "tool_calls")
                 if chunk.finish_reason:
                     finish_reason = chunk.finish_reason
@@ -1734,6 +1829,22 @@ class ChatSession:
             if provider_blocks:
                 partial["_provider_content"] = provider_blocks
             self._cancelled_partial_msg = partial
+            raise
+        except Exception:
+            # cancel() closed the underlying SDK stream, aborting the HTTP
+            # connection.  The blocked next() call on the iterator raises a
+            # transport-level error (httpx, httpcore, etc.).  Convert to
+            # GenerationCancelled if a cancel was requested.
+            if self._cancel_event.is_set():
+                if pending:
+                    _flush_text(pending, in_think)
+                self.ui.on_stream_end()
+                partial = {"role": "assistant"}
+                partial["content"] = "".join(content_parts) or ""
+                if provider_blocks:
+                    partial["_provider_content"] = provider_blocks
+                self._cancelled_partial_msg = partial
+                raise GenerationCancelled() from None
             raise
 
         # Flush any remaining buffered text
@@ -2089,6 +2200,14 @@ class ChatSession:
         self._msg_tokens = [su_tok, sa_tok]
         after_tokens = self._system_tokens + sum(self._msg_tokens)
 
+        # Update usage estimate so the status bar reflects post-compaction state
+        if self._last_usage:
+            self._last_usage = {
+                **self._last_usage,
+                "prompt_tokens": after_tokens,
+                "total_tokens": after_tokens,
+            }
+
         self.ui.on_info(f"[compacted: ~{before_tokens:,} -> ~{after_tokens:,} tokens]")
         separator = "\u2500" * 60
         lines = [separator]
@@ -2291,6 +2410,7 @@ class ChatSession:
         def run_one(
             item: dict[str, Any],
         ) -> tuple[str, str | list[dict[str, Any]]]:
+            self._check_cancelled()
             if item.get("error"):
                 self.ui.on_tool_result(
                     item["call_id"], item.get("func_name", "unknown"), item["error"]
@@ -3510,6 +3630,7 @@ class ChatSession:
 
     def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute an MCP tool call via the MCPClientManager."""
+        self._check_cancelled()
         call_id: str = item["call_id"]
         func_name: str = item["mcp_func_name"]
         args: dict[str, Any] = item["mcp_args"]
@@ -3583,6 +3704,7 @@ class ChatSession:
 
     def _exec_read_resource(self, item: dict[str, Any]) -> tuple[str, str]:
         """Read an MCP resource by URI."""
+        self._check_cancelled()
         call_id: str = item["call_id"]
         uri: str = item["resource_uri"]
 
@@ -3660,6 +3782,7 @@ class ChatSession:
 
     def _exec_use_prompt(self, item: dict[str, Any]) -> tuple[str, str]:
         """Invoke an MCP prompt and return expanded messages."""
+        self._check_cancelled()
         call_id: str = item["call_id"]
         name: str = item["prompt_name"]
         arguments: dict[str, str] = item["prompt_arguments"]
@@ -3686,6 +3809,10 @@ class ChatSession:
 
     def _exec_bash(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute a bash command via temp script, streaming stdout."""
+        self._check_cancelled()
+        # Capture cancel event locally so force-cancel (which replaces
+        # _cancel_event with a fresh instance) doesn't disarm this check.
+        cancel = self._cancel_event
         call_id, command = item["call_id"], item["command"]
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
@@ -3702,6 +3829,8 @@ class ChatSession:
                     start_new_session=True,
                     env=scrubbed_env(),
                 )
+                with self._procs_lock:
+                    self._active_procs.add(proc)
                 # Drain stderr in background thread to avoid pipe deadlock
                 stderr_lines: list[str] = []
 
@@ -3739,7 +3868,7 @@ class ChatSession:
                         except Exception:
                             log.debug("UI callback error during tool output", exc_info=True)
                         # Check cancellation during long-running commands
-                        if self._cancel_event.is_set():
+                        if cancel.is_set():
                             with contextlib.suppress(OSError, ProcessLookupError):
                                 try:
                                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -3756,6 +3885,8 @@ class ChatSession:
                     log.warning("Process did not exit after SIGKILL, pid=%d", proc.pid)
                 stderr_thread.join(timeout=5)
             finally:
+                with self._procs_lock:
+                    self._active_procs.discard(proc)
                 os.unlink(script_path)
 
             if timed_out.is_set():
@@ -4615,6 +4746,7 @@ class ChatSession:
 
     def _exec_notify(self, item: dict[str, Any]) -> tuple[str, str]:
         """Send a notification directly to the channel gateway via HTTP."""
+        self._check_cancelled()
         call_id = item["call_id"]
 
         if self._notify_count >= 5:
@@ -4999,6 +5131,7 @@ class ChatSession:
 
     def _exec_write_file(self, item: dict[str, Any]) -> tuple[str, str]:
         """Write content to a file, creating parent directories as needed."""
+        self._check_cancelled()
         call_id = item["call_id"]
         path, content, resolved = item["path"], item["content"], item["resolved"]
         try:
@@ -5020,6 +5153,7 @@ class ChatSession:
         When near_line is set, picks the occurrence nearest that line
         instead of requiring uniqueness.
         """
+        self._check_cancelled()
         call_id = item["call_id"]
         path, old_string, new_string = (
             item["path"],
@@ -5071,6 +5205,7 @@ class ChatSession:
 
     def _exec_man(self, item: dict[str, Any]) -> tuple[str, str]:
         """Look up a man or info page."""
+        self._check_cancelled()
         call_id = item["call_id"]
         page = item["page"]
         section = item.get("section", "")
@@ -5128,6 +5263,7 @@ class ChatSession:
 
     def _exec_web_fetch(self, item: dict[str, Any]) -> tuple[str, str]:
         """Fetch a URL, then summarize/extract using an API call."""
+        self._check_cancelled()
         call_id, url = item["call_id"], item["url"]
         question = item.get("question", "Summarize the key content of this page.")
 
@@ -5215,6 +5351,7 @@ class ChatSession:
 
     def _exec_web_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search the web via the configured backend (Tavily, DDG, or MCP)."""
+        self._check_cancelled()
         call_id = item["call_id"]
         query = item["query"]
         max_results = item.get("max_results", 5)

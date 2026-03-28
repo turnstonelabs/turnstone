@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from turnstone.core.session import ChatSession, GenerationCancelled
+from turnstone.core.session import ChatSession, GenerationCancelled, _CancelRef
 
 
 class NullUI:
@@ -407,3 +407,294 @@ class TestStreamFlushBeforeToolCalls:
         stream_end_idx = next(i for i, e in enumerate(events) if e[0] == "stream_end")
         late_content = [e for e in events[stream_end_idx + 1 :] if e[0] == "content"]
         assert late_content == [], f"Content after stream_end: {late_content}"
+
+
+class TestStreamAbort:
+    """Tests for cancel() closing the underlying SDK stream."""
+
+    def test_cancel_closes_cancel_stream(self, tmp_db):
+        """cancel() calls .close() on the stored SDK stream handle."""
+        session = _make_session()
+        mock_stream = MagicMock()
+        session._cancel_stream = mock_stream
+        session.cancel()
+        mock_stream.close.assert_called_once()
+        assert session._cancel_event.is_set()
+
+    def test_cancel_without_stream_is_safe(self, tmp_db):
+        """cancel() with no active stream just sets the event."""
+        session = _make_session()
+        assert session._cancel_stream is None
+        session.cancel()  # Should not raise
+        assert session._cancel_event.is_set()
+
+    def test_cancel_stream_close_error_suppressed(self, tmp_db):
+        """Errors from stream.close() are suppressed."""
+        session = _make_session()
+        mock_stream = MagicMock()
+        mock_stream.close.side_effect = RuntimeError("already closed")
+        session._cancel_stream = mock_stream
+        session.cancel()  # Should not raise
+        assert session._cancel_event.is_set()
+
+    def test_cancel_ref_populated_after_first_chunk(self, tmp_db):
+        """_cancel_ref is populated by the provider after the first chunk
+        arrives (lazy generator evaluation)."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = "stop"
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        sdk_stream = MagicMock()
+
+        def fake_provider_stream():
+            # Simulate provider appending to cancel_ref before first yield
+            session._cancel_ref.append(sdk_stream)
+            yield FakeChunk(content_delta="hi", finish_reason="stop")
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=fake_provider_stream(),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # After stream completes, cancel_stream should be cleared
+        assert session._cancel_stream is None
+        assert len(session._cancel_ref) == 0
+
+    def test_transport_error_during_cancel_becomes_generation_cancelled(self, tmp_db):
+        """When cancel() closes the stream, the resulting transport error
+        is converted to GenerationCancelled."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = ""
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        def stream_that_errors():
+            yield FakeChunk(content_delta="Hello")
+            session._cancel_event.set()
+            raise ConnectionError("stream closed")
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=stream_that_errors(),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # Should complete as cancelled, not error
+        assert "idle" in ui.states
+        assert any("cancelled" in i.lower() for i in ui.infos)
+        # Partial content preserved
+        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assert len(assistant_msgs) == 1
+        assert assistant_msgs[0]["content"] == "Hello"
+
+    def test_non_cancel_exception_not_swallowed(self, tmp_db):
+        """Exceptions during streaming that aren't caused by cancel
+        should propagate normally."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = ""
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        def stream_that_errors():
+            yield FakeChunk(content_delta="Hello")
+            raise ValueError("unexpected error")
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=stream_that_errors(),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+            pytest.raises(ValueError, match="unexpected error"),
+        ):
+            session.send("test")
+
+    def test_check_cancelled_between_retries(self, tmp_db):
+        """_try_stream checks for cancellation between retry attempts."""
+        session = _make_session()
+        session.cancel()
+
+        with pytest.raises(GenerationCancelled):
+            session._try_stream(
+                client=MagicMock(),
+                model="test",
+                msgs=[],
+            )
+
+
+class TestCancelRef:
+    """Tests for the _CancelRef list proxy."""
+
+    def test_append_sets_cancel_stream(self, tmp_db):
+        """Appending a stream handle to _CancelRef sets _cancel_stream eagerly."""
+        session = _make_session()
+        mock_stream = MagicMock()
+        assert session._cancel_stream is None
+
+        session._cancel_ref.append(mock_stream)
+
+        assert session._cancel_stream is mock_stream
+
+    def test_append_closes_stream_when_already_cancelled(self, tmp_db):
+        """If cancel is already set when a stream is appended, it is closed immediately."""
+        session = _make_session()
+        session.cancel()  # Set cancel event before stream is created
+
+        mock_stream = MagicMock()
+        session._cancel_ref.append(mock_stream)
+
+        mock_stream.close.assert_called_once()
+
+    def test_append_does_not_close_stream_when_not_cancelled(self, tmp_db):
+        """Stream is not closed if cancel hasn't been requested."""
+        session = _make_session()
+        mock_stream = MagicMock()
+
+        session._cancel_ref.append(mock_stream)
+
+        mock_stream.close.assert_not_called()
+        assert session._cancel_stream is mock_stream
+
+    def test_append_close_error_suppressed(self, tmp_db):
+        """Errors from stream.close() during eager close are suppressed."""
+        session = _make_session()
+        session.cancel()
+
+        mock_stream = MagicMock()
+        mock_stream.close.side_effect = RuntimeError("already closed")
+
+        session._cancel_ref.append(mock_stream)  # Should not raise
+
+    def test_cancel_ref_is_cancel_ref_instance(self, tmp_db):
+        """ChatSession._cancel_ref is a _CancelRef instance."""
+        session = _make_session()
+        assert isinstance(session._cancel_ref, _CancelRef)
+
+    def test_cancel_ref_cleared_after_stream_ends(self, tmp_db):
+        """_cancel_ref is cleared in the send() finally block after streaming."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+        mock_stream = MagicMock()
+        session._cancel_ref.append(mock_stream)
+        assert len(session._cancel_ref) == 1
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = "stop"
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=iter([FakeChunk(content_delta="hi", finish_reason="stop")]),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # After send() completes, _cancel_ref is cleared in the finally block
+        assert len(session._cancel_ref) == 0
+
+
+class TestForceCancelGeneration:
+    """Tests for per-generation tracking that prevents orphaned-thread side-effects."""
+
+    def test_check_cancelled_raises_for_orphaned_generation(self, tmp_db):
+        """_check_cancelled raises GenerationCancelled when my_generation is stale."""
+        session = _make_session()
+        session._generation = 2  # Simulate two generations having run
+
+        with pytest.raises(GenerationCancelled):
+            session._check_cancelled(my_generation=1)  # Generation 1 is orphaned
+
+    def test_check_cancelled_ok_for_current_generation(self, tmp_db):
+        """_check_cancelled does not raise when my_generation matches current."""
+        session = _make_session()
+        session._generation = 3
+        session._check_cancelled(my_generation=3)  # Should not raise
+
+    def test_force_cancel_orphaned_thread_does_not_mutate_messages(self, tmp_db):
+        """An abandoned generation (force-cancel) cannot append to session.messages."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        # We can't trivially test the full threading scenario in a unit test,
+        # so directly verify that _check_cancelled raises when my_generation
+        # is stale, which is what guards _stream_response against orphaned
+        # (force-cancelled) threads continuing to mutate messages.
+        session._generation = 5
+        with pytest.raises(GenerationCancelled):
+            session._check_cancelled(my_generation=4)  # orphaned generation
+
+    def test_new_cancel_event_per_generation_in_send(self, tmp_db):
+        """send() replaces _cancel_event with a fresh Event each generation."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = "stop"
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        original_event = session._cancel_event
+
+        with (
+            patch.object(
+                session,
+                "_create_stream_with_retry",
+                return_value=iter([FakeChunk(content_delta="hi", finish_reason="stop")]),
+            ),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("test")
+
+        # After send() completes, _cancel_event should be a NEW Event
+        # (not the same object as before the call).
+        assert session._cancel_event is not original_event
+        assert not session._cancel_event.is_set()
