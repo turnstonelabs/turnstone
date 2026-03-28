@@ -699,6 +699,7 @@ class TestWebSearchGating:
         with (
             patch.object(session, "_get_capabilities", return_value=caps),
             patch("turnstone.core.session.get_tavily_key", return_value=None),
+            patch("turnstone.core.web_search._ddg_available", return_value=False),
         ):
             tools = session._get_active_tools()
 

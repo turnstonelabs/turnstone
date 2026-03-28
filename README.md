@@ -290,7 +290,7 @@ All entry points read `~/.config/turnstone/config.toml`. CLI flags override conf
 [api]
 base_url = "http://localhost:8000/v1"
 api_key = ""
-tavily_key = ""        # only needed for local/vLLM models without native search
+# tavily_key = ""      # only needed for local/vLLM models without native search
 
 [model]
 name = ""              # empty = auto-detect

@@ -390,6 +390,7 @@ class TestApprovalVerdictDisplay:
         bot.config.streaming_edit_interval = 1.5
         bot.config.auto_approve = False
         bot.config.auto_approve_tools = []
+        bot.storage = None
         bot._streaming = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}

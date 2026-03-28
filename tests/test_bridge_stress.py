@@ -39,7 +39,13 @@ def _make_bridge(**overrides) -> Bridge:
         approval_timeout=1,
     )
     defaults.update(overrides)
-    return Bridge(**defaults)
+    bridge = Bridge(**defaults)
+    # Replace real httpx client with a mock so daemon threads spawned by
+    # _handle_approval / _handle_plan_review don't make real HTTP calls
+    # after the test's patch context exits.
+    bridge._http.close()
+    bridge._http = MagicMock()
+    return bridge
 
 
 def _approval_items(tool_name: str = "bash") -> list[dict]:

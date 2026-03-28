@@ -79,7 +79,12 @@ class TLSClient:
 
             setup_metrics(self._event_dispatcher)
         except ImportError:
-            pass
+            pass  # prometheus_client or lacme.metrics missing
+        except ValueError as exc:
+            if "Duplicated timeseries" in str(exc):
+                log.debug("tls_metrics_already_registered")
+            else:
+                raise
 
     async def init(self) -> None:
         """Fetch CA root cert and request a service certificate.
@@ -220,7 +225,7 @@ class TLSClient:
         _require_lacme()
         from lacme.mtls import server_ssl_context
 
-        return server_ssl_context(  # type: ignore[no-any-return]
+        return server_ssl_context(  # type: ignore[no-any-return,unused-ignore]
             cert_pem=self._bundle.fullchain_pem,
             key_pem=self._bundle.key_pem,
             ca_cert_pem=self._ca_pem,
@@ -233,7 +238,7 @@ class TLSClient:
         _require_lacme()
         from lacme.mtls import client_ssl_context
 
-        return client_ssl_context(  # type: ignore[no-any-return]
+        return client_ssl_context(  # type: ignore[no-any-return,unused-ignore]
             cert_pem=self._bundle.cert_pem,
             key_pem=self._bundle.key_pem,
             ca_cert_pem=self._ca_pem,
