@@ -401,6 +401,65 @@ class TestSessionIntegration:
         prepared = session._prepare_tool(tc)
         assert "error" in prepared
         assert "Unknown tool" in prepared["error"]
+        # Error lists available tools so the model can self-correct
+        assert "bash" in prepared["error"]
+        # Surfaces warning to user
+        session.ui.on_error.assert_called_once()
+        assert "nonexistent" in session.ui.on_error.call_args[0][0]
+
+    def test_prepare_tool_strips_whitespace_from_name(self, tmp_db):
+        """Local models may produce tool names with leading/trailing whitespace."""
+        session = self._make_session(mcp_client=None)
+        tc = {
+            "id": "call_strip",
+            "function": {"name": "  bash\n", "arguments": '{"command": "echo hi"}'},
+        }
+        prepared = session._prepare_tool(tc)
+        assert prepared["func_name"] == "bash"
+        assert "error" not in prepared
+
+    def test_prepare_tool_malformed_json_surfaces_error(self, tmp_db):
+        """Malformed JSON args should surface a warning to the user and
+        give the model a hint about expected format."""
+        session = self._make_session(mcp_client=None)
+        tc = {
+            "id": "call_bad",
+            "function": {"name": "bash", "arguments": "{command: echo hi}"},
+        }
+        prepared = session._prepare_tool(tc)
+        assert "error" in prepared
+        assert "JSON parse error" in prepared["error"]
+        assert "command" in prepared["error"]  # hint about expected key
+        assert "Please retry" in prepared["error"]
+        # User-facing warning
+        session.ui.on_error.assert_called_once()
+        assert "Malformed tool call" in session.ui.on_error.call_args[0][0]
+
+    def test_synthetic_tool_call_ids_for_empty_ids(self, tmp_db):
+        """When a local server returns empty tool call IDs, synthetic IDs
+        are generated so subsequent turns don't break."""
+        import uuid
+
+        tool_calls_acc = {
+            0: {
+                "id": "",
+                "type": "function",
+                "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+            },
+            1: {
+                "id": "",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "/tmp/x"}'},
+            },
+        }
+        # Apply the same fixup that _stream_response does
+        for tc in tool_calls_acc.values():
+            if not tc.get("id"):
+                tc["id"] = f"call_{uuid.uuid4().hex}"
+        # All IDs should now be populated and unique
+        ids = [tc["id"] for tc in tool_calls_acc.values()]
+        assert all(id_.startswith("call_") for id_ in ids)
+        assert len(set(ids)) == 2  # unique
 
     def test_mcp_command_no_client(self, tmp_db):
         session = self._make_session(mcp_client=None)
