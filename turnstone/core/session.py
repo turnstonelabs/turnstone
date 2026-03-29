@@ -2926,7 +2926,8 @@ class ChatSession:
         resolved = os.path.realpath(path)
         is_symlink = os.path.abspath(path) != resolved
         exists = os.path.exists(resolved)
-        mode = (args.get("mode") or "overwrite").strip().lower()
+        raw_mode = args.get("mode")
+        mode = str(raw_mode).strip().lower() if raw_mode else "overwrite"
         if mode not in ("overwrite", "append"):
             mode = "overwrite"
         is_append = mode == "append"
@@ -3111,7 +3112,7 @@ class ChatSession:
                             "The file may have changed — re-read it before retrying."
                         ),
                     }
-                if len(occurrences) > 1 and nl is None:
+                if len(occurrences) > 1 and nl is None and not replace_all:
                     line_list = ", ".join(str(ln) for ln in occurrences)
                     return {
                         "call_id": call_id,
@@ -3121,7 +3122,7 @@ class ChatSession:
                         "needs_approval": False,
                         "error": (
                             f"Error: {label}old_string found {len(occurrences)} times "
-                            f"at lines {line_list} — use near_line to pick one"
+                            f"at lines {line_list} — use near_line or replace_all"
                         ),
                     }
         except FileNotFoundError:
@@ -3147,6 +3148,9 @@ class ChatSession:
         preview_parts = []
         if is_symlink:
             preview_parts.append(f"    {YELLOW}Warning: symlink — actual target: {resolved}{RESET}")
+        if replace_all:
+            occ = content.count(edits[0]["old_string"])
+            preview_parts.append(f"    {YELLOW}(replace_all: {occ} occurrences){RESET}")
         for i, edit in enumerate(edits):
             if len(edits) > 1:
                 preview_parts.append(f"    {YELLOW}--- edit {i + 1}/{len(edits)} ---{RESET}")
@@ -4383,12 +4387,11 @@ class ChatSession:
             else:
                 file_count = 0
 
+            # Append summary footer before truncation so it counts toward the limit
             original_len = len(output)
-            output = self._truncate_output(output)
-
-            # Append summary footer to output
             if match_count:
                 output += f"\n\n({match_count} matches across {file_count} files)"
+            output = self._truncate_output(output)
 
             desc = f"{match_count} matches" if match_count else "no matches"
             if original_len > 500:
