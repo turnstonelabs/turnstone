@@ -1106,30 +1106,37 @@ def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
     pending = session._watch_pending
 
     def dispatch(msg: str) -> None:
-        if ws.worker_thread and ws.worker_thread.is_alive():
-            # Workstream is busy — queue for drain at IDLE (Path A)
-            pending.put({"message": msg})
-            return
+        with ws._lock:
+            if ws.worker_thread and ws.worker_thread.is_alive():
+                # Workstream is busy — queue for drain at IDLE (Path A)
+                try:
+                    pending.put_nowait({"message": msg})
+                except queue.Full:
+                    log.warning(
+                        "Watch pending queue full, dropping result for ws %s",
+                        ws.id,
+                    )
+                return
 
-        # Workstream is idle — start a worker thread (Path B)
-        # Mirrors the send_message() run() pattern for proper cleanup.
-        def run() -> None:
-            me = threading.current_thread()
-            try:
-                session.send(msg)
-            except GenerationCancelled:
-                if ws.worker_thread is me and ui:
-                    ui._enqueue({"type": "stream_end"})
-                    ui.on_state_change("idle")
-            except Exception as exc:
-                if ws.worker_thread is me and ui:
-                    ui.on_error(f"Watch error: {exc}")
-                    ui._enqueue({"type": "stream_end"})
-                    ui.on_state_change("error")
+            # Workstream is idle — start a worker thread (Path B)
+            # Mirrors the send_message() run() pattern for proper cleanup.
+            def run() -> None:
+                me = threading.current_thread()
+                try:
+                    session.send(msg)
+                except GenerationCancelled:
+                    if ws.worker_thread is me and ui:
+                        ui.on_stream_end()
+                        ui.on_state_change("idle")
+                except Exception as exc:
+                    if ws.worker_thread is me and ui:
+                        ui.on_error(f"Watch error: {exc}")
+                        ui.on_stream_end()
+                        ui.on_state_change("error")
 
-        t = threading.Thread(target=run, daemon=True)
-        ws.worker_thread = t
-        t.start()
+            t = threading.Thread(target=run, daemon=True)
+            ws.worker_thread = t
+            t.start()
 
     return dispatch
 
