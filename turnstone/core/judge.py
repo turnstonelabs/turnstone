@@ -1031,10 +1031,11 @@ class IntentJudge:
         # Prepare context
         judge_messages = self._prepare_context(item, messages)
 
-        # Prepare tools (only if read_only_tools enabled)
+        # Prepare tools (only if read_only_tools enabled).
+        # Pass raw OpenAI-format schemas — create_completion handles conversion.
         tools: list[dict[str, Any]] | None = None
         if self._config.read_only_tools:
-            tools = self._provider.convert_tools(_JUDGE_TOOL_SCHEMAS)
+            tools = _JUDGE_TOOL_SCHEMAS
 
         # Multi-turn judge loop
         timeout_budget = self._config.timeout
