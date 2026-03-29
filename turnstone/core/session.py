@@ -4188,6 +4188,16 @@ class ChatSession:
             return self._exec_read_image(call_id, path, resolved)
 
         try:
+            with open(resolved, "rb") as fb:
+                raw = fb.read(8192)  # sample first 8KB for binary detection
+            if b"\x00" in raw:
+                self._read_files.discard(resolved)
+                msg = (
+                    f"Error: {path} appears to be a binary file "
+                    "(contains null bytes). Use bash to inspect binary files."
+                )
+                self._report_tool_result(call_id, "read_file", msg, is_error=True)
+                return call_id, msg
             with open(resolved) as f:
                 all_lines = f.readlines()
         except FileNotFoundError:
