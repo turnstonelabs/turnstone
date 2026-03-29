@@ -485,6 +485,9 @@ class WebUI:
             else:
                 WebUI._workstream_mgr.set_state(self.ws_id, ws_state)
         self._broadcast_state(state)
+        # Also send to per-workstream listeners so the browser UI can track
+        # busy/idle transitions (stream_end fires per-segment, not per-turn).
+        self._enqueue({"type": "state_change", "state": state})
 
     def on_rename(self, name: str) -> None:
         """Update the workstream's display name and broadcast to all clients."""

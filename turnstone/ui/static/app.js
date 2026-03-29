@@ -378,18 +378,33 @@ Pane.prototype.handleEvent = function (evt) {
         clearTimeout(this._forceTimeout);
         this._forceTimeout = null;
       }
-      // Render final markdown for the assistant message (existing code).
-      // Note: renderMarkdown is the project's sanitizing markdown renderer.
+      // Finalize the current streaming segment's markdown.  This fires
+      // per-segment (between tool calls), NOT per-turn.  Busy state is
+      // managed by state_change events instead.
       if (this.currentAssistantEl && this.contentBuffer) {
-        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer); // sanitized by renderMarkdown
+        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer); // sanitized by renderMarkdown — see renderer.js
         postRenderMarkdown(this.currentAssistantEl);
       }
       this.currentAssistantEl = null;
       this.currentReasoningEl = null;
       this.contentBuffer = "";
-      this.setBusy(false);
-      this.inputEl.focus();
       this.scrollToBottom(true);
+      break;
+
+    case "state_change":
+      if (evt.state === "idle" || evt.state === "error") {
+        this.setBusy(false);
+        // Only steal focus if this is the active pane and no approval pending.
+        if (this.id === focusedPaneId && !this.pendingApproval) {
+          this.inputEl.focus();
+        }
+      } else if (
+        evt.state === "thinking" ||
+        evt.state === "running" ||
+        evt.state === "attention"
+      ) {
+        this.setBusy(true);
+      }
       break;
 
     case "tool_info":
@@ -438,8 +453,10 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "error":
+      // Show the error but don't change busy state — state_change
+      // handles idle/error transitions.  on_error fires for non-terminal
+      // errors (tool parse failures, truncation) mid-turn too.
       this.addErrorMessage(evt.message);
-      this.setBusy(false);
       break;
 
     case "busy_error":
@@ -454,8 +471,8 @@ Pane.prototype.handleEvent = function (evt) {
 
     case "cancelled":
       // Cancel requested but worker thread may still be finishing.
-      // Show "Cancelling..." state; stream_end will transition to ready.
-      // If stream_end already arrived (busy is false), the cancel is
+      // Show "Cancelling..." state; state_change will transition to ready.
+      // If state_change already arrived (busy is false), the cancel is
       // already handled — don't re-enter the cancelling state.
       if (!this.busy) break;
       // Clear any prior timeouts first (duplicate cancelled events).
@@ -470,7 +487,7 @@ Pane.prototype.handleEvent = function (evt) {
       this.scrollToBottom(true);
       // After 2s, offer "Force Stop" for a harder cancel that abandons
       // the stuck worker thread.  Safety timeout at 10s auto-recovers
-      // if stream_end never arrives (connection drop).
+      // if state_change never arrives (connection drop).
       var self = this;
       this._cancelTimeout = setTimeout(function () {
         if (self.busy) {
