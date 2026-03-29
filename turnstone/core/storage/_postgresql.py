@@ -147,6 +147,29 @@ class PostgreSQLBackend:
             ).fetchall()
         return _reconstruct_messages(list(rows), ws_id)
 
+    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+        with self._engine.connect() as conn:
+            cutoff_row = conn.execute(
+                sa.select(conversations.c.id)
+                .where(conversations.c.ws_id == ws_id)
+                .order_by(conversations.c.id)
+                .limit(1)
+                .offset(keep_count)
+            ).fetchone()
+            if cutoff_row is None:
+                return 0
+            cutoff_id = cutoff_row[0]
+            result = conn.execute(
+                sa.delete(conversations).where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.id >= cutoff_id,
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount
+
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:

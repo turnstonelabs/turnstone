@@ -212,6 +212,43 @@ class SQLiteBackend:
 
         return _reconstruct_messages(list(rows), ws_id)
 
+    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+        with self._engine.connect() as conn:
+            # Find the id of the first row to delete (the row at offset keep_count)
+            cutoff_row = conn.execute(
+                sa.select(conversations.c.id)
+                .where(conversations.c.ws_id == ws_id)
+                .order_by(conversations.c.id)
+                .limit(1)
+                .offset(keep_count)
+            ).fetchone()
+            if cutoff_row is None:
+                return 0  # nothing to delete
+            cutoff_id = cutoff_row[0]
+            # Remove FTS5 entries first (external content table doesn't auto-sync)
+            if self._fts5_available:
+                try:
+                    conn.execute(
+                        sa.text(
+                            "DELETE FROM conversations_fts WHERE rowid IN "
+                            "(SELECT id FROM conversations "
+                            " WHERE ws_id = :ws_id AND id >= :cutoff_id)"
+                        ),
+                        {"ws_id": ws_id, "cutoff_id": cutoff_id},
+                    )
+                except Exception:
+                    self._fts5_available = False
+            result = conn.execute(
+                sa.delete(conversations).where(
+                    sa.and_(
+                        conversations.c.ws_id == ws_id,
+                        conversations.c.id >= cutoff_id,
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount
+
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:

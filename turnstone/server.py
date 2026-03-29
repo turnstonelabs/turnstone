@@ -805,6 +805,22 @@ def _get_ws(
     return None, None
 
 
+def _audit_context(request: Request) -> tuple[str, str]:
+    """Extract (user_id, ip_address) from request for audit logging."""
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    uid: str = auth.user_id if auth else ""
+    ip = ""
+    if request.client:
+        ip = request.client.host
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        from turnstone.core.auth import is_secure_request
+
+        if is_secure_request(dict(request.headers), request.url.scheme):
+            ip = forwarded.split(",")[0].strip()
+    return uid, ip
+
+
 # ---------------------------------------------------------------------------
 # Route handlers — all async
 # ---------------------------------------------------------------------------
@@ -1331,11 +1347,20 @@ async def command(request: Request) -> JSONResponse:
     assert ws.session is not None
 
     try:
+        # Permission gate for conversation-modifying commands
+        cmd_word = cmd.strip().split(None, 1)[0].lower()
+        if cmd_word in ("/rewind", "/retry"):
+            from turnstone.core.auth import require_permission
+
+            err = require_permission(request, "conversation.modify")
+            if err:
+                ui.on_error("Permission denied: conversation.modify required")
+                return err
+
         should_exit = ws.session.handle_command(cmd)
         if should_exit:
             ui.on_info("Session ended. You can close this tab.")
         # Handle UI updates for workstream-changing commands
-        cmd_word = cmd.strip().split(None, 1)[0].lower()
         if cmd_word in ("/clear", "/new"):
             ui._enqueue({"type": "clear_ui"})
         elif cmd_word == "/resume":
@@ -1343,6 +1368,54 @@ async def command(request: Request) -> JSONResponse:
             history = _build_history(ws.session)
             if history:
                 ui._enqueue({"type": "history", "messages": history})
+        elif cmd_word in ("/rewind", "/retry"):
+            # Refresh frontend with truncated history
+            ui._enqueue({"type": "clear_ui"})
+            history = _build_history(ws.session)
+            if history:
+                ui._enqueue({"type": "history", "messages": history})
+            # Audit trail
+            storage = getattr(request.app.state, "auth_storage", None)
+            if storage:
+                from turnstone.core.audit import record_audit
+
+                audit_uid, ip = _audit_context(request)
+                record_audit(
+                    storage,
+                    audit_uid,
+                    f"conversation.{cmd_word[1:]}",
+                    "workstream",
+                    ws.id,
+                    {"command": cmd, "ws_id": ws.id},
+                    ip,
+                )
+            # Dispatch deferred retry in background thread
+            retry_msg = ws.session._pending_retry
+            if retry_msg:
+                ws.session._pending_retry = None
+                session = ws.session
+
+                def run_retry() -> None:
+                    me = threading.current_thread()
+                    try:
+                        session.send(retry_msg)
+                    except GenerationCancelled:
+                        if ws.worker_thread is me:
+                            ui.on_stream_end()
+                            ui.on_state_change("idle")
+                    except Exception as exc:
+                        if ws.worker_thread is me:
+                            ui.on_error(f"Error: {exc}")
+                            ui.on_stream_end()
+                            ui.on_state_change("error")
+
+                with ws._lock:
+                    if ws.worker_thread and ws.worker_thread.is_alive():
+                        ui.on_error("Cannot retry: workstream is busy")
+                    else:
+                        t = threading.Thread(target=run_retry, daemon=True)
+                        ws.worker_thread = t
+                        t.start()
         # Sync in-memory workstream name after any command that can change it.
         # This ensures /api/workstreams and future page loads see the right name.
         if cmd_word in ("/name", "/resume"):

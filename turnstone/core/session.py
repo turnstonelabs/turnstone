@@ -35,6 +35,7 @@ from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
 from turnstone.core.memory import (
     count_structured_memories,
+    delete_messages_after,
     delete_structured_memory,
     delete_workstream,
     get_skill_by_name,
@@ -361,6 +362,7 @@ class ChatSession:
         self._active_procs: set[subprocess.Popen[str]] = set()  # for force-kill
         self._procs_lock = threading.Lock()
         self._cancelled_partial_msg: dict[str, Any] | None = None
+        self._pending_retry: str | None = None
         # Intent validation judge (lazy-initialized)
         self._judge_config: JudgeConfig | None = judge_config
         self._judge: IntentJudge | None = None
@@ -1641,6 +1643,54 @@ class ChatSession:
         except Exception:
             self._emit_state("error")
             raise
+
+    # -- Rewind / retry -------------------------------------------------------
+
+    def _find_turn_boundaries(self) -> list[int]:
+        """Return indices of user messages in self.messages (turn start positions)."""
+        return [i for i, m in enumerate(self.messages) if m["role"] == "user"]
+
+    def rewind(self, n: int) -> int:
+        """Drop the last *n* complete turns from the conversation.
+
+        A turn = user message + all assistant/tool messages until the next
+        user message.  Returns the number of messages removed.  Updates
+        both in-memory state and the persistent database.
+        """
+        if n < 1:
+            return 0
+        boundaries = self._find_turn_boundaries()
+        if not boundaries:
+            return 0
+        n = min(n, len(boundaries))
+        cut_index = boundaries[-n]
+        removed_count = len(self.messages) - cut_index
+        del self.messages[cut_index:]
+        del self._msg_tokens[cut_index:]
+        delete_messages_after(self._ws_id, len(self.messages))
+        return removed_count
+
+    def retry(self) -> str | None:
+        """Drop the last assistant response and return the user message to re-send.
+
+        The caller is responsible for calling ``send()`` with the returned
+        message.  Returns ``None`` if there is nothing to retry.
+        """
+        boundaries = self._find_turn_boundaries()
+        if not boundaries:
+            return None
+        last_user_idx = boundaries[-1]
+        content = self.messages[last_user_idx].get("content")
+        # Multipart messages (vision/images) have list-type content;
+        # retry only supports plain text.
+        if not isinstance(content, str) or not content:
+            return None
+        # Drop everything from (and including) the user message onward;
+        # send() will re-append the user message.
+        del self.messages[last_user_idx:]
+        del self._msg_tokens[last_user_idx:]
+        delete_messages_after(self._ws_id, len(self.messages))
+        return content
 
     @staticmethod
     def _strip_reasoning(text: str) -> str:
@@ -5820,6 +5870,37 @@ class ChatSession:
                 else:
                     self.ui.on_info("\n".join(mcp_lines))
 
+        elif cmd == "/retry":
+            user_msg = self.retry()
+            if user_msg is None:
+                self.ui.on_info("Nothing to retry.")
+            else:
+                self._pending_retry = user_msg
+                self.ui.on_info(f"Retrying: {user_msg[:80]}...")
+
+        elif cmd == "/rewind":
+            if not arg:
+                self.ui.on_info("Usage: /rewind <N> — drop the last N turns")
+            else:
+                try:
+                    n = int(arg)
+                except ValueError:
+                    self.ui.on_info("Usage: /rewind <N> — N must be a positive integer")
+                else:
+                    if n < 1:
+                        self.ui.on_info("N must be at least 1.")
+                    else:
+                        turns_available = len(self._find_turn_boundaries())
+                        actual_n = min(n, turns_available)
+                        removed = self.rewind(n)
+                        if removed == 0:
+                            self.ui.on_info("No turns to rewind.")
+                        else:
+                            self.ui.on_info(
+                                f"Rewound {actual_n} turn(s) ({removed} messages removed). "
+                                f"{len(self.messages)} messages remain."
+                            )
+
         elif cmd == "/help":
             self.ui.on_info(
                 "\n".join(
@@ -5837,6 +5918,8 @@ class ChatSession:
                         "",
                         "  /history [query]       Search conversation history (or show recent)",
                         "  /compact               Compact conversation (summarize old messages)",
+                        "  /retry                 Re-send the last user message for a new response",
+                        "  /rewind <N>            Drop the last N turns (user + response)",
                         "",
                         "  /model [alias]         Show/switch model (alias from config)",
                         "  /raw                   Toggle reasoning content display",

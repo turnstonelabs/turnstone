@@ -32,6 +32,15 @@ class StorageBackend(Protocol):
         """Load messages for a workstream and reconstruct OpenAI message format."""
         ...
 
+    def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
+        """Delete conversation rows beyond the first *keep_count* rows for a workstream.
+
+        Rows are ordered by auto-increment ``id``.  If the workstream has
+        N rows total and ``keep_count`` < N, the last N - keep_count rows
+        are deleted.  Returns the number of rows deleted.
+        """
+        ...
+
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:

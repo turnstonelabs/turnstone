@@ -65,6 +65,23 @@ def load_messages(ws_id: str) -> list[dict[str, Any]]:
         return []
 
 
+def delete_messages_after(ws_id: str, keep_count: int) -> int:
+    """Delete conversation rows beyond the first *keep_count* rows.
+
+    Returns the number of rows deleted, or 0 on error.
+    """
+    try:
+        return get_storage().delete_messages_after(ws_id, keep_count)
+    except Exception:
+        log.warning(
+            "Failed to delete messages after count=%d for ws=%s",
+            keep_count,
+            ws_id,
+            exc_info=True,
+        )
+        return 0
+
+
 # -- Workstream management ----------------------------------------------------
 
 

@@ -63,6 +63,8 @@ SLASH_COMMANDS = [
     "/creative",
     "/debug",
     "/mcp",
+    "/retry",
+    "/rewind",
     "/help",
     "/exit",
     "/quit",
@@ -1254,6 +1256,16 @@ def main() -> None:
             should_exit = active.session.handle_command(user_input)
             if should_exit:
                 break
+            # Dispatch deferred retry (handle_command sets _pending_retry)
+            retry_msg = active.session._pending_retry
+            if retry_msg:
+                active.session._pending_retry = None
+                try:
+                    active.session.send(retry_msg)
+                except KeyboardInterrupt:
+                    print(f"\n{yellow('Interrupted.')}")
+                except Exception as e:
+                    print(f"\n{red(f'Error: {e}')}")
         else:
             try:
                 active.session.send(user_input)

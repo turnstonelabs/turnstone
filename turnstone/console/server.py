@@ -1771,6 +1771,7 @@ _VALID_PERMISSIONS = frozenset(
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
+        "conversation.modify",
     }
 )
 
