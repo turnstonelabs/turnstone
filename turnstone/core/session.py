@@ -3041,7 +3041,7 @@ class ChatSession:
 
         # Pre-read to validate all edits and build diff preview
         try:
-            with open(path) as f:
+            with open(resolved) as f:
                 content = f.read()
 
             for i, edit in enumerate(edits):
@@ -4193,7 +4193,7 @@ class ChatSession:
         caps = self._get_capabilities()
         if not caps.supports_vision:
             try:
-                size = os.path.getsize(path)
+                size = os.path.getsize(resolved)
             except OSError as e:
                 self._read_files.discard(resolved)
                 msg = f"Error: {path}: {e}"
@@ -4208,7 +4208,7 @@ class ChatSession:
             )
 
         try:
-            with open(path, "rb") as f:
+            with open(resolved, "rb") as f:
                 raw = f.read()
         except FileNotFoundError:
             self._read_files.discard(resolved)
@@ -5379,7 +5379,7 @@ class ChatSession:
         self._check_cancelled()
         call_id = item["call_id"]
         path = item["path"]
-        resolved = item.get("resolved", os.path.realpath(path))
+        resolved = item.get("resolved", os.path.realpath(os.path.expanduser(path)))
         edits: list[dict[str, Any]] = item["edits"]
         try:
             with open(resolved) as f:
