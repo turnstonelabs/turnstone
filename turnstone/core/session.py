@@ -1625,19 +1625,11 @@ class ChatSession:
                 if content:
                     save_message(self._ws_id, "assistant", content)
             else:
-                # Cancelled during tool execution — roll back incomplete results
-                while self.messages and self.messages[-1]["role"] == "tool":
-                    self.messages.pop()
-                    if self._msg_tokens:
-                        self._msg_tokens.pop()
-                while (
-                    self.messages
-                    and self.messages[-1]["role"] == "assistant"
-                    and self.messages[-1].get("tool_calls")
-                ):
-                    self.messages.pop()
-                    if self._msg_tokens:
-                        self._msg_tokens.pop()
+                # Cancelled during tool execution — synthesize cancelled
+                # tool_result for any tool_calls that lack a matching result.
+                # This keeps the conversation valid for both providers while
+                # preserving the full tool call structure in history.
+                self._synthesize_cancelled_results("Cancelled by user.")
             # No need to clear _cancel_event — it's replaced per-generation
             # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
@@ -1645,25 +1637,51 @@ class ChatSession:
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
         except KeyboardInterrupt:
-            # Remove any partial tool results, then the originating assistant
-            # message with unanswered tool_calls — keep _msg_tokens in sync
-            while self.messages and self.messages[-1]["role"] == "tool":
-                self.messages.pop()
-                if self._msg_tokens:
-                    self._msg_tokens.pop()
-            while (
-                self.messages
-                and self.messages[-1]["role"] == "assistant"
-                and self.messages[-1].get("tool_calls")
-            ):
-                self.messages.pop()
-                if self._msg_tokens:
-                    self._msg_tokens.pop()
+            self._synthesize_cancelled_results("Interrupted by user.")
             self._emit_state("error")
             raise
         except Exception:
             self._emit_state("error")
             raise
+
+    def _synthesize_cancelled_results(self, reason: str) -> None:
+        """Synthesize tool_result messages for orphaned tool_calls after cancel.
+
+        Finds the last assistant message with tool_calls, collects the IDs of
+        tool_calls that already have matching tool results, and synthesizes
+        cancelled results for any that don't.  This keeps the conversation
+        valid (both providers require matching tool_results) while preserving
+        the full tool call structure so the model knows what was attempted.
+        """
+        # Find the last assistant message with tool_calls
+        assistant_idx = None
+        for i in range(len(self.messages) - 1, -1, -1):
+            msg = self.messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                assistant_idx = i
+                break
+        if assistant_idx is None:
+            return
+
+        # Collect tool_call IDs that already have results
+        answered_ids: set[str] = set()
+        for msg in self.messages[assistant_idx + 1 :]:
+            if msg.get("role") == "tool":
+                answered_ids.add(msg.get("tool_call_id", ""))
+
+        # Synthesize results for unanswered tool_calls
+        for tc in self.messages[assistant_idx].get("tool_calls", []):
+            tc_id = tc.get("id", "")
+            if tc_id and tc_id not in answered_ids:
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": reason,
+                        "is_error": True,
+                    }
+                )
+                self._msg_tokens.append(1)
 
     # -- Rewind / retry -------------------------------------------------------
 

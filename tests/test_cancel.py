@@ -180,7 +180,7 @@ class TestCancelDuringToolExecution:
     """Cancel while tools are being executed."""
 
     def test_rollback_incomplete_tool_results(self, tmp_db):
-        """When cancelled during tool execution, incomplete results are rolled back."""
+        """When cancelled during tool execution, synthesized results replace missing tool outputs."""
         ui = NullUI()
         session = _make_session(ui=ui)
 
@@ -236,13 +236,14 @@ class TestCancelDuringToolExecution:
 
         # Session should be idle
         assert ui.states[-1] == "idle"
-        # No tool result messages should remain (rolled back)
-        roles = [m["role"] for m in session.messages]
-        assert "tool" not in roles
-        # The assistant message with tool_calls should also be rolled back
-        for m in session.messages:
-            if m["role"] == "assistant":
-                assert "tool_calls" not in m or not m["tool_calls"]
+        # Cancelled tool calls should have synthesized results
+        tool_msgs = [m for m in session.messages if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc_1"
+        assert "Cancelled by user" in tool_msgs[0]["content"]
+        # The assistant message with tool_calls should still be present
+        assistant_msgs = [m for m in session.messages if m.get("tool_calls")]
+        assert len(assistant_msgs) == 1
 
 
 class TestCancelWhenIdle:
