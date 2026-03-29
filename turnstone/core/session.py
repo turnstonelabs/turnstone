@@ -1880,12 +1880,34 @@ class ChatSession:
                 f"Warning: response truncated (hit {self.max_tokens} token limit). "
                 f"Use --max-tokens to increase, or /compact to free context."
             )
+            log.warning(
+                "stream.truncated",
+                finish_reason=finish_reason,
+                max_tokens=self.max_tokens,
+                had_tool_calls=bool(tool_calls_acc),
+            )
             # Drop partial tool calls — they'll have malformed JSON
             if tool_calls_acc:
+                dropped = [tool_calls_acc[i]["function"]["name"] for i in sorted(tool_calls_acc)]
                 self.ui.on_error("Discarding partial tool calls from truncated response.")
+                log.warning(
+                    "stream.tool_calls_discarded",
+                    reason="truncated",
+                    dropped_tools=dropped,
+                    count=len(dropped),
+                )
                 tool_calls_acc.clear()
         elif finish_reason == "content_filter":
             self.ui.on_error("Warning: response blocked by content filter.")
+
+        # Log stream completion for diagnostics
+        log.debug(
+            "stream.finished",
+            finish_reason=finish_reason,
+            has_content=bool(content_parts),
+            tool_call_count=len(tool_calls_acc),
+            content_length=sum(len(p) for p in content_parts),
+        )
 
         # Signal end of stream to the UI
         self.ui.on_stream_end()
@@ -1899,6 +1921,11 @@ class ChatSession:
         if tool_calls_acc:
             self._ensure_tool_call_ids(tool_calls_acc)
             msg["tool_calls"] = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+            log.info(
+                "stream.tool_calls",
+                count=len(tool_calls_acc),
+                tools=[tool_calls_acc[i]["function"]["name"] for i in sorted(tool_calls_acc)],
+            )
 
         # Store raw provider content blocks for multi-turn preservation
         # (e.g. Anthropic web_search_tool_result with encrypted_content)

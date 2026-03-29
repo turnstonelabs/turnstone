@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+import structlog
+
 from turnstone.core.providers._protocol import (
     CompletionResult,
     ModelCapabilities,
@@ -19,6 +21,8 @@ from turnstone.core.providers._protocol import (
     UsageInfo,
     _lookup_capabilities,
 )
+
+log = structlog.get_logger(__name__)
 
 # -- model capabilities -------------------------------------------------------
 
@@ -330,6 +334,14 @@ class OpenAIProvider:
         if extra_params:
             kwargs["extra_body"] = extra_params
 
+        log.debug(
+            "openai.request",
+            model=model,
+            stream=True,
+            max_tokens=max_tokens,
+            message_count=len(messages),
+            tool_count=len(tools) if tools else 0,
+        )
         stream = client.chat.completions.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
@@ -339,12 +351,17 @@ class OpenAIProvider:
         """Convert OpenAI stream chunks to normalized StreamChunks."""
         first = True
         annotations: list[Any] = []
+        content_len = 0
+        tool_call_count = 0
+        last_finish_reason: str | None = None
+        completion_tokens: int | None = None
         for chunk in stream:
             sc = StreamChunk()
 
             # Finish reason
             if chunk.choices and chunk.choices[0].finish_reason:
                 sc.finish_reason = chunk.choices[0].finish_reason
+                last_finish_reason = sc.finish_reason
 
             # Usage from final chunk
             if hasattr(chunk, "usage") and chunk.usage is not None:
@@ -352,6 +369,7 @@ class OpenAIProvider:
                 pt = getattr(u, "prompt_tokens", None)
                 ct = getattr(u, "completion_tokens", None)
                 tt = getattr(u, "total_tokens", None)
+                completion_tokens = ct
                 if pt is not None and ct is not None:
                     # Extract cached_tokens from prompt_tokens_details.
                     # OpenAI caching is automatic with no write premium, so
@@ -380,6 +398,7 @@ class OpenAIProvider:
             # Content
             if delta.content:
                 sc.content_delta = delta.content
+                content_len += len(delta.content)
 
             # Tool calls
             if delta.tool_calls:
@@ -393,6 +412,7 @@ class OpenAIProvider:
                         if tc_delta.function.arguments:
                             tcd.arguments_delta = tc_delta.function.arguments
                     sc.tool_call_deltas.append(tcd)
+                    tool_call_count += 1
 
             # Accumulate url_citation annotations from search models
             delta_anns = getattr(delta, "annotations", None)
@@ -406,6 +426,15 @@ class OpenAIProvider:
 
             if has_content or sc.finish_reason or sc.usage:
                 yield sc
+
+        log.debug(
+            "openai.response",
+            stream=True,
+            finish_reason=last_finish_reason,
+            content_length=content_len,
+            tool_call_deltas=tool_call_count,
+            completion_tokens=completion_tokens,
+        )
 
         # Emit accumulated citations as a final info chunk
         if annotations:
@@ -445,6 +474,14 @@ class OpenAIProvider:
         if extra_params:
             kwargs["extra_body"] = extra_params
 
+        log.debug(
+            "openai.request",
+            model=model,
+            stream=False,
+            max_tokens=max_tokens,
+            message_count=len(messages),
+            tool_count=len(tools) if tools else 0,
+        )
         response = client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         msg = choice.message
@@ -482,12 +519,21 @@ class OpenAIProvider:
                 cache_read_tokens=cached or 0,
             )
 
-        return CompletionResult(
+        result = CompletionResult(
             content=content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
         )
+        log.debug(
+            "openai.response",
+            stream=False,
+            finish_reason=result.finish_reason,
+            content_length=len(content),
+            tool_call_count=len(tool_calls) if tool_calls else 0,
+            completion_tokens=usage.completion_tokens if usage else None,
+        )
+        return result
 
     @staticmethod
     def _format_citations(content: str, annotations: list[Any]) -> str:
