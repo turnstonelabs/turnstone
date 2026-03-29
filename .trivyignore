@@ -1,0 +1,4 @@
+# libexpat integer overflow — no fix available in Debian repos yet
+# https://avd.aquasec.com/nvd/cve-2026-25210
+# Review: remove this entry once a patched libexpat1 is published
+CVE-2026-25210
