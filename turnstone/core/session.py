@@ -2865,7 +2865,10 @@ class ChatSession:
                     "header": f"\u2717 edit_file: {path}",
                     "preview": "",
                     "needs_approval": False,
-                    "error": f"Error: old_string not found in {path}",
+                    "error": (
+                        f"Error: old_string not found in {path}. "
+                        "The file may have changed — re-read it before retrying."
+                    ),
                 }
             if len(occurrences) > 1 and near_line is None:
                 line_list = ", ".join(str(ln) for ln in occurrences)
