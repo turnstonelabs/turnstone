@@ -484,11 +484,11 @@ def probe_model_endpoint(
 
         # --- context window detection ---
         if provider == "anthropic":
-            from turnstone.core.providers._anthropic import AnthropicProvider
+            from turnstone.core.providers import lookup_model_capabilities
 
-            result["context_window"] = (
-                AnthropicProvider().get_capabilities(inspect_id).context_window
-            )
+            known = lookup_model_capabilities("anthropic", inspect_id)
+            if known is not None:
+                result["context_window"] = known["context_window"]
             result["server_type"] = "anthropic"
         else:
             # OpenAI-compatible path
