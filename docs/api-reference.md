@@ -386,10 +386,10 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 {"type": "tool_output_chunk", "call_id": "call_abc123", "chunk": "Building project...\n"}
 ```
 
-**`tool_result`** -- final output from a completed tool execution. The `call_id` matches the corresponding `tool_info`/`approve_request` item and any preceding `tool_output_chunk` events. For bash tools, this arrives after all streaming chunks and includes both stdout and stderr.
+**`tool_result`** -- final output from a completed tool execution. The `call_id` matches the corresponding `tool_info`/`approve_request` item and any preceding `tool_output_chunk` events. For bash tools, this arrives after all streaming chunks and includes both stdout and stderr. The `is_error` field is `true` when the tool execution failed (non-zero exit, exception, denial, etc.); clients should use this flag instead of text-prefix heuristics.
 
 ```json
-{"type": "tool_result", "call_id": "call_abc123", "name": "bash", "output": "file1.py\nfile2.py\n"}
+{"type": "tool_result", "call_id": "call_abc123", "name": "bash", "output": "file1.py\nfile2.py\n", "is_error": false}
 ```
 
 **`status`** -- token usage statistics, sent after each model turn.

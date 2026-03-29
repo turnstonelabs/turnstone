@@ -190,7 +190,14 @@ class SessionUI(Protocol):
     def on_content_token(self, text: str) -> None: ...
     def on_stream_end(self) -> None: ...
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]: ...
-    def on_tool_result(self, call_id: str, name: str, output: str) -> None: ...
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+    ) -> None: ...
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None: ...
     def on_status(self, usage: dict[str, Any], context_window: int, effort: str) -> None: ...
     def on_plan_review(self, content: str) -> str: ...
@@ -344,6 +351,8 @@ class ChatSession:
         self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
         # Repeat detection: track recent tool call signatures
         self._recent_tool_sigs: set[str] = set()
+        # Tool error tracking: call_id → is_error for message persistence
+        self._tool_error_flags: dict[str, bool] = {}
         # Cooperative cancellation: set from outside to stop generation
         self._cancel_event = threading.Event()
         self._cancel_ref: _CancelRef = _CancelRef(self)  # provider appends SDK stream here
@@ -727,6 +736,19 @@ class ChatSession:
         self.ui.on_info(
             "\n".join([header, *lines]) if lines else "MCP refresh complete: no servers to refresh."
         )
+
+    def _report_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+    ) -> None:
+        """Notify the UI and record error flag for message persistence."""
+        if is_error:
+            self._tool_error_flags[call_id] = True
+        self._report_tool_result(call_id, name, output, is_error=is_error)
 
     def _truncate_output(self, output: str) -> str:
         """Truncate tool output to self.tool_truncation chars, keeping head + tail."""
@@ -1474,6 +1496,8 @@ class ChatSession:
                         "tool_call_id": tc_id,
                         "content": output,
                     }
+                    if self._tool_error_flags.pop(tc_id, False):
+                        tool_msg["is_error"] = True
                     self.messages.append(tool_msg)
 
                     # Token estimation — image content uses a fixed heuristic
@@ -2411,8 +2435,11 @@ class ChatSession:
         ) -> tuple[str, str | list[dict[str, Any]]]:
             self._check_cancelled()
             if item.get("error"):
-                self.ui.on_tool_result(
-                    item["call_id"], item.get("func_name", "unknown"), item["error"]
+                self._report_tool_result(
+                    item["call_id"],
+                    item.get("func_name", "unknown"),
+                    item["error"],
+                    is_error=True,
                 )
                 return item["call_id"], item["error"]
             if item.get("denied"):
@@ -2426,7 +2453,7 @@ class ChatSession:
                 func = item.get("func_name", "unknown")
                 msg = f"Error executing {func}: {e}"
                 log.warning("tool_exec.failed", tool=func, error=str(e), exc_info=True)
-                self.ui.on_tool_result(item["call_id"], func, msg)
+                self._report_tool_result(item["call_id"], func, msg, is_error=True)
                 return item["call_id"], msg
 
         if len(items) == 1:
@@ -3504,12 +3531,12 @@ class ChatSession:
             skill_data = get_skill_by_name(name)
             if not skill_data or not skill_data.get("enabled", True):
                 msg = f"Error: skill '{name}' not found"
-                self.ui.on_tool_result(call_id, "skill", msg)
+                self._report_tool_result(call_id, "skill", msg, is_error=True)
                 return call_id, msg
 
             if self._skill_name == name:
                 msg = f"Skill '{name}' is already active"
-                self.ui.on_tool_result(call_id, "skill", msg)
+                self._report_tool_result(call_id, "skill", msg)
                 return call_id, msg
 
             self.set_skill(name)
@@ -3522,7 +3549,7 @@ class ChatSession:
             if scan:
                 parts.append(f"Security tier: {scan}")
             msg = "\n".join(parts)
-            self.ui.on_tool_result(call_id, "skill", msg)
+            self._report_tool_result(call_id, "skill", msg)
             return call_id, msg
 
         # action == "search"
@@ -3576,7 +3603,7 @@ class ChatSession:
 
         if not rows:
             msg = "No skills found" + (f" matching '{query}'" if query else "")
-            self.ui.on_tool_result(call_id, "skill", msg)
+            self._report_tool_result(call_id, "skill", msg)
             return call_id, msg
 
         lines = [f"Found {len(rows)} skill(s):", ""]
@@ -3598,7 +3625,7 @@ class ChatSession:
             lines.append(line)
 
         msg = "\n".join(lines)
-        self.ui.on_tool_result(call_id, "skill", msg)
+        self._report_tool_result(call_id, "skill", msg)
         return call_id, msg
 
     # -- MCP tool prepare/execute ----------------------------------------------
@@ -3639,17 +3666,20 @@ class ChatSession:
         args: dict[str, Any] = item["mcp_args"]
 
         assert self._mcp_client is not None
+        mcp_error = False
         try:
             output = self._mcp_client.call_tool_sync(func_name, args, timeout=self.tool_timeout)
         except TimeoutError:
             output = f"MCP tool timed out after {self.tool_timeout}s"
+            mcp_error = True
             self.ui.on_error(output)
         except Exception as e:
             output = f"MCP tool error: {e}"
+            mcp_error = True
             self.ui.on_error(output)
 
         output = self._truncate_output(output)
-        self.ui.on_tool_result(call_id, func_name, output)
+        self._report_tool_result(call_id, func_name, output, is_error=mcp_error)
         return call_id, output
 
     @staticmethod
@@ -3712,18 +3742,21 @@ class ChatSession:
         uri: str = item["resource_uri"]
 
         assert self._mcp_client is not None
+        mcp_error = False
         try:
             output = self._mcp_client.read_resource_sync(uri, timeout=self.tool_timeout)
         except TimeoutError:
             output = f"MCP resource read timed out after {self.tool_timeout}s"
+            mcp_error = True
             self.ui.on_error(output)
         except Exception:
             log.warning("MCP resource read failed for %s", uri, exc_info=True)
             output = "MCP resource error: failed to read resource"
+            mcp_error = True
             self.ui.on_error(output)
 
         output = self._truncate_output(output)
-        self.ui.on_tool_result(call_id, "read_resource", output)
+        self._report_tool_result(call_id, "read_resource", output, is_error=mcp_error)
         return call_id, output
 
     def _prepare_use_prompt(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -3791,6 +3824,7 @@ class ChatSession:
         arguments: dict[str, str] = item["prompt_arguments"]
 
         assert self._mcp_client is not None
+        mcp_error = False
         try:
             messages = self._mcp_client.get_prompt_sync(
                 name, arguments or None, timeout=self.tool_timeout
@@ -3798,14 +3832,16 @@ class ChatSession:
             output = "\n\n".join(f"[{m['role']}]: {m['content']}" for m in messages)
         except TimeoutError:
             output = f"MCP prompt timed out after {self.tool_timeout}s"
+            mcp_error = True
             self.ui.on_error(output)
         except Exception:
             log.warning("MCP prompt invocation failed for %s", name, exc_info=True)
             output = "MCP prompt error: failed to invoke prompt"
+            mcp_error = True
             self.ui.on_error(output)
 
         output = self._truncate_output(output)
-        self.ui.on_tool_result(call_id, "use_prompt", output)
+        self._report_tool_result(call_id, "use_prompt", output, is_error=mcp_error)
         return call_id, output
 
     # -- Execute methods (do the work, report output via UI) -------------------
@@ -3901,20 +3937,21 @@ class ChatSession:
             output = output.strip()
             output = self._truncate_output(output)
 
+            bash_error = proc.returncode >= 2
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]"
 
-            self.ui.on_tool_result(call_id, "bash", output)
+            self._report_tool_result(call_id, "bash", output, is_error=bash_error)
 
             return call_id, output if output else "(no output)"
 
         except subprocess.TimeoutExpired:
             msg = f"Command timed out after {self.tool_timeout}s"
-            self.ui.on_tool_result(call_id, "bash", msg)
+            self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
         except Exception as e:
             msg = f"Error executing command: {e}"
-            self.ui.on_tool_result(call_id, "bash", msg)
+            self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
 
     def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
@@ -3935,12 +3972,12 @@ class ChatSession:
         except FileNotFoundError:
             self._read_files.discard(resolved)
             msg = f"Error: {path} not found"
-            self.ui.on_tool_result(call_id, "read_file", msg)
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
         except Exception as e:
             self._read_files.discard(resolved)
             msg = f"Error reading {path}: {e}"
-            self.ui.on_tool_result(call_id, "read_file", msg)
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
         self._read_files.add(resolved)
@@ -3963,7 +4000,7 @@ class ChatSession:
         if offset is not None or limit is not None:
             end = start + len(lines) - 1
             desc += f" (lines {start}-{end} of {total_lines})"
-        self.ui.on_tool_result(call_id, "read_file", desc)
+        self._report_tool_result(call_id, "read_file", desc)
 
         return call_id, output if output else "(empty file)"
 
@@ -3978,11 +4015,11 @@ class ChatSession:
             except OSError as e:
                 self._read_files.discard(resolved)
                 msg = f"Error: {path}: {e}"
-                self.ui.on_tool_result(call_id, "read_file", msg)
+                self._report_tool_result(call_id, "read_file", msg, is_error=True)
                 return call_id, msg
             self._read_files.add(resolved)
             desc = f"image (no vision, {size:,} bytes)"
-            self.ui.on_tool_result(call_id, "read_file", desc)
+            self._report_tool_result(call_id, "read_file", desc)
             return call_id, (
                 f"Binary image file: {path} ({size:,} bytes). "
                 "Current model does not support vision."
@@ -3994,12 +4031,12 @@ class ChatSession:
         except FileNotFoundError:
             self._read_files.discard(resolved)
             msg = f"Error: {path} not found"
-            self.ui.on_tool_result(call_id, "read_file", msg)
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
         except Exception as e:
             self._read_files.discard(resolved)
             msg = f"Error reading {path}: {e}"
-            self.ui.on_tool_result(call_id, "read_file", msg)
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
         if len(raw) > _IMAGE_SIZE_CAP:
@@ -4010,7 +4047,7 @@ class ChatSession:
                 f"Error: image {path} is {size_mb:.1f} MB, "
                 f"exceeds {cap_mb:.0f} MB limit for vision."
             )
-            self.ui.on_tool_result(call_id, "read_file", msg)
+            self._report_tool_result(call_id, "read_file", msg, is_error=True)
             return call_id, msg
 
         self._read_files.add(resolved)
@@ -4027,7 +4064,7 @@ class ChatSession:
             },
         ]
 
-        self.ui.on_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
+        self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")
         return call_id, content_parts
 
     def _exec_search(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -4070,17 +4107,17 @@ class ChatSession:
             desc = f"{match_count} matches" if match_count else "no matches"
             if original_len > 500:
                 desc += f" ({original_len} chars)"
-            self.ui.on_tool_result(call_id, "search", desc)
+            self._report_tool_result(call_id, "search", desc)
 
             return call_id, output
 
         except subprocess.TimeoutExpired:
             msg = f"Search timed out after {self.tool_timeout}s"
-            self.ui.on_tool_result(call_id, "search", msg)
+            self._report_tool_result(call_id, "search", msg, is_error=True)
             return call_id, msg
         except Exception as e:
             msg = f"Error: search failed: {e}"
-            self.ui.on_tool_result(call_id, "search", msg)
+            self._report_tool_result(call_id, "search", msg, is_error=True)
             return call_id, msg
 
     def _run_agent(
@@ -4561,24 +4598,25 @@ class ChatSession:
                 )
                 if not memory_id:
                     msg = f"Error: failed to save memory '{item['name']}'"
-                    self.ui.on_tool_result(call_id, "memory", msg)
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
                     return call_id, msg
                 self._init_system_messages()
                 if old is not None:
                     msg = f"Updated memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
                 else:
                     msg = f"Saved memory '{item['name']}' (type={item['mem_type']}, scope={item['scope']})"
-                self.ui.on_tool_result(call_id, "memory", msg)
+                self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "delete":
                 deleted = delete_structured_memory(item["name"], item["scope"], item["scope_id"])
                 if not deleted:
                     msg = f"Error: memory '{item['name']}' not found (scope={item['scope']})"
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
                 else:
                     self._init_system_messages()
                     msg = f"Deleted memory '{item['name']}'"
-                self.ui.on_tool_result(call_id, "memory", msg)
+                    self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "search":
@@ -4604,7 +4642,7 @@ class ChatSession:
                         if item["query"]
                         else "No memories stored."
                     )
-                self.ui.on_tool_result(call_id, "memory", msg)
+                self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "list":
@@ -4625,16 +4663,16 @@ class ChatSession:
                     msg = f"Memories ({len(rows)}):\n" + "\n".join(lines)
                 else:
                     msg = "No memories stored."
-                self.ui.on_tool_result(call_id, "memory", msg)
+                self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
         except Exception as e:
             msg = f"Error: {e}"
-            self.ui.on_tool_result(call_id, "memory", msg)
+            self._report_tool_result(call_id, "memory", msg, is_error=True)
             return call_id, msg
 
         msg = "Error: unexpected action"
-        self.ui.on_tool_result(call_id, "memory", msg)
+        self._report_tool_result(call_id, "memory", msg, is_error=True)
         return call_id, msg
 
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -4655,7 +4693,7 @@ class ChatSession:
         else:
             output = f"No conversation history found for '{query}'."
 
-        self.ui.on_tool_result(call_id, "recall", output)
+        self._report_tool_result(call_id, "recall", output)
         return call_id, output
 
     # -- Notify tool -----------------------------------------------------------
@@ -4754,7 +4792,7 @@ class ChatSession:
 
         if self._notify_count >= 5:
             msg = "Error: notification rate limit exceeded (max 5 per turn)"
-            self.ui.on_tool_result(call_id, "notify", msg)
+            self._report_tool_result(call_id, "notify", msg, is_error=True)
             return call_id, msg
 
         target: dict[str, str] = {}
@@ -4792,7 +4830,7 @@ class ChatSession:
                     continue
                 log.warning("notify.no_services_exhausted")
                 msg = "Error: no channel gateway services available"
-                self.ui.on_tool_result(call_id, "notify", msg)
+                self._report_tool_result(call_id, "notify", msg, is_error=True)
                 return call_id, msg
 
             # Try first healthy gateway, fall back to next
@@ -4817,7 +4855,7 @@ class ChatSession:
                         ):
                             self._notify_count += 1
                             msg = "Notification sent successfully"
-                            self.ui.on_tool_result(call_id, "notify", msg)
+                            self._report_tool_result(call_id, "notify", msg)
                             return call_id, msg
                         last_error = "no successful deliveries"
                         continue
@@ -4846,7 +4884,7 @@ class ChatSession:
                 )
 
         msg = "Error: notification delivery failed"
-        self.ui.on_tool_result(call_id, "notify", msg)
+        self._report_tool_result(call_id, "notify", msg, is_error=True)
         return call_id, msg
 
     # -- Watch tool ----------------------------------------------------------
@@ -5031,12 +5069,12 @@ class ChatSession:
         if action == "list":
             if not storage:
                 msg = "No watches (storage unavailable)"
-                self.ui.on_tool_result(call_id, "watch", msg)
+                self._report_tool_result(call_id, "watch", msg)
                 return call_id, msg
             watches = storage.list_watches_for_ws(self._ws_id)
             if not watches:
                 msg = "No active watches."
-                self.ui.on_tool_result(call_id, "watch", msg)
+                self._report_tool_result(call_id, "watch", msg)
                 return call_id, msg
             from turnstone.core.watch import format_interval
 
@@ -5051,14 +5089,14 @@ class ChatSession:
                     f"cmd: {w['command'][:60]}"
                 )
             msg = "Active watches:\n" + "\n".join(lines)
-            self.ui.on_tool_result(call_id, "watch", msg)
+            self._report_tool_result(call_id, "watch", msg)
             return call_id, msg
 
         if action == "cancel":
             name = item.get("watch_name", "")
             if not storage:
                 msg = "Error: storage unavailable"
-                self.ui.on_tool_result(call_id, "watch", msg)
+                self._report_tool_result(call_id, "watch", msg, is_error=True)
                 return call_id, msg
             watches = storage.list_watches_for_ws(self._ws_id)
             target = None
@@ -5068,17 +5106,17 @@ class ChatSession:
                     break
             if target is None:
                 msg = f'Watch "{name}" not found.'
-                self.ui.on_tool_result(call_id, "watch", msg)
+                self._report_tool_result(call_id, "watch", msg, is_error=True)
                 return call_id, msg
             storage.update_watch(target["watch_id"], active=False, next_poll="")
             msg = f'Watch "{target["name"]}" cancelled.'
-            self.ui.on_tool_result(call_id, "watch", msg)
+            self._report_tool_result(call_id, "watch", msg)
             return call_id, msg
 
         # action == "create"
         if not storage:
             msg = "Error: storage unavailable"
-            self.ui.on_tool_result(call_id, "watch", msg)
+            self._report_tool_result(call_id, "watch", msg, is_error=True)
             return call_id, msg
 
         watch_id = uuid.uuid4().hex
@@ -5107,7 +5145,7 @@ class ChatSession:
             f"  Command: {item['command']}\n"
             f"  Condition: {stop_desc}"
         )
-        self.ui.on_tool_result(call_id, "watch", msg)
+        self._report_tool_result(call_id, "watch", msg)
         return call_id, msg
 
     _MAX_WATCH_CHAIN = 5  # max consecutive watch dispatches per worker thread
@@ -5143,11 +5181,11 @@ class ChatSession:
                 f.write(content)
             self._read_files.add(resolved)
             msg = f"Wrote {len(content)} chars to {path}"
-            self.ui.on_tool_result(call_id, "write_file", msg)
+            self._report_tool_result(call_id, "write_file", msg)
             return call_id, msg
         except Exception as e:
             msg = f"Error writing {path}: {e}"
-            self.ui.on_tool_result(call_id, "write_file", msg)
+            self._report_tool_result(call_id, "write_file", msg, is_error=True)
             return call_id, msg
 
     def _exec_edit_file(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -5170,7 +5208,7 @@ class ChatSession:
             occurrences = find_occurrences(content, old_string)
             if len(occurrences) == 0:
                 msg = f"Error: old_string no longer found in {path} (file changed)"
-                self.ui.on_tool_result(call_id, "edit_file", msg)
+                self._report_tool_result(call_id, "edit_file", msg, is_error=True)
                 return call_id, msg
             if len(occurrences) > 1 and near_line is None:
                 line_list = ", ".join(str(ln) for ln in occurrences)
@@ -5178,7 +5216,7 @@ class ChatSession:
                     f"Error: old_string found {len(occurrences)} times "
                     f"at lines {line_list} (file changed)"
                 )
-                self.ui.on_tool_result(call_id, "edit_file", msg)
+                self._report_tool_result(call_id, "edit_file", msg, is_error=True)
                 return call_id, msg
             if near_line is not None and len(occurrences) > 1:
                 # Replace only the occurrence nearest to near_line
@@ -5189,11 +5227,11 @@ class ChatSession:
             with open(path, "w") as f:
                 f.write(content)
             msg = f"Edited {path}: replaced 1 occurrence"
-            self.ui.on_tool_result(call_id, "edit_file", msg)
+            self._report_tool_result(call_id, "edit_file", msg)
             return call_id, msg
         except Exception as e:
             msg = f"Error writing {path}: {e}"
-            self.ui.on_tool_result(call_id, "edit_file", msg)
+            self._report_tool_result(call_id, "edit_file", msg, is_error=True)
             return call_id, msg
 
     def _exec_math(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -5203,7 +5241,7 @@ class ChatSession:
         output = self._truncate_output(output)
 
         result_msg = f"Error:\n{output}" if is_error else output if output else "(no output)"
-        self.ui.on_tool_result(call_id, "math", result_msg)
+        self._report_tool_result(call_id, "math", result_msg, is_error=is_error)
         return call_id, result_msg
 
     def _exec_man(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -5247,20 +5285,20 @@ class ChatSession:
                     text = result.stdout
                 else:
                     msg = f"No man or info page found for '{page}'"
-                    self.ui.on_tool_result(call_id, "man", msg)
+                    self._report_tool_result(call_id, "man", msg)
                     return call_id, msg
         except FileNotFoundError:
             msg = "Error: man command not available"
-            self.ui.on_tool_result(call_id, "man", msg)
+            self._report_tool_result(call_id, "man", msg, is_error=True)
             return call_id, msg
         except subprocess.TimeoutExpired:
             msg = "Error: man page lookup timed out"
-            self.ui.on_tool_result(call_id, "man", msg)
+            self._report_tool_result(call_id, "man", msg, is_error=True)
             return call_id, msg
 
         text = self._truncate_output(text)
 
-        self.ui.on_tool_result(call_id, "man", f"{len(text)} chars")
+        self._report_tool_result(call_id, "man", f"{len(text)} chars")
 
         return call_id, text
 
@@ -5289,15 +5327,15 @@ class ChatSession:
 
         except httpx.HTTPStatusError as e:
             msg = f"Error: fetch failed: HTTP {e.response.status_code}"
-            self.ui.on_tool_result(call_id, "web_fetch", msg)
+            self._report_tool_result(call_id, "web_fetch", msg, is_error=True)
             return call_id, msg
         except (httpx.RequestError, ValueError) as e:
             msg = f"Error: fetch failed: {e}"
-            self.ui.on_tool_result(call_id, "web_fetch", msg)
+            self._report_tool_result(call_id, "web_fetch", msg, is_error=True)
             return call_id, msg
         except Exception as e:
             msg = f"Error fetching URL: {e}"
-            self.ui.on_tool_result(call_id, "web_fetch", msg)
+            self._report_tool_result(call_id, "web_fetch", msg, is_error=True)
             return call_id, msg
 
         if not text.strip():
@@ -5348,7 +5386,12 @@ class ChatSession:
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 
-        self.ui.on_tool_result(call_id, "web_fetch", answer)
+        self._report_tool_result(
+            call_id,
+            "web_fetch",
+            answer,
+            is_error=answer.startswith("Extraction failed"),
+        )
 
         return call_id, answer
 
@@ -5363,17 +5406,17 @@ class ChatSession:
         client = self._resolve_search_client()
         if not client:
             msg = "Error: web search backend not available"
-            self.ui.on_tool_result(call_id, "web_search", msg)
+            self._report_tool_result(call_id, "web_search", msg, is_error=True)
             return call_id, msg
 
         try:
             output = client.search(query, max_results=max_results, topic=topic)
         except Exception as e:
             msg = f"Error: web search failed: {e}"
-            self.ui.on_tool_result(call_id, "web_search", msg)
+            self._report_tool_result(call_id, "web_search", msg, is_error=True)
             return call_id, msg
 
-        self.ui.on_tool_result(call_id, "web_search", output)
+        self._report_tool_result(call_id, "web_search", output)
         return call_id, output
 
     def handle_command(self, cmd_line: str) -> bool:

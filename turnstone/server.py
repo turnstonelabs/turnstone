@@ -382,22 +382,20 @@ class WebUI:
 
         return approved, feedback
 
-    def on_tool_result(self, call_id: str, name: str, output: str) -> None:
+    def on_tool_result(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+    ) -> None:
         _metrics.record_tool_call(name)
         with self._ws_lock:
             self._ws_tool_calls[name] = self._ws_tool_calls.get(name, 0) + 1
             self._ws_current_activity = ""
             self._ws_activity_state = ""
         self._broadcast_activity()
-        is_error = isinstance(output, str) and (
-            output.startswith("Error")
-            or output.startswith("Command timed out")
-            or output.startswith("Search timed out")
-            or output.startswith("Unknown tool:")
-            or output.startswith("JSON parse error:")
-            or output.startswith("MCP prompt timed out")
-            or output.startswith("MCP prompt error")
-        )
         event: dict[str, Any] = {
             "type": "tool_result",
             "call_id": call_id,
@@ -647,8 +645,11 @@ def _build_history(
             if isinstance(content, str):
                 if content.startswith("Denied by user") or content.startswith("Blocked"):
                     entry["denied"] = True
-                elif (
-                    content.startswith("Error")
+                # Use persisted flag if available, fall back to text
+                # heuristic for historical data that predates is_error.
+                if (
+                    msg.get("is_error")
+                    or content.startswith("Error")
                     or content.startswith("Command timed out")
                     or content.startswith("Search timed out")
                     or content.startswith("Unknown tool:")

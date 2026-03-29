@@ -102,10 +102,14 @@ Each item's `execute` callable is invoked:
 - Errored or denied items return their error/denial message without executing.
 - The `bash` tool streams stdout incrementally: each line calls
   `ui.on_tool_output_chunk(call_id, line)` as it is produced, then the final
-  combined output (stdout + stderr) is delivered via `ui.on_tool_result(call_id, name, output)`.
+  combined output (stdout + stderr) is delivered via
+  `ui.on_tool_result(call_id, name, output, is_error=...)`.
   The `call_id` links `tool_info`/`approve_request` items to their streaming chunks and
   final result, enabling correct routing when multiple bash tools run in parallel.
-  Other tools deliver results atomically via `ui.on_tool_result(call_id, name, output)` only.
+  The `is_error` flag is `True` when the tool execution failed (non-zero exit, exception,
+  denial, etc.), removing the need for text-prefix heuristics on the client side.
+  Other tools deliver results atomically via
+  `ui.on_tool_result(call_id, name, output, is_error=...)` only.
 - Special post-execution gate for `plan`: the plan output is shown to the user
   for review, and the user can reject or annotate it.
 

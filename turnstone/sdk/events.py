@@ -107,6 +107,7 @@ class ToolResultEvent(ServerEvent):
     call_id: str = ""
     name: str = ""
     output: str = ""
+    is_error: bool = False
 
 
 @dataclass

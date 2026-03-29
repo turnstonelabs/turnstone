@@ -133,7 +133,8 @@ group loop [while tool_calls present]
         note right of TP
           bash: on_tool_output_chunk(call_id, line)
           called per stdout line,
-          then on_tool_result(call_id, name, output).
+          then on_tool_result(call_id, name, output, is_error).
+          is_error=True when execution failed.
           call_id routes chunks/results to correct
           tool div during parallel execution.
           Other tools: on_tool_result() only.

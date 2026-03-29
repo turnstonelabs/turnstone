@@ -88,7 +88,7 @@ class RecordingUI:
     def approve_tools(self, items):
         return True, None  # auto-approve everything
 
-    def on_tool_result(self, call_id, name, output):
+    def on_tool_result(self, call_id, name, output, **kwargs):
         self.tool_results.append((call_id, name, output))
 
     def on_tool_output_chunk(self, call_id, chunk):

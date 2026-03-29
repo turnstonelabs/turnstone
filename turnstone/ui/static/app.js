@@ -619,11 +619,7 @@ Pane.prototype.replayHistory = function (messages) {
           msg.denied ||
           /^Denied by user/.test(stripped) ||
           /^Blocked/.test(stripped);
-        var isToolError =
-          msg.is_error ||
-          /^Error[:. \n]|^Command timed out|^Search timed out|^Unknown tool:|^JSON parse error:|^MCP prompt /.test(
-            stripped,
-          );
+        var isToolError = !!msg.is_error;
         if (stripped && !isDenied) {
           var out = document.createElement("div");
           out.className =
@@ -925,18 +921,12 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   if (!stripped) return;
 
   // Detect error by flag or content prefix
-  var hasError =
-    isError ||
-    /^Error[:. \n]|^Command timed out|^Search timed out|^Unknown tool:|^JSON parse error:|^MCP prompt /.test(
-      stripped,
-    );
-
   var out = document.createElement("div");
-  out.className = "tool-output" + (hasError ? " tool-output-error" : "");
+  out.className = "tool-output" + (isError ? " tool-output-error" : "");
   out.textContent = stripped;
 
   // Mark the parent approval block as errored
-  if (hasError) {
+  if (isError) {
     var parentBlock = target.closest(".approval-block");
     if (parentBlock && !parentBlock.classList.contains("denied")) {
       parentBlock.classList.add("error");
