@@ -17,6 +17,7 @@ from turnstone.core.storage._schema import (
     intent_verdicts,
     mcp_servers,
     metadata,
+    model_definitions,
     oidc_identities,
     oidc_pending_states,
     orgs,
@@ -43,6 +44,9 @@ from turnstone.core.storage._schema import (
 )
 from turnstone.core.storage._utils import (
     MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    MODEL_DEFINITION_MUTABLE as _MODEL_DEF_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     ORG_MUTABLE as _ORG_MUTABLE,
@@ -2637,6 +2641,102 @@ class PostgreSQLBackend:
         with self._engine.connect() as conn:
             result = conn.execute(
                 sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Model definitions -----------------------------------------------------
+
+    def create_model_definition(
+        self,
+        definition_id: str,
+        alias: str,
+        model: str,
+        provider: str = "openai",
+        base_url: str = "",
+        api_key: str = "",
+        context_window: int = 32768,
+        capabilities: str = "{}",
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        from sqlalchemy.dialects import postgresql
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            conn.execute(
+                postgresql.insert(model_definitions)
+                .values(
+                    definition_id=definition_id,
+                    alias=alias,
+                    model=model,
+                    provider=provider,
+                    base_url=base_url,
+                    api_key=api_key,
+                    context_window=context_window,
+                    capabilities=capabilities,
+                    enabled=1 if enabled else 0,
+                    created_by=created_by,
+                    created=now,
+                    updated=now,
+                )
+                .on_conflict_do_nothing()
+            )
+            conn.commit()
+
+    def get_model_definition(self, definition_id: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(model_definitions).where(
+                    model_definitions.c.definition_id == definition_id
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled")
+
+    def get_model_definition_by_alias(self, alias: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(model_definitions).where(model_definitions.c.alias == alias)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled")
+
+    def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+
+        with self._engine.connect() as conn:
+            q = sa.select(model_definitions).order_by(model_definitions.c.alias)
+            if enabled_only:
+                q = q.where(model_definitions.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "enabled") for r in rows]
+
+    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
+
+        fields = {k: v for k, v in fields.items() if k in _MODEL_DEF_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.update(model_definitions)
+                .where(model_definitions.c.definition_id == definition_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_model_definition(self, definition_id: str) -> bool:
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(model_definitions).where(
+                    model_definitions.c.definition_id == definition_id
+                )
             )
             conn.commit()
             return result.rowcount > 0

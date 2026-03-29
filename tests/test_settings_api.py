@@ -254,20 +254,41 @@ class TestSecretMasking:
         by_key = {s["key"]: s for s in r.json()["settings"]}
         assert by_key["judge.api_key"]["value"] == "***"
 
-    def test_secret_write_blocked(self, client):
-        """Secret settings cannot be modified via API."""
+    def test_secret_writable_via_api(self, client):
+        """Secret settings can be written via API (write-only pattern)."""
         r = client.put(
             "/v1/api/admin/settings/judge.api_key",
             json={"value": "sk-secret-123"},
         )
-        assert r.status_code == 403
-        assert "config.toml" in r.json()["error"]
+        assert r.status_code == 200
+        # Response value is masked even for the write confirmation
+        assert r.json()["value"] == "***"
 
-    def test_secret_shows_managed_label(self, client):
-        """Secret settings show a label instead of a value."""
+    def test_secret_sentinel_preserves_existing(self, client):
+        """Submitting '***' for a secret setting is a no-op (preserve existing)."""
+        # First write a real value
+        r1 = client.put(
+            "/v1/api/admin/settings/judge.api_key",
+            json={"value": "sk-real-key"},
+        )
+        assert r1.status_code == 200
+        # Now submit the sentinel — should return unchanged
+        r2 = client.put(
+            "/v1/api/admin/settings/judge.api_key",
+            json={"value": "***"},
+        )
+        assert r2.status_code == 200
+        assert r2.json().get("unchanged") is True
+
+    def test_secret_still_masked_in_list(self, client):
+        """After writing a secret, list still shows '***'."""
+        client.put(
+            "/v1/api/admin/settings/judge.api_key",
+            json={"value": "sk-written-via-api"},
+        )
         r = client.get("/v1/api/admin/settings")
         by_key = {s["key"]: s for s in r.json()["settings"]}
-        assert "managed via" in by_key["judge.api_key"]["value"]
+        assert by_key["judge.api_key"]["value"] == "***"
 
 
 # ---------------------------------------------------------------------------

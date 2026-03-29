@@ -3683,7 +3683,7 @@ async def admin_list_settings(request: Request) -> JSONResponse:
         else:
             info = {
                 "key": key,
-                "value": "(managed via config file / env)" if defn.is_secret else defn.default,
+                "value": "***" if defn.is_secret else defn.default,
                 "source": "default",
                 "type": defn.type,
                 "description": defn.description,
@@ -3758,18 +3758,15 @@ async def admin_update_setting(request: Request) -> JSONResponse:
     except ValueError:
         return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=400)
 
-    if defn.is_secret:
-        return JSONResponse(
-            {
-                "error": "Secret settings cannot be modified via API — use config.toml or environment variables"
-            },
-            status_code=403,
-        )
-
     if "value" not in body:
         return JSONResponse({"error": "value is required"}, status_code=400)
 
     raw_value = body.get("value")
+
+    # Secret sentinel: "***" means "keep existing value"
+    if defn.is_secret and raw_value == "***":
+        return JSONResponse({"key": key, "value": "***", "unchanged": True})
+
     try:
         typed_value = validate_value(key, raw_value)
     except ValueError as e:

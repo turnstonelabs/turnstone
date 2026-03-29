@@ -80,6 +80,18 @@ MCP_SERVER_MUTABLE = frozenset(
         "registry_meta",
     }
 )
+MODEL_DEFINITION_MUTABLE = frozenset(
+    {
+        "alias",
+        "model",
+        "provider",
+        "base_url",
+        "api_key",
+        "context_window",
+        "capabilities",
+        "enabled",
+    }
+)
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",

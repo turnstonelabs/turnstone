@@ -951,6 +951,44 @@ class StorageBackend(Protocol):
         """Delete an MCP server definition. Returns True if existed."""
         ...
 
+    # -- Model definitions -----------------------------------------------------
+
+    def create_model_definition(
+        self,
+        definition_id: str,
+        alias: str,
+        model: str,
+        provider: str = "openai",
+        base_url: str = "",
+        api_key: str = "",
+        context_window: int = 32768,
+        capabilities: str = "{}",
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        """Create a model definition. No-op if definition_id already exists."""
+        ...
+
+    def get_model_definition(self, definition_id: str) -> dict[str, Any] | None:
+        """Return model definition dict or None."""
+        ...
+
+    def get_model_definition_by_alias(self, alias: str) -> dict[str, Any] | None:
+        """Return model definition dict by alias or None."""
+        ...
+
+    def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """Return model definitions ordered by alias."""
+        ...
+
+    def update_model_definition(self, definition_id: str, **fields: Any) -> bool:
+        """Update specified fields on a model definition. Returns True if found."""
+        ...
+
+    def delete_model_definition(self, definition_id: str) -> bool:
+        """Delete a model definition. Returns True if existed."""
+        ...
+
     # -- TLS / ACME (lacme Store) ----------------------------------------------
 
     def save_tls_account_key(self, key_id: str, key_pem: str) -> None:

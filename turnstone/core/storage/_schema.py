@@ -520,6 +520,29 @@ sa.Index(
 )
 
 # ---------------------------------------------------------------------------
+# Model definitions — database-backed model configuration
+# ---------------------------------------------------------------------------
+
+model_definitions = sa.Table(
+    "model_definitions",
+    metadata,
+    sa.Column("definition_id", sa.Text, primary_key=True),
+    sa.Column("alias", sa.Text, nullable=False, unique=True),
+    sa.Column("model", sa.Text, nullable=False),
+    sa.Column("provider", sa.Text, nullable=False, server_default="openai"),
+    sa.Column("base_url", sa.Text, nullable=False, server_default=""),
+    sa.Column("api_key", sa.Text, nullable=False, server_default=""),
+    sa.Column("context_window", sa.Integer, nullable=False, server_default="32768"),
+    sa.Column("capabilities", sa.Text, nullable=False, server_default="{}"),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_model_definitions_enabled", model_definitions.c.enabled)
+
+# ---------------------------------------------------------------------------
 # OIDC identity tables
 # ---------------------------------------------------------------------------
 
