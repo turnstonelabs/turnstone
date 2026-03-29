@@ -155,6 +155,13 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListSkillSummaryResponse,
         tags=["Skills"],
     ),
+    # --- Models ---
+    EndpointSpec(
+        "/v1/api/models",
+        "GET",
+        "List available model aliases",
+        tags=["Models"],
+    ),
     # --- Auth ---
     EndpointSpec(
         "/v1/api/auth/login",

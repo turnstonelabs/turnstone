@@ -2129,10 +2129,32 @@ function showNewWsModal() {
     if (e.target === overlay) hideNewWsModal();
   };
 
+  // Populate model dropdown
+  var modelSelect = document.getElementById("new-ws-model");
   var curModel = document.getElementById("model-name").textContent;
-  var modelInput = document.getElementById("new-ws-model");
-  modelInput.placeholder = curModel || "Default model";
-  modelInput.value = "";
+  modelSelect.textContent = "";
+  var defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = curModel
+    ? "Default (" + curModel + ")"
+    : "Default model";
+  modelSelect.appendChild(defaultOpt);
+  authFetch("/v1/api/models")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.models || []).forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m.alias;
+        opt.textContent =
+          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+        modelSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — default model still works */
+    });
 
   var tplSelect = document.getElementById("new-ws-skill");
   tplSelect.innerHTML = '<option value="">Use defaults</option>';

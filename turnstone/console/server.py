@@ -366,6 +366,25 @@ async def oidc_callback(request: Request) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Route handlers — available models (lightweight, no admin permission)
+# ---------------------------------------------------------------------------
+
+
+async def list_available_models(request: Request) -> JSONResponse:
+    """GET /v1/api/models — enabled model aliases for workstream creation."""
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+
+    rows = storage.list_model_definitions(enabled_only=True)
+    # Only expose alias/model/provider — rows also contain api_key, base_url, etc.
+    models = [{"alias": r["alias"], "model": r["model"], "provider": r["provider"]} for r in rows]
+    return JSONResponse({"models": models})
+
+
+# ---------------------------------------------------------------------------
 # Route handlers — workstream creation
 # ---------------------------------------------------------------------------
 
@@ -4681,6 +4700,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 _MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+_MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible"})
 
 
 def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
@@ -4857,9 +4877,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     audit_uid, ip = _audit_context(request)
 
     provider = str(body.get("provider", "openai")).strip()
-    if provider not in ("openai", "anthropic"):
+    if provider not in _MODEL_PROVIDERS:
         return JSONResponse(
-            {"error": f"Unknown provider: {provider!r} (must be 'openai' or 'anthropic')"},
+            {"error": f"Unknown provider: {provider!r}"},
             status_code=400,
         )
     base_url = str(body.get("base_url", "")).strip()
@@ -4967,9 +4987,9 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["model"] = model_val
     if "provider" in body:
         prov = str(body["provider"]).strip()
-        if prov not in ("openai", "anthropic"):
+        if prov not in _MODEL_PROVIDERS:
             return JSONResponse(
-                {"error": f"Unknown provider: {prov!r} (must be 'openai' or 'anthropic')"},
+                {"error": f"Unknown provider: {prov!r}"},
                 status_code=400,
             )
         updates["provider"] = prov
@@ -5058,6 +5078,99 @@ async def admin_model_reload(request: Request) -> JSONResponse:
 
     results = await _notify_nodes_model_reload(request)
     return JSONResponse({"status": "ok", "results": results})
+
+
+async def admin_detect_model(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/model-definitions/detect — stateless endpoint probe."""
+    import asyncio
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.model_registry import probe_model_endpoint
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    provider = str(body.get("provider", "openai")).strip()
+    base_url = str(body.get("base_url", "")).strip()
+    api_key = str(body.get("api_key", "")).strip()
+    model = str(body.get("model", "")).strip()
+    definition_id = str(body.get("definition_id", "")).strip()
+
+    if provider not in _MODEL_PROVIDERS:
+        return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
+
+    # Resolve api_key from DB when the UI sends the masked sentinel
+    if (not api_key or api_key == "***") and definition_id:
+        row = storage.get_model_definition(definition_id)
+        if row:
+            api_key = row.get("api_key", "")
+            if not base_url:
+                base_url = row.get("base_url", "")
+
+    # For commercial endpoints an api_key is required
+    if not api_key and (
+        not base_url or "api.openai.com" in base_url or "api.anthropic.com" in base_url
+    ):
+        return JSONResponse({"error": "api_key is required"}, status_code=400)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None, probe_model_endpoint, provider, base_url, api_key, model
+    )
+    return JSONResponse(result)
+
+
+async def admin_model_capabilities(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-capabilities — static capability lookup."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.providers import lookup_model_capabilities
+
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    provider = request.query_params.get("provider", "").strip()
+    model = request.query_params.get("model", "").strip()
+
+    if provider not in _MODEL_PROVIDERS:
+        return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
+    if not model:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+
+    caps = lookup_model_capabilities(provider, model)
+    return JSONResponse(
+        {
+            "model": model,
+            "provider": provider,
+            "known": caps is not None,
+            "capabilities": caps or {},
+        }
+    )
+
+
+async def admin_known_models(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-capabilities/known — list known model name prefixes."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.providers import list_known_models
+
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    provider = request.query_params.get("provider", "").strip()
+    if provider not in _MODEL_PROVIDERS:
+        return JSONResponse({"error": f"Unknown provider: {provider!r}"}, status_code=400)
+
+    return JSONResponse({"provider": provider, "models": list_known_models(provider)})
 
 
 # ---------------------------------------------------------------------------
@@ -5251,6 +5364,7 @@ def create_app(
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
+                    Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
                     Route("/api/auth/logout", auth_logout, methods=["POST"]),
@@ -5456,6 +5570,11 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route(
+                        "/api/admin/model-definitions/detect",
+                        admin_detect_model,
+                        methods=["POST"],
+                    ),
+                    Route(
                         "/api/admin/model-definitions/{definition_id}",
                         admin_get_model_definition,
                     ),
@@ -5468,6 +5587,11 @@ def create_app(
                         "/api/admin/model-definitions/{definition_id}",
                         admin_delete_model_definition,
                         methods=["DELETE"],
+                    ),
+                    Route("/api/admin/model-capabilities", admin_model_capabilities),
+                    Route(
+                        "/api/admin/model-capabilities/known",
+                        admin_known_models,
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

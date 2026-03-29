@@ -4223,6 +4223,10 @@ function showCreateModelModal() {
   document.getElementById("model-ctx-window").value = "0";
   document.getElementById("model-capabilities").value = "";
   document.getElementById("model-enabled").checked = true;
+  document.getElementById("model-detect-result").style.display = "none";
+  document.getElementById("model-detect-btn").disabled = false;
+  document.getElementById("model-detect-btn").textContent = "Detect";
+  _refreshModelSuggestions();
   document.getElementById("model-alias").focus();
   _modelCreateTrap = _installTrap("model-create-overlay", "model-create-box");
 }
@@ -4352,6 +4356,208 @@ function _showModelError(msg) {
   e.textContent = msg;
   e.classList.add("is-visible");
 }
+
+function _detectResultLine(text, color) {
+  var div = document.createElement("div");
+  div.style.marginTop = "3px";
+  if (color) div.style.color = "var(--" + color + ")";
+  div.textContent = text;
+  return div;
+}
+
+function _clearDetectResult() {
+  var rd = document.getElementById("model-detect-result");
+  if (rd) {
+    rd.style.display = "none";
+    rd.textContent = "";
+    rd.style.borderColor = "";
+  }
+}
+
+function detectModel() {
+  var btn = document.getElementById("model-detect-btn");
+  var resultDiv = document.getElementById("model-detect-result");
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  btn.textContent = "Detecting\u2026";
+  resultDiv.style.display = "none";
+  resultDiv.textContent = "";
+
+  var form = {
+    provider: document.getElementById("model-provider").value,
+    base_url: document.getElementById("model-base-url").value.trim(),
+    model: document.getElementById("model-name").value.trim(),
+  };
+  var apiKey = document.getElementById("model-api-key").value;
+  if (apiKey) form.api_key = apiKey;
+  var editId = document.getElementById("model-edit-id").value;
+  if (editId) form.definition_id = editId;
+
+  authFetch("/v1/api/admin/model-definitions/detect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(form),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Detect failed");
+        });
+      return r.json();
+    })
+    .then(function (d) {
+      resultDiv.style.display = "block";
+      resultDiv.textContent = "";
+      if (d.error && !d.reachable) {
+        resultDiv.appendChild(
+          _detectResultLine("\u2717 Failed: " + d.error, "red"),
+        );
+        resultDiv.style.borderColor = "var(--red)";
+        return;
+      }
+      var line1 = "\u2713 Connected";
+      if (d.available_models && d.available_models.length) {
+        line1 += " \u2014 " + d.available_models.length + " model(s) available";
+      }
+      resultDiv.appendChild(_detectResultLine(line1, "green"));
+
+      if (d.model_found === false) {
+        var models = d.available_models || [];
+        var msg =
+          '\u26A0 Model "' +
+          form.model +
+          '" not found in ' +
+          models.length +
+          " available model(s)";
+        if (models.length > 0) {
+          var shown = models.slice(0, 8);
+          msg += ": " + shown.join(", ");
+          if (models.length > 8)
+            msg += ", \u2026 +" + (models.length - 8) + " more";
+        }
+        resultDiv.appendChild(_detectResultLine(msg, "yellow"));
+      }
+      if (d.context_window) {
+        resultDiv.appendChild(
+          _detectResultLine(
+            "Context window: " + d.context_window.toLocaleString() + " tokens",
+          ),
+        );
+        var ctxInput = document.getElementById("model-ctx-window");
+        if (parseInt(ctxInput.value, 10) === 0) {
+          ctxInput.value = d.context_window;
+        }
+      }
+      if (d.server_type) {
+        resultDiv.appendChild(
+          _detectResultLine("Server type: " + d.server_type),
+        );
+      }
+      resultDiv.style.borderColor = "var(--green)";
+    })
+    .catch(function (e) {
+      if (e.message === "auth") return;
+      resultDiv.style.display = "block";
+      resultDiv.textContent = "";
+      resultDiv.appendChild(_detectResultLine("\u2717 " + e.message, "red"));
+      resultDiv.style.borderColor = "var(--red)";
+    })
+    .finally(function () {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      btn.textContent = "Detect";
+    });
+}
+
+/* Capability auto-fill: when the user types a known model name or
+   changes the provider, look up static capabilities and pre-fill
+   context_window and the capabilities textarea. */
+var _capsTimer = null;
+function _onModelFieldChange() {
+  clearTimeout(_capsTimer);
+  _capsTimer = setTimeout(function () {
+    var overlay = document.getElementById("model-create-overlay");
+    if (!overlay || overlay.style.display === "none") return;
+    var provider = document.getElementById("model-provider").value;
+    var modelName = document.getElementById("model-name").value.trim();
+    if (!modelName) return;
+    authFetch(
+      "/v1/api/admin/model-capabilities?provider=" +
+        encodeURIComponent(provider) +
+        "&model=" +
+        encodeURIComponent(modelName),
+    )
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (d) {
+        if (!d.known || !d.capabilities) return;
+        var ctxInput = document.getElementById("model-ctx-window");
+        if (
+          parseInt(ctxInput.value, 10) === 0 &&
+          d.capabilities.context_window
+        ) {
+          ctxInput.value = d.capabilities.context_window;
+        }
+        var capsInput = document.getElementById("model-capabilities");
+        if (!capsInput.value.trim()) {
+          var caps = Object.assign({}, d.capabilities);
+          delete caps.context_window;
+          delete caps.max_output_tokens;
+          delete caps.token_param;
+          delete caps.supports_streaming;
+          delete caps.supports_tools;
+          var text = JSON.stringify(caps, null, 2);
+          if (text !== "{}") capsInput.value = text;
+        }
+      })
+      .catch(function () {
+        /* silent */
+      });
+  }, 500);
+}
+/* Populate the model name datalist with known model prefixes for the
+   selected provider.  Called on page load and provider change. */
+function _refreshModelSuggestions() {
+  var dl = document.getElementById("model-name-suggestions");
+  if (!dl) return;
+  var provider = document.getElementById("model-provider").value;
+  authFetch(
+    "/v1/api/admin/model-capabilities/known?provider=" +
+      encodeURIComponent(provider),
+  )
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (d) {
+      dl.textContent = "";
+      (d.models || []).forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m;
+        dl.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      dl.textContent = "";
+    });
+}
+
+/* Register listeners once at page load */
+(function () {
+  var nameEl = document.getElementById("model-name");
+  var provEl = document.getElementById("model-provider");
+  if (nameEl) nameEl.addEventListener("input", _onModelFieldChange);
+  if (provEl) {
+    provEl.addEventListener("change", _onModelFieldChange);
+    provEl.addEventListener("change", _refreshModelSuggestions);
+    provEl.addEventListener("change", _clearDetectResult);
+  }
+  /* Clear stale detect results when probe-relevant inputs change */
+  ["model-base-url", "model-api-key"].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) el.addEventListener("input", _clearDetectResult);
+  });
+})();
 
 function _flagModelSyncPending() {
   var btn = document.getElementById("model-sync-btn");

@@ -434,3 +434,112 @@ def detect_model(
         log_fn(f"Warning: Could not connect to LLM backend: {e}")
         log_fn("Starting in degraded mode — requests will fail until backend is reachable.")
         return None, None
+
+
+def probe_model_endpoint(
+    provider: str,
+    base_url: str,
+    api_key: str,
+    target_model: str = "",
+) -> dict[str, Any]:
+    """Stateless probe of a model endpoint.
+
+    Creates a temporary SDK client, calls ``/v1/models``, and returns
+    reachability status, available model IDs, detected context window,
+    and server type.  Used by the admin *Detect* button — never persists
+    state or stores the API key.
+    """
+    from turnstone.core.providers import create_client
+
+    result: dict[str, Any] = {
+        "reachable": False,
+        "model_found": None,
+        "available_models": [],
+        "context_window": None,
+        "server_type": None,
+        "error": None,
+    }
+    client = None
+    try:
+        client = create_client(provider, base_url=base_url, api_key=api_key)
+        fast = client.with_options(timeout=10.0, max_retries=0)
+        models = fast.models.list()
+        if not models.data:
+            result["reachable"] = True
+            result["error"] = "No models found at endpoint"
+            return result
+
+        all_ids = [m.id for m in models.data]
+        result["reachable"] = True
+        result["available_models"] = all_ids
+
+        # Determine which model to inspect for context_window
+        if target_model:
+            result["model_found"] = target_model in all_ids
+            inspect_id = target_model if result["model_found"] else all_ids[0]
+        else:
+            inspect_id = all_ids[0]
+
+        inspect_obj = next((m for m in models.data if m.id == inspect_id), None)
+
+        # --- context window detection ---
+        if provider == "anthropic":
+            from turnstone.core.providers._anthropic import AnthropicProvider
+
+            result["context_window"] = (
+                AnthropicProvider().get_capabilities(inspect_id).context_window
+            )
+            result["server_type"] = "anthropic"
+        else:
+            # OpenAI-compatible path
+            _detect_openai_compat(result, inspect_obj, inspect_id, base_url)
+    except Exception as exc:
+        err_msg = str(exc)
+        if len(err_msg) > 500:
+            err_msg = err_msg[:500] + "..."
+        result["error"] = err_msg
+    finally:
+        if client is not None and hasattr(client, "close"):
+            client.close()
+    return result
+
+
+def _detect_openai_compat(
+    result: dict[str, Any],
+    model_obj: Any,
+    model_id: str,
+    base_url: str,
+) -> None:
+    """Fill context_window and server_type for an OpenAI-compatible endpoint."""
+    from turnstone.core.providers._openai import OpenAIProvider
+
+    meta: dict[str, Any] | None = None
+    owned_by: str = ""
+    if model_obj is not None:
+        dumped = model_obj.model_dump()
+        raw_meta = dumped.get("meta")
+        if isinstance(raw_meta, dict):
+            meta = raw_meta
+        owned_by = str(dumped.get("owned_by", ""))
+
+    # Context window: prefer backend metadata, fall back to static table
+    if meta is not None:
+        n_ctx = meta.get("n_ctx_train")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            result["context_window"] = n_ctx
+    if result["context_window"] is None:
+        caps = OpenAIProvider().get_capabilities(model_id)
+        if caps.context_window > 0:
+            result["context_window"] = caps.context_window
+
+    # Server type heuristics
+    if base_url and "api.openai.com" in base_url:
+        result["server_type"] = "openai"
+    elif meta is not None and "n_ctx_train" in meta:
+        result["server_type"] = "llama.cpp"
+    elif "sglang" in owned_by.lower():
+        result["server_type"] = "sglang"
+    elif "/" in (model_id or ""):
+        result["server_type"] = "vllm"
+    else:
+        result["server_type"] = "openai-compatible"

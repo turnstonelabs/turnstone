@@ -1370,6 +1370,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 }
 .modal-cancel:hover { background: var(--bg-elevated); }
 .modal-cancel:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.modal-cancel:disabled { opacity: 0.5; cursor: not-allowed; pointer-events: none; }
 .modal-submit {
   flex: 1;
   padding: 9px;

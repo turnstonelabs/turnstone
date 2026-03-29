@@ -1021,6 +1021,24 @@ async def list_skills_summary(request: Request) -> JSONResponse:
     return JSONResponse({"skills": skills})
 
 
+async def list_available_models(request: Request) -> JSONResponse:
+    """GET /v1/api/models — list available model aliases."""
+    registry = getattr(request.app.state, "registry", None)
+    if registry is None:
+        return JSONResponse({"models": []})
+    models = []
+    for alias in registry.list_aliases():
+        cfg = registry.get_config(alias)
+        models.append(
+            {
+                "alias": cfg.alias,
+                "model": cfg.model,
+                "provider": cfg.provider,
+            }
+        )
+    return JSONResponse({"models": models})
+
+
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     """Count workstream states for health/metrics endpoints."""
     counts = dict.fromkeys(("idle", "thinking", "running", "attention", "error"), 0)
@@ -2058,6 +2076,7 @@ def create_app(
                     Route("/api/dashboard", dashboard),
                     Route("/api/workstreams/saved", list_saved_workstreams),
                     Route("/api/skills", list_skills_summary),
+                    Route("/api/models", list_available_models),
                     Route("/api/send", send_message, methods=["POST"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),

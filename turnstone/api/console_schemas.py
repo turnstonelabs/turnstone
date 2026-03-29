@@ -837,3 +837,32 @@ class ListModelDefinitionsResponse(BaseModel):
 class ModelReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+
+
+class DetectModelRequest(BaseModel):
+    provider: str = "openai"
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    definition_id: str = ""
+
+
+class DetectModelResponse(BaseModel):
+    reachable: bool = False
+    model_found: bool | None = None
+    available_models: list[str] = Field(default_factory=list)
+    context_window: int | None = None
+    server_type: str | None = None
+    error: str | None = None
+
+
+class ModelCapabilitiesResponse(BaseModel):
+    model: str
+    provider: str
+    known: bool = False
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+
+
+class KnownModelsResponse(BaseModel):
+    provider: str
+    models: list[str] = Field(default_factory=list)

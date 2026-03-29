@@ -544,7 +544,9 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <label for="new-ws-name">Name <span class="label-hint">optional</span></label>
     <input id="new-ws-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
     <label for="new-ws-model">Model <span class="label-hint">optional</span></label>
-    <input id="new-ws-model" type="text" placeholder="Default model" autocomplete="off">
+    <select id="new-ws-model">
+      <option value="">Default model</option>
+    </select>
     <label for="new-ws-skill">Skill <span class="label-hint">optional</span></label>
     <select id="new-ws-skill">
       <option value="">Use defaults</option>
@@ -1219,11 +1221,13 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <label for="model-alias">Alias</label>
     <input type="text" id="model-alias" placeholder="e.g. gpt5-prod" maxlength="64" pattern="[a-zA-Z0-9._-]+">
     <label for="model-name">Model ID</label>
-    <input type="text" id="model-name" placeholder="e.g. gpt-5">
+    <input type="text" id="model-name" placeholder="e.g. gpt-5" list="model-name-suggestions">
+    <datalist id="model-name-suggestions"></datalist>
     <label for="model-provider">Provider</label>
     <select id="model-provider">
       <option value="openai">openai</option>
       <option value="anthropic">anthropic</option>
+      <option value="openai-compatible">openai-compatible</option>
     </select>
     <label for="model-base-url">Base URL <span style="font-weight:400;text-transform:none">(empty = provider default)</span></label>
     <input type="text" id="model-base-url" placeholder="https://api.openai.com/v1">
@@ -1235,6 +1239,10 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <textarea id="model-capabilities" rows="3" placeholder='{"supports_vision": true}' style="font-family:var(--font-mono);font-size:11px"></textarea>
     <div style="display:flex;gap:20px;margin-top:14px">
       <label style="margin:0;font-size:12px;color:var(--fg-dim)"><input type="checkbox" id="model-enabled" checked style="margin-right:5px">Enabled</label>
+    </div>
+    <div id="model-detect-area" style="margin-top:14px">
+      <button type="button" id="model-detect-btn" class="modal-cancel" onclick="detectModel()" style="width:auto;padding:7px 16px;font-size:12px" title="Probe endpoint to verify connectivity and discover models">Detect</button>
+      <div id="model-detect-result" role="status" aria-live="polite" style="display:none;margin-top:8px;padding:10px 12px;border-radius:6px;font-size:12px;border:1px solid var(--border);word-break:break-word"></div>
     </div>
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideCreateModelModal()">Cancel</button>

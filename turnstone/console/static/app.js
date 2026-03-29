@@ -1281,8 +1281,31 @@ function showNewWsModal() {
     .catch(function () {
       /* ignore — defaults still work */
     });
+  // Populate model dropdown
+  var modelSelect = document.getElementById("new-ws-model");
+  modelSelect.textContent = "";
+  var defaultOpt = document.createElement("option");
+  defaultOpt.value = "";
+  defaultOpt.textContent = "Default model";
+  modelSelect.appendChild(defaultOpt);
+  authFetch("/v1/api/models")
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      (data.models || []).forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m.alias;
+        opt.textContent =
+          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+        modelSelect.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* ignore — default model still works */
+    });
   document.getElementById("new-ws-name").value = "";
-  document.getElementById("new-ws-model").value = "";
+  modelSelect.value = "";
   var taskEl = document.getElementById("new-ws-task");
   taskEl.value = "";
   var mod =

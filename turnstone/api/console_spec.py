@@ -26,8 +26,11 @@ from turnstone.api.console_schemas import (
     CreateSkillRequest,
     CreateSkillResourceRequest,
     CreateToolPolicyRequest,
+    DetectModelRequest,
+    DetectModelResponse,
     ImportMcpConfigRequest,
     ImportMcpConfigResponse,
+    KnownModelsResponse,
     ListAdminMemoriesResponse,
     ListAuditEventsResponse,
     ListChannelUsersResponse,
@@ -46,6 +49,7 @@ from turnstone.api.console_schemas import (
     ListVerdictsResponse,
     McpReloadResponse,
     McpServerDetail,
+    ModelCapabilitiesResponse,
     ModelDefinitionInfo,
     ModelReloadResponse,
     NodeDetailResponse,
@@ -565,6 +569,13 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         response_model=ListSkillVersionsResponse,
         tags=["Admin"],
     ),
+    # --- Models ---
+    EndpointSpec(
+        "/v1/api/models",
+        "GET",
+        "List enabled model aliases for workstream creation",
+        tags=["Models"],
+    ),
     # --- Skills ---
     EndpointSpec(
         "/v1/api/skills",
@@ -896,6 +907,36 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[404],
         tags=["Admin"],
     ),
+    EndpointSpec(
+        "/v1/api/admin/model-definitions/detect",
+        "POST",
+        "Probe a model endpoint: verify reachability, list models, detect context window and server type",
+        request_model=DetectModelRequest,
+        response_model=DetectModelResponse,
+        error_codes=[400],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/model-capabilities",
+        "GET",
+        "Look up static capabilities for a known model",
+        response_model=ModelCapabilitiesResponse,
+        query_params=[
+            QueryParam(name="provider", description="Provider name", required=True),
+            QueryParam(name="model", description="Model ID to look up", required=True),
+        ],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/model-capabilities/known",
+        "GET",
+        "List known model name prefixes for a provider",
+        response_model=KnownModelsResponse,
+        query_params=[
+            QueryParam(name="provider", description="Provider name", required=True),
+        ],
+        tags=["Admin"],
+    ),
     # --- Admin: TLS / ACME ---
     EndpointSpec(
         "/v1/api/admin/tls/ca",
@@ -1011,6 +1052,10 @@ _ALL_MODELS: list[type[BaseModel]] = [
     UpdateModelDefinitionRequest,
     ListModelDefinitionsResponse,
     ModelReloadResponse,
+    DetectModelRequest,
+    DetectModelResponse,
+    ModelCapabilitiesResponse,
+    KnownModelsResponse,
     RegistrySearchResponse,
     RegistryInstallRequest,
     SkillDiscoverResponse,
