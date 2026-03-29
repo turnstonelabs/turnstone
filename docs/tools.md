@@ -106,8 +106,9 @@ Each item's `execute` callable is invoked:
   `ui.on_tool_result(call_id, name, output, is_error=...)`.
   The `call_id` links `tool_info`/`approve_request` items to their streaming chunks and
   final result, enabling correct routing when multiple bash tools run in parallel.
-  The `is_error` flag is `True` when the tool execution failed (non-zero exit, exception,
-  denial, etc.), removing the need for text-prefix heuristics on the client side.
+  The `is_error` flag is `True` when the tool execution failed (e.g. bash exit code >= 2
+  or signal, file not found, timeout). Exit code 1 is ambiguous and not flagged; user
+  denials are tracked separately. This removes the need for text-prefix heuristics.
   Other tools deliver results atomically via
   `ui.on_tool_result(call_id, name, output, is_error=...)` only.
 - Special post-execution gate for `plan`: the plan output is shown to the user

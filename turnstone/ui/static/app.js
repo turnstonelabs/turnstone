@@ -920,7 +920,7 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
   var stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
 
-  // Detect error by flag or content prefix
+  // Style tool output as error when indicated by isError flag
   var out = document.createElement("div");
   out.className = "tool-output" + (isError ? " tool-output-error" : "");
   out.textContent = stripped;

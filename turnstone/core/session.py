@@ -748,7 +748,7 @@ class ChatSession:
         """Notify the UI and record error flag for message persistence."""
         if is_error:
             self._tool_error_flags[call_id] = True
-        self._report_tool_result(call_id, name, output, is_error=is_error)
+        self.ui.on_tool_result(call_id, name, output, is_error=is_error)
 
     def _truncate_output(self, output: str) -> str:
         """Truncate tool output to self.tool_truncation chars, keeping head + tail."""
@@ -3937,7 +3937,7 @@ class ChatSession:
             output = output.strip()
             output = self._truncate_output(output)
 
-            bash_error = proc.returncode >= 2
+            bash_error = proc.returncode not in (0, 1)
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]"
 
