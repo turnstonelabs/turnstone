@@ -3499,14 +3499,23 @@ class ChatSession:
             name = (args.get("name") or args.get("key") or "").strip()
             content = (args.get("content") or args.get("value") or "").strip()
             name = normalize_key(name)
-            if not name or not content:
+            if not name:
                 return {
                     "call_id": call_id,
                     "func_name": "memory",
-                    "header": "\u2717 memory save: requires name and content",
+                    "header": "\u2717 memory save: missing name",
                     "preview": "",
                     "needs_approval": False,
-                    "error": "Error: both 'name' and 'content' are required for save",
+                    "error": "Error: 'name' is required for save",
+                }
+            if not content:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory save: missing content",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: 'content' must be non-empty for save",
                 }
             if len(content) > self._mem_cfg.max_content:
                 return {
