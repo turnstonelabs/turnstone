@@ -672,7 +672,24 @@ class AnthropicProvider:
             deferred_names,
         )
 
-        response = client.messages.create(**kwargs)
+        # Use streaming internally to avoid the Anthropic SDK's 10-minute
+        # timeout on non-streaming requests.  get_final_message() returns the
+        # same Message object as messages.create() would.
+        # Mirror create_streaming's defensive __enter__/__exit__ pattern so
+        # resources are cleaned up even if __enter__ fails.
+        manager = client.messages.stream(**kwargs)
+        try:
+            stream = manager.__enter__()
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        try:
+            response = stream.get_final_message()
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        else:
+            manager.__exit__(None, None, None)
 
         # Extract content and tool_calls from content blocks.
         # Skip server-side blocks (server_tool_use, web_search_tool_result)

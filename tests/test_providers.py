@@ -627,7 +627,11 @@ class TestAnthropicProvider:
         response.usage.output_tokens = 5
 
         client = MagicMock()
-        client.messages.create.return_value = response
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.get_final_message.return_value = response
+        client.messages.stream.return_value = stream_ctx
 
         result = self.provider.create_completion(
             client=client,
@@ -659,7 +663,11 @@ class TestAnthropicProvider:
         response.usage.output_tokens = 20
 
         client = MagicMock()
-        client.messages.create.return_value = response
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.get_final_message.return_value = response
+        client.messages.stream.return_value = stream_ctx
 
         result = self.provider.create_completion(
             client=client,
@@ -690,7 +698,11 @@ class TestAnthropicProvider:
         response.usage.output_tokens = 50
 
         client = MagicMock()
-        client.messages.create.return_value = response
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.get_final_message.return_value = response
+        client.messages.stream.return_value = stream_ctx
 
         result = self.provider.create_completion(
             client=client,
@@ -1412,7 +1424,11 @@ class TestAnthropicWebSearch:
         response.usage.output_tokens = 50
 
         client = MagicMock()
-        client.messages.create.return_value = response
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.get_final_message.return_value = response
+        client.messages.stream.return_value = stream_ctx
 
         with patch("turnstone.core.providers._anthropic._ensure_anthropic"):
             result = self.provider.create_completion(
@@ -2434,7 +2450,11 @@ class TestAnthropicPromptCaching:
         response.usage = usage
 
         client = MagicMock()
-        client.messages.create.return_value = response
+        stream_ctx = MagicMock()
+        stream_ctx.__enter__ = MagicMock(return_value=stream_ctx)
+        stream_ctx.__exit__ = MagicMock(return_value=False)
+        stream_ctx.get_final_message.return_value = response
+        client.messages.stream.return_value = stream_ctx
 
         result = self.provider.create_completion(
             client=client,
