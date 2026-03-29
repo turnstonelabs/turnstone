@@ -2904,21 +2904,28 @@ class ChatSession:
             }
         path = os.path.expanduser(path)
         resolved = os.path.realpath(path)
+        is_symlink = os.path.abspath(path) != resolved
         exists = os.path.exists(resolved)
         is_overwrite = exists and resolved not in self._read_files
 
         # Build preview
         preview_parts = []
+        if is_symlink:
+            preview_parts.append(f"    {YELLOW}Warning: symlink — actual target: {resolved}{RESET}")
         if is_overwrite:
             preview_parts.append(
                 f"    {YELLOW}Warning: overwriting existing file not previously read{RESET}"
             )
         preview_parts.append(f"{DIM}{textwrap.indent(content, '    ')}{RESET}")
 
+        header = f"\u2699 write_file: {path} ({len(content)} chars)"
+        if is_symlink:
+            header = f"\u2699 write_file: {path} \u2192 {resolved} ({len(content)} chars)"
+
         return {
             "call_id": call_id,
             "func_name": "write_file",
-            "header": f"\u2699 write_file: {path} ({len(content)} chars)",
+            "header": header,
             "preview": "\n".join(preview_parts),
             "needs_approval": True,
             "approval_label": "overwrite_file" if is_overwrite else "write_file",
@@ -3020,6 +3027,7 @@ class ChatSession:
 
         path = os.path.expanduser(path)
         resolved = os.path.realpath(path)
+        is_symlink = os.path.abspath(path) != resolved
 
         if resolved not in self._read_files:
             return {
@@ -3087,6 +3095,8 @@ class ChatSession:
 
         # Build diff preview
         preview_parts = []
+        if is_symlink:
+            preview_parts.append(f"    {YELLOW}Warning: symlink — actual target: {resolved}{RESET}")
         for i, edit in enumerate(edits):
             if len(edits) > 1:
                 preview_parts.append(f"    {YELLOW}--- edit {i + 1}/{len(edits)} ---{RESET}")
@@ -3100,11 +3110,18 @@ class ChatSession:
                 preview_parts.append(f"    {YELLOW}(deletion — {n} chars removed){RESET}")
 
         count = len(edits)
-        header = (
-            f"\u2699 edit_file: {path} ({count} edits)"
-            if count > 1
-            else f"\u2699 edit_file: {path}"
-        )
+        if is_symlink:
+            header = (
+                f"\u2699 edit_file: {path} \u2192 {resolved} ({count} edits)"
+                if count > 1
+                else f"\u2699 edit_file: {path} \u2192 {resolved}"
+            )
+        else:
+            header = (
+                f"\u2699 edit_file: {path} ({count} edits)"
+                if count > 1
+                else f"\u2699 edit_file: {path}"
+            )
         return {
             "call_id": call_id,
             "func_name": "edit_file",
@@ -4132,7 +4149,7 @@ class ChatSession:
             return self._exec_read_image(call_id, path, resolved)
 
         try:
-            with open(path) as f:
+            with open(resolved) as f:
                 all_lines = f.readlines()
         except FileNotFoundError:
             self._read_files.discard(resolved)
@@ -5341,8 +5358,8 @@ class ChatSession:
         call_id = item["call_id"]
         path, content, resolved = item["path"], item["content"], item["resolved"]
         try:
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w") as f:
+            os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
+            with open(resolved, "w") as f:
                 f.write(content)
             self._read_files.add(resolved)
             msg = f"Wrote {len(content)} chars to {path}"
@@ -5362,9 +5379,10 @@ class ChatSession:
         self._check_cancelled()
         call_id = item["call_id"]
         path = item["path"]
+        resolved = item.get("resolved", os.path.realpath(path))
         edits: list[dict[str, Any]] = item["edits"]
         try:
-            with open(path) as f:
+            with open(resolved) as f:
                 content = f.read()
 
             # Resolve each edit to a (start_idx, end_idx, new_string) replacement
@@ -5406,7 +5424,7 @@ class ChatSession:
             for start, end, new in reversed(replacements):
                 content = content[:start] + new + content[end:]
 
-            with open(path, "w") as f:
+            with open(resolved, "w") as f:
                 f.write(content)
             count = len(replacements)
             noun = "edit" if count == 1 else "edits"

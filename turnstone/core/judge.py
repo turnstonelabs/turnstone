@@ -606,7 +606,9 @@ def _get_arg_text(func_name: str, func_args: dict[str, object]) -> str:
     if func_name == "bash":
         return str(func_args.get("command", ""))
     if func_name in ("write_file", "edit_file"):
-        return str(func_args.get("path", ""))
+        path = str(func_args.get("path", ""))
+        resolved = os.path.realpath(os.path.expanduser(path)) if path else ""
+        return f"{path} {resolved}" if resolved != os.path.abspath(path) else path
     try:
         return json.dumps(func_args, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
