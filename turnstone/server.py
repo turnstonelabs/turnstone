@@ -1112,12 +1112,20 @@ def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
             return
 
         # Workstream is idle — start a worker thread (Path B)
+        # Mirrors the send_message() run() pattern for proper cleanup.
         def run() -> None:
+            me = threading.current_thread()
             try:
                 session.send(msg)
+            except GenerationCancelled:
+                if ws.worker_thread is me and ui:
+                    ui._enqueue({"type": "stream_end"})
+                    ui.on_state_change("idle")
             except Exception as exc:
-                if ui:
+                if ws.worker_thread is me and ui:
                     ui.on_error(f"Watch error: {exc}")
+                    ui._enqueue({"type": "stream_end"})
+                    ui.on_state_change("error")
 
         t = threading.Thread(target=run, daemon=True)
         ws.worker_thread = t
