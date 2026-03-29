@@ -3765,15 +3765,20 @@ async def admin_update_setting(request: Request) -> JSONResponse:
 
     # Secret sentinel: "***" means "keep existing value"
     if defn.is_secret and raw_value == "***":
+        existing = storage.get_system_setting(key)
         return JSONResponse(
             {
                 "key": key,
                 "value": "***",
-                "source": "storage",
+                "source": "storage" if existing else "default",
                 "type": defn.type,
                 "description": defn.description,
                 "section": defn.section,
                 "is_secret": True,
+                "node_id": existing.get("node_id", "") if existing else "",
+                "changed_by": existing.get("changed_by", "") if existing else "",
+                "updated": existing.get("updated", "") if existing else "",
+                "restart_required": defn.restart_required,
                 "unchanged": True,
             }
         )

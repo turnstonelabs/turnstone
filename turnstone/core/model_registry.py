@@ -130,6 +130,11 @@ class ModelRegistry:
         """Number of registered models."""
         return len(self._models)
 
+    @property
+    def models(self) -> dict[str, ModelConfig]:
+        """Return a copy of the models dict (public accessor for reload)."""
+        return dict(self._models)
+
     # -- lifecycle -----------------------------------------------------------
 
     def reload(

@@ -1837,7 +1837,7 @@ def internal_model_reload(request: Request) -> JSONResponse:
     )
     try:
         registry.reload(
-            new_registry._models,
+            new_registry.models,
             new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
