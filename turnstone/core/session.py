@@ -2734,6 +2734,7 @@ class ChatSession:
             "bash": self._prepare_bash,
             "read_file": self._prepare_read_file,
             "search": self._prepare_search,
+            "diff_file": self._prepare_diff,
             "write_file": self._prepare_write_file,
             "edit_file": self._prepare_edit_file,
             "math": self._prepare_math,
@@ -2908,6 +2909,60 @@ class ChatSession:
             "execute": self._exec_search,
             "pattern": pattern,
             "path": path,
+        }
+
+    def _prepare_diff(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        path_a = args.get("path_a", "")
+        path_b = args.get("path_b", "")
+        content_b = args.get("content_b")
+        if not path_a:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: missing path_a",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: path_a is required",
+            }
+        if path_b and content_b is not None:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: ambiguous params",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide path_b or content_b, not both",
+            }
+        if not path_b and content_b is None:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: missing comparison target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide path_b (another file) or content_b (string to compare against)",
+            }
+        ctx = args.get("context_lines")
+        try:
+            ctx = int(ctx) if ctx is not None else 3
+        except (ValueError, TypeError):
+            ctx = 3
+        ctx = max(0, min(ctx, 20))
+        if path_b:
+            header = f"\u2699 diff_file: {path_a} vs {path_b}"
+        else:
+            header = f"\u2699 diff_file: {path_a} vs provided content"
+        return {
+            "call_id": call_id,
+            "func_name": "diff_file",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_diff,
+            "path_a": os.path.expanduser(path_a),
+            "path_b": os.path.expanduser(path_b) if path_b else "",
+            "content_b": content_b,
+            "context_lines": ctx,
         }
 
     def _prepare_write_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4365,6 +4420,53 @@ class ChatSession:
             msg = f"Error: search failed: {e}"
             self._report_tool_result(call_id, "search", msg, is_error=True)
             return call_id, msg
+
+    def _exec_diff(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Show unified diff between two files or a file and provided content."""
+        call_id = item["call_id"]
+        path_a = item["path_a"]
+        path_b = item.get("path_b", "")
+        content_b = item.get("content_b")
+        ctx = item.get("context_lines", 3)
+        try:
+            resolved_a = os.path.realpath(path_a)
+            with open(resolved_a) as f:
+                lines_a = f.readlines()
+        except FileNotFoundError:
+            msg = f"Error: {path_a} not found"
+            self._report_tool_result(call_id, "diff_file", msg, is_error=True)
+            return call_id, msg
+        except Exception as e:
+            msg = f"Error reading {path_a}: {e}"
+            self._report_tool_result(call_id, "diff_file", msg, is_error=True)
+            return call_id, msg
+
+        if path_b:
+            label_b = path_b
+            try:
+                resolved_b = os.path.realpath(path_b)
+                with open(resolved_b) as f:
+                    lines_b = f.readlines()
+            except FileNotFoundError:
+                msg = f"Error: {path_b} not found"
+                self._report_tool_result(call_id, "diff_file", msg, is_error=True)
+                return call_id, msg
+            except Exception as e:
+                msg = f"Error reading {path_b}: {e}"
+                self._report_tool_result(call_id, "diff_file", msg, is_error=True)
+                return call_id, msg
+        else:
+            label_b = "(provided content)"
+            lines_b = (content_b or "").splitlines(keepends=True)
+
+        import difflib
+
+        diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx))
+        output = "".join(diff) if diff else "(no differences)"
+        output = self._truncate_output(output)
+        desc = f"{len(diff)} diff lines" if diff else "identical"
+        self._report_tool_result(call_id, "diff_file", desc)
+        return call_id, output
 
     def _run_agent(
         self,

@@ -72,18 +72,19 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 18
+        assert len(TOOLS) == 19
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 9
 
     def test_task_agent_tools_count(self):
-        assert len(TASK_AGENT_TOOLS) == 12
+        assert len(TASK_AGENT_TOOLS) == 13
 
     def test_auto_approve_sets_match(self):
         expected = {
             "read_file",
             "search",
+            "diff_file",
             "math",
             "man",
             "web_fetch",
@@ -113,6 +114,7 @@ class TestToolsMetadata:
             "read_resource": "uri",
             "use_prompt": "name",
             "skill": "name",
+            "diff_file": "path_a",
         }
         assert expected == PRIMARY_KEY_MAP
 

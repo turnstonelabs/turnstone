@@ -1,0 +1,29 @@
+{
+  "name": "diff_file",
+  "description": "Show a unified diff between two files, or between a file's current content and a previous version. Use after edit_file to verify changes, or to compare two files. Returns unified diff output with context lines.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path_a": {
+        "type": "string",
+        "description": "Path to the first file (or the file to diff against path_b or content_b)."
+      },
+      "path_b": {
+        "type": "string",
+        "description": "Path to the second file. Mutually exclusive with content_b."
+      },
+      "content_b": {
+        "type": "string",
+        "description": "String content to compare against path_a. Mutually exclusive with path_b. Useful for comparing current file state against a known previous version."
+      },
+      "context_lines": {
+        "type": "integer",
+        "description": "Number of context lines around changes (default 3)."
+      }
+    },
+    "required": ["path_a"]
+  },
+  "task_agent": true,
+  "auto_approve": true,
+  "primary_key": "path_a"
+}
