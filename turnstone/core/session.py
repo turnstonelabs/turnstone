@@ -2949,6 +2949,8 @@ class ChatSession:
         except (ValueError, TypeError):
             ctx = 3
         ctx = max(0, min(ctx, 20))
+        path_a = os.path.expanduser(path_a)
+        path_b = os.path.expanduser(path_b) if path_b else ""
         if path_b:
             header = f"\u2699 diff_file: {path_a} vs {path_b}"
         else:
@@ -2960,8 +2962,8 @@ class ChatSession:
             "preview": "",
             "needs_approval": False,
             "execute": self._exec_diff,
-            "path_a": os.path.expanduser(path_a),
-            "path_b": os.path.expanduser(path_b) if path_b else "",
+            "path_a": path_a,
+            "path_b": path_b,
             "content_b": content_b,
             "context_lines": ctx,
         }
@@ -4456,10 +4458,19 @@ class ChatSession:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
 
-        diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx))
-        output = "".join(diff) if diff else "(no differences)"
+        # Stream diff with early cutoff to avoid large allocations
+        max_chars = self.tool_truncation or 262_144
+        chunks: list[str] = []
+        total_chars = 0
+        line_count = 0
+        for line in difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx):
+            line_count += 1
+            if total_chars < max_chars:
+                chunks.append(line)
+                total_chars += len(line)
+        output = "".join(chunks) if chunks else "(no differences)"
         output = self._truncate_output(output)
-        desc = f"{len(diff)} diff lines" if diff else "identical"
+        desc = f"{line_count} diff lines" if line_count else "identical"
         self._report_tool_result(call_id, "diff_file", desc)
         return call_id, output
 
