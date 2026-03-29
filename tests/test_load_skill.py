@@ -54,6 +54,7 @@ def _make_session(skills: list[dict[str, Any]] | None = None):
     session._notify_on_complete = "{}"
     session.messages = []
     session._config = {}
+    session._tool_error_flags = {}
 
     # Stub set_skill to just record the call
     session._set_skill_called: list[str | None] = []
@@ -423,6 +424,7 @@ class TestSkillCatalogDisclosure:
         session._tool_search = None
         session._mcp_client = None
         session._notify_on_complete = "{}"
+        session._tool_error_flags = {}
 
         # Memory stubs
         session._memory_config = MagicMock()
