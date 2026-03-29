@@ -626,6 +626,184 @@ body { position: static; }
 }
 
 /* ==========================================================================
+   Message action toolbar (hover controls for retry / edit / rewind)
+   ========================================================================== */
+.msg-user, .msg-assistant { position: relative; }
+.msg-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: flex;
+  gap: 1px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  z-index: 2;
+}
+.msg-user:hover .msg-actions,
+.msg-assistant:hover .msg-actions,
+.msg-user:focus-within .msg-actions,
+.msg-assistant:focus-within .msg-actions,
+.msg-actions:hover { opacity: 1; pointer-events: auto; }
+.msg-action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 26px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-dim);
+  transition: color 0.1s ease, background 0.1s ease;
+  padding: 0;
+}
+.msg-action-btn:hover { color: var(--accent); background: var(--bg-highlight); box-shadow: 0 0 6px var(--accent-glow); }
+.msg-action-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.msg-action-btn + .msg-action-btn { border-left: 1px solid var(--border); }
+
+/* Icon: retry (circular arrow) */
+.icon-retry {
+  width: 13px; height: 13px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  border-bottom-color: transparent;
+  position: relative;
+}
+.icon-retry::after {
+  content: "";
+  position: absolute;
+  bottom: -1px; right: -1px;
+  width: 0; height: 0;
+  border-left: 2px solid transparent;
+  border-right: 2px solid transparent;
+  border-top: 3px solid currentColor;
+  transform: rotate(-30deg);
+}
+
+/* Icon: edit (pencil) */
+.icon-edit {
+  width: 12px; height: 12px;
+  position: relative;
+  transform: rotate(-45deg);
+}
+.icon-edit::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 3px;
+  width: 6px; height: 8px;
+  border: 1.5px solid currentColor;
+  border-radius: 1px 1px 0 0;
+  box-sizing: border-box;
+}
+.icon-edit::after {
+  content: "";
+  position: absolute;
+  bottom: 0; left: 3px;
+  width: 0; height: 0;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  border-top: 3px solid currentColor;
+}
+
+/* Icon: rewind (chevrons pointing left) */
+.icon-rewind {
+  width: 14px; height: 12px;
+  position: relative;
+}
+.icon-rewind::before, .icon-rewind::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  width: 6px; height: 6px;
+  border-left: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+}
+.icon-rewind::before { left: 1px; }
+.icon-rewind::after { left: 6px; }
+
+/* Edit-in-place form */
+.msg-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.msg-edit-textarea {
+  width: 100%;
+  min-height: 40px;
+  max-height: 200px;
+  background: var(--bg);
+  color: var(--fg-bright);
+  border: 1px solid var(--accent-dim);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-family: var(--font-display);
+  font-size: 14px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.12s ease;
+  box-sizing: border-box;
+}
+.msg-edit-textarea:focus { border-color: var(--accent); }
+.msg-edit-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.msg-edit-btn {
+  padding: 4px 14px;
+  font-size: 12px;
+  font-family: var(--font-display);
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--fg);
+  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+.msg-edit-btn:hover { background: var(--bg-highlight); }
+.msg-edit-btn-send {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.msg-edit-btn-send:hover { background: var(--accent); color: #fff; }
+
+/* Edit-in-place active state */
+.msg-editing { background: var(--bg-surface); border-color: var(--accent-dim); }
+.msg-editing .msg-actions { display: none; }
+
+/* Busy-state disables action buttons */
+[data-busy="true"] .msg-action-btn { opacity: 0.3; pointer-events: none; cursor: not-allowed; }
+
+/* Touch devices: always show action buttons inline */
+@media (hover: none) and (pointer: coarse) {
+  .msg-actions {
+    opacity: 1;
+    pointer-events: auto;
+    position: static;
+    margin-top: 6px;
+    border: none;
+    background: transparent;
+    justify-content: flex-end;
+  }
+  .msg-action-btn { width: 36px; height: 36px; }
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  .msg-actions, .msg-action-btn, .msg-edit-textarea, .msg-edit-btn { transition: none; }
+}
+
+/* ==========================================================================
    Input area
    ========================================================================== */
 .pane-input-area {

@@ -1356,6 +1356,16 @@ async def command(request: Request) -> JSONResponse:
             if err:
                 ui.on_error("Permission denied: conversation.modify required")
                 return err
+            # Prevent rewind/retry while a generation is in progress
+            with ws._lock:
+                if ws.worker_thread and ws.worker_thread.is_alive():
+                    ui._enqueue(
+                        {
+                            "type": "busy_error",
+                            "message": "Cannot rewind/retry while processing.",
+                        }
+                    )
+                    return JSONResponse({"status": "busy"})
 
         should_exit = ws.session.handle_command(cmd)
         if should_exit:

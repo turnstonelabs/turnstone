@@ -32,6 +32,7 @@ function Pane(wsId) {
   this.statusText = "";
   this._cancelTimeout = null;
   this._forceTimeout = null;
+  this._pendingEditSend = null;
   this._createDOM();
 }
 
@@ -181,6 +182,7 @@ Pane.prototype.reset = function () {
   this.setBusy(false);
   this.pendingApproval = false;
   this.approvalBlockEl = null;
+  this._pendingEditSend = null;
   this.inputEl.disabled = false;
 };
 
@@ -211,6 +213,7 @@ Pane.prototype.disconnectSSE = function () {
 
 Pane.prototype.setBusy = function (b) {
   this.busy = b;
+  this.messagesEl.dataset.busy = b ? "true" : "false";
   this.sendBtn.disabled = b;
   this.sendBtn.style.display = b ? "none" : "";
   this.stopBtn.style.display = b ? "" : "none";
@@ -394,6 +397,7 @@ Pane.prototype.handleEvent = function (evt) {
     case "state_change":
       if (evt.state === "idle" || evt.state === "error") {
         this.setBusy(false);
+        this._attachRetryToLastAssistant();
         // Only steal focus if this is the active pane and no approval pending.
         if (this.id === focusedPaneId && !this.pendingApproval) {
           this.inputEl.focus();
@@ -527,6 +531,21 @@ Pane.prototype.handleEvent = function (evt) {
 
     case "history":
       this.replayHistory(evt.messages);
+      // Dispatch pending edit-and-resend after rewind history arrives
+      if (this._pendingEditSend) {
+        var editText = this._pendingEditSend;
+        this._pendingEditSend = null;
+        this.setBusy(true);
+        this.addUserMessage(editText);
+        authFetch("/v1/api/send", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: editText, ws_id: self.wsId }),
+        }).catch(function (err) {
+          self.addErrorMessage("Connection error: " + err.message);
+          self.setBusy(false);
+        });
+      }
       break;
 
     case "clear_ui":
@@ -554,8 +573,206 @@ Pane.prototype.addUserMessage = function (text) {
   var el = document.createElement("div");
   el.className = "msg msg-user";
   el.textContent = text;
+  this._addUserMsgActions(el, text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
+};
+
+Pane.prototype._addUserMsgActions = function (el, text) {
+  var self = this;
+  var bar = document.createElement("div");
+  bar.className = "msg-actions";
+  bar.setAttribute("role", "toolbar");
+  bar.setAttribute("aria-label", "Message actions");
+  // Edit button
+  var editBtn = document.createElement("button");
+  editBtn.className = "msg-action-btn";
+  editBtn.title = "Edit & resend";
+  editBtn.setAttribute("aria-label", "Edit and resend this message");
+  var editIcon = document.createElement("span");
+  editIcon.className = "icon-edit";
+  editIcon.setAttribute("aria-hidden", "true");
+  editBtn.appendChild(editIcon);
+  editBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    self._startEdit(el, text);
+  });
+  bar.appendChild(editBtn);
+  // Rewind-to-here button
+  var rewindBtn = document.createElement("button");
+  rewindBtn.className = "msg-action-btn";
+  rewindBtn.title = "Rewind to before this message";
+  rewindBtn.setAttribute(
+    "aria-label",
+    "Rewind conversation to before this message",
+  );
+  var rewindIcon = document.createElement("span");
+  rewindIcon.className = "icon-rewind";
+  rewindIcon.setAttribute("aria-hidden", "true");
+  rewindBtn.appendChild(rewindIcon);
+  rewindBtn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    self._rewindToMessage(el);
+  });
+  bar.appendChild(rewindBtn);
+  el.appendChild(bar);
+};
+
+Pane.prototype._addRetryAction = function (el) {
+  var self = this;
+  var bar = el.querySelector(".msg-actions");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "msg-actions";
+    bar.setAttribute("role", "toolbar");
+    bar.setAttribute("aria-label", "Message actions");
+    el.appendChild(bar);
+  }
+  var btn = document.createElement("button");
+  btn.className = "msg-action-btn";
+  btn.title = "Retry (regenerate response)";
+  btn.setAttribute("aria-label", "Retry last response");
+  var icon = document.createElement("span");
+  icon.className = "icon-retry";
+  icon.setAttribute("aria-hidden", "true");
+  btn.appendChild(icon);
+  btn.addEventListener("click", function (e) {
+    e.stopPropagation();
+    self._retryLast();
+  });
+  bar.insertBefore(btn, bar.firstChild);
+};
+
+Pane.prototype._retryLast = function () {
+  if (this.busy) return;
+  var self = this;
+  authFetch("/v1/api/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ command: "/retry", ws_id: this.wsId }),
+  }).catch(function (err) {
+    self.addErrorMessage("Retry failed: " + err.message);
+  });
+};
+
+Pane.prototype._rewindToMessage = function (msgEl) {
+  if (this.busy) return;
+  var self = this;
+  // Count how many user messages come at or after this one
+  var userMsgs = this.messagesEl.querySelectorAll(".msg-user");
+  var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+  if (idx < 0) return;
+  var turnsToRewind = userMsgs.length - idx;
+  if (turnsToRewind < 1) return;
+  authFetch("/v1/api/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      command: "/rewind " + turnsToRewind,
+      ws_id: this.wsId,
+    }),
+  }).catch(function (err) {
+    self.addErrorMessage("Rewind failed: " + err.message);
+  });
+};
+
+Pane.prototype._startEdit = function (msgEl, originalText) {
+  if (this.busy) return;
+  var self = this;
+  // Save current child nodes for cancel restoration
+  var savedNodes = [];
+  while (msgEl.firstChild) {
+    savedNodes.push(msgEl.removeChild(msgEl.firstChild));
+  }
+  msgEl.classList.add("msg-editing");
+
+  var form = document.createElement("div");
+  form.className = "msg-edit-form";
+
+  var textarea = document.createElement("textarea");
+  textarea.className = "msg-edit-textarea";
+  textarea.setAttribute("aria-label", "Edit message text");
+  textarea.value = originalText;
+  textarea.rows = Math.min(originalText.split("\n").length + 1, 8);
+  form.appendChild(textarea);
+
+  var actions = document.createElement("div");
+  actions.className = "msg-edit-actions";
+
+  var cancelBtn = document.createElement("button");
+  cancelBtn.className = "msg-edit-btn";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", function () {
+    // Restore original nodes
+    while (msgEl.firstChild) msgEl.removeChild(msgEl.firstChild);
+    savedNodes.forEach(function (n) {
+      msgEl.appendChild(n);
+    });
+    msgEl.classList.remove("msg-editing");
+  });
+  actions.appendChild(cancelBtn);
+
+  var sendBtn = document.createElement("button");
+  sendBtn.className = "msg-edit-btn msg-edit-btn-send";
+  sendBtn.textContent = "Send";
+  sendBtn.addEventListener("click", function () {
+    var newText = textarea.value.trim();
+    if (!newText) return;
+    self._editAndResend(msgEl, newText);
+  });
+  actions.appendChild(sendBtn);
+
+  // Ctrl+Enter to send, Escape to cancel
+  textarea.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      sendBtn.click();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelBtn.click();
+    }
+  });
+
+  form.appendChild(actions);
+  msgEl.appendChild(form);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+};
+
+Pane.prototype._editAndResend = function (msgEl, newText) {
+  if (this.busy) return;
+  var self = this;
+  // Count turns to rewind (from this message onward)
+  var userMsgs = this.messagesEl.querySelectorAll(".msg-user");
+  var idx = Array.prototype.indexOf.call(userMsgs, msgEl);
+  if (idx < 0) return;
+  var turnsToRewind = userMsgs.length - idx;
+
+  this.setBusy(true);
+  // Store pending send — dispatched when the rewind history event arrives
+  this._pendingEditSend = newText;
+  authFetch("/v1/api/command", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      command: "/rewind " + turnsToRewind,
+      ws_id: self.wsId,
+    }),
+  })
+    .then(function (r) {
+      if (r && !r.ok) {
+        self._pendingEditSend = null;
+        self.setBusy(false);
+        self.addErrorMessage(
+          "Rewind failed (HTTP " + r.status + " " + r.statusText + ")",
+        );
+      }
+    })
+    .catch(function (err) {
+      self._pendingEditSend = null;
+      self.addErrorMessage("Rewind failed: " + err.message);
+      self.setBusy(false);
+    });
 };
 
 Pane.prototype.replayHistory = function (messages) {
@@ -660,7 +877,23 @@ Pane.prototype.replayHistory = function (messages) {
       }
     }
   }
+  this._attachRetryToLastAssistant();
   this.scrollToBottom();
+};
+
+Pane.prototype._attachRetryToLastAssistant = function () {
+  // Remove any previous retry buttons
+  var old = this.messagesEl.querySelectorAll(".msg-assistant .msg-actions");
+  for (var i = 0; i < old.length; i++) old[i].parentNode.removeChild(old[i]);
+  // Find the last assistant message with content and add retry
+  var assistants = this.messagesEl.querySelectorAll(".msg-assistant");
+  if (assistants.length) {
+    var last = assistants[assistants.length - 1];
+    // Only add if it's not a reasoning block
+    if (!last.classList.contains("reasoning")) {
+      this._addRetryAction(last);
+    }
+  }
 };
 
 Pane.prototype.showInlineToolBlock = function (
