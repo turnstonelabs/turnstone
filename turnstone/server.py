@@ -1189,12 +1189,12 @@ async def send_message(request: Request) -> JSONResponse:
                 # If this thread was force-abandoned, ws.worker_thread will
                 # have been set to None — don't emit spurious events.
                 if ws.worker_thread is me:
-                    ui._enqueue({"type": "stream_end"})
+                    ui.on_stream_end()
                     ui.on_state_change("idle")
             except Exception as e:
                 if ws.worker_thread is me:
                     ui.on_error(f"Error: {e}")
-                    ui._enqueue({"type": "stream_end"})
+                    ui.on_stream_end()
                     ui.on_state_change("error")
 
         t = threading.Thread(target=run, daemon=True)
