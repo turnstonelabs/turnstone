@@ -1,6 +1,6 @@
 {
   "name": "bash",
-  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead; for man pages use man instead. Output cap: 256KB (head+tail preserved, middle truncated). Stderr lines prefixed with [stderr].",
+  "description": "Execute a bash command and return stdout + stderr. Use for running programs, git, tests, system commands, installing packages, etc. Environment questions ('What Python version?', 'Is X installed?') are tool-use tasks — e.g. bash(command='python --version'). For file creation use write_file instead; for man pages use man instead. Long output is truncated (head+tail preserved, middle elided). Stderr lines prefixed with [stderr].",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "timeout": {
         "type": "integer",
-        "description": "Timeout in seconds. Defaults to 120. Use higher values for long-running commands like test suites or builds."
+        "description": "Timeout in seconds (1-600). Omit to use the global tools.timeout setting (typically 120s). Use higher values for long-running commands like test suites or builds."
       }
     },
     "required": ["command"]

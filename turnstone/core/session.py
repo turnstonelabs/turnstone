@@ -2801,7 +2801,8 @@ class ChatSession:
         display_cmd = command.split("\n")[0]
         is_multiline = "\n" in command
         if is_multiline:
-            display_cmd += f" ... ({command.count(chr(10))} more lines)"
+            extra = command.count(chr(10))
+            display_cmd += f" ... ({extra} more {'line' if extra == 1 else 'lines'})"
         timeout = args.get("timeout")
         try:
             timeout = int(timeout) if timeout is not None else None
