@@ -1454,6 +1454,19 @@ class ChatSession:
                 if self._generation != my_generation:
                     return
 
+                # Clear dedup sigs when a write tool executed — the state has
+                # changed so re-running a read tool (e.g. read→edit→read) is valid.
+                _write_tools = frozenset({"write_file", "edit_file", "bash"})
+                if any(
+                    tc["function"]["name"] in _write_tools
+                    for tc in tool_calls
+                    if not any(
+                        r[0] == tc["id"] and isinstance(r[1], str) and r[1].startswith("Error")
+                        for r in results
+                    )
+                ):
+                    self._recent_tool_sigs.clear()
+
                 # Repeat detection: warn when a tool is called with identical args.
                 # Skip error outputs — retrying a failed tool is valid.
                 # Skip JSON outputs (MCP structured results) — appending
