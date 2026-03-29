@@ -3518,13 +3518,22 @@ class ChatSession:
                     "needs_approval": False,
                     "error": "Error: name is required for delete",
                 }
-            scope = (args.get("scope") or "global").strip().lower()
-            if scope not in ("global", "workstream", "user"):
-                scope = "global"
-            scope_err = self._validate_scope(scope, call_id)
-            if scope_err:
-                return scope_err
-            scope_id = self._resolve_scope_id(scope)
+            explicit_scope = (args.get("scope") or "").strip().lower()
+            if explicit_scope and explicit_scope not in ("global", "workstream", "user"):
+                explicit_scope = ""
+            if explicit_scope:
+                scope_err = self._validate_scope(explicit_scope, call_id)
+                if scope_err:
+                    return scope_err
+                scope_id = self._resolve_scope_id(explicit_scope)
+                scopes_to_try = [(explicit_scope, scope_id)]
+            else:
+                # No scope specified — try narrowest first: workstream → user → global
+                scopes_to_try = []
+                for s in ("workstream", "user", "global"):
+                    sid = self._resolve_scope_id(s)
+                    if sid or s == "global":
+                        scopes_to_try.append((s, sid))
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -3534,8 +3543,7 @@ class ChatSession:
                 "execute": self._exec_memory,
                 "action": "delete",
                 "name": name,
-                "scope": scope,
-                "scope_id": scope_id,
+                "scopes_to_try": scopes_to_try,
             }
 
         if action == "search":
@@ -4774,13 +4782,21 @@ class ChatSession:
                 return call_id, msg
 
             if action == "delete":
-                deleted = delete_structured_memory(item["name"], item["scope"], item["scope_id"])
+                scopes = item["scopes_to_try"]
+                deleted = False
+                deleted_scope = ""
+                for scope, scope_id in scopes:
+                    if delete_structured_memory(item["name"], scope, scope_id):
+                        deleted = True
+                        deleted_scope = scope
+                        break
                 if not deleted:
-                    msg = f"Error: memory '{item['name']}' not found (scope={item['scope']})"
+                    tried = ", ".join(s for s, _ in scopes)
+                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
                     self._report_tool_result(call_id, "memory", msg, is_error=True)
                 else:
                     self._init_system_messages()
-                    msg = f"Deleted memory '{item['name']}'"
+                    msg = f"Deleted memory '{item['name']}' (scope={deleted_scope})"
                     self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
