@@ -98,6 +98,7 @@ export type {
   AuthLoginResponse,
   AuthStatusResponse,
   AuthSetupResponse,
+  DeleteSettingResponse,
   StatusResponse,
   ErrorResponse,
   ClusterOverviewResponse,
