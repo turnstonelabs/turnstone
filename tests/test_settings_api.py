@@ -272,13 +272,18 @@ class TestSecretMasking:
             json={"value": "sk-real-key"},
         )
         assert r1.status_code == 200
-        # Now submit the sentinel — should return unchanged
+        # Now submit the sentinel — should return unchanged with full response shape
         r2 = client.put(
             "/v1/api/admin/settings/judge.api_key",
             json={"value": "***"},
         )
         assert r2.status_code == 200
-        assert r2.json().get("unchanged") is True
+        data = r2.json()
+        assert data.get("unchanged") is True
+        assert data["key"] == "judge.api_key"
+        assert data["value"] == "***"
+        assert data["type"] == "str"
+        assert data["is_secret"] is True
 
     def test_secret_still_masked_in_list(self, client):
         """After writing a secret, list still shows '***'."""

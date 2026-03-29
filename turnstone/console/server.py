@@ -1748,6 +1748,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.memories",
         "admin.settings",
         "admin.mcp",
+        "admin.models",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -3656,7 +3657,6 @@ async def admin_list_settings(request: Request) -> JSONResponse:
     if err:
         return err
 
-    reveal = request.query_params.get("reveal") == "true"
     stored = {r["key"]: r for r in storage.list_system_settings() if r.get("node_id", "") == ""}
 
     settings: list[dict[str, Any]] = []
@@ -3669,7 +3669,7 @@ async def admin_list_settings(request: Request) -> JSONResponse:
                 val = row["value"]
             info = {
                 "key": key,
-                "value": "***" if defn.is_secret and not reveal else val,
+                "value": "***" if defn.is_secret else val,
                 "source": "storage",
                 "type": defn.type,
                 "description": defn.description,
@@ -3765,7 +3765,18 @@ async def admin_update_setting(request: Request) -> JSONResponse:
 
     # Secret sentinel: "***" means "keep existing value"
     if defn.is_secret and raw_value == "***":
-        return JSONResponse({"key": key, "value": "***", "unchanged": True})
+        return JSONResponse(
+            {
+                "key": key,
+                "value": "***",
+                "source": "storage",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+                "is_secret": True,
+                "unchanged": True,
+            }
+        )
 
     try:
         typed_value = validate_value(key, raw_value)

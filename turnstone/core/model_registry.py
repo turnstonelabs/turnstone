@@ -34,6 +34,7 @@ class ModelConfig:
     context_window: int = 32768
     provider: str = "openai"
     capabilities: dict[str, Any] = field(default_factory=dict)
+    source: str = ""  # "config", "db", or "" (CLI default)
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,25 @@ class ModelRegistry:
 
     # -- lifecycle -----------------------------------------------------------
 
+    def reload(
+        self,
+        models: dict[str, ModelConfig],
+        default: str,
+        fallback: list[str] | None = None,
+        agent_model: str | None = None,
+    ) -> None:
+        """Hot-reload all model configs. Thread-safe; clears cached clients."""
+        with self._client_lock:
+            self._models = dict(models)
+            self.default = default
+            self.fallback = list(fallback) if fallback else []
+            self.agent_model = agent_model
+            for client in self._clients.values():
+                if hasattr(client, "close"):
+                    client.close()
+            self._clients.clear()
+            self._providers.clear()
+
     def shutdown(self) -> None:
         """Close all cached client connections."""
         with self._client_lock:
@@ -146,32 +166,77 @@ class ModelRegistry:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_env_vars(value: str) -> str:
+    """Expand ``${VAR}`` patterns in *value* using environment variables.
+
+    Unresolved variables are replaced with empty strings.
+    """
+    import os
+    import re
+
+    def _replace(m: re.Match[str]) -> str:
+        return os.environ.get(m.group(1), "")
+
+    return re.sub(r"\$\{([^}]+)\}", _replace, value)
+
+
 def load_model_registry(
     base_url: str,
     api_key: str,
     model: str,
     context_window: int = 32768,
     provider: str = "openai",
+    storage: Any | None = None,
 ) -> ModelRegistry:
-    """Build a ModelRegistry from CLI args and ``config.toml``.
+    """Build a ModelRegistry from CLI args, ``config.toml``, and database.
 
-    Precedence:
+    Precedence (highest to lowest):
 
-    1. ``[models.*]`` sections in config.toml define named models.
-    2. CLI ``--base-url`` / ``--api-key`` / ``--model`` always create a
-       ``"default"`` entry (overrides any ``[models.default]`` section).
-    3. ``[model].default``, ``[model].fallback``, ``[model].agent_model``
+    1. ``[models.*]`` sections in config.toml define named models
+       (``source="config"``).  These override DB entries with the same
+       alias in-memory only — the DB rows are never modified.
+    2. Database model definitions (``source="db"``), loaded when
+       *storage* is provided.
+    3. CLI ``--base-url`` / ``--api-key`` / ``--model`` always create a
+       ``"default"`` entry.
+    4. ``[model].default``, ``[model].fallback``, ``[model].agent_model``
        control routing.
-    4. If no ``[models.*]`` sections exist, a single-entry registry is built
-       from the CLI args.
     """
+    import json as _json
+
     cfg = load_config()
     models_section: dict[str, Any] = cfg.get("models", {})
     model_section: dict[str, Any] = cfg.get("model", {})
 
     configs: dict[str, ModelConfig] = {}
 
-    # Build configs from [models.*] sections
+    # 1. Load DB model definitions (lowest priority, overridden by config.toml)
+    if storage is not None:
+        try:
+            for row in storage.list_model_definitions(enabled_only=True):
+                alias = row["alias"]
+                caps: dict[str, Any] = {}
+                if row.get("capabilities"):
+                    try:
+                        parsed = _json.loads(row["capabilities"])
+                        if isinstance(parsed, dict):
+                            caps = parsed
+                    except (_json.JSONDecodeError, TypeError):
+                        pass
+                configs[alias] = ModelConfig(
+                    alias=alias,
+                    base_url=_resolve_env_vars(row.get("base_url", "")),
+                    api_key=_resolve_env_vars(row.get("api_key", "")),
+                    model=row["model"],
+                    context_window=row.get("context_window", 32768),
+                    provider=row.get("provider", "openai"),
+                    capabilities=caps,
+                    source="db",
+                )
+        except Exception:
+            log.warning("Failed to load model definitions from storage", exc_info=True)
+
+    # 2. Build configs from [models.*] sections (overrides DB for same alias)
     for alias, entry in models_section.items():
         if not isinstance(entry, dict):
             continue
@@ -189,9 +254,10 @@ def load_model_registry(
             capabilities=entry.get("capabilities", {})
             if isinstance(entry.get("capabilities"), dict)
             else {},
+            source="config",
         )
 
-    # Ensure a "default" entry from CLI args
+    # 3. Ensure a "default" entry from CLI args
     configs["default"] = ModelConfig(
         alias="default",
         base_url=base_url,

@@ -1814,6 +1814,55 @@ def internal_mcp_status(request: Request) -> JSONResponse:
     return JSONResponse({"servers": mcp_mgr.get_all_server_status()})
 
 
+# -- internal model management -----------------------------------------------
+
+
+def internal_model_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
+    from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.storage._registry import get_storage
+
+    registry = getattr(request.app.state, "registry", None)
+    cli_args = getattr(request.app.state, "cli_model_args", None)
+    if registry is None or cli_args is None:
+        return JSONResponse({"status": "error", "reason": "no registry"}, status_code=503)
+
+    new_registry = load_model_registry(
+        base_url=cli_args["base_url"],
+        api_key=cli_args["api_key"],
+        model=cli_args["model"],
+        context_window=cli_args["context_window"],
+        provider=cli_args["provider"],
+        storage=get_storage(),
+    )
+    registry.reload(
+        new_registry._models,
+        new_registry.default,
+        new_registry.fallback,
+        new_registry.agent_model,
+    )
+    return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
+
+
+def internal_model_status(request: Request) -> JSONResponse:
+    """GET /v1/api/_internal/model-status — return this node's model aliases."""
+    registry = getattr(request.app.state, "registry", None)
+    if registry is None:
+        return JSONResponse({"models": {}})
+
+    models: dict[str, dict[str, Any]] = {}
+    for alias in registry.list_aliases():
+        cfg = registry.get_config(alias)
+        models[alias] = {
+            "model": cfg.model,
+            "provider": cfg.provider,
+            "source": cfg.source,
+            "context_window": cfg.context_window,
+            "enabled": True,
+        }
+    return JSONResponse({"models": models})
+
+
 # ---------------------------------------------------------------------------
 # Global SSE fan-out
 # ---------------------------------------------------------------------------
@@ -2027,6 +2076,12 @@ def create_app(
                     Route("/api/_internal/config-reload", config_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-status", internal_mcp_status),
+                    Route(
+                        "/api/_internal/model-reload",
+                        internal_model_reload,
+                        methods=["POST"],
+                    ),
+                    Route("/api/_internal/model-status", internal_model_status),
                 ],
             ),
             Route("/health", health),
@@ -2253,8 +2308,9 @@ def main() -> None:
     else:
         context_window = 32768
 
-    # Build model registry (reads [models.*] sections from config.toml)
+    # Build model registry (reads [models.*] + database model definitions)
     from turnstone.core.model_registry import load_model_registry
+    from turnstone.core.storage._registry import get_storage as _get_storage
 
     registry = load_model_registry(
         base_url=base_url,
@@ -2262,11 +2318,11 @@ def main() -> None:
         model=model,
         context_window=context_window,
         provider=provider_name,
+        storage=_get_storage(),
     )
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
-    from turnstone.core.storage._registry import get_storage as _get_storage
 
     mcp_config_cli = args.mcp_config  # CLI-only (no config.toml for this)
     mcp_client = create_mcp_client(
@@ -2494,6 +2550,15 @@ def main() -> None:
         judge_config=judge_config,
         config_store=config_store,
     )
+
+    # Store CLI model args for hot-reload (internal_model_reload reads these)
+    app.state.cli_model_args = {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "context_window": context_window,
+        "provider": provider_name,
+    }
 
     log.info("Server starting on http://%s:%s", args.host, args.port)
     log.info("Model: %s", model)

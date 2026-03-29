@@ -10,6 +10,7 @@ import pytest
 from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
+    _resolve_env_vars,
     detect_model,
     load_model_registry,
 )
@@ -317,6 +318,243 @@ class TestLoadModelRegistry:
         alt_cfg = reg.get_config("alt")
         assert alt_cfg.base_url == "http://base/v1"
         assert alt_cfg.api_key == "my-key"
+
+
+# ---------------------------------------------------------------------------
+# load_model_registry with DB storage
+# ---------------------------------------------------------------------------
+
+
+class _MockStorage:
+    """Minimal storage mock returning canned model definitions."""
+
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
+        self._rows = rows or []
+        self.calls: list[str] = []
+
+    def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        self.calls.append("list_model_definitions")
+        if enabled_only:
+            return [r for r in self._rows if r.get("enabled", True)]
+        return list(self._rows)
+
+
+class TestLoadModelRegistryWithDB:
+    def test_db_models_loaded(self) -> None:
+        """DB model definitions are loaded into the registry."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "cloud-gpt",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-db",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert reg.has_alias("cloud-gpt")
+        cfg = reg.get_config("cloud-gpt")
+        assert cfg.model == "gpt-5"
+        assert cfg.source == "db"
+
+    def test_config_overrides_db(self) -> None:
+        """Config.toml entry overrides DB entry with same alias."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "shared",
+                    "model": "db-model",
+                    "provider": "openai",
+                    "base_url": "http://db/v1",
+                    "api_key": "sk-db",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "shared": {
+                    "model": "config-model",
+                    "base_url": "http://config/v1",
+                },
+            },
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        cfg = reg.get_config("shared")
+        assert cfg.model == "config-model"
+        assert cfg.source == "config"
+
+    def test_db_only_models_coexist(self) -> None:
+        """DB models coexist alongside config.toml models."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "db-only",
+                    "model": "db-model",
+                    "provider": "anthropic",
+                    "base_url": "",
+                    "api_key": "sk-db",
+                    "context_window": 200000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "config-only": {"model": "config-model"},
+            },
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert reg.has_alias("db-only")
+        assert reg.has_alias("config-only")
+        assert reg.has_alias("default")
+        assert reg.get_config("db-only").source == "db"
+        assert reg.get_config("config-only").source == "config"
+
+    def test_source_field_set(self) -> None:
+        """Source field correctly distinguishes origin."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "from-db",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert reg.get_config("from-db").source == "db"
+        assert reg.get_config("default").source == ""
+
+    def test_disabled_db_models_excluded(self) -> None:
+        """Disabled DB models are not loaded."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "disabled",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": False,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert not reg.has_alias("disabled")
+
+    def test_db_capabilities_parsed(self) -> None:
+        """JSON capabilities from DB are parsed into dict."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "caps-model",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": '{"supports_vision": true}',
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert reg.get_config("caps-model").capabilities == {"supports_vision": True}
+
+    def test_no_db_writes(self) -> None:
+        """Config.toml models are NOT written to storage."""
+        storage = _MockStorage()
+        fake_cfg: dict[str, Any] = {
+            "models": {"local": {"model": "llama"}},
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            load_model_registry("http://x/v1", "x", "x", storage=storage)
+        # Only list_model_definitions should be called, no create
+        assert storage.calls == ["list_model_definitions"]
+
+    def test_storage_failure_graceful(self) -> None:
+        """Storage errors don't prevent registry creation."""
+        storage = MagicMock()
+        storage.list_model_definitions.side_effect = RuntimeError("db down")
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        assert reg.has_alias("default")
+
+
+# ---------------------------------------------------------------------------
+# _resolve_env_vars
+# ---------------------------------------------------------------------------
+
+
+class TestResolveEnvVars:
+    def test_expand_single(self) -> None:
+        with patch.dict("os.environ", {"MY_KEY": "secret123"}):
+            assert _resolve_env_vars("sk-${MY_KEY}") == "sk-secret123"
+
+    def test_expand_multiple(self) -> None:
+        with patch.dict("os.environ", {"A": "1", "B": "2"}):
+            assert _resolve_env_vars("${A}-${B}") == "1-2"
+
+    def test_missing_var_empty(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            assert _resolve_env_vars("${MISSING}") == ""
+
+    def test_no_vars(self) -> None:
+        assert _resolve_env_vars("plain-key") == "plain-key"
+
+    def test_empty_string(self) -> None:
+        assert _resolve_env_vars("") == ""
+
+
+# ---------------------------------------------------------------------------
+# ModelRegistry.reload
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryReload:
+    def test_reload_replaces_models(self) -> None:
+        models_a = {"a": ModelConfig("a", "x", "x", "m1")}
+        reg = ModelRegistry(models=models_a, default="a")
+        assert reg.has_alias("a")
+
+        models_b = {"b": ModelConfig("b", "y", "y", "m2")}
+        reg.reload(models_b, "b")
+        assert not reg.has_alias("a")
+        assert reg.has_alias("b")
+        assert reg.default == "b"
+
+    def test_reload_clears_clients(self) -> None:
+        models = {"a": ModelConfig("a", "http://x/v1", "key", "m")}
+        reg = ModelRegistry(models=models, default="a")
+        # Force client creation
+        reg.get_client("a")
+        assert "a" in reg._clients
+
+        # Reload with same models — clients should be cleared
+        reg.reload(dict(models), "a")
+        assert "a" not in reg._clients
 
 
 # ---------------------------------------------------------------------------
