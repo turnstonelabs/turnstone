@@ -3519,8 +3519,19 @@ class ChatSession:
                     "error": "Error: name is required for delete",
                 }
             explicit_scope = (args.get("scope") or "").strip().lower()
-            if explicit_scope and explicit_scope not in ("global", "workstream", "user"):
-                explicit_scope = ""
+            valid_scopes = ("global", "workstream", "user")
+            if explicit_scope and explicit_scope not in valid_scopes:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory delete: invalid scope",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": (
+                        f"Error: invalid scope '{explicit_scope}'. "
+                        f"Valid scopes: {', '.join(valid_scopes)}"
+                    ),
+                }
             if explicit_scope:
                 scope_err = self._validate_scope(explicit_scope, call_id)
                 if scope_err:
