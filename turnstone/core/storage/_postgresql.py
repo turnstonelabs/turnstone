@@ -406,10 +406,11 @@ class PostgreSQLBackend:
 
     # -- Conversation search ---------------------------------------------------
 
-    def search_history(self, query: str, limit: int = 20) -> list[Any]:
+    def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
         if not query or not query.strip():
             return []
         capped = min(limit, 100)
+        capped_offset = max(0, offset)
         with self._engine.connect() as conn:
             # Use PostgreSQL full-text search if search_vector column exists
             try:
@@ -422,9 +423,9 @@ class PostgreSQLBackend:
                             "   @@ plainto_tsquery('english', :query) "
                             "ORDER BY ts_rank(to_tsvector('english', COALESCE(c.content, '')), "
                             "   plainto_tsquery('english', :query)) DESC "
-                            "LIMIT :limit"
+                            "LIMIT :limit OFFSET :offset"
                         ),
-                        {"query": query, "limit": capped},
+                        {"query": query, "limit": capped, "offset": capped_offset},
                     ).fetchall()
                 )
             except Exception:
@@ -434,9 +435,9 @@ class PostgreSQLBackend:
                         sa.text(
                             "SELECT timestamp, ws_id, role, content, tool_name "
                             "FROM conversations WHERE content ILIKE :pattern "
-                            "ORDER BY timestamp DESC LIMIT :limit"
+                            "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                         ),
-                        {"pattern": f"%{query}%", "limit": capped},
+                        {"pattern": f"%{query}%", "limit": capped, "offset": capped_offset},
                     ).fetchall()
                 )
 

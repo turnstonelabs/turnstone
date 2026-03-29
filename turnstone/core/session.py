@@ -3801,6 +3801,12 @@ class ChatSession:
                 limit = int(limit)
             except ValueError:
                 limit = 20
+        offset = args.get("offset", 0)
+        if isinstance(offset, str):
+            try:
+                offset = int(offset)
+            except ValueError:
+                offset = 0
         return {
             "call_id": call_id,
             "func_name": "recall",
@@ -3810,6 +3816,7 @@ class ChatSession:
             "execute": self._exec_recall,
             "query": query,
             "limit": max(1, min(limit, 50)),
+            "offset": max(0, offset),
         }
 
     # -- skill prepare/execute -------------------------------------------------
@@ -5113,21 +5120,26 @@ class ChatSession:
     def _exec_recall(self, item: dict[str, Any]) -> tuple[str, str]:
         """Search conversation history."""
         call_id = item["call_id"]
-        query, limit = item["query"], item["limit"]
+        query, limit, offset = item["query"], item["limit"], item.get("offset", 0)
 
-        conv_rows = search_history(query, limit)
+        conv_rows = search_history(query, limit, offset)
         if conv_rows:
             lines = []
             for ts, sid, role, content, tool_name in conv_rows:
                 label = f"{role}({tool_name})" if tool_name else role
-                text = (content or "")[:500]
-                if content and len(content) > 500:
-                    text += "..."
+                text = (content or "")[:2000]
+                if content and len(content) > 2000:
+                    text += f"... ({len(content)} chars total)"
                 lines.append(f"[{ts} {sid}] {label}: {text}")
-            output = f"Conversations ({len(conv_rows)} matches):\n" + "\n".join(lines)
+            header = f"Conversations ({len(conv_rows)} matches"
+            if offset:
+                header += f", offset {offset}"
+            header += "):"
+            output = header + "\n" + "\n".join(lines)
         else:
             output = f"No conversation history found for '{query}'."
 
+        output = self._truncate_output(output)
         self._report_tool_result(call_id, "recall", output)
         return call_id, output
 

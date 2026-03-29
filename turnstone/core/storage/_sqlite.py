@@ -494,10 +494,11 @@ class SQLiteBackend:
 
     # -- Conversation search ---------------------------------------------------
 
-    def search_history(self, query: str, limit: int = 20) -> list[Any]:
+    def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
         if not query or not query.strip():
             return []
         capped = min(limit, 100)
+        capped_offset = max(0, offset)
         with self._engine.connect() as conn:
             if self._fts5_available:
                 return list(
@@ -507,9 +508,9 @@ class SQLiteBackend:
                             "FROM conversations_fts f "
                             "JOIN conversations c ON c.id = f.rowid "
                             "WHERE conversations_fts MATCH :query "
-                            "ORDER BY f.rank ASC LIMIT :limit"
+                            "ORDER BY f.rank ASC LIMIT :limit OFFSET :offset"
                         ),
-                        {"query": _fts5_query(query), "limit": capped},
+                        {"query": _fts5_query(query), "limit": capped, "offset": capped_offset},
                     ).fetchall()
                 )
             return list(
@@ -517,9 +518,13 @@ class SQLiteBackend:
                     sa.text(
                         "SELECT timestamp, ws_id, role, content, tool_name "
                         "FROM conversations WHERE content LIKE :pattern ESCAPE '\\' "
-                        "ORDER BY timestamp DESC LIMIT :limit"
+                        "ORDER BY timestamp DESC LIMIT :limit OFFSET :offset"
                     ),
-                    {"pattern": f"%{_escape_like(query)}%", "limit": capped},
+                    {
+                        "pattern": f"%{_escape_like(query)}%",
+                        "limit": capped,
+                        "offset": capped_offset,
+                    },
                 ).fetchall()
             )
 

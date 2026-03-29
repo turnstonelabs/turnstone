@@ -10,7 +10,11 @@
       },
       "limit": {
         "type": "integer",
-        "description": "Max results to return (default 20)."
+        "description": "Max results to return (default 20, max 50)."
+      },
+      "offset": {
+        "type": "integer",
+        "description": "Skip this many results for pagination. Default 0."
       }
     },
     "required": ["query"]
