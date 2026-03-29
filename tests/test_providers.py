@@ -94,6 +94,7 @@ def _anthropic_event(
         delta.type = kwargs.get("delta_type", "text_delta")
         delta.text = kwargs.get("text", "")
         delta.thinking = kwargs.get("thinking", "")
+        delta.signature = kwargs.get("signature", "")
         delta.partial_json = kwargs.get("partial_json", "")
         event.delta = delta
         event.index = kwargs.get("index", 0)
@@ -1961,6 +1962,104 @@ class TestAnthropicProviderBlocks:
         assert blocks[1]["input"] == {"query": "test"}  # parsed from accumulated JSON
         assert blocks[2]["type"] == "web_search_tool_result"
         assert blocks[2]["encrypted_content"] == "enc_data"
+
+    def test_streaming_thinking_block_captures_signature(self) -> None:
+        """Streaming thinking block accumulates signature from signature_delta events."""
+        thinking_block = MagicMock()
+        thinking_block.type = "thinking"
+        thinking_block.model_dump.return_value = {
+            "type": "thinking",
+            "thinking": "",
+            "signature": "",
+        }
+
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.model_dump.return_value = {"type": "text", "text": ""}
+
+        events = [
+            MagicMock(type="content_block_start", index=0, content_block=thinking_block),
+            _anthropic_event(
+                "content_block_delta", delta_type="thinking_delta", thinking="step 1", index=0
+            ),
+            _anthropic_event(
+                "content_block_delta", delta_type="thinking_delta", thinking=" step 2", index=0
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="signature_delta",
+                signature="sig_part1",
+                index=0,
+            ),
+            _anthropic_event(
+                "content_block_delta",
+                delta_type="signature_delta",
+                signature="sig_part2",
+                index=0,
+            ),
+            _anthropic_event("content_block_stop", index=0),
+            MagicMock(type="content_block_start", index=1, content_block=text_block),
+            _anthropic_event("content_block_delta", delta_type="text_delta", text="Hello", index=1),
+            _anthropic_event("content_block_stop", index=1),
+            _anthropic_event("message_delta", stop_reason="end_turn", usage_output_tokens=50),
+        ]
+
+        chunks = list(self.provider._iter_anthropic_stream(iter(events)))
+        final_chunks = [c for c in chunks if c.provider_blocks]
+        assert len(final_chunks) == 1
+        blocks = final_chunks[0].provider_blocks
+        assert blocks[0]["type"] == "thinking"
+        assert blocks[0]["thinking"] == "step 1 step 2"
+        assert blocks[0]["signature"] == "sig_part1sig_part2"
+
+    def test_thinking_block_multiturn_roundtrip(self) -> None:
+        """Thinking block with signature survives _convert_messages round-trip."""
+        provider_content = [
+            {
+                "type": "thinking",
+                "thinking": "Let me reason...",
+                "signature": "ErUBCkYIAxgCIkD_valid_sig",
+            },
+            {"type": "text", "text": "Here is my answer."},
+        ]
+        messages = [
+            {"role": "user", "content": "Question"},
+            {
+                "role": "assistant",
+                "content": "Here is my answer.",
+                "_provider_content": provider_content,
+            },
+            {"role": "user", "content": "Follow up"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        assistant_msg = converted[1]
+        assert assistant_msg["content"] is provider_content
+        assert assistant_msg["content"][0]["signature"] == "ErUBCkYIAxgCIkD_valid_sig"
+        assert assistant_msg["content"][0]["type"] == "thinking"
+
+    def test_block_to_dict_preserves_thinking_signature(self) -> None:
+        """_block_to_dict preserves signature on thinking blocks."""
+        from turnstone.core.providers._anthropic import _block_to_dict
+
+        class FakeThinkingBlock:
+            def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "type": "thinking",
+                    "thinking": "reasoning...",
+                    "signature": "abc123sig",
+                }
+
+        result = _block_to_dict(FakeThinkingBlock())
+        assert result["signature"] == "abc123sig"
+
+        # Also test fallback path (no model_dump)
+        class FallbackBlock:
+            type = "thinking"
+            thinking = "reasoning..."
+            signature = "abc123sig"
+
+        result2 = _block_to_dict(FallbackBlock())
+        assert result2["signature"] == "abc123sig"
 
 
 # ---------------------------------------------------------------------------

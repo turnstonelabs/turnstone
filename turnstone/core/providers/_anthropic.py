@@ -560,6 +560,12 @@ class AnthropicProvider:
                         raw_blocks[event.index]["thinking"] = (
                             raw_blocks[event.index].get("thinking", "") + delta.thinking
                         )
+                elif delta.type == "signature_delta":
+                    # Accumulate signature into raw block for round-trip
+                    if event.index in raw_blocks:
+                        raw_blocks[event.index]["signature"] = (
+                            raw_blocks[event.index].get("signature", "") + delta.signature
+                        )
                 elif delta.type == "input_json_delta":
                     if event.index in server_tool_blocks:
                         # Accumulate server tool input (search query)
