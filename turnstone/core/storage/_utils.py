@@ -136,8 +136,8 @@ def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]
 def reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is a 7-element tuple of ``(role, content, tool_name,
-    tool_args, tool_call_id, provider_data, tool_calls_json)`` ordered
+    Each *row* is a 6-element tuple of ``(role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json)`` ordered
     chronologically by row ID.
 
     Post-migration 013 the only roles are ``user``, ``assistant``, and
@@ -146,7 +146,7 @@ def reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
     """
     messages: list[dict[str, Any]] = []
     for row in rows:
-        role, content, _tool_name, _tool_args, tc_id, provider_data, tool_calls_json = row
+        role, content, _tool_name, tc_id, provider_data, tool_calls_json = row
 
         if role == "user":
             messages.append({"role": "user", "content": content or ""})

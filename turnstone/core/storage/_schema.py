@@ -35,7 +35,6 @@ conversations = sa.Table(
     sa.Column("role", sa.Text, nullable=False),
     sa.Column("content", sa.Text),
     sa.Column("tool_name", sa.Text),
-    sa.Column("tool_args", sa.Text),
     sa.Column("tool_call_id", sa.Text),
     sa.Column("provider_data", sa.Text),
     sa.Column("tool_calls", sa.Text),

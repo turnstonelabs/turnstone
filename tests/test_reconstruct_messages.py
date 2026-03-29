@@ -9,13 +9,12 @@ def _row(
     role,
     content=None,
     tool_name=None,
-    tool_args=None,
     tc_id=None,
     pdata=None,
     tool_calls=None,
 ):
-    """Build a 7-element conversation row tuple (post-migration 013 format)."""
-    return (role, content, tool_name, tool_args, tc_id, pdata, tool_calls)
+    """Build a 6-element conversation row tuple (post-migration 027 format)."""
+    return (role, content, tool_name, tc_id, pdata, tool_calls)
 
 
 class TestAssistantWithToolCalls:
