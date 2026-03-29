@@ -59,6 +59,7 @@ export interface ToolResultEvent {
   call_id: string;
   name: string;
   output: string;
+  is_error?: boolean;
 }
 
 export interface ToolOutputChunkEvent {

@@ -12,7 +12,7 @@ interface "SessionUI" as SessionUI <<Protocol>> {
     + on_content_token(text: str)
     + on_stream_end()
     + approve_tools(items: list) → (bool, str|None)
-    + on_tool_result(call_id: str, name: str, output: str)
+    + on_tool_result(call_id: str, name: str, output: str, *, is_error: bool = False)
     + on_tool_output_chunk(call_id: str, chunk: str)
     + on_status(usage: dict, ctx_window: int, effort: str)
     + on_plan_review(content: str) → str
