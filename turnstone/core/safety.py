@@ -21,7 +21,7 @@ BLOCKED_PATTERNS = [
     "of=/dev/loop",
     "of=/dev/disk/",
     ":(){ :|:& };:",  # fork bomb
-    "> /dev/sda",
+    "> /dev/sd",
     "> /dev/nvme",
     "> /dev/vd",
     "> /dev/xvd",
