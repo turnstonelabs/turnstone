@@ -1,6 +1,6 @@
 {
   "name": "task_agent",
-  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent inherits all tools and can read, write, edit, search, and run commands. Use for work that requires file modifications or command execution. Provide a clear, self-contained prompt.",
+  "description": "Delegate a general-purpose task to an autonomous sub-agent. The agent can read, write, edit, search, and run commands but does NOT have access to memory, recall, watch, skill, plan_agent, or task_agent — it cannot save memories, search conversation history, set up watches, or delegate further. All context must be in the prompt. Provide a clear, self-contained task description.",
   "parameters": {
     "type": "object",
     "properties": {

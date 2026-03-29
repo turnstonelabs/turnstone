@@ -1,6 +1,6 @@
 {
   "name": "plan_agent",
-  "description": "Delegate planning to a sub-agent. The agent autonomously explores the codebase, gathers context, and writes a step-by-step plan — just pass the goal directly. Use when asked to plan, design, think through, or strategize. Not for direct code changes like 'add a docstring' or 'fix a bug' — use read_file+edit_file for those.",
+  "description": "Delegate planning to a sub-agent. The agent autonomously explores the codebase, gathers context, and writes a step-by-step plan — just pass the goal directly. Use when asked to plan, design, think through, or strategize. Not for direct code changes like 'add a docstring' or 'fix a bug' — use read_file+edit_file for those. The plan agent has read-only tools (read_file, search, bash, web_fetch) but cannot save memories, set watches, or delegate further.",
   "parameters": {
     "type": "object",
     "properties": {

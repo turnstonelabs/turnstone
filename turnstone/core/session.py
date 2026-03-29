@@ -2799,17 +2799,36 @@ class ChatSession:
                 "error": blocked,
             }
         display_cmd = command.split("\n")[0]
-        if "\n" in command:
+        is_multiline = "\n" in command
+        if is_multiline:
             display_cmd += f" ... ({command.count(chr(10))} more lines)"
+        timeout = args.get("timeout")
+        try:
+            timeout = int(timeout) if timeout is not None else None
+        except (ValueError, TypeError):
+            timeout = None
+        if timeout is not None:
+            timeout = max(1, min(timeout, 600))  # clamp 1-600s
+
+        # Show full command in preview for multi-line scripts
+        preview = ""
+        if is_multiline:
+            preview = f"{DIM}{textwrap.indent(command, '    ')}{RESET}"
+
         return {
             "call_id": call_id,
             "func_name": "bash",
-            "header": f"\u2699 bash: {display_cmd}",
-            "preview": "",
+            "header": (
+                f"\u2699 bash ({timeout}s): {display_cmd}"
+                if timeout is not None
+                else f"\u2699 bash: {display_cmd}"
+            ),
+            "preview": preview,
             "needs_approval": True,
             "approval_label": "bash",
             "execute": self._exec_bash,
             "command": command,
+            "timeout": timeout,
         }
 
     def _prepare_read_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4073,6 +4092,7 @@ class ChatSession:
         # _cancel_event with a fresh instance) doesn't disarm this check.
         cancel = self._cancel_event
         call_id, command = item["call_id"], item["command"]
+        timeout = item.get("timeout") or self.tool_timeout
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
                 f.write("set -o pipefail\n" + command)
@@ -4116,7 +4136,7 @@ class ChatSession:
                             with contextlib.suppress(OSError, ProcessLookupError):
                                 proc.kill()
 
-                timer = threading.Timer(self.tool_timeout, _on_timeout)
+                timer = threading.Timer(timeout, _on_timeout)
                 timer.start()
                 try:
                     assert proc.stdout is not None
@@ -4149,7 +4169,7 @@ class ChatSession:
                 os.unlink(script_path)
 
             if timed_out.is_set():
-                raise subprocess.TimeoutExpired(cmd="bash", timeout=self.tool_timeout)
+                raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
 
             output = "".join(stdout_parts)
             if stderr_lines:
@@ -4167,7 +4187,7 @@ class ChatSession:
             return call_id, output if output else "(no output)"
 
         except subprocess.TimeoutExpired:
-            msg = f"Command timed out after {self.tool_timeout}s"
+            msg = f"Command timed out after {timeout}s"
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
         except Exception as e:
