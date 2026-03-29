@@ -21,16 +21,24 @@ def strip_html(html: str) -> str:
 
 
 def check_ssrf(url: str) -> str | None:
-    """Return error string if URL resolves to a private/link-local address, else None."""
+    """Return error string if URL resolves to a private/link-local address, else None.
+
+    Checks both IPv4 and IPv6 addresses via getaddrinfo to prevent bypasses
+    using IPv6 loopback (``::1``), link-local (``fe80::``), or unique-local
+    (``fd00::``/``fc00::``) addresses.
+    """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
         if not hostname:
             return "Invalid URL: no hostname"
-        addr = socket.gethostbyname(hostname)
-        ip = ipaddress.ip_address(addr)
-        if ip.is_private or ip.is_loopback or ip.is_link_local:
-            return f"Blocked: URL resolves to private/internal address ({addr})"
-    except (socket.gaierror, ValueError):
+        # Resolve all address families (IPv4 + IPv6)
+        results = socket.getaddrinfo(hostname, parsed.port or 80, proto=socket.IPPROTO_TCP)
+        for _family, _type, _proto, _canonname, sockaddr in results:
+            addr = sockaddr[0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local:
+                return f"Blocked: URL resolves to private/internal address ({addr})"
+    except (socket.gaierror, ValueError, OSError):
         pass  # DNS failure or invalid IP — let the actual fetch handle it
     return None
