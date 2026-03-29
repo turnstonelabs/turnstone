@@ -7,6 +7,7 @@ The ``anthropic`` SDK is imported lazily so it remains an optional dependency.
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,8 @@ from turnstone.core.providers._protocol import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+log = logging.getLogger(__name__)
 
 
 def _ensure_anthropic() -> Any:
@@ -329,6 +332,38 @@ class AnthropicProvider:
                     )
                 if content_blocks:
                     converted.append({"role": "assistant", "content": content_blocks})
+
+                # Repair orphaned tool_use blocks: if this assistant message
+                # has tool_use blocks but the next messages don't provide
+                # matching tool_results, synthesize error results.  This
+                # happens when a cancel interrupts tool execution — the
+                # assistant message is saved to DB before tools run, but
+                # GenerationCancelled prevents tool results from being created.
+                tool_use_ids = {b["id"] for b in content_blocks if b.get("type") == "tool_use"}
+                if tool_use_ids:
+                    # Peek ahead to collect tool_result IDs
+                    j = i + 1
+                    result_ids: set[str] = set()
+                    while j < len(messages) and messages[j]["role"] == "tool":
+                        result_ids.add(messages[j].get("tool_call_id", ""))
+                        j += 1
+                    orphaned = tool_use_ids - result_ids
+                    if orphaned:
+                        log.debug(
+                            "Synthesizing %d tool_result(s) for orphaned tool_use IDs",
+                            len(orphaned),
+                        )
+                        synthetic = [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": uid,
+                                "content": "Tool execution was cancelled.",
+                                "is_error": True,
+                            }
+                            for uid in orphaned
+                        ]
+                        converted.append({"role": "user", "content": synthetic})
+
                 i += 1
                 continue
 

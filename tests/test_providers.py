@@ -508,10 +508,11 @@ class TestAnthropicProvider:
                         },
                     }
                 ],
-            }
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
         ]
         _, converted = self.provider._convert_messages(messages)
-        assert len(converted) == 1
+        assert len(converted) == 2
         blocks = converted[0]["content"]
         assert len(blocks) == 2
         assert blocks[0] == {"type": "text", "text": "Let me check that."}
@@ -519,6 +520,8 @@ class TestAnthropicProvider:
         assert blocks[1]["id"] == "call_1"
         assert blocks[1]["name"] == "read_file"
         assert blocks[1]["input"] == {"path": "foo.py"}
+        # Tool result in user message
+        assert converted[1]["role"] == "user"
 
     def test_message_conversion_tool_results(self) -> None:
         messages = [
@@ -1180,6 +1183,146 @@ class TestOpenAIParameterGating:
         self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="low")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
+
+
+class TestAnthropicOrphanedToolUse:
+    """Verify _convert_messages synthesizes tool_results for orphaned tool_use."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        self.provider = AnthropicProvider()
+
+    def test_orphaned_tool_use_gets_synthetic_result(self) -> None:
+        """Assistant has tool_calls but next message is user (no tool results)."""
+        messages = [
+            {"role": "user", "content": "do something"},
+            {
+                "role": "assistant",
+                "content": "I'll run that.",
+                "tool_calls": [
+                    {
+                        "id": "call_abc",
+                        "function": {"name": "bash", "arguments": '{"command": "ls"}'},
+                    }
+                ],
+            },
+            {"role": "user", "content": "never mind, do something else"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # Should have: user, assistant(tool_use), user(synthetic tool_result), user
+        # After _merge_consecutive, the two user messages may merge.
+        # Find the synthetic tool_result
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "call_abc"
+        assert tool_results[0]["is_error"] is True
+        assert "cancelled" in tool_results[0]["content"].lower()
+
+    def test_multiple_orphaned_tool_calls(self) -> None:
+        """Assistant has 3 tool_calls, none have results."""
+        messages = [
+            {"role": "user", "content": "do three things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "c3", "function": {"name": "write_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "user", "content": "skip all that"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 3
+        result_ids = {r["tool_use_id"] for r in tool_results}
+        assert result_ids == {"c1", "c2", "c3"}
+
+    def test_partial_results_only_orphans_synthesized(self) -> None:
+        """2 tool_calls, only 1 has a result — synthesize for the missing one."""
+        messages = [
+            {"role": "user", "content": "do two things"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                    {"id": "c2", "function": {"name": "write_file", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "file1.txt"},
+            {"role": "user", "content": "skip the write"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # c1 should have a real result, c2 should have a synthetic one
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        result_map = {r["tool_use_id"]: r for r in tool_results}
+        assert "c1" in result_map
+        assert result_map["c1"]["content"] == "file1.txt"  # real result
+        assert "c2" in result_map
+        assert result_map["c2"]["is_error"] is True  # synthetic
+
+    def test_complete_results_no_synthesis(self) -> None:
+        """All tool_calls have results — no synthesis needed."""
+        messages = [
+            {"role": "user", "content": "do it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "done"},
+            {"role": "user", "content": "thanks"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # No synthetic results — only the real one
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        assert "cancelled" not in block.get("content", "").lower()
+
+    def test_trailing_orphan(self) -> None:
+        """Orphaned tool_use at end of conversation (no following messages)."""
+        messages = [
+            {"role": "user", "content": "do it"},
+            {
+                "role": "assistant",
+                "content": "Running...",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                ],
+            },
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0]["is_error"] is True
 
 
 class TestAnthropicReasoningNone:
