@@ -109,6 +109,7 @@
         </div>
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
+          <button id="tab-models" class="admin-nav" data-tab="models" role="tab" aria-selected="false" aria-controls="admin-models" tabindex="-1" onclick="switchAdminTab('models')">Models</button>
           <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
           <button id="tab-tls" class="admin-nav" data-tab="tls" role="tab" aria-selected="false" aria-controls="admin-tls" tabindex="-1" onclick="switchAdminTab('tls')">TLS</button>
         </div>
@@ -391,6 +392,26 @@
       </div>
       <div id="admin-memories-table" role="list" aria-label="Memories" aria-live="polite">
         <div class="dashboard-empty">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Models Tab -->
+    <div id="admin-models" class="admin-panel" role="tabpanel" aria-labelledby="tab-models" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header">Models</span>
+        <button id="model-sync-btn" class="admin-action-btn admin-action-btn-ghost" onclick="reloadModelNodes()" title="Push model config to all cluster nodes">Sync to Nodes</button>
+        <button class="admin-action-btn" onclick="showCreateModelModal()">+ Add Model</button>
+      </div>
+      <div class="admin-colheaders models-grid" aria-hidden="true">
+        <span class="admin-col">ALIAS</span>
+        <span class="admin-col">MODEL</span>
+        <span class="admin-col">PROVIDER</span>
+        <span class="admin-col">CTX WINDOW</span>
+        <span class="admin-col">STATUS</span>
+        <span class="admin-col">ACTIONS</span>
+      </div>
+      <div id="admin-models-table" role="list" aria-label="Model definitions" aria-live="polite">
+        <div class="dashboard-empty">Loading...</div>
       </div>
     </div>
 
@@ -1185,6 +1206,39 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideInstallMcpModal()">Cancel</button>
       <button id="mcp-install-submit" class="modal-submit" onclick="submitInstallMcp()">Install</button>
+    </div>
+  </div>
+</div>
+
+<!-- Model create/edit modal -->
+<div id="model-create-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="model-create-title">
+  <div id="model-create-box" class="admin-modal">
+    <h2 id="model-create-title">Add Model</h2>
+    <div id="model-create-error" role="alert" aria-live="assertive" style="display:none"></div>
+    <input type="hidden" id="model-edit-id" value="">
+    <label for="model-alias">Alias</label>
+    <input type="text" id="model-alias" placeholder="e.g. gpt5-prod" maxlength="64" pattern="[a-zA-Z0-9._-]+">
+    <label for="model-name">Model ID</label>
+    <input type="text" id="model-name" placeholder="e.g. gpt-5">
+    <label for="model-provider">Provider</label>
+    <select id="model-provider">
+      <option value="openai">openai</option>
+      <option value="anthropic">anthropic</option>
+    </select>
+    <label for="model-base-url">Base URL <span style="font-weight:400;text-transform:none">(empty = provider default)</span></label>
+    <input type="text" id="model-base-url" placeholder="https://api.openai.com/v1">
+    <label for="model-api-key">API Key <span style="font-weight:400;text-transform:none">(write-only, never displayed)</span></label>
+    <input type="password" id="model-api-key" placeholder="sk-..." autocomplete="off">
+    <label for="model-ctx-window">Context Window <span style="font-weight:400;text-transform:none">(0 = auto-detect from model)</span></label>
+    <input type="number" id="model-ctx-window" value="0" min="0">
+    <label for="model-capabilities">Capabilities <span style="font-weight:400;text-transform:none">(JSON)</span></label>
+    <textarea id="model-capabilities" rows="3" placeholder='{"supports_vision": true}' style="font-family:var(--font-mono);font-size:11px"></textarea>
+    <div style="display:flex;gap:20px;margin-top:14px">
+      <label style="margin:0;font-size:12px;color:var(--fg-dim)"><input type="checkbox" id="model-enabled" checked style="margin-right:5px">Enabled</label>
+    </div>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreateModelModal()">Cancel</button>
+      <button id="model-create-submit" class="modal-submit" onclick="submitCreateModel()">Create</button>
     </div>
   </div>
 </div>

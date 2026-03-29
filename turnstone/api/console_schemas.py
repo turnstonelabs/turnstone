@@ -785,3 +785,55 @@ class RegistryInstallRequest(BaseModel):
     variables: dict[str, str] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Admin: Model Definitions
+# ---------------------------------------------------------------------------
+
+
+class ModelDefinitionInfo(BaseModel):
+    definition_id: str
+    alias: str
+    model: str
+    provider: str = "openai"
+    base_url: str = ""
+    api_key: str = ""
+    context_window: int = 32768
+    capabilities: str = "{}"
+    enabled: bool = True
+    source: str = ""
+    created_by: str = ""
+    created: str = ""
+    updated: str = ""
+
+
+class CreateModelDefinitionRequest(BaseModel):
+    alias: str
+    model: str
+    provider: str = "openai"
+    base_url: str = ""
+    api_key: str = ""
+    context_window: int = 32768
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class UpdateModelDefinitionRequest(BaseModel):
+    alias: str | None = None
+    model: str | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    context_window: int | None = None
+    capabilities: dict[str, Any] | None = None
+    enabled: bool | None = None
+
+
+class ListModelDefinitionsResponse(BaseModel):
+    models: list[ModelDefinitionInfo]
+
+
+class ModelReloadResponse(BaseModel):
+    status: str = "ok"
+    results: dict[str, Any] = Field(default_factory=dict)

@@ -1189,7 +1189,7 @@
 .admin-modal label.admin-checkbox input:disabled { opacity: 0.4; }
 .admin-modal input::placeholder, .admin-modal textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
 .admin-modal textarea { resize: vertical; min-height: 40px; }
-.admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; display: none; }
+.admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; }
 
 .admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
 .admin-details[open] { padding-bottom: 12px; }
@@ -1394,7 +1394,8 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #create-template-overlay, #edit-template-overlay,
 #memory-detail-overlay,
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
-#github-import-overlay {
+#github-import-overlay,
+#model-create-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -2116,7 +2117,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 
 .admin-action-btn-ghost{background:transparent;color:var(--fg-dim);border:1px solid var(--border-strong)}
 .admin-action-btn-ghost:hover{color:var(--fg);background:var(--bg-highlight)}
-.mcp-sync-pending{color:var(--yellow)!important;border-color:var(--yellow)!important;animation:mcp-sync-pulse 2s ease-in-out infinite}
+.mcp-sync-pending,.model-sync-pending{color:var(--yellow)!important;border-color:var(--yellow)!important;animation:mcp-sync-pulse 2s ease-in-out infinite}
 @keyframes mcp-sync-pulse{0%,100%{border-color:var(--yellow)}50%{border-color:rgba(251,191,36,.3)}}
 
 /* -- MCP sub-view toggle -------------------------------------------------- */
@@ -2183,7 +2184,8 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .mcp-reg-card{grid-template-columns:1fr;gap:8px}
   .mcp-reg-card-actions{flex-direction:row;align-items:center}
   .mcp-registry-search{flex-direction:column}
-  #admin-mcp .admin-toolbar{flex-wrap:wrap;gap:8px}
+  #admin-mcp .admin-toolbar,
+  #admin-models .admin-toolbar{flex-wrap:wrap;gap:8px}
   #mcp-servers-toolbar{display:flex;gap:6px;width:100%}
   #admin-skills .admin-toolbar{flex-wrap:wrap;gap:8px}
   #skill-installed-toolbar{display:flex;gap:6px;width:100%}
@@ -2287,6 +2289,31 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .oidc-detail-panel { margin-left: 8px; }
 }
 
+/* -- Models grid --------------------------------------------------------- */
+.models-grid{grid-template-columns:1.2fr 1.2fr 80px 90px 80px 120px;gap:0 6px}
+@media(max-width:700px){
+  .models-grid{grid-template-columns:1fr 80px 120px}
+  .models-grid .admin-col:nth-child(2),
+  .models-grid .admin-col:nth-child(3),
+  .models-grid .admin-col:nth-child(4){display:none}
+}
+
+/* Model status indicators */
+.model-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle;margin-right:6px}
+.model-status-dot.enabled{background:var(--blue);box-shadow:0 0 6px var(--blue-glow)}
+.model-status-dot.disabled{background:var(--fg-dim);opacity:.35}
+
+.model-row-enabled{border-left:3px solid var(--blue)}
+.model-row-disabled{border-left:3px solid transparent}
+
+/* Provider badges */
+.model-provider-badge{display:inline-block;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:1px 6px;border-radius:2px;background:var(--bg-highlight);border:1px solid var(--border)}
+.model-provider-openai{color:var(--blue);border-color:rgba(56,189,248,.2)}
+.model-provider-anthropic{color:var(--magenta);border-color:rgba(192,132,252,.25)}
+
+/* Model source badge */
+.scope-db{color:var(--blue);border-color:rgba(56,189,248,.2)}
+
 /* ==========================================================================
    Reduced motion — console-specific
    ========================================================================== */
@@ -2310,5 +2337,5 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .mcp-view-btn, .mcp-reg-card, .mcp-install-btn, .mcp-install-source-label { transition: none; }
   .mcp-registry-search input[type="search"] { transition: none; }
   .mcp-reg-card-repo { transition: none; }
-  .mcp-sync-pending { animation: none; }
+  .mcp-sync-pending, .model-sync-pending { animation: none; }
 }

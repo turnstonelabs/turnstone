@@ -66,6 +66,7 @@ function showAdmin() {
     settings: "admin.settings",
     tls: "admin.settings",
     mcp: "admin.mcp",
+    models: "admin.models",
   };
   if (perms) {
     var permSet = perms.split(",");
@@ -193,6 +194,7 @@ function switchAdminTab(tab) {
     "usage",
     "audit",
     "memories",
+    "models",
     "settings",
     "tls",
     "mcp",
@@ -216,6 +218,7 @@ function switchAdminTab(tab) {
     loadGovAudit();
   }
   if (tab === "memories") loadAdminMemories();
+  if (tab === "models") loadAdminModels();
   if (tab === "settings") loadSettings();
   if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
@@ -1844,6 +1847,7 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "mcp-detail-overlay") hideMcpDetailModal();
         else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
         else if (overlayId === "github-import-overlay") hideGitHubImportModal();
+        else if (overlayId === "model-create-overlay") hideCreateModelModal();
       }
     };
   }
@@ -1932,6 +1936,7 @@ document.addEventListener("keydown", function (e) {
     ["mcp-import-overlay", hideImportMcpModal],
     ["mcp-create-overlay", hideCreateMcpModal],
     ["github-import-overlay", hideGitHubImportModal],
+    ["model-create-overlay", hideCreateModelModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);
@@ -4024,4 +4029,358 @@ function _pollInstallStatus(serverId, serverName, attempt) {
       })
       .catch(function () {});
   }, 3000);
+}
+
+// ---------------------------------------------------------------------------
+// Models tab
+// ---------------------------------------------------------------------------
+
+var _modelDefs = [];
+var _modelCreateTrap = null;
+var _modelCreateTrigger = null;
+
+function loadAdminModels() {
+  authFetch("/v1/api/admin/model-definitions")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _modelDefs = data.models || [];
+      _renderModels(_modelDefs);
+    })
+    .catch(function () {
+      var el = document.getElementById("admin-models-table");
+      el.textContent = "";
+      var d = document.createElement("div");
+      d.className = "dashboard-empty";
+      d.textContent = "Failed to load models";
+      el.appendChild(d);
+    });
+}
+
+function _renderModels(items) {
+  var el = document.getElementById("admin-models-table");
+  // Clear previous content
+  el.textContent = "";
+  if (!items.length) {
+    var empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No model definitions configured";
+    el.appendChild(empty);
+    return;
+  }
+  for (var i = 0; i < items.length; i++) {
+    var m = items[i];
+    var isConfig = m.source === "config";
+
+    // Status
+    var dotClass = m.enabled
+      ? "model-status-dot enabled"
+      : "model-status-dot disabled";
+    var rowClass = m.enabled ? "model-row-enabled" : "model-row-disabled";
+    var statusText = m.enabled ? "enabled" : "disabled";
+
+    // Context window formatting (0 = auto-detect)
+    var ctxText = m.context_window
+      ? m.context_window >= 1000
+        ? Math.round(m.context_window / 1000) + "k"
+        : String(m.context_window)
+      : "auto";
+
+    // Provider badge class
+    var providerCls =
+      m.provider === "anthropic"
+        ? "model-provider-anthropic"
+        : "model-provider-openai";
+
+    // Build row via DOM
+    var row = document.createElement("div");
+    row.className = "admin-row models-grid " + rowClass;
+    row.setAttribute("role", "listitem");
+
+    // Alias + source badge
+    var colAlias = document.createElement("span");
+    colAlias.className = "admin-col";
+    colAlias.textContent = m.alias;
+    var badge = document.createElement("span");
+    badge.className = isConfig
+      ? "scope-badge scope-config"
+      : "scope-badge scope-db";
+    badge.textContent = isConfig ? "config" : "db";
+    colAlias.appendChild(document.createTextNode(" "));
+    colAlias.appendChild(badge);
+    row.appendChild(colAlias);
+
+    // Model ID
+    var colModel = document.createElement("span");
+    colModel.className = "admin-col";
+    var code = document.createElement("code");
+    code.textContent = m.model;
+    colModel.appendChild(code);
+    row.appendChild(colModel);
+
+    // Provider
+    var colProvider = document.createElement("span");
+    colProvider.className = "admin-col";
+    var provBadge = document.createElement("span");
+    provBadge.className = "model-provider-badge " + providerCls;
+    provBadge.textContent = m.provider;
+    colProvider.appendChild(provBadge);
+    row.appendChild(colProvider);
+
+    // Context window
+    var colCtx = document.createElement("span");
+    colCtx.className = "admin-col";
+    colCtx.textContent = ctxText;
+    row.appendChild(colCtx);
+
+    // Status
+    var colStatus = document.createElement("span");
+    colStatus.className = "admin-col";
+    var dot = document.createElement("span");
+    dot.className = dotClass;
+    dot.setAttribute("aria-hidden", "true");
+    colStatus.appendChild(dot);
+    colStatus.appendChild(document.createTextNode(statusText));
+    row.appendChild(colStatus);
+
+    // Actions
+    var colActions = document.createElement("span");
+    colActions.className = "admin-col";
+    if (!isConfig) {
+      var editBtn = document.createElement("button");
+      editBtn.className = "admin-btn-action";
+      editBtn.textContent = "edit";
+      editBtn.setAttribute("data-model-edit", m.definition_id);
+      colActions.appendChild(editBtn);
+
+      var delBtn = document.createElement("button");
+      delBtn.className = "admin-btn-danger";
+      delBtn.textContent = "del";
+      delBtn.setAttribute("data-model-delete", m.definition_id);
+      delBtn.setAttribute("data-model-alias", m.alias);
+      colActions.appendChild(delBtn);
+    }
+    row.appendChild(colActions);
+
+    el.appendChild(row);
+  }
+
+  // Bind event handlers
+  el.querySelectorAll("[data-model-edit]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditModelModal(this.getAttribute("data-model-edit"));
+    });
+  });
+  el.querySelectorAll("[data-model-delete]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var did = this.getAttribute("data-model-delete");
+      var dalias = this.getAttribute("data-model-alias");
+      showConfirmModal(
+        "Delete Model",
+        'Delete model "' + dalias + '"?',
+        "Delete",
+        function () {
+          authFetch(
+            "/v1/api/admin/model-definitions/" + encodeURIComponent(did),
+            {
+              method: "DELETE",
+            },
+          )
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function () {
+              showToast("Model deleted");
+              _flagModelSyncPending();
+              loadAdminModels();
+            })
+            .catch(function () {
+              showToast("Failed to delete model");
+            });
+        },
+      );
+    });
+  });
+}
+
+function showCreateModelModal() {
+  _modelCreateTrigger = document.activeElement;
+  var ov = document.getElementById("model-create-overlay");
+  ov.style.display = "flex";
+  document.getElementById("model-edit-id").value = "";
+  document.getElementById("model-create-title").textContent = "Add Model";
+  document.getElementById("model-create-submit").textContent = "Create";
+  document.getElementById("model-create-error").style.display = "none";
+  document.getElementById("model-alias").value = "";
+  document.getElementById("model-name").value = "";
+  document.getElementById("model-provider").value = "openai";
+  document.getElementById("model-base-url").value = "";
+  document.getElementById("model-api-key").value = "";
+  document.getElementById("model-api-key").placeholder = "sk-...";
+  document.getElementById("model-ctx-window").value = "0";
+  document.getElementById("model-capabilities").value = "";
+  document.getElementById("model-enabled").checked = true;
+  document.getElementById("model-alias").focus();
+  _modelCreateTrap = _installTrap("model-create-overlay", "model-create-box");
+}
+
+function showEditModelModal(definitionId) {
+  authFetch(
+    "/v1/api/admin/model-definitions/" + encodeURIComponent(definitionId),
+  )
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (m) {
+      showCreateModelModal();
+      document.getElementById("model-edit-id").value = definitionId;
+      document.getElementById("model-create-title").textContent = "Edit Model";
+      document.getElementById("model-create-submit").textContent = "Save";
+      document.getElementById("model-alias").value = m.alias || "";
+      document.getElementById("model-name").value = m.model || "";
+      document.getElementById("model-provider").value = m.provider || "openai";
+      document.getElementById("model-base-url").value = m.base_url || "";
+      document.getElementById("model-api-key").value = "";
+      document.getElementById("model-api-key").placeholder =
+        "\u2022\u2022\u2022 (leave blank to keep existing)";
+      document.getElementById("model-ctx-window").value =
+        m.context_window != null ? m.context_window : 0;
+      // Parse capabilities JSON for display
+      var caps = m.capabilities || "{}";
+      try {
+        caps = JSON.stringify(JSON.parse(caps), null, 2);
+      } catch (e) {
+        /* keep raw */
+      }
+      if (caps === "{}") caps = "";
+      document.getElementById("model-capabilities").value = caps;
+      document.getElementById("model-enabled").checked = m.enabled !== false;
+    })
+    .catch(function () {
+      showToast("Failed to load model details");
+    });
+}
+
+function hideCreateModelModal() {
+  document.getElementById("model-create-overlay").style.display = "none";
+  _modelCreateTrap = _removeTrap(_modelCreateTrap);
+  if (_modelCreateTrigger && _modelCreateTrigger.focus)
+    _modelCreateTrigger.focus();
+  _modelCreateTrigger = null;
+}
+
+function submitCreateModel() {
+  var alias = document.getElementById("model-alias").value.trim();
+  var modelName = document.getElementById("model-name").value.trim();
+  if (!alias) {
+    _showModelError("Alias is required");
+    return;
+  }
+  if (!modelName) {
+    _showModelError("Model ID is required");
+    return;
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(alias)) {
+    _showModelError("Alias must be alphanumeric (with . _ -)");
+    return;
+  }
+
+  var capsText = document.getElementById("model-capabilities").value.trim();
+  var caps = {};
+  if (capsText) {
+    try {
+      caps = JSON.parse(capsText);
+    } catch (e) {
+      _showModelError("Invalid JSON in capabilities");
+      return;
+    }
+  }
+
+  var form = {
+    alias: alias,
+    model: modelName,
+    provider: document.getElementById("model-provider").value,
+    base_url: document.getElementById("model-base-url").value.trim(),
+    context_window:
+      parseInt(document.getElementById("model-ctx-window").value, 10) || 0,
+    capabilities: caps,
+    enabled: document.getElementById("model-enabled").checked,
+  };
+
+  var apiKey = document.getElementById("model-api-key").value;
+  if (apiKey) form.api_key = apiKey;
+
+  var editId = document.getElementById("model-edit-id").value;
+  var method = editId ? "PUT" : "POST";
+  var url = editId
+    ? "/v1/api/admin/model-definitions/" + encodeURIComponent(editId)
+    : "/v1/api/admin/model-definitions";
+
+  document.getElementById("model-create-submit").disabled = true;
+  authFetch(url, {
+    method: method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(form),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreateModelModal();
+      showToast(editId ? "Model updated" : "Model created");
+      _flagModelSyncPending();
+      loadAdminModels();
+    })
+    .catch(function (e) {
+      _showModelError(e.message);
+    })
+    .finally(function () {
+      document.getElementById("model-create-submit").disabled = false;
+    });
+}
+
+function _showModelError(msg) {
+  var e = document.getElementById("model-create-error");
+  e.textContent = msg;
+  e.style.display = "";
+}
+
+function _flagModelSyncPending() {
+  var btn = document.getElementById("model-sync-btn");
+  if (btn) btn.classList.add("model-sync-pending");
+}
+function _clearModelSyncPending() {
+  var btn = document.getElementById("model-sync-btn");
+  if (btn) btn.classList.remove("model-sync-pending");
+}
+
+function reloadModelNodes() {
+  var btn = document.getElementById("model-sync-btn");
+  btn.disabled = true;
+  btn.textContent = "Syncing...";
+  authFetch("/v1/api/admin/model-definitions/reload", { method: "POST" })
+    .then(function (r) {
+      if (!r.ok) throw new Error();
+      return r.json();
+    })
+    .then(function () {
+      showToast("Model reload dispatched");
+      _clearModelSyncPending();
+      loadAdminModels();
+    })
+    .catch(function () {
+      showToast("Failed to sync models");
+    })
+    .finally(function () {
+      btn.disabled = false;
+      btn.textContent = "Sync to Nodes";
+    });
 }

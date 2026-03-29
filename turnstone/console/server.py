@@ -4677,6 +4677,390 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Admin: Model Definitions
+# ---------------------------------------------------------------------------
+
+_MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
+def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
+    """Replace api_key with '***' (unconditional, write-only)."""
+    m = dict(model)
+    if m.get("api_key"):
+        m["api_key"] = "***"
+    return m
+
+
+async def _collect_model_status(
+    request: Request,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Query all nodes for model status. Returns {node_id: {alias: info}}."""
+    collector: ClusterCollector = request.app.state.collector
+    nodes = collector.get_all_nodes()
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+
+    async def _fetch(node: dict[str, Any]) -> tuple[str, dict[str, dict[str, Any]] | None]:
+        node_id = node.get("node_id", "")
+        url = node.get("server_url", "")
+        if not url:
+            return node_id, None
+        async with sem:
+            try:
+                resp = await client.get(
+                    f"{url.rstrip('/')}/v1/api/_internal/model-status",
+                    headers=headers,
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    return node_id, resp.json().get("models", {})
+            except Exception:
+                log.debug("Failed to fetch model status from node %s", node_id, exc_info=True)
+        return node_id, None
+
+    results = await asyncio.gather(*[_fetch(n) for n in nodes])
+    return {nid: models for nid, models in results if models is not None}
+
+
+async def _notify_nodes_model_reload(request: Request) -> dict[str, Any]:
+    """Tell all nodes to re-read model definitions from DB and rebuild registry."""
+    collector: ClusterCollector = request.app.state.collector
+    nodes = collector.get_all_nodes()
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+
+    async def _notify(node: dict[str, Any]) -> tuple[str, Any]:
+        node_id = node.get("node_id", "")
+        url = node.get("server_url", "")
+        if not url:
+            return node_id, None
+        async with sem:
+            try:
+                resp = await client.post(
+                    f"{url.rstrip('/')}/v1/api/_internal/model-reload",
+                    headers=headers,
+                    timeout=30,
+                )
+                return node_id, resp.json()
+            except Exception as exc:
+                log.debug("Failed to notify node %s for model reload", node_id, exc_info=True)
+                return node_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    return {nid: data for nid, data in results if data is not None}
+
+
+async def admin_list_model_definitions(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-definitions — list all model definitions."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    db_models = storage.list_model_definitions()
+
+    # Collect live status from all nodes
+    node_statuses = await _collect_model_status(request)
+
+    db_aliases: set[str] = set()
+    result = []
+    for m in db_models:
+        db_aliases.add(m["alias"])
+        m["source"] = "db"
+        result.append(_mask_model_secrets(m))
+
+    # Merge config-sourced models visible on nodes but not in DB
+    config_aliases: set[str] = set()
+    for node_models in node_statuses.values():
+        for alias in node_models:
+            if alias not in db_aliases:
+                config_aliases.add(alias)
+    for alias in sorted(config_aliases):
+        # Build a synthetic read-only entry from node-reported data
+        model_name = ""
+        provider = "openai"
+        context_window = 0
+        for node_models in node_statuses.values():
+            nm = node_models.get(alias)
+            if nm:
+                model_name = nm.get("model", "")
+                provider = nm.get("provider", "openai")
+                context_window = nm.get("context_window", 0)
+                break
+        result.append(
+            {
+                "definition_id": "",
+                "alias": alias,
+                "model": model_name,
+                "provider": provider,
+                "base_url": "",
+                "api_key": "",
+                "context_window": context_window,
+                "capabilities": "{}",
+                "enabled": True,
+                "source": "config",
+                "created_by": "",
+                "created": "",
+                "updated": "",
+            }
+        )
+
+    return JSONResponse({"models": result})
+
+
+async def admin_create_model_definition(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/model-definitions — create a model definition."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    alias = str(body.get("alias", "")).strip()[:64]
+    model_name = str(body.get("model", "")).strip()[:128]
+    if not alias:
+        return JSONResponse({"error": "alias is required"}, status_code=400)
+    if not model_name:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+    if not _MODEL_ALIAS_RE.match(alias):
+        return JSONResponse(
+            {"error": "alias must match [a-zA-Z0-9._-]+"},
+            status_code=400,
+        )
+
+    # Check alias uniqueness
+    if storage.get_model_definition_by_alias(alias):
+        return JSONResponse(
+            {"error": f"Model alias '{alias}' already exists"},
+            status_code=409,
+        )
+
+    definition_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    provider = str(body.get("provider", "openai")).strip()
+    if provider not in ("openai", "anthropic"):
+        return JSONResponse(
+            {"error": f"Unknown provider: {provider!r} (must be 'openai' or 'anthropic')"},
+            status_code=400,
+        )
+    base_url = str(body.get("base_url", "")).strip()
+    api_key = str(body.get("api_key", "")).strip()
+    ctx_raw = body.get("context_window", 32768)
+    context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    caps = body.get("capabilities", {})
+    capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
+    enabled = bool(body.get("enabled", True))
+
+    storage.create_model_definition(
+        definition_id=definition_id,
+        alias=alias,
+        model=model_name,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        context_window=context_window,
+        capabilities=capabilities,
+        enabled=enabled,
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "model_definition.create",
+        "model_definition",
+        definition_id,
+        {"alias": alias},
+        ip,
+    )
+
+    created = storage.get_model_definition(definition_id)
+    if created is None:
+        return JSONResponse(
+            {"error": f"Model alias '{alias}' already exists (concurrent insert)"},
+            status_code=409,
+        )
+    return JSONResponse(_mask_model_secrets(created))
+
+
+async def admin_get_model_definition(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-definitions/{definition_id}."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    definition_id = request.path_params["definition_id"]
+    model_def = storage.get_model_definition(definition_id)
+    if model_def is None:
+        return JSONResponse({"error": "Model definition not found"}, status_code=404)
+
+    return JSONResponse(_mask_model_secrets(model_def))
+
+
+async def admin_update_model_definition(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/model-definitions/{definition_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    definition_id = request.path_params["definition_id"]
+    existing = storage.get_model_definition(definition_id)
+    if existing is None:
+        return JSONResponse({"error": "Model definition not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    updates: dict[str, Any] = {}
+    if "alias" in body:
+        alias = str(body["alias"]).strip()[:64]
+        if not alias:
+            return JSONResponse({"error": "alias cannot be empty"}, status_code=400)
+        if not _MODEL_ALIAS_RE.match(alias):
+            return JSONResponse(
+                {"error": "alias must match [a-zA-Z0-9._-]+"},
+                status_code=400,
+            )
+        if alias != existing["alias"] and storage.get_model_definition_by_alias(alias):
+            return JSONResponse(
+                {"error": f"Model alias '{alias}' already exists"},
+                status_code=409,
+            )
+        updates["alias"] = alias
+    if "model" in body:
+        model_val = str(body["model"]).strip()[:128]
+        if not model_val:
+            return JSONResponse({"error": "model cannot be empty"}, status_code=400)
+        updates["model"] = model_val
+    if "provider" in body:
+        prov = str(body["provider"]).strip()
+        if prov not in ("openai", "anthropic"):
+            return JSONResponse(
+                {"error": f"Unknown provider: {prov!r} (must be 'openai' or 'anthropic')"},
+                status_code=400,
+            )
+        updates["provider"] = prov
+    if "base_url" in body:
+        updates["base_url"] = str(body["base_url"]).strip()
+    if "api_key" in body:
+        api_key = str(body["api_key"]).strip()
+        # Sentinel "***" or empty string means "keep existing"
+        if api_key and api_key != "***":
+            updates["api_key"] = api_key
+    if "context_window" in body:
+        ctx_raw = body["context_window"]
+        updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    if "capabilities" in body:
+        caps = body["capabilities"]
+        updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
+    if "enabled" in body:
+        updates["enabled"] = bool(body["enabled"])
+
+    if updates:
+        storage.update_model_definition(definition_id, **updates)
+
+    audit_uid, ip = _audit_context(request)
+    audit_detail = dict(updates)
+    if "api_key" in audit_detail:
+        audit_detail["api_key"] = "(updated)"
+    record_audit(
+        storage,
+        audit_uid,
+        "model_definition.update",
+        "model_definition",
+        definition_id,
+        audit_detail,
+        ip,
+    )
+
+    model_def = storage.get_model_definition(definition_id)
+    return JSONResponse(_mask_model_secrets(model_def or {}))
+
+
+async def admin_delete_model_definition(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/model-definitions/{definition_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    definition_id = request.path_params["definition_id"]
+    existing = storage.get_model_definition(definition_id)
+    if existing is None:
+        return JSONResponse({"error": "Model definition not found"}, status_code=404)
+
+    storage.delete_model_definition(definition_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "model_definition.delete",
+        "model_definition",
+        definition_id,
+        {"alias": existing.get("alias", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok", "definition_id": definition_id})
+
+
+async def admin_model_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/model-definitions/reload — tell nodes to re-read DB."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.models")
+    if err:
+        return err
+
+    results = await _notify_nodes_model_reload(request)
+    return JSONResponse({"status": "ok", "results": results})
+
+
+# ---------------------------------------------------------------------------
 # TLS endpoints
 # ---------------------------------------------------------------------------
 
@@ -5057,6 +5441,32 @@ def create_app(
                     Route(
                         "/api/admin/mcp-servers/{server_id}",
                         admin_delete_mcp_server,
+                        methods=["DELETE"],
+                    ),
+                    # System: Model Definitions
+                    Route("/api/admin/model-definitions", admin_list_model_definitions),
+                    Route(
+                        "/api/admin/model-definitions",
+                        admin_create_model_definition,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/reload",
+                        admin_model_reload,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/{definition_id}",
+                        admin_get_model_definition,
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/{definition_id}",
+                        admin_update_model_definition,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/model-definitions/{definition_id}",
+                        admin_delete_model_definition,
                         methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit

@@ -242,13 +242,18 @@ def load_model_registry(
                             caps = parsed
                     except (_json.JSONDecodeError, TypeError):
                         pass
+                row_provider = row.get("provider", "openai")
+                row_model = row["model"]
+                # 0 = auto-detect: inherit CLI-detected context_window,
+                # same fallback chain as config.toml models
+                row_ctx = row.get("context_window", 0) or context_window
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=_resolve_env_vars(row.get("base_url", "")),
                     api_key=_resolve_env_vars(row.get("api_key", "")),
-                    model=row["model"],
-                    context_window=row.get("context_window", 32768),
-                    provider=row.get("provider", "openai"),
+                    model=row_model,
+                    context_window=row_ctx,
+                    provider=row_provider,
                     capabilities=caps,
                     source="db",
                 )
