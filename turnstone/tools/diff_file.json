@@ -1,6 +1,6 @@
 {
   "name": "diff_file",
-  "description": "Show a unified diff between two files, or between a file's current content and a previous version. Use after edit_file to verify changes, or to compare two files. Returns unified diff output with context lines.",
+  "description": "Show a unified diff between two files, or between a file and a provided string. Use after edit_file to verify changes, or to compare two files. Returns unified diff output with context lines.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -23,6 +23,7 @@
     },
     "required": ["path_a"]
   },
+  "agent": true,
   "task_agent": true,
   "auto_approve": true,
   "primary_key": "path_a"

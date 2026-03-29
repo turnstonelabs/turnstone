@@ -75,7 +75,7 @@ class TestToolsMetadata:
         assert len(TOOLS) == 19
 
     def test_agent_tools_count(self):
-        assert len(AGENT_TOOLS) == 9
+        assert len(AGENT_TOOLS) == 10
 
     def test_task_agent_tools_count(self):
         assert len(TASK_AGENT_TOOLS) == 13

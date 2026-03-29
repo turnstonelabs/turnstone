@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import contextlib
 import dataclasses
+import difflib
 import hashlib
 import json
 import mimetypes
@@ -4269,7 +4270,7 @@ class ChatSession:
         if ext in _IMAGE_EXTENSIONS:
             return self._exec_read_image(call_id, path, resolved)
 
-        all_lines, resolved, err = self._read_text_lines(path)
+        all_lines, _, err = self._read_text_lines(path)
         if err:
             self._read_files.discard(resolved)
             self._report_tool_result(call_id, "read_file", err, is_error=True)
@@ -4438,22 +4439,22 @@ class ChatSession:
         content_b = item.get("content_b")
         ctx = item.get("context_lines", 3)
 
-        lines_a, _, err = self._read_text_lines(path_a)
+        lines_a, resolved_a, err = self._read_text_lines(path_a)
         if err:
             self._report_tool_result(call_id, "diff_file", err, is_error=True)
             return call_id, err
+        self._read_files.add(resolved_a)
 
         if path_b:
             label_b = path_b
-            lines_b, _, err = self._read_text_lines(path_b)
+            lines_b, resolved_b, err = self._read_text_lines(path_b)
             if err:
                 self._report_tool_result(call_id, "diff_file", err, is_error=True)
                 return call_id, err
+            self._read_files.add(resolved_b)
         else:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
-
-        import difflib
 
         diff = list(difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx))
         output = "".join(diff) if diff else "(no differences)"
