@@ -4213,7 +4213,7 @@ function showCreateModelModal() {
   document.getElementById("model-edit-id").value = "";
   document.getElementById("model-create-title").textContent = "Add Model";
   document.getElementById("model-create-submit").textContent = "Create";
-  document.getElementById("model-create-error").style.display = "none";
+  document.getElementById("model-create-error").classList.remove("is-visible");
   document.getElementById("model-alias").value = "";
   document.getElementById("model-name").value = "";
   document.getElementById("model-provider").value = "openai";
@@ -4350,7 +4350,7 @@ function submitCreateModel() {
 function _showModelError(msg) {
   var e = document.getElementById("model-create-error");
   e.textContent = msg;
-  e.style.display = "";
+  e.classList.add("is-visible");
 }
 
 function _flagModelSyncPending() {

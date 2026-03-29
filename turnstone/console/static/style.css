@@ -1189,7 +1189,8 @@
 .admin-modal label.admin-checkbox input:disabled { opacity: 0.4; }
 .admin-modal input::placeholder, .admin-modal textarea::placeholder { color: var(--fg-dim); opacity: 0.6; }
 .admin-modal textarea { resize: vertical; min-height: 40px; }
-.admin-modal [role="alert"] { color: var(--red); font-size: 12px; margin-bottom: 8px; }
+.admin-modal [role="alert"] { display: none; color: var(--red); font-size: 12px; margin-bottom: 8px; }
+.admin-modal [role="alert"].is-visible { display: block; }
 
 .admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
 .admin-details[open] { padding-bottom: 12px; }
