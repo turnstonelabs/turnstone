@@ -290,6 +290,7 @@ class AnthropicProvider:
         """
         system_parts: list[str] = []
         converted: list[dict[str, Any]] = []
+        pending_orphan_results: list[dict[str, Any]] = []
 
         i = 0
         while i < len(messages):
@@ -303,11 +304,50 @@ class AnthropicProvider:
                 continue
 
             if role == "assistant":
+                # Safety: flush any unconsumed synthetic results from a prior
+                # assistant message (should not happen with well-formed data).
+                if pending_orphan_results:
+                    converted.append({"role": "user", "content": pending_orphan_results})
+                    pending_orphan_results = []
                 # If raw provider content was preserved, pass it through verbatim
                 # so encrypted_content/encrypted_index from web search are retained
                 provider_content = msg.get("_provider_content")
                 if provider_content:
                     converted.append({"role": "assistant", "content": provider_content})
+                    # Check for orphaned tool_use in provider content too
+                    if isinstance(provider_content, list):
+                        pc_tool_ids = [
+                            b["id"]
+                            for b in provider_content
+                            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
+                        ]
+                        if pc_tool_ids:
+                            j = i + 1
+                            result_ids_pc: set[str] = set()
+                            while j < len(messages) and messages[j]["role"] == "tool":
+                                tc_id = messages[j].get("tool_call_id", "")
+                                if tc_id:
+                                    result_ids_pc.add(tc_id)
+                                j += 1
+                            orphaned_pc = [uid for uid in pc_tool_ids if uid not in result_ids_pc]
+                            if orphaned_pc:
+                                log.debug(
+                                    "Synthesizing %d tool_result(s) for orphaned provider_content tool_use IDs",
+                                    len(orphaned_pc),
+                                )
+                                synthetic_pc = [
+                                    {
+                                        "type": "tool_result",
+                                        "tool_use_id": uid,
+                                        "content": "Tool execution was cancelled.",
+                                        "is_error": True,
+                                    }
+                                    for uid in orphaned_pc
+                                ]
+                                if j == i + 1:
+                                    converted.append({"role": "user", "content": synthetic_pc})
+                                else:
+                                    pending_orphan_results = synthetic_pc
                     i += 1
                     continue
 
@@ -339,20 +379,28 @@ class AnthropicProvider:
                 # happens when a cancel interrupts tool execution — the
                 # assistant message is saved to DB before tools run, but
                 # GenerationCancelled prevents tool results from being created.
-                tool_use_ids = {b["id"] for b in content_blocks if b.get("type") == "tool_use"}
+                # Collect IDs in order, skip empty IDs (from malformed tool calls).
+                tool_use_ids = [
+                    b["id"] for b in content_blocks if b.get("type") == "tool_use" and b.get("id")
+                ]
                 if tool_use_ids:
                     # Peek ahead to collect tool_result IDs
                     j = i + 1
                     result_ids: set[str] = set()
                     while j < len(messages) and messages[j]["role"] == "tool":
-                        result_ids.add(messages[j].get("tool_call_id", ""))
+                        tc_id = messages[j].get("tool_call_id", "")
+                        if tc_id:
+                            result_ids.add(tc_id)
                         j += 1
-                    orphaned = tool_use_ids - result_ids
+                    orphaned = [uid for uid in tool_use_ids if uid not in result_ids]
                     if orphaned:
                         log.debug(
                             "Synthesizing %d tool_result(s) for orphaned tool_use IDs",
                             len(orphaned),
                         )
+                        # Store for deferred injection — synthetic results are
+                        # appended after any real tool results so
+                        # _merge_consecutive produces them in tool_use order.
                         synthetic = [
                             {
                                 "type": "tool_result",
@@ -362,7 +410,14 @@ class AnthropicProvider:
                             }
                             for uid in orphaned
                         ]
-                        converted.append({"role": "user", "content": synthetic})
+                        if j == i + 1:
+                            # No real tool messages follow — inject immediately
+                            converted.append({"role": "user", "content": synthetic})
+                        else:
+                            # Real tool messages follow — they'll be converted
+                            # next iteration.  Stash synthetic results to append
+                            # after them.
+                            pending_orphan_results = synthetic
 
                 i += 1
                 continue
@@ -376,14 +431,19 @@ class AnthropicProvider:
                     # Convert image_url parts to Anthropic image format
                     if isinstance(content, list):
                         content = self._convert_content_parts(content)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_msg.get("tool_call_id", ""),
-                            "content": content,
-                        }
-                    )
+                    result_block: dict[str, Any] = {
+                        "type": "tool_result",
+                        "tool_use_id": tool_msg.get("tool_call_id", ""),
+                        "content": content,
+                    }
+                    if tool_msg.get("is_error"):
+                        result_block["is_error"] = True
+                    tool_results.append(result_block)
                     i += 1
+                # Append any deferred synthetic results after real ones
+                if pending_orphan_results:
+                    tool_results.extend(pending_orphan_results)
+                    pending_orphan_results = []
                 converted.append({"role": "user", "content": tool_results})
                 continue
 

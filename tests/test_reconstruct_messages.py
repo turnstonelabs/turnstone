@@ -226,3 +226,91 @@ class TestEdgeCases:
         assert len(msgs) == 2
         assert msgs[0]["role"] == "user"
         assert msgs[1]["role"] == "assistant"
+
+
+class TestMidConversationOrphanRepair:
+    """Mid-conversation orphaned tool_calls get synthetic tool results."""
+
+    def test_all_orphaned_mid_conversation(self):
+        """Assistant has 2 tool_calls, no tool results, then user message."""
+        tc = json.dumps(
+            [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                {"id": "c2", "function": {"name": "write_file", "arguments": "{}"}},
+            ]
+        )
+        rows = [
+            _row("user", "do stuff"),
+            _row("assistant", "Running...", tool_calls=tc),
+            _row("user", "never mind"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        # Should have: user, assistant, tool(c1), tool(c2), user
+        assert len(msgs) == 5
+        assert msgs[2]["role"] == "tool"
+        assert msgs[2]["tool_call_id"] == "c1"
+        assert msgs[2]["is_error"] is True
+        assert msgs[3]["role"] == "tool"
+        assert msgs[3]["tool_call_id"] == "c2"
+        assert msgs[4]["role"] == "user"
+
+    def test_partial_results_mid_conversation(self):
+        """2 tool_calls, 1 result present, 1 missing — synthesize only the missing one."""
+        tc = json.dumps(
+            [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+                {"id": "c2", "function": {"name": "write_file", "arguments": "{}"}},
+            ]
+        )
+        rows = [
+            _row("user", "do stuff"),
+            _row("assistant", "", tool_calls=tc),
+            _row("tool", "file1.txt", tool_name="bash", tc_id="c1"),
+            _row("user", "skip the write"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        # Should have: user, assistant, tool(c1 real), tool(c2 synthetic), user
+        assert len(msgs) == 5
+        assert msgs[2]["role"] == "tool"
+        assert msgs[2]["tool_call_id"] == "c1"
+        assert msgs[2]["content"] == "file1.txt"
+        assert msgs[2].get("is_error") is not True
+        assert msgs[3]["role"] == "tool"
+        assert msgs[3]["tool_call_id"] == "c2"
+        assert msgs[3]["is_error"] is True
+        assert msgs[4]["role"] == "user"
+
+    def test_complete_results_no_synthesis(self):
+        """All tool_calls have results — no synthesis needed."""
+        tc = json.dumps(
+            [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+            ]
+        )
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "", tool_calls=tc),
+            _row("tool", "done", tool_name="bash", tc_id="c1"),
+            _row("user", "thanks"),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        assert len(msgs) == 4
+        tool_msgs = [m for m in msgs if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0].get("is_error") is not True
+
+    def test_trailing_orphan_stripped_not_synthesized(self):
+        """Trailing orphan is handled by the existing strip repair, not synthesis."""
+        tc = json.dumps(
+            [
+                {"id": "c1", "function": {"name": "bash", "arguments": "{}"}},
+            ]
+        )
+        rows = [
+            _row("user", "do it"),
+            _row("assistant", "Running...", tool_calls=tc),
+        ]
+        msgs = reconstruct_messages(rows, "ws1")
+        # Trailing strip removes the assistant message entirely
+        assert len(msgs) == 1
+        assert msgs[0]["role"] == "user"

@@ -200,4 +200,45 @@ def reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
             break
         del messages[asst_idx:]
 
+    # Repair: synthesize tool results for mid-conversation orphaned tool calls.
+    # This happens when a cancel interrupts tool execution — the assistant
+    # message with tool_calls is saved to DB but GenerationCancelled prevents
+    # tool results from being created.  Both Anthropic (strict) and OpenAI
+    # (lenient today, may tighten) benefit from well-formed histories.
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            expected_ids = [tc.get("id", "") for tc in msg["tool_calls"] if tc.get("id")]
+            # Collect tool result IDs that follow
+            j = i + 1
+            result_ids: set[str] = set()
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tc_id = messages[j].get("tool_call_id", "")
+                if tc_id:
+                    result_ids.add(tc_id)
+                j += 1
+            # Synthesize results for any missing IDs
+            orphaned = [uid for uid in expected_ids if uid not in result_ids]
+            if orphaned:
+                synthetic = [
+                    {
+                        "role": "tool",
+                        "tool_call_id": uid,
+                        "content": "Tool execution was cancelled.",
+                        "is_error": True,
+                    }
+                    for uid in orphaned
+                ]
+                # Insert after the last existing tool result (or after assistant)
+                messages[j:j] = synthetic
+            if orphaned:
+                i = j + len(orphaned)  # skip past spliced synthetics
+            elif j > i + 1:
+                i = j  # skip past existing tool block
+            else:
+                i += 1  # no tools followed; just advance
+        else:
+            i += 1
+
     return messages

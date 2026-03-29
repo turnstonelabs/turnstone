@@ -1273,11 +1273,13 @@ class TestAnthropicOrphanedToolUse:
                 for block in msg["content"]:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
                         tool_results.append(block)
-        result_map = {r["tool_use_id"]: r for r in tool_results}
-        assert "c1" in result_map
-        assert result_map["c1"]["content"] == "file1.txt"  # real result
-        assert "c2" in result_map
-        assert result_map["c2"]["is_error"] is True  # synthetic
+        # Real result should come before synthetic (ordering matters for Anthropic)
+        assert len(tool_results) == 2
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0]["content"] == "file1.txt"  # real result
+        assert tool_results[0].get("is_error") is not True
+        assert tool_results[1]["tool_use_id"] == "c2"
+        assert tool_results[1]["is_error"] is True  # synthetic
 
     def test_complete_results_no_synthesis(self) -> None:
         """All tool_calls have results — no synthesis needed."""
@@ -1294,12 +1296,16 @@ class TestAnthropicOrphanedToolUse:
             {"role": "user", "content": "thanks"},
         ]
         _, converted = self.provider._convert_messages(messages)
-        # No synthetic results — only the real one
+        # No synthetic results — only the real one (no is_error flag)
+        tool_results = []
         for msg in converted:
             if msg["role"] == "user" and isinstance(msg["content"], list):
                 for block in msg["content"]:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
-                        assert "cancelled" not in block.get("content", "").lower()
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0].get("is_error") is not True
 
     def test_trailing_orphan(self) -> None:
         """Orphaned tool_use at end of conversation (no following messages)."""
@@ -1322,6 +1328,43 @@ class TestAnthropicOrphanedToolUse:
                         tool_results.append(block)
         assert len(tool_results) == 1
         assert tool_results[0]["tool_use_id"] == "c1"
+        assert tool_results[0]["is_error"] is True
+
+    def test_provider_content_orphan(self) -> None:
+        """Orphaned tool_use inside _provider_content (Anthropic raw blocks)."""
+        messages = [
+            {"role": "user", "content": "run something"},
+            {
+                "role": "assistant",
+                "content": "Running...",
+                "_provider_content": [
+                    {"type": "text", "text": "Running..."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "bash",
+                        "input": {"command": "sleep 30"},
+                    },
+                ],
+                "tool_calls": [
+                    {
+                        "id": "toolu_abc",
+                        "function": {"name": "bash", "arguments": '{"command": "sleep 30"}'},
+                    },
+                ],
+            },
+            {"role": "user", "content": "never mind"},
+        ]
+        _, converted = self.provider._convert_messages(messages)
+        # Should synthesize a tool_result for the orphaned tool_use in provider_content
+        tool_results = []
+        for msg in converted:
+            if msg["role"] == "user" and isinstance(msg["content"], list):
+                for block in msg["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tool_results.append(block)
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_use_id"] == "toolu_abc"
         assert tool_results[0]["is_error"] is True
 
 
