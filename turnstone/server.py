@@ -1142,6 +1142,15 @@ async def send_message(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
     # Atomically check-and-start to prevent two concurrent workers on the
     # same session (ChatSession.send() is not thread-safe).
+    # If cancel was requested, poll briefly for the worker to exit before
+    # rejecting.  Snapshot the thread ref since force-cancel can set it to
+    # None concurrently.  Uses async sleep to avoid blocking the event loop.
+    worker = ws.worker_thread
+    if worker and worker.is_alive() and ws.session and ws.session._cancel_event.is_set():
+        for _ in range(30):  # up to 3s in 100ms steps
+            await asyncio.sleep(0.1)
+            if not worker.is_alive():
+                break
     with ws._lock:
         if ws.worker_thread and ws.worker_thread.is_alive():
             ui._enqueue(
@@ -1156,16 +1165,21 @@ async def send_message(request: Request) -> JSONResponse:
 
         def run() -> None:
             assert ui is not None
+            me = threading.current_thread()
             try:
                 session.send(message)
             except GenerationCancelled:
                 # Safety net — send() normally handles this internally.
-                ui._enqueue({"type": "stream_end"})
-                ui.on_state_change("idle")
+                # If this thread was force-abandoned, ws.worker_thread will
+                # have been set to None — don't emit spurious events.
+                if ws.worker_thread is me:
+                    ui._enqueue({"type": "stream_end"})
+                    ui.on_state_change("idle")
             except Exception as e:
-                ui.on_error(f"Error: {e}")
-                ui._enqueue({"type": "stream_end"})
-                ui.on_state_change("error")
+                if ws.worker_thread is me:
+                    ui.on_error(f"Error: {e}")
+                    ui._enqueue({"type": "stream_end"})
+                    ui.on_state_change("error")
 
         t = threading.Thread(target=run, daemon=True)
         ws.worker_thread = t
@@ -1237,6 +1251,7 @@ async def cancel_generation(request: Request) -> JSONResponse:
     session = ws.session
     if session is None:
         return JSONResponse({"error": "No session"}, status_code=400)
+    force = body.get("force", False) is True
     # Only act if generation is actually in progress
     if ws.worker_thread and ws.worker_thread.is_alive():
         # Set the cooperative cancel flag (worker thread checks at checkpoints)
@@ -1244,8 +1259,19 @@ async def cancel_generation(request: Request) -> JSONResponse:
         # Unblock any pending approval/plan review waits
         ui.resolve_approval(False, "Cancelled by user")
         ui.resolve_plan("reject")
-        # Emit cancelled SSE event so SDK consumers get a typed signal
-        ui._enqueue({"type": "cancelled"})
+        if force:
+            # Force cancel: abandon the stuck worker thread (daemon, will
+            # die on process exit or stream timeout) and emit stream_end
+            # so the UI and session recover immediately.  The per-generation
+            # cancel event stays set so the abandoned thread still kills
+            # subprocesses at its next checkpoint.
+            with ws._lock:
+                ws.worker_thread = None
+            ui._enqueue({"type": "stream_end"})
+            ui.on_state_change("idle")
+        else:
+            # Emit cancelled SSE event so SDK consumers get a typed signal
+            ui._enqueue({"type": "cancelled"})
     return JSONResponse({"status": "ok"})
 
 

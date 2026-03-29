@@ -452,9 +452,12 @@ after `/clear` or `/new` commands).
 {"type": "clear_ui"}
 ```
 
-**`cancelled`** -- the generation was cancelled by the user (via the Stop
-button or `POST /v1/api/cancel`). The client should finalize any in-progress
-assistant message with whatever partial content was streamed.
+**`cancelled`** -- a cancel request was acknowledged (via the Stop button or
+`POST /v1/api/cancel`). This signals that cancellation is in progress, not
+that it is complete. The worker thread may still be finishing — wait for
+`stream_end` before transitioning to a ready state. The client should clear
+any in-progress assistant rendering but not re-enable the send button until
+`stream_end` arrives.
 
 ```json
 {"type": "cancelled"}
@@ -793,23 +796,35 @@ containing the resumed session's messages.
 
 Cancels the active generation in a workstream. Sets a cooperative cancellation
 flag that is checked at multiple points in the generation loop (per streaming
-chunk, before tool execution, inside bash commands). The session transitions to
-`idle` state and preserves any partial content already streamed.
+chunk, before tool execution, inside bash commands). Also closes the underlying
+HTTP stream to the LLM provider, unblocking any pending read immediately.
+The session transitions to `idle` state and preserves any partial content
+already streamed.
 
 If the workstream is waiting for tool approval or plan review, the pending
 prompt is automatically denied/rejected to unblock the worker thread.
 
 Calling this endpoint when the workstream is already idle is a harmless no-op.
 
+**Force cancel:** When `force` is `true`, the server abandons the stuck worker
+thread immediately and transitions the workstream to `idle`. The abandoned
+thread continues to wind down in the background (killing any running
+subprocesses and exiting at the next cancellation checkpoint). During this
+wind-down it may emit a final `stream_end` event which the server suppresses
+for the orphaned thread. Use force cancel when cooperative cancel has not
+resolved within a few seconds — the web UI offers this as a "Force Stop"
+button automatically.
+
 **Request body:**
 
 ```json
-{"ws_id": "abc123"}
+{"ws_id": "abc123", "force": false}
 ```
 
 | Field  | Type   | Required | Description          |
 |--------|--------|----------|----------------------|
 | `ws_id`| string | yes      | Target workstream ID |
+| `force`| bool   | no       | Abandon stuck worker immediately (default: `false`) |
 
 **Response:**
 

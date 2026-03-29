@@ -310,6 +310,7 @@ class OpenAIProvider:
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        cancel_ref: list[Any] | None = None,
     ) -> Iterator[StreamChunk]:
         caps = self.get_capabilities(model)
         messages = self._sanitize_messages(messages)
@@ -330,6 +331,8 @@ class OpenAIProvider:
             kwargs["extra_body"] = extra_params
 
         stream = client.chat.completions.create(**kwargs)
+        if cancel_ref is not None:
+            cancel_ref.append(stream)
         yield from self._iter_stream(stream)
 
     def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:

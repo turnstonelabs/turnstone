@@ -30,6 +30,8 @@ function Pane(wsId) {
   this.model = "";
   this.modelAlias = "";
   this.statusText = "";
+  this._cancelTimeout = null;
+  this._forceTimeout = null;
   this._createDOM();
 }
 
@@ -193,6 +195,14 @@ Pane.prototype.updateWsName = function () {
 };
 
 Pane.prototype.disconnectSSE = function () {
+  if (this._cancelTimeout) {
+    clearTimeout(this._cancelTimeout);
+    this._cancelTimeout = null;
+  }
+  if (this._forceTimeout) {
+    clearTimeout(this._forceTimeout);
+    this._forceTimeout = null;
+  }
   if (this.evtSource) {
     this.evtSource.close();
     this.evtSource = null;
@@ -205,6 +215,9 @@ Pane.prototype.setBusy = function (b) {
   this.sendBtn.style.display = b ? "none" : "";
   this.stopBtn.style.display = b ? "" : "none";
   this.stopBtn.disabled = !b;
+  this.stopBtn.textContent = "\u25a0 Stop";
+  this.stopBtn.setAttribute("aria-label", "Stop generation");
+  delete this.stopBtn.dataset.forceCancel;
 };
 
 Pane.prototype.showEmptyState = function () {
@@ -357,8 +370,18 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "stream_end":
+      if (this._cancelTimeout) {
+        clearTimeout(this._cancelTimeout);
+        this._cancelTimeout = null;
+      }
+      if (this._forceTimeout) {
+        clearTimeout(this._forceTimeout);
+        this._forceTimeout = null;
+      }
+      // Render final markdown for the assistant message (existing code).
+      // Note: renderMarkdown is the project's sanitizing markdown renderer.
       if (this.currentAssistantEl && this.contentBuffer) {
-        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer);
+        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer); // sanitized by renderMarkdown
         postRenderMarkdown(this.currentAssistantEl);
       }
       this.currentAssistantEl = null;
@@ -420,17 +443,51 @@ Pane.prototype.handleEvent = function (evt) {
       break;
 
     case "busy_error":
+      // Server is still busy — don't transition to send mode.
+      // Re-enable the stop button so the user can try cancelling.
       this.addErrorMessage(evt.message);
-      this.setBusy(false);
+      this.stopBtn.textContent = "\u25a0 Stop";
+      this.stopBtn.setAttribute("aria-label", "Stop generation");
+      delete this.stopBtn.dataset.forceCancel;
+      this.stopBtn.disabled = false;
       break;
 
     case "cancelled":
+      // Cancel requested but worker thread may still be finishing.
+      // Show "Cancelling..." state; stream_end will transition to ready.
+      // If stream_end already arrived (busy is false), the cancel is
+      // already handled — don't re-enter the cancelling state.
+      if (!this.busy) break;
+      // Clear any prior timeouts first (duplicate cancelled events).
+      clearTimeout(this._cancelTimeout);
+      clearTimeout(this._forceTimeout);
       this.currentAssistantEl = null;
       this.currentReasoningEl = null;
       this.contentBuffer = "";
-      this.setBusy(false);
-      this.inputEl.focus();
+      this.stopBtn.disabled = true;
+      this.stopBtn.textContent = "Cancelling\u2026";
+      this.stopBtn.setAttribute("aria-label", "Cancelling generation");
       this.scrollToBottom(true);
+      // After 2s, offer "Force Stop" for a harder cancel that abandons
+      // the stuck worker thread.  Safety timeout at 10s auto-recovers
+      // if stream_end never arrives (connection drop).
+      var self = this;
+      this._cancelTimeout = setTimeout(function () {
+        if (self.busy) {
+          self.stopBtn.disabled = false;
+          self.stopBtn.textContent = "\u26a0 Force Stop";
+          self.stopBtn.setAttribute("aria-label", "Force stop generation");
+          self.stopBtn.dataset.forceCancel = "true";
+        }
+      }, 2000);
+      this._forceTimeout = setTimeout(function () {
+        if (self.busy) {
+          self.addInfoMessage(
+            "Cancel didn\u2019t complete in time. You may need to resend your last message.",
+          );
+          self.setBusy(false);
+        }
+      }, 10000);
       break;
 
     case "connected":
@@ -1080,17 +1137,35 @@ Pane.prototype.sendMessage = function () {
 };
 
 Pane.prototype.cancelGeneration = function () {
-  if (!this.busy || !this.wsId) return;
+  if (!this.busy || !this.wsId || this.stopBtn.disabled) return;
   var self = this;
+  var isForce = this.stopBtn.dataset.forceCancel === "true";
   this.stopBtn.disabled = true;
   authFetch("/v1/api/cancel", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ws_id: this.wsId }),
-  }).catch(function (err) {
-    self.addErrorMessage("Cancel error: " + err.message);
-    self.stopBtn.disabled = false;
-  });
+    body: JSON.stringify({ ws_id: this.wsId, force: isForce }),
+  })
+    .then(function () {
+      if (isForce) {
+        // Force cancel abandons the worker — transition immediately.
+        // Clear timeouts to prevent stale timers firing on next send.
+        if (self._cancelTimeout) {
+          clearTimeout(self._cancelTimeout);
+          self._cancelTimeout = null;
+        }
+        if (self._forceTimeout) {
+          clearTimeout(self._forceTimeout);
+          self._forceTimeout = null;
+        }
+        self.addInfoMessage("Force stopped. Previous generation abandoned.");
+        self.setBusy(false);
+      }
+    })
+    .catch(function (err) {
+      self.addErrorMessage("Cancel error: " + err.message);
+      self.stopBtn.disabled = false;
+    });
 };
 
 Pane.prototype._autoResize = function () {

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.8.4",
+    "version": "0.9.0",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -1223,6 +1223,12 @@
             "description": "Target workstream ID",
             "title": "Ws Id",
             "type": "string"
+          },
+          "force": {
+            "default": false,
+            "description": "Force cancel: abandon the stuck worker thread immediately. Use when cooperative cancel has not resolved within a few seconds.",
+            "title": "Force",
+            "type": "boolean"
           }
         },
         "required": [

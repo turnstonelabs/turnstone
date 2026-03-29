@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.8.4",
+    "version": "0.9.0",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -3002,7 +3002,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/StatusResponse"
+                  "$ref": "#/components/schemas/DeleteSettingResponse"
                 }
               }
             }
@@ -3453,6 +3453,126 @@
         }
       }
     },
+    "/v1/api/admin/tls/ca": {
+      "get": {
+        "summary": "CA status: initialization state, CN, cert count, cert inventory",
+        "operationId": "v1_api_admin_tls_ca_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/tls/ca.pem": {
+      "get": {
+        "summary": "Download CA root certificate (PEM format)",
+        "operationId": "v1_api_admin_tls_ca.pem_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/tls/certs": {
+      "get": {
+        "summary": "List all issued TLS certificates",
+        "operationId": "v1_api_admin_tls_certs_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/tls/certs/{domain}/renew": {
+      "post": {
+        "summary": "Force-renew a certificate by domain",
+        "operationId": "v1_api_admin_tls_certs_{domain}_renew_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/tls/certs/{domain}": {
+      "delete": {
+        "summary": "Delete a certificate by domain",
+        "operationId": "v1_api_admin_tls_certs_{domain}_delete",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Console health check",
@@ -3505,6 +3625,34 @@
           }
         },
         "title": "StatusResponse",
+        "type": "object"
+      },
+      "DeleteSettingResponse": {
+        "description": "DELETE /v1/api/admin/settings/{key} response.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "examples": [
+              "ok"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "key": {
+            "description": "Dotted setting key that was reset",
+            "title": "Key",
+            "type": "string"
+          },
+          "default": {
+            "description": "Registry default value the setting reverted to",
+            "title": "Default"
+          }
+        },
+        "required": [
+          "key",
+          "default"
+        ],
+        "title": "DeleteSettingResponse",
         "type": "object"
       },
       "AuthLoginRequest": {
