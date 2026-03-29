@@ -12,6 +12,7 @@ import base64
 import concurrent.futures
 import contextlib
 import dataclasses
+import difflib
 import hashlib
 import json
 import mimetypes
@@ -2734,6 +2735,7 @@ class ChatSession:
             "bash": self._prepare_bash,
             "read_file": self._prepare_read_file,
             "search": self._prepare_search,
+            "diff_file": self._prepare_diff,
             "write_file": self._prepare_write_file,
             "edit_file": self._prepare_edit_file,
             "math": self._prepare_math,
@@ -2928,6 +2930,62 @@ class ChatSession:
             "execute": self._exec_search,
             "pattern": pattern,
             "path": path,
+        }
+
+    def _prepare_diff(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        path_a = args.get("path_a", "")
+        path_b = args.get("path_b", "")
+        content_b = args.get("content_b")
+        if not path_a:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: missing path_a",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: path_a is required",
+            }
+        if path_b and content_b is not None:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: ambiguous params",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide path_b or content_b, not both",
+            }
+        if not path_b and content_b is None:
+            return {
+                "call_id": call_id,
+                "func_name": "diff_file",
+                "header": "\u2717 diff_file: missing comparison target",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: provide path_b (another file) or content_b (string to compare against)",
+            }
+        ctx = args.get("context_lines")
+        try:
+            ctx = int(ctx) if ctx is not None else 3
+        except (ValueError, TypeError):
+            ctx = 3
+        ctx = max(0, min(ctx, 20))
+        path_a = os.path.expanduser(path_a)
+        path_b = os.path.expanduser(path_b) if path_b else ""
+        if path_b:
+            header = f"\u2699 diff_file: {path_a} vs {path_b}"
+        else:
+            header = f"\u2699 diff_file: {path_a} vs provided content"
+        return {
+            "call_id": call_id,
+            "func_name": "diff_file",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_diff,
+            "path_a": path_a,
+            "path_b": path_b,
+            "content_b": content_b,
+            "context_lines": ctx,
         }
 
     def _prepare_write_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4240,6 +4298,33 @@ class ChatSession:
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
 
+    @staticmethod
+    def _read_text_lines(path: str) -> tuple[list[str], str, str | None]:
+        """Read a text file with binary detection and symlink resolution.
+
+        Returns (lines, resolved_path, error_msg).  On success error_msg is
+        None.  On failure lines is empty and error_msg describes the problem.
+        """
+        resolved = os.path.realpath(os.path.expanduser(path))
+        try:
+            with open(resolved, "rb") as fb:
+                sample = fb.read(8192)
+            if b"\x00" in sample:
+                return (
+                    [],
+                    resolved,
+                    (
+                        f"Error: {path} appears to be a binary file "
+                        "(contains null bytes). Use bash to inspect binary files."
+                    ),
+                )
+            with open(resolved) as f:
+                return f.readlines(), resolved, None
+        except FileNotFoundError:
+            return [], resolved, f"Error: {path} not found"
+        except Exception as e:
+            return [], resolved, f"Error reading {path}: {e}"
+
     def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Read a file and return numbered lines, or image content parts."""
         call_id, path = item["call_id"], item["path"]
@@ -4252,29 +4337,11 @@ class ChatSession:
         if ext in _IMAGE_EXTENSIONS:
             return self._exec_read_image(call_id, path, resolved)
 
-        try:
-            with open(resolved, "rb") as fb:
-                raw = fb.read(8192)  # sample first 8KB for binary detection
-            if b"\x00" in raw:
-                self._read_files.discard(resolved)
-                msg = (
-                    f"Error: {path} appears to be a binary file "
-                    "(contains null bytes). Use bash to inspect binary files."
-                )
-                self._report_tool_result(call_id, "read_file", msg, is_error=True)
-                return call_id, msg
-            with open(resolved) as f:
-                all_lines = f.readlines()
-        except FileNotFoundError:
+        all_lines, _, err = self._read_text_lines(path)
+        if err:
             self._read_files.discard(resolved)
-            msg = f"Error: {path} not found"
-            self._report_tool_result(call_id, "read_file", msg, is_error=True)
-            return call_id, msg
-        except Exception as e:
-            self._read_files.discard(resolved)
-            msg = f"Error reading {path}: {e}"
-            self._report_tool_result(call_id, "read_file", msg, is_error=True)
-            return call_id, msg
+            self._report_tool_result(call_id, "read_file", err, is_error=True)
+            return call_id, err
 
         self._read_files.add(resolved)
         total_lines = len(all_lines)
@@ -4438,6 +4505,47 @@ class ChatSession:
             msg = f"Error: search failed: {e}"
             self._report_tool_result(call_id, "search", msg, is_error=True)
             return call_id, msg
+
+    def _exec_diff(self, item: dict[str, Any]) -> tuple[str, str]:
+        """Show unified diff between two files or a file and provided content."""
+        call_id = item["call_id"]
+        path_a = item["path_a"]
+        path_b = item.get("path_b", "")
+        content_b = item.get("content_b")
+        ctx = item.get("context_lines", 3)
+
+        lines_a, resolved_a, err = self._read_text_lines(path_a)
+        if err:
+            self._report_tool_result(call_id, "diff_file", err, is_error=True)
+            return call_id, err
+        self._read_files.add(resolved_a)
+
+        if path_b:
+            label_b = path_b
+            lines_b, resolved_b, err = self._read_text_lines(path_b)
+            if err:
+                self._report_tool_result(call_id, "diff_file", err, is_error=True)
+                return call_id, err
+            self._read_files.add(resolved_b)
+        else:
+            label_b = "(provided content)"
+            lines_b = (content_b or "").splitlines(keepends=True)
+
+        # Stream diff with early cutoff to avoid large allocations
+        max_chars = self.tool_truncation or 262_144
+        chunks: list[str] = []
+        total_chars = 0
+        line_count = 0
+        for line in difflib.unified_diff(lines_a, lines_b, fromfile=path_a, tofile=label_b, n=ctx):
+            line_count += 1
+            if total_chars < max_chars:
+                chunks.append(line)
+                total_chars += len(line)
+        output = "".join(chunks) if chunks else "(no differences)"
+        output = self._truncate_output(output)
+        desc = f"{line_count} diff lines" if line_count else "identical"
+        self._report_tool_result(call_id, "diff_file", desc)
+        return call_id, output
 
     def _run_agent(
         self,
