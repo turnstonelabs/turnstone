@@ -2926,7 +2926,11 @@ class ChatSession:
         resolved = os.path.realpath(path)
         is_symlink = os.path.abspath(path) != resolved
         exists = os.path.exists(resolved)
-        is_overwrite = exists and resolved not in self._read_files
+        mode = (args.get("mode") or "overwrite").strip().lower()
+        if mode not in ("overwrite", "append"):
+            mode = "overwrite"
+        is_append = mode == "append"
+        is_overwrite = exists and resolved not in self._read_files and not is_append
 
         # Build preview
         preview_parts = []
@@ -2936,11 +2940,14 @@ class ChatSession:
             preview_parts.append(
                 f"    {YELLOW}Warning: overwriting existing file not previously read{RESET}"
             )
+        if is_append:
+            preview_parts.append(f"    {YELLOW}(append mode){RESET}")
         preview_parts.append(f"{DIM}{textwrap.indent(content, '    ')}{RESET}")
 
-        header = f"\u2699 write_file: {path} ({len(content)} chars)"
+        verb = "append" if is_append else "write"
+        header = f"\u2699 write_file ({verb}): {path} ({len(content)} chars)"
         if is_symlink:
-            header = f"\u2699 write_file: {path} \u2192 {resolved} ({len(content)} chars)"
+            header = f"\u2699 write_file ({verb}): {path} \u2192 {resolved} ({len(content)} chars)"
 
         return {
             "call_id": call_id,
@@ -2948,11 +2955,14 @@ class ChatSession:
             "header": header,
             "preview": "\n".join(preview_parts),
             "needs_approval": True,
-            "approval_label": "overwrite_file" if is_overwrite else "write_file",
+            "approval_label": "append_file"
+            if is_append
+            else ("overwrite_file" if is_overwrite else "write_file"),
             "execute": self._exec_write_file,
             "path": path,
             "resolved": resolved,
             "content": content,
+            "append": is_append,
         }
 
     def _validate_edit_entry(self, e: dict[str, Any], idx: int | None) -> dict[str, Any] | None:
@@ -3044,6 +3054,26 @@ class ChatSession:
                 err["call_id"] = call_id
                 return err
             edits = [self._normalize_edit_entry(args)]
+
+        replace_all = bool(args.get("replace_all"))
+        if replace_all and has_batch:
+            return {
+                "call_id": call_id,
+                "func_name": "edit_file",
+                "header": "\u2717 edit_file: invalid params",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: replace_all cannot be used with edits array",
+            }
+        if replace_all and edits[0].get("near_line") is not None:
+            return {
+                "call_id": call_id,
+                "func_name": "edit_file",
+                "header": "\u2717 edit_file: invalid params",
+                "preview": "",
+                "needs_approval": False,
+                "error": "Error: replace_all cannot be used with near_line",
+            }
 
         path = os.path.expanduser(path)
         resolved = os.path.realpath(path)
@@ -3153,6 +3183,7 @@ class ChatSession:
             "path": path,
             "resolved": resolved,
             "edits": edits,
+            "replace_all": replace_all,
         }
 
     def _prepare_math(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4344,11 +4375,20 @@ class ChatSession:
             elif result.returncode > 1:
                 output = result.stderr.strip() or f"grep error (exit {result.returncode})"
 
-            # Count matches BEFORE truncation
+            # Count matches and files BEFORE truncation
             match_count = output.count("\n") + 1 if result.returncode == 0 and output else 0
+            if match_count:
+                files = {line.split(":", 1)[0] for line in output.splitlines() if ":" in line}
+                file_count = len(files)
+            else:
+                file_count = 0
 
             original_len = len(output)
             output = self._truncate_output(output)
+
+            # Append summary footer to output
+            if match_count:
+                output += f"\n\n({match_count} matches across {file_count} files)"
 
             desc = f"{match_count} matches" if match_count else "no matches"
             if original_len > 500:
@@ -5429,12 +5469,14 @@ class ChatSession:
         self._check_cancelled()
         call_id = item["call_id"]
         path, content, resolved = item["path"], item["content"], item["resolved"]
+        is_append = item.get("append", False)
         try:
             os.makedirs(os.path.dirname(resolved) or ".", exist_ok=True)
-            with open(resolved, "w") as f:
+            with open(resolved, "a" if is_append else "w") as f:
                 f.write(content)
             self._read_files.add(resolved)
-            msg = f"Wrote {len(content)} chars to {path}"
+            verb = "Appended" if is_append else "Wrote"
+            msg = f"{verb} {len(content)} chars to {path}"
             self._report_tool_result(call_id, "write_file", msg)
             return call_id, msg
         except Exception as e:
@@ -5456,6 +5498,23 @@ class ChatSession:
         try:
             with open(resolved) as f:
                 content = f.read()
+
+            # replace_all mode: simple str.replace, skip offset logic
+            do_replace_all = item.get("replace_all", False)
+            if do_replace_all and len(edits) == 1:
+                old = edits[0]["old_string"]
+                new = edits[0]["new_string"]
+                count = content.count(old)
+                if count == 0:
+                    msg = f"Error: old_string not found in {path}"
+                    self._report_tool_result(call_id, "edit_file", msg, is_error=True)
+                    return call_id, msg
+                content = content.replace(old, new)
+                with open(resolved, "w") as f:
+                    f.write(content)
+                msg = f"Edited {path}: replaced {count} occurrences"
+                self._report_tool_result(call_id, "edit_file", msg)
+                return call_id, msg
 
             # Resolve each edit to a (start_idx, end_idx, new_string) replacement
             replacements: list[tuple[int, int, str]] = []

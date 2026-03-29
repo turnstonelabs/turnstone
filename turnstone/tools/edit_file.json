@@ -20,6 +20,10 @@
         "type": "integer",
         "description": "When old_string matches multiple locations, pick the one nearest this line number."
       },
+      "replace_all": {
+        "type": "boolean",
+        "description": "Replace ALL occurrences of old_string instead of requiring a unique match. Cannot be used with near_line or edits array."
+      },
       "edits": {
         "type": "array",
         "description": "Multiple replacements to apply atomically. Each entry has old_string, new_string, and optional near_line. All edits are validated before any are applied. Preferred over multiple edit_file calls when making several changes to the same file.",

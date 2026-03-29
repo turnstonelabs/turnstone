@@ -11,6 +11,11 @@
       "content": {
         "type": "string",
         "description": "The full file content to write."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["overwrite", "append"],
+        "description": "Write mode. 'overwrite' (default) replaces the file. 'append' adds content to the end."
       }
     },
     "required": ["path", "content"]
