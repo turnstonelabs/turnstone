@@ -4,8 +4,6 @@ import queue
 import threading
 import time
 
-import pytest
-
 from turnstone.core.session import GenerationCancelled
 from turnstone.core.workstream import Workstream
 from turnstone.server import _make_watch_dispatch
