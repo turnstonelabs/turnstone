@@ -769,7 +769,7 @@ body { position: static; }
   0%, 100% { border-left-color: var(--accent); }
   50% { border-left-color: var(--accent-dim); }
 }
-.tool-output.collapsed { max-height: 150px; position: relative; }
+.tool-output.collapsed { max-height: 150px; position: relative; overflow: hidden; }
 .tool-output.collapsed::after {
   content: 'click to expand';
   position: absolute;
@@ -912,7 +912,7 @@ body { position: static; }
   max-height: 300px;
   overflow-y: auto;
 }
-.plan-inline-body.collapsed { max-height: 150px; position: relative; }
+.plan-inline-body.collapsed { max-height: 150px; position: relative; overflow: hidden; }
 .plan-inline-body.collapsed::after {
   content: 'click to expand';
   position: absolute;
