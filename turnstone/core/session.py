@@ -2899,7 +2899,7 @@ class ChatSession:
                 "error": f"Error editing {path}: {e}",
             }
 
-        # Build diff preview — full content for web UI, truncated for terminal
+        # Build diff preview — full content (model output is inherently bounded)
         preview_parts = []
         for line in old_string.splitlines():
             preview_parts.append(f"    {RED}- {line}{RESET}")
