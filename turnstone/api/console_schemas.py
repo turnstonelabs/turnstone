@@ -866,3 +866,13 @@ class ModelCapabilitiesResponse(BaseModel):
 class KnownModelsResponse(BaseModel):
     provider: str
     models: list[str] = Field(default_factory=list)
+
+
+class AvailableModelInfo(BaseModel):
+    alias: str
+    model: str
+    provider: str
+
+
+class ListAvailableModelsResponse(BaseModel):
+    models: list[AvailableModelInfo] = Field(default_factory=list)

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.9.0",
+    "version": "0.9.1",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -451,6 +451,27 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ListSkillSummaryResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/models": {
+      "get": {
+        "summary": "List available model aliases",
+        "operationId": "v1_api_models_get",
+        "tags": [
+          "Models"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAvailableModelsResponse"
                 }
               }
             }
@@ -1982,6 +2003,42 @@
           "skills"
         ],
         "title": "ListSkillSummaryResponse",
+        "type": "object"
+      },
+      "AvailableModelInfo": {
+        "properties": {
+          "alias": {
+            "title": "Alias",
+            "type": "string"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          }
+        },
+        "required": [
+          "alias",
+          "model",
+          "provider"
+        ],
+        "title": "AvailableModelInfo",
+        "type": "object"
+      },
+      "ListAvailableModelsResponse": {
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/AvailableModelInfo"
+            },
+            "title": "Models",
+            "type": "array"
+          }
+        },
+        "title": "ListAvailableModelsResponse",
         "type": "object"
       }
     }

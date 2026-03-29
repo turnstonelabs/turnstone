@@ -511,7 +511,6 @@ def _detect_openai_compat(
     base_url: str,
 ) -> None:
     """Fill context_window and server_type for an OpenAI-compatible endpoint."""
-    from turnstone.core.providers._openai import OpenAIProvider
 
     meta: dict[str, Any] | None = None
     owned_by: str = ""
@@ -523,14 +522,17 @@ def _detect_openai_compat(
         owned_by = str(dumped.get("owned_by", ""))
 
     # Context window: prefer backend metadata, fall back to static table
+    # (only for known models — the default 200k would be misleading for local servers)
     if meta is not None:
         n_ctx = meta.get("n_ctx_train")
         if isinstance(n_ctx, int) and n_ctx > 0:
             result["context_window"] = n_ctx
     if result["context_window"] is None:
-        caps = OpenAIProvider().get_capabilities(model_id)
-        if caps.context_window > 0:
-            result["context_window"] = caps.context_window
+        from turnstone.core.providers import lookup_model_capabilities
+
+        known = lookup_model_capabilities("openai", model_id)
+        if known is not None:
+            result["context_window"] = known["context_window"]
 
     # Server type heuristics
     if base_url and "api.openai.com" in base_url:

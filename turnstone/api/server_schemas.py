@@ -257,3 +257,13 @@ class SkillSummary(BaseModel):
 
 class ListSkillSummaryResponse(BaseModel):
     skills: list[SkillSummary]
+
+
+class AvailableModelInfo(BaseModel):
+    alias: str
+    model: str
+    provider: str
+
+
+class ListAvailableModelsResponse(BaseModel):
+    models: list[AvailableModelInfo] = Field(default_factory=list)

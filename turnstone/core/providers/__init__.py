@@ -57,7 +57,10 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     if provider_name in ("openai", "openai-compatible"):
         from openai import OpenAI
 
-        return OpenAI(base_url=base_url, api_key=api_key)
+        kw: dict[str, str] = {"api_key": api_key}
+        if base_url:
+            kw["base_url"] = base_url
+        return OpenAI(**kw)
     if provider_name == "anthropic":
         from turnstone.core.providers._anthropic import _ensure_anthropic
 
@@ -75,9 +78,12 @@ def lookup_model_capabilities(provider: str, model: str) -> dict[str, Any] | Non
     """Return static capabilities for a known model, or ``None`` if unknown.
 
     The returned dict has JSON-friendly values (tuples converted to lists).
+    Returns ``None`` for ``openai-compatible`` (no static table for local models).
     """
     import dataclasses
 
+    if provider == "openai-compatible":
+        return None
     prov = create_provider(provider)
     caps = prov.get_capabilities(model)
     default = prov.get_capabilities("")
