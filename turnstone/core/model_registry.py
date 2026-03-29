@@ -139,7 +139,21 @@ class ModelRegistry:
         fallback: list[str] | None = None,
         agent_model: str | None = None,
     ) -> None:
-        """Hot-reload all model configs. Thread-safe; clears cached clients."""
+        """Hot-reload all model configs. Thread-safe; clears cached clients.
+
+        Validates arguments before mutating state so a bad reload
+        does not leave the registry in an inconsistent state.
+        """
+        if not models:
+            raise ValueError("ModelRegistry requires at least one model config")
+        if default not in models:
+            raise ValueError(f"Default model '{default}' not found in registry")
+        if fallback:
+            for alias in fallback:
+                if alias not in models:
+                    raise ValueError(f"Fallback model '{alias}' not found in registry")
+        if agent_model and agent_model not in models:
+            raise ValueError(f"Agent model '{agent_model}' not found in registry")
         with self._client_lock:
             self._models = dict(models)
             self.default = default
@@ -177,7 +191,7 @@ def _resolve_env_vars(value: str) -> str:
     def _replace(m: re.Match[str]) -> str:
         return os.environ.get(m.group(1), "")
 
-    return re.sub(r"\$\{([^}]+)\}", _replace, value)
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, value)
 
 
 def load_model_registry(
@@ -257,15 +271,17 @@ def load_model_registry(
             source="config",
         )
 
-    # 3. Ensure a "default" entry from CLI args
-    configs["default"] = ModelConfig(
-        alias="default",
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        context_window=context_window,
-        provider=provider,
-    )
+    # 3. Ensure a "default" entry from CLI args (only if not already defined
+    # by config.toml or DB — those take precedence)
+    if "default" not in configs:
+        configs["default"] = ModelConfig(
+            alias="default",
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            context_window=context_window,
+            provider=provider,
+        )
 
     # Determine default alias
     default_alias = model_section.get("default", "default")

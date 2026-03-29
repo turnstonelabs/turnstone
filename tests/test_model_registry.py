@@ -483,6 +483,28 @@ class TestLoadModelRegistryWithDB:
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         assert reg.get_config("caps-model").capabilities == {"supports_vision": True}
 
+    def test_db_default_alias_not_clobbered(self) -> None:
+        """DB model with alias='default' is not overwritten by CLI args."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "default",
+                    "model": "db-default-model",
+                    "provider": "openai",
+                    "base_url": "http://db/v1",
+                    "api_key": "sk-db",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://cli/v1", "cli-key", "cli-model", storage=storage)
+        cfg = reg.get_config("default")
+        assert cfg.model == "db-default-model"
+        assert cfg.source == "db"
+
     def test_no_db_writes(self) -> None:
         """Config.toml models are NOT written to storage."""
         storage = _MockStorage()
@@ -555,6 +577,21 @@ class TestRegistryReload:
         # Reload with same models — clients should be cleared
         reg.reload(dict(models), "a")
         assert "a" not in reg._clients
+
+    def test_reload_validates_default(self) -> None:
+        models_a = {"a": ModelConfig("a", "x", "x", "m")}
+        reg = ModelRegistry(models=models_a, default="a")
+        with pytest.raises(ValueError, match="Default model"):
+            reg.reload(models_a, "nonexistent")
+        # Registry should be unchanged after failed reload
+        assert reg.has_alias("a")
+        assert reg.default == "a"
+
+    def test_reload_validates_empty(self) -> None:
+        models_a = {"a": ModelConfig("a", "x", "x", "m")}
+        reg = ModelRegistry(models=models_a, default="a")
+        with pytest.raises(ValueError, match="at least one"):
+            reg.reload({}, "a")
 
 
 # ---------------------------------------------------------------------------

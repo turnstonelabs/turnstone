@@ -173,7 +173,12 @@ WRITE_PATHS: frozenset[str] = frozenset(
 )
 
 APPROVE_PATHS: frozenset[str] = frozenset(
-    {"/api/approve", "/api/_internal/config-reload", "/api/_internal/mcp-reload"}
+    {
+        "/api/approve",
+        "/api/_internal/config-reload",
+        "/api/_internal/mcp-reload",
+        "/api/_internal/model-reload",
+    }
 )
 ADMIN_PREFIX = "/api/admin/"
 

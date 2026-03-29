@@ -1835,12 +1835,15 @@ def internal_model_reload(request: Request) -> JSONResponse:
         provider=cli_args["provider"],
         storage=get_storage(),
     )
-    registry.reload(
-        new_registry._models,
-        new_registry.default,
-        new_registry.fallback,
-        new_registry.agent_model,
-    )
+    try:
+        registry.reload(
+            new_registry._models,
+            new_registry.default,
+            new_registry.fallback,
+            new_registry.agent_model,
+        )
+    except ValueError as exc:
+        return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 
 
