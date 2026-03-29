@@ -11,6 +11,10 @@
       "timeout": {
         "type": "integer",
         "description": "Timeout in seconds (1-600). Omit to use the global tools.timeout setting (typically 120s). Use higher values for long-running commands like test suites or builds."
+      },
+      "stop_on_error": {
+        "type": "boolean",
+        "description": "If true, enables 'set -e' so the script exits on the first command failure. Default false. Use for multi-step scripts where intermediate failures should halt execution."
       }
     },
     "required": ["command"]

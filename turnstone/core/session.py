@@ -2832,6 +2832,7 @@ class ChatSession:
             "execute": self._exec_bash,
             "command": command,
             "timeout": timeout,
+            "stop_on_error": bool(args.get("stop_on_error")),
         }
 
     def _prepare_read_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4198,7 +4199,10 @@ class ChatSession:
         timeout = item.get("timeout") or self.tool_timeout
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-                f.write("set -o pipefail\n" + command)
+                preamble = "set -o pipefail\n"
+                if item.get("stop_on_error"):
+                    preamble += "set -e\n"
+                f.write(preamble + command)
                 script_path = f.name
             try:
                 from turnstone.core.env import scrubbed_env
