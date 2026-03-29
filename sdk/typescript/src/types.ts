@@ -10,6 +10,12 @@ export interface StatusResponse {
   status: string;
 }
 
+export interface DeleteSettingResponse {
+  status: string;
+  key: string;
+  default: unknown;
+}
+
 export interface AuthLoginRequest {
   token: string;
 }

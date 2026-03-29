@@ -44,6 +44,7 @@ import type {
   OrgInfo,
   RoleInfo,
   ScheduleInfo,
+  DeleteSettingResponse,
   SettingInfo,
   StatusResponse,
   ToolPolicyInfo,
@@ -394,7 +395,10 @@ export class TurnstoneConsole extends BaseClient {
     });
   }
 
-  async deleteSetting(key: string, nodeId?: string): Promise<StatusResponse> {
+  async deleteSetting(
+    key: string,
+    nodeId?: string,
+  ): Promise<DeleteSettingResponse> {
     const params: Record<string, string> = {};
     if (nodeId) params.node_id = nodeId;
     return this.request("DELETE", `/v1/api/admin/settings/${key}`, {
