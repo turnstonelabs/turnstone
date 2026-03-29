@@ -4230,6 +4230,33 @@ class ChatSession:
             self._report_tool_result(call_id, "bash", msg, is_error=True)
             return call_id, msg
 
+    @staticmethod
+    def _read_text_lines(path: str) -> tuple[list[str], str, str | None]:
+        """Read a text file with binary detection and symlink resolution.
+
+        Returns (lines, resolved_path, error_msg).  On success error_msg is
+        None.  On failure lines is empty and error_msg describes the problem.
+        """
+        resolved = os.path.realpath(os.path.expanduser(path))
+        try:
+            with open(resolved, "rb") as fb:
+                sample = fb.read(8192)
+            if b"\x00" in sample:
+                return (
+                    [],
+                    resolved,
+                    (
+                        f"Error: {path} appears to be a binary file "
+                        "(contains null bytes). Use bash to inspect binary files."
+                    ),
+                )
+            with open(resolved) as f:
+                return f.readlines(), resolved, None
+        except FileNotFoundError:
+            return [], resolved, f"Error: {path} not found"
+        except Exception as e:
+            return [], resolved, f"Error reading {path}: {e}"
+
     def _exec_read_file(self, item: dict[str, Any]) -> tuple[str, str | list[dict[str, Any]]]:
         """Read a file and return numbered lines, or image content parts."""
         call_id, path = item["call_id"], item["path"]
@@ -4242,29 +4269,11 @@ class ChatSession:
         if ext in _IMAGE_EXTENSIONS:
             return self._exec_read_image(call_id, path, resolved)
 
-        try:
-            with open(resolved, "rb") as fb:
-                raw = fb.read(8192)  # sample first 8KB for binary detection
-            if b"\x00" in raw:
-                self._read_files.discard(resolved)
-                msg = (
-                    f"Error: {path} appears to be a binary file "
-                    "(contains null bytes). Use bash to inspect binary files."
-                )
-                self._report_tool_result(call_id, "read_file", msg, is_error=True)
-                return call_id, msg
-            with open(resolved) as f:
-                all_lines = f.readlines()
-        except FileNotFoundError:
+        all_lines, resolved, err = self._read_text_lines(path)
+        if err:
             self._read_files.discard(resolved)
-            msg = f"Error: {path} not found"
-            self._report_tool_result(call_id, "read_file", msg, is_error=True)
-            return call_id, msg
-        except Exception as e:
-            self._read_files.discard(resolved)
-            msg = f"Error reading {path}: {e}"
-            self._report_tool_result(call_id, "read_file", msg, is_error=True)
-            return call_id, msg
+            self._report_tool_result(call_id, "read_file", err, is_error=True)
+            return call_id, err
 
         self._read_files.add(resolved)
         total_lines = len(all_lines)
@@ -4428,33 +4437,18 @@ class ChatSession:
         path_b = item.get("path_b", "")
         content_b = item.get("content_b")
         ctx = item.get("context_lines", 3)
-        try:
-            resolved_a = os.path.realpath(path_a)
-            with open(resolved_a) as f:
-                lines_a = f.readlines()
-        except FileNotFoundError:
-            msg = f"Error: {path_a} not found"
-            self._report_tool_result(call_id, "diff_file", msg, is_error=True)
-            return call_id, msg
-        except Exception as e:
-            msg = f"Error reading {path_a}: {e}"
-            self._report_tool_result(call_id, "diff_file", msg, is_error=True)
-            return call_id, msg
+
+        lines_a, _, err = self._read_text_lines(path_a)
+        if err:
+            self._report_tool_result(call_id, "diff_file", err, is_error=True)
+            return call_id, err
 
         if path_b:
             label_b = path_b
-            try:
-                resolved_b = os.path.realpath(path_b)
-                with open(resolved_b) as f:
-                    lines_b = f.readlines()
-            except FileNotFoundError:
-                msg = f"Error: {path_b} not found"
-                self._report_tool_result(call_id, "diff_file", msg, is_error=True)
-                return call_id, msg
-            except Exception as e:
-                msg = f"Error reading {path_b}: {e}"
-                self._report_tool_result(call_id, "diff_file", msg, is_error=True)
-                return call_id, msg
+            lines_b, _, err = self._read_text_lines(path_b)
+            if err:
+                self._report_tool_result(call_id, "diff_file", err, is_error=True)
+                return call_id, err
         else:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
