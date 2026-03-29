@@ -1844,6 +1844,8 @@ def internal_model_reload(request: Request) -> JSONResponse:
         )
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
+    finally:
+        new_registry.shutdown()
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 
 

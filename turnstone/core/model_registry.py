@@ -82,9 +82,9 @@ class ModelRegistry:
 
     def get_client(self, alias: str) -> Any:
         """Get or lazily create an API client for *alias*. Thread-safe."""
-        if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
         with self._client_lock:
+            if alias not in self._models:
+                raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._clients:
                 cfg = self._models[alias]
                 self._clients[alias] = create_client(
@@ -94,9 +94,9 @@ class ModelRegistry:
 
     def get_provider(self, alias: str) -> LLMProvider:
         """Get the ``LLMProvider`` for *alias*. Thread-safe, cached."""
-        if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
         with self._client_lock:
+            if alias not in self._models:
+                raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._providers:
                 cfg = self._models[alias]
                 self._providers[alias] = create_provider(cfg.provider)
