@@ -10,8 +10,9 @@ LABEL org.opencontainers.image.title="turnstone" \
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
 
-# System dependencies for psycopg (PostgreSQL client library)
-RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends libpq5 \
+# System dependencies: psycopg (libpq5), developer tooling for agent workflows
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
+    libpq5 git curl jq man-db info \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user
