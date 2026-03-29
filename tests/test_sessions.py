@@ -525,6 +525,37 @@ class TestWorkstreamConfig:
         assert session.instructions == "be concise"
         assert session.creative_mode is True
 
+    def test_resume_restores_model(self, tmp_db):
+        """ChatSession.resume() should restore the model from workstream config."""
+        client = MagicMock()
+        client.models.list.return_value.data = [MagicMock(id="test-model")]
+        ui = MagicMock()
+        ui.on_info = MagicMock()
+        ui.on_error = MagicMock()
+        ui.on_state_change = MagicMock()
+        ui.on_rename = MagicMock()
+
+        # Create a workstream that was using a specific model
+        register_workstream("model_ws")
+        save_message("model_ws", "user", "hello")
+        save_message("model_ws", "assistant", "hi")
+        save_workstream_config("model_ws", {"model": "gpt-5", "model_alias": ""})
+
+        # Resume into a session that was created with a different model
+        session = ChatSession(
+            client=client,
+            model="gpt-5-nano",
+            ui=ui,
+            instructions=None,
+            temperature=0.5,
+            max_tokens=1000,
+            tool_timeout=10,
+        )
+        assert session.model == "gpt-5-nano"
+        result = session.resume("model_ws")
+        assert result is True
+        assert session.model == "gpt-5"
+
 
 # ── Prune workstreams ─────────────────────────────────────────────────
 

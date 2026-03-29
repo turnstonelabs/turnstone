@@ -58,6 +58,12 @@ _RE_ENV_SECRET_KEY = re.compile(
     r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL)(?:_|$)|(?:^|_)KEY(?:_|$)",
     re.IGNORECASE,
 )
+_RE_JSON_SECRET = re.compile(
+    r'"(?:api_key|apikey|api_secret|secret_key|secret|password|passwd|'
+    r"token|access_token|refresh_token|auth_token|private_key|"
+    r'client_secret|webhook_secret|signing_key|encryption_key)"\s*:\s*"([^"]{8,})"',
+    re.IGNORECASE,
+)
 
 # (pattern, redact_label) — ordered most-specific first for redaction.
 _CREDENTIAL_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -228,6 +234,15 @@ def _check_credentials(
         found = True
         risk = "high"
 
+    if _RE_JSON_SECRET.search(text):
+        _add_flag(flags, "credential_leak")
+        flags.append("json_secret_leak")
+        ann.append(
+            "Output contains JSON with secret-bearing keys (api_key, password, token, etc.)."
+        )
+        found = True
+        risk = "high"
+
     return risk, _redact_credentials(text) if found else None
 
 
@@ -247,6 +262,15 @@ def _redact_credentials(text: str) -> str:
         return key + "=[REDACTED:secret]" if _RE_ENV_SECRET_KEY.search(key) else m.group()
 
     result = _RE_ENV_SECRET_LINE.sub(_redact_env, result)
+
+    def _redact_json_secret(m: re.Match[str]) -> str:
+        # Positional replacement to avoid corrupting key when value == key name
+        start = m.start(1) - m.start()
+        end = m.end(1) - m.start()
+        full = m.group()
+        return full[:start] + "[REDACTED:secret]" + full[end:]
+
+    result = _RE_JSON_SECRET.sub(_redact_json_secret, result)
     return result
 
 

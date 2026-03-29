@@ -516,6 +516,8 @@ class ChatSession:
         save_workstream_config(
             self._ws_id,
             {
+                "model": self.model,
+                "model_alias": self._model_alias or "",
                 "temperature": str(self.temperature),
                 "reasoning_effort": self.reasoning_effort,
                 "max_tokens": str(self.max_tokens),
@@ -847,6 +849,25 @@ class ChatSession:
         # Restore persisted config
         config = load_workstream_config(ws_id)
         if config:
+            # Restore model via registry (same path as /model command)
+            saved_alias = config.get("model_alias", "")
+            saved_model = config.get("model", "")
+            if saved_alias and self._registry and self._registry.has_alias(saved_alias):
+                client, model_name, cfg = self._registry.resolve(saved_alias)
+                self.client = client
+                self.model = model_name
+                self._model_alias = saved_alias
+                self._provider = self._registry.get_provider(saved_alias)
+                self._cached_capabilities = None
+                self._judge = None  # re-create with new client/model
+                self.context_window = cfg.context_window
+                if not self._manual_tool_truncation:
+                    self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+            elif saved_model and saved_model != self.model:
+                # No alias or alias no longer in registry — at least set the model name
+                self.model = saved_model
+                self._model_alias = None
+                self._cached_capabilities = None
             if "temperature" in config:
                 self.temperature = float(config["temperature"])
             if "reasoning_effort" in config:
@@ -2857,16 +2878,48 @@ class ChatSession:
             "content": content,
         }
 
+    def _validate_edit_entry(self, e: dict[str, Any], idx: int | None) -> dict[str, Any] | None:
+        """Validate a single edit entry. Returns an error dict or None."""
+        label = f"edits[{idx}]: " if idx is not None else ""
+        old = e.get("old_string", "")
+        new = e.get("new_string", "")
+        if not old:
+            return {
+                "call_id": "",
+                "func_name": "edit_file",
+                "header": f"\u2717 edit_file: {label}missing old_string",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: {label}missing old_string",
+            }
+        if old == new:  # deletion (new_string="") is fine
+            return {
+                "call_id": "",
+                "func_name": "edit_file",
+                "header": f"\u2717 edit_file: {label}no-op",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: {label}old_string and new_string are identical",
+            }
+        return None
+
+    @staticmethod
+    def _normalize_edit_entry(e: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a single edit entry into a canonical dict."""
+        nl = e.get("near_line")
+        if isinstance(nl, str):
+            try:
+                nl = int(nl)
+            except ValueError:
+                nl = None
+        return {
+            "old_string": e.get("old_string", ""),
+            "new_string": e.get("new_string", ""),
+            "near_line": nl,
+        }
+
     def _prepare_edit_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         path = args.get("path", "")
-        old_string = args.get("old_string", "")
-        new_string = args.get("new_string", "")
-        near_line = args.get("near_line")
-        if isinstance(near_line, str):
-            try:
-                near_line = int(near_line)
-            except ValueError:
-                near_line = None
         if not path:
             return {
                 "call_id": call_id,
@@ -2876,24 +2929,45 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: missing path",
             }
-        if not old_string:
+
+        # Normalize into a list of edit dicts: old_string + new_string [+ near_line]
+        raw_edits = args.get("edits")
+        has_single = bool(args.get("old_string"))
+        has_batch = bool(raw_edits and isinstance(raw_edits, list))
+        if has_single and has_batch:
             return {
                 "call_id": call_id,
                 "func_name": "edit_file",
-                "header": "\u2717 edit_file: missing old_string",
+                "header": "\u2717 edit_file: ambiguous params",
                 "preview": "",
                 "needs_approval": False,
-                "error": "Error: missing old_string",
+                "error": "Error: provide old_string/new_string or edits array, not both",
             }
-        if old_string == new_string:
-            return {
-                "call_id": call_id,
-                "func_name": "edit_file",
-                "header": "\u2717 edit_file: no-op",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: old_string and new_string are identical",
-            }
+        if has_batch:
+            assert isinstance(raw_edits, list)
+            edits: list[dict[str, Any]] = []
+            for i, e in enumerate(raw_edits):
+                if not isinstance(e, dict):
+                    return {
+                        "call_id": call_id,
+                        "func_name": "edit_file",
+                        "header": f"\u2717 edit_file: edits[{i}] not an object",
+                        "preview": "",
+                        "needs_approval": False,
+                        "error": f"Error: edits[{i}] must be an object with old_string and new_string",
+                    }
+                err = self._validate_edit_entry(e, i)
+                if err:
+                    err["call_id"] = call_id
+                    return err
+                edits.append(self._normalize_edit_entry(e))
+        else:
+            err = self._validate_edit_entry(args, None)
+            if err:
+                err["call_id"] = call_id
+                return err
+            edits = [self._normalize_edit_entry(args)]
+
         path = os.path.expanduser(path)
         resolved = os.path.realpath(path)
 
@@ -2907,36 +2981,41 @@ class ChatSession:
                 "error": f"Error: must read_file {path} before editing it",
             }
 
-        # Pre-read to validate and build diff preview
+        # Pre-read to validate all edits and build diff preview
         try:
             with open(path) as f:
                 content = f.read()
-            occurrences = find_occurrences(content, old_string)
-            if len(occurrences) == 0:
-                return {
-                    "call_id": call_id,
-                    "func_name": "edit_file",
-                    "header": f"\u2717 edit_file: {path}",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": (
-                        f"Error: old_string not found in {path}. "
-                        "The file may have changed — re-read it before retrying."
-                    ),
-                }
-            if len(occurrences) > 1 and near_line is None:
-                line_list = ", ".join(str(ln) for ln in occurrences)
-                return {
-                    "call_id": call_id,
-                    "func_name": "edit_file",
-                    "header": f"\u2717 edit_file: {path}",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": (
-                        f"Error: old_string found {len(occurrences)} times "
-                        f"at lines {line_list} — use near_line to pick one"
-                    ),
-                }
+
+            for i, edit in enumerate(edits):
+                old = edit["old_string"]
+                nl = edit.get("near_line")
+                label = f"edits[{i}]: " if len(edits) > 1 else ""
+                occurrences = find_occurrences(content, old)
+                if len(occurrences) == 0:
+                    return {
+                        "call_id": call_id,
+                        "func_name": "edit_file",
+                        "header": f"\u2717 edit_file: {path}",
+                        "preview": "",
+                        "needs_approval": False,
+                        "error": (
+                            f"Error: {label}old_string not found in {path}. "
+                            "The file may have changed — re-read it before retrying."
+                        ),
+                    }
+                if len(occurrences) > 1 and nl is None:
+                    line_list = ", ".join(str(ln) for ln in occurrences)
+                    return {
+                        "call_id": call_id,
+                        "func_name": "edit_file",
+                        "header": f"\u2717 edit_file: {path}",
+                        "preview": "",
+                        "needs_approval": False,
+                        "error": (
+                            f"Error: {label}old_string found {len(occurrences)} times "
+                            f"at lines {line_list} — use near_line to pick one"
+                        ),
+                    }
         except FileNotFoundError:
             return {
                 "call_id": call_id,
@@ -2956,29 +3035,37 @@ class ChatSession:
                 "error": f"Error editing {path}: {e}",
             }
 
-        # Build diff preview — full content (model output is inherently bounded)
+        # Build diff preview
         preview_parts = []
-        for line in old_string.splitlines():
-            preview_parts.append(f"    {RED}- {line}{RESET}")
-        if new_string:
-            for line in new_string.splitlines():
-                preview_parts.append(f"    {GREEN}+ {line}{RESET}")
-        else:
-            preview_parts.append(f"    {YELLOW}(deletion — {len(old_string)} chars removed){RESET}")
+        for i, edit in enumerate(edits):
+            if len(edits) > 1:
+                preview_parts.append(f"    {YELLOW}--- edit {i + 1}/{len(edits)} ---{RESET}")
+            for line in edit["old_string"].splitlines():
+                preview_parts.append(f"    {RED}- {line}{RESET}")
+            if edit["new_string"]:
+                for line in edit["new_string"].splitlines():
+                    preview_parts.append(f"    {GREEN}+ {line}{RESET}")
+            else:
+                n = len(edit["old_string"])
+                preview_parts.append(f"    {YELLOW}(deletion — {n} chars removed){RESET}")
 
+        count = len(edits)
+        header = (
+            f"\u2699 edit_file: {path} ({count} edits)"
+            if count > 1
+            else f"\u2699 edit_file: {path}"
+        )
         return {
             "call_id": call_id,
             "func_name": "edit_file",
-            "header": f"\u2699 edit_file: {path}",
+            "header": header,
             "preview": "\n".join(preview_parts),
             "needs_approval": True,
             "approval_label": "edit_file",
             "execute": self._exec_edit_file,
             "path": path,
             "resolved": resolved,
-            "old_string": old_string,
-            "new_string": new_string,
-            "near_line": near_line,
+            "edits": edits,
         }
 
     def _prepare_math(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -3960,7 +4047,8 @@ class ChatSession:
 
             output = "".join(stdout_parts)
             if stderr_lines:
-                output += ("\n" if output else "") + "".join(stderr_lines)
+                tagged = "".join(f"[stderr] {line}" for line in stderr_lines)
+                output += ("\n" if output else "") + tagged
             output = output.strip()
             output = self._truncate_output(output)
 
@@ -5216,44 +5304,63 @@ class ChatSession:
             return call_id, msg
 
     def _exec_edit_file(self, item: dict[str, Any]) -> tuple[str, str]:
-        """Replace an exact string in a file (re-reads to avoid TOCTOU).
+        """Apply one or more edits to a file (re-reads to avoid TOCTOU).
 
-        When near_line is set, picks the occurrence nearest that line
-        instead of requiring uniqueness.
+        Batch edits are resolved to character offsets, checked for overlap,
+        and applied in reverse order so earlier offsets stay valid.
         """
         self._check_cancelled()
         call_id = item["call_id"]
-        path, old_string, new_string = (
-            item["path"],
-            item["old_string"],
-            item["new_string"],
-        )
-        near_line = item.get("near_line")
+        path = item["path"]
+        edits: list[dict[str, Any]] = item["edits"]
         try:
             with open(path) as f:
                 content = f.read()
-            occurrences = find_occurrences(content, old_string)
-            if len(occurrences) == 0:
-                msg = f"Error: old_string no longer found in {path} (file changed)"
-                self._report_tool_result(call_id, "edit_file", msg, is_error=True)
-                return call_id, msg
-            if len(occurrences) > 1 and near_line is None:
-                line_list = ", ".join(str(ln) for ln in occurrences)
-                msg = (
-                    f"Error: old_string found {len(occurrences)} times "
-                    f"at lines {line_list} (file changed)"
-                )
-                self._report_tool_result(call_id, "edit_file", msg, is_error=True)
-                return call_id, msg
-            if near_line is not None and len(occurrences) > 1:
-                # Replace only the occurrence nearest to near_line
-                idx = pick_nearest(content, old_string, near_line)
-                content = content[:idx] + new_string + content[idx + len(old_string) :]
-            else:
-                content = content.replace(old_string, new_string, 1)
+
+            # Resolve each edit to a (start_idx, end_idx, new_string) replacement
+            replacements: list[tuple[int, int, str]] = []
+            for i, edit in enumerate(edits):
+                new = edit["new_string"]
+                label = f"edits[{i}]: " if len(edits) > 1 else ""
+
+                old = edit["old_string"]
+                nl = edit.get("near_line")
+                occurrences = find_occurrences(content, old)
+                if len(occurrences) == 0:
+                    msg = f"Error: {label}old_string no longer found in {path} (file changed)"
+                    self._report_tool_result(call_id, "edit_file", msg, is_error=True)
+                    return call_id, msg
+                if len(occurrences) > 1 and nl is None:
+                    line_list = ", ".join(str(ln) for ln in occurrences)
+                    msg = (
+                        f"Error: {label}old_string found {len(occurrences)} times "
+                        f"at lines {line_list} (file changed)"
+                    )
+                    self._report_tool_result(call_id, "edit_file", msg, is_error=True)
+                    return call_id, msg
+                if nl is not None and len(occurrences) > 1:
+                    idx = pick_nearest(content, old, nl)
+                else:
+                    idx = content.index(old)
+                replacements.append((idx, idx + len(old), new))
+
+            # Check for overlapping edits
+            replacements.sort(key=lambda r: r[0])
+            for j in range(len(replacements) - 1):
+                if replacements[j][1] > replacements[j + 1][0]:
+                    msg = "Error: edits overlap — two edits modify the same region"
+                    self._report_tool_result(call_id, "edit_file", msg, is_error=True)
+                    return call_id, msg
+
+            # Apply in reverse order so offsets stay valid
+            for start, end, new in reversed(replacements):
+                content = content[:start] + new + content[end:]
+
             with open(path, "w") as f:
                 f.write(content)
-            msg = f"Edited {path}: replaced 1 occurrence"
+            count = len(replacements)
+            noun = "edit" if count == 1 else "edits"
+            msg = f"Edited {path}: applied {count} {noun}"
             self._report_tool_result(call_id, "edit_file", msg)
             return call_id, msg
         except Exception as e:

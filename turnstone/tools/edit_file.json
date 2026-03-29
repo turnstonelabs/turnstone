@@ -1,6 +1,6 @@
 {
   "name": "edit_file",
-  "description": "Replace an exact string in a file with new content. Fails if old_string is not found or matches multiple locations (use near_line to disambiguate). Requires read_file on the same path first — it will fail without this. Use for any modification to existing files: changing values, renaming, inserting code, adding docstrings. Prefer this over write_file for partial modifications. For multi-file edits when filenames are known, go directly to read_file + edit_file for each file — no need to search first. For generated content (docstrings, type hints), call edit_file with your best-effort content inline — e.g. edit_file(old_string='def process(...):', new_string='def process(...):\\n    \"\"\"Process input data.\"\"\"'). When asked to change something in a file, follow through with edit_file after reading — reading alone is not enough.",
+  "description": "Replace exact strings in a file, or apply multiple replacements atomically. Requires read_file on the same path first. Two modes: (1) Single — old_string + new_string replaces a unique match (fails if multiple matches unless near_line disambiguates). (2) Batch — edits array with multiple old_string/new_string pairs applied atomically. Prefer this over write_file for partial modifications. For multi-file edits when filenames are known, go directly to read_file + edit_file for each file. When asked to change something in a file, follow through with edit_file after reading — reading alone is not enough.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "old_string": {
         "type": "string",
-        "description": "The exact text to find and replace."
+        "description": "The exact text to find and replace. For multiple edits in one call, use the edits array instead."
       },
       "new_string": {
         "type": "string",
@@ -19,9 +19,22 @@
       "near_line": {
         "type": "integer",
         "description": "When old_string matches multiple locations, pick the one nearest this line number."
+      },
+      "edits": {
+        "type": "array",
+        "description": "Multiple replacements to apply atomically. Each entry has old_string, new_string, and optional near_line. All edits are validated before any are applied. Preferred over multiple edit_file calls when making several changes to the same file.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "old_string": { "type": "string" },
+            "new_string": { "type": "string" },
+            "near_line": { "type": "integer" }
+          },
+          "required": ["old_string", "new_string"]
+        }
       }
     },
-    "required": ["path", "old_string", "new_string"]
+    "required": ["path"]
   },
   "task_agent": true,
   "primary_key": "old_string"
