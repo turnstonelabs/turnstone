@@ -4258,10 +4258,11 @@ class ChatSession:
                     "--exclude-dir=.pytest_cache",
                     "--exclude-dir=dist",
                     "--exclude-dir=build",
-                    "--exclude-dir=.egg-info",
+                    "--exclude-dir=*.egg-info",
                     "--exclude-dir=.tox",
                     "--exclude-dir=.venv",
                     "--exclude-dir=venv",
+                    "--exclude-dir=vendor",
                     "--",
                     pattern,
                     path,  # -- prevents pattern as flag
