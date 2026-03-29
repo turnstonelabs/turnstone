@@ -1,5 +1,6 @@
 """Tests for generation cancellation (cooperative cancel via threading.Event)."""
 
+import contextlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -698,3 +699,111 @@ class TestForceCancelGeneration:
         # (not the same object as before the call).
         assert session._cancel_event is not original_event
         assert not session._cancel_event.is_set()
+
+
+class TestForceCancelThreaded:
+    """Force cancel with actual threads — verifies orphaned thread behavior."""
+
+    def test_force_cancel_orphan_does_not_mutate_messages(self, tmp_db):
+        """After force cancel + new send(), the orphaned thread must not
+        append stale content to session.messages."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = ""
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        barrier = threading.Event()
+        old_done = threading.Event()
+
+        def slow_stream():
+            yield FakeChunk(content_delta="Old content")
+            barrier.set()  # signal: first chunk delivered
+            time.sleep(2)  # simulate stuck stream
+            yield FakeChunk(content_delta=" more", finish_reason="stop")
+
+        # Start generation 1 (will get stuck)
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=slow_stream()),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+
+            def run_old():
+                with contextlib.suppress(Exception):
+                    session.send("old message")
+                old_done.set()
+
+            t1 = threading.Thread(target=run_old, daemon=True)
+            t1.start()
+            assert barrier.wait(timeout=5), "stream did not start"
+
+        # Force cancel: simulate what the server does
+        session.cancel()
+        # Increment generation as new send() would
+        session._generation += 1
+        session._cancel_event = threading.Event()
+
+        # Wait for old thread to notice generation mismatch and exit
+        assert old_done.wait(timeout=10), "orphaned thread did not exit"
+
+        # The orphaned thread should NOT have appended its content
+        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        # May have partial content from before cancel, but NOT the full
+        # "Old content more" that would appear without the generation guard
+        for msg in assistant_msgs:
+            assert "more" not in msg.get("content", "")
+
+    def test_force_cancel_then_new_send_succeeds(self, tmp_db):
+        """A new send() after force cancel works cleanly."""
+        ui = NullUI()
+        session = _make_session(ui=ui)
+
+        @dataclass
+        class FakeChunk:
+            content_delta: str = ""
+            reasoning_delta: str = ""
+            tool_call_deltas: list = field(default_factory=list)
+            usage: None = None
+            finish_reason: str = "stop"
+            info_delta: str = ""
+            provider_blocks: list = field(default_factory=list)
+
+        barrier = threading.Event()
+
+        def stuck_stream():
+            yield FakeChunk(content_delta="stuck")
+            barrier.set()
+            time.sleep(2)
+            yield FakeChunk(content_delta=" end", finish_reason="stop")
+
+        # Start stuck generation
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=stuck_stream()),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            t = threading.Thread(target=lambda: session.send("old"), daemon=True)
+            t.start()
+            assert barrier.wait(timeout=5), "stream did not start"
+
+        # Force cancel
+        session.cancel()
+
+        # New generation should work
+        fresh_stream = iter([FakeChunk(content_delta="Fresh response")])
+        with (
+            patch.object(session, "_create_stream_with_retry", return_value=fresh_stream),
+            patch.object(session, "_full_messages", return_value=[]),
+        ):
+            session.send("new message")
+
+        # The new generation should have completed successfully
+        assert "idle" in ui.states
+        assistant_msgs = [m for m in session.messages if m["role"] == "assistant"]
+        assert any("Fresh response" in m.get("content", "") for m in assistant_msgs)

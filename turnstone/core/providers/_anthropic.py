@@ -7,6 +7,7 @@ The ``anthropic`` SDK is imported lazily so it remains an optional dependency.
 from __future__ import annotations
 
 import json
+import sys
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.providers._protocol import (
@@ -477,10 +478,25 @@ class AnthropicProvider:
             deferred_names,
         )
 
-        with client.messages.stream(**kwargs) as stream:
-            if cancel_ref is not None:
-                cancel_ref.append(stream)
+        manager = client.messages.stream(**kwargs)
+        try:
+            stream = manager.__enter__()
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        if cancel_ref is not None:
+            cancel_ref.append(stream)
+        return self._iter_with_cleanup(stream, manager)
+
+    def _iter_with_cleanup(self, stream: Any, manager: Any) -> Iterator[StreamChunk]:
+        """Iterate the Anthropic stream, ensuring the context manager exits."""
+        try:
             yield from self._iter_anthropic_stream(stream)
+        except BaseException:
+            manager.__exit__(*sys.exc_info())
+            raise
+        else:
+            manager.__exit__(None, None, None)
 
     def _iter_anthropic_stream(self, stream: Any) -> Iterator[StreamChunk]:
         """Convert Anthropic streaming events to normalized StreamChunks."""

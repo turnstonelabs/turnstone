@@ -120,13 +120,12 @@ class GenerationCancelled(BaseException):
 class _CancelRef(list[Any]):
     """List proxy used for ``ChatSession._cancel_ref``.
 
-    Providers call ``cancel_ref.append(stream_handle)`` inside a generator
-    body — the generator body doesn't execute until the first ``next()`` call,
-    i.e. just before the first chunk is yielded.  By overriding ``append`` we
-    update ``ChatSession._cancel_stream`` eagerly at that moment.  If
-    cancellation was already requested before the first chunk arrived (e.g.
-    the model was slow to start responding), the stream is closed immediately
-    so the blocked ``for chunk in stream`` iteration is unblocked.
+    Providers call ``cancel_ref.append(stream_handle)`` eagerly — the HTTP
+    call and registration happen before the iterator is returned to the
+    caller.  By overriding ``append`` we update ``ChatSession._cancel_stream``
+    immediately.  If cancellation was already requested before the stream
+    was created (e.g. cancel during retry backoff), the stream is closed
+    on arrival so the blocked iteration is unblocked.
     """
 
     __slots__ = ("_session",)

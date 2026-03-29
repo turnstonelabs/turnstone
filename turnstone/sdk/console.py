@@ -50,6 +50,7 @@ from turnstone.api.schemas import (
     AuthLoginResponse,
     AuthSetupResponse,
     AuthStatusResponse,
+    DeleteSettingResponse,
     ListScheduleRunsResponse,
     ListSchedulesResponse,
     ScheduleInfo,
@@ -642,13 +643,16 @@ class AsyncTurnstoneConsole(_BaseClient):
             "PUT", f"/v1/api/admin/settings/{key}", json_body=body, response_model=SettingInfo
         )
 
-    async def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+    async def delete_setting(self, key: str, *, node_id: str = "") -> DeleteSettingResponse:
         """Reset a setting to its default value."""
         params: dict[str, Any] = {}
         if node_id:
             params["node_id"] = node_id
         return await self._request(
-            "DELETE", f"/v1/api/admin/settings/{key}", params=params, response_model=StatusResponse
+            "DELETE",
+            f"/v1/api/admin/settings/{key}",
+            params=params,
+            response_model=DeleteSettingResponse,
         )
 
     # -- MCP servers -------------------------------------------------------
@@ -1205,7 +1209,7 @@ class TurnstoneConsole:
     def update_setting(self, key: str, value: Any, *, node_id: str = "") -> SettingInfo:
         return self._runner.run(self._async.update_setting(key, value, node_id=node_id))
 
-    def delete_setting(self, key: str, *, node_id: str = "") -> StatusResponse:
+    def delete_setting(self, key: str, *, node_id: str = "") -> DeleteSettingResponse:
         return self._runner.run(self._async.delete_setting(key, node_id=node_id))
 
     # -- MCP servers -------------------------------------------------------

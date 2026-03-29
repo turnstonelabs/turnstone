@@ -333,7 +333,7 @@ class OpenAIProvider:
         stream = client.chat.completions.create(**kwargs)
         if cancel_ref is not None:
             cancel_ref.append(stream)
-        yield from self._iter_stream(stream)
+        return self._iter_stream(stream)
 
     def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
         """Convert OpenAI stream chunks to normalized StreamChunks."""
