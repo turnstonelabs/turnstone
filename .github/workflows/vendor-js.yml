@@ -1,0 +1,86 @@
+name: Complete Vendored JS Updates
+
+# When Renovate bumps a vendored JS version in pyproject.toml, this
+# workflow downloads the actual files and commits them to the PR branch
+# so the PR is merge-ready without manual intervention.
+#
+# Note: the commit is made with GITHUB_TOKEN, so it won't re-trigger CI
+# automatically.  The reviewer should re-run CI once this workflow passes,
+# or Renovate's next rebase will trigger it.
+
+on:
+  pull_request:
+    paths:
+      - pyproject.toml
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to update"
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  vendor-js:
+    if: github.actor == 'renovate[bot]' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR head ref
+        id: ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ref=$(gh pr view "${{ inputs.pr_number }}" --repo "${{ github.repository }}" --json headRefName -q .headRefName)
+          else
+            ref="${{ github.head_ref }}"
+          fi
+          echo "head_ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ steps.ref.outputs.head_ref }}
+
+      - name: Detect vendored JS changes
+        id: detect
+        run: |
+          updates=()
+          for lib in katex hljs mermaid; do
+            version=$(grep -oE "${lib}-[0-9.]+" pyproject.toml | head -1 | sed "s/${lib}-//")
+            [[ -z "$version" ]] && continue
+            [[ -d "turnstone/shared_static/${lib}-${version}" ]] && continue
+            updates+=("${lib}:${version}")
+          done
+          if [[ ${#updates[@]} -eq 0 ]]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "${updates[@]}" > /tmp/updates.txt
+            echo "Libs to update:"
+            cat /tmp/updates.txt
+          fi
+
+      - name: Download vendored files
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          while IFS=: read -r lib version; do
+            echo "::group::Updating ${lib} to ${version}"
+            bash scripts/update-vendored-js.sh "$lib" "$version"
+            echo "::endgroup::"
+          done < /tmp/updates.txt
+
+      - name: Commit and push
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: download vendored JS files"
+          git push
