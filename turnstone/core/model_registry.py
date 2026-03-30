@@ -417,12 +417,19 @@ def detect_model(
 
             ctx = AnthropicProvider().get_capabilities(m.id).context_window
         else:
-            # OpenAI-compatible: extract from backend metadata (llama.cpp, vLLM)
-            meta = m.model_dump().get("meta")
-            if isinstance(meta, dict):
-                n_ctx = meta.get("n_ctx_train")
-                if isinstance(n_ctx, int) and n_ctx > 0:
-                    ctx = n_ctx
+            # OpenAI-compatible: extract context window from backend metadata.
+            # vLLM exposes max_model_len at the top level; llama.cpp uses
+            # meta.n_ctx_train.
+            model_data = m.model_dump()
+            max_len = model_data.get("max_model_len")
+            if isinstance(max_len, int) and max_len > 0:
+                ctx = max_len
+            else:
+                meta = model_data.get("meta")
+                if isinstance(meta, dict):
+                    n_ctx = meta.get("n_ctx_train")
+                    if isinstance(n_ctx, int) and n_ctx > 0:
+                        ctx = n_ctx
         return m.id, ctx
     except SystemExit:
         raise
@@ -514,6 +521,7 @@ def _detect_openai_compat(
 
     meta: dict[str, Any] | None = None
     owned_by: str = ""
+    dumped: dict[str, Any] = {}
     if model_obj is not None:
         dumped = model_obj.model_dump()
         raw_meta = dumped.get("meta")
@@ -521,9 +529,13 @@ def _detect_openai_compat(
             meta = raw_meta
         owned_by = str(dumped.get("owned_by", ""))
 
-    # Context window: prefer backend metadata, fall back to static table
-    # (only for known models — the default 200k would be misleading for local servers)
-    if meta is not None:
+    # Context window: prefer backend metadata, fall back to static table.
+    # vLLM exposes max_model_len at the top level; llama.cpp uses
+    # meta.n_ctx_train.
+    max_len = dumped.get("max_model_len")
+    if isinstance(max_len, int) and max_len > 0:
+        result["context_window"] = max_len
+    elif meta is not None:
         n_ctx = meta.get("n_ctx_train")
         if isinstance(n_ctx, int) and n_ctx > 0:
             result["context_window"] = n_ctx
