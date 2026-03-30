@@ -24,7 +24,7 @@ partition "Phase 1: Prepare" #E8F5E9 {
         :Dispatch to _prepare_{func_name}();
 
         note right
-            **Dispatch table (17 tools):**
+            **Dispatch table (19 tools):**
             ┌───────────────┬──────────────────┐
             │ Tool          │ Needs Approval?  │
             ├───────────────┼──────────────────┤
@@ -33,6 +33,7 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ write_file    │ ✓ Yes            │
             │ edit_file     │ ✓ Yes            │
             │ search        │ ✗ Auto-approve   │
+            │ diff_file     │ ✗ Auto-approve   │
             │ math          │ ✗ Auto-approve   │
             │ man           │ ✗ Auto-approve   │
             │ web_fetch     │ ✗ Auto-approve   │
@@ -43,6 +44,8 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ memory        │ ✗ Auto-approve   │
             │ recall        │ ✗ Auto-approve   │
             │ notify        │ ✗ Auto-approve   │
+            │ watch         │ ✓ Yes            │
+            │ skill         │ ✓ Yes            │
             │ read_resource │ ✓ Yes            │
             │ use_prompt    │ ✓ Yes            │
             ├───────────────┼──────────────────┤
