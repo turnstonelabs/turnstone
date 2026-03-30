@@ -19,6 +19,15 @@ _MATH_BLOCKED_BUILTINS = {
     "globals",
     "locals",
     "vars",
+    # Reflection primitives — bypass AST dunder checks via runtime strings
+    "getattr",
+    "setattr",
+    "delattr",
+    # Type system — can reconstruct arbitrary classes
+    "type",
+    # Import — the replaced _safe_import is in the namespace, but block the
+    # name so direct __import__ calls are caught by the AST validator
+    "__import__",
 }
 
 _MATH_BLOCKED_MODULES = {
@@ -75,6 +84,9 @@ class _ASTValidator(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in _MATH_BLOCKED_BUILTINS:
+            self.errors.append(f"Call to '{node.func.id}' is not allowed")
+        # Catch getattr/setattr even if aliased or reached through other means
+        if isinstance(node.func, ast.Name) and node.func.id in ("getattr", "setattr", "delattr"):
             self.errors.append(f"Call to '{node.func.id}' is not allowed")
         self.generic_visit(node)
 
@@ -242,7 +254,16 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
         except ImportError:
             pass
 
-        exec(code, ns)
+        # Strip __builtins__ from all pre-imported modules so
+        # module.__builtins__['__import__'] can't bypass _safe_import.
+        import contextlib
+
+        for v in list(ns.values()):
+            if hasattr(v, "__builtins__"):
+                with contextlib.suppress(AttributeError, TypeError):
+                    v.__builtins__ = {}
+
+        exec(code, ns)  # noqa: S102
 
         _sys.stdout = _sys.__stdout__
         printed = captured.getvalue()
