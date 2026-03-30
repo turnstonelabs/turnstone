@@ -207,13 +207,28 @@ class ChannelRouter:
 
             return ws_id, True
 
-    def get_node_url(self, ws_id: str) -> str:
+    async def get_node_url(self, ws_id: str) -> str:
         """Return the direct server URL for SSE connections to *ws_id*.
 
         When routing through a console, this is the ``node_url`` from the
-        create response.  Otherwise, falls back to the configured server_url.
+        create response.  If the ws_id is not cached (e.g. after a bot
+        restart), queries the console's route lookup endpoint before
+        falling back to the configured server_url.
         """
-        return self._node_urls.get(ws_id, self._server_url)
+        url = self._node_urls.get(ws_id)
+        if url:
+            return url
+        if self._console_url:
+            try:
+                resp = await self._client.get("/api/route", params={"ws_id": ws_id})
+                if resp.status_code == 200:
+                    node_url = resp.json().get("node_url", "")
+                    if node_url:
+                        self._node_urls[ws_id] = node_url.rstrip("/")
+                        return self._node_urls[ws_id]
+            except Exception:
+                pass
+        return self._server_url
 
     # -- user resolution -----------------------------------------------------
 
@@ -285,6 +300,7 @@ class ChannelRouter:
 
     async def close_workstream(self, ws_id: str) -> None:
         """Close a workstream via the server API."""
+        self._node_urls.pop(ws_id, None)
         try:
             await self._post("/api/workstreams/close", {"ws_id": ws_id})
             log.info("channel_router.close_workstream", ws_id=ws_id)

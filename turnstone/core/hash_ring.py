@@ -62,6 +62,10 @@ class HashRing:
         nodes: Sequence[RingNode],
         vnodes_per_unit: int = DEFAULT_VNODES,
     ) -> None:
+        ids = [n.node_id for n in nodes]
+        if len(ids) != len(set(ids)):
+            dupes = [x for x in set(ids) if ids.count(x) > 1]
+            raise ValueError(f"duplicate node_ids: {dupes}")
         self._nodes = tuple(nodes)
         self._node_map: dict[str, RingNode] = {n.node_id: n for n in nodes}
 
@@ -94,7 +98,10 @@ class HashRing:
     @property
     def version(self) -> int:
         """Hash of the membership list.  Changes when nodes join/leave."""
-        return hash(tuple(sorted((n.node_id, n.weight) for n in self._nodes)))
+        key = ",".join(
+            f"{n.node_id}:{n.weight}" for n in sorted(self._nodes, key=lambda x: x.node_id)
+        )
+        return fnv1a_32(key.encode())
 
     def assignments(self) -> list[tuple[int, str]]:
         """Precompute all 65536 bucket-to-node assignments.

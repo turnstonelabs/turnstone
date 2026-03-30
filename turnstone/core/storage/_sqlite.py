@@ -1419,6 +1419,16 @@ class SQLiteBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def list_workstream_routing_data(self) -> list[tuple[str, str]]:
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT w.ws_id, w.state FROM workstreams w "
+                    "WHERE w.ws_id NOT IN (SELECT ws_id FROM workstream_overrides)"
+                )
+            ).fetchall()
+            return [(r[0], r[1]) for r in rows]
+
     # -- Roles -----------------------------------------------------------------
 
     def create_role(

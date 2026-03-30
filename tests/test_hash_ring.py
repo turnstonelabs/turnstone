@@ -2,6 +2,8 @@
 
 from collections import Counter
 
+import pytest
+
 from turnstone.core.hash_ring import (
     RING_SIZE,
     HashRing,
@@ -133,3 +135,11 @@ class TestHashRing:
             RingNode(node_id="n2", url="http://n2:8000"),
         ]
         assert HashRing(nodes).version == HashRing(nodes).version
+
+    def test_duplicate_node_id_raises(self):
+        nodes = [
+            RingNode(node_id="n1", url="http://n1:8000"),
+            RingNode(node_id="n1", url="http://n1-alt:8000"),
+        ]
+        with pytest.raises(ValueError, match="duplicate node_ids"):
+            HashRing(nodes)

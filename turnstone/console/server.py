@@ -535,11 +535,15 @@ async def route_create(request: Request) -> Response:
     except NoAvailableNodeError:
         return JSONResponse({"error": "No available node for routing"}, status_code=503)
 
-    resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
+    try:
+        resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
+    except httpx.HTTPError:
+        return JSONResponse({"error": f"upstream node {ref.node_id} unreachable"}, status_code=502)
 
     # 503 retry with a new ws_id that hashes to a different node
     if resp.status_code == 503 and not pin and not body.get("resume_ws"):
         failed_node = ref.node_id
+        found_alt = False
         for _ in range(10):
             ws_id = secrets.token_hex(16)
             try:
@@ -547,15 +551,23 @@ async def route_create(request: Request) -> Response:
             except NoAvailableNodeError:
                 break
             if ref.node_id != failed_node:
+                found_alt = True
                 break
-        else:
+        if not found_alt:
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
                 headers=dict(resp.headers),
             )
         body["ws_id"] = ws_id
-        resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
+        try:
+            resp = await client.post(
+                f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
+            )
+        except httpx.HTTPError:
+            return JSONResponse(
+                {"error": f"upstream node {ref.node_id} unreachable"}, status_code=502
+            )
 
     if resp.status_code == 200:
         data = resp.json()
@@ -581,10 +593,12 @@ async def route_proxy(request: Request) -> Response:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     ws_id = body.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id required"}, status_code=400)
     try:
         ref = router.route(ws_id)
-    except NoAvailableNodeError:
-        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+    except (NoAvailableNodeError, ValueError):
+        return JSONResponse({"error": "routing failed"}, status_code=503)
 
     # Map /v1/api/route/... → /v1/api/... on the upstream server
     path = request.url.path
@@ -592,7 +606,10 @@ async def route_proxy(request: Request) -> Response:
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
-    resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
+    try:
+        resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
+    except httpx.HTTPError:
+        return JSONResponse({"error": f"upstream node {ref.node_id} unreachable"}, status_code=502)
     return Response(
         content=resp.content,
         status_code=resp.status_code,
@@ -893,6 +910,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
         scheduler.start()
+    # Start rebalancer if configured
+    _rebalancer = getattr(app.state, "rebalancer", None)
+    if _rebalancer is not None:
+        _rebalancer.start()
     # OIDC discovery (if configured)
     oidc_config = app.state.oidc_config
     if oidc_config.enabled:
@@ -998,6 +1019,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_mgr.stop_renewal()
     if scheduler is not None:
         scheduler.stop()
+    _rebalancer = getattr(app.state, "rebalancer", None)
+    if _rebalancer is not None:
+        _rebalancer.stop()
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
@@ -5318,6 +5342,35 @@ async def tls_ca_cert(request: Request) -> Response:
     )
 
 
+async def admin_ring_status(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/ring/status — hash ring rebalancer status."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    rebalancer = getattr(request.app.state, "rebalancer", None)
+    if rebalancer is None:
+        return JSONResponse({"enabled": False})
+    return JSONResponse({"enabled": True, **rebalancer.get_status()})
+
+
+async def admin_ring_rebalance(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/ring/rebalance — trigger an immediate rebalance."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    rebalancer = getattr(request.app.state, "rebalancer", None)
+    if rebalancer is None:
+        return JSONResponse(
+            {"status": "error", "reason": "rebalancer not enabled"}, status_code=503
+        )
+    rebalancer.trigger()
+    return JSONResponse({"status": "ok"})
+
+
 async def tls_ca_status(request: Request) -> JSONResponse:
     """GET /v1/api/admin/tls/ca — CA status."""
     from turnstone.core.auth import require_permission
@@ -5468,6 +5521,7 @@ def create_app(
     tls_manager: Any = None,
     console_url: str = "",
     router: ConsoleRouter | None = None,
+    rebalancer: Any = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -5494,7 +5548,7 @@ def create_app(
                     Route("/api/route/cancel", route_proxy, methods=["POST"]),
                     Route("/api/route/command", route_proxy, methods=["POST"]),
                     Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
-                    Route("/api/route", route_lookup),
+                    Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
@@ -5735,6 +5789,13 @@ def create_app(
                         admin_rescan_skill,
                         methods=["POST"],
                     ),
+                    # Hash ring
+                    Route("/api/admin/ring/status", admin_ring_status),
+                    Route(
+                        "/api/admin/ring/rebalance",
+                        admin_ring_rebalance,
+                        methods=["POST"],
+                    ),
                     # TLS / ACME
                     Route("/api/admin/tls/ca", tls_ca_status),
                     Route("/api/admin/tls/ca.pem", tls_ca_cert),
@@ -5776,6 +5837,7 @@ def create_app(
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
     app.state.router = router
+    app.state.rebalancer = rebalancer
 
     # Mount ACME responder whenever a TLS manager is configured.
     # ACMEResponder (lacme 1.0.2+) serves /ca.pem natively.
@@ -6028,6 +6090,28 @@ def main() -> None:
         except Exception:
             log.debug("Failed to sync TLS state to ConfigStore", exc_info=True)
 
+    # Rebalancer — create if enabled in ConfigStore
+    rebalancer = None
+    if auth_storage:
+        try:
+            from turnstone.core.config_store import ConfigStore
+
+            _rcs = ConfigStore(auth_storage)
+            if _rcs.get("rebalancer.enabled"):
+                from turnstone.console.rebalancer import Rebalancer
+
+                rebalancer = Rebalancer(
+                    storage=auth_storage,
+                    router=router,
+                    collector=collector,
+                    interval=_rcs.get("rebalancer.interval", 60),
+                    threshold=_rcs.get("rebalancer.threshold", 0.10),
+                    vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
+                )
+                log.info("rebalancer.configured")
+        except Exception:
+            log.warning("Failed to configure rebalancer", exc_info=True)
+
     app = create_app(
         collector=collector,
         auth_config=auth_config,
@@ -6039,6 +6123,7 @@ def main() -> None:
         tls_manager=tls_mgr,
         console_url=console_url,
         router=router,
+        rebalancer=rebalancer,
     )
 
     log.info("Console starting on %s", console_url)

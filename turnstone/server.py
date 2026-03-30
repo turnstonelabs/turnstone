@@ -2013,6 +2013,30 @@ def internal_model_status(request: Request) -> JSONResponse:
     return JSONResponse({"models": models})
 
 
+# -- internal workstream migration -------------------------------------------
+
+
+async def internal_migrate(request: Request) -> JSONResponse:
+    """POST /v1/api/_internal/migrate — evict a workstream for rebalancer migration."""
+    from turnstone.core.web_helpers import read_json_or_400
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    ws_id = body.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"status": "error", "reason": "ws_id required"}, status_code=400)
+    mgr: WorkstreamManager = request.app.state.workstreams
+    if mgr.get(ws_id) is None:
+        return JSONResponse({"status": "not_found", "ws_id": ws_id}, status_code=404)
+    if not mgr.close(ws_id):
+        return JSONResponse(
+            {"status": "refused", "reason": "last_workstream", "ws_id": ws_id},
+            status_code=409,
+        )
+    return JSONResponse({"status": "ok", "ws_id": ws_id})
+
+
 # ---------------------------------------------------------------------------
 # Global SSE fan-out
 # ---------------------------------------------------------------------------
@@ -2266,6 +2290,7 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/_internal/model-status", internal_model_status),
+                    Route("/api/_internal/migrate", internal_migrate, methods=["POST"]),
                 ],
             ),
             Route("/health", health),

@@ -313,7 +313,7 @@ class TurnstoneBot:
 
         # When routing through the console, connect SSE directly to the
         # assigned server node (node_url from the create response).
-        node_base = self.router.get_node_url(ws_id)
+        node_base = await self.router.get_node_url(ws_id)
         url = f"{node_base}/api/events"
         delay = _SSE_RECONNECT_DELAY
 

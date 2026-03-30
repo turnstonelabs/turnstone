@@ -506,6 +506,10 @@ class StorageBackend(Protocol):
         """Return all overrides."""
         ...
 
+    def list_workstream_routing_data(self) -> list[tuple[str, str]]:
+        """Return (ws_id, state) for all non-override workstreams."""
+        ...
+
     # -- Roles (RBAC) ----------------------------------------------------------
 
     def create_role(
