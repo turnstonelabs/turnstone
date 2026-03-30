@@ -1474,7 +1474,6 @@ function setFocusedPane(paneId) {
     panes[paneId].el.classList.add("focused");
     currentWsId = panes[paneId].wsId;
     renderTabBar();
-    updateHeaderForFocusedPane();
   }
 }
 
@@ -1482,10 +1481,6 @@ function createPane(wsId) {
   var p = new Pane(wsId);
   panes[p.id] = p;
   return p;
-}
-
-function updateHeaderForFocusedPane() {
-  // Model name and token status are now per-pane (.ws-status-bar).
 }
 
 function updatePaneHeaders() {

@@ -869,8 +869,8 @@ async def events_sse(request: Request) -> Response:
             cw = session.context_window
             pct = total_tok / cw * 100 if cw > 0 else 0
             with ui._ws_lock:
-                ttc = ui._ws_turn_tool_calls
-                tc = ui._ws_messages
+                turn_tool_calls = ui._ws_turn_tool_calls
+                turn_count = ui._ws_messages
             yield {
                 "data": json.dumps(
                     {
@@ -883,8 +883,8 @@ async def events_sse(request: Request) -> Response:
                         "effort": session.reasoning_effort,
                         "cache_creation_tokens": u.get("cache_creation_tokens", 0),
                         "cache_read_tokens": u.get("cache_read_tokens", 0),
-                        "tool_calls_this_turn": ttc,
-                        "turn_count": tc,
+                        "tool_calls_this_turn": turn_tool_calls,
+                        "turn_count": turn_count,
                     }
                 )
             }
