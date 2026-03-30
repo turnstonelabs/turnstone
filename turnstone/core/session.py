@@ -5196,12 +5196,18 @@ class ChatSession:
 
             if action == "search":
                 scope = item.get("scope", "")
+                scope_id = item.get("scope_id", "")
+                # Defense-in-depth: reject scoped queries with empty scope_id
+                if scope in ("user", "workstream") and not scope_id:
+                    msg = f"Error: '{scope}' scope requires a valid identity"
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
+                    return call_id, msg
                 if scope:
                     rows = search_structured_memories(
                         item["query"],
                         mem_type=item.get("mem_type", ""),
                         scope=scope,
-                        scope_id=item.get("scope_id", ""),
+                        scope_id=scope_id,
                         limit=item["limit"],
                     )
                 else:
@@ -5233,11 +5239,16 @@ class ChatSession:
 
             if action == "list":
                 scope = item.get("scope", "")
+                scope_id = item.get("scope_id", "")
+                if scope in ("user", "workstream") and not scope_id:
+                    msg = f"Error: '{scope}' scope requires a valid identity"
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
+                    return call_id, msg
                 if scope:
                     rows = list_structured_memories(
                         mem_type=item.get("mem_type", ""),
                         scope=scope,
-                        scope_id=item.get("scope_id", ""),
+                        scope_id=scope_id,
                         limit=item["limit"],
                     )
                 else:
