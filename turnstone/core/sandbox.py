@@ -85,9 +85,6 @@ class _ASTValidator(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Name) and node.func.id in _MATH_BLOCKED_BUILTINS:
             self.errors.append(f"Call to '{node.func.id}' is not allowed")
-        # Catch getattr/setattr even if aliased or reached through other means
-        if isinstance(node.func, ast.Name) and node.func.id in ("getattr", "setattr", "delattr"):
-            self.errors.append(f"Call to '{node.func.id}' is not allowed")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
@@ -96,6 +93,9 @@ class _ASTValidator(ast.NodeVisitor):
             and node.attr.endswith("__")
             and node.attr not in {"__name__", "__doc__", "__class__"}
         ):
+            self.errors.append(f"Access to '{node.attr}' is not allowed")
+        # Block operator.attrgetter/itemgetter which act as getattr bypasses
+        if node.attr in ("attrgetter", "itemgetter"):
             self.errors.append(f"Access to '{node.attr}' is not allowed")
         self.generic_visit(node)
 
@@ -121,6 +121,7 @@ def validate_math_code(code: str) -> list[str]:
 
 def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[str, str]]) -> None:
     """Execute code in a subprocess, put (status, output) in queue."""
+    import contextlib
     import signal as _signal
     import sys as _sys
     from io import StringIO
@@ -136,7 +137,14 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
         def _safe_import(name: str, *args: Any, **kwargs: Any) -> Any:
             if name.split(".")[0] in _MATH_BLOCKED_MODULES:
                 raise ImportError(f"Import of '{name}' is blocked")
-            return original_import(name, *args, **kwargs)
+            mod = original_import(name, *args, **kwargs)
+            # Strip __builtins__ from every imported module so
+            # module.__builtins__['__import__'] can't bypass _safe_import
+            # (covers operator.attrgetter('__builtins__') and similar).
+            if hasattr(mod, "__builtins__"):
+                with contextlib.suppress(AttributeError, TypeError):
+                    mod.__builtins__ = {}
+            return mod
 
         original_import = (
             __builtins__["__import__"]
@@ -256,8 +264,6 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
 
         # Strip __builtins__ from all pre-imported modules so
         # module.__builtins__['__import__'] can't bypass _safe_import.
-        import contextlib
-
         for v in list(ns.values()):
             if hasattr(v, "__builtins__"):
                 with contextlib.suppress(AttributeError, TypeError):
