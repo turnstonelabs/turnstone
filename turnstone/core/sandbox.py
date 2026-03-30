@@ -143,7 +143,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
             # (covers operator.attrgetter('__builtins__') and similar).
             if hasattr(mod, "__builtins__"):
                 with contextlib.suppress(AttributeError, TypeError):
-                    mod.__builtins__ = {}
+                    mod.__builtins__ = {}  # type: ignore[attr-defined]
             return mod
 
         original_import = (
