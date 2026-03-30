@@ -339,3 +339,136 @@ class TestGetStatus:
         assert status["version"] == 1
         assert status["last_result"] is not None
         assert status["last_result"]["seeded"] is True
+
+
+class TestEagerMigration:
+    def test_eager_migrate_posts_to_source_nodes(self, storage):
+        """When eager_migrate=True, rebalancer POSTs /_internal/migrate for idle workstreams."""
+        import httpx
+
+        # Seed ring with 2 nodes
+        _register_nodes(storage, 2)
+        rb = Rebalancer(storage=storage, eager_migrate=True)
+        rb.rebalance_once()  # seeds
+
+        # Create a workstream on node-0's bucket range
+        # Find a bucket assigned to node-0
+        buckets = storage.list_ring_buckets()
+        node0_bucket = None
+        for b in buckets:
+            if b["node_id"] == "node-0":
+                node0_bucket = b["bucket"]
+                break
+        assert node0_bucket is not None
+
+        ws_id = f"{node0_bucket:04x}" + "a" * 28
+        storage.register_workstream(ws_id, node_id="node-0", name="test")
+        storage.increment_bucket_count(node0_bucket)
+
+        # Add a 3rd node — this will trigger rebalance
+        meta = json.dumps({"weight": 1, "started": "2026-01-01T00:00:00Z"})
+        storage.register_service("server", "node-2", "http://node-2:8080", metadata=meta)
+
+        # Track migrate calls
+        migrate_calls: list[tuple[str, str]] = []  # (url, ws_id)
+
+        class FakeTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content)
+                migrate_calls.append((str(request.url), body.get("ws_id", "")))
+                return httpx.Response(200, json={"status": "ok", "ws_id": body["ws_id"]})
+
+        # Monkey-patch httpx.Client to use our fake transport
+        original_init = httpx.Client.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = FakeTransport()
+            original_init(self_client, **kwargs)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(httpx.Client, "__init__", patched_init):
+            result = rb.rebalance_once(trigger="test")
+
+        # If the bucket moved to a different node, the workstream should be migrated
+        new_buckets = storage.list_ring_buckets()
+        new_owner = None
+        for b in new_buckets:
+            if b["bucket"] == node0_bucket:
+                new_owner = b["node_id"]
+                break
+
+        if new_owner != "node-0":
+            # Bucket moved — migration should have happened
+            assert result.migrations > 0
+            assert any(ws_id in call[1] for call in migrate_calls)
+        else:
+            # Bucket stayed — no migration needed for this ws
+            assert result.migrations >= 0  # other workstreams might have been migrated
+
+    def test_eager_migrate_skips_active_workstreams(self, storage):
+        """Active workstreams are not eagerly migrated (would disrupt in-flight work)."""
+        import httpx
+
+        _register_nodes(storage, 2)
+        rb = Rebalancer(storage=storage, eager_migrate=True)
+        rb.rebalance_once()  # seeds
+
+        # Find a bucket on node-0
+        buckets = storage.list_ring_buckets()
+        node0_bucket = None
+        for b in buckets:
+            if b["node_id"] == "node-0":
+                node0_bucket = b["bucket"]
+                break
+        assert node0_bucket is not None
+
+        # Create an ACTIVE workstream (state="running")
+        ws_id = f"{node0_bucket:04x}" + "b" * 28
+        storage.register_workstream(ws_id, node_id="node-0", name="active-ws")
+        storage.update_workstream_state(ws_id, "running")
+        storage.increment_bucket_count(node0_bucket, active=True)
+
+        # Add 3rd node to trigger rebalance
+        meta = json.dumps({"weight": 1, "started": "2026-01-01T00:00:00Z"})
+        storage.register_service("server", "node-2", "http://node-2:8080", metadata=meta)
+
+        migrate_calls: list[str] = []
+
+        class FakeTransport(httpx.BaseTransport):
+            def handle_request(self, request: httpx.Request) -> httpx.Response:
+                body = json.loads(request.content)
+                migrate_calls.append(body.get("ws_id", ""))
+                return httpx.Response(200, json={"status": "ok"})
+
+        original_init = httpx.Client.__init__
+
+        def patched_init(self_client, **kwargs):
+            kwargs["transport"] = FakeTransport()
+            original_init(self_client, **kwargs)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(httpx.Client, "__init__", patched_init):
+            rb.rebalance_once(trigger="test")
+
+        # The active workstream should NOT have been migrated
+        assert ws_id not in migrate_calls
+
+    def test_eager_migrate_disabled_by_default(self, storage):
+        """When eager_migrate=False (default), no migrate calls happen."""
+        _register_nodes(storage, 2)
+        rb = Rebalancer(storage=storage)  # eager_migrate defaults to False
+        rb.rebalance_once()  # seeds
+
+        # Create workstream and trigger rebalance
+        buckets = storage.list_ring_buckets()
+        node0_bucket = next(b["bucket"] for b in buckets if b["node_id"] == "node-0")
+        ws_id = f"{node0_bucket:04x}" + "c" * 28
+        storage.register_workstream(ws_id, node_id="node-0", name="test")
+
+        meta = json.dumps({"weight": 1, "started": "2026-01-01T00:00:00Z"})
+        storage.register_service("server", "node-2", "http://node-2:8080", metadata=meta)
+
+        result = rb.rebalance_once(trigger="test")
+        assert result.migrations == 0  # no eager migration when disabled

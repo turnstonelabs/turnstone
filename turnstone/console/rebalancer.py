@@ -36,6 +36,7 @@ class RebalanceResult:
     """Summary of a single rebalance pass."""
 
     moves: int = 0
+    migrations: int = 0
     trigger: str = "periodic"
     duration_ms: float = 0.0
     nodes: int = 0
@@ -59,6 +60,8 @@ class Rebalancer:
         threshold: float = 0.10,
         vnodes_per_unit: int = 150,
         lock_ttl: int = 120,
+        eager_migrate: bool = False,
+        api_token: str = "",
     ) -> None:
         self._storage = storage
         self._router = router
@@ -67,6 +70,8 @@ class Rebalancer:
         self._threshold = threshold
         self._vnodes_per_unit = vnodes_per_unit
         self._lock_ttl = lock_ttl
+        self._eager_migrate = eager_migrate
+        self._api_token = api_token
         self._stop_event = threading.Event()
         self._trigger_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -332,13 +337,23 @@ class Rebalancer:
         if self._router is not None:
             self._router.refresh_cache()
 
+        # 13. Eager migration: evict workstreams on moved buckets from source nodes
+        migrations = 0
+        if self._eager_migrate and filtered_moves:
+            migrations = self._eager_migrate_workstreams(
+                filtered_moves,
+                nodes_raw,
+            )
+
         result.moves = total_moved
+        result.migrations = migrations
         result.noop = False
         result.duration_ms = (time.monotonic() - t0) * 1000
 
         log.info(
             "rebalancer.rebalanced",
             moves=total_moved,
+            migrations=migrations,
             nodes=len(ring_nodes),
             trigger=trigger,
             duration_ms=round(result.duration_ms, 1),
@@ -440,6 +455,76 @@ class Rebalancer:
         # Apply active_count delta
         if active_delta != 0:
             self._storage.adjust_bucket_active(bucket, active_delta)
+
+    def _eager_migrate_workstreams(
+        self,
+        moves: list[tuple[int, str, str]],
+        nodes_raw: list[dict[str, str]],
+    ) -> int:
+        """POST /_internal/migrate to source nodes for workstreams on moved buckets.
+
+        Only migrates idle workstreams — active ones would be disrupted.
+        Returns the number of successful migrations.
+        """
+        import httpx
+
+        # Build node URL map from the services data already loaded
+        node_urls: dict[str, str] = {s["service_id"]: s["url"] for s in nodes_raw}
+
+        # Moved buckets grouped by source node
+        moved_buckets: dict[str, set[int]] = defaultdict(set)
+        for bucket, from_node, _to_node in moves:
+            moved_buckets[from_node].add(bucket)
+
+        # Find workstreams on moved buckets (idle only — don't disrupt active work)
+        ws_data = self._storage.list_workstream_routing_data()
+        to_migrate: list[tuple[str, str]] = []  # (ws_id, source_node_url)
+        for ws_id, state in ws_data:
+            if len(ws_id) < 4 or state in _ACTIVE_STATES:
+                continue
+            bucket = bucket_of(ws_id)
+            for node_id, buckets in moved_buckets.items():
+                if bucket in buckets:
+                    url = node_urls.get(node_id)
+                    if url:
+                        to_migrate.append((ws_id, url))
+                    break
+
+        if not to_migrate:
+            return 0
+
+        headers: dict[str, str] = {}
+        if self._api_token:
+            headers["Authorization"] = f"Bearer {self._api_token}"
+
+        migrated = 0
+        with httpx.Client(timeout=10, headers=headers) as client:
+            for ws_id, source_url in to_migrate:
+                try:
+                    resp = client.post(
+                        f"{source_url}/v1/api/_internal/migrate",
+                        json={"ws_id": ws_id},
+                    )
+                    if resp.status_code == 200:
+                        migrated += 1
+                    elif resp.status_code == 409:
+                        log.debug(
+                            "rebalancer.migrate.refused",
+                            ws_id=ws_id[:8],
+                            reason="last_workstream",
+                        )
+                    # 404 = already gone, that's fine
+                except httpx.HTTPError:
+                    log.warning(
+                        "rebalancer.migrate.failed",
+                        ws_id=ws_id[:8],
+                        source=source_url,
+                        exc_info=True,
+                    )
+
+        if migrated:
+            log.info("rebalancer.migrations", count=migrated, total=len(to_migrate))
+        return migrated
 
 
 def _build_ring_nodes(services: list[dict[str, str]]) -> list[RingNode]:
