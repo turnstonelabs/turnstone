@@ -5869,8 +5869,22 @@ def main() -> None:
                 log.info("TLS enabled")
         except ImportError:
             log.warning("TLS enabled but lacme not installed — pip install turnstone[tls]")
+            tls_mgr = None
         except Exception:
             log.warning("TLS initialization failed", exc_info=True)
+            tls_mgr = None
+
+        # Sync actual TLS state to ConfigStore so server nodes read the
+        # correct value.  If TLS init failed or wasn't attempted, ensure
+        # tls.enabled=false so servers don't try to negotiate TLS.
+        try:
+            actual_tls = tls_mgr is not None
+            if _cs.get("tls.enabled") != actual_tls:
+                _cs.set("tls.enabled", actual_tls, changed_by="console-startup")
+                if not actual_tls:
+                    log.info("TLS disabled in ConfigStore (init failed or not configured)")
+        except Exception:
+            pass  # best effort
 
     app = create_app(
         collector=collector,
