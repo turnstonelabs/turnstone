@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from turnstone.core.hash_ring import RING_SIZE, HashRing, RingNode, bucket_of
+from turnstone.core.hash_ring import RING_SIZE, RingNode, bucket_of
 
 if TYPE_CHECKING:
     from turnstone.console.collector import ClusterCollector
@@ -251,8 +251,7 @@ class Rebalancer:
 
         # 3. If table is empty — first run, seed all 65536 buckets
         if not current_rows:
-            ring = HashRing(ring_nodes, vnodes_per_unit=self._vnodes_per_unit)
-            assignments = ring.assignments()
+            assignments = _weight_based_assignments(ring_nodes)
             self._storage.seed_ring_buckets(assignments)
             self._bump_version()
             if self._router is not None:
@@ -267,74 +266,114 @@ class Rebalancer:
             )
             return result
 
-        # 4. Single node with all buckets assigned — noop
+        # 4. Build current assignment map and per-node bucket lists
         current_map: dict[int, str] = {r["bucket"]: r["node_id"] for r in current_rows}
         live_ids = {n.node_id for n in ring_nodes}
+
+        # Single node with all buckets assigned — noop
         if len(live_ids) == 1 and all(nid in live_ids for nid in current_map.values()):
             result.duration_ms = (time.monotonic() - t0) * 1000
             return result
 
-        # 5. Compute ideal assignments
-        ring = HashRing(ring_nodes, vnodes_per_unit=self._vnodes_per_unit)
-        ideal = ring.assignments()
-        ideal_map: dict[int, str] = {b: nid for b, nid in ideal}
-
-        # 6. Find buckets that need to move
-        moves_needed: list[tuple[int, str, str]] = []  # (bucket, from_node, to_node)
-        for bucket in range(RING_SIZE):
-            cur = current_map.get(bucket)
-            want = ideal_map.get(bucket)
-            if cur is None or want is None:
-                continue
-            # Only move if current owner is dead OR ideal owner differs
-            if cur != want:
-                # If current owner is still alive and threshold applies,
-                # we check whether deviation is big enough to warrant moves
-                moves_needed.append((bucket, cur, want))
-
-        if not moves_needed:
-            result.duration_ms = (time.monotonic() - t0) * 1000
-            return result
-
-        # 7. Reconcile bucket_stats before computing transfer priority
+        # 5. Reconcile bucket_stats before computing transfer costs
         self._reconcile_bucket_stats()
-
-        # 8. Load stats for transfer priority
         stats_rows = self._storage.list_bucket_stats()
-        stats_map: dict[int, tuple[int, int]] = {}  # bucket -> (ws_count, active_count)
+        stats_map: dict[int, tuple[int, int]] = {}
         for s in stats_rows:
             stats_map[s["bucket"]] = (s["ws_count"], s["active_count"])
 
-        # 9. Sort moves by cost: empty first, then idle, then active
-        moves_needed.sort(
-            key=lambda m: stats_map.get(m[0], (0, 0)),
-        )
+        # 6. Group buckets by current owner
+        buckets_by_node: dict[str, list[int]] = defaultdict(list)
+        for bucket, nid in current_map.items():
+            buckets_by_node[nid].append(bucket)
 
-        # 10. Check if deviation is significant enough to warrant rebalancing.
-        # Count buckets per node (current vs ideal) and check max deviation.
-        cur_counts: dict[str, int] = defaultdict(int)
-        ideal_counts: dict[str, int] = defaultdict(int)
-        for nid in current_map.values():
-            cur_counts[nid] += 1
-        for nid in ideal_map.values():
-            ideal_counts[nid] += 1
+        # 7. Compute ideal bucket count per node from weights
+        total_weight = sum(n.weight for n in ring_nodes)
+        ideal_counts: dict[str, int] = {}
+        remainder_pool: list[str] = []
+        assigned_ideal = 0
+        for n in ring_nodes:
+            ideal_n = int((n.weight / total_weight) * RING_SIZE)
+            ideal_counts[n.node_id] = ideal_n
+            assigned_ideal += ideal_n
+            remainder_pool.append(n.node_id)
+        # Distribute remainder buckets (rounding error) to heaviest nodes
+        leftover = RING_SIZE - assigned_ideal
+        remainder_pool.sort(key=lambda nid: ideal_counts[nid], reverse=True)
+        for i in range(leftover):
+            ideal_counts[remainder_pool[i % len(remainder_pool)]] += 1
 
-        # Always reassign buckets owned by dead nodes
-        dead_moves = [m for m in moves_needed if m[1] not in live_ids]
-        live_moves = [m for m in moves_needed if m[1] in live_ids]
+        # 8. Always reassign dead-node buckets first (unconditional)
+        dead_node_ids = {nid for nid in buckets_by_node if nid not in live_ids}
+        filtered_moves: list[tuple[int, str, str]] = []  # (bucket, from, to)
 
-        # For live-to-live moves, check threshold
-        filtered_moves: list[tuple[int, str, str]] = list(dead_moves)
-        if live_moves:
-            max_deviation = 0.0
-            for nid in live_ids:
-                ideal_n = ideal_counts.get(nid, 0)
-                actual_n = cur_counts.get(nid, 0)
-                if ideal_n > 0:
-                    dev = abs(actual_n - ideal_n) / ideal_n
-                    max_deviation = max(max_deviation, dev)
-            if max_deviation >= self._threshold:
-                filtered_moves.extend(live_moves)
+        if dead_node_ids:
+            # Dead nodes are implicit donors — all their buckets must move.
+            # Distribute to the most underloaded live nodes.
+            dead_buckets: list[int] = []
+            for nid in dead_node_ids:
+                dead_buckets.extend(buckets_by_node.pop(nid))
+            # Sort by cost (cheapest first)
+            dead_buckets.sort(key=lambda b: stats_map.get(b, (0, 0)))
+            # Assign to live nodes that are most below their ideal
+            for bucket in dead_buckets:
+                # Pick the node with the largest deficit
+                best = min(
+                    live_ids,
+                    key=lambda nid: len(buckets_by_node.get(nid, [])) - ideal_counts.get(nid, 0),
+                )
+                filtered_moves.append((bucket, "", best))
+                buckets_by_node[best].append(bucket)
+
+        # 9. Identify donors and recipients among live nodes
+        actual_counts = {nid: len(bkts) for nid, bkts in buckets_by_node.items()}
+        donors: list[str] = []
+        recipients: list[str] = []
+        for nid in live_ids:
+            actual = actual_counts.get(nid, 0)
+            ideal = ideal_counts.get(nid, 0)
+            if ideal > 0 and actual > ideal * (1 + self._threshold):
+                donors.append(nid)
+            elif ideal > 0 and actual < ideal * (1 - self._threshold):
+                recipients.append(nid)
+
+        # 10. Transfer from donors to recipients — minimal moves only
+        if donors and recipients:
+            # Sort donors by excess descending, recipients by deficit descending
+            donors.sort(key=lambda nid: actual_counts[nid] - ideal_counts[nid], reverse=True)
+            recipients.sort(
+                key=lambda nid: ideal_counts[nid] - actual_counts.get(nid, 0),
+                reverse=True,
+            )
+
+            for donor_id in donors:
+                donor_excess = len(buckets_by_node[donor_id]) - ideal_counts[donor_id]
+                if donor_excess <= 0:
+                    continue
+                # Sort this donor's buckets by cost (cheapest to move first)
+                donor_buckets = sorted(
+                    buckets_by_node[donor_id],
+                    key=lambda b: stats_map.get(b, (0, 0)),
+                )
+                moved_from_donor = 0
+                for recipient_id in recipients:
+                    recipient_deficit = ideal_counts[recipient_id] - len(
+                        buckets_by_node.get(recipient_id, [])
+                    )
+                    if recipient_deficit <= 0:
+                        continue
+                    # Transfer min(donor_excess - moved, recipient_deficit) buckets
+                    to_move = min(donor_excess - moved_from_donor, recipient_deficit)
+                    for _ in range(to_move):
+                        if not donor_buckets:
+                            break
+                        bucket = donor_buckets.pop(0)
+                        filtered_moves.append((bucket, donor_id, recipient_id))
+                        buckets_by_node[donor_id].remove(bucket)
+                        buckets_by_node.setdefault(recipient_id, []).append(bucket)
+                        moved_from_donor += 1
+                    if moved_from_donor >= donor_excess:
+                        break
 
         if not filtered_moves:
             result.duration_ms = (time.monotonic() - t0) * 1000
@@ -522,6 +561,33 @@ class Rebalancer:
         if migrated:
             log.info("rebalancer.migrations", count=migrated, total=len(to_migrate))
         return migrated
+
+
+def _weight_based_assignments(nodes: list[RingNode]) -> list[tuple[int, str]]:
+    """Compute bucket assignments proportional to node weights.
+
+    Distributes all 65536 buckets across nodes proportionally to their
+    weights, with deterministic rounding. Used for seeding — produces
+    an exact weight-proportional split that the donor/recipient
+    algorithm won't try to "correct" on the next run.
+    """
+    total_weight = sum(n.weight for n in nodes)
+    assignments: list[tuple[int, str]] = []
+    # Sort nodes for determinism
+    sorted_nodes = sorted(nodes, key=lambda n: n.node_id)
+    bucket = 0
+    for i, node in enumerate(sorted_nodes):
+        if i == len(sorted_nodes) - 1:
+            # Last node gets the remainder (avoids rounding gaps)
+            count = RING_SIZE - bucket
+        else:
+            count = round((node.weight / total_weight) * RING_SIZE)
+        for _ in range(count):
+            if bucket >= RING_SIZE:
+                break
+            assignments.append((bucket, node.node_id))
+            bucket += 1
+    return assignments
 
 
 def _build_ring_nodes(services: list[dict[str, str]]) -> list[RingNode]:

@@ -472,3 +472,70 @@ class TestEagerMigration:
 
         result = rb.rebalance_once(trigger="test")
         assert result.migrations == 0  # no eager migration when disabled
+
+
+class TestMinimalTransfer:
+    def test_new_node_only_receives_never_shuffles(self, storage):
+        """Adding a 3rd node moves buckets TO it, never between existing nodes.
+
+        This is the key property of the minimal-transfer algorithm: nodes A
+        and B should not exchange buckets with each other — only donate to C.
+        """
+        _register_nodes(storage, 2)
+        rb = Rebalancer(storage=storage, threshold=0.05)
+        rb.rebalance_once()  # seeds: node-0 gets 32768, node-1 gets 32768
+
+        # Record which node owns each bucket before adding node-2
+        before = {r["bucket"]: r["node_id"] for r in storage.list_ring_buckets()}
+
+        # Add a third node
+        meta = json.dumps({"weight": 1, "started": "2026-01-01T00:00:00Z"})
+        storage.register_service("server", "node-2", "http://node-2:8080", metadata=meta)
+        result = rb.rebalance_once()
+
+        after = {r["bucket"]: r["node_id"] for r in storage.list_ring_buckets()}
+
+        # Verify: every bucket that moved went TO node-2
+        for bucket in range(RING_SIZE):
+            old = before[bucket]
+            new = after[bucket]
+            if old != new:
+                assert new == "node-2", (
+                    f"bucket {bucket} moved {old} -> {new}, "
+                    "expected all moves to target node-2"
+                )
+
+        # Verify: node-2 got roughly 1/3 of all buckets
+        node2_count = sum(1 for nid in after.values() if nid == "node-2")
+        assert 19000 < node2_count < 24000, f"node-2 got {node2_count} buckets"
+        assert result.moves > 0
+
+    def test_remove_node_distributes_proportionally(self, storage):
+        """Removing a node distributes its buckets to remaining nodes
+        proportionally — doesn't shuffle between survivors."""
+        _register_nodes(storage, 3)
+        rb = Rebalancer(storage=storage, threshold=0.05)
+        rb.rebalance_once()  # seeds
+
+        before = {r["bucket"]: r["node_id"] for r in storage.list_ring_buckets()}
+
+        # Remove node-2
+        storage.deregister_service("server", "node-2")
+        result = rb.rebalance_once()
+
+        after = {r["bucket"]: r["node_id"] for r in storage.list_ring_buckets()}
+
+        # Every moved bucket should have been owned by node-2 (the dead node)
+        for bucket in range(RING_SIZE):
+            old = before[bucket]
+            new = after[bucket]
+            if old != new:
+                assert old == "node-2", (
+                    f"bucket {bucket} moved {old} -> {new}, "
+                    "but only node-2's buckets should move"
+                )
+
+        # node-2 should have zero buckets now
+        node2_count = sum(1 for nid in after.values() if nid == "node-2")
+        assert node2_count == 0
+        assert result.moves > 0
