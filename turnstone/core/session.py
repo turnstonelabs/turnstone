@@ -656,18 +656,27 @@ class ChatSession:
         """
         if not self._registry or not self._model_alias:
             return
-        if not self._registry.has_alias(self._model_alias):
-            return
-        cfg = self._registry.get_config(self._model_alias)
-        if cfg.model == self.model:
-            return
-        client, model_name, new_cfg = self._registry.resolve(self._model_alias)
+        try:
+            if not self._registry.has_alias(self._model_alias):
+                return
+            cfg = self._registry.get_config(self._model_alias)
+            if cfg.model == self.model:
+                return
+            client, model_name, new_cfg = self._registry.resolve(self._model_alias)
+        except (ValueError, KeyError):
+            return  # alias disappeared during concurrent reload
         self.client = client
         self.model = model_name
         self._provider = self._registry.get_provider(self._model_alias)
         self._cached_capabilities = None
         if new_cfg.context_window and new_cfg.context_window != self.context_window:
             self.context_window = new_cfg.context_window
+            # Recompute auto tool truncation for new context window
+            if not self._manual_tool_truncation:
+                self.tool_truncation = int(new_cfg.context_window * self._chars_per_token * 0.5)
+        # Reset judge so it picks up the new model/provider
+        if self._judge is not None:
+            self._judge = None
         self._init_system_messages()
         log.info(
             "session.model_updated ws=%s model=%s ctx=%d",

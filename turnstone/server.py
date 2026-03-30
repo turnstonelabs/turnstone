@@ -2479,14 +2479,13 @@ def main() -> None:
 
     def _handle_model_change(new_model_id: str, new_ctx: int | None) -> None:
         """Called from health probe thread when backend model changes."""
-        cli_args = app.state.cli_model_args
-        if cli_args.get("_user_specified_model"):
+        cli_args = getattr(getattr(app, "state", None), "cli_model_args", None)
+        if not cli_args or cli_args.get("_user_specified_model"):
             return
         old_model = cli_args["model"]
         ctx = new_ctx or cli_args["context_window"]
         log.info("Backend model changed: %s -> %s (ctx=%s)", old_model, new_model_id, ctx)
-        cli_args["model"] = new_model_id
-        cli_args["context_window"] = ctx
+        new_reg = None
         try:
             new_reg = load_model_registry(
                 base_url=cli_args["base_url"],
@@ -2497,9 +2496,14 @@ def main() -> None:
                 storage=get_storage(),
             )
             registry.reload(new_reg.models, new_reg.default, new_reg.fallback, new_reg.agent_model)
-            new_reg.shutdown()
+            # Update cli_model_args only after successful reload
+            cli_args["model"] = new_model_id
+            cli_args["context_window"] = ctx
         except Exception:
             log.warning("Model change reload failed", exc_info=True)
+        finally:
+            if new_reg is not None:
+                new_reg.shutdown()
 
     health_monitor = BackendHealthMonitor(
         client=client,
