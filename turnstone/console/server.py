@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import html
 import json
@@ -735,6 +736,26 @@ async def route_proxy(request: Request) -> Response:
                 status_code=502,
             ),
         )
+
+    # Transparent retry on 404 (at most once):
+    #
+    # The bucket-routed node doesn't have the workstream.  Refresh the
+    # cache (reloads overrides + bucket assignments from DB) and re-route.
+    # If the route changed (e.g., a local-create override was added since
+    # the last cache load), retry on the new node.  If the route is the
+    # same, return the 404 as-is — no loop, no scan.
+    if resp.status_code == 404:
+        router.refresh_cache()
+        try:
+            new_ref = router.route(ws_id)
+        except (NoAvailableNodeError, ValueError):
+            new_ref = ref
+        if new_ref.node_id != ref.node_id:
+            with contextlib.suppress(httpx.HTTPError):
+                resp = await client.post(
+                    f"{new_ref.url}{upstream_path}", json=body, headers=headers
+                )
+
     return _record_route(
         request,
         method,

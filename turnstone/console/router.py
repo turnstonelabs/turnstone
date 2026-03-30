@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -41,6 +42,7 @@ class ConsoleRouter:
         self._cache: list[NodeRef | None] = [None] * RING_SIZE
         self._overrides: dict[str, NodeRef] = {}
         self._version: int = 0
+        self._refresh_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Cache management
@@ -49,8 +51,19 @@ class ConsoleRouter:
     def refresh_cache(self) -> bool:
         """Reload the assignment cache from DB.
 
+        Thread-safe: if another thread is already refreshing, this call
+        returns False immediately (the other thread's refresh will apply).
         Returns True if the cache changed compared to the previous load.
         """
+        if not self._refresh_lock.acquire(blocking=False):
+            return False  # another thread is refreshing
+        try:
+            return self._refresh_cache_locked()
+        finally:
+            self._refresh_lock.release()
+
+    def _refresh_cache_locked(self) -> bool:
+        """Inner refresh — must be called with _refresh_lock held."""
         # Load node URLs from services table
         members = self._storage.list_services("server", max_age_seconds=120)
         nodes: dict[str, NodeRef] = {
