@@ -1317,6 +1317,20 @@ class PostgreSQLBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def set_bucket_stat(self, bucket: int, ws_count: int, active_count: int) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(bucket_stats).values(
+            bucket=bucket, ws_count=ws_count, active_count=active_count
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[bucket_stats.c.bucket],
+            set_={"ws_count": ws_count, "active_count": active_count},
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
     def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 

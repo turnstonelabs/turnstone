@@ -494,6 +494,10 @@ class StorageBackend(Protocol):
         """Return all bucket_stats rows with ws_count > 0."""
         ...
 
+    def set_bucket_stat(self, bucket: int, ws_count: int, active_count: int) -> None:
+        """Set bucket_stats to exact values. Upserts the row."""
+        ...
+
     def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
         """Pin a workstream to a specific node. Upserts."""
         ...

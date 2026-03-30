@@ -22,6 +22,7 @@ import queue
 import re
 import secrets
 import textwrap
+import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -38,6 +39,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
+from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
 from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, AuthMiddleware, create_jwt
 from turnstone.core.hash_ring import NoAvailableNodeError
@@ -317,6 +319,13 @@ async def health(request: Request) -> JSONResponse:
     )
 
 
+async def console_metrics_endpoint(request: Request) -> Response:
+    """GET /metrics — Prometheus text exposition format for console metrics."""
+    cm: ConsoleMetrics = request.app.state.console_metrics
+    text = cm.generate_text()
+    return Response(text, media_type="text/plain; version=0.0.4; charset=utf-8")
+
+
 async def auth_login(request: Request) -> Response:
     """Authenticate via username:password or legacy token, return JWT."""
     from turnstone.core.auth import handle_auth_login
@@ -505,16 +514,45 @@ async def create_workstream(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _record_route(
+    request: Request, method: str, status: int, t0: float, resp: Response
+) -> Response:
+    """Record routing metrics and return the response unchanged."""
+    cm: ConsoleMetrics | None = getattr(request.app.state, "console_metrics", None)
+    if cm is not None:
+        cm.record_route(method, status, time.monotonic() - t0)
+    return resp
+
+
 async def route_create(request: Request) -> Response:
     """POST /v1/api/route/workstreams/new — create via hash-ring routing."""
+    t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
     if router is None or not router.is_ready():
-        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+        return _record_route(
+            request,
+            "create",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return _record_route(
+            request,
+            "create",
+            400,
+            t0,
+            JSONResponse(
+                {"error": "Invalid JSON body"},
+                status_code=400,
+            ),
+        )
 
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
@@ -533,12 +571,30 @@ async def route_create(request: Request) -> Response:
             body["ws_id"] = ws_id
             ref = router.route(ws_id)
     except NoAvailableNodeError:
-        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+        return _record_route(
+            request,
+            "create",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "No available node for routing"},
+                status_code=503,
+            ),
+        )
 
     try:
         resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
     except httpx.HTTPError:
-        return JSONResponse({"error": f"upstream node {ref.node_id} unreachable"}, status_code=502)
+        return _record_route(
+            request,
+            "create",
+            502,
+            t0,
+            JSONResponse(
+                {"error": f"upstream node {ref.node_id} unreachable"},
+                status_code=502,
+            ),
+        )
 
     # 503 retry with a new ws_id that hashes to a different node
     if resp.status_code == 503 and not pin and not body.get("resume_ws"):
@@ -554,10 +610,16 @@ async def route_create(request: Request) -> Response:
                 found_alt = True
                 break
         if not found_alt:
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
+            return _record_route(
+                request,
+                "create",
+                resp.status_code,
+                t0,
+                Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    headers=dict(resp.headers),
+                ),
             )
         body["ws_id"] = ws_id
         try:
@@ -565,40 +627,94 @@ async def route_create(request: Request) -> Response:
                 f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
             )
         except httpx.HTTPError:
-            return JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"}, status_code=502
+            return _record_route(
+                request,
+                "create",
+                502,
+                t0,
+                JSONResponse(
+                    {"error": f"upstream node {ref.node_id} unreachable"},
+                    status_code=502,
+                ),
             )
 
     if resp.status_code == 200:
         data = resp.json()
         data["node_url"] = ref.url
         data["node_id"] = ref.node_id
-        return JSONResponse(data)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=dict(resp.headers),
+        return _record_route(request, "create", 200, t0, JSONResponse(data))
+    return _record_route(
+        request,
+        "create",
+        resp.status_code,
+        t0,
+        Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        ),
     )
 
 
 async def route_proxy(request: Request) -> Response:
     """Generic routing proxy for send/approve/cancel/command/close."""
+    t0 = time.monotonic()
+    # Extract method name from path: /v1/api/route/send -> "send"
+    method = request.url.path.rsplit("/", 1)[-1]
+    if method == "close":
+        method = "close"  # /route/workstreams/close
     router: ConsoleRouter | None = request.app.state.router
     if router is None or not router.is_ready():
-        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+        return _record_route(
+            request,
+            method,
+            400,
+            t0,
+            JSONResponse(
+                {"error": "Invalid JSON body"},
+                status_code=400,
+            ),
+        )
 
     ws_id = body.get("ws_id", "")
     if not ws_id:
-        return JSONResponse({"error": "ws_id required"}, status_code=400)
+        return _record_route(
+            request,
+            method,
+            400,
+            t0,
+            JSONResponse(
+                {"error": "ws_id required"},
+                status_code=400,
+            ),
+        )
     try:
         ref = router.route(ws_id)
     except (NoAvailableNodeError, ValueError):
-        return JSONResponse({"error": "routing failed"}, status_code=503)
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse(
+                {"error": "routing failed"},
+                status_code=503,
+            ),
+        )
 
     # Map /v1/api/route/... → /v1/api/... on the upstream server
     path = request.url.path
@@ -609,30 +725,81 @@ async def route_proxy(request: Request) -> Response:
     try:
         resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
     except httpx.HTTPError:
-        return JSONResponse({"error": f"upstream node {ref.node_id} unreachable"}, status_code=502)
-    return Response(
-        content=resp.content,
-        status_code=resp.status_code,
-        headers=dict(resp.headers),
+        return _record_route(
+            request,
+            method,
+            502,
+            t0,
+            JSONResponse(
+                {"error": f"upstream node {ref.node_id} unreachable"},
+                status_code=502,
+            ),
+        )
+    return _record_route(
+        request,
+        method,
+        resp.status_code,
+        t0,
+        Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        ),
     )
 
 
 async def route_lookup(request: Request) -> JSONResponse:
     """GET /v1/api/route — look up which node owns a workstream."""
+    t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
     if router is None or not router.is_ready():
-        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+        return _record_route(
+            request,
+            "route",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "Cluster routing not initialized"},
+                status_code=503,
+            ),
+        )  # type: ignore[return-value]
 
     ws_id = request.query_params.get("ws_id", "")
     if not ws_id:
-        return JSONResponse({"error": "ws_id required"}, status_code=400)
+        return _record_route(
+            request,
+            "route",
+            400,
+            t0,
+            JSONResponse(
+                {"error": "ws_id required"},
+                status_code=400,
+            ),
+        )  # type: ignore[return-value]
 
     try:
         ref = router.route(ws_id)
     except NoAvailableNodeError:
-        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+        return _record_route(
+            request,
+            "route",
+            503,
+            t0,
+            JSONResponse(
+                {"error": "No available node for routing"},
+                status_code=503,
+            ),
+        )  # type: ignore[return-value]
 
-    return JSONResponse({"node_url": ref.url, "node_id": ref.node_id})
+    return _record_route(
+        request,
+        "route",
+        200,
+        t0,
+        JSONResponse(
+            {"node_url": ref.url, "node_id": ref.node_id},
+        ),
+    )  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -5522,6 +5689,7 @@ def create_app(
     console_url: str = "",
     router: ConsoleRouter | None = None,
     rebalancer: Any = None,
+    console_metrics: ConsoleMetrics | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -5813,6 +5981,7 @@ def create_app(
                 ],
             ),
             Route("/health", health),
+            Route("/metrics", console_metrics_endpoint),
             Route("/openapi.json", _openapi_handler),
             Route("/docs", _docs_handler),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
@@ -5838,6 +6007,7 @@ def create_app(
     app.state.tls_manager = tls_manager
     app.state.router = router
     app.state.rebalancer = rebalancer
+    app.state.console_metrics = console_metrics or ConsoleMetrics()
 
     # Mount ACME responder whenever a TLS manager is configured.
     # ACMEResponder (lacme 1.0.2+) serves /ca.pem natively.
@@ -5995,6 +6165,7 @@ def main() -> None:
         log.info("console.collector_token_manager_created")
 
     router = ConsoleRouter(storage=auth_storage)
+    console_metrics = ConsoleMetrics()
 
     collector = ClusterCollector(
         storage=auth_storage,
@@ -6002,6 +6173,7 @@ def main() -> None:
         auth_token=collector_token if collector_token_mgr is None else "",
         token_manager=collector_token_mgr,
         router=router,
+        console_metrics=console_metrics,
     )
     collector.start()
 
@@ -6104,11 +6276,12 @@ def main() -> None:
                     storage=auth_storage,
                     router=router,
                     collector=collector,
+                    console_metrics=console_metrics,
                     interval=_rcs.get("rebalancer.interval", 60),
                     threshold=_rcs.get("rebalancer.threshold", 0.10),
                     vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
                     eager_migrate=_rcs.get("rebalancer.eager_migrate", False),
-                    api_token=proxy_auth_token,
+                    api_token=proxy_token if proxy_token_mgr is None else "",
                 )
                 log.info("rebalancer.configured")
         except Exception:
@@ -6126,6 +6299,7 @@ def main() -> None:
         console_url=console_url,
         router=router,
         rebalancer=rebalancer,
+        console_metrics=console_metrics,
     )
 
     log.info("Console starting on %s", console_url)

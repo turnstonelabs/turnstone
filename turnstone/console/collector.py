@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
+    from turnstone.console.metrics import ConsoleMetrics
     from turnstone.console.router import ConsoleRouter
     from turnstone.core.auth import ServiceTokenManager
     from turnstone.core.storage._protocol import StorageBackend
@@ -61,6 +62,7 @@ class ClusterCollector:
         tls_verify: Any = True,
         tls_cert: tuple[str, str] | None = None,
         router: ConsoleRouter | None = None,
+        console_metrics: ConsoleMetrics | None = None,
     ):
         self._storage = storage
         self._poll_interval = poll_interval
@@ -69,6 +71,7 @@ class ClusterCollector:
         self._http_timeout = http_timeout
         self._token_manager = token_manager
         self._router = router
+        self._console_metrics = console_metrics
         # Static auth header — only used when no token_manager is present.
         # When a token_manager exists, auth is injected per-request via
         # extra_headers in _poll_all_nodes to avoid stale JWT expiry.
@@ -201,6 +204,12 @@ class ClusterCollector:
                 self._router.check_version()
             except Exception:
                 log.debug("Router version check failed", exc_info=True)
+            # Update ring gauge metrics after version check
+            if self._console_metrics is not None:
+                self._console_metrics.set_ring_info(
+                    self._router.node_count(),
+                    self._router._version,
+                )
 
     # -- polling -------------------------------------------------------------
 

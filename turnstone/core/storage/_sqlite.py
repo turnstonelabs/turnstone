@@ -1392,6 +1392,20 @@ class SQLiteBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def set_bucket_stat(self, bucket: int, ws_count: int, active_count: int) -> None:
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        stmt = sqlite_insert(bucket_stats).values(
+            bucket=bucket, ws_count=ws_count, active_count=active_count
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["bucket"],
+            set_={"ws_count": ws_count, "active_count": active_count},
+        )
+        with self._engine.connect() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
     def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 

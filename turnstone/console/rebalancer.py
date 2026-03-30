@@ -22,6 +22,7 @@ from turnstone.core.hash_ring import RING_SIZE, HashRing, RingNode, bucket_of
 
 if TYPE_CHECKING:
     from turnstone.console.collector import ClusterCollector
+    from turnstone.console.metrics import ConsoleMetrics
     from turnstone.console.router import ConsoleRouter
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -56,6 +57,7 @@ class Rebalancer:
         storage: StorageBackend,
         router: ConsoleRouter | None = None,
         collector: ClusterCollector | None = None,
+        console_metrics: ConsoleMetrics | None = None,
         interval: int = 60,
         threshold: float = 0.10,
         vnodes_per_unit: int = 150,
@@ -66,6 +68,7 @@ class Rebalancer:
         self._storage = storage
         self._router = router
         self._collector = collector
+        self._console_metrics = console_metrics
         self._interval = interval
         self._threshold = threshold
         self._vnodes_per_unit = vnodes_per_unit
@@ -143,10 +146,24 @@ class Rebalancer:
             try:
                 result = self.rebalance_once(trigger=trigger)
                 self._last_result = result
+                self._record_result_metrics(result)
             except Exception:
                 log.exception("rebalancer.error")
             finally:
                 self._release_lock()
+
+    def _record_result_metrics(self, result: RebalanceResult) -> None:
+        """Push rebalance result counters to the console metrics collector."""
+        if self._console_metrics is None:
+            return
+        if result.seeded:
+            self._console_metrics.record_rebalance("seeded")
+        elif not result.noop:
+            self._console_metrics.record_rebalance("rebalanced")
+        else:
+            self._console_metrics.record_rebalance("noop")
+        if result.migrations > 0:
+            self._console_metrics.record_migrations(result.migrations)
 
     # ------------------------------------------------------------------
     # Leader lock (same pattern as TaskScheduler)
@@ -431,30 +448,10 @@ class Rebalancer:
         current_ws: int = 0,
         current_active: int = 0,
     ) -> None:
-        """Reset a bucket_stats row to exact values.
-
-        Uses the upsert pattern: the storage layer exposes increment/decrement
-        but not a direct set. We compute the delta needed and apply it.
-
-        *current_ws* and *current_active* are the stored values already loaded
-        by the caller, avoiding a redundant ``list_bucket_stats()`` query per
-        drifted bucket.
-        """
-        # Compute deltas
-        ws_delta = ws_count - current_ws
-        active_delta = active_count - current_active
-
-        # Apply ws_count delta
-        if ws_delta > 0:
-            for _ in range(ws_delta):
-                self._storage.increment_bucket_count(bucket)
-        elif ws_delta < 0:
-            for _ in range(-ws_delta):
-                self._storage.decrement_bucket_count(bucket)
-
-        # Apply active_count delta
-        if active_delta != 0:
-            self._storage.adjust_bucket_active(bucket, active_delta)
+        """Reset a bucket_stats row to exact values via single upsert."""
+        if (ws_count, active_count) == (current_ws, current_active):
+            return  # no change
+        self._storage.set_bucket_stat(bucket, ws_count, active_count)
 
     def _eager_migrate_workstreams(
         self,

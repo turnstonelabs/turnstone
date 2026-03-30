@@ -103,6 +103,30 @@ class TestBucketStats:
         assert 200 not in buckets
         assert 300 in buckets
 
+    def test_set_bucket_stat_creates(self, storage):
+        """set_bucket_stat upserts a new row."""
+        storage.set_bucket_stat(42, 5, 2)
+        stats = storage.list_bucket_stats()
+        row = next(s for s in stats if s["bucket"] == 42)
+        assert row["ws_count"] == 5
+        assert row["active_count"] == 2
+
+    def test_set_bucket_stat_overwrites(self, storage):
+        """set_bucket_stat overwrites existing values."""
+        storage.set_bucket_stat(42, 10, 3)
+        storage.set_bucket_stat(42, 2, 0)
+        stats = storage.list_bucket_stats()
+        row = next(s for s in stats if s["bucket"] == 42)
+        assert row["ws_count"] == 2
+        assert row["active_count"] == 0
+
+    def test_set_bucket_stat_zero_removes_from_sparse(self, storage):
+        """Setting ws_count=0 means list_bucket_stats excludes it (sparse)."""
+        storage.set_bucket_stat(42, 5, 1)
+        storage.set_bucket_stat(42, 0, 0)
+        stats = storage.list_bucket_stats()
+        assert not any(s["bucket"] == 42 for s in stats)
+
 
 class TestWorkstreamOverrides:
     def test_set_and_list(self, storage):
