@@ -72,6 +72,7 @@ from turnstone.core.storage._utils import (
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
 )
+from turnstone.core.storage._utils import sanitize_text
 from turnstone.core.storage._utils import (
     scan_skill_content as _scan_skill_content,
 )
@@ -163,6 +164,8 @@ class SQLiteBackend:
         tool_calls: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        content = sanitize_text(content)
+        provider_data = sanitize_text(provider_data)
         with self._engine.connect() as conn:
             result = conn.execute(
                 sa.insert(conversations),

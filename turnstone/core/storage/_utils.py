@@ -11,6 +11,22 @@ from turnstone.core.log import get_logger
 log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Text sanitization
+# ---------------------------------------------------------------------------
+
+
+def sanitize_text(value: str | None) -> str | None:
+    """Strip NUL bytes that PostgreSQL text fields cannot store.
+
+    SQLite tolerates NUL in TEXT but they cause downstream issues (API
+    payloads, web UI rendering), so both backends use this.
+    """
+    if value and "\x00" in value:
+        return value.replace("\x00", "")
+    return value
+
+
+# ---------------------------------------------------------------------------
 # Row helper
 # ---------------------------------------------------------------------------
 
