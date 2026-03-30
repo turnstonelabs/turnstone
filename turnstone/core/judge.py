@@ -189,6 +189,20 @@ _CRITICAL_RULES: list[_HeuristicRule] = [
             "This is a two-step variant of pipe-to-shell."
         ),
     ),
+    _HeuristicRule(
+        name="proc-environ-exfil",
+        risk_level="critical",
+        confidence=0.95,
+        recommendation="deny",
+        tool_pattern="bash",
+        arg_patterns=[r"/proc/\d+/environ", r"/proc/self/environ"],
+        intent_template="Process environment exfiltration: {arg_snippet}",
+        reasoning_template=(
+            "Reading /proc/*/environ exposes all environment variables of the "
+            "target process, which may include database credentials, API keys, "
+            "and JWT secrets. This is a credential exfiltration vector."
+        ),
+    ),
 ]
 
 # -- High (confidence 0.80, review) ----------------------------------------
@@ -275,20 +289,6 @@ _HIGH_RULES: list[_HeuristicRule] = [
         arg_patterns=[r"\bssh\s", r"\bscp\s"],
         intent_template="Remote access command: {arg_snippet}",
         reasoning_template="Command initiates a remote SSH or SCP connection.",
-    ),
-    _HeuristicRule(
-        name="proc-environ-exfil",
-        risk_level="critical",
-        confidence=0.95,
-        recommendation="deny",
-        tool_pattern="bash",
-        arg_patterns=[r"/proc/\d+/environ", r"/proc/self/environ"],
-        intent_template="Process environment exfiltration: {arg_snippet}",
-        reasoning_template=(
-            "Reading /proc/*/environ exposes all environment variables of the "
-            "target process, which may include database credentials, API keys, "
-            "and JWT secrets. This is a credential exfiltration vector."
-        ),
     ),
     _HeuristicRule(
         name="credential-recon",
