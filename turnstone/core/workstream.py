@@ -44,6 +44,9 @@ class WorkstreamState(enum.Enum):
     ERROR = "error"  # last operation failed
 
 
+_ACTIVE_STATES = {"running", "thinking", "attention"}
+
+
 # ---------------------------------------------------------------------------
 # Workstream dataclass
 # ---------------------------------------------------------------------------
@@ -161,8 +164,12 @@ class WorkstreamManager:
         if first_evicted is not None:
             self._cleanup_ui(first_evicted)
             self._last_evicted = first_evicted
+            from turnstone.core.memory import decrement_bucket_count as _dbc1
+            from turnstone.core.memory import delete_workstream_override as _dwo1
             from turnstone.core.metrics import metrics as _m1
 
+            _dbc1(first_evicted.id, active=False)  # evicted ws is always idle
+            _dwo1(first_evicted.id)
             _m1.record_eviction()
 
         # Create workstream and ChatSession outside the lock (construction is
@@ -186,7 +193,7 @@ class WorkstreamManager:
                 self._active_id = ws.id
 
         # Persist to storage only after successful insertion
-        from turnstone.core.memory import register_workstream
+        from turnstone.core.memory import increment_bucket_count, register_workstream
 
         register_workstream(
             ws.id,
@@ -195,13 +202,18 @@ class WorkstreamManager:
             skill_id=skill_id,
             skill_version=skill_version,
         )
+        increment_bucket_count(ws.id)
 
         # Cleanup second-phase eviction outside the lock.
         if second_evicted is not None:
             self._cleanup_ui(second_evicted)
             self._last_evicted = second_evicted
+            from turnstone.core.memory import decrement_bucket_count as _dbc2
+            from turnstone.core.memory import delete_workstream_override as _dwo2
             from turnstone.core.metrics import metrics as _m2
 
+            _dbc2(second_evicted.id, active=False)
+            _dwo2(second_evicted.id)
             _m2.record_eviction()
         return ws
 
@@ -272,14 +284,21 @@ class WorkstreamManager:
             ws = self._workstreams.pop(ws_id, None)
             if ws is None:
                 return False
+            was_active = ws.state.value in _ACTIVE_STATES
             self._order.remove(ws_id)
             if self._active_id == ws_id:
                 self._active_id = self._order[0]
         # Unblock any waiting approval/plan events so worker thread can exit
         self._cleanup_ui(ws)
-        from turnstone.core.memory import update_workstream_state
+        from turnstone.core.memory import (
+            decrement_bucket_count,
+            delete_workstream_override,
+            update_workstream_state,
+        )
 
         update_workstream_state(ws_id, "closed")
+        decrement_bucket_count(ws_id, active=was_active)
+        delete_workstream_override(ws_id)
         return True
 
     # -- lookup -------------------------------------------------------------
@@ -340,12 +359,18 @@ class WorkstreamManager:
         ws = self._workstreams.get(ws_id)
         if ws:
             with ws._lock:
+                old_active = ws.state.value in _ACTIVE_STATES
                 ws.state = state
                 ws.last_active = time.monotonic()
                 ws.error_message = error_msg
-                from turnstone.core.memory import update_workstream_state
+                from turnstone.core.memory import adjust_bucket_active, update_workstream_state
 
                 update_workstream_state(ws_id, state.value)
+                new_active = state.value in _ACTIVE_STATES
+                if old_active and not new_active:
+                    adjust_bucket_active(ws_id, -1)
+                elif new_active and not old_active:
+                    adjust_bucket_active(ws_id, 1)
             if self._on_state_change:
                 self._on_state_change(ws_id, state)
 

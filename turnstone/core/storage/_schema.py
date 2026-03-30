@@ -233,6 +233,38 @@ services = sa.Table(
 sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)
 
 # ---------------------------------------------------------------------------
+# Hash ring routing tables
+# ---------------------------------------------------------------------------
+
+hash_ring_buckets = sa.Table(
+    "hash_ring_buckets",
+    metadata,
+    sa.Column("bucket", sa.Integer, primary_key=True),
+    sa.Column("node_id", sa.Text, nullable=False),
+)
+
+sa.Index("idx_ring_buckets_node", hash_ring_buckets.c.node_id)
+
+bucket_stats = sa.Table(
+    "bucket_stats",
+    metadata,
+    sa.Column("bucket", sa.Integer, primary_key=True),
+    sa.Column("ws_count", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("active_count", sa.Integer, nullable=False, server_default="0"),
+)
+
+workstream_overrides = sa.Table(
+    "workstream_overrides",
+    metadata,
+    sa.Column("ws_id", sa.Text, primary_key=True),
+    sa.Column("node_id", sa.Text, nullable=False),
+    sa.Column("reason", sa.Text, nullable=False, server_default="targeted"),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_ws_overrides_node", workstream_overrides.c.node_id)
+
+# ---------------------------------------------------------------------------
 # Governance tables — RBAC, orgs, policies, skills, usage, audit
 # ---------------------------------------------------------------------------
 

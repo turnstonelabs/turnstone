@@ -464,6 +464,48 @@ class StorageBackend(Protocol):
         """Remove a service registration. Returns True if existed."""
         ...
 
+    # -- Hash ring routing ---
+
+    def list_ring_buckets(self) -> list[dict[str, Any]]:
+        """Return all rows from hash_ring_buckets. Empty if not seeded."""
+        ...
+
+    def seed_ring_buckets(self, assignments: list[tuple[int, str]]) -> None:
+        """Insert (bucket, node_id) rows. Idempotent (ON CONFLICT DO NOTHING)."""
+        ...
+
+    def assign_buckets(self, buckets: list[int], node_id: str) -> int:
+        """Reassign buckets to a node. Returns rows updated."""
+        ...
+
+    def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
+        """Increment ws_count (and active_count if active) in bucket_stats. Upserts."""
+        ...
+
+    def decrement_bucket_count(self, bucket: int, active: bool = False) -> None:
+        """Decrement ws_count (and active_count if active). Clamps at zero."""
+        ...
+
+    def adjust_bucket_active(self, bucket: int, delta: int) -> None:
+        """Adjust active_count only (not ws_count). For state transitions."""
+        ...
+
+    def list_bucket_stats(self) -> list[dict[str, Any]]:
+        """Return all bucket_stats rows with ws_count > 0."""
+        ...
+
+    def set_workstream_override(self, ws_id: str, node_id: str, reason: str = "targeted") -> None:
+        """Pin a workstream to a specific node. Upserts."""
+        ...
+
+    def delete_workstream_override(self, ws_id: str) -> bool:
+        """Remove a pin. Returns True if one existed."""
+        ...
+
+    def list_workstream_overrides(self) -> list[dict[str, str]]:
+        """Return all overrides."""
+        ...
+
     # -- Roles (RBAC) ----------------------------------------------------------
 
     def create_role(

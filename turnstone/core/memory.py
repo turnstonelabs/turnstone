@@ -110,6 +110,46 @@ def update_workstream_state(ws_id: str, state: str) -> None:
         log.warning("Failed to update workstream state ws=%s state=%s", ws_id, state, exc_info=True)
 
 
+# -- Hash ring bucket counts --------------------------------------------------
+
+
+def _bucket_of(ws_id: str) -> int:
+    """Extract bucket from ws_id prefix. First 4 hex chars -> 0-65535."""
+    return int(ws_id[:4], 16)
+
+
+def increment_bucket_count(ws_id: str, active: bool = False) -> None:
+    """Fire-and-forget bucket count increment."""
+    try:
+        get_storage().increment_bucket_count(_bucket_of(ws_id), active)
+    except Exception:
+        log.warning("bucket count increment failed for %s", ws_id[:8], exc_info=True)
+
+
+def decrement_bucket_count(ws_id: str, active: bool = False) -> None:
+    """Fire-and-forget bucket count decrement."""
+    try:
+        get_storage().decrement_bucket_count(_bucket_of(ws_id), active)
+    except Exception:
+        log.warning("bucket count decrement failed for %s", ws_id[:8], exc_info=True)
+
+
+def adjust_bucket_active(ws_id: str, delta: int) -> None:
+    """Fire-and-forget active count adjustment."""
+    try:
+        get_storage().adjust_bucket_active(_bucket_of(ws_id), delta)
+    except Exception:
+        log.warning("bucket active adjust failed for %s", ws_id[:8], exc_info=True)
+
+
+def delete_workstream_override(ws_id: str) -> None:
+    """Fire-and-forget override deletion."""
+    try:
+        get_storage().delete_workstream_override(ws_id)
+    except Exception:
+        log.warning("override delete failed for %s", ws_id[:8], exc_info=True)
+
+
 def update_workstream_name(ws_id: str, name: str) -> None:
     """Update a workstream's display name."""
     try:
