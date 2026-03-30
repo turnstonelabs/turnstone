@@ -405,17 +405,37 @@ class AnthropicProvider:
                 continue
 
             if role == "tool":
-                # Anthropic: tool results are content blocks in a user message
+                # Anthropic: tool results are content blocks in a user message.
+                # Collect valid tool_use IDs from the preceding assistant message
+                # so we can drop orphaned tool_results that have no matching
+                # tool_use (e.g. from compaction boundary, old cancel stripping).
+                prev_tool_use_ids: set[str] = set()
+                if converted and converted[-1].get("role") == "assistant":
+                    prev_content = converted[-1].get("content", [])
+                    if isinstance(prev_content, list):
+                        for block in prev_content:
+                            if isinstance(block, dict) and block.get("type") == "tool_use":
+                                prev_tool_use_ids.add(block.get("id", ""))
+
                 tool_results: list[dict[str, Any]] = []
                 while i < len(messages) and messages[i]["role"] == "tool":
                     tool_msg = messages[i]
+                    tc_id = tool_msg.get("tool_call_id", "")
+                    # Drop orphaned tool_results with no matching tool_use
+                    if prev_tool_use_ids and tc_id not in prev_tool_use_ids:
+                        log.debug(
+                            "Dropping orphaned tool_result (no matching tool_use): %s",
+                            tc_id,
+                        )
+                        i += 1
+                        continue
                     content = tool_msg.get("content", "")
                     # Convert image_url parts to Anthropic image format
                     if isinstance(content, list):
                         content = self._convert_content_parts(content)
                     result_block: dict[str, Any] = {
                         "type": "tool_result",
-                        "tool_use_id": tool_msg.get("tool_call_id", ""),
+                        "tool_use_id": tc_id,
                         "content": content,
                     }
                     if tool_msg.get("is_error"):
@@ -426,7 +446,8 @@ class AnthropicProvider:
                 if pending_orphan_results:
                     tool_results.extend(pending_orphan_results)
                     pending_orphan_results = []
-                converted.append({"role": "user", "content": tool_results})
+                if tool_results:
+                    converted.append({"role": "user", "content": tool_results})
                 continue
 
             if role == "user":
