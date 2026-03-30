@@ -10,9 +10,12 @@ LABEL org.opencontainers.image.title="turnstone" \
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.2 /uv /usr/local/bin/uv
 
+# Remove the slim image's man page exclusion so man-db has actual content
+RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
+
 # System dependencies: psycopg (libpq5), developer tooling for agent workflows
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db info \
+    libpq5 git curl jq man-db manpages \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user
