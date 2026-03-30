@@ -3795,18 +3795,14 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: query is required",
             }
-        limit = args.get("limit", 20)
-        if isinstance(limit, str):
-            try:
-                limit = int(limit)
-            except ValueError:
-                limit = 20
-        offset = args.get("offset", 0)
-        if isinstance(offset, str):
-            try:
-                offset = int(offset)
-            except ValueError:
-                offset = 0
+        try:
+            limit = int(args.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            offset = int(args.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
         return {
             "call_id": call_id,
             "func_name": "recall",

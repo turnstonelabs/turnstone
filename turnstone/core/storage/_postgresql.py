@@ -409,8 +409,8 @@ class PostgreSQLBackend:
     def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
         if not query or not query.strip():
             return []
-        capped = min(limit, 100)
-        capped_offset = max(0, offset)
+        capped = min(int(limit), 100)
+        capped_offset = max(0, int(offset))
         with self._engine.connect() as conn:
             # Use PostgreSQL full-text search if search_vector column exists
             try:
