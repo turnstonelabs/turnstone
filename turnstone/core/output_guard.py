@@ -51,11 +51,13 @@ _RE_PRIVATE_KEY_BLOCK = re.compile(
     r"-----END\s+(?:RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY-----",
 )
 _RE_CONNECTION_STRING = re.compile(
-    r"(?:postgresql|mysql|mongodb|redis|amqp)://[^:@\s]+:[^@\s]+@",
+    r"(?:postgresql\+?(?:psycopg)?|mysql|mongodb|redis|amqp|sqlite)://[^:@\s]+:[^@\s]+@",
 )
 _RE_ENV_SECRET_LINE = re.compile(r"[A-Z][A-Z_0-9]+=\S+")
 _RE_ENV_SECRET_KEY = re.compile(
-    r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL)(?:_|$)|(?:^|_)KEY(?:_|$)",
+    r"(?:^|_)(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|DSN)(?:_|$)"
+    r"|(?:^|_)KEY(?:_|$)"
+    r"|^(?:DATABASE_URL|TURNSTONE_DB_URL|DB_URL)$",
     re.IGNORECASE,
 )
 _RE_JSON_SECRET = re.compile(
