@@ -189,7 +189,7 @@ class StorageBackend(Protocol):
 
     # -- Conversation search ---------------------------------------------------
 
-    def search_history(self, query: str, limit: int = 20) -> list[Any]:
+    def search_history(self, query: str, limit: int = 20, offset: int = 0) -> list[Any]:
         """Search conversation history. Returns (timestamp, ws_id, role, content, tool_name)."""
         ...
 

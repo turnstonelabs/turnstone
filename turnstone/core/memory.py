@@ -267,10 +267,10 @@ def update_workstream_title(ws_id: str, title: str) -> None:
 # -- Conversation search -------------------------------------------------------
 
 
-def search_history(query: str, limit: int = 20) -> list[Any]:
+def search_history(query: str, limit: int = 20, offset: int = 0) -> list[Any]:
     """Search conversation history."""
     try:
-        return get_storage().search_history(query, limit)
+        return get_storage().search_history(query, limit, offset)
     except Exception:
         log.warning("Failed to search history", exc_info=True)
         return []
