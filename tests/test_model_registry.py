@@ -899,3 +899,22 @@ class TestDetectModelTimeout:
 
         result = detect_model(client, provider="openai", fatal=False)
         assert result == (None, None)
+
+    def test_vllm_max_model_len_detected(self) -> None:
+        """detect_model() reads max_model_len from vLLM model objects."""
+        mock_model = MagicMock()
+        mock_model.id = "/models/nemotron"
+        mock_model.model_dump.return_value = {
+            "owned_by": "vllm",
+            "max_model_len": 262144,
+        }
+
+        fast_client = MagicMock()
+        fast_client.models.list.return_value = MagicMock(data=[mock_model])
+
+        client = MagicMock()
+        client.with_options.return_value = fast_client
+
+        model_id, ctx = detect_model(client, provider="openai")
+        assert model_id == "/models/nemotron"
+        assert ctx == 262144

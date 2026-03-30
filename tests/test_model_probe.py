@@ -20,12 +20,15 @@ def _mock_model(
     *,
     owned_by: str = "test",
     meta: dict[str, Any] | None = None,
+    **kwargs: Any,
 ) -> MagicMock:
     m = MagicMock()
     m.id = model_id
     dumped: dict[str, Any] = {"owned_by": owned_by}
     if meta is not None:
         dumped["meta"] = meta
+    if kwargs.get("max_model_len") is not None:
+        dumped["max_model_len"] = kwargs["max_model_len"]
     m.model_dump.return_value = dumped
     return m
 
@@ -108,6 +111,27 @@ class TestProbeModelEndpoint:
 
         result = probe_model_endpoint("openai", "http://localhost:30000/v1", "key")
         assert result["server_type"] == "sglang"
+
+    @patch("turnstone.core.providers.create_client")
+    def test_vllm_max_model_len(self, mock_cc: MagicMock) -> None:
+        m = _mock_model("/models/nemotron", max_model_len=262144, owned_by="vllm")
+        mock_cc.return_value = _mock_client(m)
+
+        result = probe_model_endpoint("openai", "http://localhost:8000/v1", "key")
+        assert result["context_window"] == 262144
+        assert result["server_type"] == "vllm"
+
+    @patch("turnstone.core.providers.create_client")
+    def test_vllm_max_model_len_preferred_over_meta(self, mock_cc: MagicMock) -> None:
+        m = _mock_model(
+            "/models/test",
+            meta={"n_ctx_train": 8192},
+            max_model_len=131072,
+        )
+        mock_cc.return_value = _mock_client(m)
+
+        result = probe_model_endpoint("openai", "http://localhost:8000/v1", "key")
+        assert result["context_window"] == 131072
 
     @patch("turnstone.core.providers.create_client")
     def test_server_type_vllm(self, mock_cc: MagicMock) -> None:
