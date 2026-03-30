@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "0.9.3"
+version = "0.9.4"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "BUSL-1.1"
