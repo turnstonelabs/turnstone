@@ -2832,7 +2832,7 @@ class ChatSession:
             "execute": self._exec_bash,
             "command": command,
             "timeout": timeout,
-            "stop_on_error": bool(args.get("stop_on_error")),
+            "stop_on_error": args.get("stop_on_error") is True,
         }
 
     def _prepare_read_file(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4285,7 +4285,13 @@ class ChatSession:
             output = output.strip()
             output = self._truncate_output(output)
 
-            bash_error = proc.returncode not in (0, 1)
+            # With stop_on_error, any non-zero exit is a real failure (set -e
+            # killed the script).  Without it, exit code 1 is often benign
+            # (e.g. grep no-match).
+            if item.get("stop_on_error"):
+                bash_error = proc.returncode != 0
+            else:
+                bash_error = proc.returncode not in (0, 1)
             if proc.returncode != 0:
                 output += f"\n[exit code: {proc.returncode}]"
 
