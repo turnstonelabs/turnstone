@@ -34,253 +34,216 @@
   <text x="600" y="54" text-anchor="middle" fill="#8b949e" font-size="11" letter-spacing="1">SYSTEM ARCHITECTURE</text>
 
   <!-- ==================== COLUMN HEADERS ==================== -->
-  <text x="90" y="86" text-anchor="middle" fill="#58a6ff" font-size="9" font-weight="600" letter-spacing="2">CLIENTS</text>
-  <text x="276" y="86" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="600" letter-spacing="2">GATEWAYS</text>
-  <text x="480" y="86" text-anchor="middle" fill="#f0883e" font-size="9" font-weight="600" letter-spacing="2">MESSAGE QUEUE</text>
-  <text x="700" y="86" text-anchor="middle" fill="#f47067" font-size="9" font-weight="600" letter-spacing="2">CLUSTER NODES</text>
-  <text x="940" y="86" text-anchor="middle" fill="#f778ba" font-size="9" font-weight="600" letter-spacing="2">LLM PROVIDERS</text>
+  <text x="110" y="86" text-anchor="middle" fill="#58a6ff" font-size="9" font-weight="600" letter-spacing="2">CLIENTS</text>
+  <text x="380" y="86" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="600" letter-spacing="2">CONSOLE ROUTER</text>
+  <text x="700" y="86" text-anchor="middle" fill="#f47067" font-size="9" font-weight="600" letter-spacing="2">SERVER NODES</text>
+  <text x="1010" y="86" text-anchor="middle" fill="#f778ba" font-size="9" font-weight="600" letter-spacing="2">LLM PROVIDERS</text>
 
   <!-- ==================== CLIENT BOXES ==================== -->
   <!-- CLI -->
   <g filter="url(#shadow)">
-    <rect x="30" y="108" width="120" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="30" y="108" width="120" height="5" rx="5" fill="#58a6ff"/>
-    <rect x="30" y="108" width="120" height="5" fill="#58a6ff"/>
-    <rect x="30" y="111" width="120" height="2" fill="#161b22"/>
-    <text x="90" y="130" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">CLI</text>
-    <text x="90" y="145" text-anchor="middle" fill="#8b949e" font-size="9">terminal REPL</text>
+    <rect x="40" y="108" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="40" y="108" width="140" height="5" rx="5" fill="#58a6ff"/>
+    <rect x="40" y="108" width="140" height="5" fill="#58a6ff"/>
+    <rect x="40" y="111" width="140" height="2" fill="#161b22"/>
+    <text x="110" y="130" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">CLI</text>
+    <text x="110" y="145" text-anchor="middle" fill="#8b949e" font-size="9">terminal REPL</text>
   </g>
 
   <!-- Browser UI -->
   <g filter="url(#shadow)">
-    <rect x="30" y="174" width="120" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="30" y="174" width="120" height="5" rx="5" fill="#58a6ff"/>
-    <rect x="30" y="174" width="120" height="5" fill="#58a6ff"/>
-    <rect x="30" y="177" width="120" height="2" fill="#161b22"/>
-    <text x="90" y="196" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Browser UI</text>
-    <text x="90" y="211" text-anchor="middle" fill="#8b949e" font-size="9">HTTP + SSE</text>
+    <rect x="40" y="174" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="40" y="174" width="140" height="5" rx="5" fill="#58a6ff"/>
+    <rect x="40" y="174" width="140" height="5" fill="#58a6ff"/>
+    <rect x="40" y="177" width="140" height="2" fill="#161b22"/>
+    <text x="110" y="196" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Browser UI</text>
+    <text x="110" y="211" text-anchor="middle" fill="#8b949e" font-size="9">HTTP + SSE</text>
   </g>
 
   <!-- SDK / API -->
   <g filter="url(#shadow)">
-    <rect x="30" y="244" width="120" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="30" y="244" width="120" height="5" rx="5" fill="#58a6ff"/>
-    <rect x="30" y="244" width="120" height="5" fill="#58a6ff"/>
-    <rect x="30" y="247" width="120" height="2" fill="#161b22"/>
-    <text x="90" y="266" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">SDK / API</text>
-    <text x="90" y="281" text-anchor="middle" fill="#8b949e" font-size="9">programmatic</text>
-  </g>
-
-  <!-- Discord / Slack -->
-  <g filter="url(#shadow)">
-    <rect x="30" y="314" width="120" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="30" y="314" width="120" height="5" rx="5" fill="#58a6ff"/>
-    <rect x="30" y="314" width="120" height="5" fill="#58a6ff"/>
-    <rect x="30" y="317" width="120" height="2" fill="#161b22"/>
-    <text x="90" y="336" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Discord / Slack</text>
-    <text x="90" y="351" text-anchor="middle" fill="#8b949e" font-size="9">chat platforms</text>
-  </g>
-
-  <!-- ==================== GATEWAY BOXES ==================== -->
-  <!-- Console -->
-  <g filter="url(#shadow)">
-    <rect x="216" y="118" width="120" height="58" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="216" y="118" width="120" height="5" rx="5" fill="#3fb950"/>
-    <rect x="216" y="118" width="120" height="5" fill="#3fb950"/>
-    <rect x="216" y="121" width="120" height="2" fill="#161b22"/>
-    <text x="276" y="142" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Console</text>
-    <text x="276" y="157" text-anchor="middle" fill="#8b949e" font-size="9">dashboard + proxy</text>
-    <text x="276" y="169" text-anchor="middle" fill="#8b949e" font-size="9">cluster management</text>
+    <rect x="40" y="244" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="40" y="244" width="140" height="5" rx="5" fill="#58a6ff"/>
+    <rect x="40" y="244" width="140" height="5" fill="#58a6ff"/>
+    <rect x="40" y="247" width="140" height="2" fill="#161b22"/>
+    <text x="110" y="266" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">SDK / API</text>
+    <text x="110" y="281" text-anchor="middle" fill="#8b949e" font-size="9">programmatic</text>
   </g>
 
   <!-- Channel Gateway -->
   <g filter="url(#shadow)">
-    <rect x="216" y="292" width="120" height="58" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="216" y="292" width="120" height="5" rx="5" fill="#3fb950"/>
-    <rect x="216" y="292" width="120" height="5" fill="#3fb950"/>
-    <rect x="216" y="295" width="120" height="2" fill="#161b22"/>
-    <text x="276" y="316" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Channel Gateway</text>
-    <text x="276" y="331" text-anchor="middle" fill="#8b949e" font-size="9">platform adapter</text>
-    <text x="276" y="343" text-anchor="middle" fill="#8b949e" font-size="9">Discord, Slack, ...</text>
+    <rect x="40" y="314" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="40" y="314" width="140" height="5" rx="5" fill="#58a6ff"/>
+    <rect x="40" y="314" width="140" height="5" fill="#58a6ff"/>
+    <rect x="40" y="317" width="140" height="2" fill="#161b22"/>
+    <text x="110" y="336" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Channel Gateway</text>
+    <text x="110" y="351" text-anchor="middle" fill="#8b949e" font-size="9">Discord, Slack, ...</text>
   </g>
 
-  <!-- ==================== REDIS MQ ==================== -->
+  <!-- ==================== CONSOLE ROUTER ==================== -->
   <g filter="url(#shadow)">
-    <rect x="420" y="168" width="120" height="132" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="420" y="168" width="120" height="5" rx="5" fill="#f0883e"/>
-    <rect x="420" y="168" width="120" height="5" fill="#f0883e"/>
-    <rect x="420" y="171" width="120" height="2" fill="#161b22"/>
-    <text x="480" y="198" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Redis MQ</text>
-    <line x1="438" y1="210" x2="522" y2="210" stroke="#30363d" stroke-width="1"/>
-    <text x="480" y="228" text-anchor="middle" fill="#8b949e" font-size="9">inbound queues</text>
-    <text x="480" y="243" text-anchor="middle" fill="#8b949e" font-size="9">event pub/sub</text>
-    <text x="480" y="258" text-anchor="middle" fill="#8b949e" font-size="9">node heartbeats</text>
-    <text x="480" y="273" text-anchor="middle" fill="#8b949e" font-size="9">workstream routing</text>
-    <text x="480" y="288" text-anchor="middle" fill="#8b949e" font-size="9">cluster state</text>
+    <rect x="300" y="148" width="160" height="170" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="300" y="148" width="160" height="5" rx="5" fill="#3fb950"/>
+    <rect x="300" y="148" width="160" height="5" fill="#3fb950"/>
+    <rect x="300" y="151" width="160" height="2" fill="#161b22"/>
+    <text x="380" y="178" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Console</text>
+    <line x1="318" y1="190" x2="442" y2="190" stroke="#30363d" stroke-width="1"/>
+    <text x="380" y="208" text-anchor="middle" fill="#8b949e" font-size="9">hash-ring router</text>
+    <text x="380" y="223" text-anchor="middle" fill="#8b949e" font-size="9">cluster dashboard</text>
+    <text x="380" y="238" text-anchor="middle" fill="#8b949e" font-size="9">reverse proxy</text>
+    <line x1="318" y1="250" x2="442" y2="250" stroke="#30363d" stroke-width="1"/>
+    <text x="380" y="268" text-anchor="middle" fill="#484f58" font-size="8">control plane:</text>
+    <text x="380" y="282" text-anchor="middle" fill="#484f58" font-size="8">create / send / approve</text>
+    <text x="380" y="296" text-anchor="middle" fill="#484f58" font-size="8">cancel / command / close</text>
+    <text x="380" y="310" text-anchor="middle" fill="#484f58" font-size="8">port 8090</text>
   </g>
 
-  <!-- ==================== CLUSTER NODES ==================== -->
+  <!-- ==================== SERVER NODES ==================== -->
   <!-- Cluster outline -->
-  <rect x="598" y="100" width="204" height="310" rx="8" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
+  <rect x="570" y="100" width="260" height="310" rx="8" fill="none" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
   <text x="700" y="422" text-anchor="middle" fill="#30363d" font-size="9" letter-spacing="1">CLUSTER</text>
 
   <!-- Node A -->
   <g filter="url(#shadow)">
-    <rect x="614" y="118" width="170" height="100" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="614" y="118" width="170" height="5" rx="5" fill="#f47067"/>
-    <rect x="614" y="118" width="170" height="5" fill="#f47067"/>
-    <rect x="614" y="121" width="170" height="2" fill="#161b22"/>
-    <text x="699" y="142" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Node A</text>
-    <line x1="632" y1="152" x2="766" y2="152" stroke="#30363d" stroke-width="1"/>
-    <!-- Bridge -->
-    <rect x="626" y="162" width="70" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
-    <text x="661" y="180" text-anchor="middle" fill="#8b949e" font-size="9">bridge</text>
-    <!-- Server -->
-    <rect x="704" y="162" width="70" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
-    <text x="739" y="180" text-anchor="middle" fill="#8b949e" font-size="9">server</text>
-    <!-- Arrow bridge to server -->
-    <line x1="696" y1="176" x2="702" y2="176" stroke="#484f58" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="590" y="118" width="220" height="100" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="590" y="118" width="220" height="5" rx="5" fill="#f47067"/>
+    <rect x="590" y="118" width="220" height="5" fill="#f47067"/>
+    <rect x="590" y="121" width="220" height="2" fill="#161b22"/>
+    <text x="700" y="142" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Server Node A</text>
+    <line x1="608" y1="152" x2="792" y2="152" stroke="#30363d" stroke-width="1"/>
+    <!-- Server process -->
+    <rect x="608" y="162" width="184" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
+    <text x="700" y="180" text-anchor="middle" fill="#8b949e" font-size="9">turnstone-server :8080</text>
     <!-- Tools label -->
-    <text x="699" y="206" text-anchor="middle" fill="#484f58" font-size="8">14 tools + MCP</text>
+    <text x="700" y="206" text-anchor="middle" fill="#484f58" font-size="8">19 tools + MCP</text>
   </g>
 
   <!-- Node B -->
   <g filter="url(#shadow)">
-    <rect x="614" y="238" width="170" height="100" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="614" y="238" width="170" height="5" rx="5" fill="#f47067"/>
-    <rect x="614" y="238" width="170" height="5" fill="#f47067"/>
-    <rect x="614" y="241" width="170" height="2" fill="#161b22"/>
-    <text x="699" y="262" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Node B</text>
-    <line x1="632" y1="272" x2="766" y2="272" stroke="#30363d" stroke-width="1"/>
-    <!-- Bridge -->
-    <rect x="626" y="282" width="70" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
-    <text x="661" y="300" text-anchor="middle" fill="#8b949e" font-size="9">bridge</text>
-    <!-- Server -->
-    <rect x="704" y="282" width="70" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
-    <text x="739" y="300" text-anchor="middle" fill="#8b949e" font-size="9">server</text>
-    <!-- Arrow bridge to server -->
-    <line x1="696" y1="296" x2="702" y2="296" stroke="#484f58" stroke-width="1" marker-end="url(#arrow)"/>
+    <rect x="590" y="238" width="220" height="100" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="590" y="238" width="220" height="5" rx="5" fill="#f47067"/>
+    <rect x="590" y="238" width="220" height="5" fill="#f47067"/>
+    <rect x="590" y="241" width="220" height="2" fill="#161b22"/>
+    <text x="700" y="262" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Server Node B</text>
+    <line x1="608" y1="272" x2="792" y2="272" stroke="#30363d" stroke-width="1"/>
+    <!-- Server process -->
+    <rect x="608" y="282" width="184" height="28" rx="3" fill="#1c2128" stroke="#30363d" stroke-width="1"/>
+    <text x="700" y="300" text-anchor="middle" fill="#8b949e" font-size="9">turnstone-server :8080</text>
     <!-- Tools label -->
-    <text x="699" y="326" text-anchor="middle" fill="#484f58" font-size="8">14 tools + MCP</text>
+    <text x="700" y="326" text-anchor="middle" fill="#484f58" font-size="8">19 tools + MCP</text>
   </g>
 
   <!-- ==================== LLM PROVIDERS ==================== -->
   <!-- OpenAI -->
   <g filter="url(#shadow)">
-    <rect x="870" y="130" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="870" y="130" width="140" height="5" rx="5" fill="#f778ba"/>
-    <rect x="870" y="130" width="140" height="5" fill="#f778ba"/>
-    <rect x="870" y="133" width="140" height="2" fill="#161b22"/>
-    <text x="940" y="153" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">OpenAI</text>
-    <text x="940" y="167" text-anchor="middle" fill="#8b949e" font-size="9">GPT-5, o-series</text>
+    <rect x="930" y="130" width="160" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="930" y="130" width="160" height="5" rx="5" fill="#f778ba"/>
+    <rect x="930" y="130" width="160" height="5" fill="#f778ba"/>
+    <rect x="930" y="133" width="160" height="2" fill="#161b22"/>
+    <text x="1010" y="153" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">OpenAI</text>
+    <text x="1010" y="167" text-anchor="middle" fill="#8b949e" font-size="9">GPT-5, o-series</text>
   </g>
 
   <!-- Anthropic -->
   <g filter="url(#shadow)">
-    <rect x="870" y="196" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="870" y="196" width="140" height="5" rx="5" fill="#f778ba"/>
-    <rect x="870" y="196" width="140" height="5" fill="#f778ba"/>
-    <rect x="870" y="199" width="140" height="2" fill="#161b22"/>
-    <text x="940" y="219" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Anthropic</text>
-    <text x="940" y="233" text-anchor="middle" fill="#8b949e" font-size="9">Claude 4.5 / 4.6</text>
+    <rect x="930" y="196" width="160" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="930" y="196" width="160" height="5" rx="5" fill="#f778ba"/>
+    <rect x="930" y="196" width="160" height="5" fill="#f778ba"/>
+    <rect x="930" y="199" width="160" height="2" fill="#161b22"/>
+    <text x="1010" y="219" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Anthropic</text>
+    <text x="1010" y="233" text-anchor="middle" fill="#8b949e" font-size="9">Claude 4.5 / 4.6</text>
   </g>
 
   <!-- Local / vLLM -->
   <g filter="url(#shadow)">
-    <rect x="870" y="262" width="140" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="870" y="262" width="140" height="5" rx="5" fill="#f778ba"/>
-    <rect x="870" y="262" width="140" height="5" fill="#f778ba"/>
-    <rect x="870" y="265" width="140" height="2" fill="#161b22"/>
-    <text x="940" y="285" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Local / vLLM</text>
-    <text x="940" y="299" text-anchor="middle" fill="#8b949e" font-size="9">llama.cpp, NIM</text>
+    <rect x="930" y="262" width="160" height="46" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="930" y="262" width="160" height="5" rx="5" fill="#f778ba"/>
+    <rect x="930" y="262" width="160" height="5" fill="#f778ba"/>
+    <rect x="930" y="265" width="160" height="2" fill="#161b22"/>
+    <text x="1010" y="285" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">Local / vLLM</text>
+    <text x="1010" y="299" text-anchor="middle" fill="#8b949e" font-size="9">llama.cpp, NIM</text>
   </g>
 
   <!-- ==================== STORAGE ==================== -->
   <g filter="url(#shadow)">
-    <rect x="614" y="450" width="170" height="52" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="614" y="450" width="170" height="5" rx="5" fill="#bc8cff"/>
-    <rect x="614" y="450" width="170" height="5" fill="#bc8cff"/>
-    <rect x="614" y="453" width="170" height="2" fill="#161b22"/>
-    <text x="699" y="476" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">PostgreSQL / SQLite</text>
-    <text x="699" y="492" text-anchor="middle" fill="#8b949e" font-size="9">conversations, memory, auth</text>
+    <rect x="590" y="450" width="220" height="52" rx="5" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="590" y="450" width="220" height="5" rx="5" fill="#bc8cff"/>
+    <rect x="590" y="450" width="220" height="5" fill="#bc8cff"/>
+    <rect x="590" y="453" width="220" height="2" fill="#161b22"/>
+    <text x="700" y="476" text-anchor="middle" fill="#e6edf3" font-size="11" font-weight="600">PostgreSQL / SQLite</text>
+    <text x="700" y="492" text-anchor="middle" fill="#8b949e" font-size="9">conversations, memory, auth</text>
   </g>
-  <text x="699" y="444" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="600" letter-spacing="2">STORAGE</text>
+  <text x="700" y="444" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="600" letter-spacing="2">STORAGE</text>
 
   <!-- ==================== CONNECTION LINES ==================== -->
 
-  <!-- CLIENT -> GATEWAY connections -->
+  <!-- CLIENT -> CONSOLE connections (control plane) -->
   <!-- Browser -> Console -->
-  <line x1="150" y1="197" x2="214" y2="155" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
-  <!-- Discord -> Channel -->
-  <line x1="150" y1="337" x2="214" y2="325" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
+  <line x1="180" y1="197" x2="298" y2="210" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
+  <!-- Channel -> Console -->
+  <line x1="180" y1="337" x2="298" y2="290" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
+  <!-- SDK -> Console -->
+  <line x1="180" y1="267" x2="298" y2="248" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
+  <text x="240" y="238" fill="#484f58" font-size="8" text-anchor="middle">HTTP</text>
 
-  <!-- CLI -> direct to Node A server (top path, curved) -->
-  <path d="M 150 131 C 200 131, 200 100, 400 100 L 400 100 C 500 100, 570 140, 612 168" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.5" fill="none" stroke-dasharray="6,3" marker-end="url(#arrow-blue)"/>
-  <text x="370" y="96" fill="#484f58" font-size="8" text-anchor="middle">direct</text>
+  <!-- CLI -> direct to Node A (single-node mode, top path) -->
+  <path d="M 180 131 C 250 110, 400 100, 588 168" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.5" fill="none" stroke-dasharray="6,3" marker-end="url(#arrow-blue)"/>
+  <text x="370" y="104" fill="#484f58" font-size="8" text-anchor="middle">direct (single-node)</text>
 
-  <!-- SDK -> Redis (direct push) -->
-  <line x1="150" y1="267" x2="418" y2="240" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
+  <!-- CONSOLE -> NODE connections (proxy) -->
+  <!-- Console -> Node A -->
+  <line x1="460" y1="200" x2="588" y2="176" stroke="#3fb950" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-green)"/>
+  <!-- Console -> Node B -->
+  <line x1="460" y1="260" x2="588" y2="296" stroke="#3fb950" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-green)"/>
+  <text x="520" y="222" fill="#484f58" font-size="8" text-anchor="middle">proxy</text>
 
-  <!-- GATEWAY -> REDIS connections -->
-  <!-- Console -> Redis -->
-  <line x1="336" y1="160" x2="418" y2="200" stroke="#3fb950" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-green)"/>
-  <!-- Channel -> Redis -->
-  <line x1="336" y1="318" x2="418" y2="272" stroke="#3fb950" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-green)"/>
-
-  <!-- REDIS -> NODE connections -->
-  <!-- Redis -> Node A bridge -->
-  <line x1="540" y1="210" x2="624" y2="176" stroke="#f0883e" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-orange)"/>
-  <!-- Redis -> Node B bridge -->
-  <line x1="540" y1="260" x2="624" y2="296" stroke="#f0883e" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-orange)"/>
-
-  <!-- Console -> Node (proxy, dashed) -->
-  <path d="M 336 147 C 380 130, 500 108, 612 145" stroke="#3fb950" stroke-width="1" stroke-opacity="0.4" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-green)"/>
-  <text x="468" y="120" fill="#484f58" font-size="8" text-anchor="middle">proxy</text>
+  <!-- CLIENT -> NODE direct SSE (data plane, dashed) -->
+  <!-- Browser -> Node A SSE -->
+  <path d="M 180 190 C 260 180, 400 150, 588 155" stroke="#58a6ff" stroke-width="1" stroke-opacity="0.35" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
+  <!-- SDK -> Node B SSE -->
+  <path d="M 180 275 C 260 290, 400 320, 588 300" stroke="#58a6ff" stroke-width="1" stroke-opacity="0.35" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
+  <text x="400" y="310" fill="#484f58" font-size="8" text-anchor="middle">SSE (data plane)</text>
 
   <!-- NODE -> LLM connections -->
   <!-- Node A -> LLM providers -->
-  <line x1="784" y1="168" x2="868" y2="155" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.5" marker-end="url(#arrow-coral)"/>
-  <line x1="784" y1="176" x2="868" y2="219" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.3"/>
-  <line x1="784" y1="180" x2="868" y2="282" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.2"/>
+  <line x1="810" y1="168" x2="928" y2="155" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.5" marker-end="url(#arrow-coral)"/>
+  <line x1="810" y1="176" x2="928" y2="219" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.3"/>
+  <line x1="810" y1="180" x2="928" y2="282" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.2"/>
 
   <!-- Node B -> LLM providers -->
-  <line x1="784" y1="288" x2="868" y2="163" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.2"/>
-  <line x1="784" y1="296" x2="868" y2="222" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.3"/>
-  <line x1="784" y1="300" x2="868" y2="288" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.5" marker-end="url(#arrow-coral)"/>
+  <line x1="810" y1="288" x2="928" y2="163" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.2"/>
+  <line x1="810" y1="296" x2="928" y2="222" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.3"/>
+  <line x1="810" y1="300" x2="928" y2="288" stroke="#f47067" stroke-width="1.2" stroke-opacity="0.5" marker-end="url(#arrow-coral)"/>
 
   <!-- NODE -> STORAGE connections -->
   <line x1="680" y1="338" x2="680" y2="448" stroke="#bc8cff" stroke-width="1.2" stroke-opacity="0.4" stroke-dasharray="4,3" marker-end="url(#arrow-muted)"/>
   <line x1="718" y1="218" x2="718" y2="236" stroke="#484f58" stroke-width="1" stroke-opacity="0.3" stroke-dasharray="2,2"/>
 
   <!-- Extensibility hint -->
-  <text x="699" y="392" text-anchor="middle" fill="#30363d" font-size="10">...</text>
-
-  <!-- Event flow: Bridges -> Redis (dashed, bidirectional feel) -->
-  <line x1="624" y1="186" x2="542" y2="220" stroke="#f0883e" stroke-width="1" stroke-opacity="0.3" stroke-dasharray="3,3"/>
-  <line x1="624" y1="286" x2="542" y2="250" stroke="#f0883e" stroke-width="1" stroke-opacity="0.3" stroke-dasharray="3,3"/>
-  <text x="574" y="242" fill="#484f58" font-size="7" text-anchor="middle">events</text>
+  <text x="700" y="392" text-anchor="middle" fill="#30363d" font-size="10">...</text>
 
   <!-- ==================== FLOW LABELS ==================== -->
-  <!-- Interactive flow label -->
+  <!-- Direct / single-node flow label -->
   <rect x="30" y="395" width="10" height="10" rx="2" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="3,2"/>
-  <text x="46" y="404" fill="#8b949e" font-size="9">interactive (direct)</text>
+  <text x="46" y="404" fill="#8b949e" font-size="9">direct (single-node / SSE)</text>
 
-  <!-- Queue flow label -->
-  <rect x="160" y="395" width="10" height="10" rx="2" fill="none" stroke="#f0883e" stroke-width="1.5"/>
-  <text x="176" y="404" fill="#8b949e" font-size="9">queue-driven</text>
+  <!-- Control plane label -->
+  <rect x="200" y="395" width="10" height="10" rx="2" fill="none" stroke="#58a6ff" stroke-width="1.5"/>
+  <text x="216" y="404" fill="#8b949e" font-size="9">control plane (HTTP)</text>
 
-  <!-- Proxy/event label -->
-  <rect x="275" y="395" width="10" height="10" rx="2" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3,2"/>
-  <text x="291" y="404" fill="#8b949e" font-size="9">proxy / events</text>
+  <!-- Proxy label -->
+  <rect x="340" y="395" width="10" height="10" rx="2" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="356" y="404" fill="#8b949e" font-size="9">console proxy</text>
 
   <!-- ==================== BOTTOM DETAILS ==================== -->
   <line x1="30" y1="430" x2="1170" y2="430" stroke="#21262d" stroke-width="1"/>
 
   <!-- Routing rules at bottom, left-aligned -->
   <text x="44" y="456" fill="#30363d" font-size="9" font-weight="600" letter-spacing="1">ROUTING</text>
-  <circle cx="44" cy="474" r="3" fill="#f47067" opacity="0.6"/>
-  <text x="54" y="477" fill="#484f58" font-size="9">target_node set  &#x2192;  route to specific node queue</text>
-  <circle cx="44" cy="494" r="3" fill="#f0883e" opacity="0.6"/>
-  <text x="54" y="497" fill="#484f58" font-size="9">ws_id set  &#x2192;  route to owning node</text>
-  <circle cx="44" cy="514" r="3" fill="#58a6ff" opacity="0.6"/>
-  <text x="54" y="517" fill="#484f58" font-size="9">neither  &#x2192;  shared queue, any node picks up</text></svg>
+  <circle cx="44" cy="474" r="3" fill="#3fb950" opacity="0.6"/>
+  <text x="54" y="477" fill="#484f58" font-size="9">control plane: client &#x2192; console &#x2192; server node (hash-ring bucket lookup)</text>
+  <circle cx="44" cy="494" r="3" fill="#58a6ff" opacity="0.6"/>
+  <text x="54" y="497" fill="#484f58" font-size="9">data plane: client &#x2192; server node (direct SSE, node_url from create response)</text>
+  <circle cx="44" cy="514" r="3" fill="#f47067" opacity="0.6"/>
+  <text x="54" y="517" fill="#484f58" font-size="9">single-node: client &#x2192; server (direct HTTP + SSE, no console needed)</text>
+</svg>

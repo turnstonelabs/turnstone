@@ -26,8 +26,6 @@ spec:
             - turnstone-console
             - --host=0.0.0.0
             - --port={{ .Values.console.service.port }}
-            - --redis-host={{ include "turnstone.redis.host" . }}
-            - --redis-port={{ include "turnstone.redis.port" . }}
           ports:
             - name: http
               containerPort: {{ .Values.console.service.port }}

@@ -111,28 +111,6 @@ Determine the PostgreSQL username.
 {{- end }}
 
 {{/*
-Determine the Redis host.
-*/}}
-{{- define "turnstone.redis.host" -}}
-{{- if .Values.redis.enabled }}
-{{- printf "%s-redis-master" .Release.Name }}
-{{- else }}
-{{- .Values.redis.external.host }}
-{{- end }}
-{{- end }}
-
-{{/*
-Determine the Redis port.
-*/}}
-{{- define "turnstone.redis.port" -}}
-{{- if .Values.redis.enabled }}
-{{- printf "6379" }}
-{{- else }}
-{{- .Values.redis.external.port | toString }}
-{{- end }}
-{{- end }}
-
-{{/*
 Determine the secret name for LLM API keys.
 */}}
 {{- define "turnstone.llm.secretName" -}}

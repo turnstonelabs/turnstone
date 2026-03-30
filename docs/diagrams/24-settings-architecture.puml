@@ -144,7 +144,7 @@ note over Server, Registry
   **CLI entry point:**
   CLI flag  >  config.toml  >  argparse default
 
-  **Bootstrap settings** (database, Redis, auth, server bind):
+  **Bootstrap settings** (database, auth, server bind):
   Always from config.toml / env vars — never in ConfigStore.
 end note
 

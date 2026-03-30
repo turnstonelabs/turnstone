@@ -5,8 +5,6 @@ title Turnstone — Channel Integration Architecture
 skinparam class {
     BackgroundColor<<platform>> #E1BEE7
     BackgroundColor<<service>> #E8EAF6
-    BackgroundColor<<mq>> #FFCDD2
-    BackgroundColor<<bridge>> #C8E6C9
     BackgroundColor<<server>> #FFE0B2
     BackgroundColor<<storage>> #B3E5FC
 }
@@ -63,53 +61,23 @@ class "DiscordBot" as Bot <<service>> {
     Renders approval buttons
     escape_mentions() on send
     --
-    _notify_ws_map: msg_id → (ws_id, user_id)
-    _notify_reply_channels: ws_id → (dm, user_id)
+    _notify_ws_map: msg_id -> (ws_id, user_id)
+    _notify_reply_channels: ws_id -> (dm, user_id)
 }
 
 class "ChannelRouter" as Router <<service>> {
     +resolve_route(platform, channel_id)
-        → ws_id | None
+        -> ws_id | None
     +register_route(channel_id, ws_id)
     +resolve_identity(platform, platform_user_id)
-        → user_id | None
+        -> user_id | None
     --
-    Maps channels → workstreams
-    Maps platform users → turnstone users
+    Maps channels -> workstreams
+    Maps platform users -> turnstone users
     Caches routes in memory
 }
 
-class "AsyncRedisBroker" as Broker <<service>> {
-    +push_inbound(msg)
-    +subscribe(ws_id) → AsyncIterator
-    +subscribe_global() → AsyncIterator
-    +push_response(correlation_id, msg)
-    --
-    redis.asyncio client
-    Pub/sub + queue operations
-}
-
-' -- Redis MQ --
-class "Redis MQ" as Redis <<mq>> {
-    turnstone:inbound (LIST)
-    turnstone:events:{ws_id} (PUBSUB)
-    turnstone:events:global (PUBSUB)
-    turnstone:resp:{corr_id} (LIST)
-    --
-    Shared message bus
-    Same queues as bridge protocol
-}
-
-' -- Bridge + Server --
-class "turnstone-bridge" as Bridge <<bridge>> {
-    BLPOP turnstone:inbound
-    Drive server via HTTP
-    Relay SSE → Redis pub/sub
-    --
-    Owns workstream lifecycle
-    Auto-approve / manual approve
-}
-
+' -- Server --
 class "turnstone-server" as Server <<server>> {
     POST /v1/api/send
     POST /v1/api/approve
@@ -128,7 +96,7 @@ class "channel_users" as CU <<storage>> {
     channel_user_id (PK)
     platform: "discord" | "slack"
     platform_user_id
-    user_id → users
+    user_id -> users
     linked_at
     --
     /link command creates row
@@ -161,18 +129,13 @@ class "services" as SVC <<storage>> {
 ' -- Relationships --
 Discord --> Bot : gateway\nevents
 Bot --> Router : on_message\non_interaction
-Router --> Broker : SendMessage\nApproveMessage
 Router --> CU : resolve identity
 Router --> CR : resolve / register route
-Broker --> Redis : RPUSH inbound\nRPUSH resp:{id}
 
-Redis --> Bridge : BLPOP inbound
-Bridge --> Server : HTTP API
-Server --> Bridge : SSE events
-Bridge --> Redis : PUBLISH events:{ws_id}\nPUBLISH events:global
+Router --> Server : POST /v1/api/send\nPOST /v1/api/approve\nPOST /v1/api/workstreams/new
+Bot --> Server : GET /v1/api/events?ws_id=\n(SSE via httpx-sse)
+Server --> Bot : SSE event stream
 
-Redis --> Broker : SUBSCRIBE events:{ws_id}
-Broker --> Bot : event stream
 Bot --> Discord : reply / embed\nbutton callback
 
 Slack .[hidden]. Discord
@@ -180,10 +143,9 @@ Teams .[hidden]. Slack
 
 ChannelService --> Bot : creates + runs
 ChannelService --> Router : creates
-ChannelService --> Broker : creates
 ChannelService --> SVC : register / heartbeat /\nderegister
 
-' -- Notification path (direct HTTP, bypasses MQ) --
+' -- Notification path (direct HTTP) --
 Server --> ChannelService : POST /v1/api/notify\n(JWT: aud=turnstone-channel)
 Server --> SVC : list_services("channel",\nmax_age_seconds=120)
 
@@ -192,38 +154,36 @@ note right of Bot
   **Inbound Flow**
   1. Discord message arrives via gateway
   2. Bot.on_message() fires
-  3. ChannelRouter resolves channel → ws_id
+  3. ChannelRouter resolves channel -> ws_id
      (or creates new workstream)
-  4. ChannelRouter resolves platform user → user_id
+  4. ChannelRouter resolves platform user -> user_id
      via channel_users table
-  5. Broker.push_inbound(SendMessage)
-  6. Bridge pops from Redis, drives server
+  5. Router sends POST /v1/api/send to server
 
   **Workstream Resume (evicted workstreams)**
-  1. Stale route detected (no MQ owner)
+  1. Stale route detected (no active SSE listener)
   2. Existing ws_id reused directly from route
-  3. CreateWorkstreamMessage sent with
+  3. POST /v1/api/workstreams/new with
      resume_ws=<ws_id>
   4. Server resumes atomically during creation
-  5. Bridge emits WorkstreamResumedEvent → thread
+  5. SSE emits WorkstreamResumedEvent -> thread
 end note
 
-note right of Broker
+note right of Server
   **Outbound Flow**
-  1. Server emits SSE events
-  2. Bridge relays to Redis events:{ws_id}
-  3. Broker.subscribe(ws_id) yields events
-  4. Bot formats and sends to Discord thread
+  1. Server emits SSE events on
+     GET /v1/api/events?ws_id=
+  2. Bot subscribes via httpx-sse
+  3. Bot formats and sends to Discord thread
 end note
 
 note bottom of CR
   **Approval Flow**
-  1. ApprovalRequestEvent arrives via events:{ws_id}
+  1. ApprovalRequestEvent arrives via SSE
   2. Bot renders Discord buttons (Approve / Deny)
-  3. User clicks button → on_interaction()
+  3. User clicks button -> on_interaction()
   4. Router builds ApproveMessage
-  5. Broker.push_response(correlation_id, msg)
-  6. Bridge pops from resp:{id}, calls POST /api/approve
+  5. Router sends POST /v1/api/approve to server
 end note
 
 note bottom of CU
@@ -238,17 +198,17 @@ note bottom of CU
 end note
 
 note bottom of SVC
-  **Notification Flow** (direct HTTP, bypasses MQ)
-  1. LLM calls notify tool → _prepare_notify()
+  **Notification Flow** (direct HTTP)
+  1. LLM calls notify tool -> _prepare_notify()
   2. _exec_notify() checks rate limit (5/turn)
   3. Queries services table for healthy gateways
   4. Mints JWT (aud: turnstone-channel) via
      ServiceTokenManager
   5. POSTs to first healthy gateway (incl. ws_id)
   6. Gateway validates JWT, resolves target
-  7. adapter.send_notification() → Discord API
-     (tracks msg_id → ws_id for reply routing)
-  8. On failure: retry up to 3× (1s, 3s backoff)
+  7. adapter.send_notification() -> Discord API
+     (tracks msg_id -> ws_id for reply routing)
+  8. On failure: retry up to 3x (1s, 3s backoff)
   9. SSRF: only http(s) URLs allowed
 
   **Bidirectional DM Replies**

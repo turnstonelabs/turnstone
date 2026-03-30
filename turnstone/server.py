@@ -1486,11 +1486,11 @@ async def create_workstream(request: Request) -> JSONResponse:
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
-    # Trusted services (bridge, console) may forward the real user_id in the
-    # request body when creating workstreams on behalf of a user.  Only service
+    # Trusted services (console) may forward the real user_id in the request
+    # body when creating workstreams on behalf of a user.  Only service
     # identities are trusted — end-user tokens (including console-proxy tokens
     # that carry the real user's identity) must not override user_id.
-    trusted_sources = {"bridge", "console"}
+    trusted_sources = {"console"}
     if (
         body.get("user_id")
         and isinstance(body["user_id"], str)
@@ -1612,6 +1612,21 @@ async def create_workstream(request: Request) -> JSONResponse:
             if skill_data.get("content"):
                 sess._applied_skill_content = skill_data["content"]
             sess._save_config()
+
+        # Pin locally-created workstreams so the console routes to this node.
+        # Console-routed creates pass ws_id in the request body — those are
+        # already bucket-aligned and don't need an override. Direct creates
+        # (web UI, watch, TurnstoneInit) generate their own ws_id, which may
+        # hash to a bucket assigned to a different node.
+        if not requested_ws_id:
+            node_id = getattr(request.app.state, "node_id", "")
+            if node_id:
+                try:
+                    from turnstone.core.storage import get_storage as _gs
+
+                    _gs().set_workstream_override(ws.id, node_id, reason="local")
+                except Exception:
+                    pass  # best-effort; routing will still work via resume
 
         return JSONResponse(
             {

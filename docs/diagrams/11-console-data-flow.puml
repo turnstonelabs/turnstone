@@ -7,66 +7,13 @@ skinparam sequenceArrowThickness 1.5
 participant "Browser" as Browser
 participant "Console\nStarlette App" as Server
 participant "ClusterCollector" as CC
-collections "Redis" as Redis
-participant "Node-A Bridge" as BridgeA
-participant "Node-A\n(real server)" as NodeA
-participant "Node-B\n(sim node)" as NodeB
+participant "Node-A\n(server)" as NodeA
+participant "Node-B\n(server)" as NodeB
 
-== Thread 1: Cluster Event Subscriber (real-time) ==
+== Thread 1: HTTP Polling (every 10s) ==
 
-CC -> Redis : SUBSCRIBE turnstone:events:cluster
-activate CC #E1BEE7
-
-Redis --> CC : ClusterStateEvent\n{ws_id, state:"thinking",\nnode_id:"nodeA", tokens:500,\ncontext_ratio:0.05}
-CC -> CC : Update NodeSnapshot["nodeA"]\n.workstreams["ws123"].state = "thinking"
-CC -> CC : _fanout(event) → all SSE listeners
-
-Redis --> CC : {"type":"ws_created",\nws_id:"ws456", name:"task-1",\nnode_id:"sim-0003"}
-CC -> CC : Add workstream to\nNodeSnapshot["sim-0003"]
-CC -> CC : _fanout(event)
-
-Redis --> CC : ClusterStateEvent\n{ws_id:"ws456", state:"idle"}
-CC -> CC : Update workstream state
-
-note right of CC
-  Handles: cluster_state,
-  ws_created, ws_closed, ws_rename
-
-  Thread runs continuously.
-  All updates are thread-safe
-  via threading.Lock.
-end note
-
-deactivate CC
-
-== Thread 2: Node Discovery (every 15s) ==
-
-CC -> Redis : SCAN 0 MATCH turnstone:node:*
-activate CC #B2EBF2
-Redis --> CC : [turnstone:node:nodeA, turnstone:node:sim-0003, ...]
-
-loop for each discovered key
-    CC -> Redis : GET turnstone:node:{id}
-    Redis --> CC : JSON: {server_url, started, max_ws, sim:true/false}
-end
-
-CC -> CC : Create new NodeSnapshot\nfor newly discovered nodes
-CC -> CC : Remove NodeSnapshot\nfor disappeared nodes
-
-CC -> CC : _fanout({type: "node_joined", ...})\n_fanout({type: "node_lost", ...})
-
-deactivate CC
-
-== Thread 3: HTTP Polling (every 10s, real nodes only) ==
-
-CC -> CC : Filter nodes where\nserver_url.startswith("http")
+CC -> CC : Iterate registered nodes
 activate CC #C8E6C9
-
-note right of CC
-  sim:// nodes are SKIPPED.
-  Their data comes exclusively
-  from the cluster event channel.
-end note
 
 CC -> NodeA : GET /v1/api/dashboard
 activate NodeA
@@ -75,8 +22,13 @@ deactivate NodeA
 
 CC -> NodeA : GET /health
 activate NodeA
-NodeA --> CC : {status:"ok", version:"0.3.0",\nmodel:"...", workstreams:{...}}
+NodeA --> CC : {status:"ok", version:"0.9.2",\nmodel:"...", workstreams:{...}}
 deactivate NodeA
+
+CC -> NodeB : GET /v1/api/dashboard
+activate NodeB
+NodeB --> CC : {workstreams: [...],\naggregate: {total_tokens, ...}}
+deactivate NodeB
 
 CC -> CC : Diff old vs new workstream IDs
 CC -> CC : Replace NodeSnapshot["nodeA"]\n.workstreams, .health, .aggregate
@@ -87,12 +39,8 @@ note right of CC
   Poll-diff fanout ensures
   browser SSE clients learn
   about workstreams that
-  appeared without a real-time
-  cluster event (e.g. bridge
-  startup recovery).
+  appeared between polls.
 end note
-
-CC -x NodeB : (SKIPPED: sim:// URL)
 
 deactivate CC
 
@@ -110,7 +58,7 @@ note right : Per-client queue.Queue(maxsize=2000)\nSSE via EventSourceResponse +
 Server -> Browser : data: {"type":"snapshot",...}\n(full state as first SSE event)
 
 loop continuous (incremental updates)
-    CC -> Server : event via listener queue\n(from any of the 3 threads)
+    CC -> Server : event via listener queue\n(from polling thread)
     Server -> Browser : data: {"type":"cluster_state",...}\n\n
 end
 
@@ -133,20 +81,20 @@ Server --> Browser : JSON response
 
 Browser -> Server : GET /v1/api/cluster/overview
 Server -> CC : get_overview()
-CC --> Server : {nodes: 10, workstreams: 47,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.3.0"]}
+CC --> Server : {nodes: 2, workstreams: 12,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.9.2"]}
 Server --> Browser : JSON response
 
 Browser -> Server : GET /v1/api/cluster/nodes?sort=activity
 Server -> CC : get_nodes(sort_by="activity")
-CC --> Server : {nodes: [...], total: 10}
+CC --> Server : {nodes: [...], total: 2}
 Server --> Browser : JSON response
 
-Browser -> Server : GET /v1/api/cluster/workstreams\n?state=running&node=sim-0003
-Server -> CC : get_workstreams(state="running",\nnode="sim-0003")
+Browser -> Server : GET /v1/api/cluster/workstreams\n?state=running&node=nodeA
+Server -> CC : get_workstreams(state="running",\nnode="nodeA")
 CC --> Server : {workstreams: [...], total: 5,\npage: 1, per_page: 50, pages: 1}
 Server --> Browser : JSON response
 
-== Workstream Creation (via MQ) ==
+== Workstream Creation (via Console proxy) ==
 
 Browser -> Server : POST /v1/api/cluster/workstreams/new\n{node_id:"nodeA", name:"new-task"}
 activate Server #FFECB3
@@ -154,33 +102,21 @@ activate Server #FFECB3
 Server -> CC : _pick_best_node() or\nget_node_detail(node_id)
 CC --> Server : node validated
 
-Server -> Server : Build CreateWorkstreamMessage\n{target_node:"nodeA", name:"new-task",\nuser_id: from auth_result}
+Server -> NodeA : POST http://nodeA:8080/v1/api/workstreams/new\n{name:"new-task", user_id: from auth_result}
+activate NodeA
+NodeA --> Server : {ws_id:"ws789", name:"new-task",\nnode_url:"http://nodeA:8080"}
+deactivate NodeA
 
-Server -> Redis : RPUSH turnstone:inbound:nodeA\n(directed queue)
-Server --> Browser : {status:"ok", correlation_id:"abc",\ntarget_node:"nodeA"}
+Server --> Browser : {status:"ok", ws_id:"ws789",\nnode_url:"http://nodeA:8080"}
 deactivate Server
 
-note right of Redis
-  Bridge on Node-A picks up the
-  message from its directed queue,
-  POSTs to /v1/api/workstreams/new
-  (forwarding user_id in payload),
-  registers ownership, publishes
-  ws_created to cluster channel.
+note right of Server
+  Console proxies the create request
+  directly to the target node via HTTP.
+  The response includes node_url so the
+  client can establish a direct SSE
+  connection for the data plane.
 end note
-
-Redis --> BridgeA : BLPOP turnstone:inbound:nodeA
-activate BridgeA
-BridgeA -> NodeA : POST /v1/api/workstreams/new\n{name:"new-task"}
-NodeA --> BridgeA : {ws_id:"ws789", name:"new-task"}
-BridgeA -> Redis : SET turnstone:ws:ws789 = nodeA
-BridgeA -> Redis : PUBLISH turnstone:events:cluster\n{type:"ws_created", ws_id:"ws789",\nnode_id:"nodeA", name:"new-task"}
-deactivate BridgeA
-
-Redis --> CC : ws_created event
-CC -> CC : Add workstream to\nNodeSnapshot["nodeA"]
-CC -> CC : _fanout(event)
-Server -> Browser : SSE: data: {"type":"ws_created",...}
 
 == Reverse Proxy (server UI through console port) ==
 

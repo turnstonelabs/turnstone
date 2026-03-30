@@ -22,8 +22,3 @@ output "rds_endpoint" {
   description = "Endpoint of the RDS PostgreSQL instance (host:port)."
   value       = aws_db_instance.this.endpoint
 }
-
-output "redis_endpoint" {
-  description = "Primary endpoint of the ElastiCache Redis replication group."
-  value       = aws_elasticache_replication_group.this.primary_endpoint_address
-}

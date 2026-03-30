@@ -10,7 +10,7 @@ variable "vpc_id" {
 }
 
 variable "private_subnet_ids" {
-  description = "List of private subnet IDs for ECS tasks, RDS, and ElastiCache."
+  description = "List of private subnet IDs for ECS tasks and RDS."
   type        = list(string)
 }
 

@@ -64,7 +64,7 @@ note right of thinking
 
   **Propagation:**
   • WebUI → global SSE queue (ws_state)
-  • Bridge → PUBLISH to global + cluster channels
+  • Console → HTTP polling picks up state
   • CLI → WorkstreamManager.set_state()
 end note
 
@@ -72,27 +72,8 @@ note left of attention
   **Blocking mechanisms:**
   • TerminalUI: input() prompt
   • WebUI: threading.Event.wait()
-  • Bridge: BLPOP on response queue
+  • ChannelBot: SSE event + Discord button
   • NullUI: auto-approve (never reaches)
-end note
-
-state "SimWorkstream (simplified)" as sim_group {
-    state "sim_idle" as si <<idle>>
-    state "sim_thinking" as st <<thinking>>
-    state "sim_running" as sr <<running>>
-    state "sim_error" as se <<error>>
-
-    [*] --> si
-    si --> st : process_turn() called
-    st --> sr : Tool calls generated
-    sr --> st : More rounds
-    st --> si : No tools / max rounds
-    st --> se : Uncaught exception
-}
-
-note right of sim_group
-  SimWorkstream has no ATTENTION state —
-  tool approval is not simulated.
 end note
 
 @enduml

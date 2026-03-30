@@ -6,13 +6,12 @@ title Turnstone — Package & Module Structure
 skinparam component {
     BackgroundColor<<entry>> #B8D4E3
     BackgroundColor<<core>> #C8E6C9
-    BackgroundColor<<mq>> #FFE0B2
-    BackgroundColor<<sim>> #E1BEE7
     BackgroundColor<<console>> #B2EBF2
     BackgroundColor<<ui>> #F0F4C3
     BackgroundColor<<artifact>> #ECEFF1
     BackgroundColor<<sdk>> #FFCDD2
     BackgroundColor<<api>> #D1C4E9
+    BackgroundColor<<channel>> #FFE0B2
 }
 
 ' Entry points
@@ -45,23 +44,11 @@ package "turnstone/core/" <<Rectangle>> {
     component [model_registry.py\nModelRegistry] as registry <<core>>
 }
 
-' MQ subsystem
-package "turnstone/mq/" <<Rectangle>> {
-    component [protocol.py\n28 message types] as protocol <<mq>>
-    component [broker.py\nMessageBroker, RedisBroker] as broker <<mq>>
-    component [bridge.py\nturnstone-bridge] as bridge <<mq>>
-    component [client.py\nTurnstoneClient] as client <<mq>>
-}
-
-' Simulator
-package "turnstone/sim/" <<Rectangle>> {
-    component [cluster.py\nSimCluster] as simcluster <<sim>>
-    component [node.py\nSimNode, SimWorkstream] as simnode <<sim>>
-    component [engine.py\nSimEngine] as simengine <<sim>>
-    component [scenario.py\n5 scenarios] as scenario <<sim>>
-    component [sim/config.py\nSimConfig] as simconfig <<sim>>
-    component [sim/metrics.py\nSim metrics] as simmetrics <<sim>>
-    component [sim/cli.py\nturnstone-sim] as simcli <<sim>>
+' Channels
+package "turnstone/channels/" <<Rectangle>> {
+    component [_routing.py\nChannelRouter] as router <<channel>>
+    component [discord/bot.py\nDiscordBot] as discordbot <<channel>>
+    component [gateway.py\nturnstone-channel] as gateway <<channel>>
 }
 
 ' Console
@@ -146,35 +133,17 @@ mcp --> config
 registry --> config
 tools --> schemas
 
-' MQ dependencies
-bridge --> protocol
-bridge --> broker
-bridge --> config
-client --> protocol
-client --> broker
-
-' Sim dependencies
-simcli --> simcluster
-simcli --> simconfig
-simcli --> scenario
-simcluster --> simnode
-simcluster --> broker
-simcluster --> simmetrics
-simcluster --> simconfig
-simnode --> simengine
-simnode --> protocol
-simnode --> simconfig
-simnode --> simmetrics
-scenario --> broker
-scenario --> protocol
-scenario --> simconfig
-scenario --> simmetrics
+' Channel dependencies
+gateway --> discordbot
+gateway --> router
+discordbot --> sdkserver : HTTP + SSE
+router --> storage : channel_routes
 
 ' Console dependencies
 consoleserver --> collector
 consoleserver --> config
 consoleserver --> auth
-collector --> broker
+collector --> server : HTTP polling
 
 ' API dependencies
 serverspec --> openapi

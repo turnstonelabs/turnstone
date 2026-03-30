@@ -14,35 +14,14 @@ node "Docker Host" as host {
 
     frame "turnstone-net (bridge network)" as net {
 
-        node "redis" <<redis:7.4-alpine>> as redis_node {
-            component [Redis Server\nport 6379] as redis
-            note bottom of redis
-                Healthcheck: redis-cli ping
-                Volume: redis-data
-            end note
-        }
-
         node "server" <<turnstone image>> as server_node {
             component [turnstone-server\nport 8080] as server
             note bottom of server
                 Command: turnstone-server
                   --host 0.0.0.0
                   --port 8080
-                Depends: redis (healthy)
                 Volume: turnstone-data
                   (/data)
-            end note
-        }
-
-        node "bridge ×N" <<turnstone image>> as bridge_node {
-            component [turnstone-bridge] as bridge
-            note bottom of bridge
-                Command: turnstone-bridge
-                  --server-url http://server:8080
-                  --redis-host redis
-                Depends: server + redis
-                Scalable: --scale bridge=N
-                node_id: auto from hostname
             end note
         }
 
@@ -50,9 +29,10 @@ node "Docker Host" as host {
             component [turnstone-console\nport 8090] as console
             note bottom of console
                 Command: turnstone-console
-                  --redis-host redis
                   --port 8090
-                Depends: redis
+                Depends: server
+                Hash-ring router for
+                  multi-node clusters
             end note
         }
 
@@ -75,42 +55,21 @@ node "Docker Host" as host {
                 See docs/pgbouncer.md
             end note
         }
-
-        node "sim (profile: sim)" <<turnstone image>> as sim_node {
-            component [turnstone-sim] as sim
-            note bottom of sim
-                Command: turnstone-sim
-                  --redis-host redis
-                  --nodes 100
-                  --scenario steady
-                Depends: redis
-                Optional: only with
-                  --profile sim
-            end note
-        }
     }
 }
 
 actor "Browser\nUser" as browser
-actor "MQ Client" as mqclient
+actor "SDK /\nAPI Client" as apiclient
 
 ' External connections
 browser --> server : HTTP + SSE\nport 8080
 browser --> console : HTTP + SSE\nport 8090
-mqclient --> redis : Redis protocol\nport 6379
+apiclient --> server : HTTP + SSE\nport 8080
 
 ' Internal connections
-server --> redis : Redis protocol\n(6379)
 server --> llm_api : OpenAI API\n(HTTPS/HTTP)
 
-bridge --> server : HTTP REST\n(POST /v1/api/send, etc.)
-bridge <-- server : SSE\n(GET /v1/api/events)
-bridge --> redis : Redis protocol\n(queues + pubsub)
-
-console --> redis : Redis PUBSUB + LIST\n(cluster events,\nws creation commands)
-console --> server : HTTP polling + proxy\n(GET /v1/api/dashboard,\nproxy /node/{id}/*)
-
-sim --> redis : Redis protocol\n(queues + pubsub + keys)
+console --> server : HTTP proxy\n(hash-ring lookup,\nproxy /node/{id}/*)
 
 ' Database connections (production/cluster profiles)
 server ..> pgbouncer : PostgreSQL\n(pool_size=2)
@@ -120,20 +79,17 @@ pgbouncer --> postgres : transaction\npooling
 ' Environment variables
 note right of host
     **Environment Variables:**
-    • LLM_BASE_URL — LLM endpoint
-    • OPENAI_API_KEY — API key
-    • REDIS_PASSWORD — Redis auth
-    • TURNSTONE_AUTH_TOKEN — API auth
-    • TURNSTONE_DB_URL — PostgreSQL URL
-    • POSTGRES_PASSWORD — DB password
+    * LLM_BASE_URL -- LLM endpoint
+    * OPENAI_API_KEY -- API key
+    * TURNSTONE_AUTH_TOKEN -- API auth
+    * TURNSTONE_DB_URL -- PostgreSQL URL
+    * POSTGRES_PASSWORD -- DB password
 end note
 
 ' Volumes
-database "redis-data" as rv
 database "turnstone-data" as tv
 database "postgres-data" as pv
 
-redis_node --> rv
 server_node --> tv
 pg_node --> pv
 

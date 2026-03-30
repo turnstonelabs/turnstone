@@ -22,8 +22,3 @@ output "rds_endpoint" {
   description = "RDS PostgreSQL endpoint."
   value       = module.turnstone.rds_endpoint
 }
-
-output "redis_endpoint" {
-  description = "ElastiCache Redis endpoint."
-  value       = module.turnstone.redis_endpoint
-}

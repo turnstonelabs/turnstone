@@ -127,6 +127,17 @@ def main() -> None:
     server_url: str = args.server_url
     console_url: str = args.console_url
 
+    # Auto-discover console from services table if not explicitly set
+    if not console_url:
+        try:
+            from turnstone.core.storage._registry import get_storage as _get_st
+
+            consoles = _get_st().list_services("console", max_age_seconds=3600)
+            if consoles:
+                console_url = consoles[0]["url"]
+        except Exception:
+            pass  # no storage available yet, or no console registered
+
     # -- Adapter selection ---------------------------------------------------
     adapters_configured = False
 

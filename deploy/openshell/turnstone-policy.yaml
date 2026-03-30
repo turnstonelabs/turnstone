@@ -1,8 +1,8 @@
 # OpenShell sandbox policy for Turnstone AI orchestration platform.
 #
 # This policy wraps a turnstone-server process (the primary sandbox target).
-# The bridge, console, and channel gateway are separate processes that would
-# each need their own sandbox with a tailored policy variant.
+# The console and channel gateway are separate processes that would each
+# need their own sandbox with a tailored policy variant.
 #
 # Usage:
 #   openshell sandbox run \
@@ -23,7 +23,6 @@
 #
 # Customization points (search for "CUSTOMIZE"):
 #   - OIDC issuer endpoint
-#   - Redis host/port (if not localhost)
 #   - MCP HTTP server endpoints
 #   - Additional tool binaries
 #   - web_fetch domain allowlist
@@ -165,20 +164,6 @@ network_policies:
   #   binaries:
   #     - path: /usr/bin/python3*
   #     - path: /usr/local/bin/python3*
-
-  # --- Redis (MQ) ---
-  # CUSTOMIZE: if Redis is not on localhost, add host + allowed_ips.
-  # localhost is blocked by default SSRF protection, so we need allowed_ips.
-
-  redis:
-    name: redis-mq
-    endpoints:
-      - port: 6379
-        allowed_ips:
-          - "127.0.0.1"
-    binaries:
-      - path: /usr/bin/python3*
-      - path: /usr/local/bin/python3*
 
   # --- Discord (channel integration) ---
   # Uncomment if using turnstone-channel with Discord adapter.

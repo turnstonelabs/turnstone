@@ -24,16 +24,6 @@ postgresql:
     database: turnstone
     username: turnstone
 
-# -- Redis configuration
-redis:
-  enabled: true
-  architecture: standalone
-  # External Redis settings (used when redis.enabled is false)
-  external:
-    host: ""
-    port: 6379
-    existingSecret: ""
-
 # -- Turnstone server (main API + web UI)
 server:
   replicas: 1
@@ -47,17 +37,6 @@ server:
   service:
     type: ClusterIP
     port: 8080
-
-# -- Turnstone bridge (Redis MQ connector)
-bridge:
-  replicas: 1
-  resources:
-    requests:
-      cpu: 250m
-      memory: 256Mi
-    limits:
-      cpu: "1"
-      memory: 512Mi
 
 # -- Turnstone console (cluster dashboard)
 console:

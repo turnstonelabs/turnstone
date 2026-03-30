@@ -14,8 +14,6 @@ data:
   TURNSTONE_SERVER_PORT: {{ .Values.server.service.port | quote }}
   TURNSTONE_CONSOLE_HOST: "0.0.0.0"
   TURNSTONE_CONSOLE_PORT: {{ .Values.console.service.port | quote }}
-  TURNSTONE_REDIS_HOST: {{ include "turnstone.redis.host" . | quote }}
-  TURNSTONE_REDIS_PORT: {{ include "turnstone.redis.port" . | quote }}
   TURNSTONE_POLL_INTERVAL: "5"
   {{- if .Values.llm.baseUrl }}
   TURNSTONE_LLM_BASE_URL: {{ .Values.llm.baseUrl | quote }}

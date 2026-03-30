@@ -1,6 +1,6 @@
 """TLS Client — certificate provisioning for service nodes.
 
-Non-console services (server, bridge, channel gateway) use this to
+Non-console services (server, channel gateway) use this to
 request certificates from the console's ACME endpoint and build
 SSL contexts for mTLS communication.
 

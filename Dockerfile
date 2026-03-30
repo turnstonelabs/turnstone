@@ -1,6 +1,6 @@
 # =============================================================================
 # Turnstone — Docker build with uv for reproducible, locked installs
-# Single image for all services: server, bridge, console, sim, eval
+# Single image for all services: server, console, channel, eval
 # =============================================================================
 
 FROM python:3.14-slim

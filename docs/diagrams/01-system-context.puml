@@ -13,24 +13,22 @@ cloud "LLM Providers" as llm {
     component [OpenAI-compatible API\n(OpenAI, vLLM, llama.cpp)] as llm_openai
     component [Anthropic Messages API] as llm_anthropic
 }
-database "Redis" as redis
 database "SQLite\n(.turnstone.db)" as sqlite
 
 ' Turnstone System Boundary
 package "Turnstone Platform" {
     component [turnstone\n(CLI)] as cli <<entry point>>
     component [turnstone-server\n(HTTP + SSE)] as server <<entry point>>
-    component [turnstone-bridge\n(Queue ↔ HTTP)] as bridge <<service>>
-    component [turnstone-console\n(Dashboard)] as console <<service>>
+    component [turnstone-console\n(Dashboard + Router)] as console <<service>>
     component [turnstone-eval\n(Headless)] as eval <<entry point>>
-    component [turnstone-sim\n(Simulator)] as sim <<service>>
+    component [turnstone-channel\n(Channel Gateway)] as channel <<service>>
 }
 
 ' User connections
 cli_user --> cli : stdin / stdout
 browser_user --> server : HTTP + SSE\n(port 8080)
 browser_user --> console : HTTP + SSE\n(port 8090)
-ext_client --> redis : Redis LIST\n(push commands)
+ext_client --> server : HTTP + SSE\n(SDK / API)
 eval_user --> eval : Python API
 
 ' Internal connections
@@ -43,26 +41,16 @@ server --> sqlite : SQLite
 eval --> llm : LLM Provider API\n(non-streaming)
 eval --> sqlite : SQLite
 
-bridge --> server : HTTP REST\n(POST /v1/api/send, etc.)
-bridge <-- server : SSE\n(GET /v1/api/events)
-bridge --> redis : Redis LIST + PUBSUB\n+ STRING (routing, heartbeats)
+console --> server : HTTP proxy\n(hash-ring bucket lookup,\nproxy /node/{id}/* traffic)
 
-console --> redis : Redis PUBSUB + STRING + LIST\n(cluster events, heartbeats,\nworkstream creation commands)
-console --> server : HTTP polling + reverse proxy\n(GET /v1/api/dashboard,\nproxy /node/{id}/* traffic)
-
-sim --> redis : Redis LIST + PUBSUB\n+ STRING (heartbeats)
+channel --> server : HTTP + SSE\n(POST /v1/api/send,\nGET /v1/api/events)
 
 ' Notes
-note right of sim
-  Simulator replaces Server+Bridge
-  with lightweight SimNodes that
-  publish to the same Redis channels.
-end note
-
-note right of redis
-  Shared message broker:
-  - LIST: command queues
-  - STRING: heartbeats, routing
-  - PUBSUB: event broadcast
+note right of console
+  Multi-node router:
+  - Hash-ring bucket lookup
+  - Proxies create/send/approve
+  - Direct SSE from client to node
+  - HTTP polling for dashboard
 end note
 @enduml

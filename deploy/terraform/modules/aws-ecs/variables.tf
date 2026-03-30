@@ -6,7 +6,7 @@ variable "vpc_id" {
 }
 
 variable "private_subnet_ids" {
-  description = "List of private subnet IDs for ECS tasks, RDS, and ElastiCache."
+  description = "List of private subnet IDs for ECS tasks and RDS."
   type        = list(string)
 }
 
@@ -50,14 +50,6 @@ variable "db_instance_class" {
   default     = "db.t4g.micro"
 }
 
-# --- ElastiCache ---
-
-variable "redis_node_type" {
-  description = "ElastiCache node type for Redis."
-  type        = string
-  default     = "cache.t4g.micro"
-}
-
 # --- ECS Task Sizing ---
 
 variable "server_cpu" {
@@ -70,18 +62,6 @@ variable "server_memory" {
   description = "Memory (MiB) for the server task."
   type        = number
   default     = 1024
-}
-
-variable "bridge_cpu" {
-  description = "CPU units for the bridge task."
-  type        = number
-  default     = 256
-}
-
-variable "bridge_memory" {
-  description = "Memory (MiB) for the bridge task."
-  type        = number
-  default     = 512
 }
 
 variable "console_cpu" {

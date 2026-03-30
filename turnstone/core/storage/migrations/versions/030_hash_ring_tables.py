@@ -35,6 +35,7 @@ def upgrade() -> None:
         sa.Column("node_id", sa.Text, nullable=False),
         sa.Column("reason", sa.Text, nullable=False, server_default="targeted"),
         sa.Column("created", sa.Text, nullable=False),
+        sa.Column("updated", sa.Text, nullable=False),
     )
     op.create_index("idx_ws_overrides_node", "workstream_overrides", ["node_id"])
 

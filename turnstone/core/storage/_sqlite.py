@@ -476,6 +476,9 @@ class SQLiteBackend:
         with self._engine.connect() as conn:
             conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
             conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
+            conn.execute(
+                sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
+            )
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0
@@ -1394,11 +1397,11 @@ class SQLiteBackend:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         stmt = sqlite_insert(workstream_overrides).values(
-            ws_id=ws_id, node_id=node_id, reason=reason, created=now
+            ws_id=ws_id, node_id=node_id, reason=reason, created=now, updated=now
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["ws_id"],
-            set_={"node_id": node_id, "reason": reason},
+            set_={"node_id": node_id, "reason": reason, "updated": now},
         )
         with self._engine.connect() as conn:
             conn.execute(stmt)

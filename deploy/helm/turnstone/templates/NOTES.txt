@@ -25,13 +25,9 @@ Then open: http://localhost:{{ .Values.console.service.port }}
 
 Components deployed:
   - Server:  {{ include "turnstone.fullname" . }}-server  ({{ .Values.server.replicas }} replica(s))
-  - Bridge:  {{ include "turnstone.fullname" . }}-bridge  ({{ .Values.bridge.replicas }} replica(s))
   - Console: {{ include "turnstone.fullname" . }}-console ({{ .Values.console.replicas }} replica(s))
 {{- if .Values.postgresql.enabled }}
   - PostgreSQL (bitnami subchart)
-{{- end }}
-{{- if .Values.redis.enabled }}
-  - Redis (bitnami subchart)
 {{- end }}
 
 {{- if not .Values.llm.apiKey }}

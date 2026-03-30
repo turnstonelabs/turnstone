@@ -27,7 +27,6 @@ locals {
     { name = "TURNSTONE_ENV", value = var.environment },
     { name = "TURNSTONE_DB_BACKEND", value = "postgresql" },
     { name = "TURNSTONE_LLM_BASE_URL", value = var.llm_base_url },
-    { name = "TURNSTONE_REDIS_URL", value = "redis://${aws_elasticache_replication_group.this.primary_endpoint_address}:6379/0" },
   ]
 
   # Secrets pulled from Secrets Manager at container start.
@@ -185,57 +184,6 @@ resource "aws_ecs_service" "server" {
   }
 
   depends_on = [aws_lb_target_group.server]
-}
-
-# ---------- Bridge Task Definition + Service ----------
-
-resource "aws_ecs_task_definition" "bridge" {
-  family                   = "${var.name_prefix}-bridge"
-  requires_compatibilities = ["FARGATE"]
-  network_mode             = "awsvpc"
-  cpu                      = var.bridge_cpu
-  memory                   = var.bridge_memory
-  execution_role_arn       = aws_iam_role.ecs_execution.arn
-  task_role_arn            = aws_iam_role.ecs_task.arn
-  tags                     = local.common_tags
-
-  container_definitions = jsonencode([
-    {
-      name      = "bridge"
-      image     = local.full_image
-      essential = true
-      command   = ["turnstone-bridge"]
-
-      environment = concat(local.common_env, local.auth_env)
-      secrets     = concat(local.common_secrets, local.auth_secrets)
-
-      logConfiguration = {
-        logDriver = "awslogs"
-        options = {
-          "awslogs-group"         = aws_cloudwatch_log_group.this.name
-          "awslogs-region"        = data.aws_region.current.name
-          "awslogs-stream-prefix" = "bridge"
-        }
-      }
-    },
-  ])
-}
-
-resource "aws_ecs_service" "bridge" {
-  name            = "${var.name_prefix}-bridge"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.bridge.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
-  tags            = local.common_tags
-
-  network_configuration {
-    subnets          = var.private_subnet_ids
-    security_groups  = [aws_security_group.ecs_tasks.id]
-    assign_public_ip = false
-  }
-
-  depends_on = [aws_ecs_service.server]
 }
 
 # ---------- Console Task Definition + Service ----------
