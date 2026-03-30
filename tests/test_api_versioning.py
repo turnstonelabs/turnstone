@@ -84,7 +84,6 @@ class TestConsoleVersioning:
         }
         app = create_app(
             collector=collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)

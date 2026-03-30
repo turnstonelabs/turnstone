@@ -1,9 +1,7 @@
 """Standalone SSE event dataclasses for the turnstone SDK.
 
 These types match the JSON payloads emitted by the server and console
-SSE endpoints.  They are intentionally decoupled from the MQ protocol
-events in ``turnstone.mq.protocol`` so that SDK consumers do not need
-the ``redis`` optional dependency.
+SSE endpoints.
 """
 
 from __future__ import annotations
@@ -92,6 +90,7 @@ class ToolInfoEvent(ServerEvent):
 class ApproveRequestEvent(ServerEvent):
     type: str = "approve_request"
     items: list[dict[str, Any]] = field(default_factory=list)
+    judge_pending: bool = False
 
 
 @dataclass
@@ -164,6 +163,34 @@ class ClearUiEvent(ServerEvent):
 @dataclass
 class CancelledEvent(ServerEvent):
     type: str = "cancelled"
+
+
+@dataclass
+class IntentVerdictEvent(ServerEvent):
+    type: str = "intent_verdict"
+    tool_name: str = ""
+    verdict: str = ""
+    reason: str = ""
+    call_id: str = ""
+    func_name: str = ""
+    intent_summary: str = ""
+    risk_level: str = ""
+    confidence: float = 0.0
+    recommendation: str = ""
+    reasoning: str = ""
+    tier: str = ""
+    judge_model: str = ""
+    verdict_id: str = ""
+    latency_ms: int = 0
+
+
+@dataclass
+class OutputWarningEvent(ServerEvent):
+    type: str = "output_warning"
+    call_id: str = ""
+    risk_level: str = ""
+    categories: list[str] = field(default_factory=list)
+    explanation: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +335,8 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         BusyErrorEvent,
         ClearUiEvent,
         CancelledEvent,
+        IntentVerdictEvent,
+        OutputWarningEvent,
         WsStateEvent,
         WsActivityEvent,
         WsRenameEvent,

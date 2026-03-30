@@ -1,10 +1,10 @@
 # MCP Cluster Ops
 
-An MCP server that exposes tools for executing commands across a [Turnstone](https://github.com/turnstonelabs/turnstone) cluster. Serves as a reference implementation for both MCP server patterns and Turnstone MQ client SDK usage.
+An MCP server that exposes tools for executing commands across a [Turnstone](https://github.com/turnstonelabs/turnstone) cluster. Serves as a reference implementation for both MCP server patterns and Turnstone SDK usage.
 
 ## How it works
 
-This server uses Turnstone's MQ client (`TurnstoneClient`) to dispatch shell commands to specific nodes via Redis. Remote agents execute the command and the raw bash output is captured directly from the `ToolResultEvent` stream — bypassing the costly "agent reads output → re-generates output as completion tokens" round-trip.
+This server uses Turnstone's SDK client (`TurnstoneServer`) to dispatch shell commands to specific nodes via HTTP. Remote agents execute the command and the raw bash output is captured directly from the `ToolResultEvent` stream — bypassing the costly "agent reads output → re-generates output as completion tokens" round-trip.
 
 Multi-node dispatches run in parallel via `asyncio.gather`, so total wall time is bounded by the slowest node rather than the sum.
 
@@ -19,18 +19,13 @@ Multi-node dispatches run in parallel via `asyncio.gather`, so total wall time i
 
 ## Prerequisites
 
-- A running Turnstone cluster (at least one `turnstone-server` + `turnstone-bridge`)
-- Redis accessible from wherever this MCP server runs
+- A running Turnstone cluster (at least one `turnstone-server`)
 - Python 3.11+
 
 ## Installation
 
 ```bash
 # From the turnstone repo root:
-pip install -e ./examples/mcp-cluster-ops
-
-# Or install turnstone with MQ support first, then the example:
-pip install -e ".[mq]"
 pip install -e ./examples/mcp-cluster-ops
 ```
 
@@ -40,9 +35,8 @@ pip install -e ./examples/mcp-cluster-ops
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_PASSWORD` | _(none)_ | Redis password (use env vars, not config files) |
+| `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL |
+| `TURNSTONE_API_TOKEN` | _(none)_ | API token for authentication |
 | `MCP_CLUSTER_OPS_TIMEOUT` | `120` | Default command timeout (seconds, clamped 5-3600) |
 | `MCP_CLUSTER_OPS_MAX_OUTPUT` | `8192` | Max output bytes per node (0 = unlimited) |
 | `MCP_CLUSTER_OPS_MAX_NODES` | `32` | Max concurrent node dispatches |
@@ -57,7 +51,7 @@ pip install -e ./examples/mcp-cluster-ops
 command = "mcp-cluster-ops"
 
 [mcp.servers.cluster-ops.env]
-REDIS_HOST = "redis.example.com"
+TURNSTONE_SERVER_URL = "http://turnstone.example.com:8080"
 ```
 
 **JSON** (via `--mcp-config`):
@@ -68,7 +62,7 @@ REDIS_HOST = "redis.example.com"
     "cluster-ops": {
       "command": "mcp-cluster-ops",
       "env": {
-        "REDIS_HOST": "redis.example.com"
+        "TURNSTONE_SERVER_URL": "http://turnstone.example.com:8080"
       }
     }
   }
@@ -90,10 +84,6 @@ node-2: /dev/sda1  500G  410G   90G  82%  /
 node-3: /dev/sda1  1.0T  200G  800G  20%  /
 ```
 
-## Why MQ client instead of HTTP SDK?
-
-The HTTP SDK (`TurnstoneServer`) talks to a single server instance. The MQ client (`TurnstoneClient`) routes through Redis with `target_node` support, which is the entire point of cross-node cluster operations.
-
 ## Security Considerations
 
 **This MCP server grants the calling agent shell access to cluster nodes.**
@@ -104,8 +94,8 @@ The HTTP SDK (`TurnstoneServer`) talks to a single server instance. The MQ clien
   is returned through the MCP tool result and becomes part of the LLM context.
 - The security boundary is at the MCP host layer -- use Turnstone's tool
   policy system to restrict which agents can invoke these tools.
-- Set `REDIS_PASSWORD` via your environment or a secrets manager -- avoid
-  hardcoding passwords in config files.
+- Set `TURNSTONE_API_TOKEN` via your environment or a secrets manager -- avoid
+  hardcoding tokens in config files.
 
 ## Development
 

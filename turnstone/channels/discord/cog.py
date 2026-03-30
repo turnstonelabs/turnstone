@@ -10,7 +10,6 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
-from turnstone.mq.protocol import CloseWorkstreamMessage
 
 if TYPE_CHECKING:
     import discord
@@ -184,10 +183,9 @@ class MessageCog:
             )
 
             # Create workstream WITHOUT initial_message — subscribe to events
-            # first, then send the message.  Sending initial_message through
-            # the bridge races with subscription: Redis pub/sub is fire-and-
-            # forget, so response events published before subscribe completes
-            # are silently dropped.
+            # first, then send the message.  With SSE the event stream is
+            # reliable once connected, but we still subscribe first for
+            # consistency.
             ws_id, _is_new = await self.ts.router.get_or_create_workstream(
                 channel_type="discord",
                 channel_id=str(thread.id),
@@ -253,7 +251,7 @@ class MessageCog:
         # Register the DM channel for response forwarding.  The bot's
         # _on_ws_event handler will send the next turn's response here,
         # track the response for further replies, and clean up on
-        # TurnCompleteEvent.
+        # StreamEndEvent.
         self.ts._notify_reply_channels[ws_id] = (message.channel, target_user_id)
 
         log.info(
@@ -446,9 +444,8 @@ class MessageCog:
 
         ws_id = route["ws_id"]
 
-        # Close via MQ.
-        msg = CloseWorkstreamMessage(ws_id=ws_id)
-        await self.ts.broker.push_inbound(msg.to_json())
+        # Close via server API.
+        await self.ts.router.close_workstream(ws_id)
 
         # Delete route and unsubscribe.
         await self.ts.router.delete_route("discord", str(channel.id))

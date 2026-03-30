@@ -131,7 +131,7 @@ class ApprovalView:
         ws_id, correlation_id = parsed
 
         # Verify user is linked.  Scope enforcement (approve) happens
-        # server-side when the bridge executes the tool approval.
+        # server-side when the tool approval is executed.
         user_id = await self.bot.router.resolve_user("discord", str(interaction.user.id))
         if user_id is None:
             await interaction.response.send_message(

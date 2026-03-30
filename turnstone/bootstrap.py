@@ -53,16 +53,14 @@ configure a Turnstone deployment interactively.
 ## About Turnstone
 Turnstone is a multi-node AI orchestration platform. A deployment consists of:
 - **Server** (turnstone-server): Web UI + chat workstreams + LLM interaction (port 8080)
-- **Bridge** (turnstone-bridge): Redis-to-HTTP bridge for multi-node routing
 - **Console** (turnstone-console): Cluster dashboard + admin panel (port 8090)
-- **Redis**: Message broker, pub/sub, node registry
 - **PostgreSQL** (production): Persistent database (dev can use SQLite)
 - **Channel** (optional): Discord/Slack gateway
 
 ## Deployment Profiles (compose.yaml)
-- **Default** (no flag): redis + console only (infrastructure, good for running external servers)
-- **Production** (`--profile production`): redis + 1 server + 1 bridge + console + PostgreSQL + channel (single node)
-- **Cluster** (`--profile cluster`): 10-node server/bridge fleet + PostgreSQL + channel + console (multi-node)
+- **Default** (no flag): console only (infrastructure, good for running external servers)
+- **Production** (`--profile production`): 1 server + console + PostgreSQL + channel (single node)
+- **Cluster** (`--profile cluster`): 10-node server fleet + PostgreSQL + channel + console (multi-node)
 - **ddgCluster** (`--profile ddgCluster`): Cluster + DuckDuckGo Search MCP sidecar (web search via MCP, no API key needed)
 
 ## Environment Variables (.env)
@@ -83,10 +81,6 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `DATABASE_URL` — PostgreSQL connection string (production/cluster only)
 - `POSTGRES_USER` — PostgreSQL username (default: turnstone)
 - `POSTGRES_PASSWORD` — PostgreSQL password (required for production/cluster)
-
-### Redis
-- `REDIS_PASSWORD` — Redis password (optional but recommended)
-- `REDIS_PORT` — Redis port (default: 6379)
 
 ### Authentication
 - `TURNSTONE_AUTH_ENABLED` — Enable auth (`true`/empty)
@@ -121,7 +115,6 @@ The sidecar uses MCP streamable-http transport with DNS rebinding protection dis
 Safe search is disabled by default.
 
 ### Cluster
-- `HEARTBEAT_TTL` — Bridge heartbeat TTL in seconds (default: 60)
 - `APPROVAL_TIMEOUT` — Tool approval timeout in seconds (default: 3600)
 
 ## Auth Setup Flow
@@ -142,7 +135,7 @@ reasoning_effort, tool timeout, rate limiting, health probes, judge config, memo
 config, etc.) are configurable via the admin Settings tab in the console — no \
 config.toml edits or restarts needed for most changes. These settings are stored in \
 the database and apply cluster-wide. The `.env` file only needs bootstrap-critical \
-settings (database, Redis, auth, ports, API keys). Tell users they can fine-tune \
+settings (database, auth, ports, API keys). Tell users they can fine-tune \
 model and behavioral settings after deployment through the admin panel.
 
 ## Built-in Roles
@@ -170,7 +163,7 @@ Walk the user through setting up their deployment step by step:
 4. **Database**: SQLite (dev/simple) vs PostgreSQL (production/cluster). \
 PostgreSQL is required for cluster mode.
 5. **Security**: Recommend enabling auth for any non-local deployment. \
-Use `generate_secret` for JWT secret, Redis password, auth token, and Postgres password. \
+Use `generate_secret` for JWT secret, auth token, and Postgres password. \
 Ask for initial admin username and password. \
 If the user's deployment will use an external identity provider (Okta, Azure AD, Google, etc.), \
 offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \

@@ -9,7 +9,7 @@ description = "MCP server for Turnstone cluster operations — reference impleme
 requires-python = ">=3.11"
 license = "BUSL-1.1"
 dependencies = [
-    "turnstone[mq]",
+    "turnstone",
     "mcp>=1.6",
 ]
 
@@ -18,7 +18,7 @@ mcp-cluster-ops = "mcp_cluster_ops.server:main"
 
 [project.optional-dependencies]
 test = ["pytest>=9.0"]
-dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
+dev = ["ruff>=0.9", "mypy>=1.14"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,17 +16,13 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 Turnstone gives LLMs tools — shell, files, search, web, planning — and orchestrates multi-turn conversations where the model investigates, acts, and reports. It runs as:
 
 - **Interactive sessions** — terminal CLI or browser UI with parallel workstreams
-- **Queue-driven agents** — trigger workstreams via message queue, stream progress, approve or auto-approve tool use
-- **Multi-node clusters** — generic work load-balances across nodes, directed work routes to a specific server
 - **Cluster dashboard** — real-time view of all nodes and workstreams, reverse proxy for server UIs
 - **Intent validation** — an LLM judge evaluates every tool call before approval, presenting risk assessments and evidence-based recommendations so users can make informed decisions instead of blindly approving raw tool calls
 - **Governance & compliance** — RBAC, OIDC SSO (Okta, Azure AD, Google, Keycloak), tool policies, skills (reusable behavioral profiles with security scanning), usage tracking, and append-only audit logs
-- **Cluster simulator** — test the stack at scale (up to 1000 nodes) without an LLM backend
-
 Works with any OpenAI-compatible API (vLLM, llama.cpp, NVIDIA NIM) or Anthropic's native Messages API. Supports [MCP](https://modelcontextprotocol.io/) for external tool servers with native deferred tool loading on Anthropic and OpenAI APIs (BM25 fallback for local models).
 
 <p align="center">
-  <img src="docs/diagrams/architecture-overview.svg" alt="Turnstone system architecture — data flow from clients through gateways, Redis MQ, cluster nodes, to LLM providers" width="960"/>
+  <img src="docs/diagrams/architecture-overview.svg" alt="Turnstone system architecture — data flow from clients through gateways, cluster nodes, to LLM providers" width="960"/>
 </p>
 
 ## Quickstart
@@ -44,34 +40,22 @@ turnstone --base-url http://localhost:8000/v1
 turnstone-server --port 8080 --base-url http://localhost:8000/v1
 ```
 
-### Queue-driven (programmatic)
-
-```bash
-pip install turnstone[mq]
-turnstone-bridge --server-url http://localhost:8080 --redis-host localhost
-```
+### Programmatic (SDK)
 
 ```python
-from turnstone.mq import TurnstoneClient
+from turnstone.sdk import TurnstoneServer
 
-with TurnstoneClient() as client:
-    # Generic — any available node picks it up
-    result = client.send_and_wait("Analyze the error logs", auto_approve=True)
+with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+    ws = client.create_workstream(name="demo")
+    result = client.send_and_wait("Analyze the error logs", ws.ws_id, auto_approve=True)
     print(result.content)
-
-    # Directed — must run on a specific server
-    result = client.send_and_wait(
-        "Check disk I/O on this server",
-        target_node="server-12",
-        auto_approve=True,
-    )
 ```
 
 ### Cluster dashboard
 
 ```bash
 pip install turnstone[console]
-turnstone-console --redis-host localhost --port 8090
+turnstone-console --port 8090
 ```
 
 Then open `http://localhost:8090` for the cluster-wide dashboard. Create workstreams from the console and interact with any node's server UI through the built-in reverse proxy — no direct server port access required.
@@ -80,7 +64,7 @@ Then open `http://localhost:8090` for the cluster-wide dashboard. Create workstr
 
 ```bash
 cp .env.example .env  # edit LLM_BASE_URL, OPENAI_API_KEY, etc.
-docker compose up     # starts redis + server + bridge + console (SQLite)
+docker compose up     # starts server + console (SQLite)
 ```
 
 For production with PostgreSQL:
@@ -91,23 +75,6 @@ docker compose --profile production up  # adds PostgreSQL, uses it as database
 ```
 
 Console dashboard at http://localhost:8090. See [docs/docker.md](docs/docker.md) for configuration, scaling, and profiles.
-
-### Simulator
-
-Test the multi-node stack at scale without an LLM backend:
-
-```bash
-docker compose --profile sim up redis console sim
-```
-
-Or standalone:
-
-```bash
-pip install turnstone[sim]
-turnstone-sim --nodes 100 --scenario steady --duration 60 --mps 10
-```
-
-See [docs/simulator.md](docs/simulator.md) for scenarios, CLI reference, and metrics.
 
 ## Architecture
 
@@ -122,11 +89,7 @@ Detailed UML diagrams are available in [`docs/diagrams/`](docs/diagrams/):
 | [Core Engine Classes](docs/diagrams/png/03-core-engine-classes.png) | SessionUI protocol, ChatSession, LLMProvider, WorkstreamManager |
 | [Conversation Turn](docs/diagrams/png/04-conversation-turn.png) | Full message lifecycle through the engine (provider-agnostic) |
 | [Tool Pipeline](docs/diagrams/png/05-tool-pipeline.png) | Three-phase prepare/approve/execute |
-| [MQ Protocol](docs/diagrams/png/06-mq-protocol.png) | 9 inbound + 19 outbound message types |
-| [Message Routing](docs/diagrams/png/07-message-routing.png) | Multi-node routing scenarios |
-| [Redis Key Schema](docs/diagrams/png/08-redis-key-schema.png) | All Redis keys, types, and TTLs |
 | [Workstream States](docs/diagrams/png/09-workstream-states.png) | State machine transitions |
-| [Simulator](docs/diagrams/png/10-simulator-architecture.png) | SimCluster, dispatchers, scenarios |
 | [Console Data Flow](docs/diagrams/png/11-console-data-flow.png) | Dashboard data collection threads |
 | [Deployment](docs/diagrams/png/12-deployment.png) | Docker Compose service topology |
 | [SDK Architecture](docs/diagrams/png/13-sdk-architecture.png) | Python + TypeScript client libraries |
@@ -179,27 +142,6 @@ Skills are also scanned at install time — the scanner evaluates content, suppl
 Tool execution results are evaluated by an output guard before entering the conversation — detecting prompt injection payloads in fetched content, credential leakage in command output, and encoded payloads. Detected credentials are automatically redacted.
 
 See [docs/judge.md](docs/judge.md) for the full guide.
-
-## Multi-node routing
-
-Each Turnstone server runs a bridge process. Bridges share a Redis instance for coordination:
-
-| Redis Key | Purpose |
-|-----------|---------|
-| `turnstone:inbound` | Shared work queue — generic tasks, any node |
-| `turnstone:inbound:{node_id}` | Per-node queue — directed tasks |
-| `turnstone:ws:{ws_id}` | Workstream ownership — auto-routes follow-ups |
-| `turnstone:node:{node_id}` | Node heartbeat + metadata for discovery |
-| `turnstone:events:{ws_id}` | Per-workstream event pub/sub |
-| `turnstone:events:global` | Global event pub/sub |
-| `turnstone:events:cluster` | Cluster-wide state changes (for turnstone-console) |
-
-**Routing rules:**
-1. Message has `target_node` → routes to that node's queue
-2. Message has `ws_id` → looks up owner, routes to owning node
-3. Neither → shared queue, next available bridge picks it up
-
-Bridges BLPOP from their per-node queue (priority) then the shared queue. Directed work always takes precedence.
 
 ## Tools
 
@@ -312,15 +254,6 @@ host = "0.0.0.0"
 port = 8080
 max_workstreams = 50       # auto-evicts oldest idle when full
 
-[redis]
-host = "localhost"
-port = 6379
-password = ""
-
-[bridge]
-server_url = "http://localhost:8080"
-node_id = ""           # empty = hostname_xxxx
-
 [console]
 host = "0.0.0.0"
 port = 8090
@@ -376,7 +309,7 @@ Parallel independent conversations, each with its own session and state:
 | `◆` | attention | Waiting for approval |
 | `✖` | error | Something went wrong |
 
-Idle workstreams are automatically cleaned up after 2 hours (configurable). In multi-node deployments, workstream ownership is tracked in Redis — follow-up messages auto-route to the owning node.
+Idle workstreams are automatically cleaned up after 2 hours (configurable).
 
 ## Monitoring
 
@@ -412,7 +345,6 @@ Per-workstream metrics are labeled by `ws_id` (bounded by `[server].max_workstre
 
 - Python 3.11+
 - An OpenAI-compatible API endpoint ([vLLM](https://github.com/vllm-project/vllm), [NVIDIA NIM](https://build.nvidia.com/), [llama.cpp](https://github.com/ggml-org/llama.cpp), etc.) or an Anthropic API key
-- Redis (for message queue bridge — `pip install turnstone[mq]`)
 - Anthropic provider (optional — `pip install turnstone[anthropic]`)
 - PostgreSQL (optional, for production — `pip install turnstone[postgres]`)
 - Math sandbox packages (optional — `pip install turnstone[sandbox]` for sympy, numpy, scipy, pytest)

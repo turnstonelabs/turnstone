@@ -18,10 +18,9 @@ plugs in.
 |---------|--------|----------|---------|
 | `turnstone` | `turnstone.cli` | `TerminalUI` | Interactive terminal REPL |
 | `turnstone-server` | `turnstone.server` | `WebUI` | Browser-based chat (HTTP + SSE) |
-| `turnstone-bridge` | `turnstone.mq.bridge` | Bridge | Message queue ↔ HTTP API bridge |
 | `turnstone-console` | `turnstone.console.server` | ClusterCollector | Cluster dashboard (aggregates all nodes) |
 | `turnstone-eval` | `turnstone.eval` | `NullUI` | Headless evaluation and prompt optimization |
-| `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) via Redis MQ |
+| `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) |
 | `turnstone-admin` | `turnstone.core.admin_cli` | — | Offline user and API token management |
 
 ---
@@ -42,7 +41,7 @@ turnstone/
       __init__.py     create_provider() + create_client() factory functions
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
-    mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh, async-sync bridge
+    mcp_client.py     MCPClientManager — MCP server connections, tool discovery, dynamic refresh
     tool_search.py    Dynamic tool search — BM25 index, session-scoped tool visibility
     watch.py          WatchRunner daemon — periodic command polling, condition DSL, result dispatch
     judge.py          Intent validation — heuristic rules + LLM judge, advisory verdicts
@@ -74,20 +73,15 @@ turnstone/
     _base.py          Shared httpx async client, auth, error handling
     _sync.py          Background event loop for sync wrappers
     _types.py         TurnResult + TurnstoneAPIError
-  mq/
-    protocol.py       Inbound/outbound message dataclasses (JSON serialization)
-    broker.py         Abstract MessageBroker protocol + RedisBroker
-    bridge.py         Bridge service (queue ↔ turnstone-server HTTP API)
-    client.py         TurnstoneClient library + TurnResult for MQ-based access
   console/
-    collector.py      ClusterCollector — aggregates state from all nodes via Redis + HTTP
-    scheduler.py      TaskScheduler — background cron/at scheduler, dispatches via MQ
+    collector.py      ClusterCollector — aggregates state from all nodes via HTTP
+    scheduler.py      TaskScheduler — background cron/at scheduler, dispatches via HTTP
     server.py         Cluster dashboard HTTP server + SSE + CLI entry point
     static/           Cluster dashboard web UI (page-specific HTML, CSS, JS)
   channels/
     cli.py            Unified channel gateway entry point (turnstone-channel)
     _protocol.py      ChannelAdapter protocol, ChannelEvent dataclass
-    _routing.py       ChannelRouter — channel/thread ↔ workstream mapping via MQ
+    _routing.py       ChannelRouter — channel/thread ↔ workstream mapping via HTTP
     _config.py        Base ChannelConfig dataclass
     discord/          Discord adapter (bot, cog, views, streaming, config)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
@@ -704,8 +698,7 @@ supports_vision = true
    sub-agents, allowing a cheaper model for autonomous loops
 
 **Per-workstream selection:** `POST /v1/api/workstreams/new` accepts an optional
-`"model"` field. The bridge `CreateWorkstreamMessage` carries the same field
-through the MQ protocol, along with `skill` (skill name)
+`"model"` field, along with `skill` (skill name)
 which can override the model before workstream creation.
 
 ### Tool Output Truncation
@@ -1205,95 +1198,39 @@ calls `_fg_event.wait()`, which blocks the worker thread until the user
 switches to that workstream. The `_bg_attention_notify` callback writes a
 bell + status line to stderr to alert the user.
 
-### Message Queue Bridge
-
-```
-Main thread              Global SSE thread         Per-WS SSE threads (×N)
-+------------------+     +------------------+      +-------------------+
-| Inbound loop     |     | GET /events/glob |      | GET /events?ws_id |
-| BLPOP on Redis   |     | Parse SSE via    |      | Parse SSE via     |
-|                  |     |   httpx-sse      |      |   httpx-sse       |
-| Dispatch to      |     | Forward state    |      | Forward content,  |
-|   handler        |     |   changes        |      |   tool results    |
-| POST to server   |     | Detect turn      |      | Handle approval   |
-| Publish ACK      |     |   completion     |      |   forwarding      |
-+------------------+     +------------------+      +-------------------+
-       |                         |                         |
-       +-- Redis inbound queue   +-- Redis pub/sub         +-- Redis pub/sub
-           (RPUSH/BLPOP)             (PUBLISH)                 (PUBLISH)
-                                                               + response queue
-                                                                 (BLPOP on
-                                                                  approval)
-```
-
-**Approval flow:** When a per-WS SSE thread receives an `approve_request`, it checks
-the workstream's `auto_approve_tools` set. If all requested tools are in the set, the
-bridge auto-approves via `POST /v1/api/approve`. Otherwise, it publishes an
-`ApprovalRequestEvent` to the outbound channel with a `request_id`, then blocks on
-`BLPOP` of a Redis response queue (`turnstone:resp:{request_id}`) until the client pushes
-a response or the approval timeout (default 3600s / 1 hour) expires.
-
-**Cancellation:** The `CancelMessage` (type `"cancel"`) is a routed inbound message.
-The bridge dispatches it to `POST /v1/api/cancel` on the server owning the workstream,
-which sets the cooperative cancel flag and unblocks any pending approval/plan waits.
-
-**Completion detection:** The bridge tracks which `correlation_id` maps to which
-`ws_id` for active sends. The server accumulates content tokens in the WebUI and
-piggybacks the full response text onto the `ws_state → idle` global SSE event.
-When the bridge receives this event, it emits a synthetic `TurnCompleteEvent`
-carrying the correlation ID and the server-provided `content`. This lets downstream
-consumers (e.g. the Discord bot) recover the full response when individual
-`ContentEvent`s were missed, and serves as the primary delivery path for
-bidirectional notification DM forwarding.
-
-**Multi-node routing:** Each bridge retrieves its `node_id` from the server's
-`/health` endpoint on startup (with exponential backoff retry). The server
-generates the `node_id` (`{hostname}_{4hex}`) and is the sole authority for
-node identity. The bridge BLPOPs
-from both `turnstone:inbound:{node_id}` (directed, priority) and `turnstone:inbound` (shared).
-Messages with `target_node` set are pushed to the target's per-node queue. Messages
-for existing workstreams are auto-routed via `turnstone:ws:{ws_id}` ownership keys in Redis.
-If a bridge picks up a shared-queue message for a workstream owned by another node, it
-re-routes to that node's queue (1 extra hop). Bridges publish heartbeats to
-`turnstone:node:{node_id}` with configurable TTL for node discovery.
-On startup, `_recover_workstreams` re-registers ownership of existing
-workstreams and publishes `WorkstreamCreatedEvent` to the cluster channel
-so the console collector picks them up immediately.
-
 ### Cluster Console
 
 ```
 Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
 +------------------+                 +----------------------------+
 | Event subscriber |                 | POST /v1/api/cluster/      |
-| SUBSCRIBE on     |                 |   workstreams/new          |
-| events:cluster   |                 |   → LPUSH to Redis         |
-+------------------+                 |     inbound:{node_id}      |
-| Node discovery   |                 +----------------------------+
-| SCAN node:* keys |                 | GET /node/{node_id}/       |
-| every 15 seconds |                 |   → httpx.AsyncClient      |
-+------------------+                 |     proxy to server_url    |
-| Poll loop        |                 | GET /node/{id}/v1/api/events |
-| GET /v1/api/dash |                 |   → SSE stream proxy       |
-| GET /health      |                 | POST /node/{id}/v1/api/send  |
-| ThreadPoolExec   |                 |   → forwarded to server    |
+| SSE on           |                 |   workstreams/new          |
+| /events/glob     |                 |   → POST to target server  |
 +------------------+                 +----------------------------+
+| Node discovery   |                 | GET /node/{node_id}/       |
+| Service registry |                 |   → httpx.AsyncClient      |
+| every 15 seconds |                 |     proxy to server_url    |
++------------------+                 | GET /node/{id}/v1/api/events |
+| Poll loop        |                 |   → SSE stream proxy       |
+| GET /v1/api/dash |                 | POST /node/{id}/v1/api/send  |
+| GET /health      |                 |   → forwarded to server    |
+| ThreadPoolExec   |                 +----------------------------+
++------------------+
 ```
 
 The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
 endpoint uses `EventSourceResponse` with the same listener queue pattern as
 the main server. `ClusterCollector`'s background threads (event subscriber,
-node discovery, poll loop) use sync Redis clients and `ThreadPoolExecutor`
+node discovery, poll loop) use `ThreadPoolExecutor`
 for parallel HTTP polling. The poll loop diffs workstream IDs between poll
 cycles and fans out synthetic `ws_created`/`ws_closed` SSE events for any
 changes, ensuring browser clients stay in sync even when real-time cluster
-events are missed (e.g. bridge startup recovery).
+events are missed.
 
 The console has two write-path capabilities:
 
-1. **Workstream creation** — pushes `CreateWorkstreamMessage` to Redis inbound
-   queues targeting specific nodes. The bridge on each node picks up the message
-   and creates the workstream on the local server. Auto-selects the node with
+1. **Workstream creation** — sends HTTP requests to target server nodes
+   to create workstreams. Auto-selects the node with
    the most available capacity if no target is specified. When a `skill`
    field is present, the server resolves the skill BEFORE `mgr.create()`
    (applying the model override to the creation request) and snapshot-applies
@@ -1360,7 +1297,7 @@ event loop on a daemon thread.
 
 **Event types**: 27 standalone dataclasses in `events.py` with a type-registry
 pattern matching `OutboundEvent.from_json()` from `mq/protocol.py`. Events are
-decoupled from the MQ package so SDK consumers don't need the `redis` dependency.
+decoupled from server internals.
 
 **TypeScript SDK**: `sdk/typescript/` — separate npm package with the same API
 surface. Zero browser dependencies, SSE via `fetch` + `ReadableStream` parsing.
@@ -1381,20 +1318,19 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
 
 > See also: [Channel Integrations guide](channels.md)
 
-The `turnstone-channel` gateway bridges external messaging platforms
-(Discord, Slack, Teams) to the turnstone cluster via Redis MQ. Each
+The `turnstone-channel` gateway connects external messaging platforms
+(Discord, Slack, Teams) to the turnstone cluster via HTTP. Each
 platform adapter implements the `ChannelAdapter` protocol and translates
-between platform-native events and turnstone MQ messages.
+between platform-native events and turnstone server API calls.
 
 The `ChannelRouter` manages bidirectional routing: it maps platform
 channel/thread IDs to turnstone workstream IDs, handles workstream
 creation and stale-route recovery, and resolves platform users to
 turnstone identities via the `channel_users` table. When an evicted
 workstream is reactivated, the router uses atomic resume via the
-`resume_ws` field on `CreateWorkstreamMessage` — the server resumes
+`resume_ws` field on the workstream creation request — the server resumes
 the old workstream's conversation during creation in a single HTTP
-request, eliminating ordering fragility. The bridge emits a
-`WorkstreamResumedEvent` to confirm success.
+request, eliminating ordering fragility.
 
 Discord ships as the first adapter. See [channels.md](channels.md) for
 setup instructions, configuration reference, and the adapter development
@@ -1403,7 +1339,7 @@ guide.
 ### Notification Subsystem
 
 The `notify` tool enables the LLM to send notifications to users or
-channels without going through MQ. The server calls the channel gateway
+channels directly. The server calls the channel gateway
 directly over HTTP for lower latency: `_exec_notify()` queries the
 `services` database table for healthy channel gateways (heartbeat within
 120 seconds), authenticates with a service JWT (`aud: turnstone-channel`),

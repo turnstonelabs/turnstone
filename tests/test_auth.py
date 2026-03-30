@@ -923,7 +923,6 @@ class TestConsoleAuth:
 
         app = create_app(
             collector=mock_collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(
                 enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
@@ -1095,7 +1094,6 @@ class TestConsoleLogin:
 
         app = create_app(
             collector=mock_collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(
                 enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},

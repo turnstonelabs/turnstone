@@ -1,8 +1,7 @@
 """Cluster state collector — aggregates data from all turnstone nodes.
 
-Discovers nodes via Redis heartbeat keys, polls each node's /v1/api/dashboard
-endpoint for workstream data, and subscribes to the cluster event channel
-for real-time state changes.
+Discovers nodes via the service registry (StorageBackend), polls each
+node's /v1/api/dashboard endpoint for workstream data.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import httpx
 
 if TYPE_CHECKING:
     from turnstone.core.auth import ServiceTokenManager
-    from turnstone.mq.broker import RedisBroker
+    from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.collector")
 
@@ -42,18 +41,16 @@ class NodeSnapshot:
 
 
 class ClusterCollector:
-    """Aggregates cluster state from Redis and per-node HTTP APIs.
+    """Aggregates cluster state from the service registry and per-node HTTP APIs.
 
-    Three daemon threads:
-    1. Event subscriber — real-time state changes from {prefix}:events:cluster
-    2. Node discovery — scans heartbeat keys every ``discovery_interval`` seconds
-    3. Poll loop — fetches /v1/api/dashboard from each node every ``poll_interval`` seconds
+    Two daemon threads:
+    1. Node discovery — queries the service registry every ``discovery_interval`` seconds
+    2. Poll loop — fetches /v1/api/dashboard from each node every ``poll_interval`` seconds
     """
 
     def __init__(
         self,
-        broker: RedisBroker,
-        prefix: str = "turnstone",
+        storage: StorageBackend,
         poll_interval: float = 15.0,
         discovery_interval: float = 15.0,
         max_poll_workers: int = 200,
@@ -63,8 +60,7 @@ class ClusterCollector:
         tls_verify: Any = True,
         tls_cert: tuple[str, str] | None = None,
     ):
-        self._broker = broker
-        self._prefix = prefix
+        self._storage = storage
         self._poll_interval = poll_interval
         self._discovery_interval = discovery_interval
         self._max_poll_workers = max_poll_workers
@@ -121,7 +117,6 @@ class ClusterCollector:
         """Start background threads."""
         self._running = True
         for target, name in [
-            (self._event_loop, "console-events"),
             (self._discovery_loop, "console-discovery"),
             (self._poll_loop, "console-poll"),
         ]:
@@ -137,74 +132,6 @@ class ClusterCollector:
         self._http_client.close()
         log.info("ClusterCollector stopped")
 
-    # -- event subscription --------------------------------------------------
-
-    def _event_loop(self) -> None:
-        """Subscribe to cluster events for real-time updates."""
-        while self._running:
-            try:
-                self._broker.subscribe_cluster(self._on_cluster_event)
-                while self._running:
-                    time.sleep(1)
-            except Exception:
-                log.exception("Cluster subscription error, reconnecting in 5s")
-                time.sleep(5)
-
-    def _on_cluster_event(self, raw: str) -> None:
-        """Handle a cluster event from Redis pub/sub."""
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return
-
-        etype = data.get("type", "")
-        ws_id = data.get("ws_id", "")
-        node_id = data.get("node_id", "")
-
-        with self._lock:
-            if etype == "cluster_state" and node_id in self._nodes:
-                node = self._nodes[node_id]
-                if ws_id in node.workstreams:
-                    ws = node.workstreams[ws_id]
-                    ws["state"] = data.get("state", ws.get("state", "idle"))
-                    if "tokens" in data:
-                        ws["tokens"] = data["tokens"]
-                    if "context_ratio" in data:
-                        ws["context_ratio"] = data["context_ratio"]
-                    if "activity" in data:
-                        ws["activity"] = data["activity"]
-                    if "activity_state" in data:
-                        ws["activity_state"] = data["activity_state"]
-
-            elif etype == "ws_created" and node_id:
-                if node_id in self._nodes:
-                    node = self._nodes[node_id]
-                    node.workstreams[ws_id] = {
-                        "id": ws_id,
-                        "name": data.get("name", ""),
-                        "state": "idle",
-                        "node": node_id,
-                        "server_url": node.server_url,
-                        "title": data.get("title", ""),
-                        "tokens": 0,
-                        "context_ratio": 0.0,
-                        "activity": "",
-                        "activity_state": "",
-                        "tool_calls": 0,
-                    }
-
-            elif etype == "ws_closed":
-                for node in self._nodes.values():
-                    node.workstreams.pop(ws_id, None)
-
-            elif etype == "ws_rename":
-                for node in self._nodes.values():
-                    if ws_id in node.workstreams:
-                        node.workstreams[ws_id]["name"] = data.get("name", "")
-
-        # Fan out to SSE listeners
-        self._fanout(data)
-
     def _fanout(self, event: dict[str, Any]) -> None:
         """Copy an event to all registered SSE listener queues."""
         with self._listeners_lock:
@@ -215,7 +142,7 @@ class ClusterCollector:
     # -- node discovery ------------------------------------------------------
 
     def _discovery_loop(self) -> None:
-        """Periodically scan Redis for active nodes."""
+        """Periodically scan the service registry for active nodes."""
         while self._running:
             try:
                 self._discover_nodes()
@@ -224,29 +151,35 @@ class ClusterCollector:
             time.sleep(self._discovery_interval)
 
     def _discover_nodes(self) -> None:
-        """Scan heartbeat keys and update the node map."""
-        active = self._broker.list_nodes()
+        """Query the service registry and update the node map."""
+        raw_services = self._storage.list_services("server", max_age_seconds=120)
         active_ids = set()
-        pending_events = []
+        pending_events: list[dict[str, Any]] = []
+
         with self._lock:
-            for meta in active:
-                nid = meta.get("node_id", "")
+            for svc in raw_services:
+                nid = svc.get("service_id", "")
                 if not nid:
                     continue
                 active_ids.add(nid)
+                # Parse optional metadata JSON for max_ws, started
+                meta: dict[str, Any] = {}
+                raw_meta = svc.get("metadata", "")
+                if raw_meta:
+                    with contextlib.suppress(json.JSONDecodeError, TypeError):
+                        meta = json.loads(raw_meta)
+                url = svc.get("url", "")
                 if nid not in self._nodes:
                     self._nodes[nid] = NodeSnapshot(
                         node_id=nid,
-                        server_url=meta.get("server_url", ""),
+                        server_url=url,
                         started=meta.get("started", 0.0),
                         max_ws=meta.get("max_ws", 10),
                     )
                     pending_events.append({"type": "node_joined", "node_id": nid})
                     log.info("Discovered node: %s", nid)
                 else:
-                    self._nodes[nid].server_url = meta.get(
-                        "server_url", self._nodes[nid].server_url
-                    )
+                    self._nodes[nid].server_url = url or self._nodes[nid].server_url
                     self._nodes[nid].max_ws = meta.get("max_ws", self._nodes[nid].max_ws)
 
             # Remove nodes whose heartbeats expired

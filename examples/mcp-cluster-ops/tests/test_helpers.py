@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from turnstone.mq.client import TurnResult
+from turnstone.sdk import TurnResult
 
 from mcp_cluster_ops.server import (
     _clamp_timeout,

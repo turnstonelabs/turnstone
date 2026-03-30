@@ -45,25 +45,21 @@ Issues = "https://github.com/turnstonelabs/turnstone/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=9.0", "pytest-cov>=6.0", "croniter>=3.0"]
-dev = ["ruff>=0.9", "mypy>=1.14", "types-redis>=4.6"]
-mq = ["redis>=7.2"]
-console = ["redis>=7.2", "croniter>=3.0"]
-sim = ["redis>=7.2"]
+dev = ["ruff>=0.9", "mypy>=1.14"]
+console = ["croniter>=3.0"]
 anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
 ddg = ["ddgs>=9.0"]
-discord = ["discord.py>=2.4", "redis>=7.2"]
+discord = ["discord.py>=2.4"]
 tls = ["lacme>=1.0.4"]
 sandbox = ["sympy>=1.13", "numpy>=2.0", "scipy>=1.14", "pytest>=9.0"]
-all = ["turnstone[mq,console,sim,anthropic,postgres,discord,ddg,tls,sandbox]"]
+all = ["turnstone[console,anthropic,postgres,discord,ddg,tls,sandbox]"]
 
 [project.scripts]
 turnstone = "turnstone.cli:main"
 turnstone-eval = "turnstone.eval:main"
 turnstone-server = "turnstone.server:main"
-turnstone-bridge = "turnstone.mq.bridge:main"
 turnstone-console = "turnstone.console.server:main"
-turnstone-sim = "turnstone.sim.cli:main"
 turnstone-admin = "turnstone.admin:main"
 turnstone-channel = "turnstone.channels.cli:main"
 turnstone-bootstrap = "turnstone.bootstrap:main"

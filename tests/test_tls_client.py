@@ -78,21 +78,11 @@ async def test_ssl_contexts_none_before_init():
 # ── Backward compatibility ───────────────────────────────────────────────────
 
 
-def test_bridge_tls_defaults():
-    """Bridge with default TLS params works without changes."""
-    from turnstone.mq.bridge import Bridge
-
-    # Default: tls_verify=True, tls_cert=None — no mTLS
-    bridge = Bridge(server_url="http://localhost:8080")
-    assert bridge._tls_verify is True
-    assert bridge._tls_cert is None
-
-
 def test_collector_tls_defaults():
     """Collector with default TLS params works without changes."""
     from turnstone.console.collector import ClusterCollector
 
-    broker_mock = MagicMock()
-    collector = ClusterCollector(broker=broker_mock)
+    storage_mock = MagicMock()
+    collector = ClusterCollector(storage=storage_mock)
     # Should create httpx client without errors
     assert collector._http_client is not None

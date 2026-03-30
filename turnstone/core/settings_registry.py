@@ -2,7 +2,7 @@
 
 Every setting that can be stored in the ``system_settings`` table must
 have an entry here.  Unknown keys are rejected at the API boundary.
-Bootstrap settings (database, Redis, auth, server/console bind) are
+Bootstrap settings (database, auth, server/console bind) are
 excluded — they are needed before storage is available.
 """
 
@@ -537,7 +537,7 @@ def _build_registry() -> dict[str, SettingDef]:
             "tls",
             restart_required=True,
             help="When enabled, the console runs an internal Certificate Authority and "
-            "ACME server. All cluster services (servers, bridge, channels) auto-provision "
+            "ACME server. All cluster services (servers, channels) auto-provision "
             "short-lived certificates for mutual TLS. Requires lacme: pip install turnstone[tls]",
         ),
         SettingDef(
@@ -562,9 +562,7 @@ BOOTSTRAP_SECTIONS: frozenset[str] = frozenset(
     {
         "api",
         "database",
-        "redis",
         "auth",
-        "bridge",
         "console",
     },
 )

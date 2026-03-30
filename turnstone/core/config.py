@@ -113,23 +113,6 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "workstream_idle_timeout": "workstream_idle_timeout",
         "max_workstreams": "max_workstreams",
     },
-    "bridge": {
-        "server_url": "server_url",
-        "node_id": "node_id",
-        "approval_timeout": "approval_timeout",
-        "heartbeat_ttl": "heartbeat_ttl",
-        "log_level": "log_level",
-    },
-    "redis": {
-        "host": "redis_host",
-        "port": "redis_port",
-        "password": "redis_password",
-        "db": "redis_db",
-        "tls": "redis_tls",
-        "tls_ca": "redis_tls_ca",
-        "tls_cert": "redis_tls_cert",
-        "tls_key": "redis_tls_key",
-    },
     "console": {
         "host": "host",
         "port": "port",

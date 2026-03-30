@@ -1,4 +1,4 @@
-"""Tests for MCP tool handlers with mocked TurnstoneClient."""
+"""Tests for MCP tool handlers with mocked TurnstoneServer."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from turnstone.mq.client import TurnResult
+from turnstone.sdk import TurnResult
 
 from mcp_cluster_ops.server import (
     _dispatch_parallel,
@@ -22,7 +22,7 @@ from mcp_cluster_ops.server import (
 class TestListNodesImpl:
     def test_returns_nodes(self):
         nodes = [{"node_id": "a", "model": "gpt-5"}, {"node_id": "b", "model": "gpt-5"}]
-        with patch("mcp_cluster_ops.server.TurnstoneClient") as mock_cls:
+        with patch("mcp_cluster_ops.server.TurnstoneServer") as mock_cls:
             mock_client = MagicMock()
             mock_client.list_nodes.return_value = nodes
             mock_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -32,7 +32,7 @@ class TestListNodesImpl:
             assert result == nodes
 
     def test_empty_cluster(self):
-        with patch("mcp_cluster_ops.server.TurnstoneClient") as mock_cls:
+        with patch("mcp_cluster_ops.server.TurnstoneServer") as mock_cls:
             mock_client = MagicMock()
             mock_client.list_nodes.return_value = []
             mock_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -52,7 +52,7 @@ class TestExecOnNodeSync:
         turn_result = TurnResult(
             tool_results=[("bash", "hello world")],
         )
-        with patch("mcp_cluster_ops.server.TurnstoneClient") as mock_cls:
+        with patch("mcp_cluster_ops.server.TurnstoneServer") as mock_cls:
             mock_client = MagicMock()
             mock_client.send_and_wait.return_value = turn_result
             mock_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -70,7 +70,7 @@ class TestExecOnNodeSync:
 
     def test_timeout(self):
         turn_result = TurnResult(timed_out=True)
-        with patch("mcp_cluster_ops.server.TurnstoneClient") as mock_cls:
+        with patch("mcp_cluster_ops.server.TurnstoneServer") as mock_cls:
             mock_client = MagicMock()
             mock_client.send_and_wait.return_value = turn_result
             mock_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
@@ -88,7 +88,7 @@ class TestExecOnNodeSync:
 
 class TestDispatchParallel:
     def test_parallel_success(self):
-        def fake_exec(redis_kw: Any, node_id: str, command: str, timeout: float) -> Any:
+        def fake_exec(server_kw: Any, node_id: str, command: str, timeout: float) -> Any:
             return (node_id, TurnResult(tool_results=[("bash", f"output-{node_id}")]))
 
         with patch("mcp_cluster_ops.server._exec_on_node_sync", side_effect=fake_exec):
@@ -108,9 +108,9 @@ class TestDispatchParallel:
             assert outputs["b"] == "output-b"
 
     def test_partial_failure(self):
-        def fake_exec(redis_kw: Any, node_id: str, command: str, timeout: float) -> Any:
+        def fake_exec(server_kw: Any, node_id: str, command: str, timeout: float) -> Any:
             if node_id == "bad":
-                raise ConnectionError("Redis down")
+                raise ConnectionError("connection refused")
             return (node_id, TurnResult(tool_results=[("bash", "ok")]))
 
         with patch("mcp_cluster_ops.server._exec_on_node_sync", side_effect=fake_exec):
@@ -128,10 +128,10 @@ class TestDispatchParallel:
             bad = next(r for r in results if r["node"] == "bad")
             assert good["ok"] is True
             assert bad["ok"] is False
-            assert "Redis down" in bad["error"]
+            assert "connection refused" in bad["error"]
 
     def test_all_fail(self):
-        def fake_exec(redis_kw: Any, node_id: str, command: str, timeout: float) -> Any:
+        def fake_exec(server_kw: Any, node_id: str, command: str, timeout: float) -> Any:
             raise RuntimeError(f"fail-{node_id}")
 
         with patch("mcp_cluster_ops.server._exec_on_node_sync", side_effect=fake_exec):

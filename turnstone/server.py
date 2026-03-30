@@ -18,6 +18,7 @@ import functools
 import json
 import os
 import queue
+import re
 import sys
 import textwrap
 import threading
@@ -61,6 +62,7 @@ log = get_logger(__name__)
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"
 _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+_VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +1522,11 @@ async def create_workstream(request: Request) -> JSONResponse:
 
         _st = _get_storage()
         applied_skill_version = len(_st.list_skill_versions(skill_data["template_id"])) + 1
+    requested_ws_id = body.get("ws_id", "") or ""
+    if not isinstance(requested_ws_id, str):
+        requested_ws_id = ""
+    if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
+        return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -1528,6 +1535,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             skill=resolved_skill,
             skill_id=skill_data["template_id"] if skill_data else "",
             skill_version=applied_skill_version,
+            ws_id=requested_ws_id,
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -2117,8 +2125,40 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         except Exception:
             log.warning("TLS auto-renewal startup failed", exc_info=True)
 
+    # Register in service registry and start heartbeat
+    _heartbeat_task: asyncio.Task[None] | None = None
+    _svc_node_id: str = getattr(app.state, "node_id", "")
+    _svc_url: str = getattr(app.state, "advertise_url", "")
+    if _svc_node_id and _svc_url:
+        from turnstone.core.storage import get_storage as _get_svc_storage
+
+        _svc_storage = _get_svc_storage()
+        _svc_storage.register_service("server", _svc_node_id, _svc_url)
+        log.info("server.service_registered", node_id=_svc_node_id, url=_svc_url)
+
+        async def _heartbeat_loop() -> None:
+            """Periodically update service heartbeat."""
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.to_thread(_svc_storage.heartbeat_service, "server", _svc_node_id)
+                except Exception:
+                    log.exception("server.heartbeat_failed")
+
+        _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
     yield
     # Shutdown
+    if _heartbeat_task is not None:
+        _heartbeat_task.cancel()
+    if _svc_node_id and _svc_url:
+        from turnstone.core.storage import get_storage as _get_svc_dereg
+
+        try:
+            await asyncio.to_thread(_get_svc_dereg().deregister_service, "server", _svc_node_id)
+            log.info("server.service_deregistered", node_id=_svc_node_id)
+        except Exception:
+            log.exception("server.deregister_failed")
     tls_client = getattr(app.state, "tls_client", None)
     if tls_client is not None:
         await tls_client.stop_renewal()
@@ -2177,6 +2217,7 @@ def create_app(
     watch_runner: Any = None,
     judge_config: Any = None,
     config_store: Any = None,
+    advertise_url: str = "",
 ) -> Starlette:
     """Create and configure the Starlette ASGI application."""
     _spec = build_server_spec()
@@ -2254,6 +2295,7 @@ def create_app(
     app.state.watch_runner = watch_runner
     app.state.judge_config = judge_config
     app.state.config_store = config_store
+    app.state.advertise_url = advertise_url
 
     from turnstone.core.auth import LoginRateLimiter
 
@@ -2703,6 +2745,10 @@ def main() -> None:
 
     cors_origins = parse_cors_origins()
 
+    # Construct advertise URL for service registration
+    _advertise_host = socket.gethostname() if args.host in ("0.0.0.0", "::") else args.host
+    _advertise_url = f"http://{_advertise_host}:{args.port}"
+
     _skip_perms = config_store.get("tools.skip_permissions")
     app = create_app(
         workstreams=manager,
@@ -2723,6 +2769,7 @@ def main() -> None:
         watch_runner=_watch_runner,
         judge_config=judge_config,
         config_store=config_store,
+        advertise_url=_advertise_url,
     )
 
     # Store CLI model args for hot-reload (internal_model_reload reads these)
@@ -2797,6 +2844,8 @@ def main() -> None:
 
                 # Store client on app state for lifespan renewal
                 app.state.tls_client = tls_client
+                # Update advertise URL to HTTPS now that TLS is active
+                app.state.advertise_url = f"https://{_advertise_host}:{args.port}"
                 log.info("TLS enabled — serving HTTPS")
             else:
                 log.warning("TLS enabled but no cert available")

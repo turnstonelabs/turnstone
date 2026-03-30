@@ -162,7 +162,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/cluster/workstreams/new",
         "POST",
-        "Create workstream via MQ dispatch",
+        "Create workstream via HTTP dispatch",
         request_model=ConsoleCreateWsRequest,
         response_model=ConsoleCreateWsResponse,
         error_codes=[400, 404, 503],

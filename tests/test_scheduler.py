@@ -2,21 +2,45 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from turnstone.console.scheduler import TaskScheduler
 
 
+def _wire_lock_storage(storage: MagicMock, initial: dict[str, str] | None = None) -> None:
+    """Configure *storage* mock so upsert/get track scheduler_lock state.
+
+    The scheduler's ``_try_acquire_lock`` now writes then reads back to
+    verify ownership.  The mock must reflect what was most recently
+    upserted so the read-back succeeds.
+    """
+    state: dict[str, dict[str, str] | None] = {"scheduler_lock": initial}
+
+    def _get(key: str, **_kw: object) -> dict[str, str] | None:
+        return state.get(key)
+
+    def _upsert(key: str, value: str, **_kw: object) -> None:
+        state[key] = {"value": value}
+
+    def _delete(key: str, **_kw: object) -> None:
+        state.pop(key, None)
+
+    storage.get_system_setting.side_effect = _get
+    storage.upsert_system_setting.side_effect = _upsert
+    storage.delete_system_setting.side_effect = _delete
+
+
 @pytest.fixture
 def mocks():
-    """Broker, collector, and storage mocks for scheduler tests."""
-    broker = MagicMock()
-    broker._redis = MagicMock()
+    """Collector and storage mocks for scheduler tests."""
     collector = MagicMock()
     storage = MagicMock()
-    return broker, collector, storage
+    # Default: no existing lock
+    _wire_lock_storage(storage, initial=None)
+    return collector, storage
 
 
 def _make_task(**overrides):
@@ -58,70 +82,93 @@ class TestSchedulerTick:
     """Tests for _tick() lock acquisition and dispatch logic."""
 
     def test_tick_acquires_lock(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
         storage.list_due_tasks.return_value = []
 
-        scheduler = TaskScheduler(broker, collector, storage)
+        scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
-        broker._redis.set.assert_called_once()
+        storage.get_system_setting.assert_called()
+        storage.upsert_system_setting.assert_called()
         storage.list_due_tasks.assert_called_once()
-        # Lock released via Lua eval (conditional delete)
-        broker._redis.eval.assert_called_once()
 
     def test_tick_skips_when_locked(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = None  # lock held by another console
+        collector, storage = mocks
+        # Another instance holds the lock (recent timestamp)
+        from datetime import UTC, datetime
 
-        scheduler = TaskScheduler(broker, collector, storage)
+        now_str = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        _wire_lock_storage(
+            storage,
+            initial={"value": json.dumps({"owner": "other-instance", "acquired": now_str})},
+        )
+
+        scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
         storage.list_due_tasks.assert_not_called()
 
+    def test_tick_takes_expired_lock(self, mocks):
+        """An expired lock from another instance should be taken over."""
+        collector, storage = mocks
+        _wire_lock_storage(
+            storage,
+            initial={
+                "value": json.dumps({"owner": "other-instance", "acquired": "2020-01-01T00:00:00"})
+            },
+        )
+        storage.list_due_tasks.return_value = []
+
+        scheduler = TaskScheduler(collector, storage)
+        scheduler._tick()
+
+        storage.list_due_tasks.assert_called_once()
+
     def test_dispatch_auto_mode(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="auto")
         storage.list_due_tasks.return_value = [task]
         collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        broker.push_inbound.assert_called_once()
-        _, kwargs = broker.push_inbound.call_args
-        assert (
-            kwargs.get("node_id") == "node-001"
-            or broker.push_inbound.call_args[1].get("node_id") == "node-001"
-        )
+        mock_post.assert_called_once()
+        url = mock_post.call_args[0][0]
+        assert "http://node-001:8080/v1/api/workstreams/new" in url
         storage.record_task_run.assert_called_once()
         run_kwargs = storage.record_task_run.call_args[1]
         assert run_kwargs["node_id"] == "node-001"
         assert run_kwargs["status"] == "dispatched"
 
     def test_dispatch_pool_mode(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="pool")
         storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node("node-001")], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        broker.push_inbound.assert_called_once()
-        # Pool dispatch calls push_inbound without node_id kwarg
-        args, kwargs = broker.push_inbound.call_args
-        assert kwargs.get("node_id") is None or "node_id" not in kwargs
+        mock_post.assert_called_once()
         storage.record_task_run.assert_called_once()
-        run_kwargs = storage.record_task_run.call_args[1]
-        assert run_kwargs["node_id"] == "pool"
 
     def test_dispatch_all_mode(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="all")
         storage.list_due_tasks.return_value = [task]
@@ -129,37 +176,53 @@ class TestSchedulerTick:
             [_make_node("node-001"), _make_node("node-002")],
             2,
         )
+        collector.get_node_detail.side_effect = lambda nid: {
+            "server_url": f"http://{nid}:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        assert broker.push_inbound.call_count == 2
+        assert mock_post.call_count == 2
         assert storage.record_task_run.call_count == 2
 
     def test_dispatch_specific_node(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="node-001")
         storage.list_due_tasks.return_value = [task]
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        broker.push_inbound.assert_called_once()
-        _, kwargs = broker.push_inbound.call_args
-        assert kwargs["node_id"] == "node-001"
+        mock_post.assert_called_once()
+        url = mock_post.call_args[0][0]
+        assert "node-001" in url
 
     def test_at_task_disables_after_dispatch(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(schedule_type="at", cron_expr="", at_time="2099-01-01T00:00:00")
         storage.list_due_tasks.return_value = [task]
         collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
         # At-task should be disabled after dispatch
         update_calls = storage.update_scheduled_task.call_args_list
@@ -170,15 +233,20 @@ class TestSchedulerTick:
         assert kwargs["next_run"] == ""
 
     def test_cron_task_updates_next_run(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(schedule_type="cron", cron_expr="0 9 * * *")
         storage.list_due_tasks.return_value = [task]
         collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
         update_calls = storage.update_scheduled_task.call_args_list
         assert len(update_calls) == 1
@@ -187,8 +255,7 @@ class TestSchedulerTick:
         assert "enabled" not in kwargs  # cron tasks stay enabled
 
     def test_no_reachable_nodes_records_failure(self, mocks):
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="auto")
         storage.list_due_tasks.return_value = [task]
@@ -198,10 +265,9 @@ class TestSchedulerTick:
             1,
         )
 
-        scheduler = TaskScheduler(broker, collector, storage)
+        scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
-        broker.push_inbound.assert_not_called()
         storage.record_task_run.assert_called_once()
         run_kwargs = storage.record_task_run.call_args[1]
         assert run_kwargs["status"] == "failed"
@@ -209,14 +275,13 @@ class TestSchedulerTick:
 
     def test_failure_does_not_advance_schedule(self, mocks):
         """When dispatch fails, last_run/next_run should not be updated."""
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="auto")
         storage.list_due_tasks.return_value = [task]
         collector.get_nodes.return_value = ([], 0)  # no nodes at all
 
-        scheduler = TaskScheduler(broker, collector, storage)
+        scheduler = TaskScheduler(collector, storage)
         scheduler._tick()
 
         # update_scheduled_task should NOT be called (no last_run/next_run advance)
@@ -224,49 +289,84 @@ class TestSchedulerTick:
 
     def test_fan_out_capped(self, mocks):
         """Fan-out 'all' mode should respect max_fan_out limit."""
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="all")
         storage.list_due_tasks.return_value = [task]
         # 10 reachable nodes but max_fan_out=3
         nodes = [_make_node(f"node-{i:03d}") for i in range(10)]
         collector.get_nodes.return_value = (nodes, 10)
+        collector.get_node_detail.side_effect = lambda nid: {
+            "server_url": f"http://{nid}:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage, max_fan_out=3)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage, max_fan_out=3)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        assert broker.push_inbound.call_count == 3
+        assert mock_post.call_count == 3
         assert storage.record_task_run.call_count == 3
 
     def test_specific_node_target(self, mocks):
         """Non-enum target_mode is treated as a specific node_id."""
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
+        collector, storage = mocks
 
         task = _make_task(target_mode="node-custom-123")
         storage.list_due_tasks.return_value = [task]
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-custom-123:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        broker.push_inbound.assert_called_once()
-        call_kwargs = broker.push_inbound.call_args
-        assert call_kwargs[1]["node_id"] == "node-custom-123"
+        mock_post.assert_called_once()
+        url = mock_post.call_args[0][0]
+        assert "node-custom-123" in url
 
-    def test_user_id_in_dispatched_message(self, mocks):
-        """Dispatched message should include created_by as user_id."""
-        import json
+    def test_user_id_in_dispatched_body(self, mocks):
+        """Dispatched HTTP body should include created_by as user_id."""
+        collector, storage = mocks
 
-        broker, collector, storage = mocks
-        broker._redis.set.return_value = True
-
-        task = _make_task(target_mode="pool", created_by="u_scheduler_admin")
+        task = _make_task(target_mode="auto", created_by="u_scheduler_admin")
         storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
 
-        scheduler = TaskScheduler(broker, collector, storage)
-        scheduler._tick()
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.return_value = MagicMock(status_code=200)
+            mock_post.return_value.raise_for_status = MagicMock()
+            scheduler._tick()
 
-        msg_json = broker.push_inbound.call_args[0][0]
-        msg_data = json.loads(msg_json)
-        assert msg_data["user_id"] == "u_scheduler_admin"
+        body = mock_post.call_args[1]["json"]
+        assert body["user_id"] == "u_scheduler_admin"
+
+    def test_http_failure_records_failure(self, mocks):
+        """HTTP errors during dispatch should record a failure."""
+        import httpx
+
+        collector, storage = mocks
+
+        task = _make_task(target_mode="auto")
+        storage.list_due_tasks.return_value = [task]
+        collector.get_nodes.return_value = ([_make_node()], 1)
+        collector.get_node_detail.return_value = {
+            "server_url": "http://node-001:8080",
+        }
+
+        scheduler = TaskScheduler(collector, storage)
+        with patch.object(scheduler._http_client, "post") as mock_post:
+            mock_post.side_effect = httpx.ConnectError("connection refused")
+            scheduler._tick()
+
+        storage.record_task_run.assert_called_once()
+        run_kwargs = storage.record_task_run.call_args[1]
+        assert run_kwargs["status"] == "failed"

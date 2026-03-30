@@ -1,8 +1,8 @@
 """Unified channel gateway entry point.
 
 Launches one or more channel adapters (Discord, Slack, etc.) connected to
-the turnstone cluster via Redis MQ.  An HTTP server runs alongside for
-inbound notification delivery from the server.
+the turnstone server via HTTP.  An HTTP server runs alongside for inbound
+notification delivery from the server.
 
 Run as: ``turnstone-channel --discord-token $TURNSTONE_DISCORD_TOKEN``
 """
@@ -15,17 +15,19 @@ import sys
 
 
 def main() -> None:
-    """Parse arguments, initialize storage and broker, and run adapters."""
+    """Parse arguments, initialize storage, and run adapters."""
     import argparse
 
     parser = argparse.ArgumentParser(
         description="turnstone channel gateway — bridges messaging platforms to the turnstone cluster"
     )
 
-    # -- Redis ---------------------------------------------------------------
-    from turnstone.mq.broker import add_redis_args
-
-    add_redis_args(parser)
+    # -- Server connection ---------------------------------------------------
+    parser.add_argument(
+        "--server-url",
+        default=os.environ.get("TURNSTONE_SERVER_URL", "http://localhost:8080"),
+        help="Turnstone server URL (default: $TURNSTONE_SERVER_URL or http://localhost:8080)",
+    )
 
     # -- Discord -------------------------------------------------------------
     parser.add_argument(
@@ -115,10 +117,7 @@ def main() -> None:
     auth_token = args.auth_token
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
 
-    # -- Broker --------------------------------------------------------------
-    from turnstone.mq.broker import async_broker_from_args
-
-    broker = async_broker_from_args(args)
+    server_url: str = args.server_url
 
     # -- Adapter selection ---------------------------------------------------
     adapters_configured = False
@@ -150,10 +149,7 @@ def main() -> None:
             ]
 
         config = DiscordConfig(
-            redis_host=args.redis_host,
-            redis_port=args.redis_port,
-            redis_db=args.redis_db,
-            redis_password=args.redis_password,
+            server_url=server_url,
             model=args.model,
             auto_approve=args.auto_approve,
             bot_token=args.discord_token,
@@ -162,7 +158,7 @@ def main() -> None:
         )
 
         storage = get_storage()
-        bot = TurnstoneBot(config, broker, storage)
+        bot = TurnstoneBot(config, server_url, storage, api_token=auth_token)
         adapters = {"discord": bot}
 
         # Create HTTP app for notification delivery
@@ -178,6 +174,7 @@ def main() -> None:
             adapter="discord",
             guild_id=config.guild_id,
             http_port=args.http_port,
+            server_url=server_url,
         )
 
         async def _run_all() -> None:

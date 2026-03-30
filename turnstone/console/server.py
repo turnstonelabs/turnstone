@@ -4,7 +4,7 @@ Serves the cluster-level dashboard UI and provides REST/SSE APIs
 backed by the ClusterCollector.  Uses Starlette/ASGI with uvicorn.
 
 Also provides:
-- Workstream creation via MQ dispatch to target nodes
+- Workstream creation via HTTP dispatch to target server nodes
 - Reverse proxy for server UIs so users only need console port access
 """
 
@@ -43,8 +43,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from starlette.requests import Request
-
-    from turnstone.mq.broker import RedisBroker
 
 log = logging.getLogger("turnstone.console.server")
 
@@ -390,12 +388,12 @@ async def list_available_models(request: Request) -> JSONResponse:
 
 
 async def create_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/cluster/workstreams/new — create a workstream via MQ.
+    """POST /v1/api/cluster/workstreams/new — create a workstream via HTTP.
 
     Three targeting modes:
-    - ``node_id`` set to a specific node ID → directed to that node's queue
+    - ``node_id`` set to a specific node ID → POST to that node
     - ``node_id`` omitted or ``"auto"`` → console picks the node with most headroom
-    - ``node_id`` set to ``"pool"`` → pushed to the shared queue for any bridge
+    - ``node_id`` set to ``"pool"`` → console picks any available node
     """
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -403,7 +401,6 @@ async def create_workstream(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    broker: RedisBroker = request.app.state.broker
     collector: ClusterCollector = request.app.state.collector
 
     raw_node_id = body.get("node_id", "")
@@ -445,30 +442,14 @@ async def create_workstream(request: Request) -> JSONResponse:
     skill = raw_skill[:256]
     resume_ws = raw_resume_ws[:64]
 
-    from turnstone.mq.protocol import CreateWorkstreamMessage
-
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     uid: str = getattr(auth, "user_id", "") or ""
 
-    # General pool — push to shared queue, any bridge picks it up
+    # Pool — pick any available node
     if node_id == "pool":
-        msg = CreateWorkstreamMessage(
-            name=name,
-            model=model,
-            initial_message=initial_message,
-            skill=skill,
-            resume_ws=resume_ws,
-            user_id=uid,
-        )
-        broker.push_inbound(msg.to_json())
-        log.debug("Pool dispatch: correlation_id=%s name=%r", msg.correlation_id, name)
-        return JSONResponse(
-            {
-                "status": "ok",
-                "correlation_id": msg.correlation_id,
-                "target_node": "pool",
-            }
-        )
+        node_id = _pick_best_node(collector)
+        if not node_id:
+            return JSONResponse({"error": "No reachable nodes available"}, status_code=503)
 
     # Auto-select node by most available capacity
     if not node_id or node_id == "auto":
@@ -476,26 +457,41 @@ async def create_workstream(request: Request) -> JSONResponse:
         if not node_id:
             return JSONResponse({"error": "No reachable nodes available"}, status_code=503)
 
-    # Validate node exists
+    # Validate node exists and get its URL
     detail = collector.get_node_detail(node_id)
     if not detail:
         return JSONResponse({"error": "Node not found"}, status_code=404)
 
-    msg = CreateWorkstreamMessage(
-        name=name,
-        model=model,
-        target_node=node_id,
-        initial_message=initial_message,
-        skill=skill,
-        resume_ws=resume_ws,
-        user_id=uid,
-    )
-    broker.push_inbound(msg.to_json(), node_id=node_id)
+    server_url = detail.get("server_url", "")
+    if not server_url:
+        return JSONResponse({"error": "Node has no URL"}, status_code=502)
+
+    ws_body = {
+        "name": name,
+        "model": model,
+        "initial_message": initial_message,
+        "skill": skill,
+        "resume_ws": resume_ws,
+        "user_id": uid,
+    }
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    try:
+        resp = await client.post(
+            f"{server_url.rstrip('/')}/v1/api/workstreams/new",
+            json=ws_body,
+            headers=headers,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
+        return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
 
     return JSONResponse(
         {
             "status": "ok",
-            "correlation_id": msg.correlation_id,
+            "correlation_id": resp.json().get("ws_id", ""),
             "target_node": node_id,
         }
     )
@@ -878,7 +874,6 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
-    app.state.broker.close()
 
 
 # ---------------------------------------------------------------------------
@@ -5337,7 +5332,6 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
 def create_app(
     *,
     collector: ClusterCollector,
-    broker: RedisBroker,
     auth_config: Any,
     jwt_secret: str = "",
     auth_storage: Any = None,
@@ -5638,7 +5632,6 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.collector = collector
-    app.state.broker = broker
     app.state.auth_config = auth_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
@@ -5670,9 +5663,10 @@ def create_app(
         from turnstone.console.scheduler import TaskScheduler
 
         scheduler = TaskScheduler(
-            broker=broker,
             collector=collector,
             storage=auth_storage,
+            api_token=proxy_auth_token,
+            token_manager=proxy_token_mgr,
         )
         app.state.scheduler = scheduler
     else:
@@ -5703,9 +5697,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              turnstone-console                              # default Redis on localhost
+              turnstone-console                              # default settings
               turnstone-console --port 9090                  # custom port
-              turnstone-console --redis-host redis.internal   # remote Redis
         """),
     )
     parser.add_argument(
@@ -5719,9 +5712,6 @@ def main() -> None:
         default=8090,
         help="Port to listen on (default: 8090)",
     )
-    from turnstone.mq.broker import add_redis_args
-
-    add_redis_args(parser)
     parser.add_argument(
         "--poll-interval",
         type=float,
@@ -5740,16 +5730,44 @@ def main() -> None:
     from turnstone.core.config import add_config_arg, apply_config
 
     add_config_arg(parser)
-    apply_config(parser, ["console", "redis", "auth"])
+    apply_config(parser, ["console", "auth"])
     args = parser.parse_args()
 
     from turnstone.core.log import configure_logging_from_args
 
     configure_logging_from_args(args, "console")
 
-    from turnstone.mq.broker import broker_from_args
+    from turnstone.core.auth import load_auth_config, load_jwt_secret
 
-    broker = broker_from_args(args)
+    auth_config = load_auth_config()
+    jwt_secret = load_jwt_secret() if auth_config.enabled else ""
+
+    # Initialize storage early — the collector needs it for service discovery.
+    auth_storage = None
+    try:
+        from turnstone.core.storage import init_storage
+
+        db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
+        db_url = os.environ.get("TURNSTONE_DB_URL", "")
+        db_path = os.environ.get("TURNSTONE_DB_PATH", "")
+        auth_storage = init_storage(
+            db_backend,
+            path=db_path,
+            url=db_url,
+            sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
+            sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
+            sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
+            sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
+        )
+    except Exception:
+        log.info("Console storage not available — admin API disabled, JWT-only auth")
+
+    if auth_storage is None:
+        log.error(
+            "Storage backend is required for the console (service discovery). "
+            "Set TURNSTONE_DB_PATH or TURNSTONE_DB_URL."
+        )
+        raise SystemExit(1)
 
     # If no explicit auth token is provided, use a ServiceTokenManager
     # so collector JWTs auto-rotate.  A shared JWT secret is required for
@@ -5778,7 +5796,7 @@ def main() -> None:
         log.info("console.collector_token_manager_created")
 
     collector = ClusterCollector(
-        broker=broker,
+        storage=auth_storage,
         poll_interval=args.poll_interval,
         auth_token=collector_token if collector_token_mgr is None else "",
         token_manager=collector_token_mgr,
@@ -5786,31 +5804,6 @@ def main() -> None:
     collector.start()
 
     _load_static()
-
-    from turnstone.core.auth import load_auth_config, load_jwt_secret
-
-    auth_config = load_auth_config()
-    jwt_secret = load_jwt_secret() if auth_config.enabled else ""
-
-    # Initialize storage for user/token management (optional — requires DB config)
-    auth_storage = None
-    try:
-        from turnstone.core.storage import init_storage
-
-        db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
-        db_url = os.environ.get("TURNSTONE_DB_URL", "")
-        db_path = os.environ.get("TURNSTONE_DB_PATH", "")
-        auth_storage = init_storage(
-            db_backend,
-            path=db_path,
-            url=db_url,
-            sslmode=os.environ.get("TURNSTONE_DB_SSLMODE", ""),
-            sslrootcert=os.environ.get("TURNSTONE_DB_SSLROOTCERT", ""),
-            sslcert=os.environ.get("TURNSTONE_DB_SSLCERT", ""),
-            sslkey=os.environ.get("TURNSTONE_DB_SSLKEY", ""),
-        )
-    except Exception:
-        log.info("Console storage not available — admin API disabled, JWT-only auth")
 
     # If no explicit auth token is provided, use a ServiceTokenManager
     # so proxy JWTs auto-rotate.
@@ -5897,7 +5890,6 @@ def main() -> None:
 
     app = create_app(
         collector=collector,
-        broker=broker,
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,

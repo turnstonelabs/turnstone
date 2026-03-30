@@ -132,6 +132,7 @@ class WorkstreamManager:
         skill: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
+        ws_id: str = "",
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
@@ -145,6 +146,8 @@ class WorkstreamManager:
             skill: Optional skill name.
             skill_id: Template ID of the skill (for lineage tracking).
             skill_version: Version of the skill at creation time.
+            ws_id: Optional workstream ID.  If non-empty, used as-is instead of
+                generating a new UUID.
         """
         # Fast-fail capacity check (avoids expensive ChatSession creation when full).
         first_evicted: Workstream | None = None
@@ -164,7 +167,7 @@ class WorkstreamManager:
 
         # Create workstream and ChatSession outside the lock (construction is
         # expensive — involves LLM client setup and DB writes).
-        ws = Workstream(name=name)
+        ws = Workstream(id=ws_id, name=name) if ws_id else Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
         ws.session = self._session_factory(ws.ui, model, ws.id, skill=skill)

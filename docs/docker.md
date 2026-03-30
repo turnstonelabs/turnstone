@@ -1,6 +1,6 @@
 # Docker Deployment
 
-Docker Compose stack for running the full turnstone platform or the simulator.
+Docker Compose stack for running the full turnstone platform.
 
 ## Quick Start
 
@@ -10,9 +10,6 @@ cp .env.example .env
 
 # Full stack (needs an LLM API on the host)
 docker compose up
-
-# Simulator only (no LLM needed)
-docker compose --profile sim up redis console sim
 ```
 
 Console dashboard: http://localhost:8090
@@ -23,18 +20,14 @@ Console dashboard: http://localhost:8090
 
 | Service | Port | Profile | Description |
 |---------|------|---------|-------------|
-| `redis` | 6379 | default | Message broker, pub/sub, node registry |
 | `server` | 8080 | default | Web UI + chat workstreams + LLM |
-| `bridge` | — | default | Redis-to-HTTP bridge (multi-node routing) |
 | `console` | 8090 | default | Cluster dashboard |
 | `channel` | — | production | Channel gateway (Discord, Slack, etc.) |
 | `server-1`…`server-10` | — | cluster | 10-node server fleet (PostgreSQL required) |
-| `bridge-1`…`bridge-10` | — | cluster | Matching bridge fleet |
-| `sim` | — | sim | Multi-node cluster simulator |
 
 ## Profiles
 
-**Default** (no flag) — starts `redis`, `server`, `bridge`, `console`. Requires an OpenAI-compatible LLM API running on the host (default: `http://localhost:8000/v1`).
+**Default** (no flag) — starts `server` and `console`. Requires an OpenAI-compatible LLM API running on the host (default: `http://localhost:8000/v1`).
 
 ```bash
 docker compose up
@@ -46,20 +39,10 @@ docker compose up
 docker compose --profile production up
 ```
 
-**Cluster** — 10-node server/bridge fleet sharing PostgreSQL and Redis. Access all nodes via the console at `:8090`. Requires `POSTGRES_PASSWORD`:
+**Cluster** — 10-node server fleet sharing PostgreSQL. Access all nodes via the console at `:8090`. Requires `POSTGRES_PASSWORD`:
 
 ```bash
 docker compose --profile cluster up
-```
-
-**Sim** — adds the simulator. Can run alongside the full stack or standalone with just Redis and the console:
-
-```bash
-# Sim + console (no LLM needed)
-docker compose --profile sim up redis console sim
-
-# Everything including sim
-docker compose --profile sim up
 ```
 
 ## Configuration
@@ -73,13 +56,6 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 | `LLM_BASE_URL` | `http://host.docker.internal:8000/v1` | OpenAI-compatible API URL |
 | `OPENAI_API_KEY` | `dummy` | API key (`dummy` for local servers) |
 | `TAVILY_API_KEY` | — | Web search API key (only needed for local/vLLM models; Anthropic and OpenAI search models use native search) |
-
-### Redis
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `REDIS_PASSWORD` | — | Redis auth password (empty = no auth) |
-| `REDIS_PORT` | `6379` | Host port mapping |
 
 ### Server
 
@@ -100,7 +76,7 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TURNSTONE_AUTH_ENABLED` | — | Set to `1` to require authentication |
-| `TURNSTONE_AUTH_TOKEN` | — | Config-file token for server/bridge/console (backward compat, works alongside JWT) |
+| `TURNSTONE_AUTH_TOKEN` | — | Config-file token for server/console (backward compat, works alongside JWT) |
 | `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required when using user identity / JWT auth) |
 
 ### Database
@@ -130,29 +106,17 @@ The database stores workstream history, user accounts, and API tokens. When usin
 | `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord adapter) |
 | `TURNSTONE_DISCORD_GUILD` | `0` | Restrict to a single Discord guild (0 = all guilds) |
 
-The channel service runs in the `production` profile. When `TURNSTONE_DISCORD_TOKEN` is set, the Discord adapter connects to the Discord Gateway and routes messages through Redis MQ to the bridge and server. See [Channel Integrations](channels.md) for full setup instructions including Discord application creation and user account linking.
-
-### Simulator
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SIM_NODES` | `100` | Number of simulated nodes |
-| `SIM_SCENARIO` | `steady` | Scenario: `steady`, `burst`, `node_failure`, `directed`, `lifecycle` |
-| `SIM_DURATION` | `60` | Duration in seconds |
-| `SIM_MPS` | `5.0` | Messages per second (steady scenario) |
-| `SIM_LOG_LEVEL` | `INFO` | Log verbosity |
-| `SIM_SEED` | — | Random seed for reproducibility |
-| `SIM_METRICS_FILE` | — | Write JSON report to file |
+The channel service runs in the `production` profile. When `TURNSTONE_DISCORD_TOKEN` is set, the Discord adapter connects to the Discord Gateway and routes messages to the server via HTTP. See [Channel Integrations](channels.md) for full setup instructions including Discord application creation and user account linking.
 
 ## Scaling
 
-For multi-node testing, use the `cluster` profile which provides 10 dedicated server+bridge pairs with unique node IDs (`node-1` through `node-10`), resource limits, and shared PostgreSQL:
+For multi-node testing, use the `cluster` profile which provides 10 server instances with unique node IDs (`node-1` through `node-10`), resource limits, and shared PostgreSQL:
 
 ```bash
 POSTGRES_PASSWORD=secret docker compose --profile cluster up
 ```
 
-The default `server` and `bridge` also run alongside the cluster nodes (11 total). All nodes are accessible via the console dashboard at `:8090`.
+The default `server` also runs alongside the cluster nodes (11 total). All nodes are accessible via the console dashboard at `:8090`.
 
 For production clusters beyond ~50 nodes, add PgBouncer between turnstone services and PostgreSQL. See [PgBouncer Connection Pooling](pgbouncer.md) for Docker Compose and Helm configuration.
 
@@ -160,7 +124,6 @@ For production clusters beyond ~50 nodes, add PgBouncer between turnstone servic
 
 | Volume | Mount | Purpose |
 |--------|-------|---------|
-| `redis-data` | `/data` | Redis persistence |
 | `turnstone-data` | `/data` | SQLite database (`.turnstone.db`) |
 
 ## Building
@@ -175,7 +138,7 @@ docker compose build
 docker compose build --no-cache
 ```
 
-All entry points are installed in a single image: `turnstone-server`, `turnstone-bridge`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`, `turnstone-sim`, `turnstone-eval`.
+All entry points are installed in a single image: `turnstone-server`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`, `turnstone-eval`.
 
 ## Cleanup
 

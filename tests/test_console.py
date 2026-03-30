@@ -8,38 +8,20 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
-from turnstone.mq.protocol import (
-    ClusterStateEvent,
-)
 
 # ---------------------------------------------------------------------------
-# Mock broker for collector tests
+# Mock storage for collector tests
 # ---------------------------------------------------------------------------
 
 
-class MockBroker:
-    """Minimal broker mock that records calls and stores nodes."""
+class MockStorage:
+    """Minimal storage mock that implements list_services for collector tests."""
 
     def __init__(self):
-        self.nodes: list[dict] = []
-        self._subscriptions: dict[str, list] = {}
+        self.services: list[dict[str, str]] = []
 
-    def list_nodes(self) -> list[dict]:
-        return list(self.nodes)
-
-    def subscribe_outbound(self, channel, callback):
-        self._subscriptions.setdefault(channel, []).append(callback)
-
-    def publish_outbound(self, channel, event):
-        for cb in self._subscriptions.get(channel, []):
-            cb(event)
-
-    def subscribe_cluster(self, callback):
-        channel = "turnstone:events:cluster"
-        self.subscribe_outbound(channel, callback)
-
-    def close(self):
-        pass
+    def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
+        return [s for s in self.services if True]  # all services match
 
 
 # ---------------------------------------------------------------------------
@@ -47,11 +29,11 @@ class MockBroker:
 # ---------------------------------------------------------------------------
 
 
-def _make_collector(broker=None, poll_interval=0, discovery_interval=999):
+def _make_collector(storage=None, poll_interval=0, discovery_interval=999):
     """Create a collector with zero poll interval (no jitter delay in tests)."""
-    b = broker or MockBroker()
+    s = storage or MockStorage()
     return ClusterCollector(
-        broker=b,
+        storage=s,
         poll_interval=poll_interval,
         discovery_interval=discovery_interval,
     )
@@ -79,52 +61,59 @@ def _dashboard_response(workstreams=None, aggregate=None):
 
 
 class TestCollectorDiscovery:
-    """Node discovery from heartbeat keys."""
+    """Node discovery from service registry."""
 
     def test_discover_new_nodes(self):
-        broker = MockBroker()
-        broker.nodes = [
-            {"node_id": "node-a", "server_url": "http://a:8080"},
-            {"node_id": "node-b", "server_url": "http://b:8080"},
+        storage = MockStorage()
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"},
+            {"service_id": "node-b", "url": "http://b:8080", "metadata": "{}"},
         ]
-        c = _make_collector(broker)
+        c = _make_collector(storage)
         c._discover_nodes()
 
         overview = c.get_overview()
         assert overview["nodes"] == 2
 
     def test_discover_removes_lost_nodes(self):
-        broker = MockBroker()
-        broker.nodes = [{"node_id": "node-a", "server_url": "http://a:8080"}]
-        c = _make_collector(broker)
+        storage = MockStorage()
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"},
+        ]
+        c = _make_collector(storage)
         c._discover_nodes()
         assert c.get_overview()["nodes"] == 1
 
         # Node disappears
-        broker.nodes = []
+        storage.services = []
         c._discover_nodes()
         assert c.get_overview()["nodes"] == 0
 
     def test_discover_updates_server_url(self):
-        broker = MockBroker()
-        broker.nodes = [{"node_id": "node-a", "server_url": "http://a:8080"}]
-        c = _make_collector(broker)
+        storage = MockStorage()
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"},
+        ]
+        c = _make_collector(storage)
         c._discover_nodes()
 
-        broker.nodes = [{"node_id": "node-a", "server_url": "http://a:9090"}]
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:9090", "metadata": "{}"},
+        ]
         c._discover_nodes()
 
         detail = c.get_node_detail("node-a")
         assert detail["server_url"] == "http://a:9090"
 
     def test_discover_emits_node_joined_event(self):
-        broker = MockBroker()
-        c = _make_collector(broker)
-        _events = []
+        storage = MockStorage()
+        c = _make_collector(storage)
         q = queue.Queue()
         c.register_listener(q)
 
-        broker.nodes = [{"node_id": "node-a", "server_url": "http://a:8080"}]
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"},
+        ]
         c._discover_nodes()
 
         event = q.get_nowait()
@@ -132,20 +121,40 @@ class TestCollectorDiscovery:
         assert event["node_id"] == "node-a"
 
     def test_discover_emits_node_lost_event(self):
-        broker = MockBroker()
-        broker.nodes = [{"node_id": "node-a", "server_url": "http://a:8080"}]
-        c = _make_collector(broker)
+        storage = MockStorage()
+        storage.services = [
+            {"service_id": "node-a", "url": "http://a:8080", "metadata": "{}"},
+        ]
+        c = _make_collector(storage)
         c._discover_nodes()
 
         q = queue.Queue()
         c.register_listener(q)
 
-        broker.nodes = []
+        storage.services = []
         c._discover_nodes()
 
         event = q.get_nowait()
         assert event["type"] == "node_lost"
         assert event["node_id"] == "node-a"
+
+    def test_discover_parses_metadata(self):
+        storage = MockStorage()
+        storage.services = [
+            {
+                "service_id": "node-a",
+                "url": "http://a:8080",
+                "metadata": '{"max_ws": 20, "started": 1234567890.0}',
+            },
+        ]
+        c = _make_collector(storage)
+        c._discover_nodes()
+
+        detail = c.get_node_detail("node-a")
+        assert detail is not None
+        # Verify metadata was parsed into the NodeSnapshot
+        assert c._nodes["node-a"].max_ws == 20
+        assert c._nodes["node-a"].started == 1234567890.0
 
 
 class TestCollectorPolling:
@@ -316,92 +325,8 @@ class TestCollectorPolling:
         assert "ws1" in c._nodes["node-a"].workstreams
 
 
-class TestCollectorEvents:
-    """Real-time event handling from cluster channel."""
-
-    def test_cluster_state_event_updates_workstream(self):
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(
-            node_id="node-a",
-            server_url="http://a:8080",
-            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle", "node": "node-a"}},
-        )
-
-        event = ClusterStateEvent(
-            ws_id="ws1",
-            state="running",
-            node_id="node-a",
-            tokens=5000,
-            context_ratio=0.25,
-            activity="bash: echo hi",
-            activity_state="tool",
-        )
-        c._on_cluster_event(event.to_json())
-
-        ws = c._nodes["node-a"].workstreams["ws1"]
-        assert ws["state"] == "running"
-        assert ws["tokens"] == 5000
-        assert ws["activity"] == "bash: echo hi"
-
-    def test_ws_created_event_adds_workstream(self):
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
-
-        event_json = json.dumps(
-            {
-                "type": "ws_created",
-                "ws_id": "ws-new",
-                "name": "new-task",
-                "node_id": "node-a",
-                "correlation_id": "abc",
-            }
-        )
-        c._on_cluster_event(event_json)
-
-        assert "ws-new" in c._nodes["node-a"].workstreams
-        assert c._nodes["node-a"].workstreams["ws-new"]["name"] == "new-task"
-        assert c._nodes["node-a"].workstreams["ws-new"]["server_url"] == "http://a:8080"
-
-    def test_ws_closed_event_removes_workstream(self):
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(
-            node_id="node-a",
-            workstreams={"ws1": {"id": "ws1", "state": "idle"}},
-        )
-
-        event_json = json.dumps({"type": "ws_closed", "ws_id": "ws1"})
-        c._on_cluster_event(event_json)
-
-        assert "ws1" not in c._nodes["node-a"].workstreams
-
-    def test_ws_rename_event_updates_name(self):
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(
-            node_id="node-a",
-            workstreams={"ws1": {"id": "ws1", "name": "old-name", "state": "idle"}},
-        )
-
-        event_json = json.dumps({"type": "ws_rename", "ws_id": "ws1", "name": "new-name"})
-        c._on_cluster_event(event_json)
-
-        assert c._nodes["node-a"].workstreams["ws1"]["name"] == "new-name"
-
-    def test_event_fans_out_to_listeners(self):
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(
-            node_id="node-a",
-            workstreams={"ws1": {"id": "ws1", "state": "idle", "node": "node-a"}},
-        )
-
-        q = queue.Queue()
-        c.register_listener(q)
-
-        event = ClusterStateEvent(ws_id="ws1", state="running", node_id="node-a")
-        c._on_cluster_event(event.to_json())
-
-        fan_event = q.get_nowait()
-        assert fan_event["type"] == "cluster_state"
-        assert fan_event["ws_id"] == "ws1"
+class TestCollectorFanout:
+    """SSE fan-out to registered listeners."""
 
     def test_unregister_listener_stops_fanout(self):
         c = _make_collector()
@@ -413,12 +338,6 @@ class TestCollectorEvents:
 
         c._fanout({"type": "test"})
         assert q.empty()
-
-    def test_invalid_json_event_ignored(self):
-        c = _make_collector()
-        # Should not raise
-        c._on_cluster_event("not valid json {{{")
-        c._on_cluster_event("")
 
 
 class TestCollectorQueries:
@@ -599,50 +518,6 @@ class TestCollectorQueries:
 
 
 # ---------------------------------------------------------------------------
-# ClusterStateEvent protocol tests
-# ---------------------------------------------------------------------------
-
-
-class TestClusterStateEventProtocol:
-    """Ensure ClusterStateEvent round-trips through JSON correctly."""
-
-    def test_round_trip(self):
-        event = ClusterStateEvent(
-            ws_id="ws1",
-            state="running",
-            node_id="node-a",
-            tokens=5000,
-            context_ratio=0.25,
-            activity="bash: ls",
-            activity_state="tool",
-        )
-        raw = event.to_json()
-        data = json.loads(raw)
-        assert data["type"] == "cluster_state"
-        assert data["ws_id"] == "ws1"
-        assert data["node_id"] == "node-a"
-        assert data["tokens"] == 5000
-        assert data["context_ratio"] == 0.25
-
-    def test_from_json(self):
-        from turnstone.mq.protocol import OutboundEvent
-
-        raw = json.dumps(
-            {
-                "type": "cluster_state",
-                "ws_id": "ws1",
-                "state": "running",
-                "node_id": "node-a",
-                "tokens": 5000,
-            }
-        )
-        event = OutboundEvent.from_json(raw)
-        assert isinstance(event, ClusterStateEvent)
-        assert event.node_id == "node-a"
-        assert event.tokens == 5000
-
-
-# ---------------------------------------------------------------------------
 # Console HTTP server tests
 # ---------------------------------------------------------------------------
 
@@ -726,7 +601,6 @@ class TestConsoleHTTPEndpoints:
 
         app = create_app(
             collector=mock_collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)
@@ -927,7 +801,7 @@ class TestCollectorVersionInfo:
 
 
 class TestConsoleWorkstreamCreation:
-    """Tests for POST /v1/api/cluster/workstreams/new."""
+    """Tests for POST /v1/api/cluster/workstreams/new (HTTP dispatch)."""
 
     @pytest.fixture()
     def mock_collector(self):
@@ -958,25 +832,40 @@ class TestConsoleWorkstreamCreation:
         return collector
 
     @pytest.fixture()
-    def client_and_broker(self, mock_collector):
+    def client_and_mock(self, mock_collector):
+        """Returns (TestClient, mock_proxy_post) where mock_proxy_post is the
+        patched proxy_client.post that captures outgoing HTTP calls."""
+        import httpx
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
         from turnstone.core.auth import AuthConfig
 
         _load_static()
-        mock_broker = MagicMock()
         app = create_app(
             collector=mock_collector,
-            broker=mock_broker,
             auth_config=AuthConfig(),
         )
+
+        # Set up a mock proxy_client (lifespan doesn't run in TestClient)
+        async def _mock_post(*args, **kwargs):
+            return httpx.Response(
+                200,
+                json={"ws_id": "ws_new_123", "name": "test"},
+                request=httpx.Request("POST", args[0] if args else "http://test"),
+            )
+
+        mock_post = MagicMock(side_effect=_mock_post)
+        mock_proxy = MagicMock(spec=httpx.AsyncClient)
+        mock_proxy.post = mock_post
+        app.state.proxy_client = mock_proxy
+
         client = TestClient(app, raise_server_exceptions=False)
-        yield client, mock_broker
+        yield client, mock_post
         client.close()
 
-    def test_create_with_explicit_node(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_with_explicit_node(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "name": "test-ws"},
@@ -986,47 +875,46 @@ class TestConsoleWorkstreamCreation:
         assert data["status"] == "ok"
         assert data["target_node"] == "node-a"
         assert "correlation_id" in data
-        broker.push_inbound.assert_called_once()
-        # Verify the pushed message
-        msg_json = broker.push_inbound.call_args[0][0]
-        msg = json.loads(msg_json)
-        assert msg["type"] == "create_workstream"
-        assert msg["target_node"] == "node-a"
-        assert msg["name"] == "test-ws"
+        mock_post.assert_called_once()
+        # Verify the HTTP call was to the right node
+        call_args = mock_post.call_args
+        assert "http://a:8080/v1/api/workstreams/new" in call_args[0]
+        body = call_args[1]["json"]
+        assert body["name"] == "test-ws"
 
-    def test_create_with_model(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_with_model(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "model": "gpt-5"},
         )
         assert resp.status_code == 200
-        msg_json = broker.push_inbound.call_args[0][0]
-        msg = json.loads(msg_json)
-        assert msg["model"] == "gpt-5"
+        body = mock_post.call_args[1]["json"]
+        assert body["model"] == "gpt-5"
 
-    def test_create_with_initial_message_directed(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_with_initial_message_directed(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "initial_message": "Do the thing"},
         )
         assert resp.status_code == 200
-        msg = json.loads(broker.push_inbound.call_args[0][0])
-        assert msg["initial_message"] == "Do the thing"
+        body = mock_post.call_args[1]["json"]
+        assert body["initial_message"] == "Do the thing"
 
-    def test_create_with_initial_message_pool(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_with_initial_message_pool(self, client_and_mock, mock_collector):
+        """Pool mode picks the best node and dispatches via HTTP."""
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "pool", "initial_message": "Pool task"},
         )
         assert resp.status_code == 200
-        msg = json.loads(broker.push_inbound.call_args[0][0])
-        assert msg["initial_message"] == "Pool task"
+        body = mock_post.call_args[1]["json"]
+        assert body["initial_message"] == "Pool task"
 
-    def test_create_auto_selects_best_node(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_auto_selects_best_node(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"name": "auto-test"},
@@ -1036,15 +924,15 @@ class TestConsoleWorkstreamCreation:
         # node-b has more headroom (10-3=7 vs 10-8=2)
         assert data["target_node"] == "node-b"
 
-    def test_create_no_reachable_nodes(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_no_reachable_nodes(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         mock_collector.get_nodes.return_value = ([], 0)
         resp = client.post("/v1/api/cluster/workstreams/new", json={})
         assert resp.status_code == 503
         assert "No reachable nodes" in resp.json()["error"]
 
-    def test_create_unknown_node(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_unknown_node(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         mock_collector.get_node_detail.return_value = None
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
@@ -1052,8 +940,8 @@ class TestConsoleWorkstreamCreation:
         )
         assert resp.status_code == 404
 
-    def test_create_invalid_json(self, client_and_broker):
-        client, broker = client_and_broker
+    def test_create_invalid_json(self, client_and_mock):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             content=b"not json",
@@ -1061,19 +949,19 @@ class TestConsoleWorkstreamCreation:
         )
         assert resp.status_code == 400
 
-    def test_create_pushes_to_directed_queue(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_dispatches_to_correct_node_url(self, client_and_mock, mock_collector):
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a"},
         )
         assert resp.status_code == 200
-        # Verify push_inbound called with node_id kwarg
-        call_kwargs = broker.push_inbound.call_args
-        assert call_kwargs[1]["node_id"] == "node-a"
+        call_args = mock_post.call_args
+        assert "http://a:8080/v1/api/workstreams/new" in call_args[0]
 
-    def test_create_pool_pushes_to_shared_queue(self, client_and_broker, mock_collector):
-        client, broker = client_and_broker
+    def test_create_pool_picks_best_node(self, client_and_mock, mock_collector):
+        """Pool mode dispatches to the best available node."""
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "pool", "name": "pool-task"},
@@ -1081,60 +969,40 @@ class TestConsoleWorkstreamCreation:
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ok"
-        assert data["target_node"] == "pool"
-        broker.push_inbound.assert_called_once()
-        # Shared queue: no node_id kwarg (or empty)
-        call_args = broker.push_inbound.call_args
-        assert call_args[1].get("node_id", "") == ""
-        # Message should have no target_node
-        msg = json.loads(call_args[0][0])
-        assert msg["type"] == "create_workstream"
-        assert msg["target_node"] == ""
-        assert msg["name"] == "pool-task"
+        # Pool picks best node (node-b has most headroom)
+        assert data["target_node"] == "node-b"
 
-    def test_create_pool_skips_node_validation(self, client_and_broker, mock_collector):
-        """Pool mode doesn't need a valid node_id — it goes to the shared queue."""
-        client, broker = client_and_broker
-        mock_collector.get_node_detail.return_value = None  # would 404 for directed
+    def test_create_pool_no_nodes_returns_503(self, client_and_mock, mock_collector):
+        """Pool mode with no reachable nodes returns 503."""
+        client, mock_post = client_and_mock
+        mock_collector.get_nodes.return_value = ([], 0)
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "pool"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["target_node"] == "pool"
+        assert resp.status_code == 503
 
-    def test_create_with_resume_ws_directed(self, client_and_broker, mock_collector):
+    def test_create_with_resume_ws_directed(self, client_and_mock, mock_collector):
         """resume_ws is forwarded in directed dispatch."""
-        client, broker = client_and_broker
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"node_id": "node-a", "resume_ws": "old-ws-id-123"},
         )
         assert resp.status_code == 200
-        msg = json.loads(broker.push_inbound.call_args[0][0])
-        assert msg["resume_ws"] == "old-ws-id-123"
+        body = mock_post.call_args[1]["json"]
+        assert body["resume_ws"] == "old-ws-id-123"
 
-    def test_create_with_resume_ws_pool(self, client_and_broker, mock_collector):
-        """resume_ws is forwarded in pool dispatch."""
-        client, broker = client_and_broker
-        resp = client.post(
-            "/v1/api/cluster/workstreams/new",
-            json={"node_id": "pool", "resume_ws": "old-ws-id-456"},
-        )
-        assert resp.status_code == 200
-        msg = json.loads(broker.push_inbound.call_args[0][0])
-        assert msg["resume_ws"] == "old-ws-id-456"
-
-    def test_create_with_resume_ws_auto(self, client_and_broker, mock_collector):
+    def test_create_with_resume_ws_auto(self, client_and_mock, mock_collector):
         """resume_ws is forwarded in auto-select dispatch."""
-        client, broker = client_and_broker
+        client, mock_post = client_and_mock
         resp = client.post(
             "/v1/api/cluster/workstreams/new",
             json={"resume_ws": "old-ws-id-789"},
         )
         assert resp.status_code == 200
-        msg = json.loads(broker.push_inbound.call_args[0][0])
-        assert msg["resume_ws"] == "old-ws-id-789"
+        body = mock_post.call_args[1]["json"]
+        assert body["resume_ws"] == "old-ws-id-789"
 
 
 # ---------------------------------------------------------------------------
@@ -1174,7 +1042,6 @@ class TestConsoleProxy:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)
@@ -1346,7 +1213,6 @@ class TestConsoleVersionEndpoints:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)
@@ -1396,7 +1262,6 @@ class TestSharedStatic:
         }
         app = create_app(
             collector=collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)
@@ -1481,7 +1346,6 @@ class TestProxySharedStatic:
 
     def test_proxy_shim_injected_in_html(self):
         """Verify shim is injected as inline script in proxied HTML."""
-        import json
 
         from turnstone.console.server import _CONSOLE_BANNER_TEMPLATE, _JS_PROXY_SHIM
 
@@ -1516,7 +1380,6 @@ class TestProxySharedStatic:
         collector.get_node_detail.return_value = None
         app = create_app(
             collector=collector,
-            broker=MagicMock(),
             auth_config=AuthConfig(),
         )
         client = TestClient(app, raise_server_exceptions=False)

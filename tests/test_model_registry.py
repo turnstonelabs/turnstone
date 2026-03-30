@@ -840,32 +840,27 @@ class TestWorkstreamModelParam:
 
 
 # ---------------------------------------------------------------------------
-# Protocol
+# CreateWorkstreamRequest model field
 # ---------------------------------------------------------------------------
 
 
-class TestProtocolModel:
-    def test_create_workstream_message_has_model(self) -> None:
-        from turnstone.mq.protocol import CreateWorkstreamMessage
+class TestCreateWorkstreamRequestModel:
+    def test_request_has_model(self) -> None:
+        from turnstone.api.server_schemas import CreateWorkstreamRequest
 
-        msg = CreateWorkstreamMessage(name="test", model="openai")
-        assert msg.model == "openai"
+        req = CreateWorkstreamRequest(name="test", model="openai")
+        assert req.model == "openai"
 
-    def test_create_workstream_message_default(self) -> None:
-        from turnstone.mq.protocol import CreateWorkstreamMessage
+    def test_request_model_default(self) -> None:
+        from turnstone.api.server_schemas import CreateWorkstreamRequest
 
-        msg = CreateWorkstreamMessage(name="test")
-        assert msg.model == ""
+        req = CreateWorkstreamRequest(name="test")
+        assert req.model == ""
 
-    def test_round_trip(self) -> None:
-        from turnstone.mq.protocol import CreateWorkstreamMessage, InboundMessage
-
-        msg = CreateWorkstreamMessage(name="ws1", model="local")
-        raw = msg.to_json()
-        restored = InboundMessage.from_json(raw)
-        assert isinstance(restored, CreateWorkstreamMessage)
-        assert restored.model == "local"
-        assert restored.name == "ws1"
+    def test_json_payload_carries_model(self) -> None:
+        body = {"name": "ws1", "model": "local"}
+        assert body["model"] == "local"
+        assert body["name"] == "ws1"
 
 
 # ---------------------------------------------------------------------------

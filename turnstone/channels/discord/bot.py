@@ -1,29 +1,36 @@
 """Discord bot adapter — connects Discord threads to turnstone workstreams.
 
 :class:`TurnstoneBot` extends ``discord.ext.commands.Bot`` and manages the
-lifecycle of event subscriptions, streaming message edits, and interactive
+lifecycle of SSE event subscriptions, streaming message edits, and interactive
 approval / plan-review views.
+
+Events are consumed from the server's per-workstream SSE endpoint
+(``GET /v1/api/events?ws_id=X``) using httpx-sse, replacing the previous
+Redis MQ pub/sub transport.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+import httpx
+
 from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import ChannelRouter
 from turnstone.core.log import get_logger
-from turnstone.mq.protocol import (
-    ApprovalRequestEvent,
+from turnstone.sdk.events import (
+    ApproveRequestEvent,
     ContentEvent,
     ErrorEvent,
     IntentVerdictEvent,
-    OutboundEvent,
     PlanReviewEvent,
-    TurnCompleteEvent,
-    WorkstreamResumedEvent,
+    ServerEvent,
+    StreamEndEvent,
 )
 
 if TYPE_CHECKING:
@@ -32,9 +39,12 @@ if TYPE_CHECKING:
 
     from turnstone.channels.discord.config import DiscordConfig
     from turnstone.core.storage._protocol import StorageBackend
-    from turnstone.mq.async_broker import AsyncRedisBroker
 
 log = get_logger(__name__)
+
+# SSE reconnection parameters
+_SSE_RECONNECT_DELAY: float = 2.0
+_SSE_MAX_RECONNECT_DELAY: float = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -117,10 +127,12 @@ class TurnstoneBot:
     ----------
     config:
         Discord-specific configuration.
-    broker:
-        Async Redis broker for MQ communication.
+    server_url:
+        Base URL of the turnstone server API (e.g. ``http://localhost:8080/v1``).
     storage:
         Storage backend for persistent route / user lookups.
+    api_token:
+        Optional bearer token for authenticating with the server API.
     """
 
     channel_type: str = "discord"
@@ -129,39 +141,50 @@ class TurnstoneBot:
     def __init__(
         self,
         config: DiscordConfig,
-        broker: AsyncRedisBroker,
+        server_url: str,
         storage: StorageBackend,
+        *,
+        api_token: str = "",
     ) -> None:
         import discord
         from discord.ext import commands
 
         self.config = config
-        self.broker = broker
+        self._server_url = server_url.rstrip("/")
+        self._api_token = api_token
         self.storage = storage
         self.router = ChannelRouter(
-            broker,
+            server_url,
             storage,
             auto_approve=config.auto_approve,
             auto_approve_tools=list(config.auto_approve_tools),
             skill=config.skill,
+            api_token=api_token,
         )
 
         self._subscribed_ws: set[str] = set()
+        self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._streaming: dict[str, StreamingMessage] = {}
         # Track the Discord message containing the pending approval embed per
         # workstream so that IntentVerdictEvent can update it with LLM judge
         # results.
         self._pending_approval_msgs: dict[str, discord.Message] = {}
-        # Notification reply tracking: maps Discord message ID →
+        # Notification reply tracking: maps Discord message ID ->
         # (ws_id, target_discord_user_id) so that DM replies can be routed
         # back to the originating workstream.  The target user ID is checked
         # on reply to prevent cross-user message injection.
         self._notify_ws_map: dict[int, tuple[str, str]] = {}
-        # Temporary DM forwarding: maps ws_id → (DM channel, target_user_id)
+        # Temporary DM forwarding: maps ws_id -> (DM channel, target_user_id)
         # for forwarding the workstream's next response back to the
         # notification reply DM.  The target_user_id is carried so the
         # response message can be re-tracked for multi-turn DM conversations.
         self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
+
+        # Shared HTTP client for SSE connections (long-lived, no timeout).
+        headers: dict[str, str] = {}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+        self._http_client = httpx.AsyncClient(headers=headers, timeout=None)
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -188,9 +211,6 @@ class TurnstoneBot:
         """Called by discord.py after login but before connecting to the gateway."""
         from turnstone.channels.discord.cog import MessageCog
         from turnstone.channels.discord.views import ApprovalView, PlanReviewView
-
-        await self.broker.connect()
-        await self.router.start()
 
         msg_cog = MessageCog(self._bot)
         await self._bot.add_cog(msg_cog._cog)
@@ -223,7 +243,7 @@ class TurnstoneBot:
         """Re-subscribe to event channels for existing discord routes.
 
         Queries the storage backend for all channel routes of type ``discord``
-        and subscribes to each workstream's event channel.
+        and opens SSE connections for each workstream.
         """
         routes = await asyncio.to_thread(self.storage.list_channel_routes_by_type, "discord")
         for route in routes:
@@ -247,23 +267,25 @@ class TurnstoneBot:
         ws_id: str,
         thread: discord.abc.Messageable,
     ) -> None:
-        """Subscribe to workstream events and dispatch them to *thread*."""
+        """Subscribe to workstream events via SSE and dispatch them to *thread*."""
         if ws_id in self._subscribed_ws:
             return
 
-        channel = f"{self.broker._prefix}:events:{ws_id}"
-
-        async def _callback(raw: str) -> None:
-            await self._on_ws_event(ws_id, thread, raw)
-
-        await self.broker.subscribe(channel, _callback)
+        task = asyncio.create_task(
+            self._sse_listener(ws_id, thread),
+            name=f"sse:{ws_id}",
+        )
+        self._sse_tasks[ws_id] = task
         self._subscribed_ws.add(ws_id)
         log.info("discord.subscribed", ws_id=ws_id)
 
     async def unsubscribe_ws(self, ws_id: str) -> None:
-        """Cancel the subscription for *ws_id* and clean up streaming state."""
-        channel = f"{self.broker._prefix}:events:{ws_id}"
-        await self.broker.unsubscribe(channel)
+        """Cancel the SSE listener for *ws_id* and clean up streaming state."""
+        task = self._sse_tasks.pop(ws_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pending_approval_msgs.pop(ws_id, None)
@@ -274,15 +296,63 @@ class TurnstoneBot:
             del self._notify_ws_map[mid]
         log.info("discord.unsubscribed", ws_id=ws_id)
 
+    # -- SSE listener --------------------------------------------------------
+
+    async def _sse_listener(self, ws_id: str, thread: discord.abc.Messageable) -> None:
+        """SSE listener task for a workstream.
+
+        Connects to the server's per-workstream SSE endpoint, parses events
+        using :meth:`ServerEvent.from_dict`, and dispatches to
+        :meth:`_on_ws_event`.  Reconnects with exponential backoff on
+        connection failures.
+        """
+        import httpx_sse
+
+        url = f"{self._server_url}/api/events"
+        delay = _SSE_RECONNECT_DELAY
+
+        while True:
+            try:
+                async with httpx_sse.aconnect_sse(
+                    self._http_client, "GET", url, params={"ws_id": ws_id}
+                ) as event_source:
+                    delay = _SSE_RECONNECT_DELAY  # reset on successful connect
+                    async for sse in event_source.aiter_sse():
+                        if sse.event == "message" or not sse.event:
+                            try:
+                                data = json.loads(sse.data)
+                            except json.JSONDecodeError:
+                                log.debug(
+                                    "discord.sse_invalid_json",
+                                    ws_id=ws_id,
+                                    data=sse.data[:200],
+                                )
+                                continue
+                            event = ServerEvent.from_dict(data)
+                            await self._on_ws_event(ws_id, thread, event)
+                            if isinstance(event, StreamEndEvent):
+                                return  # clean end, do not reconnect
+            except httpx.RemoteProtocolError:
+                # Server closed connection (normal on stream_end or shutdown).
+                log.debug("discord.sse_remote_closed", ws_id=ws_id)
+            except asyncio.CancelledError:
+                return  # unsubscribe or shutdown
+            except Exception:
+                log.warning("discord.sse_error", ws_id=ws_id, exc_info=True)
+
+            # Exponential backoff before reconnecting.
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _SSE_MAX_RECONNECT_DELAY)
+
     # -- event dispatch ------------------------------------------------------
 
     async def _on_ws_event(
         self,
         ws_id: str,
         thread: discord.abc.Messageable,
-        raw: str,
+        event: ServerEvent,
     ) -> None:
-        """Handle an outbound event for a subscribed workstream."""
+        """Handle a typed server event for a subscribed workstream."""
         import discord
 
         from turnstone.channels._formatter import (
@@ -291,8 +361,6 @@ class TurnstoneBot:
             format_verdict,
         )
         from turnstone.channels.discord.views import ApprovalView, PlanReviewView
-
-        event = OutboundEvent.from_json(raw)
 
         if isinstance(event, ContentEvent):
             sm = self._streaming.get(ws_id)
@@ -305,7 +373,7 @@ class TurnstoneBot:
                 self._streaming[ws_id] = sm
             await sm.append(event.text)
 
-        elif isinstance(event, ApprovalRequestEvent):
+        elif isinstance(event, ApproveRequestEvent):
             # Evaluate admin tool policies before auto-approve.
             _policy_handled = False
             if self.storage is not None:
@@ -328,7 +396,7 @@ class TurnstoneBot:
                             denied = [n for n, v in verdicts.items() if v == "deny"]
                             await self.router.send_approval(
                                 ws_id,
-                                event.correlation_id,
+                                "",
                                 approved=False,
                                 feedback=f"Blocked by tool policy: {', '.join(denied)}",
                             )
@@ -339,7 +407,7 @@ class TurnstoneBot:
                         elif all(verdicts.get(n) == "allow" for n in _tool_names):
                             await self.router.send_approval(
                                 ws_id,
-                                event.correlation_id,
+                                "",
                                 approved=True,
                             )
                             await thread.send("*Tool approved by policy.*")
@@ -349,9 +417,12 @@ class TurnstoneBot:
             if not _policy_handled and (
                 self.config.auto_approve or self._should_auto_approve(event)
             ):
-                await self.router.send_approval(ws_id, event.correlation_id, approved=True)
+                # correlation_id is empty because the server's /api/approve
+                # endpoint resolves approvals by ws_id alone (one pending
+                # approval per workstream at a time).
+                await self.router.send_approval(ws_id, "", approved=True)
                 await thread.send("*Tool auto-approved.*")
-            else:
+            elif not _policy_handled:
                 text = format_approval_request(event.items)
                 embed = discord.Embed(
                     title="Tool Approval Required",
@@ -368,7 +439,7 @@ class TurnstoneBot:
                             value=format_verdict(verdict),
                             inline=False,
                         )
-                embed.set_footer(text=f"{ws_id}|{event.correlation_id}")
+                embed.set_footer(text=f"{ws_id}|")
                 msg = await thread.send(embed=embed, view=ApprovalView(self)._view)
                 self._pending_approval_msgs[ws_id] = msg
 
@@ -379,7 +450,7 @@ class TurnstoneBot:
                 description=text,
                 color=discord.Color.blue(),
             )
-            embed.set_footer(text=f"{ws_id}|{event.correlation_id}")
+            embed.set_footer(text=f"{ws_id}|")
             await thread.send(embed=embed, view=PlanReviewView(self)._view)
 
         elif isinstance(event, IntentVerdictEvent):
@@ -414,37 +485,29 @@ class TurnstoneBot:
                 except Exception:
                     log.debug("discord.verdict_embed_edit_failed", ws_id=ws_id)
 
-        elif isinstance(event, TurnCompleteEvent):
+        elif isinstance(event, StreamEndEvent):
             sm = self._streaming.pop(ws_id, None)
             if sm is not None:
                 await sm.finalize()
-            elif event.content:
-                # Catch-up: content events were missed (race between global
-                # SSE and per-ws SSE) — send the full response directly.
-                for chunk in chunk_message(event.content, self.config.max_message_length):
-                    await thread.send(chunk)
-            # Forward response to notification reply DM if active.
+            # Forward accumulated response to notification reply DM if active.
             dm_entry = self._notify_reply_channels.pop(ws_id, None)
-            if dm_entry is not None and event.content:
-                dm_channel, target_user_id = dm_entry
-                last_msg: discord.Message | None = None
-                for chunk in chunk_message(event.content, self.config.max_message_length):
-                    try:
-                        last_msg = await dm_channel.send(chunk)
-                    except Exception:
-                        log.debug("discord.notify_reply_dm_failed", ws_id=ws_id)
-                        break
-                # Track the response message so the user can reply again
-                # for multi-turn DM conversations.
-                if last_msg is not None:
-                    self._track_notification(last_msg.id, ws_id, target_user_id)
+            if dm_entry is not None and sm is not None:
+                content = "".join(sm._buffer)
+                if content:
+                    dm_channel, target_user_id = dm_entry
+                    last_msg: discord.Message | None = None
+                    for dm_chunk in chunk_message(content, self.config.max_message_length):
+                        try:
+                            last_msg = await dm_channel.send(dm_chunk)
+                        except Exception:
+                            log.debug("discord.notify_reply_dm_failed", ws_id=ws_id)
+                            break
+                    # Track the response message so the user can reply again
+                    # for multi-turn DM conversations.
+                    if last_msg is not None:
+                        self._track_notification(last_msg.id, ws_id, target_user_id)
             # Clean up pending approval message tracking.
             self._pending_approval_msgs.pop(ws_id, None)
-
-        elif isinstance(event, WorkstreamResumedEvent):
-            name = event.name or "previous workstream"
-            count = event.message_count
-            await thread.send(f"*Resumed: {name} ({count} messages restored)*")
 
         elif isinstance(event, ErrorEvent):
             safe_msg = event.message[:500] if event.message else "An error occurred"
@@ -452,7 +515,7 @@ class TurnstoneBot:
 
     # -- helpers -------------------------------------------------------------
 
-    def _should_auto_approve(self, event: ApprovalRequestEvent) -> bool:
+    def _should_auto_approve(self, event: ApproveRequestEvent) -> bool:
         """Return True if all tools in *event.items* are in the auto-approve list."""
         allowed = self.config.auto_approve_tools
         if not allowed or not event.items:
@@ -541,9 +604,9 @@ class TurnstoneBot:
         return msg_id_str
 
     async def stop(self) -> None:
-        """Disconnect the bot and clean up subscriptions."""
+        """Disconnect the bot, cancel SSE tasks, and clean up."""
         for ws_id in list(self._subscribed_ws):
             await self.unsubscribe_ws(ws_id)
-        await self.router.stop()
-        await self.broker.close()
+        await self.router.aclose()
+        await self._http_client.aclose()
         await self._bot.close()

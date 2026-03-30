@@ -1,7 +1,7 @@
 # PgBouncer Connection Pooling
 
 Turnstone cluster deployments share a single PostgreSQL instance across
-all server nodes, bridge processes, and the console. Each process
+all server nodes and the console. Each process
 maintains a small connection pool (2 base + 3 overflow = 5 max). At
 scale this adds up — a 100-node cluster opens up to 500 connections,
 and a 1000-node cluster up to 5,000.

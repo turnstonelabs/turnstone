@@ -164,17 +164,6 @@ def test_cli_bootstrap_no_issue(tmp_path):
 # ── Config parsing ────────────────────────────────────────────────────────────
 
 
-def test_redis_tls_config_map():
-    """Redis TLS keys are in the config map."""
-    from turnstone.core.config import _CONFIG_MAP
-
-    redis_map = _CONFIG_MAP["redis"]
-    assert "tls" in redis_map
-    assert "tls_ca" in redis_map
-    assert "tls_cert" in redis_map
-    assert "tls_key" in redis_map
-
-
 def test_database_ssl_config_map():
     """Database SSL keys are in the config map."""
     from turnstone.core.config import _CONFIG_MAP

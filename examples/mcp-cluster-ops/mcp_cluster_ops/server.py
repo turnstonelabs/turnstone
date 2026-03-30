@@ -1,7 +1,7 @@
 """MCP server for Turnstone cluster operations.
 
 Exposes tools to execute commands on specific nodes in a Turnstone cluster.
-Uses the MQ client (``TurnstoneClient``) for direct node targeting via Redis.
+Uses the SDK client (``TurnstoneServer``) for direct node targeting via HTTP.
 
 Usage::
 
@@ -14,22 +14,20 @@ Configure in ``~/.config/turnstone/config.toml``::
     command = "mcp-cluster-ops"
 
     [mcp.servers.cluster-ops.env]
-    REDIS_HOST = "redis.example.com"
+    TURNSTONE_SERVER_URL = "http://localhost:8080"
 
 Environment variables
 ---------------------
-REDIS_HOST              Redis host (default: localhost)
-REDIS_PORT              Redis port (default: 6379)
-REDIS_PASSWORD          Redis password (default: none)
+TURNSTONE_SERVER_URL        Server URL (default: http://localhost:8080)
+TURNSTONE_API_TOKEN         API token for authentication (default: none)
 MCP_CLUSTER_OPS_TIMEOUT     Default command timeout in seconds (default: 120)
 MCP_CLUSTER_OPS_MAX_OUTPUT  Max output bytes per node (default: 8192, 0=unlimited)
 
 Performance notes
 -----------------
 Remote agents are told to reply with only "ok" or "failed" — the raw bash
-output is captured directly from the ToolResultEvent that already flows
-through Redis, bypassing the costly "agent reads output then re-generates
-output as completion tokens" round-trip.
+output is captured directly from the ToolResultEvent, bypassing the costly
+"agent reads output then re-generates output as completion tokens" round-trip.
 
 All multi-node dispatches run in parallel via ``asyncio.gather`` so total
 wall time is bounded by the slowest node, not the sum of all nodes.
@@ -45,7 +43,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
-from turnstone.mq.client import TurnResult, TurnstoneClient
+from turnstone.sdk import TurnResult, TurnstoneServer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -68,19 +66,14 @@ _MAX_TIMEOUT = 3600
 # ---------------------------------------------------------------------------
 
 
-def _redis_kwargs() -> dict[str, Any]:
-    """Build Redis connection kwargs from environment variables.
-
-    Follows the same env var convention as ``turnstone.mq.broker.add_redis_args``:
-    ``REDIS_HOST``, ``REDIS_PORT``, ``REDIS_PASSWORD``.
-    """
-    kwargs: dict[str, Any] = {"host": os.environ.get("REDIS_HOST", "localhost")}
-    port = os.environ.get("REDIS_PORT")
-    if port is not None:
-        kwargs["port"] = int(port)
-    password = os.environ.get("REDIS_PASSWORD")
-    if password:
-        kwargs["password"] = password
+def _server_kwargs() -> dict[str, Any]:
+    """Build TurnstoneServer connection kwargs from environment variables."""
+    kwargs: dict[str, Any] = {
+        "base_url": os.environ.get("TURNSTONE_SERVER_URL", "http://localhost:8080"),
+    }
+    token = os.environ.get("TURNSTONE_API_TOKEN")
+    if token:
+        kwargs["token"] = token
     return kwargs
 
 
@@ -172,12 +165,12 @@ def _format_node_result(
 
 
 # ---------------------------------------------------------------------------
-# Core dispatch functions (testable with mocked TurnstoneClient)
+# Core dispatch functions (testable with mocked TurnstoneServer)
 # ---------------------------------------------------------------------------
 
 
 def _exec_on_node_sync(
-    redis_kw: dict[str, Any],
+    server_kw: dict[str, Any],
     node_id: str,
     command: str,
     timeout: float,
@@ -185,11 +178,11 @@ def _exec_on_node_sync(
     """Dispatch *command* to *node_id* and block until complete.
 
     Runs inside ``asyncio.to_thread`` so it does not block the event loop.
-    Each call creates its own ``TurnstoneClient`` to avoid Redis pub/sub
-    subscription conflicts between concurrent dispatches.
+    Each call creates its own ``TurnstoneServer`` client to avoid state
+    conflicts between concurrent dispatches.
     """
     prompt = _exec_prompt(command)
-    with TurnstoneClient(**redis_kw) as client:
+    with TurnstoneServer(**server_kw) as client:
         result = client.send_and_wait(
             message=prompt,
             target_node=node_id,
@@ -200,7 +193,7 @@ def _exec_on_node_sync(
 
 
 async def _dispatch_parallel(
-    redis_kw: dict[str, Any],
+    server_kw: dict[str, Any],
     node_ids: list[str],
     command: str,
     timeout: float,
@@ -211,7 +204,7 @@ async def _dispatch_parallel(
     Total wall time is bounded by the slowest node.
     """
     tasks = [
-        asyncio.to_thread(_exec_on_node_sync, redis_kw, nid, command, timeout) for nid in node_ids
+        asyncio.to_thread(_exec_on_node_sync, server_kw, nid, command, timeout) for nid in node_ids
     ]
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -227,16 +220,16 @@ async def _dispatch_parallel(
     return results
 
 
-def _list_nodes_sync(redis_kw: dict[str, Any]) -> list[dict[str, Any]]:
+def _list_nodes_sync(server_kw: dict[str, Any]) -> list[dict[str, Any]]:
     """List active cluster nodes (blocking)."""
-    with TurnstoneClient(**redis_kw) as client:
+    with TurnstoneServer(**server_kw) as client:
         nodes: list[dict[str, Any]] = client.list_nodes()
         return nodes
 
 
-async def _list_nodes_impl(redis_kw: dict[str, Any]) -> list[dict[str, Any]]:
+async def _list_nodes_impl(server_kw: dict[str, Any]) -> list[dict[str, Any]]:
     """List active cluster nodes."""
-    return await asyncio.to_thread(_list_nodes_sync, redis_kw)
+    return await asyncio.to_thread(_list_nodes_sync, server_kw)
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +239,9 @@ async def _list_nodes_impl(redis_kw: dict[str, Any]) -> list[dict[str, Any]]:
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
-    """Lifespan context — stores Redis kwargs for tool handlers."""
-    kw = _redis_kwargs()
-    yield {"redis_kwargs": kw}
+    """Lifespan context — stores server connection kwargs for tool handlers."""
+    kw = _server_kwargs()
+    yield {"server_kwargs": kw}
 
 
 mcp = FastMCP(
@@ -270,8 +263,8 @@ async def list_nodes(ctx: Context[Any, Any, Any]) -> str:
     Call this before dispatching work to discover available node IDs.
     Returns a JSON array of node metadata objects.
     """
-    redis_kw: dict[str, Any] = ctx.request_context.lifespan_context["redis_kwargs"]
-    nodes = await _list_nodes_impl(redis_kw)
+    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
+    nodes = await _list_nodes_impl(server_kw)
     return json.dumps(nodes, indent=2)
 
 
@@ -298,12 +291,12 @@ async def run_on_node(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    redis_kw: dict[str, Any] = ctx.request_context.lifespan_context["redis_kwargs"]
+    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
     log.info("run_on_node node=%s cmd=%r", node_id, command)
     _, result = await asyncio.to_thread(
-        _exec_on_node_sync, redis_kw, node_id, command, _clamp_timeout(timeout)
+        _exec_on_node_sync, server_kw, node_id, command, _clamp_timeout(timeout)
     )
     formatted = _format_node_result(node_id, result, max_output)
     return json.dumps(formatted, indent=2)
@@ -330,7 +323,7 @@ async def run_on_nodes(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    redis_kw: dict[str, Any] = ctx.request_context.lifespan_context["redis_kwargs"]
+    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
     clean_ids = list(dict.fromkeys(nid.strip() for nid in node_ids if nid.strip()))
@@ -343,7 +336,7 @@ async def run_on_nodes(
 
     log.info("run_on_nodes nodes=%s cmd=%r", clean_ids, command)
     results = await _dispatch_parallel(
-        redis_kw, clean_ids, command, _clamp_timeout(timeout), max_output
+        server_kw, clean_ids, command, _clamp_timeout(timeout), max_output
     )
     return json.dumps(results, indent=2)
 
@@ -368,10 +361,10 @@ async def run_on_all_nodes(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    redis_kw: dict[str, Any] = ctx.request_context.lifespan_context["redis_kwargs"]
+    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
-    nodes = await _list_nodes_impl(redis_kw)
+    nodes = await _list_nodes_impl(server_kw)
     if not nodes:
         return json.dumps({"error": "No active nodes found in cluster"})
 
@@ -388,7 +381,7 @@ async def run_on_all_nodes(
         )
     log.info("run_on_all_nodes nodes=%s cmd=%r", node_ids, command)
     results = await _dispatch_parallel(
-        redis_kw, node_ids, command, _clamp_timeout(timeout), max_output
+        server_kw, node_ids, command, _clamp_timeout(timeout), max_output
     )
     return json.dumps(results, indent=2)
 

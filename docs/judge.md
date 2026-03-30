@@ -379,7 +379,7 @@ emitted to the frontend:
 ```
 
 The web UI renders this as an inline warning after the tool result. The CLI
-shows a colored terminal warning. The MQ bridge forwards it as an
+shows a colored terminal warning. The server forwards it as an
 `OutputWarningEvent` for console subscribers.
 
 Assessments are persisted to the `output_assessments` table for v2

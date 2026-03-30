@@ -13,11 +13,7 @@ class ChannelConfig:
     guild IDs, etc.).
     """
 
-    redis_host: str = "localhost"
-    redis_port: int = 6379
-    redis_db: int = 0
-    redis_password: str | None = None
-    prefix: str = "turnstone"
+    server_url: str = "http://localhost:8080"
     model: str = ""
     auto_approve: bool = False
     auto_approve_tools: list[str] = field(default_factory=list)

@@ -9,8 +9,8 @@ from dataclasses import dataclass, field
 class TurnResult:
     """Aggregated result of a send_and_wait call.
 
-    Mirrors the shape of :class:`turnstone.mq.client.TurnResult` but
-    operates over HTTP/SSE instead of Redis pub/sub.
+    Collects content, reasoning, tool results, and errors from
+    an HTTP/SSE event stream into a single result object.
     """
 
     ws_id: str = ""

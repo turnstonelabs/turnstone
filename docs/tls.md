@@ -12,7 +12,7 @@ docker compose -f compose.yaml -f deploy/docker-compose.tls.yml up
 ```
 
 This:
-1. Bootstraps an internal CA and issues certs for Redis/PostgreSQL
+1. Bootstraps an internal CA and issues certs for PostgreSQL
 2. Starts the console with TLS enabled (internal CA + ACME server)
 3. Server nodes auto-provision certs via the console's ACME endpoint
 4. All inter-service communication uses mTLS
@@ -30,9 +30,9 @@ Console (CA + ACME Server)
                   | ACME protocol (auto-approve, no challenge validation)
       +-----------+-----------+
       |           |           |
-  Server(s)    Bridge    Channel GW
-  (auto-cert    (mTLS     (mTLS
-   + renewal)   client)    client)
+  Server(s)       Channel GW
+  (auto-cert       (mTLS
+   + renewal)       client)
 ```
 
 **Two cert paths on the console:**
@@ -57,12 +57,6 @@ Console (CA + ACME Server)
 These are needed before storage is available:
 
 ```toml
-[redis]
-tls = false
-tls_ca = ""      # path to CA cert
-tls_cert = ""    # path to client cert
-tls_key = ""     # path to client key
-
 [database]
 sslmode = "prefer"   # disable, allow, prefer, require, verify-full
 sslrootcert = ""     # path to CA cert
@@ -89,12 +83,11 @@ sslkey = ""          # path to client key
 Create a CA and infrastructure certs without a running console:
 
 ```bash
-# Bootstrap CA + Redis + PostgreSQL certs
-turnstone-admin tls-bootstrap --out /certs --issue redis --issue postgres
+# Bootstrap CA + PostgreSQL certs
+turnstone-admin tls-bootstrap --out /certs --issue postgres
 
 # Output:
 #   /certs/ca.pem              (CA root certificate)
-#   /certs/certs/redis/        (Redis cert + key)
 #   /certs/certs/postgres/     (PostgreSQL cert + key)
 ```
 

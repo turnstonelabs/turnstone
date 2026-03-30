@@ -1,7 +1,7 @@
 """Lightweight HTTP server for the channel gateway.
 
 Runs alongside the channel adapters (Discord, etc.) to receive notification
-requests from the bridge.  Exposes ``POST /v1/api/notify`` and ``GET /health``.
+requests from the server.  Exposes ``POST /v1/api/notify`` and ``GET /health``.
 """
 
 from __future__ import annotations

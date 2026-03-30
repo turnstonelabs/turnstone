@@ -65,61 +65,56 @@ def test_apply_config_sets_defaults(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        '[redis]\nhost = "redis.local"\nport = 7777\npassword = "pw"\n'
-        '[bridge]\nserver_url = "http://bridge:9090"\n'
+        '[server]\nhost = "0.0.0.0"\nport = 9090\n[api]\nbase_url = "http://custom/v1"\n'
     )
     set_config_path(str(cfg))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--redis-host", default="localhost")
-    parser.add_argument("--redis-port", type=int, default=6379)
-    parser.add_argument("--redis-password", default=None)
-    parser.add_argument("--server-url", default="http://localhost:8080")
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--base-url", default="http://localhost:11434/v1")
 
-    apply_config(parser, ["redis", "bridge"])
+    apply_config(parser, ["server", "api"])
     args = parser.parse_args([])
 
-    assert args.redis_host == "redis.local"
-    assert args.redis_port == 7777
-    assert args.redis_password == "pw"
-    assert args.server_url == "http://bridge:9090"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9090
+    assert args.base_url == "http://custom/v1"
 
 
 def test_apply_config_cli_overrides(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[redis]\nhost = "config-host"\nport = 7777\n')
+    cfg.write_text('[server]\nhost = "config-host"\nport = 7777\n')
     set_config_path(str(cfg))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--redis-host", default="localhost")
-    parser.add_argument("--redis-port", type=int, default=6379)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
 
-    apply_config(parser, ["redis"])
+    apply_config(parser, ["server"])
     # CLI flag overrides config
-    args = parser.parse_args(["--redis-host", "cli-host"])
+    args = parser.parse_args(["--host", "cli-host"])
 
-    assert args.redis_host == "cli-host"  # CLI wins
-    assert args.redis_port == 7777  # config wins (no CLI override)
+    assert args.host == "cli-host"  # CLI wins
+    assert args.port == 7777  # config wins (no CLI override)
 
 
 def test_apply_config_missing_keys_keep_defaults(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[redis]\nhost = "only-host"\n')  # no port, no password
+    cfg.write_text('[server]\nhost = "only-host"\n')  # no port
     set_config_path(str(cfg))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--redis-host", default="localhost")
-    parser.add_argument("--redis-port", type=int, default=6379)
-    parser.add_argument("--redis-password", default=None)
+    parser.add_argument("--host", default="localhost")
+    parser.add_argument("--port", type=int, default=8080)
 
-    apply_config(parser, ["redis"])
+    apply_config(parser, ["server"])
     args = parser.parse_args([])
 
-    assert args.redis_host == "only-host"
-    assert args.redis_port == 6379  # original default kept
-    assert args.redis_password is None  # original default kept
+    assert args.host == "only-host"
+    assert args.port == 8080  # original default kept
 
 
 def test_apply_config_no_file(tmp_path):
@@ -127,11 +122,11 @@ def test_apply_config_no_file(tmp_path):
     set_config_path(str(tmp_path / "nope.toml"))
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--redis-host", default="localhost")
+    parser.add_argument("--host", default="localhost")
 
-    apply_config(parser, ["redis"])
+    apply_config(parser, ["server"])
     args = parser.parse_args([])
-    assert args.redis_host == "localhost"
+    assert args.host == "localhost"
 
 
 def test_apply_config_model_section(tmp_path):

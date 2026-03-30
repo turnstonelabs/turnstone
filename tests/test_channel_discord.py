@@ -76,8 +76,7 @@ class TestDiscordConfig:
         assert cfg.max_message_length == 2000
         assert cfg.streaming_edit_interval == 1.5
         # Inherited from ChannelConfig
-        assert cfg.redis_host == "localhost"
-        assert cfg.redis_port == 6379
+        assert cfg.server_url == "http://localhost:8080"
         assert cfg.model == ""
         assert cfg.auto_approve is False
 
@@ -316,12 +315,12 @@ class TestParseFooter:
 
 
 class TestWsEventFinalization:
-    """TurnCompleteEvent should finalize streaming messages in the Discord bot."""
+    """StreamEndEvent should finalize streaming messages in the Discord bot."""
 
-    def test_turn_complete_finalizes_streaming(self):
-        """ContentEvent + TurnCompleteEvent(correlation_id='') finalizes the message."""
+    def test_stream_end_finalizes_streaming(self):
+        """ContentEvent + StreamEndEvent finalizes the message."""
         from turnstone.channels.discord.bot import TurnstoneBot
-        from turnstone.mq.protocol import ContentEvent, TurnCompleteEvent
+        from turnstone.sdk.events import ContentEvent, StreamEndEvent
 
         bot = MagicMock(spec=TurnstoneBot)
         bot.config = MagicMock()
@@ -339,23 +338,23 @@ class TestWsEventFinalization:
         thread = AsyncMock()
 
         # Feed content event
-        content_raw = ContentEvent(ws_id="ws-1", text="Hello world").to_json()
-        _run(bot._on_ws_event("ws-1", thread, content_raw))
+        content_event = ContentEvent(ws_id="ws-1", text="Hello world")
+        _run(bot._on_ws_event("ws-1", thread, content_event))
 
         # StreamingMessage should exist
         assert "ws-1" in bot._streaming
 
-        # Feed turn complete with empty correlation_id (server-UI-initiated)
-        complete_raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
-        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+        # Feed stream end
+        end_event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, end_event))
 
         # StreamingMessage should be removed and finalized
         assert "ws-1" not in bot._streaming
 
-    def test_turn_complete_no_streaming_is_noop(self):
-        """TurnCompleteEvent without prior content should not error."""
+    def test_stream_end_no_streaming_is_noop(self):
+        """StreamEndEvent without prior content should not error."""
         from turnstone.channels.discord.bot import TurnstoneBot
-        from turnstone.mq.protocol import TurnCompleteEvent
+        from turnstone.sdk.events import StreamEndEvent
 
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
@@ -365,8 +364,8 @@ class TestWsEventFinalization:
 
         thread = AsyncMock()
 
-        complete_raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
-        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+        end_event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, end_event))
 
         # No error, no streaming message
         assert "ws-1" not in bot._streaming
@@ -399,8 +398,8 @@ class TestApprovalVerdictDisplay:
         return bot
 
     def test_approval_with_heuristic_verdict(self):
-        """ApprovalRequestEvent items with verdict dicts add embed fields."""
-        from turnstone.mq.protocol import ApprovalRequestEvent
+        """ApproveRequestEvent items with verdict dicts add embed fields."""
+        from turnstone.sdk.events import ApproveRequestEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
@@ -421,8 +420,8 @@ class TestApprovalVerdictDisplay:
                 },
             }
         ]
-        raw = ApprovalRequestEvent(ws_id="ws-1", correlation_id="corr-1", items=items).to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        event = ApproveRequestEvent(ws_id="ws-1", items=items)
+        _run(bot._on_ws_event("ws-1", thread, event))
 
         # thread.send was called with an embed containing a verdict field
         thread.send.assert_awaited_once()
@@ -439,8 +438,8 @@ class TestApprovalVerdictDisplay:
         assert "ws-1" in bot._pending_approval_msgs
 
     def test_approval_without_verdict(self):
-        """ApprovalRequestEvent items without verdict still work normally."""
-        from turnstone.mq.protocol import ApprovalRequestEvent
+        """ApproveRequestEvent items without verdict still work normally."""
+        from turnstone.sdk.events import ApproveRequestEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
@@ -448,8 +447,8 @@ class TestApprovalVerdictDisplay:
         thread.send = AsyncMock(return_value=sent_msg)
 
         items = [{"func_name": "read_file", "preview": "/etc/hosts", "needs_approval": True}]
-        raw = ApprovalRequestEvent(ws_id="ws-1", correlation_id="corr-1", items=items).to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        event = ApproveRequestEvent(ws_id="ws-1", items=items)
+        _run(bot._on_ws_event("ws-1", thread, event))
 
         thread.send.assert_awaited_once()
         call_kwargs = thread.send.call_args[1]
@@ -459,7 +458,7 @@ class TestApprovalVerdictDisplay:
 
     def test_intent_verdict_event_updates_embed(self):
         """IntentVerdictEvent should update the pending approval embed."""
-        from turnstone.mq.protocol import IntentVerdictEvent
+        from turnstone.sdk.events import IntentVerdictEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
@@ -471,7 +470,7 @@ class TestApprovalVerdictDisplay:
         msg.edit = AsyncMock()
         bot._pending_approval_msgs["ws-1"] = msg
 
-        raw = IntentVerdictEvent(
+        event = IntentVerdictEvent(
             ws_id="ws-1",
             func_name="bash",
             risk_level="high",
@@ -479,8 +478,8 @@ class TestApprovalVerdictDisplay:
             confidence=0.9,
             intent_summary="Dangerous operation",
             tier="llm",
-        ).to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        )
+        _run(bot._on_ws_event("ws-1", thread, event))
 
         # Embed should be updated with the judge verdict field
         embed.add_field.assert_called_once()
@@ -494,19 +493,19 @@ class TestApprovalVerdictDisplay:
 
     def test_intent_verdict_without_pending_approval_is_noop(self):
         """IntentVerdictEvent without a pending approval message should not error."""
-        from turnstone.mq.protocol import IntentVerdictEvent
+        from turnstone.sdk.events import IntentVerdictEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
 
-        raw = IntentVerdictEvent(ws_id="ws-1", func_name="bash", risk_level="low").to_json()
+        event = IntentVerdictEvent(ws_id="ws-1", func_name="bash", risk_level="low")
         # Should not raise
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        _run(bot._on_ws_event("ws-1", thread, event))
 
-    def test_turn_complete_clears_pending_approval(self):
-        """TurnCompleteEvent should clean up the pending approval message tracking."""
+    def test_stream_end_clears_pending_approval(self):
+        """StreamEndEvent should clean up the pending approval message tracking."""
         from turnstone.channels.discord.bot import TurnstoneBot
-        from turnstone.mq.protocol import TurnCompleteEvent
+        from turnstone.sdk.events import StreamEndEvent
 
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
@@ -515,14 +514,14 @@ class TestApprovalVerdictDisplay:
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
 
         thread = AsyncMock()
-        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="").to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, event))
 
         assert "ws-1" not in bot._pending_approval_msgs
 
 
-class TestContentCatchup:
-    """TurnCompleteEvent with content field provides catch-up for missed ContentEvents."""
+class TestStreamEndBehavior:
+    """StreamEndEvent finalizes streaming and cleans up state."""
 
     def _make_bot(self):
         from turnstone.channels.discord.bot import TurnstoneBot
@@ -539,50 +538,34 @@ class TestContentCatchup:
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
         return bot
 
-    def test_catchup_sends_content_when_no_streaming(self):
-        """TurnCompleteEvent with content but no SM sends catch-up message."""
-        from turnstone.mq.protocol import TurnCompleteEvent
+    def test_stream_end_no_streaming_no_send(self):
+        """StreamEndEvent without prior content should not send anything."""
+        from turnstone.sdk.events import StreamEndEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
 
-        raw = TurnCompleteEvent(
-            ws_id="ws-1", correlation_id="", content="Caught up response"
-        ).to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, event))
 
-        thread.send.assert_awaited_once_with("Caught up response")
+        thread.send.assert_not_awaited()
 
-    def test_catchup_skipped_when_streaming_exists(self):
-        """TurnCompleteEvent with content and existing SM uses SM finalize, not catch-up."""
-        from turnstone.mq.protocol import ContentEvent, TurnCompleteEvent
+    def test_stream_end_finalizes_existing_streaming(self):
+        """StreamEndEvent with an existing StreamingMessage should finalize it."""
+        from turnstone.sdk.events import ContentEvent, StreamEndEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
 
         # Feed content event to create SM
-        content_raw = ContentEvent(ws_id="ws-1", text="Streamed").to_json()
-        _run(bot._on_ws_event("ws-1", thread, content_raw))
+        content_event = ContentEvent(ws_id="ws-1", text="Streamed")
+        _run(bot._on_ws_event("ws-1", thread, content_event))
         assert "ws-1" in bot._streaming
 
-        # Now TurnCompleteEvent with content — SM should be finalized, not catch-up
-        complete_raw = TurnCompleteEvent(
-            ws_id="ws-1", correlation_id="", content="Streamed"
-        ).to_json()
-        _run(bot._on_ws_event("ws-1", thread, complete_raw))
+        # Now StreamEndEvent — SM should be finalized
+        end_event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, end_event))
         assert "ws-1" not in bot._streaming
-
-    def test_catchup_empty_content_no_message(self):
-        """TurnCompleteEvent with empty content and no SM sends nothing."""
-        from turnstone.mq.protocol import TurnCompleteEvent
-
-        bot = self._make_bot()
-        thread = AsyncMock()
-
-        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="", content="").to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
-
-        thread.send.assert_not_awaited()
 
 
 class TestNotificationTracking:
@@ -767,14 +750,15 @@ class TestNotificationTracking:
 
         ts.router.send_message.assert_not_awaited()
 
-    def test_turn_complete_forwards_to_dm(self):
-        """TurnCompleteEvent should forward content to notification reply DM."""
+    def test_stream_end_forwards_accumulated_content_to_dm(self):
+        """StreamEndEvent should forward accumulated content to notification reply DM."""
         from turnstone.channels.discord.bot import TurnstoneBot
-        from turnstone.mq.protocol import TurnCompleteEvent
+        from turnstone.sdk.events import ContentEvent, StreamEndEvent
 
         bot = MagicMock(spec=TurnstoneBot)
         bot.config = MagicMock()
         bot.config.max_message_length = 2000
+        bot.config.streaming_edit_interval = 1.5
         bot._streaming = {}
         bot._pending_approval_msgs = {}
         bot._notify_ws_map = {}
@@ -790,10 +774,13 @@ class TestNotificationTracking:
 
         thread = AsyncMock()
 
-        raw = TurnCompleteEvent(
-            ws_id="ws-1", correlation_id="", content="Here's the response"
-        ).to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        # Feed content events to accumulate buffer
+        content_event = ContentEvent(ws_id="ws-1", text="Here's the response")
+        _run(bot._on_ws_event("ws-1", thread, content_event))
+
+        # Feed stream end — should finalize and forward to DM
+        end_event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, end_event))
 
         # Should send to DM channel
         dm_channel.send.assert_awaited_once_with("Here's the response")
@@ -803,10 +790,10 @@ class TestNotificationTracking:
         assert 88888 in bot._notify_ws_map
         assert bot._notify_ws_map[88888] == ("ws-1", "u123")
 
-    def test_turn_complete_cleans_up_dm_even_without_content(self):
-        """TurnCompleteEvent without content should still clean up DM tracking."""
+    def test_stream_end_cleans_up_dm_even_without_content(self):
+        """StreamEndEvent without prior content should still clean up DM tracking."""
         from turnstone.channels.discord.bot import TurnstoneBot
-        from turnstone.mq.protocol import TurnCompleteEvent
+        from turnstone.sdk.events import StreamEndEvent
 
         bot = MagicMock(spec=TurnstoneBot)
         bot._streaming = {}
@@ -819,8 +806,8 @@ class TestNotificationTracking:
 
         thread = AsyncMock()
 
-        raw = TurnCompleteEvent(ws_id="ws-1", correlation_id="", content="").to_json()
-        _run(bot._on_ws_event("ws-1", thread, raw))
+        end_event = StreamEndEvent(ws_id="ws-1")
+        _run(bot._on_ws_event("ws-1", thread, end_event))
 
         # DM should not be sent to (no content)
         dm_channel.send.assert_not_awaited()
