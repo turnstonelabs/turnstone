@@ -1216,10 +1216,20 @@ class IntentJudge:
             f"{json.dumps(func_args, indent=2, ensure_ascii=False)}\n```"
         )
 
-        # FIFO truncation of conversation history (keep most recent)
+        # Trim to messages from the last user message onward — the judge
+        # only needs the immediate request context, not the full history.
+        # This keeps latency bounded as conversations grow.
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        recent = messages[last_user_idx:] if last_user_idx is not None else messages
+
+        # Apply FIFO budget cap on the trimmed context
         truncated: list[dict[str, Any]] = []
         total_chars = 0
-        for msg in reversed(messages):
+        for msg in reversed(recent):
             content = msg.get("content", "") or ""
             if isinstance(content, list):
                 content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
