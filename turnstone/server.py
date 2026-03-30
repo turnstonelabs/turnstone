@@ -862,6 +862,32 @@ async def events_sse(request: Request) -> Response:
                 }
             )
         }
+        # Replay last status so the per-pane status bar populates on resume
+        if session._last_usage is not None:
+            u = session._last_usage
+            total_tok = u["prompt_tokens"] + u["completion_tokens"]
+            cw = session.context_window
+            pct = total_tok / cw * 100 if cw > 0 else 0
+            with ui._ws_lock:
+                ttc = ui._ws_turn_tool_calls
+                tc = ui._ws_messages
+            yield {
+                "data": json.dumps(
+                    {
+                        "type": "status",
+                        "prompt_tokens": u["prompt_tokens"],
+                        "completion_tokens": u["completion_tokens"],
+                        "total_tokens": total_tok,
+                        "context_window": cw,
+                        "pct": round(pct, 1),
+                        "effort": session.reasoning_effort,
+                        "cache_creation_tokens": u.get("cache_creation_tokens", 0),
+                        "cache_read_tokens": u.get("cache_read_tokens", 0),
+                        "tool_calls_this_turn": ttc,
+                        "turn_count": tc,
+                    }
+                )
+            }
         # History replay
         history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
         if history:
