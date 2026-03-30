@@ -5,11 +5,13 @@ from __future__ import annotations
 import enum
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from openai import OpenAI
 
 log = get_logger(__name__)
@@ -37,12 +39,21 @@ class BackendHealthMonitor:
         probe_timeout: float = 5.0,
         failure_threshold: int = 5,
         cooldown: float = 60.0,
+        *,
+        provider: str = "openai",
+        initial_model: str = "",
+        on_model_changed: Callable[[str, int | None], None] | None = None,
     ) -> None:
         self._client = client
         self._probe_interval = probe_interval
         self._probe_timeout = probe_timeout
         self._failure_threshold = failure_threshold
         self._cooldown = cooldown
+
+        # Model change detection
+        self._provider = provider
+        self._last_detected_model = initial_model
+        self._on_model_changed = on_model_changed
 
         self._lock = threading.Lock()
         self._state = CircuitState.CLOSED
@@ -197,10 +208,38 @@ class BackendHealthMonitor:
     def _probe_once(self) -> bool:
         """Single probe: call ``client.models.list()``.  Returns True on success."""
         try:
-            self._client.with_options(timeout=self._probe_timeout).models.list()
+            resp = self._client.with_options(timeout=self._probe_timeout).models.list()
+            self._check_model_change(resp)
             return True
         except Exception:
             return False
+
+    def _check_model_change(self, resp: Any) -> None:
+        """Compare detected model against last known and fire callback if changed."""
+        if not self._on_model_changed or not resp.data:
+            return
+        try:
+            from turnstone.core.model_registry import (
+                _extract_context_window,
+                _select_best_model,
+            )
+
+            all_ids = [m.id for m in resp.data]
+            selected = _select_best_model(all_ids, self._provider)
+            if selected == self._last_detected_model:
+                return
+            model_obj = next((m for m in resp.data if m.id == selected), None)
+            ctx = _extract_context_window(model_obj, self._provider) if model_obj else None
+            log.info(
+                "Backend model changed: %s -> %s (ctx=%s)",
+                self._last_detected_model,
+                selected,
+                ctx,
+            )
+            self._last_detected_model = selected
+            self._on_model_changed(selected, ctx)
+        except Exception:
+            log.debug("Model change check failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Metrics

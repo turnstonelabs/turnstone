@@ -2477,12 +2477,39 @@ def main() -> None:
     # Backend health monitor with circuit breaker
     from turnstone.core.healthcheck import BackendHealthMonitor
 
+    def _handle_model_change(new_model_id: str, new_ctx: int | None) -> None:
+        """Called from health probe thread when backend model changes."""
+        cli_args = app.state.cli_model_args
+        if cli_args.get("_user_specified_model"):
+            return
+        old_model = cli_args["model"]
+        ctx = new_ctx or cli_args["context_window"]
+        log.info("Backend model changed: %s -> %s (ctx=%s)", old_model, new_model_id, ctx)
+        cli_args["model"] = new_model_id
+        cli_args["context_window"] = ctx
+        try:
+            new_reg = load_model_registry(
+                base_url=cli_args["base_url"],
+                api_key=cli_args["api_key"],
+                model=new_model_id,
+                context_window=ctx,
+                provider=cli_args["provider"],
+                storage=get_storage(),
+            )
+            registry.reload(new_reg.models, new_reg.default, new_reg.fallback, new_reg.agent_model)
+            new_reg.shutdown()
+        except Exception:
+            log.warning("Model change reload failed", exc_info=True)
+
     health_monitor = BackendHealthMonitor(
         client=client,
         probe_interval=config_store.get("health.backend_probe_interval"),
         probe_timeout=config_store.get("health.backend_probe_timeout"),
         failure_threshold=config_store.get("health.circuit_breaker_threshold"),
         cooldown=config_store.get("health.circuit_breaker_cooldown"),
+        provider=provider_name,
+        initial_model=model,
+        on_model_changed=_handle_model_change,
     )
     health_monitor.start()
 
@@ -2701,6 +2728,7 @@ def main() -> None:
         "model": model,
         "context_window": context_window,
         "provider": provider_name,
+        "_user_specified_model": bool(effective_model),
     }
 
     log.info("Server starting on http://%s:%s", args.host, args.port)

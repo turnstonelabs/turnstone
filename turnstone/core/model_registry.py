@@ -366,6 +366,28 @@ def _select_best_model(model_ids: list[str], provider: str) -> str:
     return model_ids[0]
 
 
+def _extract_context_window(model_obj: Any, provider: str) -> int | None:
+    """Extract context window from a model object returned by ``/v1/models``.
+
+    Handles Anthropic (static capability table), vLLM (``max_model_len``),
+    and llama.cpp (``meta.n_ctx_train``).  Returns ``None`` when not available.
+    """
+    if provider == "anthropic":
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        return AnthropicProvider().get_capabilities(model_obj.id).context_window
+    model_data = model_obj.model_dump()
+    max_len = model_data.get("max_model_len")
+    if isinstance(max_len, int) and max_len > 0:
+        return max_len
+    meta = model_data.get("meta")
+    if isinstance(meta, dict):
+        n_ctx = meta.get("n_ctx_train")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            return n_ctx
+    return None
+
+
 def detect_model(
     client: Any,
     log_fn: Any = print,
@@ -411,25 +433,7 @@ def detect_model(
             log_fn(f"Available models: {', '.join(all_ids)}")
             log_fn(f"Using: {m.id} (override with --model)")
 
-        ctx: int | None = None
-        if provider == "anthropic":
-            from turnstone.core.providers._anthropic import AnthropicProvider
-
-            ctx = AnthropicProvider().get_capabilities(m.id).context_window
-        else:
-            # OpenAI-compatible: extract context window from backend metadata.
-            # vLLM exposes max_model_len at the top level; llama.cpp uses
-            # meta.n_ctx_train.
-            model_data = m.model_dump()
-            max_len = model_data.get("max_model_len")
-            if isinstance(max_len, int) and max_len > 0:
-                ctx = max_len
-            else:
-                meta = model_data.get("meta")
-                if isinstance(meta, dict):
-                    n_ctx = meta.get("n_ctx_train")
-                    if isinstance(n_ctx, int) and n_ctx > 0:
-                        ctx = n_ctx
+        ctx = _extract_context_window(m, provider)
         return m.id, ctx
     except SystemExit:
         raise
@@ -530,15 +534,10 @@ def _detect_openai_compat(
         owned_by = str(dumped.get("owned_by", ""))
 
     # Context window: prefer backend metadata, fall back to static table.
-    # vLLM exposes max_model_len at the top level; llama.cpp uses
-    # meta.n_ctx_train.
-    max_len = dumped.get("max_model_len")
-    if isinstance(max_len, int) and max_len > 0:
-        result["context_window"] = max_len
-    elif meta is not None:
-        n_ctx = meta.get("n_ctx_train")
-        if isinstance(n_ctx, int) and n_ctx > 0:
-            result["context_window"] = n_ctx
+    if model_obj is not None:
+        ctx = _extract_context_window(model_obj, "openai")
+        if ctx is not None:
+            result["context_window"] = ctx
     if result["context_window"] is None:
         from turnstone.core.providers import lookup_model_capabilities
 

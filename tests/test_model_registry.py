@@ -918,3 +918,106 @@ class TestDetectModelTimeout:
         model_id, ctx = detect_model(client, provider="openai")
         assert model_id == "/models/nemotron"
         assert ctx == 262144
+
+
+class TestExtractContextWindow:
+    def test_vllm_max_model_len(self) -> None:
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = "/models/test"
+        m.model_dump.return_value = {"max_model_len": 131072}
+        assert _extract_context_window(m, "openai") == 131072
+
+    def test_llama_cpp_meta(self) -> None:
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = "test"
+        m.model_dump.return_value = {"meta": {"n_ctx_train": 8192}}
+        assert _extract_context_window(m, "openai") == 8192
+
+    def test_vllm_preferred_over_meta(self) -> None:
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = "test"
+        m.model_dump.return_value = {"max_model_len": 262144, "meta": {"n_ctx_train": 4096}}
+        assert _extract_context_window(m, "openai") == 262144
+
+    def test_no_metadata_returns_none(self) -> None:
+        from turnstone.core.model_registry import _extract_context_window
+
+        m = MagicMock()
+        m.id = "test"
+        m.model_dump.return_value = {}
+        assert _extract_context_window(m, "openai") is None
+
+
+class TestHealthMonitorModelChange:
+    def test_model_change_fires_callback(self) -> None:
+        from turnstone.core.healthcheck import BackendHealthMonitor
+
+        changes: list[tuple[str, int | None]] = []
+
+        def on_change(model_id: str, ctx: int | None) -> None:
+            changes.append((model_id, ctx))
+
+        client = MagicMock()
+        monitor = BackendHealthMonitor(
+            client=client,
+            provider="openai",
+            initial_model="model-a",
+            on_model_changed=on_change,
+        )
+
+        # Simulate probe returning a different model
+        resp = MagicMock()
+        m = MagicMock()
+        m.id = "model-b"
+        m.model_dump.return_value = {"max_model_len": 131072}
+        resp.data = [m]
+
+        monitor._check_model_change(resp)
+        assert len(changes) == 1
+        assert changes[0] == ("model-b", 131072)
+        assert monitor._last_detected_model == "model-b"
+
+    def test_same_model_no_callback(self) -> None:
+        from turnstone.core.healthcheck import BackendHealthMonitor
+
+        changes: list[tuple[str, int | None]] = []
+
+        def on_change(model_id: str, ctx: int | None) -> None:
+            changes.append((model_id, ctx))
+
+        client = MagicMock()
+        monitor = BackendHealthMonitor(
+            client=client,
+            provider="openai",
+            initial_model="model-a",
+            on_model_changed=on_change,
+        )
+
+        resp = MagicMock()
+        m = MagicMock()
+        m.id = "model-a"
+        m.model_dump.return_value = {}
+        resp.data = [m]
+
+        monitor._check_model_change(resp)
+        assert len(changes) == 0
+
+    def test_no_callback_configured(self) -> None:
+        from turnstone.core.healthcheck import BackendHealthMonitor
+
+        client = MagicMock()
+        monitor = BackendHealthMonitor(client=client, initial_model="model-a")
+
+        resp = MagicMock()
+        m = MagicMock()
+        m.id = "model-b"
+        resp.data = [m]
+
+        # Should not raise
+        monitor._check_model_change(resp)
