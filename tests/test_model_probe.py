@@ -138,7 +138,7 @@ class TestProbeModelEndpoint:
         )
         assert result["reachable"] is True
         assert result["server_type"] == "anthropic"
-        assert result["context_window"] == 200000
+        assert result["context_window"] == 1000000
 
     @patch("turnstone.core.providers.create_client")
     def test_connection_failure(self, mock_cc: MagicMock) -> None:
@@ -184,7 +184,7 @@ class TestLookupModelCapabilities:
     def test_known_anthropic_model(self) -> None:
         caps = lookup_model_capabilities("anthropic", "claude-opus-4-6")
         assert caps is not None
-        assert caps["context_window"] == 200000
+        assert caps["context_window"] == 1000000
         assert caps["thinking_mode"] == "adaptive"
 
     def test_unknown_model_returns_none(self) -> None:

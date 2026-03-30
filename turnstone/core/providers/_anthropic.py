@@ -84,7 +84,7 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
     "claude-opus-4-6": ModelCapabilities(
-        context_window=200000,
+        context_window=1000000,
         max_output_tokens=128000,
         token_param="max_tokens",
         thinking_mode="adaptive",
@@ -95,7 +95,7 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_vision=True,
     ),
     "claude-sonnet-4-6": ModelCapabilities(
-        context_window=200000,
+        context_window=1000000,
         max_output_tokens=64000,
         token_param="max_tokens",
         thinking_mode="adaptive",
@@ -129,24 +129,6 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
         supports_effort=True,
         effort_levels=("low", "medium", "high"),
         supports_web_search=True,
-        supports_vision=True,
-    ),
-    "claude-opus-4": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=32000,
-        token_param="max_tokens",
-        thinking_mode="manual",
-        supports_web_search=True,
-        supports_tool_search=True,
-        supports_vision=True,
-    ),
-    "claude-sonnet-4": ModelCapabilities(
-        context_window=200000,
-        max_output_tokens=64000,
-        token_param="max_tokens",
-        thinking_mode="manual",
-        supports_web_search=True,
-        supports_tool_search=True,
         supports_vision=True,
     ),
 }

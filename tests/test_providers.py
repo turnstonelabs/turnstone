@@ -957,7 +957,7 @@ class TestAnthropicHelpers:
 
         provider = AnthropicProvider()
         caps = provider.get_capabilities("claude-opus-4-6")
-        assert caps.context_window == 200000
+        assert caps.context_window == 1000000
         assert caps.max_output_tokens == 128000
         assert caps.thinking_mode == "adaptive"
         assert caps.supports_effort is True
@@ -966,11 +966,11 @@ class TestAnthropicHelpers:
         from turnstone.core.providers._anthropic import AnthropicProvider
 
         provider = AnthropicProvider()
-        # Prefix match: "claude-sonnet-4" matches dated variants
-        caps = provider.get_capabilities("claude-sonnet-4-20260101")
-        assert caps.context_window == 200000
+        # Prefix match: "claude-sonnet-4-6" matches dated variants
+        caps = provider.get_capabilities("claude-sonnet-4-6-20260101")
+        assert caps.context_window == 1000000
         assert caps.token_param == "max_tokens"
-        assert caps.thinking_mode == "manual"
+        assert caps.thinking_mode == "adaptive"
 
     def test_capabilities_lookup_unknown(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
@@ -1407,7 +1407,7 @@ class TestAnthropicWebSearch:
         """All Anthropic models should support native web search."""
         caps = self.provider.get_capabilities("claude-opus-4-6")
         assert caps.supports_web_search is True
-        caps = self.provider.get_capabilities("claude-sonnet-4")
+        caps = self.provider.get_capabilities("claude-sonnet-4-6")
         assert caps.supports_web_search is True
         # Unknown models use default which also has web search
         caps = self.provider.get_capabilities("claude-unknown-99")
