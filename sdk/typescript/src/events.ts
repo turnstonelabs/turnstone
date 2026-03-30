@@ -83,6 +83,8 @@ export interface StatusEvent {
   effort: string;
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
+  tool_calls_this_turn?: number;
+  turn_count?: number;
 }
 
 export interface PlanReviewEvent {

@@ -128,6 +128,8 @@ class StatusEvent(ServerEvent):
     effort: str = ""
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    tool_calls_this_turn: int = 0
+    turn_count: int = 0
 
 
 @dataclass

@@ -6,12 +6,6 @@
 /* ==========================================================================
    Header — server-specific elements
    ========================================================================== */
-#model-name {
-  font-size: 11px;
-  color: var(--fg-dim);
-  font-family: var(--font-display);
-  letter-spacing: 0.02em;
-}
 #mcp-status {
   color: var(--magenta);
   font-size: 11px;
@@ -848,6 +842,63 @@ body { position: static; }
 .pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; }
 .pane-stop:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
 [data-theme="light"] .pane-stop { color: #fff; }
+
+/* ==========================================================================
+   Per-workstream status bar — above input
+   ========================================================================== */
+.ws-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 16px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+  min-height: 22px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  transition: background 0.3s, border-color 0.3s;
+}
+.ws-sb-model {
+  font-family: var(--font-display);
+  font-weight: 500;
+  color: var(--accent);
+  font-size: 10px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-sb-tokens { color: var(--fg-dim); white-space: nowrap; }
+.ws-sb-tools  { color: var(--fg-dim); white-space: nowrap; }
+.ws-sb-turns  { color: var(--fg-dim); white-space: nowrap; margin-left: auto; }
+
+/* Context warning states */
+.ws-status-bar.ws-sb-warn .ws-sb-tokens { color: var(--yellow); font-weight: 600; }
+.ws-status-bar.ws-sb-danger .ws-sb-tokens {
+  color: var(--red);
+  font-weight: 600;
+  text-shadow: 0 0 4px var(--red-glow);
+}
+[data-theme="light"] .ws-status-bar.ws-sb-danger .ws-sb-tokens { text-shadow: none; }
+
+/* Disconnected state */
+.ws-status-bar.ws-sb-disconnected {
+  border-top: 2px solid var(--red);
+  background: rgba(248, 113, 113, 0.04);
+}
+.ws-status-bar.ws-sb-disconnected .ws-sb-tokens { color: var(--red); }
+.ws-status-bar.ws-sb-disconnected .ws-sb-model,
+.ws-status-bar.ws-sb-disconnected .ws-sb-tools,
+.ws-status-bar.ws-sb-disconnected .ws-sb-turns { opacity: 0.4; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-status-bar { transition: none; }
+}
 
 /* ==========================================================================
    Inline approval blocks

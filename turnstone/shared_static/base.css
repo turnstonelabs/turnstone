@@ -133,8 +133,6 @@ body {
   color: var(--accent);
   letter-spacing: 0.02em;
 }
-#status-bar { font-size: 11px; color: var(--fg-dim); margin-left: auto; }
-#status-bar.disconnected { color: var(--red); }
 
 .header-btn {
   background: none;

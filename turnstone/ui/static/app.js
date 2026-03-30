@@ -29,7 +29,7 @@ function Pane(wsId) {
   this.retryDelay = 1000;
   this.model = "";
   this.modelAlias = "";
-  this.statusText = "";
+  this._lastStatusEvt = null;
   this._cancelTimeout = null;
   this._forceTimeout = null;
   this._pendingEditSend = null;
@@ -133,6 +133,37 @@ Pane.prototype._createDOM = function () {
   this.messagesEl.setAttribute("aria-live", "polite");
   this.messagesEl.setAttribute("aria-label", "Chat messages");
   this.el.appendChild(this.messagesEl);
+
+  // Per-workstream status bar (above input)
+  this.statusBarEl = document.createElement("div");
+  this.statusBarEl.className = "ws-status-bar";
+  this.statusBarEl.setAttribute("role", "status");
+  this.statusBarEl.setAttribute("aria-live", "polite");
+  this.statusBarEl.setAttribute("aria-atomic", "true");
+  this.statusBarEl.setAttribute("aria-label", "Workstream status");
+
+  this._sbModel = document.createElement("span");
+  this._sbModel.className = "ws-sb-model";
+  this._sbModel.textContent = "\u2014";
+  this._sbModel.setAttribute("aria-label", "Model");
+  this._sbTokens = document.createElement("span");
+  this._sbTokens.className = "ws-sb-tokens";
+  this._sbTokens.textContent = "0 / \u2014";
+  this._sbTokens.setAttribute("aria-label", "Token usage");
+  this._sbTools = document.createElement("span");
+  this._sbTools.className = "ws-sb-tools";
+  this._sbTools.textContent = "0 tools";
+  this._sbTools.setAttribute("aria-label", "Tool calls this turn");
+  this._sbTurns = document.createElement("span");
+  this._sbTurns.className = "ws-sb-turns";
+  this._sbTurns.textContent = "turn 0";
+  this._sbTurns.setAttribute("aria-label", "Conversation turn");
+
+  this.statusBarEl.appendChild(this._sbModel);
+  this.statusBarEl.appendChild(this._sbTokens);
+  this.statusBarEl.appendChild(this._sbTools);
+  this.statusBarEl.appendChild(this._sbTurns);
+  this.el.appendChild(this.statusBarEl);
 
   // Input area
   var inputArea = document.createElement("div");
@@ -248,11 +279,8 @@ Pane.prototype.connectSSE = function (wsId) {
 
   this.evtSource.onopen = function () {
     self.retryDelay = 1000;
-    if (self.id === focusedPaneId) {
-      var statusBar = document.getElementById("status-bar");
-      statusBar.classList.remove("disconnected");
-      statusBar.textContent = self.statusText || "";
-    }
+    self.statusBarEl.classList.remove("ws-sb-disconnected");
+    if (self._lastStatusEvt) self.updateStatus(self._lastStatusEvt);
   };
 
   this.evtSource.onmessage = function (e) {
@@ -265,11 +293,8 @@ Pane.prototype.connectSSE = function (wsId) {
     self.evtSource = null;
     var loginOverlay = document.getElementById("login-overlay");
     if (loginOverlay && loginOverlay.style.display !== "none") return;
-    if (self.id === focusedPaneId) {
-      var statusBar = document.getElementById("status-bar");
-      statusBar.textContent = "Reconnecting\u2026";
-      statusBar.classList.add("disconnected");
-    }
+    self.statusBarEl.classList.add("ws-sb-disconnected");
+    self._sbTokens.textContent = "Reconnecting\u2026";
     // Only the focused pane refreshes the global workstream list to avoid
     // race conditions when multiple panes disconnect simultaneously.
     if (self.id === focusedPaneId) {
@@ -514,9 +539,8 @@ Pane.prototype.handleEvent = function (evt) {
     case "connected":
       this.model = evt.model || "";
       this.modelAlias = evt.model_alias || evt.model || "";
-      if (this.id === focusedPaneId) {
-        updateHeaderForFocusedPane();
-      }
+      this._sbModel.textContent = this.modelAlias || this.model || "";
+      this._sbModel.title = this.model || "";
       if (evt.skip_permissions) {
         var existing = document.querySelector(".skip-permissions-warning");
         if (!existing) {
@@ -1314,19 +1338,32 @@ Pane.prototype.addErrorMessage = function (text) {
 };
 
 Pane.prototype.updateStatus = function (evt) {
-  var parts = [
+  this._sbModel.textContent = this.modelAlias || this.model || "";
+  this._sbModel.title = this.model || "";
+
+  var tokenText =
     evt.total_tokens.toLocaleString() +
-      " / " +
-      evt.context_window.toLocaleString() +
-      " tokens (" +
-      evt.pct +
-      "%)",
-  ];
-  if (evt.effort !== "medium") parts.push("reasoning: " + evt.effort);
-  this.statusText = parts.join(" \u00b7 ");
-  if (this.id === focusedPaneId) {
-    document.getElementById("status-bar").textContent = this.statusText;
-  }
+    " / " +
+    evt.context_window.toLocaleString() +
+    " (" +
+    evt.pct +
+    "%)";
+  if (evt.effort && evt.effort !== "medium")
+    tokenText += " \u00b7 " + evt.effort;
+  if (evt.pct >= 95) tokenText = "\u26a0 " + tokenText;
+  else if (evt.pct >= 80) tokenText = "\u25b2 " + tokenText;
+  this._sbTokens.textContent = tokenText;
+
+  var tc = evt.tool_calls_this_turn || 0;
+  this._sbTools.textContent = tc + " tool" + (tc !== 1 ? "s" : "");
+
+  var turns = evt.turn_count || 0;
+  this._sbTurns.textContent = "turn " + turns;
+
+  this.statusBarEl.classList.toggle("ws-sb-warn", evt.pct >= 80);
+  this.statusBarEl.classList.toggle("ws-sb-danger", evt.pct >= 95);
+
+  this._lastStatusEvt = evt;
 };
 
 Pane.prototype.isNearBottom = function () {
@@ -1448,14 +1485,7 @@ function createPane(wsId) {
 }
 
 function updateHeaderForFocusedPane() {
-  var pane = getFocusedPane();
-  var modelName = document.getElementById("model-name");
-  var statusBar = document.getElementById("status-bar");
-  if (pane) {
-    modelName.textContent = pane.modelAlias || pane.model || "";
-    modelName.title = pane.model || "";
-    statusBar.textContent = pane.statusText || "";
-  }
+  // Model name and token status are now per-pane (.ws-status-bar).
 }
 
 function updatePaneHeaders() {
@@ -2381,7 +2411,8 @@ function showNewWsModal() {
 
   // Populate model dropdown
   var modelSelect = document.getElementById("new-ws-model");
-  var curModel = document.getElementById("model-name").textContent;
+  var fp = getFocusedPane();
+  var curModel = fp ? fp.modelAlias || fp.model || "" : "";
   modelSelect.textContent = "";
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";

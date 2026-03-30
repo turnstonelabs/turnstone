@@ -665,6 +665,8 @@ class Bridge:
                     effort=data.get("effort", ""),
                     cache_creation_tokens=data.get("cache_creation_tokens", 0),
                     cache_read_tokens=data.get("cache_read_tokens", 0),
+                    tool_calls_this_turn=data.get("tool_calls_this_turn", 0),
+                    turn_count=data.get("turn_count", 0),
                 ),
             )
         elif etype == "error":
