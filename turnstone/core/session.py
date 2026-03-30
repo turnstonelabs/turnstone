@@ -1094,7 +1094,7 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        visible_mems = self._get_visible_memories(limit=self._mem_cfg.fetch_limit)
+        visible_mems = self._list_visible_memories(limit=self._mem_cfg.fetch_limit)
         if visible_mems:
             context = extract_recent_context(self.messages)
             relevant = score_memories(visible_mems, context, k=self._mem_cfg.relevance_k)
@@ -3567,17 +3567,6 @@ class ChatSession:
             }
         return None
 
-    def _get_visible_memories(self, limit: int = 50) -> list[dict[str, str]]:
-        """Return memories visible to this session (scope-filtered)."""
-        global_mems = list_structured_memories(scope="global", limit=limit)
-        ws_mems = list_structured_memories(scope="workstream", scope_id=self._ws_id, limit=limit)
-        user_mems: list[dict[str, str]] = []
-        if self._user_id:
-            user_mems = list_structured_memories(scope="user", scope_id=self._user_id, limit=limit)
-        combined = global_mems + ws_mems + user_mems
-        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
-        return combined[:limit]
-
     def _visible_memory_count(self) -> int:
         """Count memories visible to this session (cheap — counts only)."""
         n = count_structured_memories(scope="global")
@@ -3585,6 +3574,40 @@ class ChatSession:
         if self._user_id:
             n += count_structured_memories(scope="user", scope_id=self._user_id)
         return n
+
+    def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
+        """List memories visible to this session with optional type filter."""
+        global_mems = list_structured_memories(mem_type=mem_type, scope="global", limit=limit)
+        ws_mems = list_structured_memories(
+            mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
+        )
+        user_mems: list[dict[str, str]] = []
+        if self._user_id:
+            user_mems = list_structured_memories(
+                mem_type=mem_type, scope="user", scope_id=self._user_id, limit=limit
+            )
+        combined = global_mems + ws_mems + user_mems
+        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
+        return combined[:limit]
+
+    def _search_visible_memories(
+        self, query: str, mem_type: str = "", limit: int = 20
+    ) -> list[dict[str, str]]:
+        """Search memories visible to this session (scope-filtered)."""
+        global_mems = search_structured_memories(
+            query, mem_type=mem_type, scope="global", limit=limit
+        )
+        ws_mems = search_structured_memories(
+            query, mem_type=mem_type, scope="workstream", scope_id=self._ws_id, limit=limit
+        )
+        user_mems: list[dict[str, str]] = []
+        if self._user_id:
+            user_mems = search_structured_memories(
+                query, mem_type=mem_type, scope="user", scope_id=self._user_id, limit=limit
+            )
+        combined = global_mems + ws_mems + user_mems
+        combined.sort(key=lambda m: m.get("updated", ""), reverse=True)
+        return combined[:limit]
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
         """Check if a metacognitive nudge should be injected.
@@ -5164,13 +5187,21 @@ class ChatSession:
                 return call_id, msg
 
             if action == "search":
-                rows = search_structured_memories(
-                    item["query"],
-                    mem_type=item.get("mem_type", ""),
-                    scope=item.get("scope", ""),
-                    scope_id=item.get("scope_id", ""),
-                    limit=item["limit"],
-                )
+                scope = item.get("scope", "")
+                if scope:
+                    rows = search_structured_memories(
+                        item["query"],
+                        mem_type=item.get("mem_type", ""),
+                        scope=scope,
+                        scope_id=item.get("scope_id", ""),
+                        limit=item["limit"],
+                    )
+                else:
+                    rows = self._search_visible_memories(
+                        item["query"],
+                        mem_type=item.get("mem_type", ""),
+                        limit=item["limit"],
+                    )
                 if rows:
                     lines = []
                     for m in rows:
@@ -5193,12 +5224,19 @@ class ChatSession:
                 return call_id, msg
 
             if action == "list":
-                rows = list_structured_memories(
-                    mem_type=item.get("mem_type", ""),
-                    scope=item.get("scope", ""),
-                    scope_id=item.get("scope_id", ""),
-                    limit=item["limit"],
-                )
+                scope = item.get("scope", "")
+                if scope:
+                    rows = list_structured_memories(
+                        mem_type=item.get("mem_type", ""),
+                        scope=scope,
+                        scope_id=item.get("scope_id", ""),
+                        limit=item["limit"],
+                    )
+                else:
+                    rows = self._list_visible_memories(
+                        mem_type=item.get("mem_type", ""),
+                        limit=item["limit"],
+                    )
                 if rows:
                     lines = []
                     for m in rows:
