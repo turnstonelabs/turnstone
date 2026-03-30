@@ -6107,6 +6107,8 @@ def main() -> None:
                     interval=_rcs.get("rebalancer.interval", 60),
                     threshold=_rcs.get("rebalancer.threshold", 0.10),
                     vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
+                    eager_migrate=_rcs.get("rebalancer.eager_migrate", False),
+                    api_token=proxy_auth_token,
                 )
                 log.info("rebalancer.configured")
         except Exception:
