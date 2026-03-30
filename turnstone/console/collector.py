@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
+    from turnstone.console.router import ConsoleRouter
     from turnstone.core.auth import ServiceTokenManager
     from turnstone.core.storage._protocol import StorageBackend
 
@@ -59,6 +60,7 @@ class ClusterCollector:
         token_manager: ServiceTokenManager | None = None,
         tls_verify: Any = True,
         tls_cert: tuple[str, str] | None = None,
+        router: ConsoleRouter | None = None,
     ):
         self._storage = storage
         self._poll_interval = poll_interval
@@ -66,6 +68,7 @@ class ClusterCollector:
         self._max_poll_workers = max_poll_workers
         self._http_timeout = http_timeout
         self._token_manager = token_manager
+        self._router = router
         # Static auth header — only used when no token_manager is present.
         # When a token_manager exists, auth is injected per-request via
         # extra_headers in _poll_all_nodes to avoid stale JWT expiry.
@@ -190,6 +193,14 @@ class ClusterCollector:
                 log.info("Lost node: %s", nid)
         for event in pending_events:
             self._fanout(event)
+
+        # Notify the routing layer so it can refresh its hash-ring cache
+        # when the rebalancer has published a new version.
+        if self._router is not None:
+            try:
+                self._router.check_version()
+            except Exception:
+                log.debug("Router version check failed", exc_info=True)
 
     # -- polling -------------------------------------------------------------
 

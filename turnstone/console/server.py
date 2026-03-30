@@ -20,6 +20,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import textwrap
 import urllib.parse
 from contextlib import asynccontextmanager
@@ -37,7 +38,9 @@ from starlette.staticfiles import StaticFiles
 from turnstone.api.console_spec import build_console_spec
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
+from turnstone.console.router import ConsoleRouter
 from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, AuthMiddleware, create_jwt
+from turnstone.core.hash_ring import NoAvailableNodeError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -498,6 +501,124 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Route handlers — workstream routing proxy (hash-ring)
+# ---------------------------------------------------------------------------
+
+
+async def route_create(request: Request) -> Response:
+    """POST /v1/api/route/workstreams/new — create via hash-ring routing."""
+    router: ConsoleRouter | None = request.app.state.router
+    if router is None or not router.is_ready():
+        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    pin = False
+
+    try:
+        if body.get("resume_ws"):
+            ref = router.route(body["resume_ws"])
+        elif body.get("target_node"):
+            ws_id = router.generate_ws_id_for_node(body["target_node"])
+            body["ws_id"] = ws_id
+            ref = router.route(ws_id)
+            pin = True
+        else:
+            ws_id = secrets.token_hex(16)
+            body["ws_id"] = ws_id
+            ref = router.route(ws_id)
+    except NoAvailableNodeError:
+        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+
+    resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
+
+    # 503 retry with a new ws_id that hashes to a different node
+    if resp.status_code == 503 and not pin and not body.get("resume_ws"):
+        failed_node = ref.node_id
+        for _ in range(10):
+            ws_id = secrets.token_hex(16)
+            try:
+                ref = router.route(ws_id)
+            except NoAvailableNodeError:
+                break
+            if ref.node_id != failed_node:
+                break
+        else:
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=dict(resp.headers),
+            )
+        body["ws_id"] = ws_id
+        resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
+
+    if resp.status_code == 200:
+        data = resp.json()
+        data["node_url"] = ref.url
+        data["node_id"] = ref.node_id
+        return JSONResponse(data)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=dict(resp.headers),
+    )
+
+
+async def route_proxy(request: Request) -> Response:
+    """Generic routing proxy for send/approve/cancel/command/close."""
+    router: ConsoleRouter | None = request.app.state.router
+    if router is None or not router.is_ready():
+        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    ws_id = body.get("ws_id", "")
+    try:
+        ref = router.route(ws_id)
+    except NoAvailableNodeError:
+        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+
+    # Map /v1/api/route/... → /v1/api/... on the upstream server
+    path = request.url.path
+    upstream_path = path.replace("/api/route/", "/api/", 1)
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    resp = await client.post(f"{ref.url}{upstream_path}", json=body, headers=headers)
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=dict(resp.headers),
+    )
+
+
+async def route_lookup(request: Request) -> JSONResponse:
+    """GET /v1/api/route — look up which node owns a workstream."""
+    router: ConsoleRouter | None = request.app.state.router
+    if router is None or not router.is_ready():
+        return JSONResponse({"error": "Cluster routing not initialized"}, status_code=503)
+
+    ws_id = request.query_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id required"}, status_code=400)
+
+    try:
+        ref = router.route(ws_id)
+    except NoAvailableNodeError:
+        return JSONResponse({"error": "No available node for routing"}, status_code=503)
+
+    return JSONResponse({"node_url": ref.url, "node_id": ref.node_id})
+
+
+# ---------------------------------------------------------------------------
 # Route handlers — reverse proxy
 # ---------------------------------------------------------------------------
 
@@ -762,6 +883,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         ),
         verify=_proxy_verify,
     )
+    # Populate hash-ring routing cache if a router is configured
+    _router: ConsoleRouter | None = getattr(app.state, "router", None)
+    if _router is not None:
+        _router.refresh_cache()
+        if not _router.is_ready():
+            log.warning("Router cache is empty after refresh — no nodes assigned")
     # Start scheduler if configured
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
@@ -5340,6 +5467,7 @@ def create_app(
     cors_origins: list[str] | None = None,
     tls_manager: Any = None,
     console_url: str = "",
+    router: ConsoleRouter | None = None,
 ) -> Starlette:
     """Build the Starlette ASGI application for the console dashboard."""
     _spec = build_console_spec()
@@ -5359,6 +5487,14 @@ def create_app(
                     Route("/api/cluster/node/{node_id}", cluster_node_detail),
                     Route("/api/cluster/snapshot", cluster_snapshot),
                     Route("/api/cluster/events", cluster_events_sse),
+                    # Workstream routing (proxy to server nodes via hash ring)
+                    Route("/api/route/workstreams/new", route_create, methods=["POST"]),
+                    Route("/api/route/send", route_proxy, methods=["POST"]),
+                    Route("/api/route/approve", route_proxy, methods=["POST"]),
+                    Route("/api/route/cancel", route_proxy, methods=["POST"]),
+                    Route("/api/route/command", route_proxy, methods=["POST"]),
+                    Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
+                    Route("/api/route", route_lookup),
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
@@ -5639,6 +5775,7 @@ def create_app(
     app.state.proxy_token_mgr = proxy_token_mgr
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
+    app.state.router = router
 
     # Mount ACME responder whenever a TLS manager is configured.
     # ACMEResponder (lacme 1.0.2+) serves /ca.pem natively.
@@ -5795,11 +5932,14 @@ def main() -> None:
         )
         log.info("console.collector_token_manager_created")
 
+    router = ConsoleRouter(storage=auth_storage)
+
     collector = ClusterCollector(
         storage=auth_storage,
         poll_interval=args.poll_interval,
         auth_token=collector_token if collector_token_mgr is None else "",
         token_manager=collector_token_mgr,
+        router=router,
     )
     collector.start()
 
@@ -5898,6 +6038,7 @@ def main() -> None:
         cors_origins=cors_origins,
         tls_manager=tls_mgr,
         console_url=console_url,
+        router=router,
     )
 
     log.info("Console starting on %s", console_url)

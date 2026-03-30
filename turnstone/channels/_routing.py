@@ -45,18 +45,27 @@ class ChannelRouter:
         auto_approve_tools: list[str] | None = None,
         skill: str = "",
         api_token: str = "",
+        console_url: str = "",
     ) -> None:
         self._server_url = server_url.rstrip("/")
+        self._console_url = console_url.rstrip("/") if console_url else ""
         self._storage = storage
         self._auto_approve = auto_approve
         self._auto_approve_tools: list[str] = auto_approve_tools or []
         self._skill = skill
         self._create_locks: dict[str, asyncio.Lock] = {}
+        # Per-workstream node URLs from console routing responses.
+        # Populated when console_url is set and the create response
+        # includes node_url.
+        self._node_urls: dict[str, str] = {}
         headers: dict[str, str] = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
+        # When a console_url is configured, control-plane POSTs go to the
+        # console's routing proxy; otherwise they go directly to the server.
+        base = self._console_url if self._console_url else self._server_url
         self._client = httpx.AsyncClient(
-            base_url=self._server_url,
+            base_url=base,
             headers=headers,
             timeout=_WS_CREATE_TIMEOUT,
         )
@@ -70,9 +79,18 @@ class ChannelRouter:
 
     # -- internal helpers ----------------------------------------------------
 
+    def _route_path(self, path: str) -> str:
+        """Map a server API path to the console routing proxy path when needed.
+
+        E.g. ``/api/send`` → ``/api/route/send`` when console routing is active.
+        """
+        if self._console_url and path.startswith("/api/"):
+            return path.replace("/api/", "/api/route/", 1)
+        return path
+
     async def _post(self, path: str, body: dict[str, Any]) -> httpx.Response:
-        """POST JSON to the server and return the response."""
-        resp = await self._client.post(path, json=body)
+        """POST JSON to the server (or console proxy) and return the response."""
+        resp = await self._client.post(self._route_path(path), json=body)
         resp.raise_for_status()
         return resp
 
@@ -166,6 +184,12 @@ class ChannelRouter:
                 msg_err = "workstream creation returned empty ws_id"
                 raise RuntimeError(msg_err)
 
+            # When routed through the console, capture the node URL for
+            # direct SSE connections.
+            node_url = data.get("node_url", "")
+            if node_url:
+                self._node_urls[ws_id] = node_url.rstrip("/")
+
             # 3. Send the initial message if this is a brand-new workstream.
             if initial_message and not resume_ws:
                 await self._post("/api/send", {"ws_id": ws_id, "message": initial_message})
@@ -182,6 +206,14 @@ class ChannelRouter:
             )
 
             return ws_id, True
+
+    def get_node_url(self, ws_id: str) -> str:
+        """Return the direct server URL for SSE connections to *ws_id*.
+
+        When routing through a console, this is the ``node_url`` from the
+        create response.  Otherwise, falls back to the configured server_url.
+        """
+        return self._node_urls.get(ws_id, self._server_url)
 
     # -- user resolution -----------------------------------------------------
 

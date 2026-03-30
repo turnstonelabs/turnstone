@@ -28,6 +28,13 @@ def main() -> None:
         default=os.environ.get("TURNSTONE_SERVER_URL", "http://localhost:8080"),
         help="Turnstone server URL (default: $TURNSTONE_SERVER_URL or http://localhost:8080)",
     )
+    parser.add_argument(
+        "--console-url",
+        default=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
+        help="Console URL for multi-node routing (default: $TURNSTONE_CONSOLE_URL). "
+        "When set, control-plane POSTs route through the console; "
+        "SSE connects to node_url from the create response.",
+    )
 
     # -- Discord -------------------------------------------------------------
     parser.add_argument(
@@ -118,6 +125,7 @@ def main() -> None:
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
 
     server_url: str = args.server_url
+    console_url: str = args.console_url
 
     # -- Adapter selection ---------------------------------------------------
     adapters_configured = False
@@ -158,7 +166,9 @@ def main() -> None:
         )
 
         storage = get_storage()
-        bot = TurnstoneBot(config, server_url, storage, api_token=auth_token)
+        bot = TurnstoneBot(
+            config, server_url, storage, api_token=auth_token, console_url=console_url
+        )
         adapters = {"discord": bot}
 
         # Create HTTP app for notification delivery

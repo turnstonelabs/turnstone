@@ -145,12 +145,14 @@ class TurnstoneBot:
         storage: StorageBackend,
         *,
         api_token: str = "",
+        console_url: str = "",
     ) -> None:
         import discord
         from discord.ext import commands
 
         self.config = config
         self._server_url = server_url.rstrip("/")
+        self._console_url = console_url.rstrip("/") if console_url else ""
         self._api_token = api_token
         self.storage = storage
         self.router = ChannelRouter(
@@ -160,6 +162,7 @@ class TurnstoneBot:
             auto_approve_tools=list(config.auto_approve_tools),
             skill=config.skill,
             api_token=api_token,
+            console_url=console_url,
         )
 
         self._subscribed_ws: set[str] = set()
@@ -308,7 +311,10 @@ class TurnstoneBot:
         """
         import httpx_sse
 
-        url = f"{self._server_url}/api/events"
+        # When routing through the console, connect SSE directly to the
+        # assigned server node (node_url from the create response).
+        node_base = self.router.get_node_url(ws_id)
+        url = f"{node_base}/api/events"
         delay = _SSE_RECONNECT_DELAY
 
         while True:

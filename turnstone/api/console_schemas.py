@@ -876,3 +876,23 @@ class AvailableModelInfo(BaseModel):
 
 class ListAvailableModelsResponse(BaseModel):
     models: list[AvailableModelInfo] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+
+class RouteResponse(BaseModel):
+    """Route lookup result — which node owns a workstream."""
+
+    node_url: str
+    node_id: str
+
+
+class RouteCreateResponse(BaseModel):
+    """Workstream creation via the routing proxy."""
+
+    ws_id: str = ""
+    node_url: str = ""
+    node_id: str = ""
