@@ -3814,6 +3814,10 @@ class ChatSession:
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in ("global", "workstream", "user"):
                 scope = ""
+            if scope:
+                scope_err = self._validate_scope(scope, call_id)
+                if scope_err:
+                    return scope_err
             scope_id = self._resolve_scope_id(scope) if scope else ""
             limit = args.get("limit", 20)
             if isinstance(limit, str):
@@ -3843,6 +3847,10 @@ class ChatSession:
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in ("global", "workstream", "user"):
                 scope = ""
+            if scope:
+                scope_err = self._validate_scope(scope, call_id)
+                if scope_err:
+                    return scope_err
             scope_id = self._resolve_scope_id(scope) if scope else ""
             limit = args.get("limit", 20)
             if isinstance(limit, str):
