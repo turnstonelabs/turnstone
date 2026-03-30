@@ -183,16 +183,21 @@ class MessageCog:
                 auto_archive_duration=self.ts.config.thread_auto_archive,  # type: ignore[arg-type]
             )
 
-            # Create workstream with the initial message.
+            # Create workstream WITHOUT initial_message — subscribe to events
+            # first, then send the message.  Sending initial_message through
+            # the bridge races with subscription: Redis pub/sub is fire-and-
+            # forget, so response events published before subscribe completes
+            # are silently dropped.
             ws_id, _is_new = await self.ts.router.get_or_create_workstream(
                 channel_type="discord",
                 channel_id=str(thread.id),
                 name=thread_name,
                 model=self.ts.config.model,
-                initial_message=content,
+                initial_message="",
             )
 
             await self.ts.subscribe_ws(ws_id, thread)
+            await self.ts.router.send_message(ws_id, content)
             log.info(
                 "discord.workstream_created",
                 ws_id=ws_id,
@@ -362,10 +367,11 @@ class MessageCog:
             channel_id=str(thread.id),
             name=thread_name,
             model=self.ts.config.model,
-            initial_message=message,
+            initial_message="",
         )
 
         await self.ts.subscribe_ws(ws_id, thread)
+        await self.ts.router.send_message(ws_id, message)
 
         await interaction.followup.send(
             f"Workstream started in {thread.mention}",
