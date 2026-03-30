@@ -2769,7 +2769,12 @@ def main() -> None:
             else:
                 log.warning("TLS enabled but no cert available")
         except Exception as exc:
-            log.warning("TLS initialization failed — serving plain HTTP: %s", exc)
+            log.warning(
+                "TLS initialization failed — serving plain HTTP: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            log.debug("TLS init traceback", exc_info=True)
 
     print("Press Ctrl+C to stop.")
 
