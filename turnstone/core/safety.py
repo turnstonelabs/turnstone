@@ -32,6 +32,9 @@ BLOCKED_PATTERNS = [
     "mv / ",
     "chmod -R 777 /",
     "chown -R ",
+    # Credential exfiltration via procfs
+    "/proc/1/environ",
+    "/proc/self/environ",
 ]
 
 

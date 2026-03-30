@@ -277,6 +277,20 @@ _HIGH_RULES: list[_HeuristicRule] = [
         reasoning_template="Command initiates a remote SSH or SCP connection.",
     ),
     _HeuristicRule(
+        name="proc-environ-exfil",
+        risk_level="critical",
+        confidence=0.95,
+        recommendation="deny",
+        tool_pattern="bash",
+        arg_patterns=[r"/proc/\d+/environ", r"/proc/self/environ"],
+        intent_template="Process environment exfiltration: {arg_snippet}",
+        reasoning_template=(
+            "Reading /proc/*/environ exposes all environment variables of the "
+            "target process, which may include database credentials, API keys, "
+            "and JWT secrets. This is a credential exfiltration vector."
+        ),
+    ),
+    _HeuristicRule(
         name="credential-recon",
         risk_level="high",
         confidence=0.80,
