@@ -24,7 +24,7 @@ partition "Phase 1: Prepare" #E8F5E9 {
         :Dispatch to _prepare_{func_name}();
 
         note right
-            **Dispatch table (19 tools):**
+            **Dispatch table (19 built-in + tool_search):**
             ┌───────────────┬──────────────────┐
             │ Tool          │ Needs Approval?  │
             ├───────────────┼──────────────────┤
@@ -39,13 +39,13 @@ partition "Phase 1: Prepare" #E8F5E9 {
             │ web_fetch     │ ✗ Auto-approve   │
             │ web_search    │ ✗ Auto-approve   │
             │ tool_search   │ ✗ Auto-approve   │
-            │ task          │ ✓ Yes            │
-            │ plan          │ ✓ Yes            │
+            │ task_agent    │ ✓ Yes            │
+            │ plan_agent    │ ✓ Yes            │
             │ memory        │ ✗ Auto-approve   │
             │ recall        │ ✗ Auto-approve   │
             │ notify        │ ✗ Auto-approve   │
-            │ watch         │ ✓ Yes            │
-            │ skill         │ ✓ Yes            │
+            │ watch         │ ✓ create only    │
+            │ skill         │ ✓ load only      │
             │ read_resource │ ✓ Yes            │
             │ use_prompt    │ ✓ Yes            │
             ├───────────────┼──────────────────┤

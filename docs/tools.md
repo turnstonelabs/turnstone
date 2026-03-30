@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 19
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
