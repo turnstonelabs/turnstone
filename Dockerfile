@@ -15,7 +15,7 @@ RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
 
 # System dependencies: psycopg (libpq5), developer tooling for agent workflows
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    libpq5 git curl jq man-db manpages \
+    libpq5 git curl jq man-db manpages procps file \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user
