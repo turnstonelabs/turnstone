@@ -2151,101 +2151,34 @@ window.onLogout = function () {
 };
 
 // ===========================================================================
-//  7. Theme + hamburger menu
+//  7. Theme toggle
 // ===========================================================================
 
-function updateThemeMenuItem() {
-  var isLight = document.documentElement.dataset.theme === "light";
-  document.getElementById("theme-menu-icon").textContent = isLight
-    ? "\u263E"
-    : "\u2600";
-  document.getElementById("theme-menu-label").textContent = isLight
-    ? "Dark mode"
-    : "Light mode";
-  document
-    .getElementById("theme-menu-item")
-    .setAttribute(
+window.onThemeChange = function (next) {
+  var btn = document.getElementById("theme-toggle");
+  if (btn) {
+    var isLight = next === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
       "aria-label",
-      isLight
-        ? "Switch to dark mode (currently light)"
-        : "Switch to light mode (currently dark)",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
     );
-}
-window.onThemeChange = function () {
-  updateThemeMenuItem();
+  }
   reRenderAllMermaid();
 };
-updateThemeMenuItem();
-
-function toggleHamburger() {
-  var menu = document.getElementById("hamburger-menu");
-  var btn = document.getElementById("hamburger-btn");
-  var open = menu.classList.toggle("open");
-  btn.setAttribute("aria-expanded", open ? "true" : "false");
-  if (open) {
-    updateThemeMenuItem();
-    var first = menu.querySelector(".hmenu-item");
-    if (first) first.focus();
+(function () {
+  var btn = document.getElementById("theme-toggle");
+  if (btn) {
+    var isLight = document.documentElement.dataset.theme === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
+      "aria-label",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
+    );
   }
-}
-function closeHamburger() {
-  document.getElementById("hamburger-menu").classList.remove("open");
-  document
-    .getElementById("hamburger-btn")
-    .setAttribute("aria-expanded", "false");
-}
-function hamburgerDashboard() {
-  closeHamburger();
-  toggleDashboard();
-}
-function hamburgerTheme() {
-  toggleTheme();
-  closeHamburger();
-}
-
-// Close on outside click
-document.addEventListener("click", function (e) {
-  var wrap = document.getElementById("hamburger-wrap");
-  if (wrap && !wrap.contains(e.target)) closeHamburger();
-});
-// Keyboard nav within menu
-document
-  .getElementById("hamburger-menu")
-  .addEventListener("keydown", function (e) {
-    var items = Array.from(this.querySelectorAll(".hmenu-item"));
-    var idx = items.indexOf(document.activeElement);
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      items[(idx + 1) % items.length].focus();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      items[(idx - 1 + items.length) % items.length].focus();
-    } else if (e.key === "Home") {
-      e.preventDefault();
-      items[0].focus();
-    } else if (e.key === "End") {
-      e.preventDefault();
-      items[items.length - 1].focus();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      closeHamburger();
-      document.getElementById("hamburger-btn").focus();
-    } else if (e.key === "Tab") {
-      closeHamburger();
-    }
-  });
-// Escape when focus is on the button itself
-document
-  .getElementById("hamburger-btn")
-  .addEventListener("keydown", function (e) {
-    if (
-      e.key === "Escape" &&
-      document.getElementById("hamburger-menu").classList.contains("open")
-    ) {
-      e.preventDefault();
-      closeHamburger();
-    }
-  });
+})();
 
 // ===========================================================================
 //  8. Tab bar
@@ -2641,7 +2574,6 @@ function closeWorkstream(wsId) {
 
 function showDashboard() {
   dashboardVisible = true;
-  closeHamburger();
   document.getElementById("dashboard").classList.add("active");
   document.getElementById("header").inert = true;
   document.getElementById("tab-bar").inert = true;
@@ -3350,16 +3282,6 @@ document.addEventListener("keydown", function (e) {
   var nwsOverlay = document.getElementById("new-ws-overlay");
   if (nwsOverlay && nwsOverlay.style.display !== "none") return;
 
-  // Escape: close hamburger first, then dashboard
-  if (
-    e.key === "Escape" &&
-    document.getElementById("hamburger-menu").classList.contains("open")
-  ) {
-    e.preventDefault();
-    closeHamburger();
-    document.getElementById("hamburger-btn").focus();
-    return;
-  }
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
     hideDashboard();

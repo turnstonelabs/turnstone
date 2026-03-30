@@ -13,24 +13,10 @@
 </head>
 <body>
 <div id="header">
-  <div id="hamburger-wrap">
-    <button id="hamburger-btn" onclick="toggleHamburger()" aria-label="Menu" aria-haspopup="true" aria-expanded="false" aria-controls="hamburger-menu">
-      <span></span><span></span><span></span>
-    </button>
-    <div id="hamburger-menu" role="menu">
-      <button class="hmenu-item" role="menuitem" tabindex="-1" onclick="hamburgerDashboard()">
-        <span class="hmenu-icon">&#8962;</span> Dashboard
-      </button>
-      <div class="hmenu-sep" role="separator"></div>
-      <button class="hmenu-item" role="menuitem" tabindex="-1" id="theme-menu-item" onclick="hamburgerTheme()">
-        <span class="hmenu-icon" id="theme-menu-icon">&#9790;</span> <span id="theme-menu-label">Light mode</span>
-      </button>
-    </div>
-  </div>
   <h1>turnstone</h1>
   <span id="mcp-status" role="status" aria-live="polite"></span>
   <span id="health-indicator" class="health-ok" role="status" aria-live="polite" aria-atomic="true"></span>
-  <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
+  <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
 </div>
 
 <div id="tab-bar" role="toolbar" aria-label="Workstreams">
@@ -132,7 +118,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
   ]},
   { title: "Navigation", keys: [
     { desc: "Navigate table rows", badge: '<span class="kb-key">\u2191</span> <span class="kb-key">\u2193</span>' },
-    { desc: "Close dashboard / menu", badge: '<span class="kb-key">Esc</span>' }
+    { desc: "Close dashboard", badge: '<span class="kb-key">Esc</span>' }
   ]},
   { title: "General", keys: [
     { desc: "Show this help", badge: '<span class="kb-key">?</span>' }

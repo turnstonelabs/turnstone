@@ -43,68 +43,14 @@
 }
 
 /* ==========================================================================
-   Hamburger menu
+   Theme toggle
    ========================================================================== */
-#hamburger-wrap { position: relative; }
-#hamburger-btn {
-  background: none;
-  border: 1px solid var(--border-strong);
-  color: var(--fg);
-  border-radius: var(--radius-sm);
-  width: 32px;
-  height: 32px;
-  cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  padding: 0;
-  flex-shrink: 0;
-  transition: background 0.15s, border-color 0.15s;
-}
-#hamburger-btn:hover { background: var(--bg-highlight); border-color: var(--accent-dim); }
-#hamburger-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-#hamburger-btn span { display: block; width: 14px; height: 2px; background: var(--fg); border-radius: 1px; }
-#hamburger-menu {
-  display: none;
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  background: var(--bg-surface);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  min-width: 180px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  z-index: 40;
-  overflow: hidden;
-}
-[data-theme="light"] #hamburger-menu { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
-#hamburger-menu.open { display: block; }
-.hmenu-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 10px 14px;
-  background: none;
-  border: none;
-  color: var(--fg);
-  font: inherit;
-  font-family: var(--font-display);
-  font-size: 13px;
-  cursor: pointer;
-  text-align: left;
-  white-space: nowrap;
-  transition: background 0.1s;
-}
-.hmenu-item:hover { background: var(--bg-highlight); }
-.hmenu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.hmenu-item .hmenu-icon { width: 16px; text-align: center; font-size: 14px; opacity: 0.8; }
-.hmenu-sep { height: 1px; background: var(--border-strong); margin: 4px 0; }
+#theme-toggle { color: var(--fg); margin-left: auto; font-size: 14px; line-height: 1; }
+
+/* ==========================================================================
+   Mobile overrides
+   ========================================================================== */
 @media (max-width: 600px) {
-  #hamburger-btn { width: 40px; height: 40px; }
-  .hmenu-item { padding: 12px 14px; }
   .ws-tab .tab-close { opacity: 1; padding: 4px 6px; font-size: 16px; }
   #split-btn { display: none; }
 }
@@ -1514,11 +1460,11 @@ body { position: static; }
   .judge-spinner-dot { animation: none; opacity: 1; }
   .thinking-indicator::after { animation: none; content: '...'; }
   .ws-tab, .ws-tab .tab-close, #new-tab-btn, #split-btn,
-  .hmenu-item, .dashboard-card,
+  .dashboard-card,
   .approval-btn, .approval-feedback-input,
   #plan-buttons button, .pane-input-area button,
   .dashboard-new-btn, .dashboard-input,
-  #health-indicator, #hamburger-btn,
+  #health-indicator, #theme-toggle,
   #mcp-status, .msg-assistant tbody tr,
   .msg-assistant .img-placeholder,
   #new-ws-cancel, #new-ws-submit,
