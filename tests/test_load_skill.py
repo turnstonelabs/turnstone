@@ -436,7 +436,7 @@ class TestSkillCatalogDisclosure:
                 "turnstone.core.session.list_skills_by_activation",
                 return_value=search_skills or [],
             ),
-            patch.object(session, "_get_visible_memories", return_value=[]),
+            patch.object(session, "_list_visible_memories", return_value=[]),
         ):
             session._init_system_messages()
 

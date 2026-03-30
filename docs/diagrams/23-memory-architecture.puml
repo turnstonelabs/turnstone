@@ -61,7 +61,7 @@ end
 
 Session -> Session : _init_system_messages()\nevery conversation turn
 
-Session -> Session : _get_visible_memories(\nlimit=fetch_limit)
+Session -> Session : _list_visible_memories(\nlimit=fetch_limit)
 note right
   **Scope resolution:**
   1. global scope (always)
