@@ -153,6 +153,9 @@ class AsyncTurnstoneConsole(_BaseClient):
         initial_message: str = "",
         skill: str = "",
         resume_ws: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        user_id: str = "",
     ) -> ConsoleCreateWsResponse:
         body: dict[str, Any] = {}
         if node_id:
@@ -167,12 +170,113 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["skill"] = skill
         if resume_ws:
             body["resume_ws"] = resume_ws
+        if auto_approve:
+            body["auto_approve"] = True
+        if auto_approve_tools:
+            body["auto_approve_tools"] = auto_approve_tools
+        if user_id:
+            body["user_id"] = user_id
         return await self._request(
             "POST",
             "/v1/api/cluster/workstreams/new",
             json_body=body,
             response_model=ConsoleCreateWsResponse,
         )
+
+    # -- routing proxy -------------------------------------------------------
+
+    async def route_create_workstream(
+        self,
+        *,
+        name: str = "",
+        model: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        initial_message: str = "",
+        skill: str = "",
+        resume_ws: str = "",
+        target_node: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """Create a workstream via the console's routing proxy.
+
+        Posts to /v1/api/route/workstreams/new. Returns the full response
+        dict including node_url and node_id.
+        """
+        body: dict[str, Any] = {}
+        if name:
+            body["name"] = name
+        if model:
+            body["model"] = model
+        if auto_approve:
+            body["auto_approve"] = True
+        if auto_approve_tools:
+            body["auto_approve_tools"] = auto_approve_tools
+        if initial_message:
+            body["initial_message"] = initial_message
+        if skill:
+            body["skill"] = skill
+        if resume_ws:
+            body["resume_ws"] = resume_ws
+        if target_node:
+            body["target_node"] = target_node
+        if user_id:
+            body["user_id"] = user_id
+        return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
+
+    async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
+        """Send a message via the routing proxy."""
+        return await self._request(
+            "POST", "/v1/api/route/send", json_body={"message": message, "ws_id": ws_id}
+        )
+
+    async def route_approve(
+        self,
+        *,
+        ws_id: str,
+        approved: bool = True,
+        feedback: str = "",
+        always: bool = False,
+    ) -> dict[str, Any]:
+        """Approve or reject a pending tool call via the routing proxy."""
+        body: dict[str, Any] = {"ws_id": ws_id, "approved": approved}
+        if feedback:
+            body["feedback"] = feedback
+        if always:
+            body["always"] = True
+        return await self._request("POST", "/v1/api/route/approve", json_body=body)
+
+    async def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
+        """Send plan feedback via the routing proxy."""
+        return await self._request(
+            "POST", "/v1/api/route/plan", json_body={"ws_id": ws_id, "feedback": feedback}
+        )
+
+    async def route_close(self, ws_id: str) -> dict[str, Any]:
+        """Close a workstream via the routing proxy."""
+        return await self._request(
+            "POST", "/v1/api/route/workstreams/close", json_body={"ws_id": ws_id}
+        )
+
+    async def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
+        """Cancel the current turn via the routing proxy."""
+        body: dict[str, Any] = {"ws_id": ws_id}
+        if force:
+            body["force"] = True
+        return await self._request("POST", "/v1/api/route/cancel", json_body=body)
+
+    async def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
+        """Send a slash command via the routing proxy."""
+        return await self._request(
+            "POST", "/v1/api/route/command", json_body={"ws_id": ws_id, "command": command}
+        )
+
+    async def route_lookup(self, ws_id: str) -> dict[str, Any]:
+        """Look up which server node owns a workstream.
+
+        Returns {"node_url": "...", "node_id": "..."}.
+        """
+        return await self._request("GET", "/v1/api/route", params={"ws_id": ws_id})
 
     # -- streaming -----------------------------------------------------------
 
@@ -921,6 +1025,9 @@ class TurnstoneConsole:
         initial_message: str = "",
         skill: str = "",
         resume_ws: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        user_id: str = "",
     ) -> ConsoleCreateWsResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -930,8 +1037,72 @@ class TurnstoneConsole:
                 initial_message=initial_message,
                 skill=skill,
                 resume_ws=resume_ws,
+                auto_approve=auto_approve,
+                auto_approve_tools=auto_approve_tools,
+                user_id=user_id,
             )
         )
+
+    # -- routing proxy -------------------------------------------------------
+
+    def route_create_workstream(
+        self,
+        *,
+        name: str = "",
+        model: str = "",
+        auto_approve: bool = False,
+        auto_approve_tools: str = "",
+        initial_message: str = "",
+        skill: str = "",
+        resume_ws: str = "",
+        target_node: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        return self._runner.run(
+            self._async.route_create_workstream(
+                name=name,
+                model=model,
+                auto_approve=auto_approve,
+                auto_approve_tools=auto_approve_tools,
+                initial_message=initial_message,
+                skill=skill,
+                resume_ws=resume_ws,
+                target_node=target_node,
+                user_id=user_id,
+            )
+        )
+
+    def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_send(message, ws_id))
+
+    def route_approve(
+        self,
+        *,
+        ws_id: str,
+        approved: bool = True,
+        feedback: str = "",
+        always: bool = False,
+    ) -> dict[str, Any]:
+        return self._runner.run(
+            self._async.route_approve(
+                ws_id=ws_id, approved=approved, feedback=feedback, always=always
+            )
+        )
+
+    def route_plan_feedback(self, *, ws_id: str, feedback: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_plan_feedback(ws_id=ws_id, feedback=feedback))
+
+    def route_close(self, ws_id: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_close(ws_id))
+
+    def route_cancel(self, ws_id: str, *, force: bool = False) -> dict[str, Any]:
+        return self._runner.run(self._async.route_cancel(ws_id, force=force))
+
+    def route_command(self, *, ws_id: str, command: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_command(ws_id=ws_id, command=command))
+
+    def route_lookup(self, ws_id: str) -> dict[str, Any]:
+        return self._runner.run(self._async.route_lookup(ws_id))
 
     # -- streaming -----------------------------------------------------------
 

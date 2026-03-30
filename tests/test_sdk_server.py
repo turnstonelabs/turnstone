@@ -279,3 +279,54 @@ async def test_request_body_correct():
         client = AsyncTurnstoneServer(httpx_client=hc)
         await client.send("Hello world", "ws_123")
         assert captured_body == {"message": "Hello world", "ws_id": "ws_123"}
+
+
+# ---------------------------------------------------------------------------
+# create_workstream extended params
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_create_workstream_extended_params():
+    """New optional params appear in JSON body only when non-empty."""
+    captured_body: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(200, json={"ws_id": "ws_ext", "name": "ext"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.create_workstream(
+            name="ext",
+            initial_message="hi",
+            auto_approve_tools="read_file,write_file",
+            user_id="u42",
+            ws_id="ws_custom",
+        )
+        assert captured_body["name"] == "ext"
+        assert captured_body["initial_message"] == "hi"
+        assert captured_body["auto_approve_tools"] == "read_file,write_file"
+        assert captured_body["user_id"] == "u42"
+        assert captured_body["ws_id"] == "ws_custom"
+
+
+@pytest.mark.anyio
+async def test_create_workstream_omits_empty_params():
+    """Empty-string params should NOT appear in the JSON body."""
+    captured_body: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_body.update(json.loads(request.content))
+        return httpx.Response(200, json={"ws_id": "ws_min", "name": "min"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.create_workstream(name="min")
+        assert captured_body == {"name": "min"}
+        assert "initial_message" not in captured_body
+        assert "auto_approve_tools" not in captured_body
+        assert "user_id" not in captured_body
+        assert "ws_id" not in captured_body

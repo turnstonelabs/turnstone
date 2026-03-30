@@ -92,6 +92,10 @@ class AsyncTurnstoneServer(_BaseClient):
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
+        initial_message: str = "",
+        auto_approve_tools: str = "",
+        user_id: str = "",
+        ws_id: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -104,6 +108,14 @@ class AsyncTurnstoneServer(_BaseClient):
             body["resume_ws"] = resume_ws
         if skill:
             body["skill"] = skill
+        if initial_message:
+            body["initial_message"] = initial_message
+        if auto_approve_tools:
+            body["auto_approve_tools"] = auto_approve_tools
+        if user_id:
+            body["user_id"] = user_id
+        if ws_id:
+            body["ws_id"] = ws_id
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -439,6 +451,10 @@ class TurnstoneServer:
         auto_approve: bool = False,
         resume_ws: str = "",
         skill: str = "",
+        initial_message: str = "",
+        auto_approve_tools: str = "",
+        user_id: str = "",
+        ws_id: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -447,6 +463,10 @@ class TurnstoneServer:
                 auto_approve=auto_approve,
                 resume_ws=resume_ws,
                 skill=skill,
+                initial_message=initial_message,
+                auto_approve_tools=auto_approve_tools,
+                user_id=user_id,
+                ws_id=ws_id,
             )
         )
 
