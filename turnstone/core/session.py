@@ -40,6 +40,7 @@ from turnstone.core.memory import (
     delete_structured_memory,
     delete_workstream,
     get_skill_by_name,
+    get_structured_memory_by_name,
     get_workstream_display_name,
     list_default_skills,
     list_skills_by_activation,
@@ -3687,6 +3688,51 @@ class ChatSession:
                 "scope_id": scope_id,
             }
 
+        if action == "get":
+            name = normalize_key((args.get("name") or args.get("key") or "").strip())
+            if not name:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory get: missing name",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": "Error: 'name' is required for get",
+                }
+            explicit_scope = (args.get("scope") or "").strip().lower()
+            valid_scopes = ("global", "workstream", "user")
+            if explicit_scope and explicit_scope not in valid_scopes:
+                return {
+                    "call_id": call_id,
+                    "func_name": "memory",
+                    "header": "\u2717 memory get: invalid scope",
+                    "preview": "",
+                    "needs_approval": False,
+                    "error": f"Error: invalid scope '{explicit_scope}'. Valid: {', '.join(valid_scopes)}",
+                }
+            if explicit_scope:
+                scope_err = self._validate_scope(explicit_scope, call_id)
+                if scope_err:
+                    return scope_err
+                scopes_to_try = [(explicit_scope, self._resolve_scope_id(explicit_scope))]
+            else:
+                scopes_to_try = []
+                for s in ("workstream", "user", "global"):
+                    sid = self._resolve_scope_id(s)
+                    if sid or s == "global":
+                        scopes_to_try.append((s, sid))
+            return {
+                "call_id": call_id,
+                "func_name": "memory",
+                "header": f"\u2699 memory get: {name}",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_memory,
+                "action": "get",
+                "name": name,
+                "scopes_to_try": scopes_to_try,
+            }
+
         if action == "delete":
             name = normalize_key((args.get("name") or args.get("key") or "").strip())
             if not name:
@@ -5075,6 +5121,29 @@ class ChatSession:
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
+            if action == "get":
+                scopes = item["scopes_to_try"]
+                mem = None
+                found_scope = ""
+                for scope, scope_id in scopes:
+                    mem = get_structured_memory_by_name(item["name"], scope, scope_id)
+                    if mem:
+                        found_scope = scope
+                        break
+                if mem:
+                    content = mem.get("content", "")
+                    desc = mem.get("description", "")
+                    mem_type = mem.get("type", "")
+                    header = f"[{mem_type}:{found_scope}] {item['name']}"
+                    if desc:
+                        header += f" — {desc}"
+                    msg = f"{header}\n\n{content}"
+                else:
+                    tried = ", ".join(s for s, _ in scopes)
+                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
+                self._report_tool_result(call_id, "memory", msg, is_error=mem is None)
+                return call_id, msg
+
             if action == "delete":
                 scopes = item["scopes_to_try"]
                 deleted = False
@@ -5106,11 +5175,14 @@ class ChatSession:
                     lines = []
                     for m in rows:
                         desc = f" — {m['description']}" if m.get("description") else ""
+                        preview = m["content"][:200]
+                        if len(m["content"]) > 200:
+                            preview += "..."
                         lines.append(
-                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n"
-                            f"    {m['content'][:500]}"
+                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
                         )
                     msg = f"Memories ({len(rows)} results):\n" + "\n".join(lines)
+                    msg += "\n\nUse memory(action='get', name='...') for full content."
                 else:
                     msg = (
                         f"No memories found for '{item['query']}'."
@@ -5131,11 +5203,14 @@ class ChatSession:
                     lines = []
                     for m in rows:
                         desc = f" — {m['description']}" if m.get("description") else ""
+                        preview = m["content"][:200]
+                        if len(m["content"]) > 200:
+                            preview += "..."
                         lines.append(
-                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n"
-                            f"    {m['content'][:500]}"
+                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
                         )
                     msg = f"Memories ({len(rows)}):\n" + "\n".join(lines)
+                    msg += "\n\nUse memory(action='get', name='...') for full content."
                 else:
                     msg = "No memories stored."
                 self._report_tool_result(call_id, "memory", msg)

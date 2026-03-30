@@ -331,6 +331,18 @@ def save_structured_memory(
         return "", None
 
 
+def get_structured_memory_by_name(
+    name: str, scope: str = "global", scope_id: str = ""
+) -> dict[str, str] | None:
+    """Retrieve a single structured memory by name+scope. Returns full content."""
+    name = normalize_key(name)
+    try:
+        return get_storage().get_structured_memory_by_name(name, scope, scope_id)
+    except Exception:
+        log.warning("Failed to get structured memory name=%s", name, exc_info=True)
+        return None
+
+
 def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "") -> bool:
     """Delete a structured memory by name+scope. Returns True if existed."""
     name = normalize_key(name)

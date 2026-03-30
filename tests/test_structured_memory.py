@@ -3,6 +3,7 @@
 from turnstone.core.memory import (
     count_structured_memories,
     delete_structured_memory,
+    get_structured_memory_by_name,
     list_structured_memories,
     normalize_key,
     save_structured_memory,
@@ -65,6 +66,29 @@ class TestSearchStructuredMemories:
         results = search_structured_memories("database")
         assert len(results) >= 1
         assert any(r["name"] == "db_host" for r in results)
+
+
+class TestGetStructuredMemoryByName:
+    def test_get_existing(self, tmp_db):
+        save_structured_memory("my_mem", "full content here that is quite long")
+        mem = get_structured_memory_by_name("my_mem", "global", "")
+        assert mem is not None
+        assert mem["content"] == "full content here that is quite long"
+        assert mem["name"] == "my_mem"
+
+    def test_get_nonexistent(self, tmp_db):
+        assert get_structured_memory_by_name("nope", "global", "") is None
+
+    def test_get_wrong_scope(self, tmp_db):
+        save_structured_memory("ws_mem", "data", scope="workstream", scope_id="ws1")
+        assert get_structured_memory_by_name("ws_mem", "global", "") is None
+        assert get_structured_memory_by_name("ws_mem", "workstream", "ws1") is not None
+
+    def test_get_normalizes_key(self, tmp_db):
+        save_structured_memory("My-Key", "value")
+        mem = get_structured_memory_by_name("My-Key", "global", "")
+        assert mem is not None
+        assert mem["name"] == "my_key"
 
 
 class TestCountStructuredMemories:

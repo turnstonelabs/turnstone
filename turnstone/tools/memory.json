@@ -1,17 +1,17 @@
 {
   "name": "memory",
-  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate to 500 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["save", "search", "delete", "list"],
+        "enum": ["save", "get", "search", "delete", "list"],
         "description": "Action to perform."
       },
       "name": {
         "type": "string",
-        "description": "Memory identifier (required for 'save' and 'delete'). Short snake_case key."
+        "description": "Memory identifier (required for 'save', 'get', and 'delete'). Short snake_case key."
       },
       "content": {
         "type": "string",
