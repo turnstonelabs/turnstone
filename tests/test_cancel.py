@@ -241,6 +241,7 @@ class TestCancelDuringToolExecution:
         assert len(tool_msgs) == 1
         assert tool_msgs[0]["tool_call_id"] == "tc_1"
         assert "Cancelled by user" in tool_msgs[0]["content"]
+        assert tool_msgs[0].get("is_error") is True
         # The assistant message with tool_calls should still be present
         assistant_msgs = [m for m in session.messages if m.get("tool_calls")]
         assert len(assistant_msgs) == 1

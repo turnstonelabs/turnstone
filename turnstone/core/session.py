@@ -1672,6 +1672,7 @@ class ChatSession:
         # Synthesize results for unanswered tool_calls
         for tc in self.messages[assistant_idx].get("tool_calls", []):
             tc_id = tc.get("id", "")
+            func_name = tc.get("function", {}).get("name", "")
             if tc_id and tc_id not in answered_ids:
                 self.messages.append(
                     {
@@ -1682,6 +1683,7 @@ class ChatSession:
                     }
                 )
                 self._msg_tokens.append(1)
+                save_message(self._ws_id, "tool", reason, func_name, tool_call_id=tc_id)
 
     # -- Rewind / retry -------------------------------------------------------
 
