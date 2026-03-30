@@ -415,13 +415,18 @@ class AnthropicProvider:
                     if isinstance(prev_content, list):
                         for block in prev_content:
                             if isinstance(block, dict) and block.get("type") == "tool_use":
-                                prev_tool_use_ids.add(block.get("id", ""))
+                                bid = block.get("id", "")
+                                if bid:
+                                    prev_tool_use_ids.add(bid)
 
                 tool_results: list[dict[str, Any]] = []
                 while i < len(messages) and messages[i]["role"] == "tool":
                     tool_msg = messages[i]
                     tc_id = tool_msg.get("tool_call_id", "")
-                    # Drop orphaned tool_results with no matching tool_use
+                    # Drop orphaned tool_results with no matching tool_use.
+                    # When prev_tool_use_ids is empty (no preceding assistant
+                    # tool_use), let all results through — avoids false drops
+                    # from unexpected message ordering.
                     if prev_tool_use_ids and tc_id not in prev_tool_use_ids:
                         log.debug(
                             "Dropping orphaned tool_result (no matching tool_use): %s",
