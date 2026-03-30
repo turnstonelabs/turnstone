@@ -1,6 +1,6 @@
 # Tools Reference
 
-turnstone exposes 18 built-in tools plus any number of external MCP tools to the
+turnstone exposes 19 built-in tools plus any number of external MCP tools to the
 LLM via the OpenAI function-calling interface. Built-in tools are defined as JSON
 files under `turnstone/tools/` and loaded at startup by `turnstone/core/tools.py`.
 MCP tools are discovered from configured MCP servers at startup by
@@ -46,12 +46,12 @@ schema plus turnstone-specific metadata keys:
 
 | Name                | Description |
 |---------------------|-------------|
-| `TOOLS`             | All 17 tool definitions (sent to the model). |
+| `TOOLS`             | All 19 tool definitions (sent to the model). |
 | `AGENT_TOOLS`       | Tools with `agent: true` -- available to plan sub-agents. Read-only tools. |
 | `TASK_AGENT_TOOLS`  | Tools with `task_agent: true` -- available to task sub-agents. Includes write operations. |
 | `AGENT_AUTO_TOOLS`  | Set of tool names with `auto_approve: true` -- no user confirmation needed. |
 | `TASK_AUTO_TOOLS`   | Same as `AGENT_AUTO_TOOLS` (identical filter). |
-| `BUILTIN_TOOL_NAMES`| Frozenset of all 17 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
+| `BUILTIN_TOOL_NAMES`| Frozenset of all 19 built-in tool names. Used by tool search to distinguish always-on tools from deferrable MCP tools. |
 | `PRIMARY_KEY_MAP`   | Dict mapping tool name to its `primary_key` parameter name. |
 
 ---
@@ -69,7 +69,7 @@ Tool execution follows a three-phase pipeline inside `ChatSession._execute_tools
 - Parses the JSON arguments (with fallback for malformed JSON).
 - If JSON parsing fails entirely, uses `PRIMARY_KEY_MAP` to map a bare string
   to the correct parameter.
-- Dispatches to the matching `_prepare_{func_name}()` handler. There are 17
+- Dispatches to the matching `_prepare_{func_name}()` handler. There are 19
   built-in tools plus `tool_search` (synthetic, client-side BM25 fallback) and
   the generic `_prepare_mcp_tool()` handler for MCP tools.
 - Validates arguments and builds a preview dict containing:
@@ -188,8 +188,10 @@ Execute a bash command and return stdout + stderr.
 | Parameter | Type   | Required | Description |
 |-----------|--------|----------|-------------|
 | `command` | string | yes      | The bash command to execute. |
+| `timeout` | integer | no      | Timeout in seconds (1-600). Omit to use the global `tools.timeout` setting (typically 120s). |
+| `stop_on_error` | boolean | no | Enable `set -e` so the script exits on the first command failure. Default false. |
 
-- **What it does**: Runs the command in a subprocess with a configurable timeout (default 120s). Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.).
+- **What it does**: Runs the command in a subprocess with a configurable timeout. Commands are sanitized and checked against a blocklist (e.g. `rm -rf /`). Environment variables containing secrets are scrubbed (`*_KEY`, `*_SECRET`, `*_TOKEN`, etc.).
 - **Output format**: Stdout is returned directly. Stderr lines are prefixed with `[stderr]` so the model can distinguish them. When the command itself redirects stderr to stdout (`2>&1`), no prefix is added. Output exceeding 256KB is truncated (head + tail preserved, middle replaced with a truncation notice).
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: `task_agent` only (not available to plan sub-agents).
@@ -222,8 +224,9 @@ Write content to a file, creating it if needed.
 |-----------|--------|----------|-------------|
 | `path`    | string | yes      | Absolute or relative file path. |
 | `content` | string | yes      | The full file content to write. |
+| `mode`    | string | no       | `"overwrite"` (default) replaces the file. `"append"` adds content to the end. |
 
-- **What it does**: Creates or overwrites the file at the given path. Parent directories are created as needed.
+- **What it does**: Creates or overwrites (or appends to) the file at the given path. Parent directories are created as needed.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: `task_agent` only.
 
@@ -239,14 +242,33 @@ Replace exact strings in a file, or apply multiple replacements atomically.
 | `old_string` | string  | no*      | The exact text to find and replace. |
 | `new_string` | string  | no*      | The replacement text. |
 | `near_line`  | integer | no       | Disambiguate when `old_string` matches multiple locations. |
-| `edits`      | array   | no*      | Multiple replacements to apply atomically (see below). |
+| `edits`       | array   | no*      | Multiple replacements to apply atomically (see below). |
+| `replace_all` | boolean | no       | Replace ALL occurrences of `old_string`. Cannot combine with `near_line` or `edits`. |
 
 \* Provide either `old_string`+`new_string` (single edit) or `edits` array (batch), not both.
 
-- **What it does**: Finds `old_string` in the file and replaces it with `new_string`. Fails if the string is not found or matches multiple locations (unless `near_line` is provided to pick the nearest match). Requires a prior `read_file` call on the same path.
+- **What it does**: Finds `old_string` in the file and replaces it with `new_string`. Fails if the string is not found or matches multiple locations (unless `near_line` or `replace_all` is provided). Requires a prior `read_file` or `diff_file` call on the same path.
 - **Batch mode**: The `edits` array accepts multiple `{old_string, new_string, near_line?}` entries applied atomically. All edits are validated before any are applied. Overlapping edits (two entries targeting the same text region) are rejected. Edits are applied in reverse file-position order so character offsets stay stable.
+- **Replace-all mode**: When `replace_all` is true, all occurrences are replaced via `str.replace()`. The approval preview shows the occurrence count.
 - **Auto-approve**: No -- requires user confirmation.
 - **Agent availability**: `task_agent` only.
+
+---
+
+### diff_file
+
+Show a unified diff between two files, or between a file and a provided string.
+
+| Parameter       | Type    | Required | Description |
+|-----------------|---------|----------|-------------|
+| `path_a`        | string  | yes      | Path to the first file. |
+| `path_b`        | string  | no       | Path to the second file. Mutually exclusive with `content_b`. |
+| `content_b`     | string  | no       | String content to compare against `path_a`. Mutually exclusive with `path_b`. |
+| `context_lines` | integer | no       | Number of context lines around changes (default 3, max 20). |
+
+- **What it does**: Returns unified diff output using Python's `difflib`. Binary files (containing null bytes) are rejected with a clear error. Files read through `diff_file` satisfy `edit_file`'s read guard — you can diff then edit without a separate `read_file` call. Large diffs are streamed with early cutoff at the tool truncation limit.
+- **Auto-approve**: Yes (read-only).
+- **Agent availability**: `agent` and `task_agent`.
 
 ---
 
@@ -607,7 +629,7 @@ CLI flags override the config file:
    directly.
 
 2. **Partitioning**: When active, tools are split into two sets:
-   - **Always-on** -- the 17 built-in tools (members of `BUILTIN_TOOL_NAMES`).
+   - **Always-on** -- the 19 built-in tools (members of `BUILTIN_TOOL_NAMES`).
      These are always visible to the model.
    - **Deferred** -- all MCP tools. These are not sent in the tool list unless
      the model searches for them.
@@ -650,7 +672,7 @@ MCP-compatible service.
 3. **Schema conversion**: Each MCP tool's `inputSchema` is converted to OpenAI
    function-calling format. The tool name is prefixed: `mcp__{server}__{tool}`.
 
-4. **Merging**: MCP tools are appended after the 17 built-in tools via
+4. **Merging**: MCP tools are appended after the 19 built-in tools via
    `merge_mcp_tools()`. Built-in tools appear first, giving them natural LLM priority.
    When dynamic tool search is active, MCP tools are deferred rather than directly
    visible -- the model discovers them via search as needed (see
