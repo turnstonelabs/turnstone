@@ -3627,7 +3627,7 @@ class ChatSession:
         return None
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Prepare a memory tool action (save/search/delete/list)."""
+        """Prepare a memory tool action (save/get/search/delete/list)."""
         action = (args.get("action") or "").strip().lower()
 
         if action == "save":
@@ -3847,7 +3847,7 @@ class ChatSession:
             "header": "\u2717 memory: invalid action",
             "preview": "",
             "needs_approval": False,
-            "error": f"Error: action must be save/search/delete/list, got '{action}'",
+            "error": f"Error: action must be save/get/search/delete/list, got '{action}'",
         }
 
     def _prepare_recall(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
