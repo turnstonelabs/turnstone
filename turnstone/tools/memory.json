@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate to 500 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
+  "description": "Persistent memory across sessions. Actions: 'save' stores a memory, 'get' retrieves full content by name, 'search' finds memories by query, 'delete' removes a memory, 'list' shows all memories. Use 'get' to read full content — search/list truncate previews to 200 chars. Memories have a type (user/project/feedback/reference) and scope (global/workstream/user).",
   "parameters": {
     "type": "object",
     "properties": {
