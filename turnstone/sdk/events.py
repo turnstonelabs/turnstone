@@ -300,6 +300,36 @@ class ClusterSnapshotEvent(ClusterEvent):
     timestamp: float = 0.0
 
 
+@dataclass
+class NodeSnapshotEvent(ClusterEvent):
+    """Full node state delivered on SSE connect to ``/v1/api/events/global``."""
+
+    type: str = "node_snapshot"
+    node_id: str = ""
+    workstreams: list[dict[str, Any]] = field(default_factory=list)
+    health: dict[str, Any] = field(default_factory=dict)
+    aggregate: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class HealthChangedEvent(ClusterEvent):
+    """Circuit breaker state transition on a server node."""
+
+    type: str = "health_changed"
+    circuit_state: str = ""
+
+
+@dataclass
+class AggregateEvent(ClusterEvent):
+    """Periodic aggregate metrics from a server node."""
+
+    type: str = "aggregate"
+    total_tokens: int = 0
+    total_tool_calls: int = 0
+    active_count: int = 0
+    total_count: int = 0
+
+
 # ---------------------------------------------------------------------------
 # Type registries (built after all classes are defined)
 # ---------------------------------------------------------------------------
@@ -354,5 +384,8 @@ _CLUSTER_REGISTRY: dict[str, type[ClusterEvent]] = {
         ClusterWsClosedEvent,
         ClusterWsRenameEvent,
         ClusterSnapshotEvent,
+        NodeSnapshotEvent,
+        HealthChangedEvent,
+        AggregateEvent,
     ]
 }

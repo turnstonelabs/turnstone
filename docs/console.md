@@ -1,6 +1,6 @@
 # Cluster Dashboard (turnstone-console)
 
-`turnstone-console` is a cluster management service that provides cluster-wide visibility and control across all turnstone nodes. It discovers nodes via the `services` database table, polls each node's HTTP API for workstream data, and receives real-time state changes via HTTP polling.
+`turnstone-console` is a cluster management service that provides cluster-wide visibility and control across all turnstone nodes. It discovers nodes via the `services` database table and subscribes to each node's SSE event stream for real-time workstream, health, and metric updates.
 
 The console also supports **workstream creation** (dispatched via HTTP proxy to target nodes) and a **reverse proxy** that serves each node's server UI through the console port — so users only need network access to the console, not to individual server nodes.
 
@@ -21,7 +21,7 @@ turnstone-console ──────┤
 
 Data flows in two directions:
 
-- **Inbound (monitoring):** The console discovers nodes via the `services` database table (nodes register on startup and send periodic heartbeats). It periodically polls each node's `GET /v1/api/dashboard` for full workstream snapshots and `GET /health` for node health.
+- **Inbound (monitoring):** The console discovers nodes via the `services` database table (nodes register on startup and send periodic heartbeats). It opens a persistent SSE connection to each node's `GET /v1/api/events/global` endpoint, receiving a full snapshot on connect followed by real-time delta events (state changes, health transitions, aggregate metrics).
 - **Outbound (control):** The console proxies workstream creation requests to target nodes via HTTP.
 - **Proxy (pass-through):** The console reverse-proxies each node's server UI at `/node/{node_id}/`, forwarding HTTP and SSE traffic so the browser never contacts server nodes directly.
 
@@ -30,8 +30,7 @@ Data flows in two directions:
 | Source | Method | Direction | Data |
 |--------|--------|-----------|------|
 | `services` table | Database query | Read | Node discovery (node_id, server_url, started) |
-| Node HTTP API | `GET {server_url}/v1/api/dashboard` | Read | Full workstream list with tokens, context, activity |
-| Node HTTP API | `GET {server_url}/health` | Read | Node health status |
+| Node SSE | `GET {server_url}/v1/api/events/global` | Stream | Snapshot on connect, then real-time delta events (state, health, aggregate) |
 | Node HTTP API | `POST {server_url}/v1/api/workstreams/new` | Write | Workstream creation |
 | Node HTTP API | `GET/POST {server_url}/*` | Proxy | Server UI, API requests, SSE streams |
 
@@ -41,9 +40,9 @@ Data flows in two directions:
 
 The collector (`turnstone/console/collector.py`) maintains an in-memory snapshot of all nodes and workstreams. Two daemon threads handle data acquisition:
 
-1. **Node discovery** — queries the `services` database table every 15 seconds. Adds newly discovered nodes, removes expired ones (stale heartbeats), emits `node_joined` / `node_lost` events to SSE listeners.
+1. **Node discovery** — queries the `services` database table every 60 seconds. Adds newly discovered nodes, removes expired ones (stale heartbeats), emits `node_joined` / `node_lost` events to SSE listeners, and spawns/cancels SSE tasks for new/lost nodes.
 
-2. **Poll loop** — fetches `GET /v1/api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
+2. **SSE manager** — a single asyncio event loop on one thread multiplexes persistent SSE connections to all discovered nodes via `GET /v1/api/events/global`. Each connection receives a `node_snapshot` on connect (workstreams, health, aggregate) followed by real-time delta events (`ws_state`, `ws_created`, `ws_closed`, `ws_rename`, `health_changed`, `aggregate`). On disconnect, the node is marked unreachable and the connection is retried with exponential backoff (1s–30s). An `?expected_node_id=` query parameter provides identity verification against IP reuse (server returns 409 on mismatch).
 
 A `get_snapshot()` method builds the full cluster state under a single lock acquisition — overview aggregates and per-node workstream lists in one atomic read. This is served both as a REST endpoint and as the initial SSE event on client connect.
 
@@ -54,7 +53,7 @@ All reads and writes to the node/workstream map are protected by a single `threa
 ### Scale Considerations
 
 - **50,000 workstreams** (1,000 nodes × 50 per node) at ~500 bytes each = ~25 MB in memory
-- **1,000 nodes** polled in parallel — fan-out concurrency is configurable via `cluster.node_fan_out_limit` (default 200), yielding 5 batches at ~100ms each = ~0.5 second poll cycle
+- **1,000 nodes** connected via persistent SSE — a single asyncio event loop multiplexes all connections with negligible overhead. Ensure `ulimit -n` >= 4096 for fd headroom
 - **Filtering and pagination** run in-memory on the full workstream list — sub-millisecond at this scale
 - **SSE fan-out** uses per-client queues (2,000 events) — backed-up clients get events dropped, not blocking
 - **Database** — for clusters sharing PostgreSQL, use [PgBouncer](pgbouncer.md) in transaction pooling mode
@@ -629,7 +628,6 @@ CLI flags for `turnstone-console`:
 |------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | `8090` | HTTP port |
-| `--poll-interval` | `10` | Node polling interval (seconds) |
 | `--auth-token` | `$TURNSTONE_AUTH_TOKEN` | Bearer token for server node communication and proxy |
 | `--log-level` | `INFO` | Log level |
 
@@ -640,7 +638,6 @@ Config file (`~/.config/turnstone/config.toml`):
 host = "0.0.0.0"
 port = 8090
 url = "http://localhost:8090"   # used by CLI /cluster commands
-poll_interval = 10
 ```
 
 ---

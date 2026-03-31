@@ -3,7 +3,7 @@
 import asyncio
 import json
 import queue
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -29,30 +29,13 @@ class MockStorage:
 # ---------------------------------------------------------------------------
 
 
-def _make_collector(storage=None, poll_interval=0, discovery_interval=999):
-    """Create a collector with zero poll interval (no jitter delay in tests)."""
+def _make_collector(storage=None, discovery_interval=999):
+    """Create a collector for tests (discovery disabled by default)."""
     s = storage or MockStorage()
     return ClusterCollector(
         storage=s,
-        poll_interval=poll_interval,
         discovery_interval=discovery_interval,
     )
-
-
-def _dashboard_response(workstreams=None, aggregate=None):
-    """Build a /v1/api/dashboard-style response dict."""
-    return {
-        "workstreams": workstreams or [],
-        "aggregate": aggregate
-        or {
-            "total_tokens": 0,
-            "total_tool_calls": 0,
-            "active_count": 0,
-            "total_count": 0,
-            "uptime_seconds": 0,
-            "node": "local",
-        },
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -157,30 +140,35 @@ class TestCollectorDiscovery:
         assert c._nodes["node-a"].started == 1234567890.0
 
 
-class TestCollectorPolling:
-    """Polling /v1/api/dashboard from nodes."""
+class TestCollectorSnapshot:
+    """Applying node_snapshot SSE events."""
 
-    def test_apply_poll_populates_workstreams(self):
+    def test_apply_snapshot_populates_workstreams(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
 
-        dashboard = _dashboard_response(
-            workstreams=[
-                {
-                    "id": "ws1",
-                    "name": "test",
-                    "state": "running",
-                    "tokens": 1000,
-                    "context_ratio": 0.15,
-                    "activity": "bash: ls",
-                    "activity_state": "tool",
-                    "tool_calls": 3,
-                    "title": "My task",
-                },
-            ],
-            aggregate={"total_tokens": 1000, "total_tool_calls": 3},
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [
+                    {
+                        "id": "ws1",
+                        "name": "test",
+                        "state": "running",
+                        "tokens": 1000,
+                        "context_ratio": 0.15,
+                        "activity": "bash: ls",
+                        "activity_state": "tool",
+                        "tool_calls": 3,
+                        "title": "My task",
+                    },
+                ],
+                "health": {"status": "ok"},
+                "aggregate": {"total_tokens": 1000, "total_tool_calls": 3},
+            },
         )
-        c._apply_poll("node-a", dashboard, {"status": "ok"})
 
         detail = c.get_node_detail("node-a")
         assert len(detail["workstreams"]) == 1
@@ -189,7 +177,7 @@ class TestCollectorPolling:
         assert detail["workstreams"][0]["server_url"] == "http://a:8080"
         assert detail["health"]["status"] == "ok"
 
-    def test_apply_poll_replaces_stale_workstreams(self):
+    def test_apply_snapshot_replaces_stale_workstreams(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -197,30 +185,44 @@ class TestCollectorPolling:
             workstreams={"old-ws": {"id": "old-ws", "name": "old", "state": "idle"}},
         )
 
-        dashboard = _dashboard_response(
-            workstreams=[{"id": "new-ws", "name": "new", "state": "running"}]
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [{"id": "new-ws", "name": "new", "state": "running"}],
+                "health": {},
+                "aggregate": {},
+            },
         )
-        c._apply_poll("node-a", dashboard, {})
 
         detail = c.get_node_detail("node-a")
         assert len(detail["workstreams"]) == 1
         assert detail["workstreams"][0]["id"] == "new-ws"
 
-    def test_apply_poll_ignores_unknown_node(self):
+    def test_apply_snapshot_ignores_unknown_node(self):
         c = _make_collector()
         # Should not raise
-        c._apply_poll("unknown", _dashboard_response(), {})
+        c._apply_snapshot(
+            "unknown", {"type": "node_snapshot", "workstreams": [], "health": {}, "aggregate": {}}
+        )
 
-    def test_apply_poll_emits_ws_created_for_new_workstream(self):
+    def test_apply_snapshot_emits_ws_created_for_new_workstream(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        dashboard = _dashboard_response(
-            workstreams=[{"id": "ws1", "name": "new-task", "state": "idle"}]
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [{"id": "ws1", "name": "new-task", "state": "idle"}],
+                "health": {},
+                "aggregate": {},
+            },
         )
-        c._apply_poll("node-a", dashboard, {})
 
         event = q.get_nowait()
         assert event["type"] == "ws_created"
@@ -228,7 +230,7 @@ class TestCollectorPolling:
         assert event["name"] == "new-task"
         assert event["node_id"] == "node-a"
 
-    def test_apply_poll_emits_ws_closed_for_removed_workstream(self):
+    def test_apply_snapshot_emits_ws_closed_for_removed_workstream(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -238,13 +240,22 @@ class TestCollectorPolling:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        c._apply_poll("node-a", _dashboard_response(), {})
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [],
+                "health": {},
+                "aggregate": {},
+            },
+        )
 
         event = q.get_nowait()
         assert event["type"] == "ws_closed"
         assert event["ws_id"] == "ws1"
 
-    def test_apply_poll_no_events_when_unchanged(self):
+    def test_apply_snapshot_no_events_when_unchanged(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -254,15 +265,21 @@ class TestCollectorPolling:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        # Same state — no events expected
-        dashboard = _dashboard_response(
-            workstreams=[{"id": "ws1", "name": "same", "state": "idle"}]
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [{"id": "ws1", "name": "same", "state": "idle"}],
+                "health": {},
+                "aggregate": {},
+            },
         )
-        c._apply_poll("node-a", dashboard, {})
 
         assert q.empty()
 
-    def test_apply_poll_emits_state_change(self):
+    def test_apply_snapshot_emits_state_change_as_cluster_state(self):
+        """State change events must use type 'cluster_state' for the frontend."""
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -272,30 +289,141 @@ class TestCollectorPolling:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        dashboard = _dashboard_response(
-            workstreams=[{"id": "ws1", "name": "same", "state": "running"}]
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [{"id": "ws1", "name": "same", "state": "running"}],
+                "health": {},
+                "aggregate": {},
+            },
         )
-        c._apply_poll("node-a", dashboard, {})
 
         event = q.get_nowait()
-        assert event["type"] == "ws_state"
+        assert event["type"] == "cluster_state"
         assert event["ws_id"] == "ws1"
         assert event["state"] == "running"
 
-    def test_apply_poll_skips_empty_id_workstream(self):
+    def test_apply_snapshot_skips_empty_id_workstream(self):
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
-        dashboard = _dashboard_response(workstreams=[{"name": "no-id", "state": "idle"}])
-        c._apply_poll("node-a", dashboard, {})
+        c._apply_snapshot(
+            "node-a",
+            {
+                "type": "node_snapshot",
+                "node_id": "node-a",
+                "workstreams": [{"name": "no-id", "state": "idle"}],
+                "health": {},
+                "aggregate": {},
+            },
+        )
 
         assert q.empty()
         assert len(c._nodes["node-a"].workstreams) == 0
 
-    def test_poll_401_preserves_workstreams_and_marks_unreachable(self):
-        """A 401 from the server must NOT wipe workstream data."""
+
+class TestCollectorDelta:
+    """Applying individual SSE delta events."""
+
+    def test_apply_delta_ws_state_fans_out_as_cluster_state(self):
+        """Server emits ws_state; collector must translate to cluster_state."""
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "test", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta(
+            "node-a", {"type": "ws_state", "ws_id": "ws1", "state": "running", "tokens": 500}
+        )
+
+        event = q.get_nowait()
+        assert event["type"] == "cluster_state"
+        assert event["state"] == "running"
+        # Verify in-memory state was updated
+        assert c._nodes["node-a"].workstreams["ws1"]["state"] == "running"
+
+    def test_apply_delta_ws_created(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "ws_created", "ws_id": "ws1", "name": "new"})
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_created"
+        assert "ws1" in c._nodes["node-a"].workstreams
+
+    def test_apply_delta_ws_closed(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "old", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "ws_closed", "ws_id": "ws1"})
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_closed"
+        assert "ws1" not in c._nodes["node-a"].workstreams
+
+    def test_apply_delta_ws_rename(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "old-name", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
+        c._apply_delta("node-a", {"type": "ws_rename", "ws_id": "ws1", "name": "new-name"})
+
+        event = q.get_nowait()
+        assert event["type"] == "ws_rename"
+        assert event["name"] == "new-name"
+        assert c._nodes["node-a"].workstreams["ws1"]["name"] == "new-name"
+
+    def test_apply_delta_health_changed(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            health={"status": "ok", "backend": {"status": "up", "circuit_state": "closed"}},
+        )
+
+        c._apply_delta("node-a", {"type": "health_changed", "circuit_state": "open"})
+
+        health = c._nodes["node-a"].health
+        assert health["backend"]["circuit_state"] == "open"
+        assert health["backend"]["status"] == "down"
+        assert health["status"] == "degraded"
+
+    def test_apply_delta_aggregate(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(node_id="node-a", server_url="http://a:8080")
+
+        c._apply_delta(
+            "node-a",
+            {"type": "aggregate", "total_tokens": 5000, "total_tool_calls": 42, "active_count": 3},
+        )
+
+        assert c._nodes["node-a"].aggregate["total_tokens"] == 5000
+        assert c._nodes["node-a"].aggregate["total_tool_calls"] == 42
+
+    def test_mark_unreachable_preserves_workstreams(self):
+        """Disconnection marks unreachable but preserves workstream data."""
         c = _make_collector()
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
@@ -304,46 +432,11 @@ class TestCollectorPolling:
             workstreams={"ws1": {"id": "ws1", "name": "existing", "state": "idle"}},
         )
 
-        # Mock httpx to return 401
-        import httpx as _httpx
+        c._mark_unreachable("node-a")
 
-        mock_response = _httpx.Response(
-            401,
-            json={"error": "Unauthorized"},
-            request=_httpx.Request("GET", "http://a:8080/v1/api/dashboard"),
-        )
-
-        with patch.object(c._http_client, "get", return_value=mock_response):
-            c._poll_all_nodes()
-
-        # Workstream data must be preserved, node marked unreachable
         assert c._nodes["node-a"].reachable is False
         assert "ws1" in c._nodes["node-a"].workstreams
         assert c._nodes["node-a"].workstreams["ws1"]["name"] == "existing"
-
-    def test_poll_403_preserves_workstreams(self):
-        """A 403 should also preserve state and mark unreachable."""
-        c = _make_collector()
-        c._nodes["node-a"] = NodeSnapshot(
-            node_id="node-a",
-            server_url="http://a:8080",
-            reachable=True,
-            workstreams={"ws1": {"id": "ws1", "name": "keep-me", "state": "running"}},
-        )
-
-        import httpx as _httpx
-
-        mock_response = _httpx.Response(
-            403,
-            json={"error": "Forbidden"},
-            request=_httpx.Request("GET", "http://a:8080/v1/api/dashboard"),
-        )
-
-        with patch.object(c._http_client, "get", return_value=mock_response):
-            c._poll_all_nodes()
-
-        assert c._nodes["node-a"].reachable is False
-        assert "ws1" in c._nodes["node-a"].workstreams
 
 
 class TestCollectorFanout:

@@ -919,17 +919,107 @@ async def events_sse(request: Request) -> Response:
     return EventSourceResponse(event_generator(), ping=5)
 
 
+def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
+    """Build a complete node state snapshot for SSE consumers.
+
+    Includes workstream list, health, and aggregate — everything the console
+    collector needs to populate a ``NodeSnapshot`` without polling.
+    """
+    from turnstone.core.memory import get_workstream_display_name
+
+    mgr: WorkstreamManager = app_state.workstreams
+    wss = mgr.list_all()
+    total_tokens = 0
+    total_tool_calls = 0
+    active_count = 0
+    ws_list = []
+    for ws in wss:
+        ui = ws.ui
+        if hasattr(ui, "_ws_lock"):
+            with ui._ws_lock:  # type: ignore[union-attr]
+                tok = ui._ws_prompt_tokens + ui._ws_completion_tokens  # type: ignore[union-attr]
+                tc = sum(ui._ws_tool_calls.values())  # type: ignore[union-attr]
+                ctx = ui._ws_context_ratio  # type: ignore[union-attr]
+                activity = ui._ws_current_activity  # type: ignore[union-attr]
+                activity_state = ui._ws_activity_state  # type: ignore[union-attr]
+        else:
+            tok = tc = 0
+            ctx = 0.0
+            activity = activity_state = ""
+        total_tokens += tok
+        total_tool_calls += tc
+        if ws.state.value != "idle":
+            active_count += 1
+        title = ""
+        if ws.session:
+            title = get_workstream_display_name(ws.session.ws_id) or ""
+        ws_list.append(
+            {
+                "id": ws.id,
+                "name": ws.name,
+                "state": ws.state.value,
+                "title": title,
+                "tokens": tok,
+                "context_ratio": round(ctx, 3),
+                "activity": activity,
+                "activity_state": activity_state,
+                "tool_calls": tc,
+                "model": ws.session.model if ws.session else "",
+                "model_alias": ws.session.model_alias if ws.session else "",
+            }
+        )
+    return {
+        "type": "node_snapshot",
+        "node_id": getattr(app_state, "node_id", ""),
+        "workstreams": ws_list,
+        "health": _build_health_dict(app_state),
+        "aggregate": {
+            "total_tokens": total_tokens,
+            "total_tool_calls": total_tool_calls,
+            "active_count": active_count,
+            "total_count": len(ws_list),
+        },
+    }
+
+
 async def global_events_sse(request: Request) -> Response:
-    """GET /v1/api/events/global — global SSE event stream."""
+    """GET /v1/api/events/global — global SSE event stream.
+
+    Supports optional ``?expected_node_id=X`` query parameter for node identity
+    verification.  If present and the server's node_id does not match, returns
+    409 Conflict immediately.
+
+    On connect, emits a ``node_snapshot`` event with the full node state
+    (workstreams, health, aggregate) followed by real-time delta events.
+    The snapshot and listener registration are atomic — no events are lost.
+    """
+    # -- Node identity check --------------------------------------------------
+    expected = request.query_params.get("expected_node_id")
+    actual_node_id = getattr(request.app.state, "node_id", "")
+    if expected and actual_node_id and expected != actual_node_id:
+        return JSONResponse(
+            {"error": "node_id mismatch", "expected": expected, "actual": actual_node_id},
+            status_code=409,
+        )
+
+    # -- Atomic snapshot + listener registration ------------------------------
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
     listeners = request.app.state.global_listeners
     listeners_lock = request.app.state.global_listeners_lock
+
+    # Hold the listeners lock while building the snapshot AND registering.
+    # The fanout thread also acquires this lock when snapshotting the listener
+    # list, so events that land on global_queue during snapshot build will be
+    # distributed to our queue after we release — gap-free.
     with listeners_lock:
+        snapshot = _build_node_snapshot(request.app.state)
         listeners.append(client_queue)
 
     async def event_generator() -> AsyncGenerator[dict[str, str], None]:
         _metrics.record_sse_connect()
         try:
+            # Emit snapshot as first event
+            yield {"data": json.dumps(snapshot)}
             loop = asyncio.get_running_loop()
             executor = request.app.state.sse_executor
             while True:
@@ -1100,17 +1190,20 @@ def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:
     return counts
 
 
-async def health(request: Request) -> JSONResponse:
-    """GET /health — server health status."""
-    mgr: WorkstreamManager = request.app.state.workstreams
+def _build_health_dict(app_state: Any) -> dict[str, Any]:
+    """Assemble health status dict from app state.
+
+    Shared by the ``/health`` endpoint and the global SSE snapshot.
+    """
+    mgr: WorkstreamManager = app_state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
-    monitor = getattr(request.app.state, "health_monitor", None)
+    monitor = getattr(app_state, "health_monitor", None)
     backend_ok = monitor.is_healthy if monitor else True
     data: dict[str, Any] = {
         "status": "ok" if backend_ok else "degraded",
         "version": __version__,
-        "node_id": getattr(request.app.state, "node_id", ""),
+        "node_id": getattr(app_state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
         "model": _metrics.model,
         "max_ws": mgr.max_workstreams,
@@ -1120,14 +1213,19 @@ async def health(request: Request) -> JSONResponse:
             "circuit_state": monitor.circuit_state.value if monitor else "closed",
         },
     }
-    mc = getattr(request.app.state, "mcp_client", None)
+    mc = getattr(app_state, "mcp_client", None)
     if mc:
         data["mcp"] = {
             "servers": mc.server_count,
             "resources": mc.resource_count,
             "prompts": mc.prompt_count,
         }
-    return JSONResponse(data)
+    return data
+
+
+async def health(request: Request) -> JSONResponse:
+    """GET /health — server health status."""
+    return JSONResponse(_build_health_dict(request.app.state))
 
 
 async def metrics_endpoint(request: Request) -> Response:
@@ -1546,10 +1644,21 @@ async def create_workstream(request: Request) -> JSONResponse:
             ws.session.set_watch_runner(
                 runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
             )
+        # Emit creation event on global queue for SSE consumers (console)
+        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws.id,
+                    "name": ws.name,
+                    "model": ws.session.model if ws.session else "",
+                    "model_alias": ws.session.model_alias if ws.session else "",
+                }
+            )
         # Emit eviction event if a workstream was evicted to make room
         evicted = mgr.last_evicted
         if evicted is not None:
-            gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
             with contextlib.suppress(queue.Full):
                 gq.put_nowait(
                     {
@@ -1669,6 +1778,9 @@ async def close_workstream(request: Request) -> JSONResponse:
     ws_id = str(body.get("ws_id", ""))
     mgr = request.app.state.workstreams
     if mgr.close(ws_id):
+        gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+        with contextlib.suppress(queue.Full):
+            gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
 
@@ -2076,6 +2188,58 @@ async def internal_migrate(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+def _emit_health_changed(circuit_state: str, gq: queue.Queue[dict[str, Any]]) -> None:
+    """Push a health_changed event onto the global SSE queue.
+
+    Called from the BackendHealthMonitor callback on circuit breaker transitions.
+    """
+    with contextlib.suppress(queue.Full):
+        gq.put_nowait({"type": "health_changed", "circuit_state": circuit_state})
+
+
+def _aggregate_emitter_thread(
+    mgr: WorkstreamManager,
+    global_queue: queue.Queue[dict[str, Any]],
+    interval: float = 10.0,
+) -> None:
+    """Periodically emit aggregate token/tool_call totals on the global SSE queue.
+
+    Runs as a daemon thread so the console receives periodic updates without
+    having to poll ``/v1/api/dashboard``.
+    """
+    while True:
+        time.sleep(interval)
+        total_tokens = 0
+        total_tool_calls = 0
+        active_count = 0
+        try:
+            for ws in mgr.list_all():
+                ui = ws.ui
+                if hasattr(ui, "_ws_lock"):
+                    with ui._ws_lock:  # type: ignore[union-attr]
+                        tok = ui._ws_prompt_tokens + ui._ws_completion_tokens  # type: ignore[union-attr]
+                        tc = sum(ui._ws_tool_calls.values())  # type: ignore[union-attr]
+                else:
+                    tok = 0
+                    tc = 0
+                total_tokens += tok
+                total_tool_calls += tc
+                if ws.state.value != "idle":
+                    active_count += 1
+            with contextlib.suppress(queue.Full):
+                global_queue.put_nowait(
+                    {
+                        "type": "aggregate",
+                        "total_tokens": total_tokens,
+                        "total_tool_calls": total_tool_calls,
+                        "active_count": active_count,
+                        "total_count": len(mgr.list_all()),
+                    }
+                )
+        except Exception:
+            log.debug("Aggregate emitter error", exc_info=True)
+
+
 def _idle_cleanup_thread(
     mgr: WorkstreamManager,
     timeout_sec: float,
@@ -2134,6 +2298,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         daemon=True,
     )
     fanout.start()
+    # Start aggregate emitter thread for SSE consumers
+    agg_emitter = threading.Thread(
+        target=_aggregate_emitter_thread,
+        args=(app.state.workstreams, app.state.global_queue),
+        daemon=True,
+    )
+    agg_emitter.start()
     # Start idle cleanup thread if configured
     if app.state.idle_timeout > 0:
         cleanup = threading.Thread(
@@ -2606,6 +2777,13 @@ def main() -> None:
             if new_reg is not None:
                 new_reg.shutdown()
 
+    # Set up global event queue for state-change broadcasts (created early so
+    # the health monitor callback can reference it).
+    global_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=10000)
+    global_listeners: list[queue.Queue[dict[str, Any]]] = []
+    global_listeners_lock = threading.Lock()
+    WebUI._global_queue = global_queue
+
     health_monitor = BackendHealthMonitor(
         client=client,
         probe_interval=config_store.get("health.backend_probe_interval"),
@@ -2615,6 +2793,7 @@ def main() -> None:
         provider=provider_name,
         initial_model=model,
         on_model_changed=_handle_model_change,
+        on_state_changed=lambda state: _emit_health_changed(state, global_queue),
     )
     health_monitor.start()
 
@@ -2627,12 +2806,6 @@ def main() -> None:
         burst=config_store.get("ratelimit.burst"),
         trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
-
-    # Set up global event queue for state-change broadcasts
-    global_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=10000)
-    global_listeners: list[queue.Queue[dict[str, Any]]] = []
-    global_listeners_lock = threading.Lock()
-    WebUI._global_queue = global_queue
 
     # Config builders — shared between startup logging and session factory.
     # Re-read from ConfigStore each call so hot-reload works.

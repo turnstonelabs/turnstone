@@ -6140,12 +6140,6 @@ def main() -> None:
         default=8090,
         help="Port to listen on (default: 8090)",
     )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=10.0,
-        help="Node polling interval in seconds (default: 10)",
-    )
     from turnstone.core.log import add_log_args
 
     add_log_args(parser)
@@ -6228,7 +6222,6 @@ def main() -> None:
 
     collector = ClusterCollector(
         storage=auth_storage,
-        poll_interval=args.poll_interval,
         auth_token=collector_token if collector_token_mgr is None else "",
         token_manager=collector_token_mgr,
         router=router,

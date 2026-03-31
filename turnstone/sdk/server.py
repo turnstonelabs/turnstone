@@ -37,6 +37,7 @@ from turnstone.sdk._base import _BaseClient
 from turnstone.sdk._sync import _SyncRunner
 from turnstone.sdk._types import TurnResult
 from turnstone.sdk.events import (
+    ClusterEvent,
     ContentEvent,
     ErrorEvent,
     ReasoningEvent,
@@ -198,6 +199,22 @@ class AsyncTurnstoneServer(_BaseClient):
         """Iterate over global SSE events."""
         async for data in self._stream_sse("/v1/api/events/global"):
             yield ServerEvent.from_dict(data)
+
+    async def stream_node_events(
+        self, *, expected_node_id: str = ""
+    ) -> AsyncIterator[ClusterEvent]:
+        """Iterate over node-level SSE events (snapshot + deltas).
+
+        Connects to ``/v1/api/events/global`` with the optional
+        ``expected_node_id`` param for identity verification.  Yields
+        ``ClusterEvent`` instances (``NodeSnapshotEvent``, ``HealthChangedEvent``,
+        etc.) suitable for console collector consumption.
+        """
+        params: dict[str, str] = {}
+        if expected_node_id:
+            params["expected_node_id"] = expected_node_id
+        async for data in self._stream_sse("/v1/api/events/global", params=params):
+            yield ClusterEvent.from_dict(data)
 
     # -- high-level convenience ----------------------------------------------
 
@@ -508,6 +525,11 @@ class TurnstoneServer:
 
     def stream_global_events(self) -> Iterator[ServerEvent]:
         return self._runner.run_iter(self._async.stream_global_events())
+
+    def stream_node_events(self, *, expected_node_id: str = "") -> Iterator[ClusterEvent]:
+        return self._runner.run_iter(
+            self._async.stream_node_events(expected_node_id=expected_node_id)
+        )
 
     # -- high-level convenience ----------------------------------------------
 

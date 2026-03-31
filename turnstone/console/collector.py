@@ -1,22 +1,26 @@
 """Cluster state collector — aggregates data from all turnstone nodes.
 
-Discovers nodes via the service registry (StorageBackend), polls each
-node's /v1/api/dashboard endpoint for workstream data.
+Discovers nodes via the service registry (StorageBackend) and subscribes
+to each node's ``/v1/api/events/global`` SSE stream for real-time state
+updates.  A single asyncio event loop on one dedicated thread multiplexes
+all SSE connections, scaling to 1000+ nodes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import queue
+import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import httpx_sse
 
 if TYPE_CHECKING:
     from turnstone.console.metrics import ConsoleMetrics
@@ -34,7 +38,7 @@ class NodeSnapshot:
     node_id: str = ""
     server_url: str = ""
     started: float = 0.0
-    last_seen: float = 0.0  # monotonic time of last successful poll
+    last_seen: float = 0.0  # monotonic time of last successful data
     max_ws: int = 10  # max workstreams (capacity)
     workstreams: dict[str, dict[str, Any]] = field(default_factory=dict)
     health: dict[str, Any] = field(default_factory=dict)
@@ -43,19 +47,17 @@ class NodeSnapshot:
 
 
 class ClusterCollector:
-    """Aggregates cluster state from the service registry and per-node HTTP APIs.
+    """Aggregates cluster state from the service registry and per-node SSE streams.
 
     Two daemon threads:
     1. Node discovery — queries the service registry every ``discovery_interval`` seconds
-    2. Poll loop — fetches /v1/api/dashboard from each node every ``poll_interval`` seconds
+    2. SSE manager — single asyncio event loop multiplexing SSE connections to all nodes
     """
 
     def __init__(
         self,
         storage: StorageBackend,
-        poll_interval: float = 15.0,
-        discovery_interval: float = 15.0,
-        max_poll_workers: int = 200,
+        discovery_interval: float = 60.0,
         http_timeout: float = 30.0,
         auth_token: str = "",
         token_manager: ServiceTokenManager | None = None,
@@ -65,16 +67,14 @@ class ClusterCollector:
         console_metrics: ConsoleMetrics | None = None,
     ):
         self._storage = storage
-        self._poll_interval = poll_interval
         self._discovery_interval = discovery_interval
-        self._max_poll_workers = max_poll_workers
         self._http_timeout = http_timeout
         self._token_manager = token_manager
         self._router = router
         self._console_metrics = console_metrics
+        self._tls_verify = tls_verify
+        self._tls_cert = tls_cert
         # Static auth header — only used when no token_manager is present.
-        # When a token_manager exists, auth is injected per-request via
-        # extra_headers in _poll_all_nodes to avoid stale JWT expiry.
         self._static_auth: dict[str, str] | None = None
         if auth_token and token_manager is None:
             self._static_auth = {"Authorization": f"Bearer {auth_token}"}
@@ -83,39 +83,41 @@ class ClusterCollector:
         self._nodes: dict[str, NodeSnapshot] = {}
         self._running = False
         self._threads: list[threading.Thread] = []
-        self._poll_pool = ThreadPoolExecutor(max_workers=max_poll_workers)
-        self._http_client = httpx.Client(
-            timeout=httpx.Timeout(connect=10, read=http_timeout, write=5, pool=http_timeout),
-            limits=httpx.Limits(
-                max_connections=max_poll_workers + 10,
-                max_keepalive_connections=min(max_poll_workers, 200),
-            ),
-            verify=tls_verify,
-            cert=tls_cert,
-        )
 
         # SSE fan-out to browser clients
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
 
+        # SSE manager state (managed by the asyncio event loop thread)
+        self._sse_loop: asyncio.AbstractEventLoop | None = None
+        self._sse_tasks: dict[str, asyncio.Task[None]] = {}
+        self._sse_stop_events: dict[str, asyncio.Event] = {}
+        self._sse_async_client: httpx.AsyncClient | None = None
+
     def upgrade_tls(self, tls_verify: Any = True, tls_cert: tuple[str, str] | None = None) -> None:
-        """Replace the httpx client with one using mTLS context."""
-        old = self._http_client
-        self._http_client = httpx.Client(
-            timeout=httpx.Timeout(
-                connect=10, read=self._http_timeout, write=5, pool=self._http_timeout
-            ),
-            limits=httpx.Limits(
-                max_connections=self._max_poll_workers + 10,
-                max_keepalive_connections=min(self._max_poll_workers, 200),
-            ),
-            verify=tls_verify,
-            cert=tls_cert,
+        """Update TLS settings for future SSE connections."""
+        self._tls_verify = tls_verify
+        self._tls_cert = tls_cert
+        # If the async client is running, replace it on the event loop.
+        if self._sse_loop is not None and self._sse_loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._replace_async_client(), self._sse_loop)
+
+    async def _replace_async_client(self) -> None:
+        """Replace the async httpx client (called on the SSE event loop).
+
+        Closing the old client terminates its underlying connections, which
+        causes active ``_node_sse_task`` coroutines to raise and reconnect
+        using the new client with updated TLS settings.
+        """
+        old = self._sse_async_client
+        self._sse_async_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
+            limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1500),
+            verify=self._tls_verify,
+            cert=self._tls_cert,
         )
-        # Don't close old client — concurrent _fetch_node() threads may still
-        # be using it.  It will be GC'd once all references are released, and
-        # the current client is closed in stop().
-        del old
+        if old is not None:
+            await old.aclose()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -124,7 +126,7 @@ class ClusterCollector:
         self._running = True
         for target, name in [
             (self._discovery_loop, "console-discovery"),
-            (self._poll_loop, "console-poll"),
+            (self._sse_manager_thread, "console-sse"),
         ]:
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
@@ -134,8 +136,11 @@ class ClusterCollector:
     def stop(self) -> None:
         """Stop all threads and clean up resources."""
         self._running = False
-        self._poll_pool.shutdown(wait=False)
-        self._http_client.close()
+        # Cancel all SSE tasks on the event loop
+        if self._sse_loop is not None and self._sse_loop.is_running():
+            for node_id in list(self._sse_tasks):
+                asyncio.run_coroutine_threadsafe(self._stop_node(node_id), self._sse_loop)
+            self._sse_loop.call_soon_threadsafe(self._sse_loop.stop)
         log.info("ClusterCollector stopped")
 
     def _fanout(self, event: dict[str, Any]) -> None:
@@ -144,6 +149,131 @@ class ClusterCollector:
             for q in self._listeners:
                 with contextlib.suppress(queue.Full):
                     q.put_nowait(event)
+
+    # -- auth helpers --------------------------------------------------------
+
+    def _auth_headers(self) -> dict[str, str]:
+        """Build auth headers for the current SSE connection."""
+        if self._token_manager is not None:
+            return {"Authorization": f"Bearer {self._token_manager.token}"}
+        return dict(self._static_auth) if self._static_auth else {}
+
+    # -- SSE manager ---------------------------------------------------------
+
+    def _sse_manager_thread(self) -> None:
+        """Run asyncio event loop that manages all node SSE connections."""
+        self._sse_loop = asyncio.new_event_loop()
+        try:
+            self._sse_loop.run_until_complete(self._sse_manager())
+        finally:
+            self._sse_loop.close()
+            self._sse_loop = None
+
+    async def _sse_manager(self) -> None:
+        """Top-level coroutine — runs until collector stops."""
+        self._sse_async_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
+            limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1500),
+            verify=self._tls_verify,
+            cert=self._tls_cert,
+        )
+        try:
+            while self._running:
+                await asyncio.sleep(1)
+        finally:
+            # Cancel all remaining tasks
+            for task in self._sse_tasks.values():
+                task.cancel()
+            for task in self._sse_tasks.values():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            self._sse_tasks.clear()
+            self._sse_stop_events.clear()
+            await self._sse_async_client.aclose()
+            self._sse_async_client = None
+
+    async def _start_node(self, node_id: str) -> None:
+        """Start an SSE task for a node (called on the SSE event loop)."""
+        if node_id in self._sse_tasks:
+            return  # already running
+        stop = asyncio.Event()
+        self._sse_stop_events[node_id] = stop
+        self._sse_tasks[node_id] = asyncio.create_task(
+            self._node_sse_task(node_id, stop),
+            name=f"sse-{node_id}",
+        )
+
+    async def _stop_node(self, node_id: str) -> None:
+        """Stop an SSE task for a node (called on the SSE event loop)."""
+        stop = self._sse_stop_events.pop(node_id, None)
+        if stop:
+            stop.set()
+        task = self._sse_tasks.pop(node_id, None)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _node_sse_task(self, node_id: str, stop_event: asyncio.Event) -> None:
+        """Persistent SSE connection to a single server node."""
+        backoff = 1.0
+        while not stop_event.is_set() and self._running:
+            url = self._get_node_url(node_id)
+            if not url or self._sse_async_client is None:
+                break
+            base = url.rstrip("/")
+            try:
+                async with httpx_sse.aconnect_sse(
+                    self._sse_async_client,
+                    "GET",
+                    f"{base}/v1/api/events/global",
+                    params={"expected_node_id": node_id},
+                    headers=self._auth_headers(),
+                ) as source:
+                    if source.response.status_code == 409:
+                        log.warning("Node identity mismatch for %s at %s", node_id, url)
+                        self._mark_unreachable(node_id)
+                        break  # stop reconnecting — wrong node at this URL
+                    source.response.raise_for_status()
+                    async for sse in source.aiter_sse():
+                        if stop_event.is_set():
+                            break
+                        data = json.loads(sse.data)
+                        etype = data.get("type", "")
+                        if etype == "node_snapshot":
+                            # Client-side identity check (defense in depth)
+                            if data.get("node_id") != node_id:
+                                log.warning(
+                                    "Snapshot node_id mismatch: expected %s, got %s",
+                                    node_id,
+                                    data.get("node_id"),
+                                )
+                                self._mark_unreachable(node_id)
+                                break
+                            self._apply_snapshot(node_id, data)
+                            backoff = 1.0
+                        else:
+                            self._apply_delta(node_id, data)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("SSE error for node %s", node_id, exc_info=True)
+                self._mark_unreachable(node_id)
+                await asyncio.sleep(min(backoff, 30) + random.random())
+                backoff = min(backoff * 2, 30)
+
+    def _get_node_url(self, node_id: str) -> str:
+        """Get the server URL for a node (thread-safe)."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            return node.server_url if node else ""
+
+    def _mark_unreachable(self, node_id: str) -> None:
+        """Mark a node as unreachable (thread-safe)."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node:
+                node.reachable = False
 
     # -- node discovery ------------------------------------------------------
 
@@ -161,6 +291,8 @@ class ClusterCollector:
         raw_services = self._storage.list_services("server", max_age_seconds=120)
         active_ids = set()
         pending_events: list[dict[str, Any]] = []
+        new_nodes: list[str] = []
+        lost_nodes: list[str] = []
 
         with self._lock:
             for svc in raw_services:
@@ -183,6 +315,7 @@ class ClusterCollector:
                         max_ws=meta.get("max_ws", 10),
                     )
                     pending_events.append({"type": "node_joined", "node_id": nid})
+                    new_nodes.append(nid)
                     log.info("Discovered node: %s", nid)
                 else:
                     self._nodes[nid].server_url = url or self._nodes[nid].server_url
@@ -193,9 +326,17 @@ class ClusterCollector:
             for nid in lost:
                 del self._nodes[nid]
                 pending_events.append({"type": "node_lost", "node_id": nid})
+                lost_nodes.append(nid)
                 log.info("Lost node: %s", nid)
         for event in pending_events:
             self._fanout(event)
+
+        # Manage SSE tasks for new/lost nodes
+        if self._sse_loop is not None and self._sse_loop.is_running():
+            for nid in new_nodes:
+                asyncio.run_coroutine_threadsafe(self._start_node(nid), self._sse_loop)
+            for nid in lost_nodes:
+                asyncio.run_coroutine_threadsafe(self._stop_node(nid), self._sse_loop)
 
         # Notify the routing layer so it can refresh its hash-ring cache
         # when the rebalancer has published a new version.
@@ -211,114 +352,67 @@ class ClusterCollector:
                     self._router.version,
                 )
 
-    # -- polling -------------------------------------------------------------
+    # -- SSE event handlers --------------------------------------------------
 
-    def _poll_loop(self) -> None:
-        """Periodically fetch /v1/api/dashboard from each node."""
-        while self._running:
-            try:
-                self._poll_all_nodes()
-            except Exception:
-                log.exception("Poll loop error")
-            time.sleep(self._poll_interval)
+    def _reconcile_node(
+        self, node_id: str, node: NodeSnapshot, new_ws_list: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Diff new workstream data against the current snapshot.
 
-    @staticmethod
-    def _node_jitter(node_id: str, window: float) -> float:
-        """Deterministic per-node delay within a sliding window.
-
-        Uses a Mersenne prime (2^31 - 1) to hash the node_id into a
-        stable offset so each node is polled at a different point in
-        the cycle.  The offset is consistent across restarts for the
-        same node_id, giving an even spread without randomness.
+        Returns a list of pending events. Caller must hold ``_lock``.
+        Updates ``node.workstreams`` in place.
         """
-        h = hash(node_id) & 0x7FFFFFFF  # positive 31-bit
-        return (h % 2147483647) / 2147483647 * window  # M31 = 2^31 - 1
+        pending: list[dict[str, Any]] = []
+        old_ids = {k for k in node.workstreams if k}
+        new_ws: dict[str, dict[str, Any]] = {}
+        for ws in new_ws_list:
+            ws_id = ws.get("id", "")
+            if not ws_id:
+                continue
+            ws["node"] = node_id
+            ws["server_url"] = node.server_url
+            new_ws[ws_id] = ws
+        new_ids = set(new_ws.keys())
+        # Additions
+        for ws_id in sorted(new_ids - old_ids):
+            ws = new_ws[ws_id]
+            pending.append(
+                {
+                    "type": "ws_created",
+                    "ws_id": ws_id,
+                    "name": ws.get("name", ""),
+                    "node_id": node_id,
+                }
+            )
+        # Removals
+        for ws_id in sorted(old_ids - new_ids):
+            pending.append({"type": "ws_closed", "ws_id": ws_id})
+        # State and name changes on existing workstreams
+        for ws_id in sorted(new_ids & old_ids):
+            old_ws = node.workstreams.get(ws_id, {})
+            new_w = new_ws[ws_id]
+            old_state = old_ws.get("state", "")
+            new_state = new_w.get("state", "")
+            if old_state != new_state:
+                pending.append(
+                    {
+                        "type": "cluster_state",
+                        "ws_id": ws_id,
+                        "state": new_state,
+                        "node_id": node_id,
+                        "tokens": new_w.get("tokens", 0),
+                        "content": new_w.get("content", ""),
+                    }
+                )
+            old_name = old_ws.get("name", "")
+            new_name = new_w.get("name", "")
+            if old_name != new_name and new_name:
+                pending.append({"type": "ws_rename", "ws_id": ws_id, "name": new_name})
+        node.workstreams = new_ws
+        return pending
 
-    def _poll_all_nodes(self) -> None:
-        """Fetch dashboard data from all known nodes in parallel.
-
-        Submissions are throttled by the thread pool size to avoid a
-        thundering herd — at most ``max_poll_workers`` concurrent HTTP
-        requests are in flight at any time.  Each worker sleeps a
-        deterministic per-node jitter (derived from its node_id) to
-        spread requests across the first half of the poll interval.
-        """
-        # Snapshot current auth header for this poll cycle.  Per-request
-        # headers avoid mutating shared client state (thread-safe).
-        if self._token_manager is not None:
-            poll_headers: dict[str, str] | None = {
-                "Authorization": f"Bearer {self._token_manager.token}"
-            }
-        else:
-            poll_headers = self._static_auth
-        with self._lock:
-            targets = [
-                (n.node_id, n.server_url)
-                for n in self._nodes.values()
-                if n.server_url and n.server_url.startswith("http")
-            ]
-
-        if not targets:
-            return
-
-        jitter_window = self._poll_interval / 2
-
-        def _jittered_fetch(
-            nid: str, url: str, headers: dict[str, str] | None
-        ) -> tuple[dict[str, Any], dict[str, Any]]:
-            delay = self._node_jitter(nid, jitter_window)
-            if delay > 0.1:
-                time.sleep(delay)
-            return self._fetch_node(nid, url, headers)
-
-        futures = {
-            self._poll_pool.submit(_jittered_fetch, nid, url, poll_headers): nid
-            for nid, url in targets
-        }
-        for future in as_completed(futures):
-            nid = futures[future]
-            try:
-                dashboard, health = future.result()
-                self._apply_poll(nid, dashboard, health)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code in (401, 403):
-                    log.warning(
-                        "Auth failure polling node %s: HTTP %d", nid, exc.response.status_code
-                    )
-                else:
-                    log.debug("Failed to poll node %s: HTTP %d", nid, exc.response.status_code)
-                with self._lock:
-                    if nid in self._nodes:
-                        self._nodes[nid].reachable = False
-            except Exception:
-                log.warning("Failed to poll node %s", nid, exc_info=True)
-                with self._lock:
-                    if nid in self._nodes:
-                        self._nodes[nid].reachable = False
-
-    def _fetch_node(
-        self,
-        node_id: str,
-        server_url: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Fetch /v1/api/dashboard and /health from a single node."""
-        base = server_url.rstrip("/")
-        dash_resp = self._http_client.get(f"{base}/v1/api/dashboard", headers=extra_headers)
-        dash_resp.raise_for_status()
-        dash_data: dict[str, Any] = dash_resp.json()
-        try:
-            health_resp = self._http_client.get(f"{base}/health", headers=extra_headers)
-            health_data: dict[str, Any] = health_resp.json()
-        except Exception:
-            log.debug("Failed to fetch health from %s", node_id, exc_info=True)
-            health_data = {}
-        return dash_data, health_data
-
-    def _apply_poll(self, node_id: str, dashboard: dict[str, Any], health: dict[str, Any]) -> None:
-        """Apply polled data to the in-memory node snapshot."""
-        ws_list = dashboard.get("workstreams", [])
-        aggregate = dashboard.get("aggregate", {})
+    def _apply_snapshot(self, node_id: str, data: dict[str, Any]) -> None:
+        """Apply a ``node_snapshot`` SSE event to the in-memory state."""
         pending_events: list[dict[str, Any]] = []
         with self._lock:
             node = self._nodes.get(node_id)
@@ -326,63 +420,116 @@ class ClusterCollector:
                 return
             node.last_seen = time.monotonic()
             node.reachable = True
-            node.health = health
-            node.aggregate = aggregate
-            # Build new workstream map
-            old_ids = {k for k in node.workstreams if k}
-            new_ws: dict[str, dict[str, Any]] = {}
-            for ws in ws_list:
-                ws_id = ws.get("id", "")
-                if not ws_id:
-                    continue
-                ws["node"] = node_id
-                ws["server_url"] = node.server_url
-                new_ws[ws_id] = ws
-            new_ids = set(new_ws.keys())
-            # Detect additions not yet known to SSE clients
-            for ws_id in sorted(new_ids - old_ids):
-                ws = new_ws[ws_id]
+            node.health = data.get("health", {})
+            node.aggregate = data.get("aggregate", {})
+            pending_events = self._reconcile_node(node_id, node, data.get("workstreams", []))
+        for event in pending_events:
+            self._fanout(event)
+
+    def _apply_delta(self, node_id: str, data: dict[str, Any]) -> None:
+        """Apply a single delta SSE event to the in-memory state."""
+        etype = data.get("type", "")
+        if not etype:
+            return
+        pending_events: list[dict[str, Any]] = []
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if not node:
+                return
+            node.last_seen = time.monotonic()
+
+            if etype == "ws_state":
+                # Server emits ws_state; translate to cluster_state for browser.
+                # Only fan out if the workstream is known — a ws_state arriving
+                # before ws_created (race) is silently absorbed on reconnect.
+                ws_id = data.get("ws_id", "")
+                ws = node.workstreams.get(ws_id)
+                if ws:
+                    ws["state"] = data.get("state", ws.get("state", ""))
+                    ws["tokens"] = data.get("tokens", ws.get("tokens", 0))
+                    ws["context_ratio"] = data.get("context_ratio", ws.get("context_ratio", 0))
+                    ws["activity"] = data.get("activity", ws.get("activity", ""))
+                    ws["activity_state"] = data.get("activity_state", ws.get("activity_state", ""))
+                    pending_events.append(
+                        {
+                            "type": "cluster_state",
+                            "ws_id": ws_id,
+                            "state": data.get("state", ""),
+                            "node_id": node_id,
+                            "tokens": data.get("tokens", 0),
+                            "content": data.get("content", ""),
+                        }
+                    )
+
+            elif etype == "ws_activity":
+                ws_id = data.get("ws_id", "")
+                ws = node.workstreams.get(ws_id)
+                if ws:
+                    ws["activity"] = data.get("activity", "")
+                    ws["activity_state"] = data.get("activity_state", "")
+                # Activity events are not forwarded to cluster SSE — only state changes
+
+            elif etype == "ws_created":
+                ws_id = data.get("ws_id", "")
+                if ws_id and ws_id not in node.workstreams:
+                    node.workstreams[ws_id] = {
+                        "id": ws_id,
+                        "name": data.get("name", ""),
+                        "state": "idle",
+                        "node": node_id,
+                        "server_url": node.server_url,
+                        "model": data.get("model", ""),
+                        "model_alias": data.get("model_alias", ""),
+                        "tokens": 0,
+                        "context_ratio": 0.0,
+                        "activity": "",
+                        "activity_state": "",
+                        "tool_calls": 0,
+                        "title": "",
+                    }
                 pending_events.append(
                     {
                         "type": "ws_created",
                         "ws_id": ws_id,
-                        "name": ws.get("name", ""),
+                        "name": data.get("name", ""),
                         "node_id": node_id,
                     }
                 )
-            # Detect removals
-            for ws_id in sorted(old_ids - new_ids):
+
+            elif etype == "ws_closed":
+                ws_id = data.get("ws_id", "")
+                node.workstreams.pop(ws_id, None)
                 pending_events.append({"type": "ws_closed", "ws_id": ws_id})
-            # Detect state changes on existing workstreams
-            for ws_id in sorted(new_ids & old_ids):
-                old_ws = node.workstreams.get(ws_id, {})
-                new_w = new_ws[ws_id]
-                old_state = old_ws.get("state", "")
-                new_state = new_w.get("state", "")
-                if old_state != new_state:
-                    pending_events.append(
-                        {
-                            "type": "ws_state",
-                            "ws_id": ws_id,
-                            "state": new_state,
-                            "node_id": node_id,
-                            "tokens": new_w.get("tokens", 0),
-                            "content": new_w.get("content", ""),
-                        }
-                    )
-                # Detect name/title changes
-                old_name = old_ws.get("name", "")
-                new_name = new_w.get("name", "")
-                if old_name != new_name and new_name:
-                    pending_events.append(
-                        {
-                            "type": "ws_rename",
-                            "ws_id": ws_id,
-                            "name": new_name,
-                        }
-                    )
-            node.workstreams = new_ws
-        # Fan out diffs to SSE listeners outside the lock
+
+            elif etype == "ws_rename":
+                ws_id = data.get("ws_id", "")
+                name = data.get("name", "")
+                ws = node.workstreams.get(ws_id)
+                if ws and name:
+                    ws["name"] = name
+                pending_events.append({"type": "ws_rename", "ws_id": ws_id, "name": name})
+
+            elif etype == "health_changed":
+                # Update the health dict's circuit state in-place
+                circuit = data.get("circuit_state", "")
+                if circuit:
+                    if not node.health:
+                        node.health = {}
+                    backend = node.health.setdefault("backend", {})
+                    backend["circuit_state"] = circuit
+                    backend["status"] = "up" if circuit == "closed" else "down"
+                    node.health["status"] = "ok" if circuit == "closed" else "degraded"
+                # Not forwarded to cluster SSE — next snapshot refreshes UI
+
+            elif etype == "aggregate":
+                node.aggregate = {
+                    "total_tokens": data.get("total_tokens", 0),
+                    "total_tool_calls": data.get("total_tool_calls", 0),
+                    "active_count": data.get("active_count", 0),
+                    "total_count": data.get("total_count", 0),
+                }
+                # Not forwarded to cluster SSE — overview queries read from snapshot
+
         for event in pending_events:
             self._fanout(event)
 

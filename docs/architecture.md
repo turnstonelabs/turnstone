@@ -74,7 +74,7 @@ turnstone/
     _sync.py          Background event loop for sync wrappers
     _types.py         TurnResult + TurnstoneAPIError
   console/
-    collector.py      ClusterCollector — aggregates state from all nodes via HTTP
+    collector.py      ClusterCollector — aggregates state from all nodes via SSE
     scheduler.py      TaskScheduler — background cron/at scheduler, dispatches via HTTP
     server.py         Cluster dashboard HTTP server + SSE + CLI entry point
     static/           Cluster dashboard web UI (page-specific HTML, CSS, JS)
@@ -1201,31 +1201,31 @@ bell + status line to stderr to alert the user.
 ### Cluster Console
 
 ```
-Monitoring (3 daemon threads)        Control + Proxy (async Starlette)
+Monitoring (2 daemon threads)        Control + Proxy (async Starlette)
 +------------------+                 +----------------------------+
-| Event subscriber |                 | POST /v1/api/cluster/      |
-| SSE on           |                 |   workstreams/new          |
-| /events/glob     |                 |   → POST to target server  |
+| Node discovery   |                 | POST /v1/api/cluster/      |
+| Service registry |                 |   workstreams/new          |
+| every 60 seconds |                 |   → POST to target server  |
 +------------------+                 +----------------------------+
-| Node discovery   |                 | GET /node/{node_id}/       |
-| Service registry |                 |   → httpx.AsyncClient      |
-| every 15 seconds |                 |     proxy to server_url    |
-+------------------+                 | GET /node/{id}/v1/api/events |
-| Poll loop        |                 |   → SSE stream proxy       |
-| GET /v1/api/dash |                 | POST /node/{id}/v1/api/send  |
-| GET /health      |                 |   → forwarded to server    |
-| ThreadPoolExec   |                 +----------------------------+
-+------------------+
+| SSE manager      |                 | GET /node/{node_id}/       |
+| asyncio loop     |                 |   → httpx.AsyncClient      |
+| 1 task per node  |                 |     proxy to server_url    |
+| /events/global   |                 | GET /node/{id}/v1/api/events |
+| snapshot+deltas  |                 |   → SSE stream proxy       |
++------------------+                 | POST /node/{id}/v1/api/send  |
+                                     |   → forwarded to server    |
+                                     +----------------------------+
 ```
 
 The console HTTP layer is a Starlette/ASGI app served by uvicorn. The SSE
 endpoint uses `EventSourceResponse` with the same listener queue pattern as
-the main server. `ClusterCollector`'s background threads (event subscriber,
-node discovery, poll loop) use `ThreadPoolExecutor`
-for parallel HTTP polling. The poll loop diffs workstream IDs between poll
-cycles and fans out synthetic `ws_created`/`ws_closed` SSE events for any
-changes, ensuring browser clients stay in sync even when real-time cluster
-events are missed.
+the main server. `ClusterCollector` runs two daemon threads: a discovery loop
+that queries the service registry every 60 seconds, and an SSE manager that
+runs a single asyncio event loop multiplexing persistent SSE connections to
+all nodes via `GET /v1/api/events/global`. Each node delivers a full snapshot
+on connect followed by real-time delta events — state changes, health
+transitions, and aggregate metrics arrive sub-second instead of on a 15-second
+poll cycle.
 
 The console has two write-path capabilities:
 

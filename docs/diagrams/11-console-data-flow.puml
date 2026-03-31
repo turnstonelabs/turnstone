@@ -10,55 +10,76 @@ participant "ClusterCollector" as CC
 participant "Node-A\n(server)" as NodeA
 participant "Node-B\n(server)" as NodeB
 
-== Thread 1: HTTP Polling (every 10s) ==
+== Thread 1: Node Discovery (every 60s) ==
 
-CC -> CC : Iterate registered nodes
+CC -> CC : list_services("server",\nmax_age_seconds=120)
 activate CC #C8E6C9
 
-CC -> NodeA : GET /v1/api/dashboard
-activate NodeA
-NodeA --> CC : {workstreams: [...],\naggregate: {total_tokens, ...}}
-deactivate NodeA
-
-CC -> NodeA : GET /health
-activate NodeA
-NodeA --> CC : {status:"ok", version:"0.9.2",\nmodel:"...", workstreams:{...}}
-deactivate NodeA
-
-CC -> NodeB : GET /v1/api/dashboard
-activate NodeB
-NodeB --> CC : {workstreams: [...],\naggregate: {total_tokens, ...}}
-deactivate NodeB
-
-CC -> CC : Diff old vs new workstream IDs
-CC -> CC : Replace NodeSnapshot["nodeA"]\n.workstreams, .health, .aggregate
-CC -> CC : _fanout(ws_created) for\nnewly appeared workstreams
-CC -> CC : _fanout(ws_closed) for\nremoved workstreams
-
-note right of CC
-  Poll-diff fanout ensures
-  browser SSE clients learn
-  about workstreams that
-  appeared between polls.
-end note
+CC -> CC : New node? → spawn SSE task\nLost node? → cancel SSE task
+CC -> CC : _fanout(node_joined)\n_fanout(node_lost)
 
 deactivate CC
+
+== Thread 2: SSE Manager (asyncio event loop) ==
+
+note over CC
+  Single asyncio event loop multiplexes
+  one persistent SSE connection per node.
+  Scales to 1000+ nodes.
+end note
+
+CC -> NodeA : GET /v1/api/events/global\n?expected_node_id=nodeA
+activate NodeA
+activate CC #BBDEFB
+
+NodeA --> CC : data: {"type":"node_snapshot",\n"node_id":"nodeA",\n"workstreams":[...],\n"health":{...},\n"aggregate":{...}}
+
+note right of CC
+  Snapshot populates NodeSnapshot
+  in-memory state. Reconciles
+  against stale data (emits
+  ws_created/ws_closed diffs).
+end note
+
+loop real-time delta events
+    NodeA --> CC : data: {"type":"ws_state",\n"ws_id":"ws1","state":"running"}
+    CC -> CC : Update NodeSnapshot\n_fanout(cluster_state)
+end
+
+alt health transition
+    NodeA --> CC : data: {"type":"health_changed",\n"circuit_state":"open"}
+    CC -> CC : Update node.health
+end
+
+alt periodic aggregate (every 10s)
+    NodeA --> CC : data: {"type":"aggregate",\n"total_tokens":50000}
+    CC -> CC : Update node.aggregate
+end
+
+deactivate CC
+deactivate NodeA
+
+alt SSE disconnect
+    CC -> CC : Mark node unreachable\nReconnect with backoff\n(1s → 30s cap)
+end
+
+alt identity mismatch (409 or snapshot node_id differs)
+    CC -> CC : Mark node unreachable\nStop reconnecting to this URL
+end
 
 == Browser SSE Stream ==
 
 Browser -> Server : GET /v1/api/cluster/events
 activate Server
 
-Server -> CC : get_snapshot()
+Server -> CC : get_snapshot_and_register(queue)
+note right : Atomic: snapshot + listener\nregistration under both locks\n→ no event gap
 CC --> Server : ClusterSnapshot\n(full current state)
-
-Server -> CC : register_listener(queue)
-note right : Per-client queue.Queue(maxsize=2000)\nSSE via EventSourceResponse + run_in_executor()
 
 Server -> Browser : data: {"type":"snapshot",...}\n(full state as first SSE event)
 
 loop continuous (incremental updates)
-    CC -> Server : event via listener queue\n(from polling thread)
+    CC -> Server : event via listener queue\n(from SSE manager thread)
     Server -> Browser : data: {"type":"cluster_state",...}\n\n
 end
 
@@ -81,7 +102,7 @@ Server --> Browser : JSON response
 
 Browser -> Server : GET /v1/api/cluster/overview
 Server -> CC : get_overview()
-CC --> Server : {nodes: 2, workstreams: 12,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.9.2"]}
+CC --> Server : {nodes: 2, workstreams: 12,\nstates: {running:5, ...},\naggregate: {total_tokens: 50000},\nversion_drift: false, versions: ["0.9.7"]}
 Server --> Browser : JSON response
 
 Browser -> Server : GET /v1/api/cluster/nodes?sort=activity
