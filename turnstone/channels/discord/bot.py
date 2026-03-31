@@ -188,7 +188,7 @@ class TurnstoneBot:
         # Per-tool "running" embeds, edited in-place when the result arrives.
         # List preserves call order for FIFO matching when the same tool name
         # appears more than once in a single turn.
-        self._tool_info_msgs: dict[str, list[tuple[str, discord.Message]]] = {}
+        self._tool_info_msgs: dict[str, list[tuple[str, str, discord.Message]]] = {}
         # Track the Discord message containing the pending approval embed per
         # workstream so that IntentVerdictEvent can update it with LLM judge
         # results.
@@ -475,10 +475,16 @@ class TurnstoneBot:
             from turnstone.channels._formatter import truncate
 
             # Show items that won't appear as interactive approval prompts:
-            # either they don't need approval, or they'll be auto-approved.
+            # auto-approved, don't need approval, or already failed (error).
+            # Items with error (e.g. policy-denied) never produce an
+            # ApproveRequestEvent, so they must be surfaced here.
             allowed = self.config.auto_approve_tools
             for it in event.items:
-                if it.get("needs_approval") and not self.config.auto_approve:
+                if (
+                    it.get("needs_approval")
+                    and not self.config.auto_approve
+                    and not it.get("error")
+                ):
                     tool_name = (
                         it.get("func_name")
                         or it.get("approval_label")
@@ -499,7 +505,8 @@ class TurnstoneBot:
                     color=discord.Color.light_grey(),
                 )
                 msg = await thread.send(embed=embed)
-                self._tool_info_msgs.setdefault(ws_id, []).append((name, msg))
+                call_id = it.get("call_id", "")
+                self._tool_info_msgs.setdefault(ws_id, []).append((call_id, name, msg))
 
         elif isinstance(event, ToolResultEvent):
             from turnstone.channels._formatter import format_tool_result
@@ -512,12 +519,19 @@ class TurnstoneBot:
                 color=color,
             )
             # Edit the matching "running" embed from ToolInfoEvent if present.
+            # Prefer call_id match (deterministic); fall back to name (FIFO).
             info_list = self._tool_info_msgs.get(ws_id, [])
             matched_msg: discord.Message | None = None
-            for i, (tname, _tmsg) in enumerate(info_list):
-                if tname == event.name:
-                    matched_msg = info_list.pop(i)[1]
-                    break
+            if event.call_id:
+                for i, (cid, _tname, _tmsg) in enumerate(info_list):
+                    if cid == event.call_id:
+                        matched_msg = info_list.pop(i)[2]
+                        break
+            if matched_msg is None:
+                for i, (_cid, tname, _tmsg) in enumerate(info_list):
+                    if tname == event.name:
+                        matched_msg = info_list.pop(i)[2]
+                        break
             if matched_msg is not None:
                 try:
                     await matched_msg.edit(embed=result_embed)

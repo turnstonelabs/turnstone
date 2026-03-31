@@ -1028,7 +1028,7 @@ class TestToolInfoEvent:
         assert embed.title == "bash"
         assert embed.description == "ls -la"
         # Message tracked for later editing by ToolResultEvent.
-        assert bot._tool_info_msgs["ws-1"] == [("bash", sent_msg)]
+        assert bot._tool_info_msgs["ws-1"] == [("", "bash", sent_msg)]
 
     def test_multiple_tools_send_multiple_embeds(self):
         from turnstone.sdk.events import ToolInfoEvent
@@ -1090,6 +1090,28 @@ class TestToolInfoEvent:
         thread.send.assert_awaited_once()
         assert thread.send.call_args[1]["embed"].title == "bash"
 
+    def test_error_items_shown_unconditionally(self):
+        from turnstone.sdk.events import ToolInfoEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        items = [
+            {"func_name": "bash", "preview": "rm -rf /", "needs_approval": True},
+            {
+                "func_name": "bash",
+                "preview": "blocked",
+                "needs_approval": True,
+                "error": "policy_denied",
+            },
+        ]
+        event = ToolInfoEvent(ws_id="ws-1", items=items)
+        _run(bot._on_ws_event("ws-1", thread, event))
+
+        # Only the error item is shown (first item needs interactive approval).
+        thread.send.assert_awaited_once()
+        assert thread.send.call_args[1]["embed"].title == "bash"
+
 
 class TestToolResultEvent:
     """Tests for ToolResultEvent handling in the Discord bot."""
@@ -1122,7 +1144,7 @@ class TestToolResultEvent:
         # Pre-populate a tool info message (as ToolInfoEvent would).
         info_msg = MagicMock()
         info_msg.edit = AsyncMock()
-        bot._tool_info_msgs["ws-1"] = [("bash", info_msg)]
+        bot._tool_info_msgs["ws-1"] = [("", "bash", info_msg)]
 
         event = ToolResultEvent(ws_id="ws-1", name="bash", output="file1\nfile2")
         _run(bot._on_ws_event("ws-1", thread, event))
@@ -1177,7 +1199,7 @@ class TestToolResultEvent:
         embed = thread.send.call_args[1]["embed"]
         assert embed.color == discord.Color.dark_grey()
 
-    def test_fifo_matching_same_name_tools(self):
+    def test_call_id_matching(self):
         from turnstone.sdk.events import ToolResultEvent
 
         bot = self._make_bot()
@@ -1187,15 +1209,35 @@ class TestToolResultEvent:
         first_msg.edit = AsyncMock()
         second_msg = MagicMock()
         second_msg.edit = AsyncMock()
-        bot._tool_info_msgs["ws-1"] = [("bash", first_msg), ("bash", second_msg)]
+        bot._tool_info_msgs["ws-1"] = [
+            ("call-1", "bash", first_msg),
+            ("call-2", "bash", second_msg),
+        ]
 
-        # First result matches first info message.
+        # Result with call_id matches the correct message regardless of order.
+        event = ToolResultEvent(ws_id="ws-1", call_id="call-2", name="bash", output="result")
+        _run(bot._on_ws_event("ws-1", thread, event))
+        second_msg.edit.assert_awaited_once()
+        first_msg.edit.assert_not_awaited()
+
+    def test_fifo_fallback_when_no_call_id(self):
+        from turnstone.sdk.events import ToolResultEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        first_msg = MagicMock()
+        first_msg.edit = AsyncMock()
+        second_msg = MagicMock()
+        second_msg.edit = AsyncMock()
+        bot._tool_info_msgs["ws-1"] = [("", "bash", first_msg), ("", "bash", second_msg)]
+
+        # No call_id — falls back to FIFO name match.
         event1 = ToolResultEvent(ws_id="ws-1", name="bash", output="result1")
         _run(bot._on_ws_event("ws-1", thread, event1))
         first_msg.edit.assert_awaited_once()
         second_msg.edit.assert_not_awaited()
 
-        # Second result matches second info message.
         event2 = ToolResultEvent(ws_id="ws-1", name="bash", output="result2")
         _run(bot._on_ws_event("ws-1", thread, event2))
         second_msg.edit.assert_awaited_once()
@@ -1208,7 +1250,7 @@ class TestToolResultEvent:
 
         info_msg = MagicMock()
         info_msg.edit = AsyncMock(side_effect=Exception("Discord API error"))
-        bot._tool_info_msgs["ws-1"] = [("bash", info_msg)]
+        bot._tool_info_msgs["ws-1"] = [("", "bash", info_msg)]
 
         event = ToolResultEvent(ws_id="ws-1", name="bash", output="ok")
         _run(bot._on_ws_event("ws-1", thread, event))

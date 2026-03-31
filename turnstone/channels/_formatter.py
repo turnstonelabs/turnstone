@@ -151,11 +151,11 @@ def format_tool_result(name: str, output: str, *, is_error: bool = False) -> str
         lines = lines[:10]
         lines.append("\u2026")
     trimmed = "\n".join(lines)
-    # Truncate to 500 chars.
-    if len(trimmed) > 500:
-        trimmed = trimmed[:497] + "\u2026"
     # Escape triple backticks to prevent code-block breakout.
     trimmed = trimmed.replace("```", "` ` `")
+    # Truncate to 500 chars (after escaping, which can expand the string).
+    if len(trimmed) > 500:
+        trimmed = trimmed[:497] + "\u2026"
     prefix = "ERROR" if is_error else name
     return f"**{prefix}**\n```\n{trimmed}\n```"
 
