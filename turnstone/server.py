@@ -2911,7 +2911,10 @@ def main() -> None:
                 # Store client on app state for lifespan renewal
                 app.state.tls_client = tls_client
                 # Update advertise URL to HTTPS now that TLS is active
-                app.state.advertise_url = f"https://{_advertise_host}:{args.port}"
+                if _advertise_url.startswith("http://"):
+                    app.state.advertise_url = _advertise_url.replace("http://", "https://", 1)
+                else:
+                    app.state.advertise_url = _advertise_url
                 log.info("TLS enabled — serving HTTPS")
             else:
                 log.warning("TLS enabled but no cert available")
