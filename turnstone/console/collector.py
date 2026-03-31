@@ -353,6 +353,34 @@ class ClusterCollector:
             # Detect removals
             for ws_id in sorted(old_ids - new_ids):
                 pending_events.append({"type": "ws_closed", "ws_id": ws_id})
+            # Detect state changes on existing workstreams
+            for ws_id in sorted(new_ids & old_ids):
+                old_ws = node.workstreams.get(ws_id, {})
+                new_w = new_ws[ws_id]
+                old_state = old_ws.get("state", "")
+                new_state = new_w.get("state", "")
+                if old_state != new_state:
+                    pending_events.append(
+                        {
+                            "type": "ws_state",
+                            "ws_id": ws_id,
+                            "state": new_state,
+                            "node_id": node_id,
+                            "tokens": new_w.get("tokens", 0),
+                            "content": new_w.get("content", ""),
+                        }
+                    )
+                # Detect name/title changes
+                old_name = old_ws.get("name", "")
+                new_name = new_w.get("name", "")
+                if old_name != new_name and new_name:
+                    pending_events.append(
+                        {
+                            "type": "ws_rename",
+                            "ws_id": ws_id,
+                            "name": new_name,
+                        }
+                    )
             node.workstreams = new_ws
         # Fan out diffs to SSE listeners outside the lock
         for event in pending_events:
