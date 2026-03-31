@@ -30,15 +30,17 @@ def _parse_footer(interaction: discord.Interaction) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-async def _disable_buttons(interaction: discord.Interaction, label: str) -> None:
-    """Edit the message to disable all buttons and append a result label."""
+async def disable_message_buttons(message: discord.Message, label: str) -> None:
+    """Disable all buttons on *message* and append *label* to the embed title.
+
+    Used both from interaction callbacks (via the message attribute) and
+    from bot event handlers when the server resolves an approval externally
+    (e.g. timeout).
+    """
     import discord
 
-    if interaction.message is None:
-        return
-
     view = discord.ui.View()
-    for item in interaction.message.components or []:
+    for item in message.components or []:
         for child in item.children:  # type: ignore[union-attr]
             button: discord.ui.Button[discord.ui.View] = discord.ui.Button(
                 label=getattr(child, "label", ""),
@@ -48,12 +50,19 @@ async def _disable_buttons(interaction: discord.Interaction, label: str) -> None
             )
             view.add_item(button)
 
-    embed = interaction.message.embeds[0] if interaction.message.embeds else None
+    embed = message.embeds[0] if message.embeds else None
     if embed is not None:
         embed.color = discord.Color.greyple()
         embed.title = f"{embed.title} - {label}"
 
-    await interaction.message.edit(embed=embed, view=view)
+    await message.edit(embed=embed, view=view)
+
+
+async def _disable_buttons(interaction: discord.Interaction, label: str) -> None:
+    """Edit the interaction message to disable all buttons."""
+    if interaction.message is None:
+        return
+    await disable_message_buttons(interaction.message, label)
 
 
 # ---------------------------------------------------------------------------

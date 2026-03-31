@@ -24,6 +24,7 @@ from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import ChannelRouter
 from turnstone.core.log import get_logger
 from turnstone.sdk.events import (
+    ApprovalResolvedEvent,
     ApproveRequestEvent,
     ContentEvent,
     ErrorEvent,
@@ -637,6 +638,19 @@ class TurnstoneBot:
                     await approval_msg.edit(embed=embed)
                 except Exception:
                     log.debug("discord.verdict_embed_edit_failed", ws_id=ws_id)
+
+        elif isinstance(event, ApprovalResolvedEvent):
+            # Server resolved the approval (timeout, external approve/reject).
+            # Disable the buttons so they can't be clicked stale.
+            approval_msg = self._pending_approval_msgs.pop(ws_id, None)
+            if approval_msg is not None:
+                from turnstone.channels.discord.views import disable_message_buttons
+
+                label = "Approved" if event.approved else "Denied"
+                try:
+                    await disable_message_buttons(approval_msg, label)
+                except Exception:
+                    log.debug("discord.approval_resolved_edit_failed", ws_id=ws_id)
 
         elif isinstance(event, StreamEndEvent):
             # Edge-case cleanup: clear any lingering thinking indicator.

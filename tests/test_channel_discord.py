@@ -1212,6 +1212,84 @@ class TestToolResultEvent:
         thread.send.assert_awaited_once()
 
 
+# ---------------------------------------------------------------------------
+# Approval resolved (timeout / external resolution)
+# ---------------------------------------------------------------------------
+
+
+class TestApprovalResolved:
+    """ApprovalResolvedEvent should disable buttons on the pending approval embed."""
+
+    def _make_bot(self):
+        from turnstone.channels.discord.bot import TurnstoneBot
+
+        bot = MagicMock(spec=TurnstoneBot)
+        bot.config = MagicMock()
+        bot.config.max_message_length = 2000
+        bot.config.streaming_edit_interval = 1.5
+        bot.config.auto_approve = False
+        bot.config.auto_approve_tools = []
+        bot.storage = None
+        bot._streaming = {}
+        bot._thinking_msgs = {}
+        bot._tool_info_msgs = {}
+        bot._pending_approval_msgs = {}
+        bot._notify_reply_channels = {}
+        bot._should_auto_approve = MagicMock(return_value=False)
+        bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
+        return bot
+
+    def test_disables_buttons_on_timeout(self):
+        from turnstone.sdk.events import ApprovalResolvedEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        # Set up a pending approval message with components.
+        approval_msg = MagicMock()
+        approval_msg.embeds = [MagicMock()]
+        approval_msg.components = []
+        approval_msg.edit = AsyncMock()
+        bot._pending_approval_msgs["ws-1"] = approval_msg
+
+        event = ApprovalResolvedEvent(ws_id="ws-1", approved=False, feedback="timeout")
+        _run(bot._on_ws_event("ws-1", thread, event))
+
+        approval_msg.edit.assert_awaited_once()
+        # Pending approval message should be removed.
+        assert "ws-1" not in bot._pending_approval_msgs
+
+    def test_disables_buttons_on_approved(self):
+        from turnstone.sdk.events import ApprovalResolvedEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        approval_msg = MagicMock()
+        approval_msg.embeds = [MagicMock()]
+        approval_msg.components = []
+        approval_msg.edit = AsyncMock()
+        bot._pending_approval_msgs["ws-1"] = approval_msg
+
+        event = ApprovalResolvedEvent(ws_id="ws-1", approved=True)
+        _run(bot._on_ws_event("ws-1", thread, event))
+
+        approval_msg.edit.assert_awaited_once()
+        # Check the embed title was updated with "Approved".
+        edited_embed = approval_msg.edit.call_args[1]["embed"]
+        assert "Approved" in edited_embed.title
+
+    def test_no_pending_approval_is_noop(self):
+        from turnstone.sdk.events import ApprovalResolvedEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+
+        event = ApprovalResolvedEvent(ws_id="ws-1", approved=False)
+        _run(bot._on_ws_event("ws-1", thread, event))
+        # No error, no state change.
+
+
 class TestChannelCLI:
     """Tests for the channel CLI entry point."""
 
