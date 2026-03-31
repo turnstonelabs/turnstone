@@ -127,7 +127,6 @@ services:
       - turnstone-console
       - --host=0.0.0.0
       - --port=8090
-      - --poll-interval=${CONSOLE_POLL_INTERVAL:-10}
     ports:
       - "${CONSOLE_PORT:-8090}:8090"
     environment:
