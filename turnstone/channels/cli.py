@@ -121,8 +121,37 @@ def main() -> None:
     )
 
     # -- Auth config ---------------------------------------------------------
-    auth_token = args.auth_token
+    auth_token = os.environ.get("TURNSTONE_AUTH_TOKEN", "") or args.auth_token
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+
+    # Prefer auto-rotating service JWTs when jwt_secret is available.
+    # Two separate token factories: one for console (aud=turnstone-console)
+    # and one for server nodes (aud=turnstone-server, used for SSE).
+    _console_token_factory = None
+    _server_token_factory = None
+    if jwt_secret:
+        from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, ServiceTokenManager
+
+        _scopes = frozenset({"read", "write", "approve"})
+        _console_mgr = ServiceTokenManager(
+            user_id="channel-gateway",
+            scopes=_scopes,
+            source="channel",
+            secret=jwt_secret,
+            audience=JWT_AUD_CONSOLE,
+            expiry_hours=1,
+        )
+        _server_mgr = ServiceTokenManager(
+            user_id="channel-gateway",
+            scopes=_scopes,
+            source="channel",
+            secret=jwt_secret,
+            audience=JWT_AUD_SERVER,
+            expiry_hours=1,
+        )
+        _console_token_factory = lambda: _console_mgr.token  # noqa: E731
+        _server_token_factory = lambda: _server_mgr.token  # noqa: E731
+        auth_token = ""  # don't also pass static token
 
     server_url: str = args.server_url
     console_url: str = args.console_url
@@ -197,7 +226,13 @@ def main() -> None:
 
         storage = get_storage()
         bot = TurnstoneBot(
-            config, server_url, storage, api_token=auth_token, console_url=console_url
+            config,
+            server_url,
+            storage,
+            api_token=auth_token,
+            console_url=console_url,
+            console_token_factory=_console_token_factory,
+            server_token_factory=_server_token_factory,
         )
         adapters = {"discord": bot}
 

@@ -16,6 +16,8 @@ from turnstone.sdk.console import AsyncTurnstoneConsole
 from turnstone.sdk.server import AsyncTurnstoneServer
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from turnstone.core.storage import StorageBackend
 
 log = get_logger(__name__)
@@ -48,6 +50,8 @@ class ChannelRouter:
         skill: str = "",
         api_token: str = "",
         console_url: str = "",
+        console_token_factory: Callable[[], str] | None = None,
+        server_token_factory: Callable[[], str] | None = None,
     ) -> None:
         self._server_url = server_url.rstrip("/")
         self._console_url = console_url.rstrip("/") if console_url else ""
@@ -68,12 +72,14 @@ class ChannelRouter:
             self._console = AsyncTurnstoneConsole(
                 base_url=self._console_url,
                 token=api_token,
+                token_factory=console_token_factory,
                 timeout=_WS_CREATE_TIMEOUT,
             )
         else:
             self._server = AsyncTurnstoneServer(
                 base_url=self._server_url,
                 token=api_token,
+                token_factory=server_token_factory,
                 timeout=_WS_CREATE_TIMEOUT,
             )
 

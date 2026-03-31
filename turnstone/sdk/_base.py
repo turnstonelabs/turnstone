@@ -11,7 +11,7 @@ import httpx
 from turnstone.sdk._types import TurnstoneAPIError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Callable
 
 T = TypeVar("T")
 
@@ -28,6 +28,7 @@ class _BaseClient:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        token_factory: Callable[[], str] | None = None,
     ) -> None:
         """Initialise the client.
 
@@ -35,11 +36,22 @@ class _BaseClient:
         params are ignored — configure headers, base URL, and TLS on the
         injected client instead.
 
+        *token_factory* is called before each request to get the current
+        auth token.  Use this with :class:`ServiceTokenManager` for
+        auto-rotating JWTs::
+
+            mgr = ServiceTokenManager(...)
+            client = AsyncTurnstoneServer(token_factory=lambda: mgr.token)
+
+        A static *token* string is set once at construction.  If both
+        *token* and *token_factory* are provided, *token_factory* wins.
+
         For mTLS, pass *ca_cert* (CA bundle path), *client_cert* and
         *client_key* (client certificate + key paths).
         """
+        self._token_factory = token_factory
         headers: dict[str, str] = {}
-        if token:
+        if token and not token_factory:
             headers["Authorization"] = f"Bearer {token}"
         if httpx_client is not None:
             self._client = httpx_client
@@ -98,7 +110,16 @@ class _BaseClient:
 
         Raises :class:`TurnstoneAPIError` on non-2xx responses.
         """
-        resp = await self._client.request(method, path, json=json_body, params=params)
+        headers: dict[str, str] | None = None
+        if self._token_factory is not None:
+            headers = {"Authorization": f"Bearer {self._token_factory()}"}
+        resp = await self._client.request(
+            method,
+            path,
+            json=json_body,
+            params=params,
+            headers=headers,
+        )
         if resp.status_code >= 400:
             # Try to extract error message from JSON body
             msg = ""
@@ -122,7 +143,12 @@ class _BaseClient:
         """Open an SSE stream and yield parsed JSON dicts."""
         from httpx_sse import aconnect_sse
 
-        async with aconnect_sse(self._client, "GET", path, params=params) as source:
+        sse_kwargs: dict[str, Any] = {}
+        if params:
+            sse_kwargs["params"] = params
+        if self._token_factory is not None:
+            sse_kwargs["headers"] = {"Authorization": f"Bearer {self._token_factory()}"}
+        async with aconnect_sse(self._client, "GET", path, **sse_kwargs) as source:
             async for sse in source.aiter_sse():
                 if sse.data:
                     with contextlib.suppress(json.JSONDecodeError):

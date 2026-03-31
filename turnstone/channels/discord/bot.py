@@ -34,6 +34,8 @@ from turnstone.sdk.events import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import discord
     from discord.ext import commands
 
@@ -146,6 +148,8 @@ class TurnstoneBot:
         *,
         api_token: str = "",
         console_url: str = "",
+        console_token_factory: Callable[[], str] | None = None,
+        server_token_factory: Callable[[], str] | None = None,
     ) -> None:
         import discord
         from discord.ext import commands
@@ -154,7 +158,11 @@ class TurnstoneBot:
         self._server_url = server_url.rstrip("/")
         self._console_url = console_url.rstrip("/") if console_url else ""
         self._api_token = api_token
+        # Server factory for direct SSE connections to server nodes
+        self._token_factory = server_token_factory
         self.storage = storage
+        # Router gets the appropriate factory based on mode:
+        # console mode → console factory; direct mode → server factory
         self.router = ChannelRouter(
             server_url,
             storage,
@@ -163,6 +171,8 @@ class TurnstoneBot:
             skill=config.skill,
             api_token=api_token,
             console_url=console_url,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
         )
 
         self._subscribed_ws: set[str] = set()
@@ -184,8 +194,9 @@ class TurnstoneBot:
         self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
 
         # Shared HTTP client for SSE connections (long-lived, no timeout).
+        # Token factory provides auto-rotating JWTs; static token is fallback.
         headers: dict[str, str] = {}
-        if api_token:
+        if api_token and not server_token_factory:
             headers["Authorization"] = f"Bearer {api_token}"
         self._http_client = httpx.AsyncClient(headers=headers, timeout=None)
 
@@ -319,8 +330,16 @@ class TurnstoneBot:
 
         while True:
             try:
+                # Refresh auth header per-connection (token may have rotated)
+                sse_headers: dict[str, str] | None = None
+                if self._token_factory is not None:
+                    sse_headers = {"Authorization": f"Bearer {self._token_factory()}"}
                 async with httpx_sse.aconnect_sse(
-                    self._http_client, "GET", url, params={"ws_id": ws_id}
+                    self._http_client,
+                    "GET",
+                    url,
+                    params={"ws_id": ws_id},
+                    headers=sse_headers,
                 ) as event_source:
                     delay = _SSE_RECONNECT_DELAY  # reset on successful connect
                     async for sse in event_source.aiter_sse():

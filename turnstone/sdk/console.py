@@ -63,7 +63,7 @@ from turnstone.sdk.events import ClusterEvent
 _UNSET: Any = object()
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
     import httpx
 
@@ -80,6 +80,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        token_factory: Callable[[], str] | None = None,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -89,6 +90,7 @@ class AsyncTurnstoneConsole(_BaseClient):
             ca_cert=ca_cert,
             client_cert=client_cert,
             client_key=client_key,
+            token_factory=token_factory,
         )
 
     # -- cluster overview ----------------------------------------------------
