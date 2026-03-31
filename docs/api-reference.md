@@ -1857,3 +1857,54 @@ turnstone_tokens_total{type="completion"} 12150
 turnstone_tool_calls_total{tool="bash"} 7
 turnstone_tool_calls_total{tool="read_file"} 3
 ```
+
+---
+
+## Console Routing Proxy Endpoints
+
+These endpoints are served by the console (`turnstone-console`) and proxy
+requests to the correct server node via the hash ring bucket cache. In
+multi-node deployments, clients (SDK, channel gateway) talk to the console
+instead of individual server nodes.
+
+### `POST /v1/api/route/workstreams/new`
+
+Create a workstream via hash-ring routing. The console generates the `ws_id`,
+routes to the assigned node, and includes `node_url` in the response for
+direct SSE connections.
+
+### `POST /v1/api/route/send`
+
+Proxy a message to the workstream's assigned server node.
+
+### `POST /v1/api/route/approve`
+
+Proxy an approval response to the workstream's assigned server node.
+
+### `POST /v1/api/route/cancel`
+
+Cancel generation on a workstream.
+
+### `POST /v1/api/route/command`
+
+Send a slash command to a workstream.
+
+### `POST /v1/api/route/plan`
+
+Send plan review feedback to a workstream.
+
+### `POST /v1/api/route/workstreams/close`
+
+Close a workstream.
+
+### `GET /v1/api/route?ws_id=X`
+
+Look up which server node owns a workstream. Returns `{"node_url": "...", "node_id": "..."}`.
+Used by channel adapters to open direct SSE connections to the correct server node.
+
+### `GET /metrics` (Console)
+
+Prometheus metrics for the console routing layer. Includes:
+`turnstone_router_requests_total`, `turnstone_router_request_duration_seconds`,
+`turnstone_ring_membership_size`, `turnstone_ring_version`,
+`turnstone_ring_rebalance_total`, `turnstone_ring_migrations_total`.

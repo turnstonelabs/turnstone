@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import functools
 import html
 import json
@@ -745,15 +744,32 @@ async def route_proxy(request: Request) -> Response:
     # the last cache load), retry on the new node.  If the route is the
     # same, return the 404 as-is — no loop, no scan.
     if resp.status_code == 404:
-        router.refresh_cache()
+        # Blocking refresh — wait for any in-progress refresh to finish
+        # so the retry uses the latest data, not stale cache.
+        router._refresh_lock.acquire()
+        try:
+            router._refresh_cache_locked()
+        finally:
+            router._refresh_lock.release()
         try:
             new_ref = router.route(ws_id)
         except (NoAvailableNodeError, ValueError):
             new_ref = ref
         if new_ref.node_id != ref.node_id:
-            with contextlib.suppress(httpx.HTTPError):
+            try:
                 resp = await client.post(
                     f"{new_ref.url}{upstream_path}", json=body, headers=headers
+                )
+            except httpx.HTTPError:
+                return _record_route(
+                    request,
+                    method,
+                    502,
+                    t0,
+                    JSONResponse(
+                        {"error": f"retry node {new_ref.node_id} unreachable"},
+                        status_code=502,
+                    ),
                 )
 
     return _record_route(

@@ -153,10 +153,8 @@ class ChannelRouter:
                 )
 
             # 2. Create via SDK client with atomic resume.
-            # Note: auto_approve_tools is not passed here because the server's
-            # create endpoint does not accept it.  Per-tool auto-approve is
-            # handled channel-side in the adapter's _should_auto_approve().
             resume_ws = old_ws_id or ""
+            _tools_csv = ",".join(self._auto_approve_tools) if self._auto_approve_tools else ""
             log.info(
                 "channel_router.creating_workstream",
                 channel_type=channel_type,
@@ -171,6 +169,7 @@ class ChannelRouter:
                     resume_ws=resume_ws,
                     skill=self._skill,
                     auto_approve=self._auto_approve,
+                    auto_approve_tools=_tools_csv,
                 )
                 ws_id = data.get("ws_id", "")
             else:
@@ -181,6 +180,7 @@ class ChannelRouter:
                     resume_ws=resume_ws,
                     skill=self._skill,
                     auto_approve=self._auto_approve,
+                    auto_approve_tools=_tools_csv,
                 )
                 ws_id = resp.ws_id
                 data = {"ws_id": resp.ws_id, "name": resp.name}
