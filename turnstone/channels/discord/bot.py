@@ -558,7 +558,7 @@ class TurnstoneBot:
                     log.debug("discord.tool_info_status_edit_failed", ws_id=ws_id)
 
             # Send the result as a separate message.
-            desc = format_tool_result(event.name, event.output, is_error=event.is_error)
+            desc = format_tool_result(event.output)
             color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
             result_embed = discord.Embed(
                 title=event.name,

@@ -59,7 +59,7 @@ async def disable_message_buttons(message: discord.Message, label: str) -> None:
 
 
 async def _disable_buttons(interaction: discord.Interaction, label: str) -> None:
-    """Edit the interaction message to disable all buttons."""
+    """Edit the interaction message to disable all buttons and append *label* to the embed title."""
     if interaction.message is None:
         return
     await disable_message_buttons(interaction.message, label)
@@ -160,6 +160,8 @@ class ApprovalView:
         )
 
         label = "Always Approved" if always else ("Approved" if approved else "Rejected")
+        # Pop pending approval so ApprovalResolvedEvent doesn't double-update.
+        self.bot._pending_approval_msgs.pop(ws_id, None)
         await _disable_buttons(interaction, label)
         await interaction.followup.send(
             f"Tool execution **{label.lower()}**.",

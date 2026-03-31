@@ -848,14 +848,14 @@ class TestFormatToolResult:
     def test_basic_output(self):
         from turnstone.channels._formatter import format_tool_result
 
-        result = format_tool_result("bash", "hello world")
+        result = format_tool_result("hello world")
         assert "```" in result
         assert "hello world" in result
 
     def test_wraps_in_code_block(self):
         from turnstone.channels._formatter import format_tool_result
 
-        result = format_tool_result("bash", "output text", is_error=True)
+        result = format_tool_result("output text")
         assert result.startswith("```\n")
         assert result.endswith("\n```")
 
@@ -863,7 +863,7 @@ class TestFormatToolResult:
         from turnstone.channels._formatter import format_tool_result
 
         output = "\n".join(f"line {i}" for i in range(20))
-        result = format_tool_result("bash", output)
+        result = format_tool_result(output)
         # Should have at most 10 content lines + ellipsis
         inner = result.split("```")[1]
         assert inner.strip().count("\n") <= 11
@@ -872,7 +872,7 @@ class TestFormatToolResult:
         from turnstone.channels._formatter import format_tool_result
 
         output = "x" * 600
-        result = format_tool_result("bash", output)
+        result = format_tool_result(output)
         # Code block content should be <= 500 chars (497 + ellipsis)
         inner = result.split("```")[1].strip()
         assert len(inner) <= 501  # 497 + ellipsis char
@@ -881,7 +881,7 @@ class TestFormatToolResult:
         from turnstone.channels._formatter import format_tool_result
 
         output = "before ``` after"
-        result = format_tool_result("bash", output)
+        result = format_tool_result(output)
         # Only the opening and closing code fences should remain as ```.
         assert result.count("```") == 2
 

@@ -139,7 +139,7 @@ def format_plan_review(content: str) -> str:
     return f"**Plan review requested:**\n\n{content}"
 
 
-def format_tool_result(name: str, output: str, *, is_error: bool = False) -> str:
+def format_tool_result(output: str) -> str:
     """Format a tool result into a compact code-block summary.
 
     Truncates to the first 10 lines (plus an ellipsis line if trimmed) or
