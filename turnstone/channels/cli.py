@@ -182,9 +182,22 @@ def main() -> None:
                     break
                 _time.sleep(1)
             else:
-                log.warning("channel.discovery_timeout", console=console_url, server=server_url)
+                log.warning(
+                    "channel.discovery_timeout",
+                    console_url=console_url,
+                    server_url=server_url,
+                )
         except Exception:
             log.warning("channel.discovery_failed", exc_info=True)
+
+    if not console_url and not server_url:
+        print(
+            "Error: no console or server URL available. Set --server-url, "
+            "--console-url, or ensure the database is reachable and services "
+            "are registered.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # -- Adapter selection ---------------------------------------------------
     adapters_configured = False
