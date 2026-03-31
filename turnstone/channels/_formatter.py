@@ -142,7 +142,8 @@ def format_plan_review(content: str) -> str:
 def format_tool_result(name: str, output: str, *, is_error: bool = False) -> str:
     """Format a tool result into a compact code-block summary.
 
-    Truncates to the first 10 lines or 500 characters, whichever is shorter.
+    Truncates to the first 10 lines (plus an ellipsis line if trimmed) or
+    500 characters, whichever is shorter.
     """
     # Truncate to 10 lines.
     lines = output.split("\n", 10)

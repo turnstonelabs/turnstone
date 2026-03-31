@@ -312,7 +312,10 @@ class TurnstoneBot:
                 await task
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
-        self._thinking_msgs.pop(ws_id, None)
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
         self._tool_info_msgs.pop(ws_id, None)
         self._pending_approval_msgs.pop(ws_id, None)
         self._notify_reply_channels.pop(ws_id, None)
@@ -334,7 +337,10 @@ class TurnstoneBot:
         self._subscribed_ws.discard(ws_id)
         self._sse_tasks.pop(ws_id, None)
         self._streaming.pop(ws_id, None)
-        self._thinking_msgs.pop(ws_id, None)
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        if thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
         self._tool_info_msgs.pop(ws_id, None)
         self._pending_approval_msgs.pop(ws_id, None)
         self._notify_reply_channels.pop(ws_id, None)
@@ -480,7 +486,12 @@ class TurnstoneBot:
                     if not (allowed and tool_name in allowed):
                         continue
                 name = it.get("func_name") or it.get("approval_label") or "tool"
-                preview = truncate(it.get("preview", ""), max_length=120) or None
+                raw_preview = it.get("preview", "")
+                # Sanitize preview: escape backticks to prevent markdown
+                # breakout and strip @-mentions.
+                raw_preview = raw_preview.replace("`", "\\`")
+                raw_preview = discord.utils.escape_mentions(raw_preview)
+                preview = truncate(raw_preview, max_length=120) or None
                 embed = discord.Embed(
                     title=name,
                     description=preview,

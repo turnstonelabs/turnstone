@@ -871,6 +871,14 @@ class TestFormatToolResult:
         inner = result.split("```")[1].strip()
         assert len(inner) <= 501  # 497 + ellipsis char
 
+    def test_escapes_triple_backticks_in_output(self):
+        from turnstone.channels._formatter import format_tool_result
+
+        output = "before ``` after"
+        result = format_tool_result("bash", output)
+        # Only the opening and closing code fences should remain as ```.
+        assert result.count("```") == 2
+
 
 # ---------------------------------------------------------------------------
 # Thinking indicator lifecycle
