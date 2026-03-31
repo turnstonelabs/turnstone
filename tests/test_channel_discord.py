@@ -229,13 +229,15 @@ class TestMessageCog:
 
         ts.router.send_message.assert_not_awaited()
 
-    def test_ignores_dms(self):
+    def test_dm_without_reference_sends_guidance(self):
         cog, ts, _bot = self._make_cog()
-        msg = _make_message(guild=False)
+        dm_channel = AsyncMock()
+        msg = _make_message(guild=False, channel=dm_channel)
 
         _run(cog._on_message(msg))
 
         ts.router.send_message.assert_not_awaited()
+        dm_channel.send.assert_awaited_once()
 
     def test_ignores_non_allowed_channels(self):
         cog, ts, _bot = self._make_cog()
@@ -712,8 +714,8 @@ class TestNotificationTracking:
         # Should send feedback to the DM channel
         dm_channel.send.assert_awaited_once_with("*This notification is no longer active.*")
 
-    def test_dm_without_reference_ignored(self):
-        """DM without a message reference should be ignored."""
+    def test_dm_without_reference_sends_guidance(self):
+        """DM without a message reference should reply with guidance."""
         from turnstone.channels.discord.cog import MessageCog
 
         bot = MagicMock()
@@ -728,11 +730,15 @@ class TestNotificationTracking:
         bot.turnstone = ts
 
         cog = MessageCog(bot)
-        msg = _make_message(guild=False)  # reference=None
+        dm_channel = AsyncMock()
+        msg = _make_message(guild=False, channel=dm_channel)  # reference=None
 
         _run(cog._on_message(msg))
 
         ts.router.send_message.assert_not_awaited()
+        dm_channel.send.assert_awaited_once()
+        sent_text = dm_channel.send.call_args[0][0]
+        assert "/ask" in sent_text
 
     def test_dm_reply_unlinked_user_ignored(self):
         """DM reply from an unlinked user should be ignored."""

@@ -210,6 +210,10 @@ class MessageCog:
         # Only handle explicit replies to a tracked notification message.
         ref = message.reference
         if ref is None or ref.message_id is None:
+            await message.channel.send(
+                "*Direct messages aren't supported. "
+                "Use `/ask` in a server channel or @mention me to start a conversation.*"
+            )
             return
 
         # Atomic pop prevents TOCTOU race across await points.
