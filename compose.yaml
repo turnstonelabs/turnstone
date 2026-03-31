@@ -136,6 +136,7 @@ services:
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:-}
       - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
       - TURNSTONE_DB_URL=${DATABASE_URL:-}
+      - TURNSTONE_CONSOLE_URL=http://console:8090
     networks:
       - turnstone-net
     healthcheck:
