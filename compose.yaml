@@ -164,15 +164,15 @@ services:
       - -c
       - >-
         turnstone-channel
-        --server-url=http://server:8080
         --http-host=0.0.0.0
         $${TURNSTONE_DISCORD_GUILD:+--discord-guild $$TURNSTONE_DISCORD_GUILD}
     environment:
       - TURNSTONE_DISCORD_TOKEN=${TURNSTONE_DISCORD_TOKEN:-}
       - TURNSTONE_DISCORD_GUILD=${TURNSTONE_DISCORD_GUILD:-0}
+      - TURNSTONE_AUTH_TOKEN=${TURNSTONE_AUTH_TOKEN:-}
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:-}
-      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-}
+      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-postgresql}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
       - TURNSTONE_CHANNEL_ADVERTISE_URL=http://channel:8091
     networks:
       - turnstone-net

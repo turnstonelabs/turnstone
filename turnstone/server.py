@@ -1628,6 +1628,25 @@ async def create_workstream(request: Request) -> JSONResponse:
                 except Exception:
                     pass  # best-effort; routing will still work via resume
 
+        # If an initial_message was provided, send it as the first user message.
+        # This replaces the old bridge behavior where CreateWorkstreamMessage
+        # carried initial_message and the bridge sent it as a follow-up.
+        initial_message = body.get("initial_message", "").strip()
+        if initial_message and ws.session is not None:
+            session = ws.session
+
+            def _run_initial() -> None:
+                try:
+                    session.send(initial_message)
+                except Exception:
+                    if isinstance(ws.ui, WebUI):
+                        ws.ui.on_stream_end()
+                        ws.ui.on_state_change("idle")
+
+            t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
+            ws.worker_thread = t
+            t.start()
+
         return JSONResponse(
             {
                 "ws_id": ws.id,
