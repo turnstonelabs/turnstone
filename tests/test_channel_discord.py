@@ -927,7 +927,7 @@ class TestThinkingIndicator:
         thread.send.assert_awaited_once_with("*Thinking...*")
         assert bot._thinking_msgs["ws-1"] is sent_msg
 
-    def test_thinking_stop_deletes_message(self):
+    def test_thinking_stop_preserves_message_for_reuse(self):
         from turnstone.sdk.events import ThinkingStopEvent
 
         bot = self._make_bot()
@@ -939,8 +939,9 @@ class TestThinkingIndicator:
         event = ThinkingStopEvent(ws_id="ws-1")
         _run(bot._on_ws_event("ws-1", thread, event))
 
-        thinking_msg.delete.assert_awaited_once()
-        assert "ws-1" not in bot._thinking_msgs
+        # Message kept for next event to reuse via edit.
+        thinking_msg.delete.assert_not_awaited()
+        assert "ws-1" in bot._thinking_msgs
 
     def test_thinking_stop_without_message_is_noop(self):
         from turnstone.sdk.events import ThinkingStopEvent
@@ -950,22 +951,23 @@ class TestThinkingIndicator:
 
         event = ThinkingStopEvent(ws_id="ws-1")
         _run(bot._on_ws_event("ws-1", thread, event))
-        # No error, no state change
 
-    def test_content_event_clears_thinking_message(self):
+    def test_content_event_reuses_thinking_message(self):
         from turnstone.sdk.events import ContentEvent
 
         bot = self._make_bot()
         thread = AsyncMock()
         thinking_msg = MagicMock()
-        thinking_msg.delete = AsyncMock()
+        thinking_msg.edit = AsyncMock()
         bot._thinking_msgs["ws-1"] = thinking_msg
 
         event = ContentEvent(ws_id="ws-1", text="Hello")
         _run(bot._on_ws_event("ws-1", thread, event))
 
-        thinking_msg.delete.assert_awaited_once()
+        # Thinking message becomes the StreamingMessage base — no delete.
         assert "ws-1" not in bot._thinking_msgs
+        sm = bot._streaming["ws-1"]
+        assert sm._message is thinking_msg
 
     def test_stream_end_clears_thinking_message(self):
         from turnstone.sdk.events import StreamEndEvent
@@ -1111,6 +1113,42 @@ class TestToolInfoEvent:
         # Only the error item is shown (first item needs interactive approval).
         thread.send.assert_awaited_once()
         assert thread.send.call_args[1]["embed"].title == "bash"
+
+    def test_reuses_thinking_message_for_first_tool(self):
+        from turnstone.sdk.events import ToolInfoEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+        thinking_msg = MagicMock()
+        thinking_msg.edit = AsyncMock()
+        bot._thinking_msgs["ws-1"] = thinking_msg
+
+        items = [{"func_name": "bash", "preview": "ls -la", "needs_approval": False}]
+        event = ToolInfoEvent(ws_id="ws-1", items=items)
+        _run(bot._on_ws_event("ws-1", thread, event))
+
+        # Thinking message edited into tool embed, no new message sent.
+        thinking_msg.edit.assert_awaited_once()
+        thread.send.assert_not_awaited()
+        assert "ws-1" not in bot._thinking_msgs
+        # The reused message is tracked for ToolResultEvent editing.
+        assert bot._tool_info_msgs["ws-1"][0][2] is thinking_msg
+
+    def test_thinking_deleted_when_no_visible_items(self):
+        from turnstone.sdk.events import ToolInfoEvent
+
+        bot = self._make_bot()
+        thread = AsyncMock()
+        thinking_msg = MagicMock()
+        thinking_msg.delete = AsyncMock()
+        bot._thinking_msgs["ws-1"] = thinking_msg
+
+        # All items need approval, none visible.
+        items = [{"func_name": "bash", "preview": "rm /", "needs_approval": True}]
+        event = ToolInfoEvent(ws_id="ws-1", items=items)
+        _run(bot._on_ws_event("ws-1", thread, event))
+
+        thinking_msg.delete.assert_awaited_once()
 
 
 class TestToolResultEvent:

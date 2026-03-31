@@ -450,17 +450,15 @@ class TurnstoneBot:
                 log.debug("discord.thinking_start_send_failed", ws_id=ws_id)
 
         elif isinstance(event, ThinkingStopEvent):
-            thinking_msg = self._thinking_msgs.pop(ws_id, None)
-            if thinking_msg is not None:
-                with contextlib.suppress(Exception):
-                    await thinking_msg.delete()
+            # Leave the thinking message in place — the next visible event
+            # (ContentEvent, ToolInfoEvent, StreamEndEvent) will edit or
+            # clean it up, avoiding a delete→gap→new-message flicker.
+            pass
 
         elif isinstance(event, ContentEvent):
-            # Clear thinking indicator when content starts streaming.
+            # Reuse thinking message as the initial streaming message so the
+            # first flush edits it in-place (no delete→gap→send flicker).
             thinking_msg = self._thinking_msgs.pop(ws_id, None)
-            if thinking_msg is not None:
-                with contextlib.suppress(Exception):
-                    await thinking_msg.delete()
             sm = self._streaming.get(ws_id)
             if sm is None:
                 sm = StreamingMessage(
@@ -468,11 +466,19 @@ class TurnstoneBot:
                     max_length=self.config.max_message_length,
                     edit_interval=self.config.streaming_edit_interval,
                 )
+                if thinking_msg is not None:
+                    sm._message = thinking_msg
                 self._streaming[ws_id] = sm
+            elif thinking_msg is not None:
+                with contextlib.suppress(Exception):
+                    await thinking_msg.delete()
             await sm.append(event.text)
 
         elif isinstance(event, ToolInfoEvent):
             from turnstone.channels._formatter import truncate
+
+            # Reuse the thinking message for the first tool embed.
+            thinking_msg = self._thinking_msgs.pop(ws_id, None)
 
             # Show items that won't appear as interactive approval prompts:
             # auto-approved, don't need approval, or already failed (error).
@@ -504,9 +510,23 @@ class TurnstoneBot:
                     description=preview,
                     color=discord.Color.light_grey(),
                 )
-                msg = await thread.send(embed=embed)
+                # Edit thinking message into first tool embed to avoid flicker.
+                if thinking_msg is not None:
+                    try:
+                        await thinking_msg.edit(content=None, embed=embed)
+                        msg = thinking_msg
+                    except Exception:
+                        msg = await thread.send(embed=embed)
+                    thinking_msg = None
+                else:
+                    msg = await thread.send(embed=embed)
                 call_id = it.get("call_id", "")
                 self._tool_info_msgs.setdefault(ws_id, []).append((call_id, name, msg))
+
+            # If no visible items consumed the thinking message, clean it up.
+            if thinking_msg is not None:
+                with contextlib.suppress(Exception):
+                    await thinking_msg.delete()
 
         elif isinstance(event, ToolResultEvent):
             from turnstone.channels._formatter import format_tool_result
