@@ -263,11 +263,11 @@ class BackendHealthMonitor:
     # ------------------------------------------------------------------
 
     def _update_metrics(self) -> None:
-        """Push state to metrics collector.  Called with *self._lock* held.
+        """Push circuit-breaker state to metrics collector.
 
-        Also schedules the ``on_state_changed`` callback to fire *after* the
-        lock is released (via ``record_success``/``record_failure`` callers).
-        We capture the state string here so the callback receives it.
+        Called with *self._lock* held. State-change callbacks are dispatched
+        by the callers (``record_success`` / ``record_failure``) after the
+        lock is released, not by this method.
         """
         from turnstone.core.metrics import metrics
 

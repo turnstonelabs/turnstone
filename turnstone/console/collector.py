@@ -134,13 +134,22 @@ class ClusterCollector:
         log.info("ClusterCollector started")
 
     def stop(self) -> None:
-        """Stop all threads and clean up resources."""
+        """Stop all threads and clean up resources.
+
+        Sets ``_running = False`` which causes the SSE manager coroutine to
+        exit naturally (its ``while self._running`` loop terminates), running
+        its ``finally`` cleanup (cancel tasks, close AsyncClient).
+        """
         self._running = False
-        # Cancel all SSE tasks on the event loop
+        # Request cancellation of all SSE tasks so they don't block the
+        # manager's cleanup. The manager coroutine exits when _running is
+        # False and handles remaining task cancellation in its finally block.
         if self._sse_loop is not None and self._sse_loop.is_running():
             for node_id in list(self._sse_tasks):
                 asyncio.run_coroutine_threadsafe(self._stop_node(node_id), self._sse_loop)
-            self._sse_loop.call_soon_threadsafe(self._sse_loop.stop)
+        # Wait for background threads to finish their shutdown.
+        for t in self._threads:
+            t.join(timeout=5)
         log.info("ClusterCollector stopped")
 
     def _fanout(self, event: dict[str, Any]) -> None:
@@ -238,7 +247,13 @@ class ClusterCollector:
                     async for sse in source.aiter_sse():
                         if stop_event.is_set():
                             break
-                        data = json.loads(sse.data)
+                        if not sse.data:
+                            continue  # ping/comment frame
+                        try:
+                            data = json.loads(sse.data)
+                        except json.JSONDecodeError:
+                            log.debug("Invalid SSE JSON from node %s", node_id)
+                            continue
                         etype = data.get("type", "")
                         if etype == "node_snapshot":
                             # Client-side identity check (defense in depth)

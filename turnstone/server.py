@@ -996,9 +996,13 @@ async def global_events_sse(request: Request) -> Response:
     # -- Node identity check --------------------------------------------------
     expected = request.query_params.get("expected_node_id")
     actual_node_id = getattr(request.app.state, "node_id", "")
-    if expected and actual_node_id and expected != actual_node_id:
+    if expected and expected != actual_node_id:
         return JSONResponse(
-            {"error": "node_id mismatch", "expected": expected, "actual": actual_node_id},
+            {
+                "error": "node_id mismatch" if actual_node_id else "node_id unavailable",
+                "expected": expected,
+                "actual": actual_node_id,
+            },
             status_code=409,
         )
 
