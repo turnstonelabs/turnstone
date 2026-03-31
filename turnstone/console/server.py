@@ -528,17 +528,26 @@ async def route_create(request: Request) -> Response:
     """POST /v1/api/route/workstreams/new — create via hash-ring routing."""
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    if router is None or not router.is_ready():
-        return _record_route(
-            request,
-            "create",
-            503,
-            t0,
-            JSONResponse(
-                {"error": "Cluster routing not initialized"},
-                status_code=503,
-            ),
-        )
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        # Ring not yet populated (rebalancer hasn't run or is disabled).
+        # Try a one-shot refresh before giving up — the rebalancer may
+        # have written buckets since the last collector poll.
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                "create",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
 
     try:
         body = await request.json()
@@ -664,17 +673,23 @@ async def route_proxy(request: Request) -> Response:
     if method == "close":
         method = "close"  # /route/workstreams/close
     router: ConsoleRouter | None = request.app.state.router
-    if router is None or not router.is_ready():
-        return _record_route(
-            request,
-            method,
-            503,
-            t0,
-            JSONResponse(
-                {"error": "Cluster routing not initialized"},
-                status_code=503,
-            ),
-        )
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                method,
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
 
     try:
         body = await request.json()
@@ -789,17 +804,23 @@ async def route_lookup(request: Request) -> JSONResponse:
     """GET /v1/api/route — look up which node owns a workstream."""
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
-    if router is None or not router.is_ready():
-        return _record_route(
-            request,
-            "route",
-            503,
-            t0,
-            JSONResponse(
-                {"error": "Cluster routing not initialized"},
-                status_code=503,
-            ),
-        )  # type: ignore[return-value]
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                "route",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )  # type: ignore[return-value]
+    assert router is not None
 
     ws_id = request.query_params.get("ws_id", "")
     if not ws_id:

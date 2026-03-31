@@ -568,12 +568,12 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "rebalancer.enabled",
             "bool",
-            False,
+            True,
             "Enable the hash ring rebalancer daemon",
             "rebalancer",
             help="When enabled, the console runs a background thread that monitors cluster "
             "membership and automatically redistributes hash ring buckets when nodes join "
-            "or leave. Required for multi-node deployments.",
+            "or leave. Required for the channel gateway and multi-node routing.",
         ),
         SettingDef(
             "rebalancer.interval",

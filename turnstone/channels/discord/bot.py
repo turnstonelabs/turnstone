@@ -310,6 +310,24 @@ class TurnstoneBot:
             del self._notify_ws_map[mid]
         log.info("discord.unsubscribed", ws_id=ws_id)
 
+    async def _cleanup_stale_route(self, ws_id: str) -> None:
+        """Remove a channel route whose workstream no longer exists."""
+        route = await asyncio.to_thread(self.storage.get_channel_route_by_ws, ws_id)
+        if route:
+            await asyncio.to_thread(
+                self.storage.delete_channel_route, route["channel_type"], route["channel_id"]
+            )
+            log.info("discord.stale_route_removed", ws_id=ws_id)
+        # Clear same per-ws state that unsubscribe_ws() clears.
+        self._subscribed_ws.discard(ws_id)
+        self._sse_tasks.pop(ws_id, None)
+        self._streaming.pop(ws_id, None)
+        self._pending_approval_msgs.pop(ws_id, None)
+        self._notify_reply_channels.pop(ws_id, None)
+        stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
+        for mid in stale:
+            del self._notify_ws_map[mid]
+
     # -- SSE listener --------------------------------------------------------
 
     async def _sse_listener(self, ws_id: str, thread: discord.abc.Messageable) -> None:
@@ -325,7 +343,7 @@ class TurnstoneBot:
         # When routing through the console, connect SSE directly to the
         # assigned server node (node_url from the create response).
         node_base = await self.router.get_node_url(ws_id)
-        url = f"{node_base}/api/events"
+        url = f"{node_base}/v1/api/events"
         delay = _SSE_RECONNECT_DELAY
 
         while True:
@@ -341,6 +359,19 @@ class TurnstoneBot:
                     params={"ws_id": ws_id},
                     headers=sse_headers,
                 ) as event_source:
+                    # Bail on non-retryable responses (404 = workstream gone).
+                    status = event_source.response.status_code
+                    if status == 404:
+                        log.info("discord.sse_ws_gone", ws_id=ws_id)
+                        await self._cleanup_stale_route(ws_id)
+                        return
+                    if status >= 400:
+                        log.warning(
+                            "discord.sse_upstream_error",
+                            ws_id=ws_id,
+                            status=status,
+                        )
+                        # Fall through to backoff/retry for transient errors.
                     delay = _SSE_RECONNECT_DELAY  # reset on successful connect
                     async for sse in event_source.aiter_sse():
                         if sse.event == "message" or not sse.event:
@@ -355,8 +386,6 @@ class TurnstoneBot:
                                 continue
                             event = ServerEvent.from_dict(data)
                             await self._on_ws_event(ws_id, thread, event)
-                            if isinstance(event, StreamEndEvent):
-                                return  # clean end, do not reconnect
             except httpx.RemoteProtocolError:
                 # Server closed connection (normal on stream_end or shutdown).
                 log.debug("discord.sse_remote_closed", ws_id=ws_id)
