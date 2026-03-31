@@ -59,6 +59,7 @@ function showAdmin() {
     watches: "admin.watches",
     roles: "admin.roles",
     policies: "admin.policies",
+    "prompt-policies": "admin.prompt_policies",
     skills: "admin.skills",
     usage: "admin.usage",
     audit: "admin.audit",
@@ -198,6 +199,7 @@ function switchAdminTab(tab) {
     "settings",
     "tls",
     "mcp",
+    "prompt-policies",
   ];
   for (var p = 0; p < panels.length; p++) {
     var el = document.getElementById("admin-" + panels[p]);
@@ -222,6 +224,7 @@ function switchAdminTab(tab) {
   if (tab === "settings") loadSettings();
   if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
+  if (tab === "prompt-policies") loadPromptPolicies();
 
   // Update breadcrumb with active tab label
   var activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
@@ -1848,6 +1851,10 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "mcp-install-overlay") hideInstallMcpModal();
         else if (overlayId === "github-import-overlay") hideGitHubImportModal();
         else if (overlayId === "model-create-overlay") hideCreateModelModal();
+        else if (overlayId === "create-ppolicy-overlay")
+          hideCreatePromptPolicyModal();
+        else if (overlayId === "edit-ppolicy-overlay")
+          hideEditPromptPolicyModal();
       }
     };
   }
@@ -1937,6 +1944,8 @@ document.addEventListener("keydown", function (e) {
     ["mcp-create-overlay", hideCreateMcpModal],
     ["github-import-overlay", hideGitHubImportModal],
     ["model-create-overlay", hideCreateModelModal],
+    ["create-ppolicy-overlay", hideCreatePromptPolicyModal],
+    ["edit-ppolicy-overlay", hideEditPromptPolicyModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);

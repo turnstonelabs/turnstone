@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
             ws_id: str | None = ...,
             *,
             skill: str | None = ...,
+            client_type: str = ...,
         ) -> ChatSession: ...
 
 
@@ -136,6 +137,7 @@ class WorkstreamManager:
         skill_id: str = "",
         skill_version: int = 0,
         ws_id: str = "",
+        client_type: str = "",
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
@@ -177,7 +179,10 @@ class WorkstreamManager:
         ws = Workstream(id=ws_id, name=name) if ws_id else Workstream(name=name)
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        ws.session = self._session_factory(ws.ui, model, ws.id, skill=skill)
+        factory_kwargs: dict[str, Any] = {"skill": skill}
+        if client_type:
+            factory_kwargs["client_type"] = client_type
+        ws.session = self._session_factory(ws.ui, model, ws.id, **factory_kwargs)
 
         # Authoritative insert under lock with re-check (another thread may
         # have filled capacity while we were unlocked).

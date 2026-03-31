@@ -1395,6 +1395,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #create-schedule-overlay, #edit-schedule-overlay, #schedule-runs-overlay,
 #create-role-overlay, #edit-role-overlay, #user-roles-overlay,
 #create-policy-overlay, #edit-policy-overlay,
+#create-ppolicy-overlay, #edit-ppolicy-overlay,
 #create-template-overlay, #edit-template-overlay,
 #memory-detail-overlay,
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
@@ -1491,6 +1492,12 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #admin-policies .admin-colheaders,
 #admin-policies .admin-row {
   grid-template-columns: 1.2fr 1fr 70px 50px 80px 140px;
+}
+
+/* Prompt Policies grid: NAME | TOOL GATE | PRI | STATUS | ACTIONS */
+#admin-prompt-policies .admin-colheaders,
+#admin-prompt-policies .admin-row {
+  grid-template-columns: 1.2fr 1fr 50px 80px 140px;
 }
 
 /* Policy action badges */
@@ -1807,6 +1814,9 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
     grid-template-columns: 1fr 70px 50px 100px;
   }
   .admin-col-pstatus, .admin-col-ppriority { display: none; }
+  #admin-prompt-policies .admin-colheaders, #admin-prompt-policies .admin-row {
+    grid-template-columns: 1fr 70px 100px;
+  }
   #admin-skills .admin-colheaders, #admin-skills .admin-row {
     grid-template-columns: 1fr 100px;
   }

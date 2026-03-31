@@ -5567,6 +5567,191 @@ async def tls_ca_cert(request: Request) -> Response:
     )
 
 
+# ---------------------------------------------------------------------------
+# Admin: Prompt Policies (system message composition)
+# ---------------------------------------------------------------------------
+
+
+async def admin_list_prompt_policies(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/prompt-policies — list all prompt policies."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.prompt_policies")
+    if err:
+        return err
+
+    policies = storage.list_prompt_policies()
+    return JSONResponse({"policies": policies})
+
+
+async def admin_create_prompt_policy(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/prompt-policies — create a prompt policy."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.prompt_policies")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:64]
+    content = str(body.get("content", "")).strip()[:32768]
+    if not name:
+        return JSONResponse({"error": "name is required"}, status_code=400)
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+
+    try:
+        priority = int(body.get("priority", 0))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+
+    policy_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    storage.upsert_prompt_policy(
+        {
+            "policy_id": policy_id,
+            "name": name,
+            "content": content,
+            "tool_gate": str(body.get("tool_gate", "")).strip(),
+            "priority": priority,
+            "enabled": bool(body.get("enabled", True)),
+            "org_id": str(body.get("org_id", "")).strip(),
+            "created_by": audit_uid,
+        }
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "prompt_policy.create",
+        "prompt_policy",
+        policy_id,
+        {"name": name},
+        ip,
+    )
+
+    return JSONResponse(storage.get_prompt_policy(policy_id) or {})
+
+
+async def admin_get_prompt_policy(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/prompt-policies/{policy_id}."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.prompt_policies")
+    if err:
+        return err
+
+    policy_id = request.path_params["policy_id"]
+    policy = storage.get_prompt_policy(policy_id)
+    if policy is None:
+        return JSONResponse({"error": "Prompt policy not found"}, status_code=404)
+    return JSONResponse(policy)
+
+
+async def admin_update_prompt_policy(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/prompt-policies/{policy_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.prompt_policies")
+    if err:
+        return err
+
+    policy_id = request.path_params["policy_id"]
+    existing = storage.get_prompt_policy(policy_id)
+    if existing is None:
+        return JSONResponse({"error": "Prompt policy not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    update = dict(body)
+    update["policy_id"] = policy_id
+    if "name" in update:
+        update["name"] = str(update["name"]).strip()[:64]
+    if "priority" in update:
+        try:
+            update["priority"] = int(update["priority"])
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+    if "content" in update:
+        update["content"] = str(update["content"]).strip()[:32768]
+    if "enabled" in update:
+        update["enabled"] = bool(update["enabled"])
+    storage.upsert_prompt_policy(update)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "prompt_policy.update",
+        "prompt_policy",
+        policy_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse(storage.get_prompt_policy(policy_id) or {})
+
+
+async def admin_delete_prompt_policy(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/prompt-policies/{policy_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.prompt_policies")
+    if err:
+        return err
+
+    policy_id = request.path_params["policy_id"]
+    existing = storage.get_prompt_policy(policy_id)
+    if existing is None:
+        return JSONResponse({"error": "Prompt policy not found"}, status_code=404)
+
+    storage.delete_prompt_policy(policy_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "prompt_policy.delete",
+        "prompt_policy",
+        policy_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    return JSONResponse({"status": "ok", "policy_id": policy_id})
+
+
 async def admin_ring_status(request: Request) -> JSONResponse:
     """GET /v1/api/admin/ring/status — hash ring rebalancer status."""
     from turnstone.core.auth import require_permission
@@ -6004,6 +6189,27 @@ def create_app(
                     Route(
                         "/api/admin/model-capabilities/known",
                         admin_known_models,
+                    ),
+                    # Governance: Prompt Policies
+                    Route("/api/admin/prompt-policies", admin_list_prompt_policies),
+                    Route(
+                        "/api/admin/prompt-policies",
+                        admin_create_prompt_policy,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/prompt-policies/{policy_id}",
+                        admin_get_prompt_policy,
+                    ),
+                    Route(
+                        "/api/admin/prompt-policies/{policy_id}",
+                        admin_update_prompt_policy,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/prompt-policies/{policy_id}",
+                        admin_delete_prompt_policy,
+                        methods=["DELETE"],
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

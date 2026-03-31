@@ -136,6 +136,7 @@ class MessageCog:
                     str(channel.id),
                     name=channel.name or "",
                     initial_message="",
+                    client_type="chat",
                 )
             except (TimeoutError, RuntimeError):
                 log.warning("discord.ws_reactivation_failed", thread_id=channel.id)
@@ -192,6 +193,7 @@ class MessageCog:
                 name=thread_name,
                 model=self.ts.config.model,
                 initial_message="",
+                client_type="chat",
             )
 
             await self.ts.subscribe_ws(ws_id, thread)
@@ -370,6 +372,7 @@ class MessageCog:
             name=thread_name,
             model=self.ts.config.model,
             initial_message="",
+            client_type="chat",
         )
 
         await self.ts.subscribe_ws(ws_id, thread)

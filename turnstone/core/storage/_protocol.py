@@ -1048,6 +1048,24 @@ class StorageBackend(Protocol):
         """Delete a model definition. Returns True if existed."""
         ...
 
+    # -- Prompt policies -------------------------------------------------------
+
+    def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:
+        """Return all prompt policies ordered by priority."""
+        ...
+
+    def get_prompt_policy(self, policy_id: str) -> dict[str, Any] | None:
+        """Return prompt policy dict or None."""
+        ...
+
+    def upsert_prompt_policy(self, policy: dict[str, Any]) -> None:
+        """Create or update a prompt policy."""
+        ...
+
+    def delete_prompt_policy(self, policy_id: str) -> bool:
+        """Delete a prompt policy. Returns True if existed."""
+        ...
+
     # -- TLS / ACME (lacme Store) ----------------------------------------------
 
     def save_tls_account_key(self, key_id: str, key_pem: str) -> None:

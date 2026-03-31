@@ -2450,3 +2450,282 @@ function submitGitHubImport() {
       submitBtn.textContent = "Install";
     });
 }
+
+// ---------------------------------------------------------------------------
+// Prompt Policies (system message composition)
+// ---------------------------------------------------------------------------
+
+var _promptPolicies = [];
+var _cppTrapHandler = null;
+var _cppTriggerEl = null;
+var _eppTrapHandler = null;
+var _eppTriggerEl = null;
+
+function loadPromptPolicies() {
+  authFetch("/v1/api/admin/prompt-policies")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      _promptPolicies = data.policies || [];
+      _renderPromptPolicies(_promptPolicies);
+    })
+    .catch(function () {
+      var el = document.getElementById("admin-prompt-policies-table");
+      el.textContent = "";
+      var empty = document.createElement("div");
+      empty.className = "dashboard-empty";
+      empty.textContent = "Failed to load prompts";
+      el.appendChild(empty);
+    });
+}
+
+function _renderPromptPolicies(items) {
+  var el = document.getElementById("admin-prompt-policies-table");
+  el.textContent = "";
+  if (!items.length) {
+    var empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No prompts defined";
+    el.appendChild(empty);
+    return;
+  }
+  for (var i = 0; i < items.length; i++) {
+    var p = items[i];
+    var row = document.createElement("div");
+    row.className = "admin-row";
+    row.setAttribute("role", "listitem");
+
+    var colName = document.createElement("span");
+    colName.className = "admin-col admin-col-pname";
+    colName.textContent = p.name;
+    row.appendChild(colName);
+
+    var colGate = document.createElement("span");
+    colGate.className = "admin-col admin-col-ppattern";
+    if (p.tool_gate) {
+      var code = document.createElement("code");
+      code.textContent = p.tool_gate;
+      colGate.appendChild(code);
+    } else {
+      var em = document.createElement("em");
+      em.textContent = "unconditional";
+      colGate.appendChild(em);
+    }
+    row.appendChild(colGate);
+
+    var colPri = document.createElement("span");
+    colPri.className = "admin-col admin-col-ppriority";
+    colPri.textContent = String(p.priority);
+    row.appendChild(colPri);
+
+    var colStatus = document.createElement("span");
+    colStatus.className = "admin-col admin-col-pstatus";
+    var dot = document.createElement("span");
+    dot.className = p.enabled ? "watch-active" : "watch-completed";
+    dot.title = p.enabled ? "Enabled" : "Disabled";
+    dot.textContent = p.enabled ? "\u25CF active" : "\u25CB disabled";
+    colStatus.appendChild(dot);
+    row.appendChild(colStatus);
+
+    var colActions = document.createElement("span");
+    colActions.className = "admin-col admin-col-actions";
+    var editBtn = document.createElement("button");
+    editBtn.className = "admin-btn-action";
+    editBtn.textContent = "edit";
+    editBtn.setAttribute("data-edit-ppolicy", p.policy_id);
+    editBtn.setAttribute("aria-label", "Edit prompt " + p.name);
+    colActions.appendChild(editBtn);
+    var delBtn = document.createElement("button");
+    delBtn.className = "admin-btn-danger";
+    delBtn.textContent = "delete";
+    delBtn.setAttribute("data-delete-ppolicy", p.policy_id);
+    delBtn.setAttribute("data-ppolicy-name", p.name);
+    delBtn.setAttribute("aria-label", "Delete prompt " + p.name);
+    colActions.appendChild(delBtn);
+    row.appendChild(colActions);
+
+    el.appendChild(row);
+  }
+  el.querySelectorAll("[data-edit-ppolicy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditPromptPolicyModal(this.getAttribute("data-edit-ppolicy"));
+    });
+  });
+  el.querySelectorAll("[data-delete-ppolicy]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var pid = this.getAttribute("data-delete-ppolicy");
+      var pname = this.getAttribute("data-ppolicy-name");
+      showConfirmModal(
+        "Delete Prompt",
+        'Delete prompt "' + pname + '"?',
+        "Delete",
+        function () {
+          authFetch("/v1/api/admin/prompt-policies/" + pid, {
+            method: "DELETE",
+          })
+            .then(function (r) {
+              if (!r.ok) throw new Error();
+              return r.json();
+            })
+            .then(function () {
+              showToast("Prompt deleted");
+              loadPromptPolicies();
+            })
+            .catch(function () {
+              showToast("Failed to delete prompt");
+            });
+        },
+      );
+    });
+  });
+}
+
+function showCreatePromptPolicyModal() {
+  _cppTriggerEl = document.activeElement;
+  var ov = document.getElementById("create-ppolicy-overlay");
+  ov.style.display = "flex";
+  document.getElementById("cpp-name").value = "";
+  document.getElementById("cpp-gate").value = "";
+  document.getElementById("cpp-content").value = "";
+  document.getElementById("cpp-priority").value = "0";
+  document.getElementById("cpp-error").style.display = "none";
+  document.getElementById("cpp-name").focus();
+  _cppTrapHandler = _installTrap(
+    "create-ppolicy-overlay",
+    "create-ppolicy-box",
+  );
+}
+
+function hideCreatePromptPolicyModal() {
+  document.getElementById("create-ppolicy-overlay").style.display = "none";
+  _cppTrapHandler = _removeTrap(_cppTrapHandler);
+  if (_cppTriggerEl && _cppTriggerEl.focus) {
+    _cppTriggerEl.focus();
+  }
+  _cppTriggerEl = null;
+}
+
+function submitCreatePromptPolicy() {
+  var errEl = document.getElementById("cpp-error");
+  var name = document.getElementById("cpp-name").value.trim();
+  var content = document.getElementById("cpp-content").value.trim();
+  if (!name || !content) {
+    errEl.textContent = "Name and content are required";
+    errEl.style.display = "";
+    return;
+  }
+  errEl.style.display = "none";
+  var submitBtn = document.getElementById("cpp-submit");
+  submitBtn.disabled = true;
+  authFetch("/v1/api/admin/prompt-policies", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name,
+      content: content,
+      tool_gate: document.getElementById("cpp-gate").value.trim(),
+      priority:
+        parseInt(document.getElementById("cpp-priority").value, 10) || 0,
+      enabled: true,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideCreatePromptPolicyModal();
+      showToast("Prompt created");
+      loadPromptPolicies();
+    })
+    .catch(function (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = "";
+    })
+    .finally(function () {
+      submitBtn.disabled = false;
+    });
+}
+
+function showEditPromptPolicyModal(policyId) {
+  _eppTriggerEl = document.activeElement;
+  var p = null;
+  for (var i = 0; i < _promptPolicies.length; i++) {
+    if (_promptPolicies[i].policy_id === policyId) {
+      p = _promptPolicies[i];
+      break;
+    }
+  }
+  if (!p) return;
+  document.getElementById("epp-id").value = p.policy_id;
+  document.getElementById("epp-name").value = p.name;
+  document.getElementById("epp-gate").value = p.tool_gate || "";
+  document.getElementById("epp-content").value = p.content || "";
+  document.getElementById("epp-priority").value = p.priority || 0;
+  document.getElementById("epp-enabled").checked = p.enabled;
+  document.getElementById("epp-error").style.display = "none";
+  var ov = document.getElementById("edit-ppolicy-overlay");
+  ov.style.display = "flex";
+  document.getElementById("epp-name").focus();
+  _eppTrapHandler = _installTrap("edit-ppolicy-overlay", "edit-ppolicy-box");
+}
+
+function hideEditPromptPolicyModal() {
+  document.getElementById("edit-ppolicy-overlay").style.display = "none";
+  _eppTrapHandler = _removeTrap(_eppTrapHandler);
+  if (_eppTriggerEl && _eppTriggerEl.focus) {
+    _eppTriggerEl.focus();
+  }
+  _eppTriggerEl = null;
+}
+
+function submitEditPromptPolicy() {
+  var errEl = document.getElementById("epp-error");
+  var policyId = document.getElementById("epp-id").value;
+  var name = document.getElementById("epp-name").value.trim();
+  var content = document.getElementById("epp-content").value.trim();
+  if (!name || !content) {
+    errEl.textContent = "Name and content are required";
+    errEl.style.display = "";
+    return;
+  }
+  errEl.style.display = "none";
+  var submitBtn = document.getElementById("epp-submit");
+  submitBtn.disabled = true;
+  authFetch("/v1/api/admin/prompt-policies/" + policyId, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: name,
+      content: content,
+      tool_gate: document.getElementById("epp-gate").value.trim(),
+      priority:
+        parseInt(document.getElementById("epp-priority").value, 10) || 0,
+      enabled: document.getElementById("epp-enabled").checked,
+    }),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideEditPromptPolicyModal();
+      showToast("Prompt updated");
+      loadPromptPolicies();
+    })
+    .catch(function (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = "";
+    })
+    .finally(function () {
+      submitBtn.disabled = false;
+    });
+}

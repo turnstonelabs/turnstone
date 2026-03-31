@@ -26,6 +26,7 @@ import textwrap
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
 from html import escape as _html_escape
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -87,6 +88,7 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.web import check_ssrf, strip_html
+from turnstone.prompts import ClientType, SessionContext, compose_system_message
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
 log = get_logger(__name__)
@@ -290,6 +292,8 @@ class ChatSession:
         memory_config: MemoryConfig | None = None,
         config_store: ConfigStore | None = None,
         web_search_backend: str = "",
+        client_type: ClientType = ClientType.CLI,
+        username: str = "",
     ):
         self.client = client
         self.model = model
@@ -325,6 +329,8 @@ class ChatSession:
         self.auto_approve = False
         self._node_id = node_id
         self._user_id = user_id
+        self._username = username
+        self._client_type = client_type
         self._config_store = config_store
         self._memory_config = memory_config or MemoryConfig()
         self._ws_id = ws_id or uuid.uuid4().hex
@@ -988,64 +994,32 @@ class ChatSession:
                 "Never condescend to the form.",
             ]
         else:
-            dev_parts = [
-                "You are a resident engineer on a small, focused infrastructure team. "
-                "Your workspace is an instrumented workbench — a terminal with tools for "
-                "reading, writing, searching, and executing code. You've been here a while. "
-                "You know the codebase. You know the tools. You know their limits.\n\n"
-                "Your team trusts you with real work: investigating bugs, implementing features, "
-                "reviewing security, writing code that ships. You have access to the project's "
-                "files, git history, and a running database. You don't have access to everything "
-                "— some tools require approval, some paths are restricted, and that's by design. "
-                "You work within those boundaries.\n\n"
-                "You think before you act. You read before you edit. You verify before you commit. "
-                "When something breaks, you diagnose before you retry. When you're uncertain, you "
-                "say so. When a request is ambiguous, you make a reasonable call and note what you "
-                "assumed — you don't stall asking for permission on every judgment call.\n\n"
-                "When you disagree with a direction, you push back with reasoning — then defer to "
-                "the team's call.\n\n"
-                "You are not performing a demo. There is no audience. The code you write will run. "
-                "The files you edit are real. The commits you make go to a shared repository. "
-                "Act accordingly.\n\n"
-                "TOOL PATTERNS:\n\n"
-                "Modify existing file → read_file then edit_file:\n"
-                "   read_file(path='config.py') → "
-                "edit_file(path='config.py')\n\n"
-                "Modify multiple files → read_file then edit_file each:\n"
-                "   read_file(path='a.py') → edit_file(path='a.py') → "
-                "read_file(path='b.py') → edit_file(path='b.py')\n\n"
-                "Create new file → write_file (generate reasonable "
-                "content even if the request is vague):\n"
-                "   write_file(path='hello.py', content='...')\n"
-                "   write_file(path='README.md', "
-                "content='# Project\\nDescription.')\n\n"
-                "Create a file then run it → write_file then bash:\n"
-                "   write_file(path='fib.py', content='...') → "
-                "bash(command='python fib.py')\n\n"
-                "Find something across files → search:\n"
-                "   search(query='test_')\n\n"
-                "Find and modify → search then read_file then edit_file:\n"
-                "   search(query='MAX_RETRIES') → "
-                "read_file(path='found.py') → "
-                "edit_file(path='found.py')\n\n"
-                "Plan, design, or architect something → "
-                "explore codebase then plan_agent:\n"
-                "   bash(command='ls') → read_file(path='app.py') → "
-                "plan_agent(goal='add caching to the application')\n"
-                "   plan_agent(goal='refactor database layer "
-                "from monolith to service')\n"
-                "   plan_agent(goal='restructure auth module')\n\n"
-                "Run a command, git, or tests → bash:\n"
-                "   bash(command='git log -5')\n"
-                "   bash(command='pytest')\n\n"
-                "Retrieve a URL → web_fetch:\n"
-                "   web_fetch(url='https://example.com')\n\n"
-                "Search the web for information → web_search:\n"
-                "   web_search(query='current population of Tokyo')\n\n"
-                "Look up command flags or documentation → man:\n"
-                "   man(page='tar')\n"
-                "   man(page='grep')",
-            ]
+            # Compose system message from modular components
+            tool_names = frozenset(t["function"]["name"] for t in self._tools if "function" in t)
+            # Load DB prompt policies if storage is available
+            db_policies: list[dict[str, Any]] = []
+            try:
+                storage = get_storage()
+                if storage:
+                    db_policies = storage.list_prompt_policies()
+            except Exception:
+                pass
+            now = datetime.now(UTC)
+            ctx = SessionContext(
+                current_datetime=now.strftime("%Y-%m-%dT%H:%M"),
+                timezone=time.tzname[time.localtime().tm_isdst]
+                if time.daylight
+                else time.tzname[0],
+                username=self._username or self._user_id or "unknown",
+            )
+            composed = compose_system_message(
+                client_type=self._client_type,
+                context=ctx,
+                available_tools=tool_names,
+                policies=["web_search"],
+                db_policies=db_policies,
+            )
+            dev_parts = [composed]
         # Tool search hint (client-side mode only — native mode needs no hint)
         if self._tool_search:
             caps = self._get_capabilities()

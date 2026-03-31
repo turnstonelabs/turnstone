@@ -199,6 +199,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         resume_ws: str = "",
         target_node: str = "",
         user_id: str = "",
+        client_type: str = "",
     ) -> dict[str, Any]:
         """Create a workstream via the console's routing proxy.
 
@@ -224,6 +225,8 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["target_node"] = target_node
         if user_id:
             body["user_id"] = user_id
+        if client_type:
+            body["client_type"] = client_type
         return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
 
     async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
@@ -1059,6 +1062,7 @@ class TurnstoneConsole:
         resume_ws: str = "",
         target_node: str = "",
         user_id: str = "",
+        client_type: str = "",
     ) -> dict[str, Any]:
         return self._runner.run(
             self._async.route_create_workstream(
@@ -1071,6 +1075,7 @@ class TurnstoneConsole:
                 resume_ws=resume_ws,
                 target_node=target_node,
                 user_id=user_id,
+                client_type=client_type,
             )
         )
 

@@ -576,6 +576,25 @@ model_definitions = sa.Table(
 sa.Index("idx_model_definitions_enabled", model_definitions.c.enabled)
 
 # ---------------------------------------------------------------------------
+# Prompt policies — system message behavioral rules (admin-managed)
+# ---------------------------------------------------------------------------
+
+prompt_policies = sa.Table(
+    "prompt_policies",
+    metadata,
+    sa.Column("policy_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("content", sa.Text, nullable=False),
+    sa.Column("tool_gate", sa.Text, nullable=False, server_default=""),
+    sa.Column("priority", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("org_id", sa.Text, nullable=False, server_default=""),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+# ---------------------------------------------------------------------------
 # OIDC identity tables
 # ---------------------------------------------------------------------------
 

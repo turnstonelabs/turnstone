@@ -120,6 +120,7 @@ class ChannelRouter:
         name: str = "",
         model: str = "",
         initial_message: str = "",
+        client_type: str = "",
     ) -> tuple[str, bool]:
         """Look up or create a workstream for a channel.
 
@@ -176,6 +177,7 @@ class ChannelRouter:
                     skill=self._skill,
                     auto_approve=self._auto_approve,
                     auto_approve_tools=_tools_csv,
+                    client_type=client_type,
                 )
                 ws_id = data.get("ws_id", "")
             else:
@@ -187,6 +189,7 @@ class ChannelRouter:
                     skill=self._skill,
                     auto_approve=self._auto_approve,
                     auto_approve_tools=_tools_csv,
+                    client_type=client_type,
                 )
                 ws_id = resp.ws_id
                 data = {"ws_id": resp.ws_id, "name": resp.name}

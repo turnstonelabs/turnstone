@@ -47,6 +47,7 @@ from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
+from turnstone.prompts import ClientType
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, MutableMapping
@@ -1638,6 +1639,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             skill_id=skill_data["template_id"] if skill_data else "",
             skill_version=applied_skill_version,
             ws_id=requested_ws_id,
+            client_type=str(body.get("client_type", "")),
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -2855,10 +2857,25 @@ def main() -> None:
         ws_id: str | None = None,
         *,
         skill: str | None = None,
+        client_type: str = "",
     ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         uid = getattr(ui, "_user_id", "") or ""
+
+        # Resolve username from user_id for system message context
+        _username = ""
+        if uid:
+            try:
+                from turnstone.core.storage._registry import get_storage as _gs
+
+                _st = _gs()
+                if _st:
+                    _u = _st.get_user(uid)
+                    if _u:
+                        _username = _u.get("username", "")
+            except Exception:
+                pass
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
         live_memory_config = _build_memory_config()
@@ -2893,6 +2910,10 @@ def main() -> None:
             user_id=uid,
             memory_config=live_memory_config,
             config_store=config_store,
+            client_type=ClientType(client_type)
+            if client_type in ClientType.__members__.values()
+            else ClientType.WEB,
+            username=_username,
         )
 
     # Create WatchRunner (periodic command polling, server-level)

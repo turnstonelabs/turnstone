@@ -57,6 +57,10 @@ class CreateWorkstreamRequest(BaseModel):
         description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    client_type: str = Field(
+        default="",
+        description="Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):

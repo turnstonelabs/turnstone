@@ -108,6 +108,7 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "enabled",
     }
 )
+PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",

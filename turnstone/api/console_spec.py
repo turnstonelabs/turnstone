@@ -942,6 +942,41 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         ],
         tags=["Admin"],
     ),
+    # --- Admin: Prompt Policies ---
+    EndpointSpec(
+        "/v1/api/admin/prompt-policies",
+        "GET",
+        "List all prompt policies for system message composition",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/prompt-policies",
+        "POST",
+        "Create a prompt policy",
+        error_codes=[400],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/prompt-policies/{policy_id}",
+        "GET",
+        "Get a single prompt policy",
+        error_codes=[404],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/prompt-policies/{policy_id}",
+        "PUT",
+        "Update a prompt policy",
+        error_codes=[400, 404],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/prompt-policies/{policy_id}",
+        "DELETE",
+        "Delete a prompt policy",
+        error_codes=[404],
+        tags=["Admin"],
+    ),
     # --- Admin: TLS / ACME ---
     EndpointSpec(
         "/v1/api/admin/tls/ca",

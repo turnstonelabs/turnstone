@@ -425,11 +425,16 @@ class TestSkillCatalogDisclosure:
         session._mcp_client = None
         session._notify_on_complete = "{}"
         session._tool_error_flags = {}
+        from turnstone.prompts import ClientType
+
+        session._tools = []
+        session._client_type = ClientType.CLI
+        session._username = ""
 
         # Memory stubs
         session._memory_config = MagicMock()
         session._memory_config.fetch_limit = 0
-        session._user_id = ""
+        session._user_id = "test-user"
 
         with (
             patch(

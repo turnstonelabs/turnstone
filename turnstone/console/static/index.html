@@ -95,6 +95,7 @@
           <div class="admin-sidebar-group-label" aria-hidden="true">Governance</div>
           <button id="tab-roles" class="admin-nav" data-tab="roles" role="tab" aria-selected="false" aria-controls="admin-roles" tabindex="-1" onclick="switchAdminTab('roles')">Roles</button>
           <button id="tab-policies" class="admin-nav" data-tab="policies" role="tab" aria-selected="false" aria-controls="admin-policies" tabindex="-1" onclick="switchAdminTab('policies')">Policies</button>
+          <button id="tab-prompt-policies" class="admin-nav" data-tab="prompt-policies" role="tab" aria-selected="false" aria-controls="admin-prompt-policies" tabindex="-1" onclick="switchAdminTab('prompt-policies')">Prompts</button>
         </div>
         <div class="admin-sidebar-group" data-group="extensions" role="group" aria-label="Extensions">
           <div class="admin-sidebar-group-label" aria-hidden="true">Extensions</div>
@@ -256,6 +257,24 @@
       </div>
       <div id="admin-policies-table" role="list" aria-label="Tool policies" aria-live="polite">
         <div class="dashboard-empty">Loading policies...</div>
+      </div>
+    </div>
+
+    <!-- Prompt Policies Tab -->
+    <div id="admin-prompt-policies" class="admin-panel" role="tabpanel" aria-labelledby="tab-prompt-policies" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">PROMPTS</span>
+        <button class="admin-action-btn" onclick="showCreatePromptPolicyModal()">+ Create prompt</button>
+      </div>
+      <div class="admin-colheaders" aria-hidden="true">
+        <span class="admin-col admin-col-pname">NAME</span>
+        <span class="admin-col admin-col-ppattern">TOOL GATE</span>
+        <span class="admin-col admin-col-ppriority">PRI</span>
+        <span class="admin-col admin-col-pstatus">STATUS</span>
+        <span class="admin-col admin-col-actions">ACTIONS</span>
+      </div>
+      <div id="admin-prompt-policies-table" role="list" aria-label="Prompt policies" aria-live="polite">
+        <div class="dashboard-empty">Loading prompt policies...</div>
       </div>
     </div>
 
@@ -884,6 +903,48 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideEditPolicyModal()">Cancel</button>
       <button id="ep-submit" class="modal-submit" onclick="submitEditPolicy()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Create Prompt Policy Modal -->
+<div id="create-ppolicy-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-ppolicy-title">
+  <div id="create-ppolicy-box" class="admin-modal admin-modal-wide">
+    <h2 id="create-ppolicy-title">Create Prompt</h2>
+    <div id="cpp-error" role="alert" aria-live="assertive"></div>
+    <label for="cpp-name">Name <span class="label-hint">slug-style identifier</span></label>
+    <input id="cpp-name" type="text" placeholder="e.g. web_search, data_handling" autocomplete="off">
+    <label for="cpp-gate">Tool Gate <span class="label-hint">tool name or blank for unconditional</span></label>
+    <input id="cpp-gate" type="text" placeholder="e.g. web_search" autocomplete="off">
+    <label for="cpp-content">Content <span class="label-hint">markdown body for system message</span></label>
+    <textarea id="cpp-content" rows="10" placeholder="## Policy Name&#10;&#10;Behavioral guidance..." spellcheck="false"></textarea>
+    <label for="cpp-priority">Priority <span class="label-hint">higher = assembled later (closer to conversation)</span></label>
+    <input id="cpp-priority" type="number" value="0" min="0" max="9999">
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideCreatePromptPolicyModal()">Cancel</button>
+      <button id="cpp-submit" class="modal-submit" onclick="submitCreatePromptPolicy()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Prompt Policy Modal -->
+<div id="edit-ppolicy-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-ppolicy-title">
+  <div id="edit-ppolicy-box" class="admin-modal admin-modal-wide">
+    <h2 id="edit-ppolicy-title">Edit Prompt</h2>
+    <div id="epp-error" role="alert" aria-live="assertive"></div>
+    <input id="epp-id" type="hidden">
+    <label for="epp-name">Name</label>
+    <input id="epp-name" type="text" autocomplete="off">
+    <label for="epp-gate">Tool Gate</label>
+    <input id="epp-gate" type="text" autocomplete="off">
+    <label for="epp-content">Content</label>
+    <textarea id="epp-content" rows="10" spellcheck="false"></textarea>
+    <label for="epp-priority">Priority</label>
+    <input id="epp-priority" type="number" value="0" min="0" max="9999">
+    <label class="admin-checkbox"><input id="epp-enabled" type="checkbox" checked> Enabled</label>
+    <div class="modal-buttons">
+      <button class="modal-cancel" onclick="hideEditPromptPolicyModal()">Cancel</button>
+      <button id="epp-submit" class="modal-submit" onclick="submitEditPromptPolicy()">Save</button>
     </div>
   </div>
 </div>
