@@ -412,6 +412,13 @@ class TurnstoneBot:
                 log.debug("discord.sse_remote_closed", ws_id=ws_id)
             except asyncio.CancelledError:
                 return  # unsubscribe or shutdown
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                log.warning(
+                    "discord.sse_connect_failed",
+                    ws_id=ws_id,
+                    url=url,
+                    error=str(exc),
+                )
             except Exception:
                 log.warning("discord.sse_error", ws_id=ws_id, exc_info=True)
 
