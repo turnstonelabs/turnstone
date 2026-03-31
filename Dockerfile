@@ -34,7 +34,7 @@ RUN uv sync --frozen --no-dev \
     --no-compile --extra all
 
 # Compile bytecode in a separate step (avoids fd exhaustion during install)
-RUN python -m compileall -q .venv/lib/ turnstone/
+RUN python -m compileall -q .venv turnstone/
 
 # Add venv to PATH so entry points are found
 ENV PATH="/app/.venv/bin:$PATH"

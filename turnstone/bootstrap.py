@@ -669,7 +669,7 @@ class _BootstrapLLM:
         if getattr(message, "tool_calls", None):
             tool_calls = [
                 {
-                    "id": getattr(tc, "id", f"call_{i}"),
+                    "id": getattr(tc, "id", None) or f"call_{secrets.token_hex(4)}",
                     "type": "function",
                     "function": {
                         "name": tc.function.name,
