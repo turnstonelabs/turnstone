@@ -23,18 +23,18 @@ RUN useradd --create-home --shell /bin/bash turnstone
 
 WORKDIR /app
 
-# Compile bytecode for faster startup
-ENV UV_COMPILE_BYTECODE=1
-
 # Install dependencies first (cached layer — only re-runs when deps change)
 COPY pyproject.toml uv.lock README.md LICENSE ./
 RUN uv sync --frozen --no-install-project --no-dev \
-    --extra all
+    --no-compile --extra all
 
 # Install the project itself
 COPY turnstone/ turnstone/
 RUN uv sync --frozen --no-dev \
-    --extra all
+    --no-compile --extra all
+
+# Compile bytecode in a separate step (avoids fd exhaustion during install)
+RUN python -m compileall -q .venv/lib/ turnstone/
 
 # Add venv to PATH so entry points are found
 ENV PATH="/app/.venv/bin:$PATH"
