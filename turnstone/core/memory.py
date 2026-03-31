@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 
+from turnstone.core.hash_ring import bucket_of as _bucket_of
 from turnstone.core.log import get_logger
 from turnstone.core.storage import get_storage
 
@@ -111,11 +112,6 @@ def update_workstream_state(ws_id: str, state: str) -> None:
 
 
 # -- Hash ring bucket counts --------------------------------------------------
-
-
-def _bucket_of(ws_id: str) -> int:
-    """Extract bucket from ws_id prefix. First 4 hex chars -> 0-65535."""
-    return int(ws_id[:4], 16)
 
 
 def increment_bucket_count(ws_id: str, active: bool = False) -> None:

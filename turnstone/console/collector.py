@@ -208,7 +208,7 @@ class ClusterCollector:
             if self._console_metrics is not None:
                 self._console_metrics.set_ring_info(
                     self._router.node_count(),
-                    self._router._version,
+                    self._router.version,
                 )
 
     # -- polling -------------------------------------------------------------

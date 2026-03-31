@@ -186,9 +186,9 @@
   <line x1="180" y1="267" x2="298" y2="248" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-blue)"/>
   <text x="240" y="238" fill="#484f58" font-size="8" text-anchor="middle">HTTP</text>
 
-  <!-- CLI -> direct to Node A (single-node mode, top path) -->
-  <path d="M 180 131 C 250 110, 400 100, 588 168" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.5" fill="none" stroke-dasharray="6,3" marker-end="url(#arrow-blue)"/>
-  <text x="370" y="104" fill="#484f58" font-size="8" text-anchor="middle">direct (single-node)</text>
+  <!-- CLI -> direct to Node A (single-node mode, above everything) -->
+  <path d="M 180 120 L 588 120" stroke="#58a6ff" stroke-width="1.2" stroke-opacity="0.4" fill="none" stroke-dasharray="6,3" marker-end="url(#arrow-blue)"/>
+  <text x="390" y="114" fill="#484f58" font-size="8" text-anchor="middle">direct (single-node)</text>
 
   <!-- CONSOLE -> NODE connections (proxy) -->
   <!-- Console -> Node A -->
@@ -197,12 +197,10 @@
   <line x1="460" y1="260" x2="588" y2="296" stroke="#3fb950" stroke-width="1.2" stroke-opacity="0.6" marker-end="url(#arrow-green)"/>
   <text x="520" y="222" fill="#484f58" font-size="8" text-anchor="middle">proxy</text>
 
-  <!-- CLIENT -> NODE direct SSE (data plane, dashed) -->
-  <!-- Browser -> Node A SSE -->
-  <path d="M 180 190 C 260 180, 400 150, 588 155" stroke="#58a6ff" stroke-width="1" stroke-opacity="0.35" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
-  <!-- SDK -> Node B SSE -->
-  <path d="M 180 275 C 260 290, 400 320, 588 300" stroke="#58a6ff" stroke-width="1" stroke-opacity="0.35" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
-  <text x="400" y="310" fill="#484f58" font-size="8" text-anchor="middle">SSE (data plane)</text>
+  <!-- CLIENT -> NODE direct SSE (data plane, below console) -->
+  <!-- Browser -> Node A SSE (arc below console) -->
+  <path d="M 180 205 C 240 370, 450 380, 588 330" stroke="#58a6ff" stroke-width="1" stroke-opacity="0.3" fill="none" stroke-dasharray="4,3" marker-end="url(#arrow-blue)"/>
+  <text x="340" y="378" fill="#484f58" font-size="8" text-anchor="middle">SSE (data plane)</text>
 
   <!-- NODE -> LLM connections -->
   <!-- Node A -> LLM providers -->

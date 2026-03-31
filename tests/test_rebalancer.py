@@ -501,8 +501,7 @@ class TestMinimalTransfer:
             new = after[bucket]
             if old != new:
                 assert new == "node-2", (
-                    f"bucket {bucket} moved {old} -> {new}, "
-                    "expected all moves to target node-2"
+                    f"bucket {bucket} moved {old} -> {new}, expected all moves to target node-2"
                 )
 
         # Verify: node-2 got roughly 1/3 of all buckets
@@ -531,8 +530,7 @@ class TestMinimalTransfer:
             new = after[bucket]
             if old != new:
                 assert old == "node-2", (
-                    f"bucket {bucket} moved {old} -> {new}, "
-                    "but only node-2's buckets should move"
+                    f"bucket {bucket} moved {old} -> {new}, but only node-2's buckets should move"
                 )
 
         # node-2 should have zero buckets now

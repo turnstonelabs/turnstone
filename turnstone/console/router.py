@@ -128,7 +128,12 @@ class ConsoleRouter:
         ref = self._overrides.get(ws_id)
         if ref is not None:
             return ref
-        bucket = int(ws_id[:4], 16)
+        if len(ws_id) < 4:
+            raise NoAvailableNodeError(f"invalid ws_id: {ws_id!r}")
+        try:
+            bucket = int(ws_id[:4], 16)
+        except ValueError:
+            raise NoAvailableNodeError(f"invalid ws_id prefix: {ws_id[:4]!r}") from None
         ref = self._cache[bucket]
         if ref is None:
             raise NoAvailableNodeError(f"bucket {bucket} not assigned")
@@ -145,6 +150,11 @@ class ConsoleRouter:
     def is_ready(self) -> bool:
         """Return True if at least one bucket is assigned."""
         return any(ref is not None for ref in self._cache)
+
+    @property
+    def version(self) -> int:
+        """The last seen rebalancer version."""
+        return self._version
 
     def node_count(self) -> int:
         """Count distinct nodes present in the cache."""
