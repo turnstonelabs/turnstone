@@ -43,6 +43,7 @@ class BackendHealthMonitor:
         provider: str = "openai",
         initial_model: str = "",
         on_model_changed: Callable[[str, int | None], None] | None = None,
+        on_state_changed: Callable[[str], None] | None = None,
     ) -> None:
         self._client = client
         self._probe_interval = probe_interval
@@ -54,6 +55,7 @@ class BackendHealthMonitor:
         self._provider = provider
         self._last_detected_model = initial_model
         self._on_model_changed = on_model_changed
+        self._on_state_changed = on_state_changed
 
         self._lock = threading.Lock()
         self._state = CircuitState.CLOSED
@@ -82,8 +84,17 @@ class BackendHealthMonitor:
     # Passive tracking (called by request path)
     # ------------------------------------------------------------------
 
+    def _fire_state_callback(self, state_val: str | None) -> None:
+        """Fire on_state_changed callback outside the lock."""
+        if state_val is not None and self._on_state_changed is not None:
+            try:
+                self._on_state_changed(state_val)
+            except Exception:
+                log.debug("on_state_changed callback error", exc_info=True)
+
     def record_success(self) -> None:
         """Called on successful LLM call.  Resets failure count, closes circuit."""
+        state_to_dispatch: str | None = None
         with self._lock:
             self._consecutive_failures = 0
             if self._state != CircuitState.CLOSED:
@@ -93,9 +104,12 @@ class BackendHealthMonitor:
                 self._last_state_change = time.monotonic()
                 log.info("Circuit breaker CLOSED (was %s): backend recovered", prev.value)
                 self._update_metrics()
+                state_to_dispatch = self._state.value
+        self._fire_state_callback(state_to_dispatch)
 
     def record_failure(self) -> None:
         """Called on LLM call failure.  May open circuit."""
+        state_to_dispatch: str | None = None
         with self._lock:
             self._consecutive_failures += 1
             if self._state == CircuitState.HALF_OPEN:
@@ -105,6 +119,7 @@ class BackendHealthMonitor:
                 self._last_state_change = time.monotonic()
                 log.warning("Circuit breaker OPEN: probe failed in HALF_OPEN")
                 self._update_metrics()
+                state_to_dispatch = self._state.value
             elif (
                 self._state == CircuitState.CLOSED
                 and self._consecutive_failures >= self._failure_threshold
@@ -116,6 +131,8 @@ class BackendHealthMonitor:
                     self._consecutive_failures,
                 )
                 self._update_metrics()
+                state_to_dispatch = self._state.value
+        self._fire_state_callback(state_to_dispatch)
 
     # ------------------------------------------------------------------
     # Query helpers
@@ -246,7 +263,12 @@ class BackendHealthMonitor:
     # ------------------------------------------------------------------
 
     def _update_metrics(self) -> None:
-        """Push state to metrics collector.  Called with *self._lock* held."""
+        """Push circuit-breaker state to metrics collector.
+
+        Called with *self._lock* held. State-change callbacks are dispatched
+        by the callers (``record_success`` / ``record_failure``) after the
+        lock is released, not by this method.
+        """
         from turnstone.core.metrics import metrics
 
         metrics.set_backend_status(self._state == CircuitState.CLOSED)

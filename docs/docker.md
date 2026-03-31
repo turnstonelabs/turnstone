@@ -69,7 +69,6 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CONSOLE_PORT` | `8090` | Host port mapping |
-| `CONSOLE_POLL_INTERVAL` | `10` | Node polling interval (seconds) |
 
 ### Auth
 

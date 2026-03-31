@@ -84,5 +84,5 @@ def test_collector_tls_defaults():
 
     storage_mock = MagicMock()
     collector = ClusterCollector(storage=storage_mock)
-    # Should create httpx client without errors
-    assert collector._http_client is not None
+    # Should store TLS settings for async client creation
+    assert collector._tls_verify is True

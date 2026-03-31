@@ -137,8 +137,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/events/global",
         "GET",
         "Global SSE event stream",
-        description="Global Server-Sent Events stream for state-change broadcasts "
-        "across all workstreams. Returns text/event-stream.",
+        description="Server-Sent Events stream for node-level state broadcasts. "
+        "Emits a node_snapshot event on connect (workstreams, health, aggregate), "
+        "followed by real-time delta events (ws_state, ws_activity, ws_created, "
+        "ws_closed, ws_rename, health_changed, aggregate). "
+        "Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
         tags=["Streaming"],
     ),
     # --- Saved workstreams ---

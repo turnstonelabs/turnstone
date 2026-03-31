@@ -117,7 +117,6 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "host": "host",
         "port": "port",
         "url": "console_url",
-        "poll_interval": "poll_interval",
         "log_level": "log_level",
     },
     "auth": {
