@@ -1639,7 +1639,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             skill_id=skill_data["template_id"] if skill_data else "",
             skill_version=applied_skill_version,
             ws_id=requested_ws_id,
-            client_type=str(body.get("client_type", "")),
+            client_type=body.get("client_type", "") or "",
         )
         assert isinstance(ws.ui, WebUI)
         if skip or body.get("auto_approve", False):
@@ -2911,7 +2911,7 @@ def main() -> None:
             memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
-            if client_type in ClientType.__members__.values()
+            if client_type in {ct.value for ct in ClientType}
             else ClientType.WEB,
             username=_username,
         )

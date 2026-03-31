@@ -1004,12 +1004,10 @@ class ChatSession:
                     db_policies = storage.list_prompt_policies()
             except Exception:
                 pass
-            now = datetime.now(UTC)
+            now = datetime.now().astimezone()
             ctx = SessionContext(
                 current_datetime=now.strftime("%Y-%m-%dT%H:%M"),
-                timezone=time.tzname[time.localtime().tm_isdst]
-                if time.daylight
-                else time.tzname[0],
+                timezone=now.tzname() or "UTC",
                 username=self._username or self._user_id or "unknown",
             )
             composed = compose_system_message(
@@ -5699,7 +5697,7 @@ class ChatSession:
         }
 
     def _exec_watch(self, item: dict[str, Any]) -> tuple[str, str]:
-        from datetime import UTC, datetime, timedelta
+        from datetime import datetime, timedelta
 
         call_id = item["call_id"]
         action = item["action"]

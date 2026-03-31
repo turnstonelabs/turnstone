@@ -5700,6 +5700,8 @@ async def admin_update_prompt_policy(request: Request) -> JSONResponse:
             return JSONResponse({"error": "priority must be an integer"}, status_code=400)
     if "content" in update:
         update["content"] = str(update["content"]).strip()[:32768]
+    if "tool_gate" in update:
+        update["tool_gate"] = str(update["tool_gate"] or "").strip()
     if "enabled" in update:
         update["enabled"] = bool(update["enabled"])
     storage.upsert_prompt_policy(update)

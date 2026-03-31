@@ -1132,6 +1132,7 @@ def main() -> None:
         ws_id: str | None = None,
         *,
         skill: str | None = None,
+        client_type: str = "",
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         r_client, r_model, r_cfg = registry.resolve(model_alias)

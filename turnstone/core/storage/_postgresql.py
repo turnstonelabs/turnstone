@@ -45,6 +45,9 @@ from turnstone.core.storage._schema import (
     workstream_overrides,
     workstreams,
 )
+from turnstone.core.storage._schema import (
+    prompt_policies as prompt_policies_t,
+)
 from turnstone.core.storage._utils import (
     MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
 )
@@ -56,6 +59,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     POLICY_MUTABLE as _POLICY_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    PROMPT_POLICY_MUTABLE as _PROMPT_POLICY_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     ROLE_MUTABLE as _ROLE_MUTABLE,
@@ -3086,6 +3092,73 @@ class PostgreSQLBackend:
             )
             conn.commit()
             return result.rowcount
+
+    # -- Prompt policies -------------------------------------------------------
+
+    def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:
+
+        with self._engine.connect() as conn:
+            q = sa.select(prompt_policies_t).order_by(prompt_policies_t.c.priority)
+            if org_id:
+                q = q.where(prompt_policies_t.c.org_id == org_id)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "enabled") for r in rows]
+
+    def get_prompt_policy(self, policy_id: str) -> dict[str, Any] | None:
+
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.select(prompt_policies_t).where(prompt_policies_t.c.policy_id == policy_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled")
+
+    def upsert_prompt_policy(self, policy: dict[str, Any]) -> None:
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._engine.connect() as conn:
+            existing = conn.execute(
+                sa.select(prompt_policies_t).where(
+                    prompt_policies_t.c.policy_id == policy["policy_id"]
+                )
+            ).fetchone()
+            if existing:
+                fields = {k: v for k, v in policy.items() if k in _PROMPT_POLICY_MUTABLE}
+                fields["updated"] = now
+                if "enabled" in fields:
+                    fields["enabled"] = 1 if fields["enabled"] else 0
+                conn.execute(
+                    sa.update(prompt_policies_t)
+                    .where(prompt_policies_t.c.policy_id == policy["policy_id"])
+                    .values(**fields)
+                )
+            else:
+                conn.execute(
+                    sa.insert(prompt_policies_t),
+                    {
+                        "policy_id": policy["policy_id"],
+                        "name": policy["name"],
+                        "content": policy["content"],
+                        "tool_gate": policy.get("tool_gate", ""),
+                        "priority": policy.get("priority", 0),
+                        "enabled": 1 if policy.get("enabled", True) else 0,
+                        "org_id": policy.get("org_id", ""),
+                        "created_by": policy.get("created_by", ""),
+                        "created": now,
+                        "updated": now,
+                    },
+                )
+            conn.commit()
+
+    def delete_prompt_policy(self, policy_id: str) -> bool:
+
+        with self._engine.connect() as conn:
+            result = conn.execute(
+                sa.delete(prompt_policies_t).where(prompt_policies_t.c.policy_id == policy_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
 
     # -- TLS / ACME ------------------------------------------------------------
 
