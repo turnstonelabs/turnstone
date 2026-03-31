@@ -480,24 +480,11 @@ class TurnstoneBot:
             # Reuse the thinking message for the first tool embed.
             thinking_msg = self._thinking_msgs.pop(ws_id, None)
 
-            # Show items that won't appear as interactive approval prompts:
-            # auto-approved, don't need approval, or already failed (error).
-            # Items with error (e.g. policy-denied) never produce an
-            # ApproveRequestEvent, so they must be surfaced here.
-            allowed = self.config.auto_approve_tools
+            # Show a "running" embed for every tool.  The approval dialog
+            # (ApproveRequestEvent) is a separate concern — it asks "do you
+            # authorize this?" while the running embed says "this tool is
+            # executing."  Both can coexist in the thread.
             for it in event.items:
-                if (
-                    it.get("needs_approval")
-                    and not self.config.auto_approve
-                    and not it.get("error")
-                ):
-                    tool_name = (
-                        it.get("func_name")
-                        or it.get("approval_label")
-                        or it.get("function", {}).get("name", "")
-                    )
-                    if not (allowed and tool_name in allowed):
-                        continue
                 name = it.get("func_name") or it.get("approval_label") or "tool"
                 raw_preview = it.get("preview", "")
                 # Sanitize preview: escape backticks to prevent markdown
@@ -525,7 +512,7 @@ class TurnstoneBot:
                     (call_id, name, preview or "", msg)
                 )
 
-            # If no visible items consumed the thinking message, clean it up.
+            # If no items consumed the thinking message (empty event), clean up.
             if thinking_msg is not None:
                 with contextlib.suppress(Exception):
                     await thinking_msg.delete()

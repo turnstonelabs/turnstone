@@ -849,15 +849,15 @@ class TestFormatToolResult:
         from turnstone.channels._formatter import format_tool_result
 
         result = format_tool_result("bash", "hello world")
-        assert "**bash**" in result
         assert "```" in result
         assert "hello world" in result
 
-    def test_error_prefix(self):
+    def test_wraps_in_code_block(self):
         from turnstone.channels._formatter import format_tool_result
 
-        result = format_tool_result("bash", "command not found", is_error=True)
-        assert "**ERROR**" in result
+        result = format_tool_result("bash", "output text", is_error=True)
+        assert result.startswith("```\n")
+        assert result.endswith("\n```")
 
     def test_truncates_long_output_by_lines(self):
         from turnstone.channels._formatter import format_tool_result
@@ -1048,51 +1048,7 @@ class TestToolInfoEvent:
         assert thread.send.await_count == 2
         assert len(bot._tool_info_msgs["ws-1"]) == 2
 
-    def test_needs_approval_without_auto_approve_sends_nothing(self):
-        from turnstone.sdk.events import ToolInfoEvent
-
-        bot = self._make_bot()
-        thread = AsyncMock()
-
-        items = [{"func_name": "bash", "preview": "rm -rf /", "needs_approval": True}]
-        event = ToolInfoEvent(ws_id="ws-1", items=items)
-        _run(bot._on_ws_event("ws-1", thread, event))
-
-        thread.send.assert_not_awaited()
-
-    def test_needs_approval_with_auto_approve_sends_embed(self):
-        from turnstone.sdk.events import ToolInfoEvent
-
-        bot = self._make_bot()
-        bot.config.auto_approve = True
-        thread = AsyncMock()
-
-        items = [{"func_name": "bash", "preview": "rm -rf /", "needs_approval": True}]
-        event = ToolInfoEvent(ws_id="ws-1", items=items)
-        _run(bot._on_ws_event("ws-1", thread, event))
-
-        thread.send.assert_awaited_once()
-        assert thread.send.call_args[1]["embed"].title == "bash"
-
-    def test_needs_approval_with_auto_approve_tools_filters(self):
-        from turnstone.sdk.events import ToolInfoEvent
-
-        bot = self._make_bot()
-        bot.config.auto_approve_tools = ["bash"]
-        thread = AsyncMock()
-
-        items = [
-            {"func_name": "bash", "preview": "ls", "needs_approval": True},
-            {"func_name": "write_file", "preview": "/etc/passwd", "needs_approval": True},
-        ]
-        event = ToolInfoEvent(ws_id="ws-1", items=items)
-        _run(bot._on_ws_event("ws-1", thread, event))
-
-        # Only bash is auto-approved, so only one embed sent.
-        thread.send.assert_awaited_once()
-        assert thread.send.call_args[1]["embed"].title == "bash"
-
-    def test_error_items_shown_unconditionally(self):
+    def test_shows_all_items_regardless_of_approval(self):
         from turnstone.sdk.events import ToolInfoEvent
 
         bot = self._make_bot()
@@ -1100,19 +1056,13 @@ class TestToolInfoEvent:
 
         items = [
             {"func_name": "bash", "preview": "rm -rf /", "needs_approval": True},
-            {
-                "func_name": "bash",
-                "preview": "blocked",
-                "needs_approval": True,
-                "error": "policy_denied",
-            },
+            {"func_name": "read_file", "preview": "/etc/hosts", "needs_approval": False},
         ]
         event = ToolInfoEvent(ws_id="ws-1", items=items)
         _run(bot._on_ws_event("ws-1", thread, event))
 
-        # Only the error item is shown (first item needs interactive approval).
-        thread.send.assert_awaited_once()
-        assert thread.send.call_args[1]["embed"].title == "bash"
+        # Both items shown — running indicator is separate from approval dialog.
+        assert thread.send.await_count == 2
 
     def test_reuses_thinking_message_for_first_tool(self):
         from turnstone.sdk.events import ToolInfoEvent
@@ -1133,22 +1083,6 @@ class TestToolInfoEvent:
         assert "ws-1" not in bot._thinking_msgs
         # The reused message is tracked for ToolResultEvent editing.
         assert bot._tool_info_msgs["ws-1"][0][3] is thinking_msg
-
-    def test_thinking_deleted_when_no_visible_items(self):
-        from turnstone.sdk.events import ToolInfoEvent
-
-        bot = self._make_bot()
-        thread = AsyncMock()
-        thinking_msg = MagicMock()
-        thinking_msg.delete = AsyncMock()
-        bot._thinking_msgs["ws-1"] = thinking_msg
-
-        # All items need approval, none visible.
-        items = [{"func_name": "bash", "preview": "rm /", "needs_approval": True}]
-        event = ToolInfoEvent(ws_id="ws-1", items=items)
-        _run(bot._on_ws_event("ws-1", thread, event))
-
-        thinking_msg.delete.assert_awaited_once()
 
 
 class TestToolResultEvent:
@@ -1227,7 +1161,6 @@ class TestToolResultEvent:
 
         embed = thread.send.call_args[1]["embed"]
         assert embed.color == discord.Color.red()
-        assert "**ERROR**" in embed.description
 
     def test_success_result_uses_dark_grey_color(self):
         from turnstone.sdk.events import ToolResultEvent

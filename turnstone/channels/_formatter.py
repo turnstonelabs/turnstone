@@ -156,8 +156,7 @@ def format_tool_result(name: str, output: str, *, is_error: bool = False) -> str
     # Truncate to 500 chars (after escaping, which can expand the string).
     if len(trimmed) > 500:
         trimmed = trimmed[:497] + "\u2026"
-    prefix = "ERROR" if is_error else name
-    return f"**{prefix}**\n```\n{trimmed}\n```"
+    return f"```\n{trimmed}\n```"
 
 
 def truncate(text: str, max_length: int = 200) -> str:
