@@ -192,7 +192,7 @@ Note: the MCP SDK's DNS rebinding protection must be disabled for Docker-interna
 (the compose.yaml handles this), and the server must bind to 0.0.0.0 (not 127.0.0.1) to be \
 reachable from other containers.
 - The `DATABASE_URL` for docker compose internal networking uses the hostname `postgres` \
-(e.g., `postgresql://turnstone:<password>@postgres:5432/turnstone`).
+(e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
 - For local LLM backends (vLLM, llama.cpp, Ollama, etc.), set `OPENAI_API_KEY=dummy` in the \
 .env file — local servers typically don't require authentication. The `LLM_BASE_URL` should \
 use `host.docker.internal` to reach the host machine from inside Docker \
@@ -643,22 +643,42 @@ class _BootstrapLLM:
             messages=messages,
             tools=tools if tools else None,
         )
-        choice = resp.choices[0]
-        content = choice.message.content or ""
+        # Guard against non-spec responses from proxies (Open WebUI, LiteLLM, etc.)
+        if resp is None:
+            raise RuntimeError(
+                "Server returned null — your OpenAI-compatible endpoint may not "
+                "support tool calling. Try a direct connection to the model server."
+            )
+        choices = getattr(resp, "choices", None)
+        if not choices:
+            raise RuntimeError(
+                "Server returned an empty choices array. "
+                "The model may have hit its context limit, or the proxy "
+                "dropped the response."
+            )
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        if message is None:
+            raise RuntimeError(
+                "Server returned a choice with no message. "
+                "Your OpenAI-compatible endpoint may not fully implement "
+                "the chat completions API."
+            )
+        content = message.content or ""
         tool_calls = None
-        if choice.message.tool_calls:
+        if getattr(message, "tool_calls", None):
             tool_calls = [
                 {
-                    "id": tc.id,
+                    "id": getattr(tc, "id", None) or f"call_{secrets.token_hex(4)}",
                     "type": "function",
                     "function": {
                         "name": tc.function.name,
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in choice.message.tool_calls
+                for i, tc in enumerate(message.tool_calls)
             ]
-        return content, tool_calls, choice.finish_reason or "stop"
+        return content, tool_calls, getattr(choice, "finish_reason", None) or "stop"
 
     # -- Anthropic path -----------------------------------------------------
 
@@ -1002,7 +1022,16 @@ def _run_conversation(
                 retries += 1
                 if retries >= _max_retries:
                     print(f"\n{RED}LLM error after {_max_retries} attempts: {exc}{RESET}")
-                    print("Please check your connection and try again.")
+                    print()
+                    print("Troubleshooting:")
+                    print(
+                        f"  {DIM}• If using a proxy (Open WebUI, LiteLLM), try connecting directly{RESET}"
+                    )
+                    print(f"  {DIM}• Verify the endpoint supports tool/function calling{RESET}")
+                    print(f"  {DIM}• Check that the model context window isn't exceeded{RESET}")
+                    print(
+                        f"  {DIM}• Try a different model — not all models handle tool calls reliably{RESET}"
+                    )
                     return
                 print(f"\n{RED}LLM error: {exc}{RESET}")
                 print(f"{DIM}Retrying ({retries}/{_max_retries})...{RESET}")
