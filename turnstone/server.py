@@ -2804,9 +2804,16 @@ def main() -> None:
 
     cors_origins = parse_cors_origins()
 
-    # Construct advertise URL for service registration
-    _advertise_host = socket.gethostname() if args.host in ("0.0.0.0", "::") else args.host
-    _advertise_url = f"http://{_advertise_host}:{args.port}"
+    # Construct advertise URL for service registration.
+    # In Docker/k8s, socket.gethostname() returns the container ID which
+    # isn't DNS-resolvable by other containers.  Priority:
+    # 1. TURNSTONE_ADVERTISE_URL env var (explicit override)
+    # 2. Explicit --host (not a wildcard bind address)
+    # 3. socket.getfqdn() (may work in k8s with proper DNS)
+    _advertise_url = os.environ.get("TURNSTONE_ADVERTISE_URL", "")
+    if not _advertise_url:
+        _advertise_host = args.host if args.host not in ("0.0.0.0", "::") else socket.getfqdn()
+        _advertise_url = f"http://{_advertise_host}:{args.port}"
 
     _skip_perms = config_store.get("tools.skip_permissions")
     app = create_app(
