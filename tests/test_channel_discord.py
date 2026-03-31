@@ -1030,7 +1030,7 @@ class TestToolInfoEvent:
         assert embed.title == "bash"
         assert embed.description == "ls -la"
         # Message tracked for later editing by ToolResultEvent.
-        assert bot._tool_info_msgs["ws-1"] == [("", "bash", sent_msg)]
+        assert bot._tool_info_msgs["ws-1"] == [("", "bash", "ls -la", sent_msg)]
 
     def test_multiple_tools_send_multiple_embeds(self):
         from turnstone.sdk.events import ToolInfoEvent
@@ -1132,7 +1132,7 @@ class TestToolInfoEvent:
         thread.send.assert_not_awaited()
         assert "ws-1" not in bot._thinking_msgs
         # The reused message is tracked for ToolResultEvent editing.
-        assert bot._tool_info_msgs["ws-1"][0][2] is thinking_msg
+        assert bot._tool_info_msgs["ws-1"][0][3] is thinking_msg
 
     def test_thinking_deleted_when_no_visible_items(self):
         from turnstone.sdk.events import ToolInfoEvent
@@ -1173,7 +1173,7 @@ class TestToolResultEvent:
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
         return bot
 
-    def test_edits_matching_info_message(self):
+    def test_marks_info_done_and_sends_result(self):
         from turnstone.sdk.events import ToolResultEvent
 
         bot = self._make_bot()
@@ -1182,21 +1182,25 @@ class TestToolResultEvent:
         # Pre-populate a tool info message (as ToolInfoEvent would).
         info_msg = MagicMock()
         info_msg.edit = AsyncMock()
-        bot._tool_info_msgs["ws-1"] = [("", "bash", info_msg)]
+        bot._tool_info_msgs["ws-1"] = [("", "bash", "ls -la", info_msg)]
 
         event = ToolResultEvent(ws_id="ws-1", name="bash", output="file1\nfile2")
         _run(bot._on_ws_event("ws-1", thread, event))
 
-        # Should edit existing message, not send a new one.
+        # Info embed edited to "Done" status.
         info_msg.edit.assert_awaited_once()
-        embed = info_msg.edit.call_args[1]["embed"]
-        assert embed.title == "bash"
-        assert "file1" in embed.description
-        thread.send.assert_not_awaited()
+        status_embed = info_msg.edit.call_args[1]["embed"]
+        assert "Done" in status_embed.title
+        assert status_embed.description == "ls -la"  # preview preserved
+        # Result sent as separate new message.
+        thread.send.assert_awaited_once()
+        result_embed = thread.send.call_args[1]["embed"]
+        assert result_embed.title == "bash"
+        assert "file1" in result_embed.description
         # Entry consumed from tracking list.
         assert bot._tool_info_msgs["ws-1"] == []
 
-    def test_sends_new_embed_when_no_match(self):
+    def test_result_sent_even_without_info_match(self):
         from turnstone.sdk.events import ToolResultEvent
 
         bot = self._make_bot()
@@ -1248,8 +1252,8 @@ class TestToolResultEvent:
         second_msg = MagicMock()
         second_msg.edit = AsyncMock()
         bot._tool_info_msgs["ws-1"] = [
-            ("call-1", "bash", first_msg),
-            ("call-2", "bash", second_msg),
+            ("call-1", "bash", "", first_msg),
+            ("call-2", "bash", "", second_msg),
         ]
 
         # Result with call_id matches the correct message regardless of order.
@@ -1268,7 +1272,7 @@ class TestToolResultEvent:
         first_msg.edit = AsyncMock()
         second_msg = MagicMock()
         second_msg.edit = AsyncMock()
-        bot._tool_info_msgs["ws-1"] = [("", "bash", first_msg), ("", "bash", second_msg)]
+        bot._tool_info_msgs["ws-1"] = [("", "bash", "", first_msg), ("", "bash", "", second_msg)]
 
         # No call_id — falls back to FIFO name match.
         event1 = ToolResultEvent(ws_id="ws-1", name="bash", output="result1")
@@ -1288,7 +1292,7 @@ class TestToolResultEvent:
 
         info_msg = MagicMock()
         info_msg.edit = AsyncMock(side_effect=Exception("Discord API error"))
-        bot._tool_info_msgs["ws-1"] = [("", "bash", info_msg)]
+        bot._tool_info_msgs["ws-1"] = [("", "bash", "ls -la", info_msg)]
 
         event = ToolResultEvent(ws_id="ws-1", name="bash", output="ok")
         _run(bot._on_ws_event("ws-1", thread, event))

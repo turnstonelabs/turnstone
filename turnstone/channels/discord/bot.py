@@ -188,7 +188,7 @@ class TurnstoneBot:
         # Per-tool "running" embeds, edited in-place when the result arrives.
         # List preserves call order for FIFO matching when the same tool name
         # appears more than once in a single turn.
-        self._tool_info_msgs: dict[str, list[tuple[str, str, discord.Message]]] = {}
+        self._tool_info_msgs: dict[str, list[tuple[str, str, str, discord.Message]]] = {}
         # Track the Discord message containing the pending approval embed per
         # workstream so that IntentVerdictEvent can update it with LLM judge
         # results.
@@ -521,7 +521,9 @@ class TurnstoneBot:
                 else:
                     msg = await thread.send(embed=embed)
                 call_id = it.get("call_id", "")
-                self._tool_info_msgs.setdefault(ws_id, []).append((call_id, name, msg))
+                self._tool_info_msgs.setdefault(ws_id, []).append(
+                    (call_id, name, preview or "", msg)
+                )
 
             # If no visible items consumed the thinking message, clean it up.
             if thinking_msg is not None:
@@ -531,6 +533,37 @@ class TurnstoneBot:
         elif isinstance(event, ToolResultEvent):
             from turnstone.channels._formatter import format_tool_result
 
+            # Mark the matching "running" embed as complete/errored.
+            # Prefer call_id match (deterministic); fall back to name (FIFO).
+            info_list = self._tool_info_msgs.get(ws_id, [])
+            matched_preview = ""
+            matched_msg: discord.Message | None = None
+            if event.call_id:
+                for i, (cid, _tname, _prev, _tmsg) in enumerate(info_list):
+                    if cid == event.call_id:
+                        entry = info_list.pop(i)
+                        matched_preview, matched_msg = entry[2], entry[3]
+                        break
+            if matched_msg is None:
+                for i, (_cid, tname, _prev, _tmsg) in enumerate(info_list):
+                    if tname == event.name:
+                        entry = info_list.pop(i)
+                        matched_preview, matched_msg = entry[2], entry[3]
+                        break
+            if matched_msg is not None:
+                status = "Error" if event.is_error else "Done"
+                status_color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
+                status_embed = discord.Embed(
+                    title=f"{event.name} \u2014 {status}",
+                    description=matched_preview or None,
+                    color=status_color,
+                )
+                try:
+                    await matched_msg.edit(content=None, embed=status_embed)
+                except Exception:
+                    log.debug("discord.tool_info_status_edit_failed", ws_id=ws_id)
+
+            # Send the result as a separate message.
             desc = format_tool_result(event.name, event.output, is_error=event.is_error)
             color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
             result_embed = discord.Embed(
@@ -538,28 +571,7 @@ class TurnstoneBot:
                 description=desc,
                 color=color,
             )
-            # Edit the matching "running" embed from ToolInfoEvent if present.
-            # Prefer call_id match (deterministic); fall back to name (FIFO).
-            info_list = self._tool_info_msgs.get(ws_id, [])
-            matched_msg: discord.Message | None = None
-            if event.call_id:
-                for i, (cid, _tname, _tmsg) in enumerate(info_list):
-                    if cid == event.call_id:
-                        matched_msg = info_list.pop(i)[2]
-                        break
-            if matched_msg is None:
-                for i, (_cid, tname, _tmsg) in enumerate(info_list):
-                    if tname == event.name:
-                        matched_msg = info_list.pop(i)[2]
-                        break
-            if matched_msg is not None:
-                try:
-                    await matched_msg.edit(embed=result_embed)
-                except Exception:
-                    log.debug("discord.tool_result_edit_failed", ws_id=ws_id)
-                    await thread.send(embed=result_embed)
-            else:
-                await thread.send(embed=result_embed)
+            await thread.send(embed=result_embed)
 
         elif isinstance(event, ApproveRequestEvent):
             # Evaluate admin tool policies before auto-approve.
