@@ -254,12 +254,33 @@ class TestCollectorPolling:
         q: queue.Queue[dict] = queue.Queue()
         c.register_listener(q)
 
+        # Same state — no events expected
+        dashboard = _dashboard_response(
+            workstreams=[{"id": "ws1", "name": "same", "state": "idle"}]
+        )
+        c._apply_poll("node-a", dashboard, {})
+
+        assert q.empty()
+
+    def test_apply_poll_emits_state_change(self):
+        c = _make_collector()
+        c._nodes["node-a"] = NodeSnapshot(
+            node_id="node-a",
+            server_url="http://a:8080",
+            workstreams={"ws1": {"id": "ws1", "name": "same", "state": "idle"}},
+        )
+        q: queue.Queue[dict] = queue.Queue()
+        c.register_listener(q)
+
         dashboard = _dashboard_response(
             workstreams=[{"id": "ws1", "name": "same", "state": "running"}]
         )
         c._apply_poll("node-a", dashboard, {})
 
-        assert q.empty()
+        event = q.get_nowait()
+        assert event["type"] == "ws_state"
+        assert event["ws_id"] == "ws1"
+        assert event["state"] == "running"
 
     def test_apply_poll_skips_empty_id_workstream(self):
         c = _make_collector()
