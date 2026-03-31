@@ -5736,6 +5736,7 @@ def create_app(
                     Route("/api/route/approve", route_proxy, methods=["POST"]),
                     Route("/api/route/cancel", route_proxy, methods=["POST"]),
                     Route("/api/route/command", route_proxy, methods=["POST"]),
+                    Route("/api/route/plan", route_proxy, methods=["POST"]),
                     Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
                     Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),

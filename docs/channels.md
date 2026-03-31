@@ -1,9 +1,10 @@
 # Channel Integrations
 
 The `turnstone-channel` gateway connects external messaging platforms to
-turnstone workstreams via Redis MQ. Each platform adapter translates
+turnstone workstreams via direct HTTP to the server (single-node) or the
+console routing proxy (multi-node). Each platform adapter translates
 platform-native events (messages, button clicks, slash commands) into
-turnstone MQ messages, and renders workstream output back into the
+turnstone API calls, and renders workstream output back into the
 platform's UI.
 
 Discord ships as the first adapter. The adapter protocol is designed for
@@ -20,10 +21,9 @@ Discord Gateway
 turnstone-channel  (Discord adapter)
       |
       v
-  Redis MQ
-      |
-      v
-turnstone-bridge  ──>  turnstone-server
+turnstone-server   (direct HTTP)
+      or
+turnstone-console  (routing proxy, multi-node)
 ```
 
 Key components:
@@ -34,10 +34,7 @@ Key components:
   `send_approval_request()`, `send_plan_review()`, and `create_thread()`.
 - **ChannelRouter** (`turnstone/channels/_routing.py`) — maps
   channel/thread IDs to turnstone workstream IDs. Handles workstream
-  creation via MQ, stale route detection, and user identity resolution.
-- **AsyncRedisBroker** (`turnstone/mq/async_broker.py`) — async Redis
-  client compatible with discord.py's event loop. Used by the router for
-  pub/sub and queue operations.
+  creation via HTTP, stale route detection, and user identity resolution.
 - **channel_users table** — maps `(channel_type, channel_user_id)` to a
   turnstone `user_id`. Messages from unlinked users are silently dropped.
 - **channel_routes table** — persistent channel-to-workstream mappings.
@@ -84,8 +81,7 @@ TURNSTONE_DISCORD_GUILD=123456789  # optional, restrict to one guild
 turnstone-channel \
   --discord-token "your-bot-token" \
   --discord-guild 123456789 \
-  --redis-host localhost \
-  --redis-port 6379
+  --server-url http://localhost:8080
 ```
 
 **Docker Compose** (production profile):
@@ -138,7 +134,7 @@ An admin can also force-link or unlink users via the console admin panel
   thread auto-creates a new workstream and atomically resumes the
   previous workstream via the `resume_ws` field on
   `CreateWorkstreamMessage`. The server resumes the workstream during
-  creation (same HTTP request), and the bridge emits a
+  creation (same HTTP request), and the server emits a
   `WorkstreamResumedEvent` back to the channel. The thread receives a
   *"Resumed: {name} ({count} messages restored)"* confirmation.
 
@@ -160,8 +156,7 @@ an orange embed with:
 - Tool name and argument preview
 - **Approve** (green), **Reject** (red), **Always Approve** (gray) buttons
 - Only linked users can interact with approval buttons
-- The approval decision is forwarded through MQ to the bridge, which
-  relays it to the server
+- The approval decision is forwarded to the server via HTTP
 
 Buttons use static `custom_id` values so they survive bot restarts.
 Correlation data (`ws_id`, `correlation_id`) is stored in the embed footer.
@@ -181,7 +176,7 @@ Plan review requests are displayed as a blue embed with:
 - **Approve Plan** (green) button — approves the plan with empty feedback
 - **Request Changes** (gray) button — opens a modal for feedback text
   (up to 2000 characters)
-- Feedback is forwarded through MQ as a `PlanFeedbackMessage`
+- Feedback is forwarded to the server via HTTP
 
 ---
 
@@ -192,10 +187,8 @@ Plan review requests are displayed as a blue embed with:
 | `--discord-token` | `TURNSTONE_DISCORD_TOKEN` | — | Bot token (required to enable Discord) |
 | `--discord-guild` | — | `0` (all guilds) | Restrict to a single Discord guild |
 | `--discord-channels` | — | empty (all) | Comma-separated channel IDs to allow |
-| `--redis-host` | `REDIS_HOST` | `localhost` | Redis host |
-| `--redis-port` | — | `6379` | Redis port |
-| `--redis-password` | `REDIS_PASSWORD` | — | Redis password |
-| `--redis-db` | — | `0` | Redis DB number |
+| `--server-url` | `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL (single-node) |
+| `--console-url` | `TURNSTONE_CONSOLE_URL` | — | Console URL (multi-node routing proxy) |
 | `--model` | — | server default | Default model for new workstreams |
 | `--auto-approve` | — | `false` | Auto-approve ALL tool calls (skips approval buttons entirely) |
 | `--http-host` | — | `127.0.0.1` | HTTP server bind address for notify endpoint |
@@ -232,13 +225,13 @@ See [Security: Database Schema](security.md#database-schema) for the
 3. **Eviction** — the server evicts an idle workstream for capacity. The
    route is preserved and the thread stays open.
 4. **Reactivation** — the next message in the thread detects the stale
-   route (no MQ owner) and creates a new workstream with the old `ws_id`
-   as `resume_ws` on the `CreateWorkstreamMessage`. The server resumes
+   route and creates a new workstream with the old `ws_id`
+   as `resume_ws` on the creation request. The server resumes
    the workstream during creation (no separate command or reverse lookup
-   needed). The bridge emits a `WorkstreamResumedEvent` to the channel, and
+   needed). The channel receives a `WorkstreamResumedEvent`, and
    the thread displays *"Resumed: {name} ({count} messages restored)"*.
    If the old workstream was pruned, a fresh one starts with no error.
-5. **Close** — `/close` command closes the workstream via MQ, deletes the
+5. **Close** — `/close` command closes the workstream via HTTP, deletes the
    route, unsubscribes from events, and archives the Discord thread.
 
 ---
@@ -264,7 +257,7 @@ Two modes:
 
 ### Delivery Flow
 
-Notifications bypass MQ for lower latency. The server calls the channel
+Notifications use direct HTTP for low latency. The server calls the channel
 gateway directly over HTTP:
 
 1. The LLM calls the `notify` tool with a message and target

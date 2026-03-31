@@ -45,9 +45,9 @@ That's it — no flags, no arguments. The wizard prompts for everything.
 The wizard supports two deployment modes:
 
 - **Single-node production** (`docker compose --profile production up`) —
-  1 server + bridge + console + PostgreSQL + Redis. Good for most use cases.
+  1 server + console + PostgreSQL. Good for most use cases.
 - **Multi-node cluster** (`docker compose --profile cluster up`) —
-  10-node server/bridge fleet + PostgreSQL + Redis. For high-throughput or
+  10-node server fleet + console + PostgreSQL. For high-throughput or
   HA deployments.
 
 ## Example Session

@@ -53,17 +53,6 @@
 # sslcert = ""                 # path to client cert (mTLS)
 # sslkey = ""                  # path to client key (mTLS)
 
-# --- Redis (bridge, console, channel) ---
-
-[redis]
-# url = ""                     # redis://host:6379/0 or rediss://host:6380/0
-                               # env: TURNSTONE_REDIS_URL
-# TLS params (passed through to Redis connection):
-# tls = false                  # enable TLS (also auto-enabled by rediss:// scheme)
-# tls_ca = ""                  # path to CA cert
-# tls_cert = ""                # path to client cert (mTLS)
-# tls_key = ""                 # path to client key (mTLS)
-
 # --- Auth (node, console) ---
 
 [auth]

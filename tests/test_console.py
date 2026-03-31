@@ -1723,7 +1723,7 @@ class TestCreateWorkstreamUserIdTrust:
         """Replicate the trust check from server.py:create_workstream."""
         auth = auth_result
         uid: str = getattr(auth, "user_id", "") or ""
-        trusted_sources = {"bridge", "console"}
+        trusted_sources = {"console"}
         if (
             body.get("user_id")
             and isinstance(body["user_id"], str)
@@ -1733,13 +1733,13 @@ class TestCreateWorkstreamUserIdTrust:
             uid = body["user_id"]
         return uid
 
-    def test_bridge_can_forward_user_id(self):
+    def test_console_can_forward_user_id(self):
         from turnstone.core.auth import AuthResult
 
         auth = AuthResult(
-            user_id="bridge",
+            user_id="console",
             scopes=frozenset({"approve"}),
-            token_source="bridge",
+            token_source="console",
         )
         uid = self._extract_uid({"user_id": "real-user-abc"}, auth)
         assert uid == "real-user-abc"

@@ -1,8 +1,8 @@
 """Background task scheduler for timed workstream dispatch.
 
 Runs as a daemon thread inside the console process. Checks for due tasks
-every ``check_interval`` seconds and dispatches them via HTTP POST to
-server nodes' ``/v1/api/workstreams/new`` endpoint.
+every ``check_interval`` seconds and dispatches them to server nodes via
+the :class:`~turnstone.sdk.server.TurnstoneServer` SDK client.
 
 Uses a ``system_settings`` row for distributed locking in multi-console
 deployments.
@@ -16,8 +16,9 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-import httpx
 import structlog
+
+from turnstone.sdk.server import TurnstoneServer
 
 if TYPE_CHECKING:
     from turnstone.console.collector import ClusterCollector
@@ -67,7 +68,8 @@ class TaskScheduler:
         self._lock_owner = uuid.uuid4().hex
         self._api_token = api_token
         self._token_manager = token_manager
-        self._http_client = httpx.Client(timeout=30)
+        self._sdk_clients: dict[str, TurnstoneServer] = {}
+        self._last_token: str = ""
 
     def start(self) -> None:
         """Start the scheduler daemon thread."""
@@ -81,7 +83,9 @@ class TaskScheduler:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
-        self._http_client.close()
+        for client in self._sdk_clients.values():
+            client.close()
+        self._sdk_clients.clear()
         log.info("scheduler.stopped")
 
     def _loop(self) -> None:
@@ -183,6 +187,14 @@ class TaskScheduler:
                         log.info("scheduler.pruned_audit", count=audit_pruned)
                 except Exception:
                     log.warning("scheduler.prune_audit_error", exc_info=True)
+                # Prune SDK clients for nodes no longer in the cluster
+                if self._sdk_clients and self._collector:
+                    live_urls = {n.get("server_url", "") for n in self._collector.get_all_nodes()}
+                    stale = [u for u in self._sdk_clients if u not in live_urls]
+                    for url in stale:
+                        self._sdk_clients.pop(url).close()
+                    if stale:
+                        log.info("scheduler.pruned_sdk_clients", count=len(stale))
         finally:
             self._release_lock()
 
@@ -252,17 +264,29 @@ class TaskScheduler:
         raw = task.get("auto_approve_tools", "")
         return [t.strip() for t in raw.split(",") if t.strip()]
 
-    def _auth_headers(self) -> dict[str, str]:
-        """Build auth headers for HTTP dispatch.
+    def _get_sdk_client(self, node_url: str) -> TurnstoneServer:
+        """Return a cached :class:`TurnstoneServer` for *node_url*.
 
-        Prefers a :class:`ServiceTokenManager` (auto-rotating JWT) over a
-        static API token.  Returns an empty dict when neither is configured.
+        When a :class:`ServiceTokenManager` is configured, the client is
+        re-created whenever the token rotates so that fresh JWTs are used.
         """
+        token = self._api_token
         if self._token_manager is not None:
-            return dict(self._token_manager.bearer_header)
-        if self._api_token:
-            return {"Authorization": f"Bearer {self._api_token}"}
-        return {}
+            token = self._token_manager.token
+
+        if token != self._last_token:
+            # Token rotated — close all stale clients.
+            for client in self._sdk_clients.values():
+                client.close()
+            self._sdk_clients.clear()
+            self._last_token = token
+
+        if node_url not in self._sdk_clients:
+            self._sdk_clients[node_url] = TurnstoneServer(
+                base_url=node_url,
+                token=token,
+            )
+        return self._sdk_clients[node_url]
 
     def _get_node_url(self, node_id: str) -> str:
         """Resolve a node_id to its server URL via the collector."""
@@ -273,39 +297,35 @@ class TaskScheduler:
         return ""
 
     def _dispatch_to_node(self, task: dict[str, Any], node_id: str, now: str) -> None:
-        """POST to a specific node's /v1/api/workstreams/new endpoint."""
+        """Dispatch a workstream to a specific node via the SDK client."""
         server_url = self._get_node_url(node_id)
         if not server_url:
             self._record_failure(task, now, f"No URL for node {node_id}")
             return
 
         correlation_id = uuid.uuid4().hex
-        body: dict[str, Any] = {
-            "name": task["name"],
-            "model": task.get("model", ""),
-            "initial_message": task["initial_message"],
-            "auto_approve": bool(task.get("auto_approve", 0)),
-            "auto_approve_tools": ",".join(self._parse_tools(task)),
-            "user_id": task.get("created_by", ""),
-            "skill": task.get("skill", ""),
-        }
         try:
-            resp = self._http_client.post(
-                f"{server_url.rstrip('/')}/v1/api/workstreams/new",
-                json=body,
-                headers=self._auth_headers(),
+            client = self._get_sdk_client(server_url)
+            resp = client.create_workstream(
+                name=task["name"],
+                model=task.get("model", ""),
+                initial_message=task["initial_message"],
+                auto_approve=bool(task.get("auto_approve", 0)),
+                auto_approve_tools=",".join(self._parse_tools(task)),
+                user_id=task.get("created_by", ""),
+                skill=task.get("skill", ""),
             )
-            resp.raise_for_status()
+            ws_id = resp.ws_id
         except Exception:
-            self._record_failure(task, now, f"HTTP dispatch to {node_id} failed")
-            log.warning("scheduler.http_dispatch_failed", node_id=node_id, exc_info=True)
+            self._record_failure(task, now, f"SDK dispatch to {node_id} failed")
+            log.warning("scheduler.sdk_dispatch_failed", node_id=node_id, exc_info=True)
             return
 
         self._storage.record_task_run(
             run_id=uuid.uuid4().hex,
             task_id=task["task_id"],
             node_id=node_id,
-            ws_id="",
+            ws_id=ws_id,
             correlation_id=correlation_id,
             started=now,
             status="dispatched",

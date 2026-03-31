@@ -2,8 +2,6 @@
 
 ## Overview
 
-> See also: [MQ Protocol diagram](diagrams/png/06-mq-protocol.png) | [Message Routing diagram](diagrams/png/07-message-routing.png) | [Redis Key Schema diagram](diagrams/png/08-redis-key-schema.png)
-
 `turnstone-server` exposes a browser-based chat UI backed by a
 **Starlette** ASGI application served by **uvicorn**. The server uses
 **Server-Sent Events (SSE)** via `sse-starlette` for real-time streaming
@@ -523,7 +521,7 @@ inactivity.
 
 Each SSE connection to a workstream receives its own delivery queue.  Events
 produced by the worker thread are fanned out to all registered listener queues,
-so multiple consumers (browser, bridge, console proxy, SDK) can connect
+so multiple consumers (browser, console proxy, SDK) can connect
 simultaneously and each receives every event.  On reconnect the client receives
 a full history replay, so no catch-up mechanism is needed.
 

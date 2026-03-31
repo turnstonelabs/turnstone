@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from turnstone.console.scheduler import TaskScheduler
+from turnstone.sdk._types import TurnstoneAPIError
 
 
 def _wire_lock_storage(storage: MagicMock, initial: dict[str, str] | None = None) -> None:
@@ -78,6 +79,13 @@ def _make_node(node_id="node-001", reachable=True, ws_total=2, max_ws=10):
     }
 
 
+def _mock_create_response(ws_id: str = "ws_abc123") -> MagicMock:
+    """Build a mock CreateWorkstreamResponse with the given ws_id."""
+    resp = MagicMock()
+    resp.ws_id = ws_id
+    return resp
+
+
 class TestSchedulerTick:
     """Tests for _tick() lock acquisition and dispatch logic."""
 
@@ -135,18 +143,18 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        mock_post.assert_called_once()
-        url = mock_post.call_args[0][0]
-        assert "http://node-001:8080/v1/api/workstreams/new" in url
+        mock_create.assert_called_once()
         storage.record_task_run.assert_called_once()
         run_kwargs = storage.record_task_run.call_args[1]
         assert run_kwargs["node_id"] == "node-001"
         assert run_kwargs["status"] == "dispatched"
+        assert run_kwargs["ws_id"] == "ws_abc123"
 
     def test_dispatch_pool_mode(self, mocks):
         collector, storage = mocks
@@ -159,12 +167,13 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        mock_post.assert_called_once()
+        mock_create.assert_called_once()
         storage.record_task_run.assert_called_once()
 
     def test_dispatch_all_mode(self, mocks):
@@ -181,12 +190,13 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        assert mock_post.call_count == 2
+        assert mock_create.call_count == 2
         assert storage.record_task_run.call_count == 2
 
     def test_dispatch_specific_node(self, mocks):
@@ -199,14 +209,15 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        mock_post.assert_called_once()
-        url = mock_post.call_args[0][0]
-        assert "node-001" in url
+        mock_create.assert_called_once()
+        run_kwargs = storage.record_task_run.call_args[1]
+        assert run_kwargs["node_id"] == "node-001"
 
     def test_at_task_disables_after_dispatch(self, mocks):
         collector, storage = mocks
@@ -219,9 +230,10 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
             scheduler._tick()
 
         # At-task should be disabled after dispatch
@@ -243,9 +255,10 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ):
             scheduler._tick()
 
         update_calls = storage.update_scheduled_task.call_args_list
@@ -301,12 +314,13 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage, max_fan_out=3)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        assert mock_post.call_count == 3
+        assert mock_create.call_count == 3
         assert storage.record_task_run.call_count == 3
 
     def test_specific_node_target(self, mocks):
@@ -320,17 +334,18 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        mock_post.assert_called_once()
-        url = mock_post.call_args[0][0]
-        assert "node-custom-123" in url
+        mock_create.assert_called_once()
+        run_kwargs = storage.record_task_run.call_args[1]
+        assert run_kwargs["node_id"] == "node-custom-123"
 
-    def test_user_id_in_dispatched_body(self, mocks):
-        """Dispatched HTTP body should include created_by as user_id."""
+    def test_user_id_in_dispatched_call(self, mocks):
+        """Dispatched SDK call should include created_by as user_id."""
         collector, storage = mocks
 
         task = _make_task(target_mode="auto", created_by="u_scheduler_admin")
@@ -341,18 +356,17 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.return_value = MagicMock(status_code=200)
-            mock_post.return_value.raise_for_status = MagicMock()
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            return_value=_mock_create_response(),
+        ) as mock_create:
             scheduler._tick()
 
-        body = mock_post.call_args[1]["json"]
-        assert body["user_id"] == "u_scheduler_admin"
+        _, kwargs = mock_create.call_args
+        assert kwargs["user_id"] == "u_scheduler_admin"
 
-    def test_http_failure_records_failure(self, mocks):
-        """HTTP errors during dispatch should record a failure."""
-        import httpx
-
+    def test_sdk_failure_records_failure(self, mocks):
+        """SDK errors during dispatch should record a failure."""
         collector, storage = mocks
 
         task = _make_task(target_mode="auto")
@@ -363,8 +377,10 @@ class TestSchedulerTick:
         }
 
         scheduler = TaskScheduler(collector, storage)
-        with patch.object(scheduler._http_client, "post") as mock_post:
-            mock_post.side_effect = httpx.ConnectError("connection refused")
+        with patch(
+            "turnstone.console.scheduler.TurnstoneServer.create_workstream",
+            side_effect=TurnstoneAPIError(502, "Bad Gateway"),
+        ):
             scheduler._tick()
 
         storage.record_task_run.assert_called_once()

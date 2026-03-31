@@ -52,11 +52,11 @@ class TestServiceRegistry:
 
     def test_list_filters_by_type(self, storage):
         storage.register_service("channel", "ch-1", "http://localhost:8091")
-        storage.register_service("bridge", "br-1", "http://localhost:8080")
+        storage.register_service("worker", "wk-1", "http://localhost:8080")
         channels = storage.list_services("channel", max_age_seconds=120)
-        bridges = storage.list_services("bridge", max_age_seconds=120)
+        workers = storage.list_services("worker", max_age_seconds=120)
         assert len(channels) == 1
-        assert len(bridges) == 1
+        assert len(workers) == 1
 
     def test_deregister(self, storage):
         storage.register_service("channel", "ch-1", "http://localhost:8091")

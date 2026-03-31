@@ -1,17 +1,19 @@
 """Channel router -- maps external channels/threads to turnstone workstreams.
 
-:class:`ChannelRouter` uses direct HTTP calls to the turnstone server API
-and the storage backend for persistent channel-to-workstream mappings.
+:class:`ChannelRouter` uses the turnstone SDK clients to communicate with
+the server (single-node) or console (multi-node) API, and the storage
+backend for persistent channel-to-workstream mappings.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any
-
-import httpx
+from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
+from turnstone.sdk._types import TurnstoneAPIError
+from turnstone.sdk.console import AsyncTurnstoneConsole
+from turnstone.sdk.server import AsyncTurnstoneServer
 
 if TYPE_CHECKING:
     from turnstone.core.storage import StorageBackend
@@ -22,7 +24,7 @@ _WS_CREATE_TIMEOUT = 30.0  # seconds
 
 
 class ChannelRouter:
-    """Manage channel-to-workstream routing via the server REST API.
+    """Manage channel-to-workstream routing via SDK clients.
 
     Parameters
     ----------
@@ -58,41 +60,34 @@ class ChannelRouter:
         # Populated when console_url is set and the create response
         # includes node_url.
         self._node_urls: dict[str, str] = {}
-        headers: dict[str, str] = {}
-        if api_token:
-            headers["Authorization"] = f"Bearer {api_token}"
-        # When a console_url is configured, control-plane POSTs go to the
-        # console's routing proxy; otherwise they go directly to the server.
-        base = self._console_url if self._console_url else self._server_url
-        self._client = httpx.AsyncClient(
-            base_url=base,
-            headers=headers,
-            timeout=_WS_CREATE_TIMEOUT,
-        )
+
+        # SDK clients: use console for multi-node, server for single-node.
+        self._console: AsyncTurnstoneConsole | None = None
+        self._server: AsyncTurnstoneServer | None = None
+        if self._console_url:
+            self._console = AsyncTurnstoneConsole(
+                base_url=self._console_url,
+                token=api_token,
+                timeout=_WS_CREATE_TIMEOUT,
+            )
+        else:
+            self._server = AsyncTurnstoneServer(
+                base_url=self._server_url,
+                token=api_token,
+                timeout=_WS_CREATE_TIMEOUT,
+            )
 
     # -- lifecycle -----------------------------------------------------------
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP client."""
-        await self._client.aclose()
+        """Close the underlying SDK clients."""
+        if self._server:
+            await self._server.aclose()
+        if self._console:
+            await self._console.aclose()
         log.info("channel_router.closed")
 
     # -- internal helpers ----------------------------------------------------
-
-    def _route_path(self, path: str) -> str:
-        """Map a server API path to the console routing proxy path when needed.
-
-        E.g. ``/api/send`` → ``/api/route/send`` when console routing is active.
-        """
-        if self._console_url and path.startswith("/api/"):
-            return path.replace("/api/", "/api/route/", 1)
-        return path
-
-    async def _post(self, path: str, body: dict[str, Any]) -> httpx.Response:
-        """POST JSON to the server (or console proxy) and return the response."""
-        resp = await self._client.post(self._route_path(path), json=body)
-        resp.raise_for_status()
-        return resp
 
     async def _is_ws_alive(self, ws_id: str) -> bool:
         """Check whether *ws_id* is a known workstream.
@@ -157,18 +152,11 @@ class ChannelRouter:
                     channel_id=channel_id,
                 )
 
-            # 2. Create via HTTP API with atomic resume.
+            # 2. Create via SDK client with atomic resume.
             # Note: auto_approve_tools is not passed here because the server's
             # create endpoint does not accept it.  Per-tool auto-approve is
             # handled channel-side in the adapter's _should_auto_approve().
             resume_ws = old_ws_id or ""
-            body: dict[str, Any] = {
-                "name": name,
-                "model": model,
-                "resume_ws": resume_ws,
-                "skill": self._skill,
-                "auto_approve": self._auto_approve,
-            }
             log.info(
                 "channel_router.creating_workstream",
                 channel_type=channel_type,
@@ -176,9 +164,26 @@ class ChannelRouter:
                 resume_ws=resume_ws or None,
             )
 
-            resp = await self._post("/api/workstreams/new", body)
-            data = resp.json()
-            ws_id: str = data.get("ws_id", "")
+            if self._console:
+                data = await self._console.route_create_workstream(
+                    name=name,
+                    model=model,
+                    resume_ws=resume_ws,
+                    skill=self._skill,
+                    auto_approve=self._auto_approve,
+                )
+                ws_id = data.get("ws_id", "")
+            else:
+                assert self._server is not None
+                resp = await self._server.create_workstream(
+                    name=name,
+                    model=model,
+                    resume_ws=resume_ws,
+                    skill=self._skill,
+                    auto_approve=self._auto_approve,
+                )
+                ws_id = resp.ws_id
+                data = {"ws_id": resp.ws_id, "name": resp.name}
 
             if not ws_id:
                 msg_err = "workstream creation returned empty ws_id"
@@ -192,7 +197,11 @@ class ChannelRouter:
 
             # 3. Send the initial message if this is a brand-new workstream.
             if initial_message and not resume_ws:
-                await self._post("/api/send", {"ws_id": ws_id, "message": initial_message})
+                if self._console:
+                    await self._console.route_send(initial_message, ws_id)
+                else:
+                    assert self._server is not None
+                    await self._server.send(initial_message, ws_id)
 
             # 4. Persist the route.
             await asyncio.to_thread(
@@ -218,14 +227,13 @@ class ChannelRouter:
         url = self._node_urls.get(ws_id)
         if url:
             return url
-        if self._console_url:
+        if self._console:
             try:
-                resp = await self._client.get("/api/route", params={"ws_id": ws_id})
-                if resp.status_code == 200:
-                    node_url = resp.json().get("node_url", "")
-                    if node_url:
-                        self._node_urls[ws_id] = node_url.rstrip("/")
-                        return self._node_urls[ws_id]
+                data = await self._console.route_lookup(ws_id)
+                node_url = data.get("node_url", "")
+                if node_url:
+                    self._node_urls[ws_id] = node_url.rstrip("/")
+                    return self._node_urls[ws_id]
             except Exception:
                 pass
         return self._server_url
@@ -248,7 +256,11 @@ class ChannelRouter:
 
     async def send_message(self, ws_id: str, message: str) -> None:
         """Send a user message to a workstream via the server API."""
-        await self._post("/api/send", {"ws_id": ws_id, "message": message})
+        if self._console:
+            await self._console.route_send(message, ws_id)
+        else:
+            assert self._server is not None
+            await self._server.send(message, ws_id)
         log.debug("channel_router.send_message", ws_id=ws_id)
 
     async def send_approval(
@@ -260,14 +272,15 @@ class ChannelRouter:
         always: bool = False,
     ) -> None:
         """Approve or deny a pending tool call via the server API."""
-        body: dict[str, Any] = {
-            "ws_id": ws_id,
-            "approved": approved,
-            "always": always,
-        }
-        if feedback:
-            body["feedback"] = feedback
-        await self._post("/api/approve", body)
+        if self._console:
+            await self._console.route_approve(
+                ws_id=ws_id, approved=approved, feedback=feedback, always=always
+            )
+        else:
+            assert self._server is not None
+            await self._server.approve(
+                ws_id=ws_id, approved=approved, feedback=feedback or None, always=always
+            )
         log.debug(
             "channel_router.send_approval",
             ws_id=ws_id,
@@ -277,7 +290,11 @@ class ChannelRouter:
 
     async def send_plan_feedback(self, ws_id: str, correlation_id: str, feedback: str) -> None:
         """Respond to a plan review via the server API."""
-        await self._post("/api/plan", {"ws_id": ws_id, "feedback": feedback})
+        if self._console:
+            await self._console.route_plan_feedback(ws_id=ws_id, feedback=feedback)
+        else:
+            assert self._server is not None
+            await self._server.plan_feedback(ws_id=ws_id, feedback=feedback)
         log.debug(
             "channel_router.send_plan_feedback",
             ws_id=ws_id,
@@ -302,11 +319,15 @@ class ChannelRouter:
         """Close a workstream via the server API."""
         self._node_urls.pop(ws_id, None)
         try:
-            await self._post("/api/workstreams/close", {"ws_id": ws_id})
+            if self._console:
+                await self._console.route_close(ws_id)
+            else:
+                assert self._server is not None
+                await self._server.close_workstream(ws_id)
             log.info("channel_router.close_workstream", ws_id=ws_id)
-        except httpx.HTTPStatusError as exc:
+        except TurnstoneAPIError as exc:
             log.warning(
                 "channel_router.close_workstream_failed",
                 ws_id=ws_id,
-                status=exc.response.status_code,
+                status=exc.status_code,
             )

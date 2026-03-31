@@ -27,7 +27,7 @@ Settings resolution differs between entry points:
 
 | Entry point | Chain |
 |-------------|-------|
-| **Server** (`turnstone-server`, `turnstone-bridge`) | CLI flag > ConfigStore > registry default |
+| **Server** (`turnstone-server`) | CLI flag > ConfigStore > registry default |
 | **CLI** (`turnstone`) | CLI flag > config.toml > argparse default |
 
 The server's `apply_config()` ignores config.toml sections that overlap with
@@ -46,9 +46,7 @@ connection, Redis, auth secrets, server bind address). These stay in
 |----------|---------|-------|
 | API credentials | `[api]` | config.toml / env |
 | Database | `[database]` | config.toml / env |
-| Redis | `[redis]` | config.toml / env |
 | Auth | `[auth]` | config.toml / env |
-| Bridge identity | `[bridge]` | config.toml / env |
 | Console bind | `[console]` | config.toml / env |
 
 **ConfigStore settings** (48 settings) are loaded from the database after

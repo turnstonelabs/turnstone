@@ -21,20 +21,20 @@ def test_load_config_missing_file(tmp_path):
 def test_load_config_valid_toml(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[redis]\nhost = "10.0.0.1"\nport = 6380\npassword = "secret"\n')
+    cfg.write_text('[database]\nhost = "10.0.0.1"\nport = 5432\nname = "turnstone"\n')
     set_config_path(str(cfg))
     result = load_config()
-    assert result["redis"]["host"] == "10.0.0.1"
-    assert result["redis"]["port"] == 6380
-    assert result["redis"]["password"] == "secret"
+    assert result["database"]["host"] == "10.0.0.1"
+    assert result["database"]["port"] == 5432
+    assert result["database"]["name"] == "turnstone"
 
 
 def test_load_config_section(tmp_path):
     _reset_cache()
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[api]\nbase_url = "http://x:8000/v1"\n[redis]\nhost = "y"\n')
+    cfg.write_text('[api]\nbase_url = "http://x:8000/v1"\n[database]\nhost = "y"\n')
     set_config_path(str(cfg))
-    assert load_config("redis") == {"host": "y"}
+    assert load_config("database") == {"host": "y"}
     assert load_config("api") == {"base_url": "http://x:8000/v1"}
     assert load_config("nonexistent") == {}
 

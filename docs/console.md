@@ -1,16 +1,16 @@
 # Cluster Dashboard (turnstone-console)
 
-`turnstone-console` is a cluster management service that provides cluster-wide visibility and control across all turnstone nodes. It connects to the shared Redis broker, discovers nodes via heartbeat keys, polls each node's HTTP API for workstream data, and subscribes to a cluster event channel for real-time state changes.
+`turnstone-console` is a cluster management service that provides cluster-wide visibility and control across all turnstone nodes. It discovers nodes via the `services` database table, polls each node's HTTP API for workstream data, and receives real-time state changes via HTTP polling.
 
-The console also supports **workstream creation** (dispatched via MQ to target nodes) and a **reverse proxy** that serves each node's server UI through the console port — so users only need network access to the console, not to individual server nodes.
+The console also supports **workstream creation** (dispatched via HTTP proxy to target nodes) and a **reverse proxy** that serves each node's server UI through the console port — so users only need network access to the console, not to individual server nodes.
 
 ## Architecture
 
 > See also: [Console Data Flow diagram](diagrams/png/11-console-data-flow.png)
 
 ```
-                        ┌── Redis ←── turnstone-bridge ←── turnstone-server
-                        │    (MQ)        (per node)           (per node)
+                        ┌── services table ──  turnstone-server
+                        │   (node registry)      (per node)
 turnstone-console ──────┤
    (one instance)       │
                         └── turnstone-server (direct HTTP proxy)
@@ -21,45 +21,29 @@ turnstone-console ──────┤
 
 Data flows in two directions:
 
-- **Inbound (monitoring):** Bridges publish state changes to `{prefix}:events:cluster` on Redis pub/sub. The console subscribes for real-time updates and periodically polls each node's `GET /v1/api/dashboard` for full workstream snapshots.
-- **Outbound (control):** The console pushes `CreateWorkstreamMessage` to Redis inbound queues targeting specific nodes. Bridges pick up these messages and create workstreams on their local servers.
+- **Inbound (monitoring):** The console discovers nodes via the `services` database table (nodes register on startup and send periodic heartbeats). It periodically polls each node's `GET /v1/api/dashboard` for full workstream snapshots and `GET /health` for node health.
+- **Outbound (control):** The console proxies workstream creation requests to target nodes via HTTP.
 - **Proxy (pass-through):** The console reverse-proxies each node's server UI at `/node/{node_id}/`, forwarding HTTP and SSE traffic so the browser never contacts server nodes directly.
 
 ### Data Sources
 
 | Source | Method | Direction | Data |
 |--------|--------|-----------|------|
-| Redis heartbeats | `SCAN turnstone:node:*` | Read | Node discovery (node_id, server_url, started) |
-| Redis pub/sub | `SUBSCRIBE turnstone:events:cluster` | Read | State changes, creates, closes, renames |
+| `services` table | Database query | Read | Node discovery (node_id, server_url, started) |
 | Node HTTP API | `GET {server_url}/v1/api/dashboard` | Read | Full workstream list with tokens, context, activity |
 | Node HTTP API | `GET {server_url}/health` | Read | Node health status |
-| Redis inbound queue | `RPUSH turnstone:inbound:{node_id}` | Write | Workstream creation commands |
+| Node HTTP API | `POST {server_url}/v1/api/workstreams/new` | Write | Workstream creation |
 | Node HTTP API | `GET/POST {server_url}/*` | Proxy | Server UI, API requests, SSE streams |
-
-### Redis Key: Cluster Event Channel
-
-Bridges publish to `{prefix}:events:cluster` whenever a workstream state change, creation, closure, or rename occurs. Events include `node_id` so the console can attribute them to the correct node.
-
-Event types on the cluster channel:
-
-| Event | Fields | Trigger |
-|-------|--------|---------|
-| `cluster_state` | ws_id, state, node_id, tokens, context_ratio, activity | Workstream state transition |
-| `ws_created` | ws_id, name, node_id | New workstream created |
-| `ws_closed` | ws_id | Workstream closed |
-| `ws_rename` | ws_id, name | Workstream renamed |
 
 ---
 
 ## ClusterCollector
 
-The collector (`turnstone/console/collector.py`) maintains an in-memory snapshot of all nodes and workstreams. Three daemon threads handle data acquisition:
+The collector (`turnstone/console/collector.py`) maintains an in-memory snapshot of all nodes and workstreams. Two daemon threads handle data acquisition:
 
-1. **Event subscriber** — subscribes to `{prefix}:events:cluster` via `RedisBroker.subscribe_cluster()`. Applies state changes, creates, closes, and renames to the in-memory model immediately.
+1. **Node discovery** — queries the `services` database table every 15 seconds. Adds newly discovered nodes, removes expired ones (stale heartbeats), emits `node_joined` / `node_lost` events to SSE listeners.
 
-2. **Node discovery** — scans heartbeat keys every 15 seconds via `broker.list_nodes()`. Adds newly discovered nodes, removes expired ones, emits `node_joined` / `node_lost` events to SSE listeners.
-
-3. **Poll loop** — fetches `GET /v1/api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
+2. **Poll loop** — fetches `GET /v1/api/dashboard` and `GET /health` from each known node every 10 seconds. Uses `ThreadPoolExecutor(max_workers=50)` for parallelism. Each poll replaces the node's workstream list with the authoritative server data.
 
 A `get_snapshot()` method builds the full cluster state under a single lock acquisition — overview aggregates and per-node workstream lists in one atomic read. This is served both as a REST endpoint and as the initial SSE event on client connect.
 
@@ -183,7 +167,7 @@ Full cluster state in a single response — all nodes with their workstreams plu
 
 ### `POST /v1/api/cluster/workstreams/new`
 
-Create a new workstream on a target node. Dispatches a `CreateWorkstreamMessage` through the Redis MQ pipeline — the bridge on the target node picks it up and creates the workstream on the server. Requires `write` scope.
+Create a new workstream on a target node. The console proxies the creation request to the target node's HTTP API. Requires `write` scope.
 
 Request:
 
@@ -197,9 +181,9 @@ Request:
 
 All fields are optional:
 - `node_id` — targeting mode:
-  - **omitted or `"auto"`** — console picks the reachable node with the most available capacity (max_ws - ws_total) and pushes to its directed queue.
-  - **`"pool"`** — pushes to the shared inbound queue; the next available bridge picks it up (true general-pool dispatch).
-  - **specific node ID** — pushes to that node's directed queue.
+  - **omitted or `"auto"`** — console picks the reachable node with the most available capacity (max_ws - ws_total) and proxies the request to it.
+  - **`"pool"`** — console picks a reachable node with available capacity using round-robin selection.
+  - **specific node ID** — proxies the request to that node directly.
 - `name` — workstream display name. Auto-generated if omitted.
 - `model` — model alias from the target node's registry. Uses the node's default model if omitted.
 
@@ -213,7 +197,7 @@ Response:
 }
 ```
 
-Creation is asynchronous — the response confirms the MQ message was dispatched. A `ws_created` event on the cluster SSE stream confirms the workstream was actually created.
+The response confirms the workstream creation request was proxied to the target node. A `ws_created` event on the cluster SSE stream confirms the workstream was actually created.
 
 ### `GET /v1/api/cluster/events`
 
@@ -395,7 +379,7 @@ Breadcrumb: `Cluster > Running` or `Cluster > db-west-04`. Server-side paginated
 
 Triggered by the "+ new" header button. A modal dialog with:
 
-- **Node selector** — dropdown with three targeting modes: "Auto (best available)" picks the node with the most headroom, "General pool (any node)" pushes to the shared queue for any bridge to pick up, or a specific node from the list (showing capacity).
+- **Node selector** — dropdown with three targeting modes: "Auto (best available)" picks the node with the most headroom, "General pool (any node)" picks a node with available capacity using round-robin, or a specific node from the list (showing capacity).
 - **Profile** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional text input for a model alias from the target node's registry.
@@ -482,17 +466,17 @@ to create the initial admin user and receive a JWT in one step. See
 
 ## Scheduled Tasks
 
-The console includes a background **TaskScheduler** daemon that creates workstreams on a timed basis via the MQ broker. It supports cron-based recurring schedules and one-shot `at` schedules.
+The console includes a background **TaskScheduler** daemon that creates workstreams on a timed basis via HTTP proxy to target nodes. It supports cron-based recurring schedules and one-shot `at` schedules.
 
 ### Architecture
 
 The scheduler runs as a daemon thread inside the console process. Every `check_interval` seconds (default 15) it:
 
-1. Acquires a distributed lock via Redis `SET NX EX` (prevents duplicate dispatch in multi-console deployments)
+1. Acquires a distributed lock via the `system_settings` table (prevents duplicate dispatch in multi-console deployments)
 2. Queries the storage backend for tasks whose `next_run <= now` and `enabled = true`
-3. Dispatches each due task as one or more `CreateWorkstreamMessage` via MQ
+3. Dispatches each due task as one or more workstream creation requests via HTTP proxy
 4. Updates `last_run` and computes the next `next_run` (or disables one-shot `at` tasks)
-5. Releases the lock via Lua script (safe conditional delete)
+5. Releases the lock
 
 Run history is automatically pruned (runs older than 90 days) approximately once per hour.
 
@@ -508,7 +492,7 @@ Run history is automatically pruned (runs older than 90 days) approximately once
 | Mode | Behavior |
 |------|----------|
 | `auto` | Picks the reachable node with the most available capacity |
-| `pool` | Pushes to the shared inbound queue (any bridge picks it up) |
+| `pool` | Picks a reachable node with available capacity using round-robin |
 | `all` | Fan-out to all reachable nodes (capped at `max_fan_out`, default 20) |
 | `<node_id>` | Targets a specific node by ID |
 
@@ -645,10 +629,6 @@ CLI flags for `turnstone-console`:
 |------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | `8090` | HTTP port |
-| `--redis-host` | `localhost` | Redis host |
-| `--redis-port` | `6379` | Redis port |
-| `--redis-password` | `$REDIS_PASSWORD` | Redis password |
-| `--redis-db` | `0` | Redis DB |
 | `--poll-interval` | `10` | Node polling interval (seconds) |
 | `--auth-token` | `$TURNSTONE_AUTH_TOKEN` | Bearer token for server node communication and proxy |
 | `--log-level` | `INFO` | Log level |
@@ -661,11 +641,6 @@ host = "0.0.0.0"
 port = 8090
 url = "http://localhost:8090"   # used by CLI /cluster commands
 poll_interval = 10
-
-[redis]
-host = "localhost"
-port = 6379
-password = "my-redis-password"
 ```
 
 ---
@@ -673,17 +648,11 @@ password = "my-redis-password"
 ## Deployment
 
 ```bash
-# Start Redis
-redis-server
-
 # Start turnstone servers (one per node)
 turnstone-server --port 8080
 
-# Start bridges (one per server)
-turnstone-bridge --server-url http://localhost:8080 --node-id node-a
-
 # Start cluster console (one instance)
-turnstone-console --redis-host localhost --port 8090 --auth-token "$TURNSTONE_AUTH_TOKEN"
+turnstone-console --port 8090 --auth-token "$TURNSTONE_AUTH_TOKEN"
 ```
 
 Open `http://localhost:8090` for the cluster dashboard. Create workstreams via the "+ new" button. Click any workstream to open the proxied server UI — no direct access to server ports required.

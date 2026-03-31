@@ -98,7 +98,6 @@ cannot bypass the proxy.
 | `skills_registry` | `skills.sh` | Skill discovery |
 | `github_api` | `api.github.com` (read-only L7), `raw.githubusercontent.com` | Skill fetch, GitHub API |
 | `mcp_registry` | `registry.modelcontextprotocol.io` (read-only L7) | MCP server discovery |
-| `redis` | `127.0.0.1:6379` | Message queue |
 | `web_fetch_common` | readthedocs, python docs, GitHub Pages, PyPI, npm, Stack Overflow, Wikipedia | Curated web_fetch domains |
 | `bash_network_tools` | Same as `web_fetch_common` | curl/wget from bash tool |
 | `package_registries` | `pypi.org`, `files.pythonhosted.org` | pip/uv package installs |
@@ -283,6 +282,5 @@ For production deployments:
 - [ ] Review and trim `web_fetch_common` domains to your actual needs
 - [ ] Remove `package_registries` policy if pip/uv installs are not needed
 - [ ] Add your OIDC provider endpoint if using SSO
-- [ ] Set Redis `allowed_ips` to your actual Redis host if not localhost
 - [ ] Consider removing `bash_network_tools` entirely if bash should not have
       network access

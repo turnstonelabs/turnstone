@@ -134,13 +134,13 @@ def test_cli_bootstrap(tmp_path):
     from turnstone.admin import _cmd_tls_bootstrap
 
     out = tmp_path / "certs"
-    args = argparse.Namespace(out=str(out), issue=["redis.internal", "pg.internal"])
+    args = argparse.Namespace(out=str(out), issue=["app.internal", "pg.internal"])
     _cmd_tls_bootstrap(args)
 
     assert (out / "ca.pem").exists()
     assert b"BEGIN CERTIFICATE" in (out / "ca.pem").read_bytes()
     # Check certs were issued
-    assert (out / "certs" / "redis.internal").exists()
+    assert (out / "certs" / "app.internal").exists()
     assert (out / "certs" / "pg.internal").exists()
 
 

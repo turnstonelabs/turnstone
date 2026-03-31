@@ -339,10 +339,9 @@ secret. If no secret is configured, an ephemeral key is generated at
 startup and a warning is logged — JWTs will not survive restarts or work
 across nodes.
 
-The bridge and console **require** `TURNSTONE_JWT_SECRET` when no
-`--auth-token` is provided. They exit with an error if the secret is
-missing, since ephemeral secrets would silently break inter-service
-communication.
+The console **requires** `TURNSTONE_JWT_SECRET` when no `--auth-token`
+is provided. It exits with an error if the secret is missing, since
+ephemeral secrets would silently break inter-service communication.
 
 ---
 
@@ -484,30 +483,26 @@ static token is used as a final fallback.
 
 ### Service-to-service authentication
 
-The bridge and console collector use `ServiceTokenManager` for
-auto-rotating JWTs when communicating with server nodes:
+The console collector uses `ServiceTokenManager` for auto-rotating
+JWTs when communicating with server nodes:
 
 | Service | Identity | Scope | Audience | Purpose |
 |---------|----------|-------|----------|---------|
-| Bridge | `bridge` | `approve` | `turnstone-server` | Tool approval proxy, message relay |
 | Console collector | `console-collector` | `read` | `turnstone-server` | Node health polling |
 | Console proxy (fallback) | `console-proxy` | `approve` | `turnstone-server` | Proxied API calls when no user context |
 | Channel notify | `system` | `write` | `turnstone-channel` | Notification delivery to channel gateway |
 
 Service tokens use 1-hour expiry with automatic refresh via
-`ServiceTokenManager`.  The bridge injects auth headers per-request via
-httpx event hooks to ensure rotated tokens are picked up on SSE
-reconnects.
+`ServiceTokenManager`.
 
 ### User identity in MQ-dispatched workstreams
 
-When the console creates a workstream via MQ (the normal path), the
-authenticated user's `user_id` is embedded in the
-`CreateWorkstreamMessage`.  The bridge forwards this `user_id` in the
-HTTP payload when calling the server's `POST /v1/api/workstreams/new`.
-The server accepts a `user_id` from the request body **only when the
-caller is a trusted service** — identified by `token_source` matching
-`bridge`, `console-proxy`, or `console`.  Regular API callers cannot
+When the console creates a workstream (the normal path), the
+authenticated user's `user_id` is forwarded in the HTTP payload when
+calling the server's `POST /v1/api/workstreams/new`.  The server
+accepts a `user_id` from the request body **only when the caller is a
+trusted service** — identified by `token_source` matching
+`console-proxy` or `console`.  Regular API callers cannot
 override `user_id`; the server always uses their JWT identity.
 
 Note that the channel gateway uses a distinct JWT audience

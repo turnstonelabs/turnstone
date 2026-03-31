@@ -572,19 +572,24 @@ def _weight_based_assignments(nodes: list[RingNode]) -> list[tuple[int, str]]:
     algorithm won't try to "correct" on the next run.
     """
     total_weight = sum(n.weight for n in nodes)
-    assignments: list[tuple[int, str]] = []
-    # Sort nodes for determinism
+    # Compute per-node counts using the same int() + remainder distribution
+    # as rebalance_once step 7, so seeding is a guaranteed noop on first rebalance.
     sorted_nodes = sorted(nodes, key=lambda n: n.node_id)
+    counts: dict[str, int] = {}
+    assigned = 0
+    for n in sorted_nodes:
+        c = int((n.weight / total_weight) * RING_SIZE)
+        counts[n.node_id] = c
+        assigned += c
+    # Distribute remainder to heaviest nodes (same as rebalance_once step 7)
+    remainder_pool = sorted(counts, key=lambda nid: counts[nid], reverse=True)
+    for i in range(RING_SIZE - assigned):
+        counts[remainder_pool[i % len(remainder_pool)]] += 1
+
+    assignments: list[tuple[int, str]] = []
     bucket = 0
-    for i, node in enumerate(sorted_nodes):
-        if i == len(sorted_nodes) - 1:
-            # Last node gets the remainder (avoids rounding gaps)
-            count = RING_SIZE - bucket
-        else:
-            count = round((node.weight / total_weight) * RING_SIZE)
-        for _ in range(count):
-            if bucket >= RING_SIZE:
-                break
+    for node in sorted_nodes:
+        for _ in range(counts[node.node_id]):
             assignments.append((bucket, node.node_id))
             bucket += 1
     return assignments
