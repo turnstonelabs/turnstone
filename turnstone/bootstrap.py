@@ -82,10 +82,9 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `POSTGRES_USER` — PostgreSQL username (default: turnstone)
 - `POSTGRES_PASSWORD` — PostgreSQL password (required for production/cluster)
 
-### Authentication
-- `TURNSTONE_AUTH_ENABLED` — Enable auth (`true`/empty)
-- `TURNSTONE_JWT_SECRET` — JWT signing secret (required if auth enabled)
-- `TURNSTONE_AUTH_TOKEN` — Static bearer token for inter-service auth
+### Authentication (always enabled)
+- `TURNSTONE_JWT_SECRET` — JWT signing secret (required)
+- `TURNSTONE_AUTH_TOKEN` — Static bearer token for inter-service auth (required)
 
 ### OIDC SSO (optional)
 - `TURNSTONE_OIDC_ISSUER` — OIDC issuer URL (e.g., https://accounts.google.com). Setting this + CLIENT_ID + CLIENT_SECRET enables SSO.
@@ -162,8 +161,9 @@ Walk the user through setting up their deployment step by step:
 (may differ from this wizard's model). Ask for base URL, API key, model name.
 4. **Database**: SQLite (dev/simple) vs PostgreSQL (production/cluster). \
 PostgreSQL is required for cluster mode.
-5. **Security**: Recommend enabling auth for any non-local deployment. \
+5. **Security**: Auth is always enabled. \
 Use `generate_secret` for JWT secret, auth token, and Postgres password. \
+Always set `TURNSTONE_JWT_SECRET` and `TURNSTONE_AUTH_TOKEN` in the .env. \
 Ask for initial admin username and password. \
 If the user's deployment will use an external identity provider (Okta, Azure AD, Google, etc.), \
 offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \
