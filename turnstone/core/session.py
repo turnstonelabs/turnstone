@@ -345,7 +345,7 @@ class ChatSession:
         self._title_generated = False
         self._read_files: set[str] = set()
         self.messages: list[dict[str, Any]] = []
-        self._last_usage: dict[str, Any] | None = None
+        self._last_usage: dict[str, int] | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
         # Workstream template metadata
@@ -2038,7 +2038,6 @@ class ChatSession:
                 if chunk.usage:
                     if self._last_usage is None:
                         self._last_usage = {
-                            "model": self.model,
                             "prompt_tokens": chunk.usage.prompt_tokens,
                             "completion_tokens": chunk.usage.completion_tokens,
                             "total_tokens": chunk.usage.total_tokens,
@@ -2336,7 +2335,8 @@ class ChatSession:
         """Emit status info via the UI."""
         if not self._last_usage:
             return
-        self.ui.on_status(self._last_usage, self.context_window, self.reasoning_effort)
+        usage: dict[str, Any] = {**self._last_usage, "model": self.model}
+        self.ui.on_status(usage, self.context_window, self.reasoning_effort)
 
     # -- Conversation compaction ------------------------------------------------
 
