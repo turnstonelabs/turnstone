@@ -265,9 +265,22 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
 
     url = f"{console_url}/v1/api/admin/tls/certs"
     headers = {}
-    token = getattr(args, "auth_token", "") or _get_config_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    # Prefer JWT via ServiceTokenManager when JWT secret is available
+    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    if jwt_secret:
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="admin-cli",
+            scopes=frozenset({"read", "write", "approve"}),
+            source="cli",
+            secret=jwt_secret,
+        )
+        headers["Authorization"] = f"Bearer {mgr.token}"
+    else:
+        token = getattr(args, "auth_token", "") or _get_config_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
     resp = httpx.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()

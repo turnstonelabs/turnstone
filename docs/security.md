@@ -518,23 +518,22 @@ channel gateway endpoint, and vice versa.
 
 ```toml
 [auth]
-enabled = true
 jwt_secret = "your-secret-key-here"
 jwt_expiry_hours = 24
 
 [[auth.tokens]]
-value = "tok_legacy"
+value = "tok_legacy"    # deprecated — use API tokens instead
 role = "full"
 ```
 
 ### Environment variables
 
-Auth is always enabled.
+Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
 
 | Variable | Description |
 |----------|-------------|
-| `TURNSTONE_AUTH_TOKEN=tok_xxx` | Register a config-file token with `full` access |
-| `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (must match across nodes) |
+| `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (required, must match across nodes) |
+| `TURNSTONE_AUTH_TOKEN=tok_xxx` | Config-file token with `full` access (deprecated — use API tokens) |
 | `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |
 
 ---

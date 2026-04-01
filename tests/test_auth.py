@@ -1339,6 +1339,16 @@ class TestSecretStrength:
                 else:
                     os.environ.pop("TURNSTONE_JWT_SECRET", None)
 
+    def test_missing_secret_exits(self):
+        import turnstone.core.auth as auth_mod
+
+        with (
+            patch("turnstone.core.config.load_config", return_value={}),
+            patch.dict(os.environ, {}, clear=True),
+            pytest.raises(SystemExit),
+        ):
+            auth_mod.load_jwt_secret()
+
 
 class TestCorsConfigurable:
     """Verify CORS middleware is only added when origins are configured."""

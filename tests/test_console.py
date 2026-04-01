@@ -9,6 +9,10 @@ import pytest
 
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 
+# Shared test auth constants — used by all console test fixtures
+_TEST_TOKEN = "test_console_token"
+_TEST_AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+
 # ---------------------------------------------------------------------------
 # Mock storage for collector tests
 # ---------------------------------------------------------------------------
@@ -715,9 +719,9 @@ class TestConsoleHTTPEndpoints:
 
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
         client.close()
 
@@ -958,7 +962,7 @@ class TestConsoleWorkstreamCreation:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
 
         # Set up a mock proxy_client (lifespan doesn't run in TestClient)
@@ -974,7 +978,7 @@ class TestConsoleWorkstreamCreation:
         mock_proxy.post = mock_post
         app.state.proxy_client = mock_proxy
 
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client, mock_post
         client.close()
 
@@ -1156,9 +1160,9 @@ class TestConsoleProxy:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
         client.close()
 
@@ -1327,9 +1331,9 @@ class TestConsoleVersionEndpoints:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
         client.close()
 
@@ -1376,9 +1380,9 @@ class TestSharedStatic:
         }
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
         client.close()
 
@@ -1494,9 +1498,9 @@ class TestProxySharedStatic:
         collector.get_node_detail.return_value = None
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(),
+            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
         )
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         resp = client.get("/node/unknown/shared/base.css")
         assert resp.status_code == 404
         client.close()

@@ -642,7 +642,19 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
         return
 
     headers: dict[str, str] = {}
-    if auth_token:
+    # Prefer JWT via ServiceTokenManager when JWT secret is available
+    jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
+    if jwt_secret:
+        from turnstone.core.auth import ServiceTokenManager
+
+        _cluster_token_mgr = ServiceTokenManager(
+            user_id="cli",
+            scopes=frozenset({"read", "write", "approve"}),
+            source="cli",
+            secret=jwt_secret,
+        )
+        headers["Authorization"] = f"Bearer {_cluster_token_mgr.token}"
+    elif auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"
 
     parts = cmd_line.strip().split()

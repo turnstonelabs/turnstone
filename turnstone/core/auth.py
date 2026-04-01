@@ -302,7 +302,11 @@ def parse_scopes(scopes_str: str) -> frozenset[str]:
 
 
 def load_jwt_secret() -> str:
-    """Load JWT signing secret from env or config, or auto-generate."""
+    """Load JWT signing secret from env or config.
+
+    Raises :class:`SystemExit` if no secret is configured.  A JWT secret
+    is required for auth, inter-service communication, and session tokens.
+    """
     secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
     if not secret:
         from turnstone.core.config import load_config
@@ -311,12 +315,11 @@ def load_jwt_secret() -> str:
         secret = str(auth_cfg.get("jwt_secret", "")).strip()
 
     if not secret:
-        # Auto-generate an ephemeral secret
-        secret = secrets.token_hex(32)
-        log.warning(
-            "No JWT secret configured — using ephemeral secret (tokens will not survive restart)"
+        log.error(
+            "TURNSTONE_JWT_SECRET is required but not set. "
+            'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"'
         )
-        return secret
+        raise SystemExit(1)
 
     if len(secret) < _MIN_SECRET_LENGTH:
         log.warning(
@@ -583,9 +586,13 @@ def _authenticate_token(
     if token.startswith(TOKEN_PREFIX) and storage is not None:
         return _authenticate_api_token(token, storage)
 
-    # 3. Config-file token (hmac comparison)
+    # 3. Config-file token (hmac comparison) — deprecated
     role = auth_config.check(token)
     if role is not None:
+        log.warning(
+            "Config-file token authentication is deprecated and will be removed "
+            "in a future release. Use JWT login or API tokens (ts_) instead."
+        )
         scopes = _ROLE_TO_SCOPES.get(role, frozenset({"read"}))
         return AuthResult(user_id="", scopes=scopes, token_source="config")
 
