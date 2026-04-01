@@ -638,29 +638,27 @@ class ChatSession:
             return
         base = tempfile.mkdtemp(prefix=f"skill-{self._ws_id[:8]}-")
         written = 0
-        try:
-            for rel_path, content in self._skill_resources.items():
-                normed = os.path.normpath(rel_path)
-                if not normed or normed == "." or normed.startswith(("..", "/")):
-                    log.warning("skill_resources.bad_path", path=rel_path)
-                    continue
-                if ".." in normed.split(os.sep):
-                    log.warning("skill_resources.bad_path", path=rel_path)
-                    continue
-                full = os.path.join(base, normed)
-                if not os.path.realpath(full).startswith(os.path.realpath(base)):
-                    log.warning("skill_resources.path_escape", path=rel_path)
-                    continue
+        for rel_path, content in self._skill_resources.items():
+            normed = os.path.normpath(rel_path)
+            if not normed or normed == "." or normed.startswith(("..", "/")):
+                log.warning("skill_resources.bad_path", path=rel_path)
+                continue
+            if ".." in normed.split(os.sep):
+                log.warning("skill_resources.bad_path", path=rel_path)
+                continue
+            full = os.path.join(base, normed)
+            if not os.path.realpath(full).startswith(os.path.realpath(base)):
+                log.warning("skill_resources.path_escape", path=rel_path)
+                continue
+            try:
                 os.makedirs(os.path.dirname(full), exist_ok=True)
-                with open(full, "w") as f:
+                with open(full, "w", encoding="utf-8") as f:
                     f.write(content)
                 if normed.startswith("scripts/"):
                     os.chmod(full, 0o755)
                 written += 1
-        except Exception:
-            shutil.rmtree(base, ignore_errors=True)
-            log.warning("skill_resources.materialize_failed", exc_info=True)
-            return
+            except Exception:
+                log.warning("skill_resources.write_failed", path=rel_path, exc_info=True)
         if written == 0:
             shutil.rmtree(base, ignore_errors=True)
             return
@@ -678,7 +676,11 @@ class ChatSession:
         env: dict[str, str] = {"SKILL_RESOURCES_DIR": self._skill_resources_dir}
         scripts_dir = os.path.join(self._skill_resources_dir, "scripts")
         if os.path.isdir(scripts_dir):
-            env["PATH"] = scripts_dir + ":" + os.environ.get("PATH", "")
+            current_path = os.environ.get("PATH")
+            if current_path:
+                env["PATH"] = scripts_dir + os.pathsep + current_path
+            else:
+                env["PATH"] = scripts_dir
         return env
 
     def _validate_skill_resources(self) -> None:
