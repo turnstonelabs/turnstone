@@ -119,6 +119,11 @@ class WebUI:
         self._ws_turn_content_size: int = 0
 
     def _enqueue(self, data: dict[str, Any]) -> None:
+        # Stamp ws_id on every per-workstream event so the client can
+        # validate it belongs to the pane's current workstream.
+        # Shallow copy to avoid mutating caller's dict (e.g. _pending_approval).
+        if "ws_id" not in data:
+            data = {**data, "ws_id": self.ws_id}
         with self._listeners_lock:
             snapshot = list(self._listeners)
         for lq in snapshot:

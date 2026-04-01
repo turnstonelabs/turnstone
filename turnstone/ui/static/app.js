@@ -310,29 +310,53 @@ Pane.prototype.connectSSE = function (wsId) {
               workstreams[ws.id] = { name: ws.name, state: ws.state };
             });
             renderTabBar();
-            // Reconnect all disconnected panes, reassigning stale ws_ids
+            // Reconnect all disconnected panes, reassigning stale ws_ids.
+            // Two passes: (1) reassign stale panes, (2) reconnect all.
+            // Track assigned ws_ids to avoid multiple panes on the same ws.
+            var remaining = Object.keys(workstreams);
+            if (!remaining.length) {
+              showDashboard();
+              return;
+            }
+            var usedWsIds = {};
             for (var pid in panes) {
-              var p = panes[pid];
-              if (p.wsId && !workstreams[p.wsId]) {
-                var ids = Object.keys(workstreams);
-                if (ids.length) {
-                  p.wsId = ids[0];
-                  p.messagesEl.innerHTML = "";
-                  p.showEmptyState();
-                  p.updateWsName();
-                } else {
-                  showDashboard();
-                  return;
+              if (panes[pid].wsId && workstreams[panes[pid].wsId])
+                usedWsIds[panes[pid].wsId] = true;
+            }
+            for (var pid2 in panes) {
+              var p2 = panes[pid2];
+              if (p2.wsId && !workstreams[p2.wsId]) {
+                var newWsId = null;
+                for (var ri = 0; ri < remaining.length; ri++) {
+                  if (!usedWsIds[remaining[ri]]) {
+                    newWsId = remaining[ri];
+                    break;
+                  }
                 }
+                if (newWsId) {
+                  p2.disconnectSSE();
+                  p2.wsId = newWsId;
+                  usedWsIds[newWsId] = true;
+                  while (p2.messagesEl.firstChild)
+                    p2.messagesEl.removeChild(p2.messagesEl.firstChild);
+                  p2.showEmptyState();
+                  p2.updateWsName();
+                }
+                // else: more panes than workstreams — leave pane stale,
+                // connectSSE below will pick it up or it stays disconnected.
               }
-              if (pid === focusedPaneId) currentWsId = p.wsId;
-              if (!p.evtSource) {
+            }
+            // Pass 2: reconnect all panes and sync focused pane
+            for (var pid3 in panes) {
+              var p3 = panes[pid3];
+              if (pid3 === focusedPaneId) currentWsId = p3.wsId;
+              if (!p3.evtSource && p3.wsId && workstreams[p3.wsId]) {
                 setTimeout(
                   (function (pp) {
                     return function () {
                       pp.connectSSE(pp.wsId);
                     };
-                  })(p),
+                  })(p3),
                   self.retryDelay,
                 );
               }
@@ -357,6 +381,9 @@ Pane.prototype.connectSSE = function (wsId) {
 };
 
 Pane.prototype.handleEvent = function (evt) {
+  // Guard: drop events that belong to a different workstream.
+  // This prevents cross-contamination during tab switches and reconnects.
+  if (evt.ws_id && evt.ws_id !== this.wsId) return;
   var self = this;
   switch (evt.type) {
     case "thinking_start":
@@ -2304,10 +2331,12 @@ function switchTab(wsId) {
     }
   }
 
+  pane.disconnectSSE();
   pane.reset();
   pane.wsId = wsId;
   currentWsId = wsId;
-  pane.messagesEl.innerHTML = "";
+  while (pane.messagesEl.firstChild)
+    pane.messagesEl.removeChild(pane.messagesEl.firstChild);
   pane.showEmptyState();
   pane.updateWsName();
   renderTabBar();
@@ -2957,8 +2986,18 @@ function connectGlobalSSE() {
       for (var id in panes) {
         if (panes[id].wsId === data.ws_id) panes[id].updateWsName();
       }
+    } else if (data.type === "ws_created") {
+      workstreams[data.ws_id] = workstreams[data.ws_id] || {};
+      workstreams[data.ws_id].name = data.name || data.ws_id.slice(0, 6);
+      workstreams[data.ws_id].state = "idle";
+      renderTabBar();
     } else if (data.type === "ws_closed") {
       var wsId = data.ws_id;
+      // Disconnect per-ws SSE on affected panes immediately so stale
+      // events from the dying workstream don't leak into reassigned panes.
+      for (var cid in panes) {
+        if (panes[cid].wsId === wsId) panes[cid].disconnectSSE();
+      }
       delete workstreams[wsId];
       renderTabBar();
       if (data.reason === "evicted") {
@@ -3137,10 +3176,13 @@ function makeCollapsible(el) {
 
 var _planContent = "";
 var _planPaneId = null;
+var _planWsId = null;
 
 function showPlanDialog(content) {
   _planContent = content;
   _planPaneId = focusedPaneId;
+  var paneNow = panes[_planPaneId];
+  _planWsId = paneNow ? paneNow.wsId : currentWsId;
   document.getElementById("plan-content").textContent = content;
   var feedbackEl = document.getElementById("plan-feedback");
   feedbackEl.value = "";
@@ -3186,7 +3228,10 @@ function resolvePlan(defaultFeedback) {
   }
 
   // Critical: fire the API call first — this unblocks the server.
-  var wsId = pane ? pane.wsId : currentWsId;
+  // Use the ws_id captured when the dialog opened, not the current pane
+  // (user may have switched tabs while the dialog was open).
+  var wsId = _planWsId || (pane ? pane.wsId : currentWsId);
+  _planWsId = null;
   authFetch("/v1/api/plan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

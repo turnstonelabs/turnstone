@@ -730,13 +730,23 @@ class TestWebUIFanOut:
         ui._enqueue({"type": "content", "text": "hello"})  # should not raise
 
     def test_enqueue_single_listener(self):
-        """Single listener receives the event."""
+        """Single listener receives the event with ws_id stamped."""
         from turnstone.server import WebUI
 
         ui = WebUI(ws_id="test")
         q = ui._register_listener()
         ui._enqueue({"type": "content", "text": "hello"})
-        assert q.get_nowait() == {"type": "content", "text": "hello"}
+        assert q.get_nowait() == {"type": "content", "text": "hello", "ws_id": "test"}
+
+    def test_enqueue_does_not_mutate_input(self):
+        """_enqueue must not mutate the caller's dict."""
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test")
+        ui._register_listener()
+        original = {"type": "content", "text": "hello"}
+        ui._enqueue(original)
+        assert "ws_id" not in original
 
     def test_enqueue_multiple_listeners(self):
         """All registered listeners receive an identical copy."""
@@ -747,12 +757,12 @@ class TestWebUIFanOut:
         q2 = ui._register_listener()
         q3 = ui._register_listener()
 
-        event = {"type": "content", "text": "world"}
-        ui._enqueue(event)
+        ui._enqueue({"type": "content", "text": "world"})
 
-        assert q1.get_nowait() == event
-        assert q2.get_nowait() == event
-        assert q3.get_nowait() == event
+        expected = {"type": "content", "text": "world", "ws_id": "test"}
+        assert q1.get_nowait() == expected
+        assert q2.get_nowait() == expected
+        assert q3.get_nowait() == expected
 
     def test_unregister_stops_delivery(self):
         """After unregister, the queue receives no further events."""
@@ -784,11 +794,10 @@ class TestWebUIFanOut:
         assert fast.qsize() == 0
 
         # Enqueue via fan-out — slow drops (full), fast receives
-        event = {"type": "content", "text": "overflow"}
-        ui._enqueue(event)
+        ui._enqueue({"type": "content", "text": "overflow"})
         assert slow.qsize() == 500  # still full, overflow dropped
         assert fast.qsize() == 1
-        assert fast.get_nowait() == event
+        assert fast.get_nowait() == {"type": "content", "text": "overflow", "ws_id": "test"}
 
     def test_unregister_idempotent(self):
         """Double unregister does not raise."""
