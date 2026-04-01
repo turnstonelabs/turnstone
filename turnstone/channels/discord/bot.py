@@ -180,6 +180,7 @@ class TurnstoneBot:
             server_token_factory=server_token_factory,
         )
 
+        self._commands_synced: bool = False
         self._subscribed_ws: set[str] = set()
         self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._streaming: dict[str, StreamingMessage] = {}
@@ -204,12 +205,17 @@ class TurnstoneBot:
         # response message can be re-tracked for multi-turn DM conversations.
         self._notify_reply_channels: dict[str, tuple[discord.abc.Messageable, str]] = {}
 
-        # Shared HTTP client for SSE connections (long-lived, no timeout).
+        # Shared HTTP client for SSE connections.
+        # Read timeout detects half-open connections (server sends ping=5s
+        # keepalives, so 90s is very conservative).
         # Token factory provides auto-rotating JWTs; static token is fallback.
         headers: dict[str, str] = {}
         if api_token and not server_token_factory:
             headers["Authorization"] = f"Bearer {api_token}"
-        self._http_client = httpx.AsyncClient(headers=headers, timeout=None)
+        self._http_client = httpx.AsyncClient(
+            headers=headers,
+            timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0),
+        )
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -230,6 +236,10 @@ class TurnstoneBot:
         async def on_ready() -> None:
             await self._on_ready()
 
+        @self._bot.event
+        async def on_resumed() -> None:
+            await self._on_resumed()
+
     # -- lifecycle -----------------------------------------------------------
 
     async def _setup_hook(self) -> None:
@@ -247,22 +257,45 @@ class TurnstoneBot:
         log.info("discord.setup_hook_complete")
 
     async def _on_ready(self) -> None:
-        """Sync slash commands and recover existing routes."""
+        """Sync slash commands (once) and recover existing routes."""
         import discord
 
         bot = self._bot
         log.info("discord.ready", user=str(bot.user), guild_count=len(bot.guilds))
 
-        if self.config.guild_id:
-            guild = discord.Object(id=self.config.guild_id)
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-            log.info("discord.commands_synced", guild_id=self.config.guild_id)
-        else:
-            await bot.tree.sync()
-            log.info("discord.commands_synced_global")
+        if not self._commands_synced:
+            if self.config.guild_id:
+                guild = discord.Object(id=self.config.guild_id)
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+                log.info("discord.commands_synced", guild_id=self.config.guild_id)
+            else:
+                await bot.tree.sync()
+                log.info("discord.commands_synced_global")
+            self._commands_synced = True
 
+        self._purge_dead_sse_tasks("ready")
         await self._recover_routes()
+
+    async def _on_resumed(self) -> None:
+        """Recover dead SSE tasks after a gateway session resume.
+
+        Unlike ``on_ready``, ``on_resumed`` fires when discord.py resumes
+        an existing session after a brief disconnect — ``on_ready`` is NOT
+        called in that case.  Any SSE listener tasks that died during the
+        blip need to be cleaned up and re-subscribed.
+        """
+        self._purge_dead_sse_tasks("resumed")
+        await self._recover_routes()
+
+    def _purge_dead_sse_tasks(self, trigger: str) -> None:
+        """Remove completed/failed SSE tasks so they can be re-subscribed."""
+        dead = [ws_id for ws_id, task in self._sse_tasks.items() if task.done()]
+        for ws_id in dead:
+            self._subscribed_ws.discard(ws_id)
+            self._sse_tasks.pop(ws_id, None)
+        if dead:
+            log.info("discord.purged_dead_tasks", trigger=trigger, count=len(dead), ws_ids=dead)
 
     async def _recover_routes(self) -> None:
         """Re-subscribe to event channels for existing discord routes.
@@ -361,14 +394,15 @@ class TurnstoneBot:
         """
         import httpx_sse
 
-        # When routing through the console, connect SSE directly to the
-        # assigned server node (node_url from the create response).
-        node_base = await self.router.get_node_url(ws_id)
-        url = f"{node_base}/v1/api/events"
         delay = _SSE_RECONNECT_DELAY
+        url = ""  # set before loop so exception handlers can reference it
 
         while True:
             try:
+                # Re-resolve node URL on each attempt so reconnects pick up
+                # changes after bot restarts or router cache expiry.
+                node_base = await self.router.get_node_url(ws_id)
+                url = f"{node_base}/v1/api/events"
                 # Refresh auth header per-connection (token may have rotated)
                 sse_headers: dict[str, str] | None = None
                 if self._token_factory is not None:
@@ -392,7 +426,9 @@ class TurnstoneBot:
                             ws_id=ws_id,
                             status=status,
                         )
-                        # Fall through to backoff/retry for transient errors.
+                        # Skip to backoff/retry — don't try to parse
+                        # a non-SSE error response body.
+                        continue
                     delay = _SSE_RECONNECT_DELAY  # reset on successful connect
                     async for sse in event_source.aiter_sse():
                         if sse.event == "message" or not sse.event:
@@ -406,12 +442,25 @@ class TurnstoneBot:
                                 )
                                 continue
                             event = ServerEvent.from_dict(data)
-                            await self._on_ws_event(ws_id, thread, event)
+                            try:
+                                await self._on_ws_event(ws_id, thread, event)
+                            except Exception:
+                                # Discord API failures (rate limits, outages)
+                                # must not kill the SSE connection.
+                                log.warning(
+                                    "discord.event_dispatch_failed",
+                                    ws_id=ws_id,
+                                    exc_info=True,
+                                )
             except httpx.RemoteProtocolError:
                 # Server closed connection (normal on stream_end or shutdown).
                 log.debug("discord.sse_remote_closed", ws_id=ws_id)
             except asyncio.CancelledError:
                 return  # unsubscribe or shutdown
+            except httpx.ReadTimeout:
+                # No data received within read timeout — likely a half-open
+                # connection.  Reconnect to recover.
+                log.info("discord.sse_read_timeout", ws_id=ws_id)
             except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
                 log.warning(
                     "discord.sse_connect_failed",
