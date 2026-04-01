@@ -1388,7 +1388,8 @@ class ChatSession:
     ) -> Iterator[StreamChunk]:
         """Attempt a streaming API call with retries on transient errors."""
         prov = provider or self._provider
-        base_url = getattr(client, "base_url", getattr(client, "_base_url", "?"))
+        raw_url = str(getattr(client, "base_url", getattr(client, "_base_url", "?")))
+        safe_url = raw_url.split("?")[0]  # strip query params (may contain keys)
         msg_count = len(msgs)
         role_counts: dict[str, int] = {}
         for m in msgs:
@@ -1398,7 +1399,7 @@ class ChatSession:
             "API call: provider=%s model=%s base_url=%s msgs=%d roles=%s",
             type(prov).__name__,
             model,
-            base_url,
+            safe_url,
             msg_count,
             role_counts,
         )
@@ -1421,19 +1422,28 @@ class ChatSession:
                 )
             except Exception as e:
                 ename = type(e).__name__
-                cause = e.__cause__ or e.__context__
+                cause_name = (
+                    type(e.__cause__).__name__
+                    if e.__cause__
+                    else (type(e.__context__).__name__ if e.__context__ else "None")
+                )
                 log.warning(
-                    "API error (attempt %d/%d): %s: %s (cause: %s) "
+                    "API error (attempt %d/%d): %s (cause=%s) "
                     "provider=%s model=%s base_url=%s msgs=%d",
                     attempt + 1,
                     self._MAX_RETRIES + 1,
                     ename,
-                    e,
-                    cause,
+                    cause_name,
                     type(prov).__name__,
                     model,
-                    base_url,
+                    safe_url,
                     msg_count,
+                )
+                log.debug(
+                    "API error details (attempt %d/%d)",
+                    attempt + 1,
+                    self._MAX_RETRIES + 1,
+                    exc_info=True,
                 )
                 if ename not in prov.retryable_error_names or attempt == self._MAX_RETRIES:
                     raise

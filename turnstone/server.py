@@ -2101,6 +2101,7 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
 
         mcp_mgr = MCPClientManager({})
         mcp_mgr.start()
+        mcp_mgr.set_storage(storage)
         request.app.state.mcp_client = mcp_mgr
         # Update shared ref so session_factory sees the new client
         mcp_ref = getattr(request.app.state, "mcp_ref", None)
