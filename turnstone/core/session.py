@@ -162,6 +162,13 @@ _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
 
+# Matches resource paths referenced in skill content (scripts/foo.py, etc.)
+_RESOURCE_PATH_RE = re.compile(
+    r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
+    r"(?:json|yaml|yml|toml|cfg|ini|py|sh|js|ts|md|txt)"
+    r"(?=[\s)\]}'\"`,;:\x60]|$)"
+)
+
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
 
@@ -586,6 +593,7 @@ class ChatSession:
                 self._skill_content = None
             self._skill_resources = {}
         self._materialize_skill_resources()
+        self._validate_skill_resources()
 
     def set_skill(self, name: str | None) -> None:
         """Set or clear the active skill."""
@@ -672,6 +680,22 @@ class ChatSession:
         if os.path.isdir(scripts_dir):
             env["PATH"] = scripts_dir + ":" + os.environ.get("PATH", "")
         return env
+
+    def _validate_skill_resources(self) -> None:
+        """Warn if skill content references resource paths not in skill_resources."""
+        if not self._skill_content or not self._skill_name:
+            return
+        referenced = {os.path.normpath(p) for p in _RESOURCE_PATH_RE.findall(self._skill_content)}
+        if not referenced:
+            return
+        available = set(self._skill_resources.keys())
+        missing = sorted(referenced - available)
+        if missing:
+            log.warning("skill_resources.missing", skill=self._skill_name, paths=missing)
+            self.ui.on_info(
+                f"Skill '{self._skill_name}' references {len(missing)} resource(s) "
+                f"not bundled: {', '.join(missing)}"
+            )
 
     # -- MCP tool refresh ----------------------------------------------------
 

@@ -365,3 +365,115 @@ class TestMaterializeEdgeCases:
         session = _make_session(skill="double-skill")
         session.close()
         session.close()  # must not raise
+
+
+class TestPreflightValidation:
+    def test_missing_resource_warns(self, tmp_db):
+        """Skill content references a script not in resources."""
+        db = get_storage()
+        _create_skill(db, "s1", "warn-skill", "Run scripts/missing.py to start.")
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="warn-skill")
+        ui.on_info.assert_called_once()
+        msg = ui.on_info.call_args[0][0]
+        assert "scripts/missing.py" in msg
+        assert "warn-skill" in msg
+        session.close()
+
+    def test_all_resources_present_no_warn(self, tmp_db):
+        """No warning when all referenced paths are bundled."""
+        db = get_storage()
+        _create_skill(db, "s1", "ok-skill", "Run scripts/helper.py for help.")
+        db.create_skill_resource("r1", "s1", "scripts/helper.py", "print('hi')")
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="ok-skill")
+        ui.on_info.assert_not_called()
+        session.close()
+
+    def test_no_references_no_warn(self, tmp_db):
+        """Skill content with no resource paths triggers no validation warning."""
+        db = get_storage()
+        _create_skill(db, "s1", "plain-skill", "Just a plain skill with no paths.")
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="plain-skill")
+        ui.on_info.assert_not_called()
+        session.close()
+
+    def test_multiple_missing_warns_once(self, tmp_db):
+        """Multiple missing resources produce a single warning listing all."""
+        db = get_storage()
+        _create_skill(
+            db,
+            "s1",
+            "multi-skill",
+            "Use scripts/a.py and scripts/b.sh to process references/guide.md",
+        )
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="multi-skill")
+        ui.on_info.assert_called_once()
+        msg = ui.on_info.call_args[0][0]
+        assert "3 resource(s)" in msg
+        assert "scripts/a.py" in msg
+        assert "scripts/b.sh" in msg
+        assert "references/guide.md" in msg
+        session.close()
+
+    def test_validation_skipped_no_skill(self, tmp_db):
+        """No crash or warning when no skill is active."""
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui)
+        ui.on_info.assert_not_called()
+        session.close()
+
+    def test_json_extension_not_truncated(self, tmp_db):
+        """assets/config.json should match as .json, not .js."""
+        db = get_storage()
+        _create_skill(db, "s1", "json-skill", "Load assets/config.json for settings.")
+        db.create_skill_resource("r1", "s1", "assets/config.json", "{}")
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="json-skill")
+        ui.on_info.assert_not_called()
+        session.close()
+
+    def test_compound_prefix_not_matched(self, tmp_db):
+        """'myscripts/tool.py' should not match as 'scripts/tool.py'."""
+        db = get_storage()
+        _create_skill(
+            db,
+            "s1",
+            "compound-skill",
+            "The myscripts/tool.py file is unrelated.",
+        )
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="compound-skill")
+        ui.on_info.assert_not_called()
+        session.close()
+
+    def test_extension_suffix_not_matched(self, tmp_db):
+        """'scripts/tool.python' should not match as 'scripts/tool.py'."""
+        db = get_storage()
+        _create_skill(
+            db,
+            "s1",
+            "suffix-skill",
+            "Run scripts/tool.python to start.",
+        )
+
+        ui = NullUI()
+        ui.on_info = MagicMock()
+        session = _make_session(ui=ui, skill="suffix-skill")
+        ui.on_info.assert_not_called()
+        session.close()
