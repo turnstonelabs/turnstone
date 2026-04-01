@@ -593,7 +593,7 @@ current turn and letting it search for them on demand.
 Tool search uses the best available mechanism for each provider:
 
 1. **Anthropic (native)** -- Models that support it receive `defer_loading: true`
-   on deferred tool definitions plus the `tool_search_tool_bm25_20251119` server-side
+   on deferred tool definitions plus the `tool_search_tool_bm25` server-side
    search tool. Anthropic's API handles search and expansion transparently.
 
 2. **OpenAI GPT-5.4+ (native)** -- Models with hosted tool search receive

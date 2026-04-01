@@ -69,7 +69,7 @@ def _merge_consecutive(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 _WEB_SEARCH_TOOL_TYPE = "web_search_20250305"
 
 # Tool search: server-side BM25 tool discovery for deferred tools
-_TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25_20251119"
+_TOOL_SEARCH_TOOL_TYPE = "tool_search_tool_bm25"
 
 # -- model capabilities -------------------------------------------------------
 
@@ -205,7 +205,7 @@ class AnthropicProvider:
                 result.append({**tool, "defer_loading": True})
             else:
                 result.append(tool)
-        result.append({"type": _TOOL_SEARCH_TOOL_TYPE, "name": "tool_search"})
+        result.append({"type": _TOOL_SEARCH_TOOL_TYPE, "name": _TOOL_SEARCH_TOOL_TYPE})
         return result
 
     # -- shared param logic --------------------------------------------------

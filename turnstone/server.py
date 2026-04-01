@@ -2102,6 +2102,10 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
         mcp_mgr = MCPClientManager({})
         mcp_mgr.start()
         request.app.state.mcp_client = mcp_mgr
+        # Update shared ref so session_factory sees the new client
+        mcp_ref = getattr(request.app.state, "mcp_ref", None)
+        if mcp_ref is not None:
+            mcp_ref[0] = mcp_mgr
 
     result = mcp_mgr.reconcile_sync(storage)
     return JSONResponse({"status": "ok", **result})
@@ -2450,6 +2454,7 @@ def create_app(
     health_monitor: Any = None,
     rate_limiter: Any = None,
     mcp_client: Any = None,
+    mcp_ref: list[Any] | None = None,
     registry: Any = None,
     idle_timeout: int = 0,
     node_id: str = "",
@@ -2530,6 +2535,7 @@ def create_app(
     app.state.health_monitor = health_monitor
     app.state.rate_limiter = rate_limiter
     app.state.mcp_client = mcp_client
+    app.state.mcp_ref = mcp_ref
     app.state.registry = registry
     app.state.idle_timeout = idle_timeout
     app.state.node_id = node_id
@@ -2756,6 +2762,9 @@ def main() -> None:
         refresh_interval=config_store.get("mcp.refresh_interval"),
         storage=_get_storage(),
     )
+    # Mutable ref so session_factory always sees the latest MCP client,
+    # including ones created by internal_mcp_reload after startup.
+    _mcp_ref: list[Any] = [mcp_client]
 
     # Backend health monitor with circuit breaker
     from turnstone.core.healthcheck import BackendHealthMonitor
@@ -2866,6 +2875,9 @@ def main() -> None:
     ) -> ChatSession:
         assert ui is not None
         r_client, r_model, r_cfg = registry.resolve(model_alias)
+        # Read MCP client from shared ref — may have been replaced after startup
+        # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
+        live_mcp_client = _mcp_ref[0]
         uid = getattr(ui, "_user_id", "") or ""
 
         # Resolve username from user_id for system message context
@@ -2900,7 +2912,7 @@ def main() -> None:
             auto_compact_pct=config_store.get("session.auto_compact_pct"),
             agent_max_turns=config_store.get("tools.agent_max_turns"),
             tool_truncation=config_store.get("tools.truncation"),
-            mcp_client=mcp_client,
+            mcp_client=live_mcp_client,
             registry=registry,
             model_alias=model_alias or registry.default,
             health_monitor=health_monitor,
@@ -3031,6 +3043,7 @@ def main() -> None:
         health_monitor=health_monitor,
         rate_limiter=rate_limiter,
         mcp_client=mcp_client,
+        mcp_ref=_mcp_ref,
         registry=registry,
         idle_timeout=config_store.get("server.workstream_idle_timeout"),
         node_id=_node_id,

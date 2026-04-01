@@ -980,6 +980,13 @@ class ChatSession:
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
+        log.info(
+            "Resuming ws=%s: %d messages, provider=%s, model=%s",
+            ws_id,
+            len(messages),
+            type(self._provider).__name__,
+            self.model,
+        )
         # Restore persisted config
         config = load_workstream_config(ws_id)
         if config:
@@ -997,11 +1004,24 @@ class ChatSession:
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                log.info(
+                    "Resume: resolved alias=%s → provider=%s, model=%s, ctx=%d",
+                    saved_alias,
+                    type(self._provider).__name__,
+                    model_name,
+                    cfg.context_window,
+                )
             elif saved_model and saved_model != self.model:
                 # No alias or alias no longer in registry — at least set the model name
                 self.model = saved_model
                 self._model_alias = None
                 self._cached_capabilities = None
+                log.warning(
+                    "Resume: alias %r not in registry, keeping default provider=%s for model=%s",
+                    saved_alias,
+                    type(self._provider).__name__,
+                    saved_model,
+                )
             if "temperature" in config:
                 self.temperature = float(config["temperature"])
             if "reasoning_effort" in config:
@@ -1368,6 +1388,20 @@ class ChatSession:
     ) -> Iterator[StreamChunk]:
         """Attempt a streaming API call with retries on transient errors."""
         prov = provider or self._provider
+        base_url = getattr(client, "base_url", getattr(client, "_base_url", "?"))
+        msg_count = len(msgs)
+        role_counts: dict[str, int] = {}
+        for m in msgs:
+            r = m.get("role", "?")
+            role_counts[r] = role_counts.get(r, 0) + 1
+        log.debug(
+            "API call: provider=%s model=%s base_url=%s msgs=%d roles=%s",
+            type(prov).__name__,
+            model,
+            base_url,
+            msg_count,
+            role_counts,
+        )
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -1387,6 +1421,20 @@ class ChatSession:
                 )
             except Exception as e:
                 ename = type(e).__name__
+                cause = e.__cause__ or e.__context__
+                log.warning(
+                    "API error (attempt %d/%d): %s: %s (cause: %s) "
+                    "provider=%s model=%s base_url=%s msgs=%d",
+                    attempt + 1,
+                    self._MAX_RETRIES + 1,
+                    ename,
+                    e,
+                    cause,
+                    type(prov).__name__,
+                    model,
+                    base_url,
+                    msg_count,
+                )
                 if ename not in prov.retryable_error_names or attempt == self._MAX_RETRIES:
                     raise
                 last_err = e

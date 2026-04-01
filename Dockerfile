@@ -18,6 +18,12 @@ RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-reco
     libpq5 git curl jq man-db manpages procps file \
     && rm -rf /var/lib/apt/lists/*
 
+# Node.js LTS (for npx-based MCP servers like @modelcontextprotocol/server-github)
+COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:24-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
 # Non-root user
 RUN useradd --create-home --shell /bin/bash turnstone
 

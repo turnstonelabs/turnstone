@@ -2303,8 +2303,8 @@ class TestAnthropicToolSearch:
         # MCP tool should be deferred
         assert result[1]["defer_loading"] is True
         # Search tool should be appended
-        assert result[-1]["type"] == "tool_search_tool_bm25_20251119"
-        assert result[-1]["name"] == "tool_search"
+        assert result[-1]["type"] == "tool_search_tool_bm25"
+        assert result[-1]["name"] == "tool_search_tool_bm25"
 
     def test_inject_tool_search_no_op_without_deferred(self, provider):
         caps = provider.get_capabilities("claude-opus-4-6-20260101")
