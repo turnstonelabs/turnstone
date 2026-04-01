@@ -1394,3 +1394,69 @@ class TestOIDCPublicPaths:
     def test_oidc_callback_is_public(self):
         assert is_public_path("/api/auth/oidc/callback") is True
         assert is_public_path("/v1/api/auth/oidc/callback") is True
+
+
+# ---------------------------------------------------------------------------
+# TestRequirePermissionServiceScope — service scope bypasses permission checks
+# ---------------------------------------------------------------------------
+
+
+class TestRequirePermissionServiceScope:
+    """Verify require_permission() behaviour with the service scope."""
+
+    def _make_request(self, auth_result):
+        """Build a mock Starlette request with the given AuthResult on state."""
+        request = MagicMock()
+        request.state.auth_result = auth_result
+        return request
+
+    def test_service_scope_bypasses_permission(self):
+        """Service-scoped tokens bypass all permission checks (returns None)."""
+        from turnstone.core.auth import AuthResult, require_permission
+
+        auth = AuthResult(
+            user_id="svc-agent",
+            scopes=frozenset({"service"}),
+            token_source="jwt",
+        )
+        request = self._make_request(auth)
+        result = require_permission(request, "admin.users")
+        assert result is None  # bypass — no 403
+
+    def test_without_service_scope_and_without_permission_returns_403(self):
+        """Non-service tokens without the required permission get 403."""
+        from turnstone.core.auth import AuthResult, require_permission
+
+        auth = AuthResult(
+            user_id="regular-user",
+            scopes=frozenset({"read", "write"}),
+            token_source="jwt",
+        )
+        request = self._make_request(auth)
+        result = require_permission(request, "admin.users")
+        assert result is not None
+        assert result.status_code == 403
+
+    def test_without_service_scope_with_permission_returns_none(self):
+        """Non-service tokens with the required permission pass."""
+        from turnstone.core.auth import AuthResult, require_permission
+
+        auth = AuthResult(
+            user_id="admin-user",
+            scopes=frozenset({"read", "write", "approve"}),
+            token_source="jwt",
+            permissions=frozenset({"admin.users"}),
+        )
+        request = self._make_request(auth)
+        result = require_permission(request, "admin.users")
+        assert result is None  # granted — no 403
+
+    def test_no_auth_result_returns_401(self):
+        """Missing auth_result on request state returns 401."""
+        from turnstone.core.auth import require_permission
+
+        request = MagicMock()
+        del request.state.auth_result  # ensure attribute is absent
+        result = require_permission(request, "admin.users")
+        assert result is not None
+        assert result.status_code == 401

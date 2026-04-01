@@ -191,9 +191,9 @@ def _strip_version_prefix(path: str) -> str:
 class AuthResult:
     """Result of successful authentication."""
 
-    user_id: str  # empty string for config-file tokens
+    user_id: str
     scopes: frozenset[str]
-    token_source: str  # "config", "jwt", "database"
+    token_source: str  # "jwt", "database", "password"
     permissions: frozenset[str] = frozenset()
 
     def has_scope(self, scope: str) -> bool:
@@ -206,7 +206,7 @@ class AuthResult:
 
 
 # ---------------------------------------------------------------------------
-# AuthConfig (unchanged from before — static config-file tokens)
+# AuthConfig
 # ---------------------------------------------------------------------------
 
 

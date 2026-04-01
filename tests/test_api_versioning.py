@@ -6,6 +6,37 @@ from unittest.mock import MagicMock
 
 import pytest
 
+# Shared test auth — JWT-based
+_TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
+
+
+def _server_jwt() -> str:
+    from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+    return create_jwt(
+        user_id="test-versioning",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_SERVER,
+    )
+
+
+def _console_jwt() -> str:
+    from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+    return create_jwt(
+        user_id="test-versioning",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_CONSOLE,
+    )
+
+
+_SERVER_AUTH_HEADERS = {"Authorization": f"Bearer {_server_jwt()}"}
+_CONSOLE_AUTH_HEADERS = {"Authorization": f"Bearer {_console_jwt()}"}
+
 
 class TestServerVersioning:
     """Test /v1/ routes and OpenAPI endpoints on the server."""
@@ -27,18 +58,19 @@ class TestServerVersioning:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
 
     def test_v1_workstreams(self, client):
-        resp = client.get("/v1/api/workstreams")
+        resp = client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS)
         assert resp.status_code == 200
         assert "workstreams" in resp.json()
 
     def test_unversioned_api_404(self, client):
-        resp = client.get("/api/workstreams")
+        resp = client.get("/api/workstreams", headers=_SERVER_AUTH_HEADERS)
         assert resp.status_code == 404
 
     def test_openapi_json(self, client):
@@ -85,17 +117,18 @@ class TestConsoleVersioning:
         app = create_app(
             collector=collector,
             auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False)
         yield client
         client.close()
 
     def test_v1_cluster_overview(self, client):
-        resp = client.get("/v1/api/cluster/overview")
+        resp = client.get("/v1/api/cluster/overview", headers=_CONSOLE_AUTH_HEADERS)
         assert resp.status_code == 200
 
     def test_unversioned_api_404(self, client):
-        resp = client.get("/api/cluster/overview")
+        resp = client.get("/api/cluster/overview", headers=_CONSOLE_AUTH_HEADERS)
         assert resp.status_code == 404
 
     def test_openapi_json(self, client):

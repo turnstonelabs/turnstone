@@ -145,7 +145,7 @@ async def test_tls_ca_cert_endpoint(tls_manager):
 
     async def _grant_access(request, call_next):  # type: ignore[no-untyped-def]
         request.state.auth_result = AuthResult(
-            user_id="", scopes=frozenset({"approve"}), token_source="config"
+            user_id="", scopes=frozenset({"approve", "service"}), token_source="config"
         )
         return await call_next(request)
 
@@ -190,7 +190,7 @@ async def test_tls_endpoints_disabled():
 
     async def _grant_access(request, call_next):  # type: ignore[no-untyped-def]
         request.state.auth_result = AuthResult(
-            user_id="", scopes=frozenset({"approve"}), token_source="config"
+            user_id="", scopes=frozenset({"approve", "service"}), token_source="config"
         )
         return await call_next(request)
 

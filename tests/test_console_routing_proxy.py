@@ -13,6 +13,24 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.console.router import ConsoleRouter, NodeRef
 from turnstone.core.hash_ring import NoAvailableNodeError
 
+# Shared test auth — JWT-based
+_TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
+
+
+def _test_jwt() -> str:
+    from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+    return create_jwt(
+        user_id="test-routing",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_CONSOLE,
+    )
+
+
+_TEST_AUTH_HEADERS: dict[str, str] = {"Authorization": f"Bearer {_test_jwt()}"}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -48,6 +66,7 @@ def _make_app(
     return create_app(
         collector=collector or _make_mock_collector(),
         auth_config=AuthConfig(),
+        jwt_secret=_TEST_JWT_SECRET,
         router=router,
     )
 
@@ -100,6 +119,7 @@ class TestRouteCreate:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -109,6 +129,7 @@ class TestRouteCreate:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -126,6 +147,7 @@ class TestRouteCreate:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"resume_ws": "old_ws_id"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -150,6 +172,7 @@ class TestRouteCreate:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"target_node": "node-c"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -203,6 +226,7 @@ class TestRouteCreate503Retry:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -233,6 +257,7 @@ class TestRouteProxy:
         resp = client.post(
             "/v1/api/route/send",
             json={"ws_id": "abc123", "message": "hello"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
         # Verify upstream URL was /v1/api/send (not /v1/api/route/send)
@@ -245,6 +270,7 @@ class TestRouteProxy:
         resp = client.post(
             "/v1/api/route/approve",
             json={"ws_id": "abc123", "approved": True},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
 
@@ -252,6 +278,7 @@ class TestRouteProxy:
         resp = client.post(
             "/v1/api/route/cancel",
             json={"ws_id": "abc123"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
 
@@ -259,6 +286,7 @@ class TestRouteProxy:
         resp = client.post(
             "/v1/api/route/command",
             json={"ws_id": "abc123", "command": "status"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
 
@@ -266,6 +294,7 @@ class TestRouteProxy:
         resp = client.post(
             "/v1/api/route/workstreams/close",
             json={"ws_id": "abc123"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 200
 
@@ -288,14 +317,14 @@ class TestRouteLookup:
         client.close()
 
     def test_route_lookup(self, client):
-        resp = client.get("/v1/api/route?ws_id=abc123")
+        resp = client.get("/v1/api/route?ws_id=abc123", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 200
         data = resp.json()
         assert data["node_url"] == "http://a:8080"
         assert data["node_id"] == "node-a"
 
     def test_route_lookup_missing_ws_id(self, client):
-        resp = client.get("/v1/api/route")
+        resp = client.get("/v1/api/route", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 400
         assert "ws_id" in resp.json()["error"]
 
@@ -329,6 +358,7 @@ class TestRouteNotReady:
         resp = client_no_router.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
 
@@ -336,6 +366,7 @@ class TestRouteNotReady:
         resp = client_empty_cache.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
 
@@ -343,22 +374,24 @@ class TestRouteNotReady:
         resp = client_no_router.post(
             "/v1/api/route/send",
             json={"ws_id": "abc", "message": "hello"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
 
     def test_route_lookup_no_router_503(self, client_no_router):
-        resp = client_no_router.get("/v1/api/route?ws_id=abc")
+        resp = client_no_router.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 503
 
     def test_route_proxy_empty_cache_503(self, client_empty_cache):
         resp = client_empty_cache.post(
             "/v1/api/route/send",
             json={"ws_id": "abc", "message": "hello"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
 
     def test_route_lookup_empty_cache_503(self, client_empty_cache):
-        resp = client_empty_cache.get("/v1/api/route?ws_id=abc")
+        resp = client_empty_cache.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 503
 
 
@@ -384,6 +417,7 @@ class TestRouteNoNode:
         resp = client.post(
             "/v1/api/route/workstreams/new",
             json={"name": "test"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
         assert "No available node" in resp.json()["error"]
@@ -392,9 +426,10 @@ class TestRouteNoNode:
         resp = client.post(
             "/v1/api/route/send",
             json={"ws_id": "abc", "message": "hello"},
+            headers=_TEST_AUTH_HEADERS,
         )
         assert resp.status_code == 503
 
     def test_route_lookup_no_node_503(self, client):
-        resp = client.get("/v1/api/route?ws_id=abc")
+        resp = client.get("/v1/api/route?ws_id=abc", headers=_TEST_AUTH_HEADERS)
         assert resp.status_code == 503

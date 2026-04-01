@@ -1839,14 +1839,14 @@ class TestProxyAuthHeaders:
         # Should use ServiceTokenManager, not mint a user JWT
         assert headers["Authorization"] == f"Bearer {mgr.token}"
 
-    def test_fallback_static_token(self):
-        """No auth_result, no ServiceTokenManager → uses static proxy_auth_token."""
+    def test_no_mgr_no_user_returns_empty(self):
+        """No auth_result, no ServiceTokenManager → empty headers."""
         from turnstone.console.server import _proxy_auth_headers
 
-        req = self._make_request(proxy_auth_token="static-tok-123")
+        req = self._make_request()
         headers = _proxy_auth_headers(req)
 
-        assert headers == {"Authorization": "Bearer static-tok-123"}
+        assert headers == {}
 
 
 # ---------------------------------------------------------------------------

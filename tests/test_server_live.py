@@ -580,6 +580,24 @@ class TestSessionConfig:
 # ---------------------------------------------------------------------------
 
 
+_TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
+
+
+def _server_jwt() -> str:
+    from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
+
+    return create_jwt(
+        user_id="test-server-live",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_SERVER,
+    )
+
+
+_SERVER_AUTH_HEADERS = {"Authorization": f"Bearer {_server_jwt()}"}
+
+
 class TestServerHealthMetrics:
     """Verify /health and /metrics endpoints using a Starlette TestClient.
 
@@ -632,6 +650,7 @@ class TestServerHealthMetrics:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
 
@@ -727,8 +746,8 @@ class TestServerHealthMetrics:
         assert 'le="+Inf"' in body
 
     def test_unknown_endpoint_returns_404(self):
-        status, _, _ = self._get("/does-not-exist")
-        assert status == 404
+        resp = self.client.get("/does-not-exist", headers=_SERVER_AUTH_HEADERS)
+        assert resp.status_code == 404
 
     def test_health_contains_backend_field(self):
         _, _, body = self._get("/health")
@@ -809,6 +828,7 @@ class TestServerRateLimiting:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
             rate_limiter=RateLimiter(enabled=True, rate=2.0, burst=3),
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
@@ -830,16 +850,19 @@ class TestServerRateLimiting:
         """After exhausting burst on a non-exempt endpoint, get 429."""
         # Exhaust burst on a non-exempt endpoint
         for _ in range(5):
-            self._get("/v1/api/workstreams")
+            self.client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS)
         # At least one should be 429
-        statuses = [self._get("/v1/api/workstreams").status_code for _ in range(3)]
+        statuses = [
+            self.client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS).status_code
+            for _ in range(3)
+        ]
         assert 429 in statuses
 
     def test_429_includes_retry_after(self):
         """429 response includes Retry-After header."""
         # Burn through burst
         for _ in range(10):
-            resp = self._get("/v1/api/workstreams")
+            resp = self.client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS)
             if resp.status_code == 429:
                 assert "retry-after" in resp.headers
                 data = resp.json()
@@ -851,7 +874,7 @@ class TestServerRateLimiting:
         """Health endpoint is always accessible regardless of rate limit."""
         # Burn through bucket on non-exempt path
         for _ in range(10):
-            self._get("/v1/api/workstreams")
+            self.client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS)
         # Health should still work
         resp = self._get("/health")
         assert resp.status_code == 200
@@ -859,6 +882,6 @@ class TestServerRateLimiting:
     def test_metrics_exempt_from_ratelimit(self):
         """Metrics endpoint is always accessible regardless of rate limit."""
         for _ in range(10):
-            self._get("/v1/api/workstreams")
+            self.client.get("/v1/api/workstreams", headers=_SERVER_AUTH_HEADERS)
         resp = self._get("/metrics")
         assert resp.status_code == 200

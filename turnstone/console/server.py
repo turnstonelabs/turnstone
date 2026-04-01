@@ -162,18 +162,10 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
         )
         return {"Authorization": f"Bearer {token}"}
 
-    # Fallback: service identity (no user context).
-    # When auth is disabled on the console, auth_result is None, so all proxied
-    # requests use the full-privilege service identity.  This is safe only when
-    # the upstream server also has auth disabled.
+    # Fallback: service identity via ServiceTokenManager.
     mgr = getattr(request.app.state, "proxy_token_mgr", None)
     if mgr is not None:
         return dict(mgr.bearer_header)
-
-    # Fall back to static proxy_auth_token (e.g. from --auth-token)
-    static_token = getattr(request.app.state, "proxy_auth_token", "")
-    if static_token:
-        return {"Authorization": f"Bearer {static_token}"}
 
     return {}
 
@@ -5927,7 +5919,6 @@ def create_app(
     auth_config: Any,
     jwt_secret: str = "",
     auth_storage: Any = None,
-    proxy_auth_token: str = "",
     proxy_token_mgr: Any = None,
     cors_origins: list[str] | None = None,
     tls_manager: Any = None,
@@ -6268,7 +6259,6 @@ def create_app(
     app.state.auth_config = auth_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
-    app.state.proxy_auth_token = proxy_auth_token
     app.state.proxy_token_mgr = proxy_token_mgr
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
@@ -6301,7 +6291,7 @@ def create_app(
         scheduler = TaskScheduler(
             collector=collector,
             storage=auth_storage,
-            api_token=proxy_auth_token,
+            api_token="",
             token_manager=proxy_token_mgr,
         )
         app.state.scheduler = scheduler
@@ -6525,7 +6515,6 @@ def main() -> None:
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
-        proxy_auth_token="",
         proxy_token_mgr=proxy_token_mgr,
         cors_origins=cors_origins,
         tls_manager=tls_mgr,

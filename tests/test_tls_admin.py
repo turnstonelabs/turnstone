@@ -55,7 +55,7 @@ def _make_app(tls_manager):
     async def _grant_access(request, call_next):  # type: ignore[no-untyped-def]
         request.state.auth_result = AuthResult(
             user_id="",
-            scopes=frozenset({"approve"}),
+            scopes=frozenset({"approve", "service"}),
             token_source="config",
         )
         return await call_next(request)
