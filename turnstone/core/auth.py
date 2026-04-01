@@ -193,7 +193,7 @@ class AuthResult:
 
     user_id: str
     scopes: frozenset[str]
-    token_source: str  # "jwt", "database", "password"
+    token_source: str  # "jwt", "database", "password", or service origin (e.g. "console", "cli")
     permissions: frozenset[str] = frozenset()
 
     def has_scope(self, scope: str) -> bool:

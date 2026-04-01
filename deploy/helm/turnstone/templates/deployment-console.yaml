@@ -36,6 +36,14 @@ spec:
             - secretRef:
                 name: {{ include "turnstone.llm.secretName" . }}
                 optional: true
+          {{- if .Values.auth.existingSecret }}
+          env:
+            - name: TURNSTONE_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: TURNSTONE_JWT_SECRET
+          {{- end }}
           readinessProbe:
             httpGet:
               path: /health

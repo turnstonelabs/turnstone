@@ -90,11 +90,10 @@ variable "name_prefix" {
   default     = "turnstone"
 }
 
-variable "auth_token" {
-  description = "Optional authentication token for the Turnstone API. Empty string disables auth."
+variable "jwt_secret" {
+  description = "JWT signing secret for Turnstone auth (required, min 32 characters)."
   type        = string
   sensitive   = true
-  default     = ""
 }
 
 variable "certificate_arn" {

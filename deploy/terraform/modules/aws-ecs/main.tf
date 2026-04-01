@@ -41,11 +41,25 @@ locals {
     },
   ]
 
-  auth_env = []  # Auth is always enabled; no toggle needed
-  auth_secrets = []
+  auth_secrets = [
+    {
+      name      = "TURNSTONE_JWT_SECRET"
+      valueFrom = aws_secretsmanager_secret_version.jwt_secret.arn
+    },
+  ]
 }
 
 # ---------- Secrets Manager ----------
+
+resource "aws_secretsmanager_secret" "jwt_secret" {
+  name = "${var.name_prefix}-${var.environment}-jwt-secret"
+  tags = local.common_tags
+}
+
+resource "aws_secretsmanager_secret_version" "jwt_secret" {
+  secret_id     = aws_secretsmanager_secret.jwt_secret.id
+  secret_string = var.jwt_secret
+}
 
 resource "aws_secretsmanager_secret" "openai_api_key" {
   name = "${var.name_prefix}-${var.environment}-openai-api-key"
@@ -57,17 +71,7 @@ resource "aws_secretsmanager_secret_version" "openai_api_key" {
   secret_string = var.openai_api_key
 }
 
-resource "aws_secretsmanager_secret" "auth_token" {
-  count = var.auth_token != "" ? 1 : 0
-  name  = "${var.name_prefix}-${var.environment}-auth-token"
-  tags  = local.common_tags
-}
 
-resource "aws_secretsmanager_secret_version" "auth_token" {
-  count         = var.auth_token != "" ? 1 : 0
-  secret_id     = aws_secretsmanager_secret.auth_token[0].id
-  secret_string = var.auth_token
-}
 
 resource "aws_secretsmanager_secret" "db_password" {
   name = "${var.name_prefix}-${var.environment}-db-password"

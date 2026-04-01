@@ -40,8 +40,8 @@ resource "aws_iam_role_policy" "ecs_execution_secrets" {
           [
             aws_secretsmanager_secret.openai_api_key.arn,
             aws_secretsmanager_secret.db_password.arn,
+            aws_secretsmanager_secret.jwt_secret.arn,
           ],
-          var.auth_token != "" ? [aws_secretsmanager_secret.auth_token[0].arn] : [],
         )
       },
     ]

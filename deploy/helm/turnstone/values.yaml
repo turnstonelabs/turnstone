@@ -59,6 +59,11 @@ llm:
   apiKey: ""
   existingSecret: ""
 
+# -- Authentication (always enabled, JWT secret required)
+auth:
+  jwtSecret: ""
+  existingSecret: ""
+
 # -- Ingress configuration
 ingress:
   enabled: false
