@@ -268,13 +268,14 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
     # Prefer JWT via ServiceTokenManager when JWT secret is available
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
     if jwt_secret:
-        from turnstone.core.auth import ServiceTokenManager
+        from turnstone.core.auth import JWT_AUD_CONSOLE, ServiceTokenManager
 
         mgr = ServiceTokenManager(
             user_id="admin-cli",
             scopes=frozenset({"read", "write", "approve", "service"}),
             source="cli",
             secret=jwt_secret,
+            audience=JWT_AUD_CONSOLE,
         )
         headers["Authorization"] = f"Bearer {mgr.token}"
     resp = httpx.get(url, headers=headers)

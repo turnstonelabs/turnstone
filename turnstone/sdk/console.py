@@ -73,7 +73,7 @@ class AsyncTurnstoneConsole(_BaseClient):
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8081",
+        base_url: str = "http://localhost:8090",
         token: str = "",
         timeout: float = 30.0,
         httpx_client: httpx.AsyncClient | None = None,
@@ -968,7 +968,7 @@ class TurnstoneConsole:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8081",
+        base_url: str = "http://localhost:8090",
         token: str = "",
         timeout: float = 30.0,
         ca_cert: str | None = None,
