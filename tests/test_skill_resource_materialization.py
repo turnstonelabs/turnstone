@@ -247,8 +247,8 @@ class TestMaterializeResources:
 
         session = _make_session(skill="traversal-skill")
         base = session._skill_resources_dir
-        # The traversal path must not be written
-        assert not os.path.exists(os.path.join(base, "..", "etc", "passwd"))
+        # The traversal path must not be written inside the resources dir
+        assert not os.path.exists(os.path.join(base, "etc"))
         # The good resource should still be materialized
         assert os.path.isfile(os.path.join(base, "scripts", "good.py"))
         session.close()

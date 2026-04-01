@@ -690,7 +690,7 @@ class ChatSession:
         referenced = {os.path.normpath(p) for p in _RESOURCE_PATH_RE.findall(self._skill_content)}
         if not referenced:
             return
-        available = set(self._skill_resources.keys())
+        available = {os.path.normpath(p) for p in self._skill_resources}
         missing = sorted(referenced - available)
         if missing:
             log.warning("skill_resources.missing", skill=self._skill_name, paths=missing)
