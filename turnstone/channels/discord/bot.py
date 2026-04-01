@@ -292,8 +292,19 @@ class TurnstoneBot:
         """Remove completed/failed SSE tasks so they can be re-subscribed."""
         dead = [ws_id for ws_id, task in self._sse_tasks.items() if task.done()]
         for ws_id in dead:
+            task = self._sse_tasks.pop(ws_id)
             self._subscribed_ws.discard(ws_id)
-            self._sse_tasks.pop(ws_id, None)
+            # Retrieve exception to suppress "Task exception was never
+            # retrieved" warnings and log the underlying failure.
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    log.warning(
+                        "discord.sse_task_failed",
+                        trigger=trigger,
+                        ws_id=ws_id,
+                        error=str(exc),
+                    )
         if dead:
             log.info("discord.purged_dead_tasks", trigger=trigger, count=len(dead), ws_ids=dead)
 
@@ -426,9 +437,13 @@ class TurnstoneBot:
                             ws_id=ws_id,
                             status=status,
                         )
-                        # Skip to backoff/retry — don't try to parse
-                        # a non-SSE error response body.
-                        continue
+                        # Don't try to parse a non-SSE error body —
+                        # fall through to backoff/retry below.
+                        raise httpx.HTTPStatusError(
+                            f"SSE upstream {status}",
+                            request=event_source.response.request,
+                            response=event_source.response,
+                        )
                     delay = _SSE_RECONNECT_DELAY  # reset on successful connect
                     async for sse in event_source.aiter_sse():
                         if sse.event == "message" or not sse.event:
@@ -452,6 +467,8 @@ class TurnstoneBot:
                                     ws_id=ws_id,
                                     exc_info=True,
                                 )
+            except httpx.HTTPStatusError:
+                pass  # already logged above; fall through to backoff
             except httpx.RemoteProtocolError:
                 # Server closed connection (normal on stream_end or shutdown).
                 log.debug("discord.sse_remote_closed", ws_id=ws_id)
