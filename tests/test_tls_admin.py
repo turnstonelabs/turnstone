@@ -124,6 +124,113 @@ def test_delete_cert_not_found(tls_manager):
     assert resp.status_code == 404
 
 
+# ── Auth enforcement ──────────────────────────────────────────────────────────
+
+
+def _make_app_no_auth(tls_manager):
+    """Create app without auth middleware — simulates unauthenticated requests."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
+    from turnstone.console.server import (
+        tls_ca_cert,
+        tls_ca_status,
+        tls_delete_cert,
+        tls_list_certs,
+        tls_renew_cert,
+    )
+
+    app = Starlette(
+        routes=[
+            Route("/ca", tls_ca_status),
+            Route("/ca.pem", tls_ca_cert),
+            Route("/certs", tls_list_certs),
+            Route("/certs/{domain}/renew", tls_renew_cert, methods=["POST"]),
+            Route("/certs/{domain}", tls_delete_cert, methods=["DELETE"]),
+        ],
+    )
+    app.state.tls_manager = tls_manager
+    return app
+
+
+def _make_app_read_only(tls_manager):
+    """Create app with read-only auth — should be rejected by admin endpoints."""
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.routing import Route
+
+    from turnstone.console.server import (
+        tls_ca_cert,
+        tls_ca_status,
+        tls_delete_cert,
+        tls_list_certs,
+        tls_renew_cert,
+    )
+    from turnstone.core.auth import AuthResult
+
+    async def _grant_read(request, call_next):  # type: ignore[no-untyped-def]
+        request.state.auth_result = AuthResult(
+            user_id="viewer",
+            scopes=frozenset({"read"}),
+            token_source="jwt",
+        )
+        return await call_next(request)
+
+    app = Starlette(
+        routes=[
+            Route("/ca", tls_ca_status),
+            Route("/ca.pem", tls_ca_cert),
+            Route("/certs", tls_list_certs),
+            Route("/certs/{domain}/renew", tls_renew_cert, methods=["POST"]),
+            Route("/certs/{domain}", tls_delete_cert, methods=["DELETE"]),
+        ],
+        middleware=[Middleware(BaseHTTPMiddleware, dispatch=_grant_read)],
+    )
+    app.state.tls_manager = tls_manager
+    return app
+
+
+def test_unauthenticated_list_certs_401(tls_manager):
+    from starlette.testclient import TestClient
+
+    client = TestClient(_make_app_no_auth(tls_manager))
+    resp = client.get("/certs")
+    assert resp.status_code == 401
+
+
+def test_unauthenticated_renew_401(tls_manager):
+    from starlette.testclient import TestClient
+
+    client = TestClient(_make_app_no_auth(tls_manager))
+    resp = client.post("/certs/test.internal/renew")
+    assert resp.status_code == 401
+
+
+def test_unauthenticated_delete_401(tls_manager):
+    from starlette.testclient import TestClient
+
+    client = TestClient(_make_app_no_auth(tls_manager))
+    resp = client.delete("/certs/test.internal")
+    assert resp.status_code == 401
+
+
+def test_read_only_renew_403(tls_manager):
+    from starlette.testclient import TestClient
+
+    client = TestClient(_make_app_read_only(tls_manager))
+    resp = client.post("/certs/test.internal/renew")
+    assert resp.status_code == 403
+
+
+def test_read_only_delete_403(tls_manager):
+    from starlette.testclient import TestClient
+
+    client = TestClient(_make_app_read_only(tls_manager))
+    resp = client.delete("/certs/test.internal")
+    assert resp.status_code == 403
+
+
 # ── CLI bootstrap ─────────────────────────────────────────────────────────────
 
 
