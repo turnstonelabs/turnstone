@@ -19,6 +19,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -417,6 +418,7 @@ class ChatSession:
         self._skill_name: str | None = skill
         self._skill_content: str | None = None
         self._skill_resources: dict[str, str] = {}
+        self._skill_resources_dir: str | None = None
         self._load_skills()
         self._init_system_messages()
         self._save_config()
@@ -583,6 +585,7 @@ class ChatSession:
             else:
                 self._skill_content = None
             self._skill_resources = {}
+        self._materialize_skill_resources()
 
     def set_skill(self, name: str | None) -> None:
         """Set or clear the active skill."""
@@ -612,6 +615,63 @@ class ChatSession:
         except Exception:
             log.warning("skill_resources.load_failed", skill_id=skill_id, exc_info=True)
             return {}
+
+    def _cleanup_skill_resources(self) -> None:
+        """Remove materialized skill resources from disk."""
+        d = self._skill_resources_dir
+        if d is not None:
+            shutil.rmtree(d, ignore_errors=True)
+            self._skill_resources_dir = None
+
+    def _materialize_skill_resources(self) -> None:
+        """Write skill resources to a temp directory for subprocess access."""
+        self._cleanup_skill_resources()
+        if not self._skill_resources:
+            return
+        base = tempfile.mkdtemp(prefix=f"skill-{self._ws_id[:8]}-")
+        written = 0
+        try:
+            for rel_path, content in self._skill_resources.items():
+                normed = os.path.normpath(rel_path)
+                if not normed or normed == "." or normed.startswith(("..", "/")):
+                    log.warning("skill_resources.bad_path", path=rel_path)
+                    continue
+                if ".." in normed.split(os.sep):
+                    log.warning("skill_resources.bad_path", path=rel_path)
+                    continue
+                full = os.path.join(base, normed)
+                if not os.path.realpath(full).startswith(os.path.realpath(base)):
+                    log.warning("skill_resources.path_escape", path=rel_path)
+                    continue
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w") as f:
+                    f.write(content)
+                if normed.startswith("scripts/"):
+                    os.chmod(full, 0o755)
+                written += 1
+        except Exception:
+            shutil.rmtree(base, ignore_errors=True)
+            log.warning("skill_resources.materialize_failed", exc_info=True)
+            return
+        if written == 0:
+            shutil.rmtree(base, ignore_errors=True)
+            return
+        self._skill_resources_dir = base
+        log.info(
+            "skill_resources.materialized",
+            dir=base,
+            count=written,
+        )
+
+    def _skill_resource_env(self) -> dict[str, str]:
+        """Return extra env vars for bash when skill resources are materialized."""
+        if not self._skill_resources_dir:
+            return {}
+        env: dict[str, str] = {"SKILL_RESOURCES_DIR": self._skill_resources_dir}
+        scripts_dir = os.path.join(self._skill_resources_dir, "scripts")
+        if os.path.isdir(scripts_dir):
+            env["PATH"] = scripts_dir + ":" + os.environ.get("PATH", "")
+        return env
 
     # -- MCP tool refresh ----------------------------------------------------
 
@@ -747,6 +807,7 @@ class ChatSession:
             self._mcp_prompt_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
+        self._cleanup_skill_resources()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
@@ -1090,6 +1151,12 @@ class ChatSession:
                     lines.append(
                         "Resource content omitted (total exceeds 8KB). "
                         "Resource files are listed above by path and size."
+                    )
+                if self._skill_resources_dir:
+                    lines.append(
+                        "\nResource files are materialized on disk. "
+                        "Scripts in scripts/ are on PATH and can be run by name. "
+                        "All files are under $SKILL_RESOURCES_DIR."
                     )
                 lines.append("</skill-resources>")
                 dev_parts.append("\n".join(lines))
@@ -4338,7 +4405,7 @@ class ChatSession:
                     stderr=subprocess.PIPE,
                     text=True,
                     start_new_session=True,
-                    env=scrubbed_env(),
+                    env=scrubbed_env(extra=self._skill_resource_env()),
                 )
                 with self._procs_lock:
                     self._active_procs.add(proc)
