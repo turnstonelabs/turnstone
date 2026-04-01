@@ -278,7 +278,7 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
         )
         headers["Authorization"] = f"Bearer {mgr.token}"
     else:
-        token = getattr(args, "auth_token", "") or _get_config_token()
+        token = getattr(args, "auth_token", "")
         if token:
             headers["Authorization"] = f"Bearer {token}"
     resp = httpx.get(url, headers=headers)
@@ -294,20 +294,6 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
     print("-" * 74)
     for c in certs:
         print(f"{c['domain']:<30s} {c['issued_at']:<22s} {c['expires_at']:<22s}")
-
-
-def _get_config_token() -> str:
-    """Try to load auth token from config.toml or environment."""
-    token = os.environ.get("TURNSTONE_AUTH_TOKEN", "")
-    if token:
-        return token
-    try:
-        from turnstone.core.config import load_config
-
-        cfg = load_config("auth")
-        return str(cfg.get("token", ""))
-    except Exception:
-        return ""
 
 
 def _discover_console_url() -> str:

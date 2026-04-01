@@ -7,7 +7,7 @@
  *
  * const client = new TurnstoneServer({
  *   baseUrl: "http://localhost:8080",
- *   token: "tok_xxx",
+ *   token: "ts_your_api_token",
  * });
  *
  * const ws = await client.createWorkstream({ name: "demo" });

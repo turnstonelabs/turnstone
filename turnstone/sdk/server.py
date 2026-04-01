@@ -4,7 +4,7 @@ Usage::
 
     from turnstone.sdk import TurnstoneServer
 
-    with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+    with TurnstoneServer("http://localhost:8080", token="ts_your_api_token") as client:
         ws = client.create_workstream(name="Analysis")
         result = client.send_and_wait("Hello", ws.ws_id)
         print(result.content)
@@ -432,7 +432,7 @@ class TurnstoneServer:
 
     Usage::
 
-        with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
+        with TurnstoneServer("http://localhost:8080", token="ts_your_api_token") as client:
             ws = client.create_workstream(name="Analysis")
             result = client.send_and_wait("Hello", ws.ws_id)
             print(result.content)

@@ -939,6 +939,25 @@ class TestServerLogin:
         mock_mgr.list_all.return_value = [mock_ws]
         mock_mgr.max_workstreams = 10
 
+        # Mock storage with a test user for password login
+        from turnstone.core.auth import hash_password
+
+        mock_storage = MagicMock()
+        mock_storage.get_user_by_username.side_effect = lambda u: (
+            {
+                "user_id": "uid_test",
+                "username": "testuser",
+                "password_hash": hash_password("testpass"),
+                "display_name": "Test",
+            }
+            if u == "testuser"
+            else None
+        )
+        mock_storage.list_user_roles.return_value = [
+            {"role_id": "builtin-admin", "scopes": "read,write,approve"}
+        ]
+
+        cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
         app = srv_mod.create_app(
             workstreams=mock_mgr,
             global_queue=queue.Queue(),
@@ -948,6 +967,8 @@ class TestServerLogin:
             auth_config=AuthConfig(
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
+            jwt_secret=cls._jwt_secret,
+            auth_storage=mock_storage,
         )
         cls.test_client = TestClient(app, raise_server_exceptions=False)
 
@@ -955,36 +976,36 @@ class TestServerLogin:
     def teardown_class(cls):
         cls.test_client.close()
 
-    def test_login_valid_token_sets_cookie(self):
+    def test_login_config_token_rejected(self):
+        """Config token exchange is no longer allowed."""
         resp = self.test_client.post(
             "/v1/api/auth/login",
             json={"token": "tok_full"},
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["role"] == "full"
-        cookie = resp.headers.get("set-cookie", "")
-        assert "turnstone_auth=tok_full" in cookie
-        assert "HttpOnly" in cookie
+        assert resp.status_code == 401
 
-    def test_login_invalid_token_401(self):
+    def test_login_invalid_credentials_401(self):
         resp = self.test_client.post(
             "/v1/api/auth/login",
-            json={"token": "wrong"},
+            json={"username": "testuser", "password": "wrong"},
         )
         assert resp.status_code == 401
 
-    def test_login_no_auth_required(self):
-        # /v1/api/auth/login is public — shouldn't require auth itself
+    def test_login_password_ok(self):
         resp = self.test_client.post(
             "/v1/api/auth/login",
-            json={"token": "tok_read"},
+            json={"username": "testuser", "password": "testpass"},
         )
         assert resp.status_code == 200
+        data = resp.json()
+        assert "jwt" in data
 
     def test_cookie_auth_on_api(self):
         # Login to get cookie (TestClient tracks cookies automatically)
-        login_resp = self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        login_resp = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
         assert login_resp.status_code == 200
 
         # Use cookie to access API — TestClient forwards cookies
@@ -992,7 +1013,10 @@ class TestServerLogin:
         assert resp.status_code == 200
 
     def test_logout_clears_cookie(self):
-        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
 
         # Logout
         logout_resp = self.test_client.post("/v1/api/auth/logout")
@@ -1016,6 +1040,7 @@ class TestConsoleLogin:
 
         from turnstone.console.collector import ClusterCollector
         from turnstone.console.server import _load_static, create_app
+        from turnstone.core.auth import hash_password
 
         _load_static()
 
@@ -1027,11 +1052,29 @@ class TestConsoleLogin:
             "aggregate": {"total_tokens": 100},
         }
 
+        mock_storage = MagicMock()
+        mock_storage.get_user_by_username.side_effect = lambda u: (
+            {
+                "user_id": "uid_test",
+                "username": "testuser",
+                "password_hash": hash_password("testpass"),
+                "display_name": "Test",
+            }
+            if u == "testuser"
+            else None
+        )
+        mock_storage.list_user_roles.return_value = [
+            {"role_id": "builtin-admin", "scopes": "read,write,approve"}
+        ]
+
+        cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
         app = create_app(
             collector=mock_collector,
             auth_config=AuthConfig(
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
+            jwt_secret=cls._jwt_secret,
+            auth_storage=mock_storage,
         )
         cls.test_client = TestClient(app, raise_server_exceptions=False)
 
@@ -1039,28 +1082,34 @@ class TestConsoleLogin:
     def teardown_class(cls):
         cls.test_client.close()
 
-    def test_login_valid_token(self):
+    def test_login_config_token_rejected(self):
         resp = self.test_client.post(
             "/v1/api/auth/login",
             json={"token": "tok_read"},
         )
+        assert resp.status_code == 401
+
+    def test_login_password_ok(self):
+        resp = self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
         assert resp.status_code == 200
         assert "turnstone_auth" in resp.headers.get("set-cookie", "")
 
-    def test_login_invalid_token(self):
-        resp = self.test_client.post(
-            "/v1/api/auth/login",
-            json={"token": "wrong"},
-        )
-        assert resp.status_code == 401
-
     def test_cookie_auth_on_api(self):
-        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
         resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 200
 
     def test_logout_then_api_fails(self):
-        self.test_client.post("/v1/api/auth/login", json={"token": "tok_read"})
+        self.test_client.post(
+            "/v1/api/auth/login",
+            json={"username": "testuser", "password": "testpass"},
+        )
         self.test_client.post("/v1/api/auth/logout")
         resp = self.test_client.get("/v1/api/cluster/overview")
         assert resp.status_code == 401

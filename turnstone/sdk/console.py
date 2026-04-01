@@ -4,7 +4,7 @@ Usage::
 
     from turnstone.sdk import TurnstoneConsole
 
-    with TurnstoneConsole("http://localhost:8081", token="tok_xxx") as client:
+    with TurnstoneConsole("http://localhost:8090", token="ts_your_api_token") as client:
         overview = client.overview()
         print(f"Nodes: {overview.nodes}, Workstreams: {overview.workstreams}")
 """
@@ -961,7 +961,7 @@ class TurnstoneConsole:
 
     Usage::
 
-        with TurnstoneConsole("http://localhost:8081", token="tok_xxx") as client:
+        with TurnstoneConsole("http://localhost:8090", token="ts_your_api_token") as client:
             overview = client.overview()
             print(f"Nodes: {overview.nodes}")
     """

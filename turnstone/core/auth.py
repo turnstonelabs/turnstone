@@ -950,6 +950,9 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
             jwt_audience=audience,
             storage=storage,
         )
+        # Reject config-file token exchange — only JWT and API tokens allowed
+        if result is not None and result.token_source == "config":
+            result = None
 
     if result is None:
         # Record failed attempt for rate limiting
