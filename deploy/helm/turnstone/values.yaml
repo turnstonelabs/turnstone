@@ -59,11 +59,6 @@ llm:
   apiKey: ""
   existingSecret: ""
 
-# -- Authentication (always enabled)
-auth:
-  token: ""
-  existingSecret: ""
-
 # -- Ingress configuration
 ingress:
   enabled: false

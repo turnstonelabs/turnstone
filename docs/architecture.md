@@ -1016,13 +1016,10 @@ limits using a token-bucket algorithm. Each IP gets a `TokenBucket` with
 Turnstone supports three authentication mechanisms, unified behind an
 `AuthResult` dataclass that carries `user_id`, `scopes`, and `token_source`:
 
-1. **Config-file tokens** — static secrets in `config.toml` `[[auth.tokens]]`
-   or the `TURNSTONE_AUTH_TOKEN` env var. Validated in-memory via
-   `hmac.compare_digest`. Map to scopes through their role (`read` or `full`).
-2. **API tokens** — database-backed, prefixed `ts_`, stored as SHA-256 hashes
+1. **API tokens** — database-backed, prefixed `ts_`, stored as SHA-256 hashes
    in the `api_tokens` table. Can be exchanged for JWTs via
    `POST /v1/api/auth/login`.
-3. **JWTs** — short-lived HMAC-SHA256 session tokens (default 24h) issued after
+2. **JWTs** — short-lived HMAC-SHA256 session tokens (default 24h) issued after
    successful credential validation. Contain `sub` (user_id), `scopes`, and
    `src` (origin) in claims.
 

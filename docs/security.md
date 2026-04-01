@@ -8,23 +8,6 @@ credentials while individual server nodes validate JWTs locally.
 
 ## Token Types
 
-### Config-file tokens
-
-Static tokens defined in `config.toml` or the `TURNSTONE_AUTH_TOKEN`
-environment variable. Validated in-memory using `hmac.compare_digest`
-(timing-safe). Each token maps to a role that determines its scopes.
-
-```toml
-[[auth.tokens]]
-value = "tok_legacy"
-role = "full"     # full → {read, write, approve}
-```
-
-Role mappings: `"read"` → `{read}`, `"full"` → `{read, write, approve}`.
-
-Config tokens are sent directly as `Authorization: Bearer tok_legacy`
-on every request. No JWT exchange is needed.
-
 ### API tokens
 
 Database-backed tokens prefixed with `ts_`. Created via the admin CLI
@@ -533,7 +516,6 @@ Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
 | Variable | Description |
 |----------|-------------|
 | `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (required, must match across nodes) |
-| `TURNSTONE_AUTH_TOKEN=tok_xxx` | Config-file token with `full` access (deprecated — use API tokens) |
 | `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |
 
 ---

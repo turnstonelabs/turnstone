@@ -13,6 +13,7 @@ from turnstone.core.auth import (
     _extract_bearer,
     _extract_cookie,
     check_request,
+    create_jwt,
     is_public_path,
     load_auth_config,
     make_clear_cookie,
@@ -200,37 +201,6 @@ class TestRequiredScope:
 
 
 # ---------------------------------------------------------------------------
-# TestAuthConfig
-# ---------------------------------------------------------------------------
-
-
-class TestAuthConfig:
-    def test_check_valid_full_token(self):
-        cfg = AuthConfig(tokens={"tok_full": "full", "tok_read": "read"})
-        assert cfg.check("tok_full") == "full"
-
-    def test_check_valid_read_token(self):
-        cfg = AuthConfig(tokens={"tok_full": "full", "tok_read": "read"})
-        assert cfg.check("tok_read") == "read"
-
-    def test_check_invalid_token(self):
-        cfg = AuthConfig(tokens={"tok_full": "full"})
-        assert cfg.check("wrong") is None
-
-    def test_check_none_token(self):
-        cfg = AuthConfig(tokens={"tok_full": "full"})
-        assert cfg.check(None) is None
-
-    def test_check_empty_token(self):
-        cfg = AuthConfig(tokens={"tok_full": "full"})
-        assert cfg.check("") is None
-
-    def test_check_no_tokens(self):
-        cfg = AuthConfig(tokens={})
-        assert cfg.check("anything") is None
-
-
-# ---------------------------------------------------------------------------
 # TestExtractBearer
 # ---------------------------------------------------------------------------
 
@@ -353,153 +323,157 @@ class TestMakeClearCookie:
 class TestCheckRequest:
     """Tests for the main check_request() entry point."""
 
-    @pytest.fixture()
-    def enabled(self):
-        return AuthConfig(
-            tokens={"tok_full": "full", "tok_read": "read"},
-        )
+    _SECRET = "test-jwt-secret-minimum-32-chars!"
 
-    def test_public_path_no_token_ok(self, enabled):
-        allowed, status, msg, _result = check_request(enabled, "GET", "/health", None)
+    @pytest.fixture()
+    def read_jwt(self):
+        return f"Bearer {create_jwt('u1', frozenset({'read'}), 'test', self._SECRET)}"
+
+    @pytest.fixture()
+    def full_jwt(self):
+        return f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', self._SECRET)}"
+
+    def test_public_path_no_token_ok(self):
+        allowed, status, msg, _result = check_request("GET", "/health", None)
         assert allowed is True
         assert status == 200
 
-    def test_public_root_no_token_ok(self, enabled):
-        allowed, status, msg, _result = check_request(enabled, "GET", "/", None)
+    def test_public_root_no_token_ok(self):
+        allowed, status, msg, _result = check_request("GET", "/", None)
         assert allowed is True
 
-    def test_public_static_no_token_ok(self, enabled):
-        allowed, status, msg, _result = check_request(enabled, "GET", "/static/style.css", None)
+    def test_public_static_no_token_ok(self):
+        allowed, status, msg, _result = check_request("GET", "/static/style.css", None)
         assert allowed is True
 
-    def test_api_no_token_401(self, enabled):
-        allowed, status, msg, _result = check_request(enabled, "GET", "/api/workstreams", None)
+    def test_api_no_token_401(self):
+        allowed, status, msg, _result = check_request("GET", "/api/workstreams", None)
         assert allowed is False
         assert status == 401
         assert "Unauthorized" in msg
 
-    def test_api_invalid_token_401(self, enabled):
+    def test_api_invalid_token_401(self):
         allowed, status, msg, _result = check_request(
-            enabled, "GET", "/api/workstreams", "Bearer wrong_token"
+            "GET", "/api/workstreams", "Bearer wrong_token"
         )
         assert allowed is False
         assert status == 401
 
-    def test_api_read_token_ok(self, enabled):
+    def test_api_read_token_ok(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "GET", "/api/workstreams", "Bearer tok_read"
+            "GET", "/api/workstreams", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
         assert status == 200
 
-    def test_api_full_token_ok(self, enabled):
+    def test_api_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "GET", "/api/workstreams", "Bearer tok_full"
+            "GET", "/api/workstreams", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
-    def test_write_read_token_403(self, enabled):
+    def test_write_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/send", "Bearer tok_read"
+            "POST", "/api/send", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
         assert "Forbidden" in msg
 
-    def test_write_full_token_ok(self, enabled):
+    def test_write_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/send", "Bearer tok_full"
+            "POST", "/api/send", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
         assert status == 200
 
-    def test_approve_read_token_403(self, enabled):
+    def test_approve_read_token_403(self, read_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/approve", "Bearer tok_read"
+            "POST", "/api/approve", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_proxy_write_read_token_403(self, enabled):
+    def test_proxy_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via proxy routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/node/node-a/api/send", "Bearer tok_read"
+            "POST", "/node/node-a/api/send", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_proxy_write_trailing_slash_read_token_403(self, enabled):
+    def test_proxy_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on proxy routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/node/node-a/api/send/", "Bearer tok_read"
+            "POST", "/node/node-a/api/send/", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_direct_write_trailing_slash_read_token_403(self, enabled):
+    def test_direct_write_trailing_slash_read_token_403(self, read_jwt):
         """Trailing slash must not bypass write-role check on direct routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/send/", "Bearer tok_read"
+            "POST", "/api/send/", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_proxy_write_full_token_ok(self, enabled):
+    def test_proxy_write_full_token_ok(self, full_jwt):
         """Full tokens pass through proxy write routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/node/node-a/api/send", "Bearer tok_full"
+            "POST", "/node/node-a/api/send", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
-    def test_proxy_v1_write_read_token_403(self, enabled):
+    def test_proxy_v1_write_read_token_403(self, read_jwt):
         """Read tokens cannot escalate to write ops via v1 proxy routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_read"
+            "POST", "/node/node-a/v1/api/send", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_proxy_v1_write_full_token_ok(self, enabled):
+    def test_proxy_v1_write_full_token_ok(self, full_jwt):
         """Full tokens pass through v1 proxy write routes."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/node/node-a/v1/api/send", "Bearer tok_full"
+            "POST", "/node/node-a/v1/api/send", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
-    def test_proxy_v1_cluster_ws_new_read_403(self, enabled):
+    def test_proxy_v1_cluster_ws_new_read_403(self, read_jwt):
         """Read tokens cannot create workstreams via v1 proxy."""
         allowed, status, msg, _result = check_request(
-            enabled,
             "POST",
             "/node/node-a/v1/api/cluster/workstreams/new",
-            "Bearer tok_read",
+            read_jwt,
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
 
-    def test_proxy_read_endpoint_read_token_ok(self, enabled):
+    def test_proxy_read_endpoint_read_token_ok(self, read_jwt):
         """Read tokens can access proxy read endpoints."""
         allowed, status, msg, _result = check_request(
-            enabled, "GET", "/node/node-a/api/workstreams", "Bearer tok_read"
+            "GET", "/node/node-a/api/workstreams", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
-    def test_console_create_ws_read_token_403(self, enabled):
+    def test_console_create_ws_read_token_403(self, read_jwt):
         """Read tokens cannot create workstreams."""
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/cluster/workstreams/new", "Bearer tok_read"
+            "POST", "/api/cluster/workstreams/new", read_jwt, jwt_secret=self._SECRET
         )
         assert allowed is False
         assert status == 403
 
-    def test_approve_full_token_ok(self, enabled):
+    def test_approve_full_token_ok(self, full_jwt):
         allowed, status, msg, _result = check_request(
-            enabled, "POST", "/api/approve", "Bearer tok_full"
+            "POST", "/api/approve", full_jwt, jwt_secret=self._SECRET
         )
         assert allowed is True
 
-    def test_no_auth_header_string(self, enabled):
-        allowed, status, msg, _result = check_request(enabled, "GET", "/api/dashboard", "")
+    def test_no_auth_header_string(self):
+        allowed, status, msg, _result = check_request("GET", "/api/dashboard", "")
         assert allowed is False
         assert status == 401
 
@@ -512,69 +486,71 @@ class TestCheckRequest:
 class TestCheckRequestWithCookie:
     """Tests for cookie-based auth fallback in check_request."""
 
-    @pytest.fixture()
-    def enabled(self):
-        return AuthConfig(
-            tokens={"tok_full": "full", "tok_read": "read"},
-        )
+    _SECRET = "test-jwt-secret-minimum-32-chars!"
 
-    def test_cookie_fallback_when_no_bearer(self, enabled):
+    @pytest.fixture()
+    def read_jwt(self):
+        return create_jwt("u1", frozenset({"read"}), "test", self._SECRET)
+
+    @pytest.fixture()
+    def full_jwt(self):
+        return create_jwt("u1", frozenset({"read", "write", "approve"}), "test", self._SECRET)
+
+    def test_cookie_fallback_when_no_bearer(self, read_jwt):
         allowed, status, _, _r = check_request(
-            enabled,
             "GET",
             "/api/workstreams",
             None,
-            cookie_header="turnstone_auth=tok_read",
+            cookie_header=f"turnstone_auth={read_jwt}",
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
         assert status == 200
 
-    def test_bearer_takes_precedence_over_cookie(self, enabled):
-        # Bearer is full, cookie is read — Bearer should win
+    def test_bearer_takes_precedence_over_cookie(self, read_jwt, full_jwt):
         allowed, status, _, _r = check_request(
-            enabled,
             "POST",
             "/api/send",
-            "Bearer tok_full",
-            cookie_header="turnstone_auth=tok_read",
+            f"Bearer {full_jwt}",
+            cookie_header=f"turnstone_auth={read_jwt}",
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
-    def test_invalid_cookie_401(self, enabled):
+    def test_invalid_cookie_401(self):
         allowed, status, _, _r = check_request(
-            enabled,
             "GET",
             "/api/workstreams",
             None,
             cookie_header="turnstone_auth=wrong_token",
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 401
 
-    def test_cookie_read_on_write_403(self, enabled):
+    def test_cookie_read_on_write_403(self, read_jwt):
         allowed, status, _, _r = check_request(
-            enabled,
             "POST",
             "/api/send",
             None,
-            cookie_header="turnstone_auth=tok_read",
+            cookie_header=f"turnstone_auth={read_jwt}",
+            jwt_secret=self._SECRET,
         )
         assert allowed is False
         assert status == 403
 
-    def test_cookie_full_on_write_ok(self, enabled):
+    def test_cookie_full_on_write_ok(self, full_jwt):
         allowed, status, _, _r = check_request(
-            enabled,
             "POST",
             "/api/send",
             None,
-            cookie_header="turnstone_auth=tok_full",
+            cookie_header=f"turnstone_auth={full_jwt}",
+            jwt_secret=self._SECRET,
         )
         assert allowed is True
 
-    def test_no_cookie_no_bearer_401(self, enabled):
+    def test_no_cookie_no_bearer_401(self):
         allowed, status, _, _r = check_request(
-            enabled,
             "GET",
             "/api/workstreams",
             None,
@@ -583,18 +559,16 @@ class TestCheckRequestWithCookie:
         assert allowed is False
         assert status == 401
 
-    def test_login_path_public(self, enabled):
+    def test_login_path_public(self):
         allowed, status, _, _r = check_request(
-            enabled,
             "POST",
             "/api/auth/login",
             None,
         )
         assert allowed is True
 
-    def test_logout_path_public(self, enabled):
+    def test_logout_path_public(self):
         allowed, status, _, _r = check_request(
-            enabled,
             "POST",
             "/api/auth/logout",
             None,
@@ -608,84 +582,11 @@ class TestCheckRequestWithCookie:
 
 
 class TestLoadAuthConfig:
-    """Tests for load_auth_config with mocked config + env vars."""
+    """Tests for load_auth_config."""
 
-    def test_default_no_tokens(self):
-        with patch("turnstone.core.config.load_config", return_value={}):
-            cfg = load_auth_config()
-        assert cfg.tokens == {}
-
-    def test_config_file_tokens(self):
-        mock_cfg = {
-            "tokens": [
-                {"value": "tok_a", "role": "full"},
-                {"value": "tok_b", "role": "read"},
-            ],
-        }
-        with (
-            patch("turnstone.core.config.load_config", return_value=mock_cfg),
-            patch.dict(os.environ, {}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert cfg.tokens == {"tok_a": "full", "tok_b": "read"}
-
-    def test_env_var_token(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_TOKEN": "tok_env"}, clear=False),
-        ):
-            cfg = load_auth_config()
-        assert "tok_env" in cfg.tokens
-        assert cfg.tokens["tok_env"] == "full"
-
-    def test_config_plus_env_merge(self):
-        mock_cfg = {
-            "tokens": [{"value": "tok_cfg", "role": "read"}],
-        }
-        with (
-            patch("turnstone.core.config.load_config", return_value=mock_cfg),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_TOKEN": "tok_env"}, clear=False),
-        ):
-            cfg = load_auth_config()
-        assert cfg.tokens["tok_cfg"] == "read"
-        assert cfg.tokens["tok_env"] == "full"
-
-    def test_invalid_role_skipped(self):
-        mock_cfg = {
-            "tokens": [
-                {"value": "tok_ok", "role": "full"},
-                {"value": "tok_bad", "role": "admin"},
-            ],
-        }
-        with (
-            patch("turnstone.core.config.load_config", return_value=mock_cfg),
-            patch.dict(os.environ, {}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert "tok_ok" in cfg.tokens
-        assert "tok_bad" not in cfg.tokens
-
-    def test_empty_value_skipped(self):
-        mock_cfg = {
-            "tokens": [{"value": "", "role": "full"}],
-        }
-        with (
-            patch("turnstone.core.config.load_config", return_value=mock_cfg),
-            patch.dict(os.environ, {}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert len(cfg.tokens) == 0
-
-    def test_non_dict_token_entry_skipped(self):
-        mock_cfg = {
-            "tokens": ["not_a_dict", {"value": "tok_ok", "role": "full"}],
-        }
-        with (
-            patch("turnstone.core.config.load_config", return_value=mock_cfg),
-            patch.dict(os.environ, {}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert cfg.tokens == {"tok_ok": "full"}
+    def test_returns_auth_config(self):
+        cfg = load_auth_config()
+        assert isinstance(cfg, AuthConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -723,15 +624,23 @@ class TestServerAuth:
         mock_mgr.list_all.return_value = [mock_ws]
         mock_mgr.max_workstreams = 10
 
+        from turnstone.core.auth import JWT_AUD_SERVER
+
+        cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
+        cls._read_hdr = {
+            "Authorization": f"Bearer {create_jwt('u1', frozenset({'read'}), 'test', cls._jwt_secret, audience=JWT_AUD_SERVER)}"
+        }
+        cls._full_hdr = {
+            "Authorization": f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', cls._jwt_secret, audience=JWT_AUD_SERVER)}"
+        }
         app = srv_mod.create_app(
             workstreams=mock_mgr,
             global_queue=queue.Queue(),
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(
-                tokens={"tok_full": "full", "tok_read": "read"},
-            ),
+            auth_config=AuthConfig(),
+            jwt_secret=cls._jwt_secret,
             cors_origins=["*"],
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
@@ -746,7 +655,6 @@ class TestServerAuth:
 
     def test_metrics_no_token_passes_auth(self):
         resp = self.client.get("/metrics")
-        # Public path — should never be 401/403
         assert resp.status_code not in (401, 403)
 
     def test_root_no_token_200(self):
@@ -763,23 +671,17 @@ class TestServerAuth:
         assert "Unauthorized" in resp.json().get("error", "")
 
     def test_api_workstreams_read_token_200(self):
-        resp = self.client.get(
-            "/v1/api/workstreams",
-            headers={"Authorization": "Bearer tok_read"},
-        )
+        resp = self.client.get("/v1/api/workstreams", headers=self._read_hdr)
         assert resp.status_code == 200
 
     def test_api_workstreams_full_token_200(self):
-        resp = self.client.get(
-            "/v1/api/workstreams",
-            headers={"Authorization": "Bearer tok_full"},
-        )
+        resp = self.client.get("/v1/api/workstreams", headers=self._full_hdr)
         assert resp.status_code == 200
 
     def test_api_send_read_token_403(self):
         resp = self.client.post(
             "/v1/api/send",
-            headers={"Authorization": "Bearer tok_read"},
+            headers=self._read_hdr,
             json={"message": "hello", "ws_id": "x"},
         )
         assert resp.status_code == 403
@@ -788,10 +690,9 @@ class TestServerAuth:
     def test_api_send_full_token_passes_auth(self):
         resp = self.client.post(
             "/v1/api/send",
-            headers={"Authorization": "Bearer tok_full"},
+            headers=self._full_hdr,
             json={"message": "hello", "ws_id": "nonexistent"},
         )
-        # Should get 404 (unknown workstream), not 401/403
         assert resp.status_code not in (401, 403)
 
     def test_api_send_no_token_401(self):
@@ -858,11 +759,19 @@ class TestConsoleAuth:
             "aggregate": {"total_tokens": 100},
         }
 
+        from turnstone.core.auth import JWT_AUD_CONSOLE
+
+        cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
+        cls._read_hdr = {
+            "Authorization": f"Bearer {create_jwt('u1', frozenset({'read'}), 'test', cls._jwt_secret, audience=JWT_AUD_CONSOLE)}"
+        }
+        cls._full_hdr = {
+            "Authorization": f"Bearer {create_jwt('u1', frozenset({'read', 'write', 'approve'}), 'test', cls._jwt_secret, audience=JWT_AUD_CONSOLE)}"
+        }
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(
-                tokens={"tok_full": "full", "tok_read": "read"},
-            ),
+            auth_config=AuthConfig(),
+            jwt_secret=cls._jwt_secret,
         )
         cls.test_client = TestClient(app, raise_server_exceptions=False)
 
@@ -883,17 +792,11 @@ class TestConsoleAuth:
         assert resp.status_code == 401
 
     def test_api_overview_read_token_200(self):
-        resp = self.test_client.get(
-            "/v1/api/cluster/overview",
-            headers={"Authorization": "Bearer tok_read"},
-        )
+        resp = self.test_client.get("/v1/api/cluster/overview", headers=self._read_hdr)
         assert resp.status_code == 200
 
     def test_api_overview_full_token_200(self):
-        resp = self.test_client.get(
-            "/v1/api/cluster/overview",
-            headers={"Authorization": "Bearer tok_full"},
-        )
+        resp = self.test_client.get("/v1/api/cluster/overview", headers=self._full_hdr)
         assert resp.status_code == 200
 
     def test_invalid_token_401(self):
@@ -964,9 +867,7 @@ class TestServerLogin:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(
-                tokens={"tok_full": "full", "tok_read": "read"},
-            ),
+            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
             auth_storage=mock_storage,
         )
@@ -1070,9 +971,7 @@ class TestConsoleLogin:
         cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(
-                tokens={"tok_full": "full", "tok_read": "read"},
-            ),
+            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
             auth_storage=mock_storage,
         )

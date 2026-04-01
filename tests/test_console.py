@@ -9,9 +9,23 @@ import pytest
 
 from turnstone.console.collector import ClusterCollector, NodeSnapshot
 
-# Shared test auth constants — used by all console test fixtures
-_TEST_TOKEN = "test_console_token"
-_TEST_AUTH_HEADERS = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+# Shared test auth — JWT-based
+_TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
+
+
+def _test_jwt() -> str:
+    from turnstone.core.auth import JWT_AUD_CONSOLE, create_jwt
+
+    return create_jwt(
+        user_id="test-console",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="test",
+        secret=_TEST_JWT_SECRET,
+        audience=JWT_AUD_CONSOLE,
+    )
+
+
+_TEST_AUTH_HEADERS = {"Authorization": f"Bearer {_test_jwt()}"}
 
 # ---------------------------------------------------------------------------
 # Mock storage for collector tests
@@ -719,7 +733,8 @@ class TestConsoleHTTPEndpoints:
 
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
@@ -962,7 +977,8 @@ class TestConsoleWorkstreamCreation:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
 
         # Set up a mock proxy_client (lifespan doesn't run in TestClient)
@@ -1160,7 +1176,8 @@ class TestConsoleProxy:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
@@ -1331,7 +1348,8 @@ class TestConsoleVersionEndpoints:
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
@@ -1380,7 +1398,8 @@ class TestSharedStatic:
         }
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         yield client
@@ -1498,7 +1517,8 @@ class TestProxySharedStatic:
         collector.get_node_detail.return_value = None
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(tokens={_TEST_TOKEN: "full"}),
+            auth_config=AuthConfig(),
+            jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
         resp = client.get("/node/unknown/shared/base.css")

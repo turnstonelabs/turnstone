@@ -277,10 +277,6 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
             secret=jwt_secret,
         )
         headers["Authorization"] = f"Bearer {mgr.token}"
-    else:
-        token = getattr(args, "auth_token", "")
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
     resp = httpx.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
@@ -380,7 +376,6 @@ def main() -> None:
 
     p_tlslist = sub.add_parser("tls-list", help="List issued certificates")
     p_tlslist.add_argument("--console-url", default="", help="Console URL")
-    p_tlslist.add_argument("--auth-token", default="", help="Auth token for admin API")
 
     args = parser.parse_args()
     if not args.command:

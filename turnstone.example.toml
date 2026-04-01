@@ -56,11 +56,9 @@
 # --- Auth (node, console) ---
 
 [auth]
-# Auth is always enabled.
+# Auth is always enabled. JWT secret is required.
 # jwt_secret = ""              # HS256 signing secret (min 32 bytes recommended)
                                # env: TURNSTONE_JWT_SECRET
-# token = ""                   # Static config token for full access
-                               # env: TURNSTONE_AUTH_TOKEN
 
 # --- Logging (turnstone, node, console) ---
 

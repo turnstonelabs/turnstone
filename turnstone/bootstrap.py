@@ -85,8 +85,6 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 ### Authentication (always enabled)
 - `TURNSTONE_JWT_SECRET` — JWT signing secret (required). All services must share the same secret. \
 Generate with: `python -c "import secrets; print(secrets.token_hex(32))"`
-- `TURNSTONE_AUTH_TOKEN` — Static config token (deprecated, optional). \
-Prefer API tokens created via the admin panel or turnstone-admin CLI.
 
 ### OIDC SSO (optional)
 - `TURNSTONE_OIDC_ISSUER` — OIDC issuer URL (e.g., https://accounts.google.com). Setting this + CLIENT_ID + CLIENT_SECRET enables SSO.

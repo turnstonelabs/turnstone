@@ -3012,7 +3012,7 @@ def main() -> None:
 
     auth_config = load_auth_config()
     jwt_secret = load_jwt_secret()
-    log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
+    log.info("Auth: enabled (JWT)")
 
     # Build the ASGI app
     from turnstone.core.web_helpers import parse_cors_origins

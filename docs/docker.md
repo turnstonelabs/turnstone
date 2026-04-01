@@ -77,7 +77,6 @@ Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required) |
-| `TURNSTONE_AUTH_TOKEN` | — | Config-file token (deprecated — use API tokens instead) |
 
 ### Database
 

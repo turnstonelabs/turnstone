@@ -332,6 +332,6 @@ client.login(token="ts_abc123...")
 - `client.logout()` clears the stored JWT from the client.
 - If a request returns 401, the SDK raises `TurnstoneAPIError` — the caller is responsible for re-authenticating.
 
-### Backward Compatibility
+### Token Types
 
-The config-file token (`TURNSTONE_AUTH_TOKEN`) still works as a simple Bearer token for environments that do not use the user/JWT system. When the server receives a non-JWT Bearer token, it falls back to the legacy token check.
+The SDK accepts any Bearer token — JWTs (from `ServiceTokenManager` or login) and API tokens (`ts_` prefix) are both supported. Use `token_factory` for auto-rotating JWTs or a static `token` for API tokens.

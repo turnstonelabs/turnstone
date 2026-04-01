@@ -1,15 +1,12 @@
 """Bearer token authentication and authorization for turnstone HTTP servers.
 
-Supports three token types:
+Supports two token types:
 
-1. **Config-file tokens** — static tokens in ``config.toml`` or the
-   ``TURNSTONE_AUTH_TOKEN`` env var.  Validated in-memory via
-   ``hmac.compare_digest``.  Map to scopes via their role.
-2. **API tokens** — database-backed, prefixed ``ts_``, stored as SHA-256
+1. **API tokens** — database-backed, prefixed ``ts_``, stored as SHA-256
    hashes.  Exchanged for JWTs via ``/api/auth/login``.
-3. **JWTs** — short-lived session tokens issued after API token validation.
-   Validated locally via shared HMAC-SHA256 secret.  Contain user_id and
-   scopes in claims.
+2. **JWTs** — short-lived session tokens issued after login or by
+   :class:`ServiceTokenManager`.  Validated locally via shared HMAC-SHA256
+   secret.  Contain user_id and scopes in claims.
 
 Public paths (``/``, ``/static/*``, ``/shared/*``, ``/health``, ``/metrics``,
 ``/openapi.json``, ``/docs``, ``/api/auth/login``, ``/api/auth/logout``) are
@@ -19,7 +16,6 @@ always accessible without authentication.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -28,7 +24,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -78,12 +74,6 @@ SCOPE_HIERARCHY: dict[str, frozenset[str]] = {
     "write": frozenset({"read", "write"}),
     "approve": frozenset({"read", "write", "approve"}),
     "service": frozenset({"read", "write", "approve", "service"}),
-}
-
-# Map old role names to scope sets.
-_ROLE_TO_SCOPES: dict[str, frozenset[str]] = {
-    "read": frozenset({"read"}),
-    "full": frozenset({"read", "write", "approve"}),
 }
 
 # ---------------------------------------------------------------------------
@@ -223,17 +213,6 @@ class AuthResult:
 @dataclass
 class AuthConfig:
     """Auth configuration loaded once at startup (not modified after creation)."""
-
-    tokens: dict[str, str] = field(default_factory=dict)  # token_value → role
-
-    def check(self, token: str | None) -> str | None:
-        """Return the role for a valid config token, or *None*."""
-        if not token:
-            return None
-        for known_token, role in self.tokens.items():
-            if hmac.compare_digest(token, known_token):
-                return role
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -406,40 +385,8 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
 
 
 def load_auth_config() -> AuthConfig:
-    """Build :class:`AuthConfig` from ``config.toml`` ``[auth]`` + env vars.
-
-    Auth is always enabled.
-
-    Config format::
-
-        [[auth.tokens]]
-        value = "tok_abc123"
-        role = "full"
-
-    Environment variables:
-
-    - ``TURNSTONE_AUTH_TOKEN=<token>`` — registers a single full-access token
-    """
-    from turnstone.core.config import load_config
-
-    auth_cfg = load_config("auth")
-    tokens: dict[str, str] = {}
-
-    # Tokens from config file (TOML array-of-tables)
-    for entry in auth_cfg.get("tokens", []):
-        value = entry.get("value", "") if isinstance(entry, dict) else ""
-        role = entry.get("role", "read") if isinstance(entry, dict) else ""
-        if value and role in ("read", "full"):
-            tokens[value] = role
-
-    env_token = os.environ.get("TURNSTONE_AUTH_TOKEN", "").strip()
-    if env_token:
-        tokens[env_token] = "full"
-
-    if not tokens:
-        log.info("Auth enabled (no config tokens — use /api/auth/setup or turnstone-admin)")
-
-    return AuthConfig(tokens=tokens)
+    """Return an :class:`AuthConfig` instance.  Auth is always enabled."""
+    return AuthConfig()
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +465,6 @@ def _extract_proxied_path(normalized: str) -> str | None:
 
 
 def check_request(
-    auth_config: AuthConfig,
     method: str,
     path: str,
     auth_header: str | None,
@@ -528,14 +474,13 @@ def check_request(
     jwt_audience: str = "",
     storage: Any = None,
 ) -> tuple[bool, int, str, AuthResult | None]:
-    """Validate a request against the auth config.
+    """Validate a request.
 
     Checks ``Authorization: Bearer <token>`` first, then falls back to the
     ``turnstone_auth`` cookie.  Token types are auto-detected:
 
     - Contains ``.`` → JWT (validated with *jwt_secret*)
     - Starts with ``ts_`` → API token (looked up in *storage* by hash)
-    - Otherwise → config-file token (hmac check)
 
     Returns ``(allowed, status_code, message, auth_result)``.
     """
@@ -552,7 +497,7 @@ def check_request(
 
     # Authenticate
     result = _authenticate_token(
-        raw_token, auth_config, jwt_secret=jwt_secret, jwt_audience=jwt_audience, storage=storage
+        raw_token, jwt_secret=jwt_secret, jwt_audience=jwt_audience, storage=storage
     )
     if result is None:
         return False, 401, "Unauthorized: missing or invalid token", None
@@ -567,7 +512,6 @@ def check_request(
 
 def _authenticate_token(
     token: str,
-    auth_config: AuthConfig,
     *,
     jwt_secret: str = "",
     jwt_audience: str = "",
@@ -586,16 +530,6 @@ def _authenticate_token(
     # 2. API token (starts with ts_) — look up in storage
     if token.startswith(TOKEN_PREFIX) and storage is not None:
         return _authenticate_api_token(token, storage)
-
-    # 3. Config-file token (hmac comparison) — deprecated
-    role = auth_config.check(token)
-    if role is not None:
-        log.warning(
-            "Config-file token authentication is deprecated and will be removed "
-            "in a future release. Use JWT login or API tokens (ts_) instead."
-        )
-        scopes = _ROLE_TO_SCOPES.get(role, frozenset({"read"}))
-        return AuthResult(user_id="", scopes=scopes, token_source="config")
 
     return None
 
@@ -842,7 +776,6 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        auth_config = request.app.state.auth_config
         jwt_secret = getattr(request.app.state, "jwt_secret", "")
         storage = getattr(request.app.state, "auth_storage", None)
         method = request.method
@@ -850,7 +783,6 @@ class AuthMiddleware:
         auth_header = request.headers.get("Authorization")
         cookie_header = request.headers.get("Cookie")
         allowed, status, msg, auth_result = check_request(
-            auth_config,
             method,
             path,
             auth_header,
@@ -894,7 +826,6 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
     except (ValueError, json.JSONDecodeError):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    auth_config = request.app.state.auth_config
     jwt_secret = getattr(request.app.state, "jwt_secret", "")
     storage = getattr(request.app.state, "auth_storage", None)
     login_limiter: LoginRateLimiter | None = getattr(request.app.state, "login_limiter", None)
@@ -945,14 +876,10 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
     elif body.get("token"):
         result = _authenticate_token(
             body["token"],
-            auth_config,
             jwt_secret=jwt_secret,
             jwt_audience=audience,
             storage=storage,
         )
-        # Reject config-file token exchange — only JWT and API tokens allowed
-        if result is not None and result.token_source == "config":
-            result = None
 
     if result is None:
         # Record failed attempt for rate limiting

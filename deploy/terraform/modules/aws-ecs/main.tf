@@ -42,13 +42,7 @@ locals {
   ]
 
   auth_env = []  # Auth is always enabled; no toggle needed
-
-  auth_secrets = var.auth_token != "" ? [
-    {
-      name      = "TURNSTONE_AUTH_TOKEN"
-      valueFrom = aws_secretsmanager_secret_version.auth_token[0].arn
-    },
-  ] : []
+  auth_secrets = []
 }
 
 # ---------- Secrets Manager ----------

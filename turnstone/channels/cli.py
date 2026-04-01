@@ -121,7 +121,7 @@ def main() -> None:
     )
 
     # -- Auth config ---------------------------------------------------------
-    auth_token = os.environ.get("TURNSTONE_AUTH_TOKEN", "") or args.auth_token
+    auth_token = args.auth_token
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
 
     # Prefer auto-rotating service JWTs when jwt_secret is available.

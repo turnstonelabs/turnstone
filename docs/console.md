@@ -628,7 +628,6 @@ CLI flags for `turnstone-console`:
 |------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind host |
 | `--port` | `8090` | HTTP port |
-| `--auth-token` | `$TURNSTONE_AUTH_TOKEN` | Bearer token for server node communication and proxy |
 | `--log-level` | `INFO` | Log level |
 
 Config file (`~/.config/turnstone/config.toml`):
@@ -649,7 +648,7 @@ url = "http://localhost:8090"   # used by CLI /cluster commands
 turnstone-server --port 8080
 
 # Start cluster console (one instance)
-turnstone-console --port 8090 --auth-token "$TURNSTONE_AUTH_TOKEN"
+turnstone-console --port 8090
 ```
 
 Open `http://localhost:8090` for the cluster dashboard. Create workstreams via the "+ new" button. Click any workstream to open the proxied server UI — no direct access to server ports required.

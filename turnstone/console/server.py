@@ -6351,12 +6351,6 @@ def main() -> None:
     from turnstone.core.log import add_log_args
 
     add_log_args(parser)
-    parser.add_argument(
-        "--auth-token",
-        default=os.environ.get("TURNSTONE_AUTH_TOKEN", ""),
-        help="Bearer token for polling turnstone-server nodes (default: $TURNSTONE_AUTH_TOKEN)",
-    )
-
     from turnstone.core.config import add_config_arg, apply_config
 
     add_config_arg(parser)
@@ -6399,38 +6393,24 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    # If no explicit auth token is provided, use a ServiceTokenManager
-    # so collector JWTs auto-rotate.  A shared JWT secret is required for
-    # multi-service deployments — ephemeral secrets differ per process.
-    collector_token = args.auth_token
-    collector_token_mgr = None
-    if not collector_token:
-        _jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "")
-        if not _jwt_secret:
-            log.error(
-                "TURNSTONE_JWT_SECRET is not set and no --auth-token provided. "
-                "The console cannot authenticate to server nodes. Set TURNSTONE_JWT_SECRET "
-                "to a shared secret (at least 32 characters) or pass --auth-token."
-            )
-            raise SystemExit(1)
-        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
+    from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
 
-        collector_token_mgr = ServiceTokenManager(
-            user_id="console-collector",
-            scopes=frozenset({"read"}),
-            source="console",
-            secret=_jwt_secret,
-            audience=JWT_AUD_SERVER,
-            expiry_hours=1,
-        )
-        log.info("console.collector_token_manager_created")
+    collector_token_mgr = ServiceTokenManager(
+        user_id="console-collector",
+        scopes=frozenset({"read"}),
+        source="console",
+        secret=jwt_secret,
+        audience=JWT_AUD_SERVER,
+        expiry_hours=1,
+    )
+    log.info("console.collector_token_manager_created")
 
     router = ConsoleRouter(storage=auth_storage)
     console_metrics = ConsoleMetrics()
 
     collector = ClusterCollector(
         storage=auth_storage,
-        auth_token=collector_token if collector_token_mgr is None else "",
+        auth_token="",
         token_manager=collector_token_mgr,
         router=router,
         console_metrics=console_metrics,
@@ -6439,22 +6419,15 @@ def main() -> None:
 
     _load_static()
 
-    # If no explicit auth token is provided, use a ServiceTokenManager
-    # so proxy JWTs auto-rotate.
-    proxy_token = args.auth_token
-    proxy_token_mgr = None
-    if not proxy_token and jwt_secret:
-        from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
-
-        proxy_token_mgr = ServiceTokenManager(
-            user_id="console-proxy",
-            scopes=frozenset({"read", "write", "approve", "service"}),
-            source="console",
-            secret=jwt_secret,
-            audience=JWT_AUD_SERVER,
-            expiry_hours=1,
-        )
-        log.info("console.proxy_token_manager_created")
+    proxy_token_mgr = ServiceTokenManager(
+        user_id="console-proxy",
+        scopes=frozenset({"read", "write", "approve", "service"}),
+        source="console",
+        secret=jwt_secret,
+        audience=JWT_AUD_SERVER,
+        expiry_hours=1,
+    )
+    log.info("console.proxy_token_manager_created")
 
     from turnstone.core.web_helpers import parse_cors_origins
 
@@ -6541,7 +6514,7 @@ def main() -> None:
                     threshold=_rcs.get("rebalancer.threshold", 0.10),
                     vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
                     eager_migrate=_rcs.get("rebalancer.eager_migrate", False),
-                    api_token=proxy_token if proxy_token_mgr is None else "",
+                    api_token="",
                 )
                 log.info("rebalancer.configured")
         except Exception:
@@ -6552,7 +6525,7 @@ def main() -> None:
         auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
-        proxy_auth_token=proxy_token if proxy_token_mgr is None else "",
+        proxy_auth_token="",
         proxy_token_mgr=proxy_token_mgr,
         cors_origins=cors_origins,
         tls_manager=tls_mgr,
@@ -6563,7 +6536,7 @@ def main() -> None:
     )
 
     log.info("Console starting on %s", console_url)
-    log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
+    log.info("Auth: enabled (JWT)")
     print("Press Ctrl+C to stop.")
 
     import uvicorn
