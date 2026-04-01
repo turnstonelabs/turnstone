@@ -6,7 +6,6 @@
 #   Single node:          docker compose --profile production up
 #   Production (PG):      DB_BACKEND=postgresql docker compose --profile production up
 #   10-node cluster:      docker compose --profile cluster up
-#   Cluster + DDG:        docker compose --profile ddgCluster up
 # =============================================================================
 
 name: turnstone
@@ -28,7 +27,6 @@ services:
     profiles:
       - production
       - cluster
-      - ddgCluster
     command:
       - postgres
       - -c
@@ -82,7 +80,6 @@ services:
       - "${SERVER_PORT:-8080}:8080"
     volumes:
       - turnstone-data:/data
-      - ./docker/mcp-ddg.json:/etc/turnstone/mcp-ddg.json:ro
     environment:
       - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
@@ -103,9 +100,6 @@ services:
       - turnstone-net
     depends_on:
       postgres:
-        condition: service_healthy
-        required: false
-      ddg-search:
         condition: service_healthy
         required: false
     healthcheck:
@@ -157,7 +151,6 @@ services:
     profiles:
       - production
       - cluster
-      - ddgCluster
     command:
       - sh
       - -c
@@ -181,39 +174,6 @@ services:
         required: false
     restart: unless-stopped
 
-  # -------------------------------------------------------------------
-  # ddg-search — DuckDuckGo Search MCP server (HTTP transport)
-  # Provides web search + content fetch tools to turnstone via MCP.
-  # No API key required.
-  #
-  # Start with: MCP_CONFIG=/etc/turnstone/mcp-ddg.json \
-  #             docker compose --profile ddgCluster up
-  # -------------------------------------------------------------------
-  ddg-search:
-    image: python:3.14-slim
-    profiles:
-      - ddgCluster
-    command:
-      - sh
-      - -c
-      - >-
-        pip install --no-cache-dir duckduckgo-mcp-server &&
-        python -c "from mcp.server.transport_security import TransportSecuritySettings; import duckduckgo_mcp_server.server as s; s.safe_search=s.SafeSearchMode.OFF; s.mcp.settings.host='0.0.0.0'; s.mcp.settings.port=3000; s.mcp.settings.transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False); s.mcp.run(transport='streamable-http')"
-    networks:
-      - turnstone-net
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import socket; s=socket.create_connection(('0.0.0.0',3000),2); s.close()\""]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-          cpus: '0.25'
-    restart: unless-stopped
-
   # ===================================================================
   # 10-node cluster (profile: cluster)
   #
@@ -228,7 +188,7 @@ services:
   server-1: &cluster-server
     image: turnstone:local
     build: { context: ., dockerfile: Dockerfile }
-    profiles: [cluster, ddgCluster]
+    profiles: [cluster]
     command:
       - sh
       - -c
@@ -243,7 +203,6 @@ services:
         $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
     volumes:
       - turnstone-data:/data
-      - ./docker/mcp-ddg.json:/etc/turnstone/mcp-ddg.json:ro
     environment: &cluster-server-env
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
@@ -262,7 +221,6 @@ services:
     networks: [turnstone-net]
     depends_on:
       postgres: { condition: service_healthy }
-      ddg-search: { condition: service_healthy, required: false }
     healthcheck:
       test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
       interval: 10s

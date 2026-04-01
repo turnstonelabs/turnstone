@@ -1,7 +1,0 @@
-{
-  "mcpServers": {
-    "ddg": {
-      "url": "http://ddg-search:3000/mcp"
-    }
-  }
-}
