@@ -204,14 +204,14 @@ class TestRequiredScope:
 
 class TestAuthenticateToken:
     def test_config_token_read(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_read": "read"})
         result = _authenticate_token("tok_read", cfg)
         assert result is not None
         assert result.scopes == frozenset({"read"})
         assert result.token_source == "config"
 
     def test_config_token_full(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         result = _authenticate_token("tok_full", cfg)
         assert result is not None
         assert result.scopes == frozenset({"read", "write", "approve"})
@@ -219,7 +219,7 @@ class TestAuthenticateToken:
     def test_jwt_token(self):
         secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("user1", frozenset({"read", "write"}), "db", secret)
-        cfg = AuthConfig(enabled=True)
+        cfg = AuthConfig()
         result = _authenticate_token(jwt_tok, cfg, jwt_secret=secret)
         assert result is not None
         assert result.user_id == "user1"
@@ -243,7 +243,7 @@ class TestAuthenticateToken:
                     }
                 return None
 
-        cfg = AuthConfig(enabled=True)
+        cfg = AuthConfig()
         result = _authenticate_token(raw, cfg, storage=MockStorage())
         assert result is not None
         assert result.user_id == "user1"
@@ -266,12 +266,12 @@ class TestAuthenticateToken:
                     "expires": "2020-01-02T00:00:00",
                 }
 
-        cfg = AuthConfig(enabled=True)
+        cfg = AuthConfig()
         result = _authenticate_token(raw, cfg, storage=MockStorage())
         assert result is None
 
     def test_unknown_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok": "full"})
+        cfg = AuthConfig(tokens={"tok": "full"})
         result = _authenticate_token("unknown", cfg)
         assert result is None
 
@@ -283,21 +283,21 @@ class TestAuthenticateToken:
 
 class TestCheckRequestScopes:
     def test_config_read_on_write_403(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_read": "read"})
         allowed, status, msg, _ = check_request(cfg, "POST", "/api/send", "Bearer tok_read")
         assert not allowed
         assert status == 403
         assert "write" in msg
 
     def test_config_read_on_approve_403(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_read": "read"})
         allowed, status, msg, _ = check_request(cfg, "POST", "/api/approve", "Bearer tok_read")
         assert not allowed
         assert status == 403
         assert "approve" in msg
 
     def test_config_full_on_approve_ok(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         allowed, status, msg, result = check_request(cfg, "POST", "/api/approve", "Bearer tok_full")
         assert allowed
         assert result is not None
@@ -306,7 +306,7 @@ class TestCheckRequestScopes:
     def test_jwt_with_scopes(self):
         secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("u1", frozenset({"read", "write"}), "db", secret)
-        cfg = AuthConfig(enabled=True)
+        cfg = AuthConfig()
         allowed, status, msg, result = check_request(
             cfg,
             "POST",
@@ -321,7 +321,7 @@ class TestCheckRequestScopes:
     def test_jwt_insufficient_scope(self):
         secret = "test-secret-key-for-jwt-min-32b!"
         jwt_tok = create_jwt("u1", frozenset({"read"}), "db", secret)
-        cfg = AuthConfig(enabled=True)
+        cfg = AuthConfig()
         allowed, status, msg, _ = check_request(
             cfg,
             "POST",
@@ -333,7 +333,7 @@ class TestCheckRequestScopes:
         assert status == 403
 
     def test_admin_path_requires_approve(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_read": "read"})
         allowed, status, msg, _ = check_request(
             cfg,
             "GET",
@@ -345,7 +345,7 @@ class TestCheckRequestScopes:
 
     def test_backward_compat_role_full(self):
         """Config tokens with role='full' get all scopes."""
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         allowed, _, _, result = check_request(
             cfg,
             "GET",

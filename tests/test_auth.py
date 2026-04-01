@@ -206,27 +206,27 @@ class TestRequiredScope:
 
 class TestAuthConfig:
     def test_check_valid_full_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full", "tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_full": "full", "tok_read": "read"})
         assert cfg.check("tok_full") == "full"
 
     def test_check_valid_read_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full", "tok_read": "read"})
+        cfg = AuthConfig(tokens={"tok_full": "full", "tok_read": "read"})
         assert cfg.check("tok_read") == "read"
 
     def test_check_invalid_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         assert cfg.check("wrong") is None
 
     def test_check_none_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         assert cfg.check(None) is None
 
     def test_check_empty_token(self):
-        cfg = AuthConfig(enabled=True, tokens={"tok_full": "full"})
+        cfg = AuthConfig(tokens={"tok_full": "full"})
         assert cfg.check("") is None
 
     def test_check_no_tokens(self):
-        cfg = AuthConfig(enabled=True, tokens={})
+        cfg = AuthConfig(tokens={})
         assert cfg.check("anything") is None
 
 
@@ -354,24 +354,10 @@ class TestCheckRequest:
     """Tests for the main check_request() entry point."""
 
     @pytest.fixture()
-    def disabled(self):
-        return AuthConfig(enabled=False)
-
-    @pytest.fixture()
     def enabled(self):
         return AuthConfig(
-            enabled=True,
             tokens={"tok_full": "full", "tok_read": "read"},
         )
-
-    def test_disabled_allows_all(self, disabled):
-        allowed, status, msg, _result = check_request(disabled, "POST", "/api/send", None)
-        assert allowed is True
-        assert status == 200
-
-    def test_disabled_allows_no_header(self, disabled):
-        allowed, status, msg, _result = check_request(disabled, "GET", "/api/workstreams", None)
-        assert allowed is True
 
     def test_public_path_no_token_ok(self, enabled):
         allowed, status, msg, _result = check_request(enabled, "GET", "/health", None)
@@ -529,7 +515,6 @@ class TestCheckRequestWithCookie:
     @pytest.fixture()
     def enabled(self):
         return AuthConfig(
-            enabled=True,
             tokens={"tok_full": "full", "tok_read": "read"},
         )
 
@@ -625,31 +610,13 @@ class TestCheckRequestWithCookie:
 class TestLoadAuthConfig:
     """Tests for load_auth_config with mocked config + env vars."""
 
-    def test_default_enabled(self):
+    def test_default_no_tokens(self):
         with patch("turnstone.core.config.load_config", return_value={}):
             cfg = load_auth_config()
-        assert cfg.enabled is True
         assert cfg.tokens == {}
-
-    def test_explicit_disable(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={"enabled": False}),
-            patch.dict(os.environ, {}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert cfg.enabled is False
-
-    def test_env_disable(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_ENABLED": "0"}, clear=True),
-        ):
-            cfg = load_auth_config()
-        assert cfg.enabled is False
 
     def test_config_file_tokens(self):
         mock_cfg = {
-            "enabled": True,
             "tokens": [
                 {"value": "tok_a", "role": "full"},
                 {"value": "tok_b", "role": "read"},
@@ -660,16 +627,7 @@ class TestLoadAuthConfig:
             patch.dict(os.environ, {}, clear=True),
         ):
             cfg = load_auth_config()
-        assert cfg.enabled is True
         assert cfg.tokens == {"tok_a": "full", "tok_b": "read"}
-
-    def test_env_var_enabled(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_ENABLED": "1"}, clear=False),
-        ):
-            cfg = load_auth_config()
-        assert cfg.enabled is True
 
     def test_env_var_token(self):
         with (
@@ -682,7 +640,6 @@ class TestLoadAuthConfig:
 
     def test_config_plus_env_merge(self):
         mock_cfg = {
-            "enabled": True,
             "tokens": [{"value": "tok_cfg", "role": "read"}],
         }
         with (
@@ -695,7 +652,6 @@ class TestLoadAuthConfig:
 
     def test_invalid_role_skipped(self):
         mock_cfg = {
-            "enabled": True,
             "tokens": [
                 {"value": "tok_ok", "role": "full"},
                 {"value": "tok_bad", "role": "admin"},
@@ -711,7 +667,6 @@ class TestLoadAuthConfig:
 
     def test_empty_value_skipped(self):
         mock_cfg = {
-            "enabled": True,
             "tokens": [{"value": "", "role": "full"}],
         }
         with (
@@ -723,7 +678,6 @@ class TestLoadAuthConfig:
 
     def test_non_dict_token_entry_skipped(self):
         mock_cfg = {
-            "enabled": True,
             "tokens": ["not_a_dict", {"value": "tok_ok", "role": "full"}],
         }
         with (
@@ -732,22 +686,6 @@ class TestLoadAuthConfig:
         ):
             cfg = load_auth_config()
         assert cfg.tokens == {"tok_ok": "full"}
-
-    def test_env_enabled_true(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_ENABLED": "true"}, clear=False),
-        ):
-            cfg = load_auth_config()
-        assert cfg.enabled is True
-
-    def test_env_enabled_yes(self):
-        with (
-            patch("turnstone.core.config.load_config", return_value={}),
-            patch.dict(os.environ, {"TURNSTONE_AUTH_ENABLED": "yes"}, clear=False),
-        ):
-            cfg = load_auth_config()
-        assert cfg.enabled is True
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +730,6 @@ class TestServerAuth:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             auth_config=AuthConfig(
-                enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
             cors_origins=["*"],
@@ -924,7 +861,6 @@ class TestConsoleAuth:
         app = create_app(
             collector=mock_collector,
             auth_config=AuthConfig(
-                enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
         )
@@ -1010,7 +946,6 @@ class TestServerLogin:
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
             auth_config=AuthConfig(
-                enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
         )
@@ -1095,7 +1030,6 @@ class TestConsoleLogin:
         app = create_app(
             collector=mock_collector,
             auth_config=AuthConfig(
-                enabled=True,
                 tokens={"tok_full": "full", "tok_read": "read"},
             ),
         )
@@ -1424,7 +1358,7 @@ class TestCorsConfigurable:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(enabled=False),
+            auth_config=AuthConfig(),
         )
         client = TestClient(app)
         resp = client.get("/health", headers={"Origin": "http://evil.com"})
@@ -1446,7 +1380,7 @@ class TestCorsConfigurable:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(enabled=False),
+            auth_config=AuthConfig(),
             cors_origins=["http://example.com"],
         )
         client = TestClient(app)

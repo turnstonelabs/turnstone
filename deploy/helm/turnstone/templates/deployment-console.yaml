@@ -36,7 +36,7 @@ spec:
             - secretRef:
                 name: {{ include "turnstone.llm.secretName" . }}
                 optional: true
-          {{- if and .Values.auth.enabled .Values.auth.existingSecret }}
+          {{- if .Values.auth.existingSecret }}
           env:
             - name: TURNSTONE_AUTH_TOKEN
               valueFrom:

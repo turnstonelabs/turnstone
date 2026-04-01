@@ -529,9 +529,10 @@ role = "full"
 
 ### Environment variables
 
+Auth is always enabled.
+
 | Variable | Description |
 |----------|-------------|
-| `TURNSTONE_AUTH_ENABLED=1` | Enable authentication |
 | `TURNSTONE_AUTH_TOKEN=tok_xxx` | Register a config-file token with `full` access |
 | `TURNSTONE_JWT_SECRET=xxx` | JWT signing secret (must match across nodes) |
 | `TURNSTONE_CORS_ORIGINS=` | CORS allowed origins (comma-separated; empty = same-origin only) |

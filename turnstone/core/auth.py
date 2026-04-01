@@ -223,7 +223,6 @@ class AuthResult:
 class AuthConfig:
     """Auth configuration loaded once at startup (not modified after creation)."""
 
-    enabled: bool = False
     tokens: dict[str, str] = field(default_factory=dict)  # token_value → role
 
     def check(self, token: str | None) -> str | None:
@@ -405,13 +404,9 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
 def load_auth_config() -> AuthConfig:
     """Build :class:`AuthConfig` from ``config.toml`` ``[auth]`` + env vars.
 
-    Auth is **enabled by default**.  Set ``[auth] enabled = false`` or
-    ``TURNSTONE_AUTH_ENABLED=0`` to disable.
+    Auth is always enabled.
 
     Config format::
-
-        [auth]
-        enabled = false   # opt out
 
         [[auth.tokens]]
         value = "tok_abc123"
@@ -419,14 +414,11 @@ def load_auth_config() -> AuthConfig:
 
     Environment variables:
 
-    - ``TURNSTONE_AUTH_ENABLED=0`` — disables auth
-    - ``TURNSTONE_AUTH_ENABLED=1`` — enables auth (default)
     - ``TURNSTONE_AUTH_TOKEN=<token>`` — registers a single full-access token
     """
     from turnstone.core.config import load_config
 
     auth_cfg = load_config("auth")
-    enabled = bool(auth_cfg.get("enabled", True))
     tokens: dict[str, str] = {}
 
     # Tokens from config file (TOML array-of-tables)
@@ -436,21 +428,14 @@ def load_auth_config() -> AuthConfig:
         if value and role in ("read", "full"):
             tokens[value] = role
 
-    # Environment variable overrides
-    env_enabled = os.environ.get("TURNSTONE_AUTH_ENABLED", "").strip().lower()
-    if env_enabled in ("1", "true", "yes"):
-        enabled = True
-    elif env_enabled in ("0", "false", "no"):
-        enabled = False
-
     env_token = os.environ.get("TURNSTONE_AUTH_TOKEN", "").strip()
     if env_token:
         tokens[env_token] = "full"
 
-    if enabled and not tokens:
+    if not tokens:
         log.info("Auth enabled (no config tokens — use /api/auth/setup or turnstone-admin)")
 
-    return AuthConfig(enabled=enabled, tokens=tokens)
+    return AuthConfig(tokens=tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -550,9 +535,6 @@ def check_request(
 
     Returns ``(allowed, status_code, message, auth_result)``.
     """
-    if not auth_config.enabled:
-        return True, 200, "", None
-
     if is_public_path(path):
         return True, 200, "", None
 
@@ -1011,7 +993,6 @@ async def handle_auth_status(request: Request) -> Response:
     """Shared ``GET /api/auth/status`` handler — login UI state detection."""
     from starlette.responses import JSONResponse
 
-    auth_config = request.app.state.auth_config
     storage = getattr(request.app.state, "auth_storage", None)
 
     has_users = False
@@ -1027,9 +1008,9 @@ async def handle_auth_status(request: Request) -> Response:
     oidc_enabled = bool(oidc_config and oidc_config.enabled)
 
     resp: dict[str, Any] = {
-        "auth_enabled": auth_config.enabled,
+        "auth_enabled": True,
         "has_users": has_users,
-        "setup_required": auth_config.enabled and not has_users,
+        "setup_required": not has_users,
     }
     if oidc_enabled and oidc_config is not None:
         resp["oidc_enabled"] = True

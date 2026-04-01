@@ -72,11 +72,12 @@ All configuration is via environment variables in `.env` (copy from `.env.exampl
 
 ### Auth
 
+Auth is always enabled. Configure tokens and JWT secret for your deployment.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TURNSTONE_AUTH_ENABLED` | — | Set to `1` to require authentication |
-| `TURNSTONE_AUTH_TOKEN` | — | Config-file token for server/console (backward compat, works alongside JWT) |
-| `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required when using user identity / JWT auth) |
+| `TURNSTONE_AUTH_TOKEN` | — | Config-file token for server/console (works alongside JWT) |
+| `TURNSTONE_JWT_SECRET` | — | Secret key for signing JWTs (required) |
 
 ### Database
 

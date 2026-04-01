@@ -56,7 +56,7 @@
 # --- Auth (node, console) ---
 
 [auth]
-# enabled = true               # env: TURNSTONE_AUTH_ENABLED
+# Auth is always enabled.
 # jwt_secret = ""              # HS256 signing secret (min 32 bytes recommended)
                                # env: TURNSTONE_JWT_SECRET
 # token = ""                   # Static config token for full access

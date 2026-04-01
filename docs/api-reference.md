@@ -56,7 +56,7 @@ console.log(result.content);
 
 ## Authentication
 
-When auth is enabled (`[auth].enabled = true` or `TURNSTONE_AUTH_ENABLED=1`), all API endpoints except public paths require a valid token.
+Auth is always enabled. All API endpoints except public paths require a valid token.
 
 ### Sending Credentials
 

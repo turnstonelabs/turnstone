@@ -41,9 +41,7 @@ locals {
     },
   ]
 
-  auth_env = var.auth_token != "" ? [
-    { name = "TURNSTONE_AUTH_ENABLED", value = "true" },
-  ] : []
+  auth_env = []  # Auth is always enabled; no toggle needed
 
   auth_secrets = var.auth_token != "" ? [
     {

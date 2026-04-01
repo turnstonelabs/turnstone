@@ -6370,7 +6370,7 @@ def main() -> None:
     from turnstone.core.auth import load_auth_config, load_jwt_secret
 
     auth_config = load_auth_config()
-    jwt_secret = load_jwt_secret() if auth_config.enabled else ""
+    jwt_secret = load_jwt_secret()
 
     # Initialize storage early — the collector needs it for service discovery.
     auth_storage = None
@@ -6563,8 +6563,7 @@ def main() -> None:
     )
 
     log.info("Console starting on %s", console_url)
-    if auth_config.enabled:
-        log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
+    log.info("Auth: enabled (%d config token(s))", len(auth_config.tokens))
     print("Press Ctrl+C to stop.")
 
     import uvicorn

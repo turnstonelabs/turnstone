@@ -59,9 +59,8 @@ llm:
   apiKey: ""
   existingSecret: ""
 
-# -- Authentication
+# -- Authentication (always enabled)
 auth:
-  enabled: false
   token: ""
   existingSecret: ""
 
