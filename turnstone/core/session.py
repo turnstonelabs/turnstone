@@ -19,6 +19,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -160,6 +161,13 @@ _IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
 
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
+
+# Matches resource paths referenced in skill content (scripts/foo.py, etc.)
+_RESOURCE_PATH_RE = re.compile(
+    r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
+    r"(?:json|yaml|yml|toml|cfg|ini|py|sh|js|ts|md|txt)"
+    r"(?=[\s)\]}'\"`,;:\x60]|$)"
+)
 
 
 _TEMPLATE_VAR_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -417,6 +425,7 @@ class ChatSession:
         self._skill_name: str | None = skill
         self._skill_content: str | None = None
         self._skill_resources: dict[str, str] = {}
+        self._skill_resources_dir: str | None = None
         self._load_skills()
         self._init_system_messages()
         self._save_config()
@@ -583,6 +592,8 @@ class ChatSession:
             else:
                 self._skill_content = None
             self._skill_resources = {}
+        self._materialize_skill_resources()
+        self._validate_skill_resources()
 
     def set_skill(self, name: str | None) -> None:
         """Set or clear the active skill."""
@@ -612,6 +623,81 @@ class ChatSession:
         except Exception:
             log.warning("skill_resources.load_failed", skill_id=skill_id, exc_info=True)
             return {}
+
+    def _cleanup_skill_resources(self) -> None:
+        """Remove materialized skill resources from disk."""
+        d = self._skill_resources_dir
+        if d is not None:
+            shutil.rmtree(d, ignore_errors=True)
+            self._skill_resources_dir = None
+
+    def _materialize_skill_resources(self) -> None:
+        """Write skill resources to a temp directory for subprocess access."""
+        self._cleanup_skill_resources()
+        if not self._skill_resources:
+            return
+        base = tempfile.mkdtemp(prefix=f"skill-{self._ws_id[:8]}-")
+        written = 0
+        for rel_path, content in self._skill_resources.items():
+            normed = os.path.normpath(rel_path)
+            if not normed or normed == "." or normed.startswith(("..", "/")):
+                log.warning("skill_resources.bad_path", path=rel_path)
+                continue
+            if ".." in normed.split(os.sep):
+                log.warning("skill_resources.bad_path", path=rel_path)
+                continue
+            full = os.path.join(base, normed)
+            if not os.path.realpath(full).startswith(os.path.realpath(base)):
+                log.warning("skill_resources.path_escape", path=rel_path)
+                continue
+            try:
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w", encoding="utf-8") as f:
+                    f.write(content)
+                if normed.startswith("scripts/"):
+                    os.chmod(full, 0o755)
+                written += 1
+            except Exception:
+                log.warning("skill_resources.write_failed", path=rel_path, exc_info=True)
+        if written == 0:
+            shutil.rmtree(base, ignore_errors=True)
+            return
+        self._skill_resources_dir = base
+        log.info(
+            "skill_resources.materialized",
+            dir=base,
+            count=written,
+        )
+
+    def _skill_resource_env(self) -> dict[str, str]:
+        """Return extra env vars for bash when skill resources are materialized."""
+        if not self._skill_resources_dir:
+            return {}
+        env: dict[str, str] = {"SKILL_RESOURCES_DIR": self._skill_resources_dir}
+        scripts_dir = os.path.join(self._skill_resources_dir, "scripts")
+        if os.path.isdir(scripts_dir):
+            current_path = os.environ.get("PATH")
+            if current_path:
+                env["PATH"] = scripts_dir + os.pathsep + current_path
+            else:
+                env["PATH"] = scripts_dir
+        return env
+
+    def _validate_skill_resources(self) -> None:
+        """Warn if skill content references resource paths not in skill_resources."""
+        if not self._skill_content or not self._skill_name:
+            return
+        referenced = {os.path.normpath(p) for p in _RESOURCE_PATH_RE.findall(self._skill_content)}
+        if not referenced:
+            return
+        available = {os.path.normpath(p) for p in self._skill_resources}
+        missing = sorted(referenced - available)
+        if missing:
+            log.warning("skill_resources.missing", skill=self._skill_name, paths=missing)
+            self.ui.on_info(
+                f"Skill '{self._skill_name}' references {len(missing)} resource(s) "
+                f"not bundled: {', '.join(missing)}"
+            )
 
     # -- MCP tool refresh ----------------------------------------------------
 
@@ -747,6 +833,7 @@ class ChatSession:
             self._mcp_prompt_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
+        self._cleanup_skill_resources()
 
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
@@ -1090,6 +1177,12 @@ class ChatSession:
                     lines.append(
                         "Resource content omitted (total exceeds 8KB). "
                         "Resource files are listed above by path and size."
+                    )
+                if self._skill_resources_dir:
+                    lines.append(
+                        "\nResource files are materialized on disk. "
+                        "Scripts in scripts/ are on PATH and can be run by name. "
+                        "All files are under $SKILL_RESOURCES_DIR."
                     )
                 lines.append("</skill-resources>")
                 dev_parts.append("\n".join(lines))
@@ -4338,7 +4431,7 @@ class ChatSession:
                     stderr=subprocess.PIPE,
                     text=True,
                     start_new_session=True,
-                    env=scrubbed_env(),
+                    env=scrubbed_env(extra=self._skill_resource_env()),
                 )
                 with self._procs_lock:
                     self._active_procs.add(proc)
