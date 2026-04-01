@@ -56,7 +56,7 @@ JWT_AUD_CONSOLE = "turnstone-console"
 JWT_AUD_CHANNEL = "turnstone-channel"
 _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
-VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve"})
+VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve", "service"})
 
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 USERNAME_MAX_LEN = 64
@@ -72,10 +72,12 @@ def is_valid_username(username: str) -> bool:
 
 
 # Hierarchical: each scope implies all lower scopes.
+# "service" is a superset that grants full access + bypasses RBAC permission checks.
 SCOPE_HIERARCHY: dict[str, frozenset[str]] = {
     "read": frozenset({"read"}),
     "write": frozenset({"read", "write"}),
     "approve": frozenset({"read", "write", "approve"}),
+    "service": frozenset({"read", "write", "approve", "service"}),
 }
 
 # Map old role names to scope sets.
@@ -120,15 +122,14 @@ def require_permission(request: Request, permission: str) -> JSONResponse | None
     """Return a 403 JSONResponse if the user lacks *permission*, else None.
 
     Call from admin handlers after the middleware scope check passes.
-    Config-file tokens (no user_id) are treated as full-access.
+    Service tokens (scope ``service``) bypass permission checks.
     """
     from starlette.responses import JSONResponse
 
     auth_result: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
     if auth_result is None:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    # Config-file tokens (no user_id) are treated as full-access
-    if not auth_result.user_id:
+    if auth_result.has_scope("service"):
         return None
     if auth_result.has_permission(permission):
         return None

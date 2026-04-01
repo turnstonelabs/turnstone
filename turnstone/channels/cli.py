@@ -132,7 +132,7 @@ def main() -> None:
     if jwt_secret:
         from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, ServiceTokenManager
 
-        _scopes = frozenset({"read", "write", "approve"})
+        _scopes = frozenset({"read", "write", "approve", "service"})
         _console_mgr = ServiceTokenManager(
             user_id="channel-gateway",
             scopes=_scopes,

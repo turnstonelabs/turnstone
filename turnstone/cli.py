@@ -649,7 +649,7 @@ def _handle_cluster_command(cmd_line: str, console_url: str | None, auth_token: 
 
         _cluster_token_mgr = ServiceTokenManager(
             user_id="cli",
-            scopes=frozenset({"read", "write", "approve"}),
+            scopes=frozenset({"read", "write", "approve", "service"}),
             source="cli",
             secret=jwt_secret,
         )

@@ -272,7 +272,7 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
 
         mgr = ServiceTokenManager(
             user_id="admin-cli",
-            scopes=frozenset({"read", "write", "approve"}),
+            scopes=frozenset({"read", "write", "approve", "service"}),
             source="cli",
             secret=jwt_secret,
         )
