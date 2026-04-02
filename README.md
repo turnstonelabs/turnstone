@@ -7,9 +7,20 @@
 
 Multi-node AI orchestration platform. Deploy tool-using AI agents across a cluster of servers with direct HTTP routing, interactive interfaces, and enterprise governance.
 
-> **Beta — Use at your own risk.** APIs, configuration formats, and database schemas may change between versions without migration paths.
+<p align="center">
+  <img src="docs/assets/hero.png" alt="Turnstone console — multi-workstream AI orchestration with mermaid diagrams" width="960"/>
+</p>
 
 Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone) (*Arenaria interpres*) — a shorebird that flips stones to discover what's hiding underneath.
+
+### Release Tracks
+
+| Track | Install | Docker | Description |
+|-------|---------|--------|-------------|
+| **Stable** | `pip install turnstone` | `ghcr.io/turnstonelabs/turnstone:stable` | Production-grade. Bugfixes only. |
+| **Experimental** | `pip install turnstone --pre` | `ghcr.io/turnstonelabs/turnstone:experimental` | New features. May have rough edges. |
+
+See [docs/releasing.md](docs/releasing.md) for the full release process.
 
 ## What it does
 

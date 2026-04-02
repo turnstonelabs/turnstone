@@ -55,6 +55,9 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 WORKDIR /data
 RUN chown turnstone:turnstone /data
 
+# Workspace mount point — bind-mount a host directory here
+RUN mkdir -p /workspace && chown turnstone:turnstone /workspace
+
 USER turnstone
 
 ENTRYPOINT ["entrypoint.sh"]

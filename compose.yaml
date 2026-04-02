@@ -16,6 +16,7 @@ networks:
 
 volumes:
   turnstone-data:
+  workspace:
   postgres-data:
 
 services:
@@ -80,6 +81,7 @@ services:
       - "${SERVER_PORT:-8080}:8080"
     volumes:
       - turnstone-data:/data
+      - ${WORKSPACE_MOUNT:-workspace}:/workspace
     environment:
       - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-dummy}
@@ -201,6 +203,7 @@ services:
         $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
     volumes:
       - turnstone-data:/data
+      - ${WORKSPACE_MOUNT:-workspace}:/workspace
     environment: &cluster-server-env
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}

@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "stable/*"]
+    tags: ["v*"]
   pull_request:
-    branches: [main]
+    branches: [main, "stable/*"]
 
 jobs:
   lint:
@@ -25,8 +26,8 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.14"
-      - run: pip install mypy types-redis
-      - run: pip install -e ".[mq]"
+      - run: pip install mypy
+      - run: pip install -e ".[all]"
       - run: mypy turnstone/
 
   test:
@@ -39,7 +40,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[test,mq]"
+      - run: pip install -e ".[test]"
       - run: pytest tests/ -m "not live" --cov=turnstone --cov-report=term-missing --cov-report=xml -q
       - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         if: always()
@@ -68,7 +69,7 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
         with:
           python-version: "3.14"
-      - run: pip install -e ".[test,mq,postgres]"
+      - run: pip install -e ".[test,postgres]"
       - run: pytest tests/ -m "not live" --storage-backend=postgresql -q
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test

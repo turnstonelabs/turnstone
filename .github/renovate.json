@@ -83,7 +83,7 @@
     {
       "description": "Infrastructure dependencies",
       "groupName": "Infrastructure",
-      "matchPackageNames": ["structlog", "redis", "croniter", "discord.py"],
+      "matchPackageNames": ["structlog", "croniter", "discord.py"],
       "schedule": ["before 9am on the first day of the month"],
       "automerge": true,
       "matchUpdateTypes": ["patch"]
@@ -101,7 +101,6 @@
       "matchPackageNames": [
         "ruff",
         "mypy",
-        "types-redis",
         "pytest",
         "pytest-cov",
         "pre-commit"
