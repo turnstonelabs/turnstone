@@ -974,6 +974,7 @@ class TurnstoneConsole:
         ca_cert: str | None = None,
         client_cert: str | None = None,
         client_key: str | None = None,
+        token_factory: Callable[[], str] | None = None,
     ) -> None:
         self._runner = _SyncRunner()
         self._async = AsyncTurnstoneConsole(
@@ -983,6 +984,7 @@ class TurnstoneConsole:
             ca_cert=ca_cert,
             client_cert=client_cert,
             client_key=client_key,
+            token_factory=token_factory,
         )
 
     # -- cluster overview ----------------------------------------------------
