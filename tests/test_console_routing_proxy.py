@@ -60,12 +60,10 @@ def _make_app(
     router: Any = None,
 ) -> Any:
     from turnstone.console.server import _load_static, create_app
-    from turnstone.core.auth import AuthConfig
 
     _load_static()
     return create_app(
         collector=collector or _make_mock_collector(),
-        auth_config=AuthConfig(),
         jwt_secret=_TEST_JWT_SECRET,
         router=router,
     )

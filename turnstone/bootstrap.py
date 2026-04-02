@@ -163,8 +163,7 @@ Walk the user through setting up their deployment step by step:
 PostgreSQL is required for cluster mode.
 5. **Security**: Auth is always enabled and requires `TURNSTONE_JWT_SECRET`. \
 Use `generate_secret` for JWT secret and Postgres password. \
-Always set `TURNSTONE_JWT_SECRET` in the .env. Do NOT generate `TURNSTONE_AUTH_TOKEN` — \
-it is deprecated; users should create API tokens via the admin panel after setup. \
+Always set `TURNSTONE_JWT_SECRET` in the .env. \
 Ask for initial admin username and password. \
 If the user's deployment will use an external identity provider (Okta, Azure AD, Google, etc.), \
 offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \

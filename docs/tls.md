@@ -105,7 +105,7 @@ turnstone-admin tls-ca-cert --out ca.pem --console-url http://console:8080
 turnstone-admin tls-issue worker-1.internal --out /certs --console-url http://console:8080
 
 # List issued certs
-turnstone-admin tls-list --console-url http://console:8080 --auth-token $TOKEN
+turnstone-admin tls-list --console-url http://console:8080
 ```
 
 ### Console URL Discovery

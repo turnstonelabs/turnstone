@@ -98,7 +98,7 @@ def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
         scopes.add("read")
         return frozenset(scopes)
     for perm in permissions:
-        if perm in VALID_SCOPES:
+        if perm in VALID_SCOPES and perm != "service":
             scopes.update(SCOPE_HIERARCHY.get(perm, {perm}))
     # Any admin.* permission requires access to admin endpoints → approve scope
     if any(p.startswith("admin.") for p in permissions):
@@ -206,16 +206,6 @@ class AuthResult:
 
 
 # ---------------------------------------------------------------------------
-# AuthConfig
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AuthConfig:
-    """Auth configuration loaded once at startup (not modified after creation)."""
-
-
-# ---------------------------------------------------------------------------
 # Token generation and hashing
 # ---------------------------------------------------------------------------
 
@@ -302,10 +292,12 @@ def load_jwt_secret() -> str:
         raise SystemExit(1)
 
     if len(secret) < _MIN_SECRET_LENGTH:
-        log.warning(
-            "JWT secret is shorter than %d characters — consider using a stronger secret",
+        log.error(
+            "JWT secret must be at least %d characters. "
+            'Generate one with: python -c "import secrets; print(secrets.token_hex(32))"',
             _MIN_SECRET_LENGTH,
         )
+        raise SystemExit(1)
     return secret
 
 
@@ -377,16 +369,6 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
         token_source=source,
         permissions=perms,
     )
-
-
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-
-def load_auth_config() -> AuthConfig:
-    """Return an :class:`AuthConfig` instance.  Auth is always enabled."""
-    return AuthConfig()
 
 
 # ---------------------------------------------------------------------------

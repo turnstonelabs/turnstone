@@ -2449,7 +2449,6 @@ def create_app(
     global_listeners: list[queue.Queue[dict[str, Any]]],
     global_listeners_lock: threading.Lock,
     skip_permissions: bool,
-    auth_config: Any,
     jwt_secret: str = "",
     auth_storage: Any = None,
     health_monitor: Any = None,
@@ -2530,7 +2529,6 @@ def create_app(
     app.state.global_listeners = global_listeners
     app.state.global_listeners_lock = global_listeners_lock
     app.state.skip_permissions = skip_permissions
-    app.state.auth_config = auth_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.health_monitor = health_monitor
@@ -3007,10 +3005,9 @@ def main() -> None:
     _metrics.set_judge_enabled(judge_config.enabled if judge_config else False)
 
     # Auth config
-    from turnstone.core.auth import load_auth_config, load_jwt_secret
+    from turnstone.core.auth import load_jwt_secret
     from turnstone.core.storage import get_storage
 
-    auth_config = load_auth_config()
     jwt_secret = load_jwt_secret()
     log.info("Auth: enabled (JWT)")
 
@@ -3037,7 +3034,6 @@ def main() -> None:
         global_listeners=global_listeners,
         global_listeners_lock=global_listeners_lock,
         skip_permissions=_skip_perms,
-        auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=get_storage(),
         health_monitor=health_monitor,

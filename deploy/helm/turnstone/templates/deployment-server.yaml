@@ -41,11 +41,11 @@ spec:
           env:
             - name: TURNSTONE_DB_URL
               value: "postgresql+psycopg://$(TURNSTONE_DB_USER):$(POSTGRES_PASSWORD)@$(TURNSTONE_DB_HOST):$(TURNSTONE_DB_PORT)/$(TURNSTONE_DB_NAME)"
-          {{- if .Values.auth.existingSecret }}
+          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.auth.existingSecret }}
+                  name: {{ include "turnstone.auth.secretName" . }}
                   key: TURNSTONE_JWT_SECRET
           {{- end }}
           readinessProbe:

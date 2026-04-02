@@ -37,10 +37,9 @@ async def _handle_health(request: Request) -> JSONResponse:
 
 def _check_auth(request: Request) -> JSONResponse | None:
     """Validate the request's Authorization header.  Returns an error response or None."""
-    auth_token: str = getattr(request.app.state, "auth_token", "")
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
 
-    if not auth_token and not jwt_secret:
+    if not jwt_secret:
         log.warning("notify.auth_not_configured")
         return JSONResponse({"error": "authentication not configured"}, status_code=401)
 
@@ -50,15 +49,8 @@ def _check_auth(request: Request) -> JSONResponse | None:
 
     token = header[7:]
 
-    # Static token check
-    if auth_token:
-        import hmac
-
-        if hmac.compare_digest(token, auth_token):
-            return None
-
-    # JWT check
-    if jwt_secret and "." in token:
+    # JWT validation
+    if "." in token:
         from turnstone.core.auth import JWT_AUD_CHANNEL, validate_jwt
 
         result = validate_jwt(token, jwt_secret, audience=JWT_AUD_CHANNEL)
@@ -178,7 +170,6 @@ def create_channel_app(
     adapters: dict[str, ChannelAdapter],
     storage: StorageBackend,
     *,
-    auth_token: str = "",
     jwt_secret: str = "",
 ) -> Starlette:
     """Create the channel gateway HTTP application."""
@@ -195,7 +186,6 @@ def create_channel_app(
     )
     app.state.adapters = adapters
     app.state.storage = storage
-    app.state.auth_token = auth_token
     app.state.jwt_secret = jwt_secret
     return app
 

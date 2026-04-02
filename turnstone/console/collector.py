@@ -59,7 +59,6 @@ class ClusterCollector:
         storage: StorageBackend,
         discovery_interval: float = 60.0,
         http_timeout: float = 30.0,
-        auth_token: str = "",
         token_manager: ServiceTokenManager | None = None,
         tls_verify: Any = True,
         tls_cert: tuple[str, str] | None = None,
@@ -74,10 +73,6 @@ class ClusterCollector:
         self._console_metrics = console_metrics
         self._tls_verify = tls_verify
         self._tls_cert = tls_cert
-        # Static auth header — only used when no token_manager is present.
-        self._static_auth: dict[str, str] | None = None
-        if auth_token and token_manager is None:
-            self._static_auth = {"Authorization": f"Bearer {auth_token}"}
 
         self._lock = threading.Lock()
         self._nodes: dict[str, NodeSnapshot] = {}
@@ -165,7 +160,7 @@ class ClusterCollector:
         """Build auth headers for the current SSE connection."""
         if self._token_manager is not None:
             return {"Authorization": f"Bearer {self._token_manager.token}"}
-        return dict(self._static_auth) if self._static_auth else {}
+        return {}
 
     # -- SSE manager ---------------------------------------------------------
 

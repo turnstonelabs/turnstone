@@ -246,10 +246,10 @@ password) before OIDC is enabled. The setup wizard always works
 regardless of this setting because it is only available when zero users
 exist in the database.
 
-API token login (`POST /v1/api/auth/login` with a `ts_` token) and
-config-file tokens (`Authorization: Bearer tok_xxx`) continue to work
-regardless of this setting. OIDC-only mode affects password-based
-authentication only.
+API token login (`POST /v1/api/auth/login` with a `ts_` token)
+continues to work regardless of this setting. JWTs and API tokens are
+the supported authentication methods. OIDC-only mode affects
+password-based authentication only.
 
 ---
 

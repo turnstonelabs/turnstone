@@ -136,7 +136,7 @@ resource "aws_ecs_task_definition" "server" {
         { containerPort = 8080, protocol = "tcp" },
       ]
 
-      environment = concat(local.common_env, local.auth_env)
+      environment = local.common_env
       secrets     = concat(local.common_secrets, local.auth_secrets)
 
       logConfiguration = {
@@ -205,7 +205,7 @@ resource "aws_ecs_task_definition" "console" {
         { containerPort = 8090, protocol = "tcp" },
       ]
 
-      environment = concat(local.common_env, local.auth_env)
+      environment = local.common_env
       secrets     = concat(local.common_secrets, local.auth_secrets)
 
       logConfiguration = {

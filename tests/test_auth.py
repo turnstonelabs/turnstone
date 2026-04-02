@@ -9,13 +9,11 @@ import pytest
 
 from turnstone.core.auth import (
     WRITE_PATHS,
-    AuthConfig,
     _extract_bearer,
     _extract_cookie,
     check_request,
     create_jwt,
     is_public_path,
-    load_auth_config,
     make_clear_cookie,
     make_set_cookie,
     required_scope,
@@ -577,19 +575,6 @@ class TestCheckRequestWithCookie:
 
 
 # ---------------------------------------------------------------------------
-# TestLoadAuthConfig
-# ---------------------------------------------------------------------------
-
-
-class TestLoadAuthConfig:
-    """Tests for load_auth_config."""
-
-    def test_returns_auth_config(self):
-        cfg = load_auth_config()
-        assert isinstance(cfg, AuthConfig)
-
-
-# ---------------------------------------------------------------------------
 # Integration tests — actual HTTP server with auth enabled
 # ---------------------------------------------------------------------------
 
@@ -639,7 +624,6 @@ class TestServerAuth:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
             cors_origins=["*"],
         )
@@ -770,7 +754,6 @@ class TestConsoleAuth:
         }
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
         )
         cls.test_client = TestClient(app, raise_server_exceptions=False)
@@ -867,7 +850,6 @@ class TestServerLogin:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
             auth_storage=mock_storage,
         )
@@ -971,7 +953,6 @@ class TestConsoleLogin:
         cls._jwt_secret = "test-jwt-secret-minimum-32-chars!"
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=cls._jwt_secret,
             auth_storage=mock_storage,
         )
@@ -1267,25 +1248,19 @@ class TestIsSecureRequest:
 
 
 class TestSecretStrength:
-    def test_short_secret_warns(self, caplog):
-        import logging
+    def test_short_secret_exits(self):
+        import turnstone.core.auth as auth_mod
 
-        from turnstone.core.auth import _MIN_SECRET_LENGTH
-
-        with caplog.at_level(logging.WARNING, logger="turnstone.core.auth"):
-            import turnstone.core.auth as auth_mod
-
-            old = os.environ.get("TURNSTONE_JWT_SECRET", "")
-            os.environ["TURNSTONE_JWT_SECRET"] = "short"
-            try:
-                secret = auth_mod.load_jwt_secret()
-                assert secret == "short"
-                assert any(str(_MIN_SECRET_LENGTH) in r.message for r in caplog.records)
-            finally:
-                if old:
-                    os.environ["TURNSTONE_JWT_SECRET"] = old
-                else:
-                    os.environ.pop("TURNSTONE_JWT_SECRET", None)
+        old = os.environ.get("TURNSTONE_JWT_SECRET", "")
+        os.environ["TURNSTONE_JWT_SECRET"] = "short"
+        try:
+            with pytest.raises(SystemExit):
+                auth_mod.load_jwt_secret()
+        finally:
+            if old:
+                os.environ["TURNSTONE_JWT_SECRET"] = old
+            else:
+                os.environ.pop("TURNSTONE_JWT_SECRET", None)
 
     def test_missing_secret_exits(self):
         import turnstone.core.auth as auth_mod
@@ -1316,7 +1291,6 @@ class TestCorsConfigurable:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
         )
         client = TestClient(app)
         resp = client.get("/health", headers={"Origin": "http://evil.com"})
@@ -1338,7 +1312,6 @@ class TestCorsConfigurable:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             cors_origins=["http://example.com"],
         )
         client = TestClient(app)

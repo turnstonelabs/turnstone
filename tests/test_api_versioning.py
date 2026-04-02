@@ -45,7 +45,6 @@ class TestServerVersioning:
     def client(self):
         from starlette.testclient import TestClient
 
-        from turnstone.core.auth import AuthConfig
         from turnstone.server import create_app
 
         mock_mgr = MagicMock()
@@ -57,7 +56,6 @@ class TestServerVersioning:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False)
@@ -104,7 +102,6 @@ class TestConsoleVersioning:
 
         from turnstone.console.collector import ClusterCollector
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         collector = MagicMock(spec=ClusterCollector)
@@ -116,7 +113,6 @@ class TestConsoleVersioning:
         }
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False)

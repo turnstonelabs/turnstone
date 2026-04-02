@@ -614,7 +614,6 @@ class TestServerHealthMetrics:
         from starlette.testclient import TestClient
 
         import turnstone.server as srv_mod
-        from turnstone.core.auth import AuthConfig
         from turnstone.core.metrics import MetricsCollector
         from turnstone.core.workstream import WorkstreamState
 
@@ -649,7 +648,6 @@ class TestServerHealthMetrics:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         cls.client = TestClient(app, raise_server_exceptions=False)
@@ -791,7 +789,6 @@ class TestServerRateLimiting:
         from starlette.testclient import TestClient
 
         import turnstone.server as srv_mod
-        from turnstone.core.auth import AuthConfig
         from turnstone.core.metrics import MetricsCollector
         from turnstone.core.ratelimit import RateLimiter
         from turnstone.core.workstream import WorkstreamState
@@ -827,7 +824,6 @@ class TestServerRateLimiting:
             global_listeners=[],
             global_listeners_lock=threading.Lock(),
             skip_permissions=False,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
             rate_limiter=RateLimiter(enabled=True, rate=2.0, burst=3),
         )

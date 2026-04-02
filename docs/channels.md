@@ -321,11 +321,11 @@ The `services` table schema:
 ### Security
 
 - **Authentication** — the gateway's `POST /v1/api/notify` endpoint
-  requires authentication. Configure either `TURNSTONE_JWT_SECRET`
-  (the server mints JWTs with `aud: turnstone-channel` automatically)
-  or a static token via `--auth-token`. If neither is set, the
-  gateway fails closed and rejects all requests with 401. Server JWTs
-  (`aud: turnstone-server`) are rejected.
+  requires authentication. Configure `TURNSTONE_JWT_SECRET` so the
+  server can mint JWTs with `aud: turnstone-channel` automatically.
+  If the secret is not set, the gateway fails closed and rejects all
+  requests with 401. Server JWTs (`aud: turnstone-server`) are
+  rejected.
 - **Rate limit** — maximum 5 notifications per turn. The counter only
   increments on successful delivery, so failures don't consume the
   budget.

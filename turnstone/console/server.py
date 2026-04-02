@@ -5916,7 +5916,6 @@ def _seed_config_from_env(config_store: Any, storage: Any) -> None:
 def create_app(
     *,
     collector: ClusterCollector,
-    auth_config: Any,
     jwt_secret: str = "",
     auth_storage: Any = None,
     proxy_token_mgr: Any = None,
@@ -6256,7 +6255,6 @@ def create_app(
         lifespan=_lifespan,
     )
     app.state.collector = collector
-    app.state.auth_config = auth_config
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_token_mgr = proxy_token_mgr
@@ -6351,9 +6349,8 @@ def main() -> None:
 
     configure_logging_from_args(args, "console")
 
-    from turnstone.core.auth import load_auth_config, load_jwt_secret
+    from turnstone.core.auth import load_jwt_secret
 
-    auth_config = load_auth_config()
     jwt_secret = load_jwt_secret()
 
     # Initialize storage early — the collector needs it for service discovery.
@@ -6400,7 +6397,6 @@ def main() -> None:
 
     collector = ClusterCollector(
         storage=auth_storage,
-        auth_token="",
         token_manager=collector_token_mgr,
         router=router,
         console_metrics=console_metrics,
@@ -6505,6 +6501,7 @@ def main() -> None:
                     vnodes_per_unit=_rcs.get("ring.vnodes_per_unit", 150),
                     eager_migrate=_rcs.get("rebalancer.eager_migrate", False),
                     api_token="",
+                    token_manager=proxy_token_mgr,
                 )
                 log.info("rebalancer.configured")
         except Exception:
@@ -6512,7 +6509,6 @@ def main() -> None:
 
     app = create_app(
         collector=collector,
-        auth_config=auth_config,
         jwt_secret=jwt_secret,
         auth_storage=auth_storage,
         proxy_token_mgr=proxy_token_mgr,

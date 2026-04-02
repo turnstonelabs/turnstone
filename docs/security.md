@@ -280,8 +280,6 @@ and classifies the token:
 
 1. **Contains `.`** → JWT → validate HS256 signature and expiry
 2. **Starts with `ts_`** → API token → SHA-256 hash, database lookup
-3. **Otherwise** → config-file token → `hmac.compare_digest` against
-   each configured token
 
 If a session cookie is present and no `Authorization` header is sent,
 the cookie value is treated as a JWT (step 1).
@@ -461,8 +459,7 @@ distinguish proxied requests from direct logins in audit logs.
 
 When no user context is available (auth disabled, or internal requests),
 the proxy falls back to a `ServiceTokenManager` with service identity
-`console-proxy` and full scopes.  If `--auth-token` is provided, that
-static token is used as a final fallback.
+`console-proxy` and full scopes.
 
 ### Service-to-service authentication
 
@@ -549,8 +546,6 @@ and browsers enforce same-origin policy.
 
 ## Security Properties
 
-- **Timing-safe comparison** for config-file tokens via
-  `hmac.compare_digest` — no timing side-channel.
 - **Hash-based lookup** for API tokens — the database stores only
   SHA-256 hashes, eliminating timing attacks on token comparison.
 - **Local JWT validation** — no network call or database query needed

@@ -72,13 +72,6 @@ def main() -> None:
     parser.add_argument("--ssl-keyfile", default=None, help="SSL private key file")
     parser.add_argument("--ssl-ca-certs", default=None, help="SSL CA certs for client verification")
 
-    # -- Auth ----------------------------------------------------------------
-    parser.add_argument(
-        "--auth-token",
-        default=os.environ.get("TURNSTONE_CHANNEL_AUTH_TOKEN", ""),
-        help="Static auth token for /v1/api/notify (default: $TURNSTONE_CHANNEL_AUTH_TOKEN)",
-    )
-
     # -- Workstream defaults -------------------------------------------------
     parser.add_argument(
         "--model",
@@ -121,7 +114,6 @@ def main() -> None:
     )
 
     # -- Auth config ---------------------------------------------------------
-    auth_token = args.auth_token
     jwt_secret = os.environ.get("TURNSTONE_JWT_SECRET", "").strip()
 
     # Prefer auto-rotating service JWTs when jwt_secret is available.
@@ -151,7 +143,6 @@ def main() -> None:
         )
         _console_token_factory = lambda: _console_mgr.token  # noqa: E731
         _server_token_factory = lambda: _server_mgr.token  # noqa: E731
-        auth_token = ""  # don't also pass static token
 
     server_url: str = args.server_url
     console_url: str = args.console_url
@@ -242,7 +233,6 @@ def main() -> None:
             config,
             server_url,
             storage,
-            api_token=auth_token,
             console_url=console_url,
             console_token_factory=_console_token_factory,
             server_token_factory=_server_token_factory,
@@ -253,7 +243,6 @@ def main() -> None:
         channel_app = create_channel_app(
             adapters,  # type: ignore[arg-type]
             storage,
-            auth_token=auth_token,
             jwt_secret=jwt_secret,
         )
 

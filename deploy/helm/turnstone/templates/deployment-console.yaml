@@ -36,12 +36,12 @@ spec:
             - secretRef:
                 name: {{ include "turnstone.llm.secretName" . }}
                 optional: true
-          {{- if .Values.auth.existingSecret }}
+          {{- if or .Values.auth.existingSecret .Values.auth.jwtSecret }}
           env:
             - name: TURNSTONE_JWT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.auth.existingSecret }}
+                  name: {{ include "turnstone.auth.secretName" . }}
                   key: TURNSTONE_JWT_SECRET
           {{- end }}
           readinessProbe:

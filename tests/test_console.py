@@ -729,11 +729,8 @@ class TestConsoleHTTPEndpoints:
 
         _load_static()
 
-        from turnstone.core.auth import AuthConfig
-
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
@@ -972,12 +969,10 @@ class TestConsoleWorkstreamCreation:
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
 
@@ -1171,12 +1166,10 @@ class TestConsoleProxy:
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
@@ -1343,12 +1336,10 @@ class TestConsoleVersionEndpoints:
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         app = create_app(
             collector=mock_collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
@@ -1386,7 +1377,6 @@ class TestSharedStatic:
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         collector = MagicMock(spec=ClusterCollector)
@@ -1398,7 +1388,6 @@ class TestSharedStatic:
         }
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)
@@ -1504,7 +1493,6 @@ class TestProxySharedStatic:
         from starlette.testclient import TestClient
 
         from turnstone.console.server import _load_static, create_app
-        from turnstone.core.auth import AuthConfig
 
         _load_static()
         collector = MagicMock(spec=ClusterCollector)
@@ -1517,7 +1505,6 @@ class TestProxySharedStatic:
         collector.get_node_detail.return_value = None
         app = create_app(
             collector=collector,
-            auth_config=AuthConfig(),
             jwt_secret=_TEST_JWT_SECRET,
         )
         client = TestClient(app, raise_server_exceptions=False, headers=_TEST_AUTH_HEADERS)

@@ -1043,9 +1043,8 @@ Three hierarchical scopes control endpoint access:
 2. **Token extraction** — `Authorization: Bearer <token>` header first, then
    `turnstone_auth` cookie as fallback.
 3. **Token type detection** — dots in the token indicate JWT; `ts_` prefix
-   indicates API token; otherwise config-file token.
-4. **Validation** — JWT signature check, API token hash lookup in storage, or
-   config-token hmac comparison.
+   indicates API token.
+4. **Validation** — JWT signature check or API token hash lookup in storage.
 5. **Scope check** — `required_scope(method, path)` determines the minimum
    scope; the request is rejected with 403 if the token lacks it.
 6. **Context propagation** — on success, `ctx_user_id` is set so structured

@@ -8,7 +8,25 @@ import pytest
 from starlette.testclient import TestClient
 
 from turnstone.channels._http import create_channel_app
+from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
 from turnstone.core.storage._sqlite import SQLiteBackend
+
+_JWT_SECRET = "a" * 32
+
+
+def _make_jwt() -> str:
+    """Create a valid JWT for channel auth."""
+    return create_jwt(
+        user_id="system",
+        scopes=frozenset({"write"}),
+        source="service",
+        secret=_JWT_SECRET,
+        audience=JWT_AUD_CHANNEL,
+    )
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {_make_jwt()}"}
 
 
 @pytest.fixture
@@ -33,22 +51,22 @@ def no_auth_client(storage, mock_adapter):
 
 @pytest.fixture
 def client(storage, mock_adapter):
-    """Default client with static auth token configured."""
-    app = create_channel_app({"discord": mock_adapter}, storage, auth_token="test-secret-token")
+    """Default client with JWT auth configured."""
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
     return TestClient(app)
 
 
 @pytest.fixture
 def authed_client(storage, mock_adapter):
-    """Alias — same as client, for auth-specific test clarity."""
-    app = create_channel_app({"discord": mock_adapter}, storage, auth_token="test-secret-token")
+    """Alias -- same as client, for auth-specific test clarity."""
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
     return TestClient(app)
 
 
 @pytest.fixture
 def jwt_client(storage, mock_adapter):
     """Client with JWT auth configured."""
-    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret="a" * 32)
+    app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
     return TestClient(app)
 
 
@@ -58,9 +76,6 @@ class TestNotifyEndpoint:
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": "Bearer test-secret-token"}
-
     def test_direct_discord_target(self, client, mock_adapter):
         resp = client.post(
             "/v1/api/notify",
@@ -68,7 +83,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "discord", "channel_id": "123456"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -85,7 +100,7 @@ class TestNotifyEndpoint:
                 "message": "Hello!",
                 "title": "Alert",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 200
         mock_adapter.send.assert_called_once_with("123456", "**Alert**\nHello!")
@@ -101,7 +116,7 @@ class TestNotifyEndpoint:
                 "target": {"username": "testuser"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -116,7 +131,7 @@ class TestNotifyEndpoint:
                 "target": {"username": "nobody"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 404
         error = resp.json()["error"]
@@ -132,10 +147,10 @@ class TestNotifyEndpoint:
                 "target": {"username": "testuser"},
                 "message": "Hello!",
             },
-            headers={"Authorization": "Bearer test-secret-token"},
+            headers=_auth_headers(),
         )
         assert resp.status_code == 404
-        # Generic message — must not differentiate "not found" vs "no channels"
+        # Generic message -- must not differentiate "not found" vs "no channels"
         error = resp.json()["error"]
         assert "testuser" not in error
         assert "not found or has no linked channels" in error
@@ -144,7 +159,7 @@ class TestNotifyEndpoint:
         resp = client.post(
             "/v1/api/notify",
             json={"target": {"username": "x"}},
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 400
 
@@ -152,7 +167,7 @@ class TestNotifyEndpoint:
         resp = client.post(
             "/v1/api/notify",
             json={"message": "Hello!"},
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 400
 
@@ -163,7 +178,7 @@ class TestNotifyEndpoint:
                 "target": {"invalid": "field"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 400
 
@@ -175,7 +190,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "email", "channel_id": "test@example.com"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -189,7 +204,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "discord", "channel_id": "123456"},
                 "message": "Hello!",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 200
         results = resp.json()["results"]
@@ -201,7 +216,7 @@ class TestNotifyEndpoint:
             content=b"not json",
             headers={
                 "content-type": "application/json",
-                "Authorization": "Bearer test-secret-token",
+                "Authorization": f"Bearer {_make_jwt()}",
             },
         )
         assert resp.status_code == 400
@@ -214,7 +229,7 @@ class TestNotifyEndpoint:
                 "target": {"channel_type": "discord", "channel_id": "123"},
                 "message": "   ",
             },
-            headers=self._headers(),
+            headers=_auth_headers(),
         )
         assert resp.status_code == 400
 
@@ -256,30 +271,9 @@ class TestNotifyAuth:
         )
         assert resp.status_code == 401
 
-    def test_accept_valid_static_token(self, authed_client, mock_adapter):
-        """Requests with correct static token are accepted."""
-        resp = authed_client.post(
-            "/v1/api/notify",
-            json={
-                "target": {"channel_type": "discord", "channel_id": "123"},
-                "message": "Hello!",
-            },
-            headers={"Authorization": "Bearer test-secret-token"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["results"][0]["status"] == "sent"
-
     def test_accept_valid_jwt(self, jwt_client, mock_adapter):
         """Requests with a valid JWT for the channel audience are accepted."""
-        from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
-
-        token = create_jwt(
-            user_id="system",
-            scopes=frozenset({"write"}),
-            source="service",
-            secret="a" * 32,
-            audience=JWT_AUD_CHANNEL,
-        )
+        token = _make_jwt()
         resp = jwt_client.post(
             "/v1/api/notify",
             json={
@@ -292,13 +286,11 @@ class TestNotifyAuth:
 
     def test_reject_jwt_wrong_audience(self, jwt_client):
         """JWTs with wrong audience are rejected."""
-        from turnstone.core.auth import create_jwt
-
         token = create_jwt(
             user_id="system",
             scopes=frozenset({"write"}),
             source="service",
-            secret="a" * 32,
+            secret=_JWT_SECRET,
             audience="turnstone-server",  # wrong audience
         )
         resp = jwt_client.post(
@@ -313,8 +305,6 @@ class TestNotifyAuth:
 
     def test_reject_jwt_wrong_secret(self, jwt_client):
         """JWTs signed with wrong secret are rejected."""
-        from turnstone.core.auth import JWT_AUD_CHANNEL, create_jwt
-
         token = create_jwt(
             user_id="system",
             scopes=frozenset({"write"}),

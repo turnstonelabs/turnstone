@@ -64,6 +64,7 @@ class Rebalancer:
         lock_ttl: int = 120,
         eager_migrate: bool = False,
         api_token: str = "",
+        token_manager: Any = None,
     ) -> None:
         self._storage = storage
         self._router = router
@@ -75,6 +76,7 @@ class Rebalancer:
         self._lock_ttl = lock_ttl
         self._eager_migrate = eager_migrate
         self._api_token = api_token
+        self._token_manager = token_manager
         self._stop_event = threading.Event()
         self._trigger_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -530,7 +532,9 @@ class Rebalancer:
             return 0
 
         headers: dict[str, str] = {}
-        if self._api_token:
+        if self._token_manager is not None:
+            headers["Authorization"] = f"Bearer {self._token_manager.token}"
+        elif self._api_token:
             headers["Authorization"] = f"Bearer {self._api_token}"
 
         migrated = 0
