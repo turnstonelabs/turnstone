@@ -193,7 +193,6 @@ Plan review requests are displayed as a blue embed with:
 | `--auto-approve` | — | `false` | Auto-approve ALL tool calls (skips approval buttons entirely) |
 | `--http-host` | — | `127.0.0.1` | HTTP server bind address for notify endpoint |
 | `--http-port` | `TURNSTONE_CHANNEL_PORT` | `8091` | HTTP server port |
-| `--auth-token` | `TURNSTONE_CHANNEL_AUTH_TOKEN` | — | Static auth token for `/v1/api/notify` (alternative to JWT) |
 | `--log-level` | `TURNSTONE_LOG_LEVEL` | `INFO` | Log level |
 | `--log-format` | `TURNSTONE_LOG_FORMAT` | `auto` | Log format (`auto`/`json`/`text`) |
 

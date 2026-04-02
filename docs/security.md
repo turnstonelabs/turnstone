@@ -132,15 +132,6 @@ The API token is hashed, looked up in the database, and exchanged for a
 JWT with the token's scopes. This is the recommended flow for SDKs and
 automated clients that need cookie-based sessions.
 
-### Config-file tokens (direct)
-
-Config tokens are validated per-request via `hmac.compare_digest`. No
-login exchange is needed — include the token as a `Bearer` header:
-
-```
-Authorization: Bearer tok_legacy
-```
-
 ### First-time setup
 
 When no users exist in the database:
@@ -259,7 +250,7 @@ Setting `TURNSTONE_OIDC_PASSWORD_ENABLED=false` hides the password
 form on the login page and blocks password-based login at the API
 level. The setup wizard always works regardless of this setting — the
 first admin user is created with a password before OIDC is relevant.
-API tokens and config-file tokens are unaffected by this setting.
+API tokens are unaffected by this setting.
 
 #### Known limitations
 
@@ -313,16 +304,10 @@ deployments.
 | Signing secret | `[auth] jwt_secret` | `TURNSTONE_JWT_SECRET` | Auto-generated ephemeral (warning logged) |
 | Expiry | `[auth] jwt_expiry_hours` | — | 24 hours |
 | Algorithm | — | — | HS256 (not configurable) |
-| Minimum secret length | — | — | 32 characters (warning if shorter) |
+| Minimum secret length | — | — | 32 characters (exits if shorter) |
 
-All service nodes that need to validate JWTs must share the same signing
-secret. If no secret is configured, an ephemeral key is generated at
-startup and a warning is logged — JWTs will not survive restarts or work
-across nodes.
-
-The console **requires** `TURNSTONE_JWT_SECRET` when no `--auth-token`
-is provided. It exits with an error if the secret is missing, since
-ephemeral secrets would silently break inter-service communication.
+All services require `TURNSTONE_JWT_SECRET` and exit at startup if it is
+missing or shorter than 32 characters.
 
 ---
 
@@ -423,16 +408,15 @@ Console (cluster-wide)              Server (per-node)
 ┌──────────────────────┐           ┌──────────────────────┐
 │ User/Token CRUD (DB) │           │ JWT validation only  │
 │ Login: creds → JWT   │           │ (shared signing key) │
-│ Admin API endpoints  │           │ Config tokens: hmac  │
-│ Storage: users,      │           │ No auth DB needed    │
+│ Admin API endpoints  │           │ No auth DB needed    │
+│ Storage: users,      │           │                      │
 │   api_tokens tables  │           │                      │
 └──────────────────────┘           └──────────────────────┘
 ```
 
 The console owns the credential database and handles all user/token
 CRUD.  Individual server nodes only need the JWT signing secret to
-validate session tokens.  Config-file tokens are validated locally
-without any database.
+validate session tokens.
 
 ### Proxy auth forwarding
 
