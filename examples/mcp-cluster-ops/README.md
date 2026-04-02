@@ -1,10 +1,14 @@
 # MCP Cluster Ops
 
-An MCP server that exposes tools for executing commands across a [Turnstone](https://github.com/turnstonelabs/turnstone) cluster. Serves as a reference implementation for both MCP server patterns and Turnstone SDK usage.
+An MCP server that exposes tools for executing commands across a Turnstone cluster. Serves as a reference implementation for both MCP server patterns and Turnstone SDK usage.
 
 ## How it works
 
-This server uses Turnstone's SDK client (`TurnstoneServer`) to dispatch shell commands to specific nodes via HTTP. Remote agents execute the command and the raw bash output is captured directly from the `ToolResultEvent` stream — bypassing the costly "agent reads output → re-generates output as completion tokens" round-trip.
+This server uses the Turnstone console SDK (`TurnstoneConsole`) for node discovery and routing, and `TurnstoneServer` for per-node SSE streaming. The dispatch flow for each command is:
+
+1. **Route** — `TurnstoneConsole.route_create_workstream(target_node=..., auto_approve=True)` creates a workstream pinned to the target node via the console's hash-ring routing proxy, returning `ws_id` and `node_url`.
+2. **Execute** — `TurnstoneServer(node_url).send_and_wait(prompt, ws_id)` connects directly to the node's SSE stream. The remote agent runs the command and the raw bash output is captured from the `ToolResultEvent` — bypassing the costly "agent reads output then re-generates output as completion tokens" round-trip.
+3. **Cleanup** — `TurnstoneConsole.route_close(ws_id)` closes the workstream.
 
 Multi-node dispatches run in parallel via `asyncio.gather`, so total wall time is bounded by the slowest node rather than the sum.
 
@@ -19,7 +23,7 @@ Multi-node dispatches run in parallel via `asyncio.gather`, so total wall time i
 
 ## Prerequisites
 
-- A running Turnstone cluster (at least one `turnstone-server`)
+- A running Turnstone cluster with at least one `turnstone-server` and a `turnstone-console`
 - Python 3.11+
 
 ## Installation
@@ -35,8 +39,8 @@ pip install -e ./examples/mcp-cluster-ops
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL |
-| `TURNSTONE_API_TOKEN` | _(none)_ | API token for authentication |
+| `TURNSTONE_CONSOLE_URL` | `http://localhost:8090` | Console URL for node discovery and routing |
+| `TURNSTONE_API_TOKEN` | _(none)_ | API token / JWT for authentication |
 | `MCP_CLUSTER_OPS_TIMEOUT` | `120` | Default command timeout (seconds, clamped 5-3600) |
 | `MCP_CLUSTER_OPS_MAX_OUTPUT` | `8192` | Max output bytes per node (0 = unlimited) |
 | `MCP_CLUSTER_OPS_MAX_NODES` | `32` | Max concurrent node dispatches |
@@ -51,7 +55,7 @@ pip install -e ./examples/mcp-cluster-ops
 command = "mcp-cluster-ops"
 
 [mcp.servers.cluster-ops.env]
-TURNSTONE_SERVER_URL = "http://turnstone.example.com:8080"
+TURNSTONE_CONSOLE_URL = "http://console.example.com:8090"
 ```
 
 **JSON** (via `--mcp-config`):
@@ -62,7 +66,7 @@ TURNSTONE_SERVER_URL = "http://turnstone.example.com:8080"
     "cluster-ops": {
       "command": "mcp-cluster-ops",
       "env": {
-        "TURNSTONE_SERVER_URL": "http://turnstone.example.com:8080"
+        "TURNSTONE_CONSOLE_URL": "http://console.example.com:8090"
       }
     }
   }

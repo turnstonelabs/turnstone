@@ -1,7 +1,8 @@
 """MCP server for Turnstone cluster operations.
 
 Exposes tools to execute commands on specific nodes in a Turnstone cluster.
-Uses the SDK client (``TurnstoneServer``) for direct node targeting via HTTP.
+Uses the SDK console client (``TurnstoneConsole``) for node discovery and
+routing, and ``TurnstoneServer`` for per-node SSE streaming.
 
 Usage::
 
@@ -14,12 +15,12 @@ Configure in ``~/.config/turnstone/config.toml``::
     command = "mcp-cluster-ops"
 
     [mcp.servers.cluster-ops.env]
-    TURNSTONE_SERVER_URL = "http://localhost:8080"
+    TURNSTONE_CONSOLE_URL = "http://localhost:8090"
 
 Environment variables
 ---------------------
-TURNSTONE_SERVER_URL        Server URL (default: http://localhost:8080)
-TURNSTONE_API_TOKEN         API token for authentication (default: none)
+TURNSTONE_CONSOLE_URL       Console URL (default: http://localhost:8090)
+TURNSTONE_API_TOKEN         API token / JWT for authentication (default: none)
 MCP_CLUSTER_OPS_TIMEOUT     Default command timeout in seconds (default: 120)
 MCP_CLUSTER_OPS_MAX_OUTPUT  Max output bytes per node (default: 8192, 0=unlimited)
 
@@ -43,7 +44,7 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import Context, FastMCP
-from turnstone.sdk import TurnResult, TurnstoneServer
+from turnstone.sdk import TurnResult, TurnstoneConsole, TurnstoneServer
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -66,15 +67,12 @@ _MAX_TIMEOUT = 3600
 # ---------------------------------------------------------------------------
 
 
-def _server_kwargs() -> dict[str, Any]:
-    """Build TurnstoneServer connection kwargs from environment variables."""
-    kwargs: dict[str, Any] = {
-        "base_url": os.environ.get("TURNSTONE_SERVER_URL", "http://localhost:8080"),
+def _console_kwargs() -> dict[str, Any]:
+    """Build TurnstoneConsole connection kwargs from environment variables."""
+    return {
+        "base_url": os.environ.get("TURNSTONE_CONSOLE_URL", "http://localhost:8090"),
+        "token": os.environ.get("TURNSTONE_API_TOKEN", ""),
     }
-    token = os.environ.get("TURNSTONE_API_TOKEN")
-    if token:
-        kwargs["token"] = token
-    return kwargs
 
 
 def _exec_prompt(command: str) -> str:
@@ -141,6 +139,11 @@ def _validate_command(command: str) -> str | None:
     return None
 
 
+def _extract_node_ids(nodes: list[dict[str, Any]]) -> list[str]:
+    """Extract unique, non-empty node IDs from a list of node dicts."""
+    return list(dict.fromkeys(n["node_id"].strip() for n in nodes if n.get("node_id", "").strip()))
+
+
 def _format_node_result(
     node_id: str,
     result: TurnResult,
@@ -165,12 +168,12 @@ def _format_node_result(
 
 
 # ---------------------------------------------------------------------------
-# Core dispatch functions (testable with mocked TurnstoneServer)
+# Core dispatch functions (testable with mocked SDK clients)
 # ---------------------------------------------------------------------------
 
 
 def _exec_on_node_sync(
-    server_kw: dict[str, Any],
+    console_kw: dict[str, Any],
     node_id: str,
     command: str,
     timeout: float,
@@ -178,22 +181,35 @@ def _exec_on_node_sync(
     """Dispatch *command* to *node_id* and block until complete.
 
     Runs inside ``asyncio.to_thread`` so it does not block the event loop.
-    Each call creates its own ``TurnstoneServer`` client to avoid state
-    conflicts between concurrent dispatches.
+
+    Flow:
+      1. Create a workstream on the target node via the console routing proxy
+      2. Connect directly to the node's SSE stream to send + collect output
+      3. Close the workstream via the routing proxy
     """
     prompt = _exec_prompt(command)
-    with TurnstoneServer(**server_kw) as client:
-        result = client.send_and_wait(
-            message=prompt,
-            target_node=node_id,
-            auto_approve=True,
-            timeout=timeout,
-        )
+    ws_id = ""
+    with TurnstoneConsole(**console_kw) as console:
+        try:
+            route_resp = console.route_create_workstream(
+                target_node=node_id,
+                auto_approve=True,
+            )
+            ws_id = route_resp["ws_id"]
+            node_url: str = route_resp["node_url"]
+            with TurnstoneServer(
+                base_url=node_url,
+                token=console_kw["token"],
+            ) as server:
+                result = server.send_and_wait(prompt, ws_id, timeout=timeout)
+        finally:
+            if ws_id:
+                console.route_close(ws_id)
     return node_id, result
 
 
 async def _dispatch_parallel(
-    server_kw: dict[str, Any],
+    console_kw: dict[str, Any],
     node_ids: list[str],
     command: str,
     timeout: float,
@@ -204,7 +220,7 @@ async def _dispatch_parallel(
     Total wall time is bounded by the slowest node.
     """
     tasks = [
-        asyncio.to_thread(_exec_on_node_sync, server_kw, nid, command, timeout) for nid in node_ids
+        asyncio.to_thread(_exec_on_node_sync, console_kw, nid, command, timeout) for nid in node_ids
     ]
     outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -220,16 +236,16 @@ async def _dispatch_parallel(
     return results
 
 
-def _list_nodes_sync(server_kw: dict[str, Any]) -> list[dict[str, Any]]:
+def _list_nodes_sync(console_kw: dict[str, Any]) -> list[dict[str, Any]]:
     """List active cluster nodes (blocking)."""
-    with TurnstoneServer(**server_kw) as client:
-        nodes: list[dict[str, Any]] = client.list_nodes()
-        return nodes
+    with TurnstoneConsole(**console_kw) as console:
+        resp = console.nodes()
+        return [n.model_dump() for n in resp.nodes]
 
 
-async def _list_nodes_impl(server_kw: dict[str, Any]) -> list[dict[str, Any]]:
+async def _list_nodes_impl(console_kw: dict[str, Any]) -> list[dict[str, Any]]:
     """List active cluster nodes."""
-    return await asyncio.to_thread(_list_nodes_sync, server_kw)
+    return await asyncio.to_thread(_list_nodes_sync, console_kw)
 
 
 # ---------------------------------------------------------------------------
@@ -239,9 +255,9 @@ async def _list_nodes_impl(server_kw: dict[str, Any]) -> list[dict[str, Any]]:
 
 @asynccontextmanager
 async def _lifespan(server: FastMCP[dict[str, Any]]) -> AsyncIterator[dict[str, Any]]:
-    """Lifespan context — stores server connection kwargs for tool handlers."""
-    kw = _server_kwargs()
-    yield {"server_kwargs": kw}
+    """Lifespan context — stores console connection kwargs for tool handlers."""
+    kw = _console_kwargs()
+    yield {"console_kwargs": kw}
 
 
 mcp = FastMCP(
@@ -263,8 +279,8 @@ async def list_nodes(ctx: Context[Any, Any, Any]) -> str:
     Call this before dispatching work to discover available node IDs.
     Returns a JSON array of node metadata objects.
     """
-    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
-    nodes = await _list_nodes_impl(server_kw)
+    console_kw: dict[str, Any] = ctx.request_context.lifespan_context["console_kwargs"]
+    nodes = await _list_nodes_impl(console_kw)
     return json.dumps(nodes, indent=2)
 
 
@@ -291,13 +307,16 @@ async def run_on_node(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
+    console_kw: dict[str, Any] = ctx.request_context.lifespan_context["console_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
     log.info("run_on_node node=%s cmd=%r", node_id, command)
-    _, result = await asyncio.to_thread(
-        _exec_on_node_sync, server_kw, node_id, command, _clamp_timeout(timeout)
-    )
+    try:
+        _, result = await asyncio.to_thread(
+            _exec_on_node_sync, console_kw, node_id, command, _clamp_timeout(timeout)
+        )
+    except Exception as exc:
+        return json.dumps({"node": node_id, "ok": False, "error": str(exc)}, indent=2)
     formatted = _format_node_result(node_id, result, max_output)
     return json.dumps(formatted, indent=2)
 
@@ -323,7 +342,7 @@ async def run_on_nodes(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
+    console_kw: dict[str, Any] = ctx.request_context.lifespan_context["console_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
     clean_ids = list(dict.fromkeys(nid.strip() for nid in node_ids if nid.strip()))
@@ -336,7 +355,7 @@ async def run_on_nodes(
 
     log.info("run_on_nodes nodes=%s cmd=%r", clean_ids, command)
     results = await _dispatch_parallel(
-        server_kw, clean_ids, command, _clamp_timeout(timeout), max_output
+        console_kw, clean_ids, command, _clamp_timeout(timeout), max_output
     )
     return json.dumps(results, indent=2)
 
@@ -361,18 +380,14 @@ async def run_on_all_nodes(
     if cmd_err:
         return json.dumps({"error": cmd_err})
 
-    server_kw: dict[str, Any] = ctx.request_context.lifespan_context["server_kwargs"]
+    console_kw: dict[str, Any] = ctx.request_context.lifespan_context["console_kwargs"]
     max_output = _DEFAULT_MAX_OUTPUT
 
-    nodes = await _list_nodes_impl(server_kw)
+    nodes = await _list_nodes_impl(console_kw)
     if not nodes:
         return json.dumps({"error": "No active nodes found in cluster"})
 
-    node_ids = list(
-        dict.fromkeys(
-            nid.strip() for n in nodes if (nid := n.get("node_id") or n.get("id")) and nid.strip()
-        )
-    )
+    node_ids = _extract_node_ids(nodes)
     if not node_ids:
         return json.dumps({"error": "No nodes with identifiable IDs found"})
     if len(node_ids) > _MAX_CONCURRENT_NODES:
@@ -381,7 +396,7 @@ async def run_on_all_nodes(
         )
     log.info("run_on_all_nodes nodes=%s cmd=%r", node_ids, command)
     results = await _dispatch_parallel(
-        server_kw, node_ids, command, _clamp_timeout(timeout), max_output
+        console_kw, node_ids, command, _clamp_timeout(timeout), max_output
     )
     return json.dumps(results, indent=2)
 

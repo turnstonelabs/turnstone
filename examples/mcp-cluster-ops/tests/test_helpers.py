@@ -7,6 +7,7 @@ from turnstone.sdk import TurnResult
 from mcp_cluster_ops.server import (
     _clamp_timeout,
     _exec_prompt,
+    _extract_node_ids,
     _extract_output,
     _format_node_result,
     _truncate,
@@ -190,3 +191,53 @@ class TestClampTimeout:
 
     def test_negative(self):
         assert _clamp_timeout(-1) == 5.0
+
+
+# ---------------------------------------------------------------------------
+# _extract_node_ids
+# ---------------------------------------------------------------------------
+
+
+class TestExtractNodeIds:
+    def test_normal(self):
+        nodes = [
+            {"node_id": "a", "server_url": "http://a:8080"},
+            {"node_id": "b", "server_url": "http://b:8080"},
+        ]
+        assert _extract_node_ids(nodes) == ["a", "b"]
+
+    def test_deduplicates(self):
+        nodes = [
+            {"node_id": "a"},
+            {"node_id": "a"},
+            {"node_id": "b"},
+        ]
+        assert _extract_node_ids(nodes) == ["a", "b"]
+
+    def test_strips_whitespace(self):
+        nodes = [{"node_id": "  a  "}, {"node_id": "b "}]
+        assert _extract_node_ids(nodes) == ["a", "b"]
+
+    def test_skips_empty(self):
+        nodes = [
+            {"node_id": "a"},
+            {"node_id": ""},
+            {"node_id": "  "},
+            {"node_id": "b"},
+        ]
+        assert _extract_node_ids(nodes) == ["a", "b"]
+
+    def test_skips_missing_key(self):
+        nodes = [
+            {"node_id": "a"},
+            {"server_url": "http://orphan:8080"},
+            {"node_id": "b"},
+        ]
+        assert _extract_node_ids(nodes) == ["a", "b"]
+
+    def test_empty_list(self):
+        assert _extract_node_ids([]) == []
+
+    def test_all_empty_ids(self):
+        nodes = [{"node_id": ""}, {"node_id": "  "}]
+        assert _extract_node_ids(nodes) == []
