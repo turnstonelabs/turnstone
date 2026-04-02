@@ -95,6 +95,7 @@ class WebUI:
         self._pending_approval: dict[str, Any] | None = None  # re-sent on SSE reconnect
         self._plan_event = threading.Event()
         self._plan_result: str = ""
+        self._pending_plan_review: dict[str, Any] | None = None  # re-sent on SSE reconnect
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
         # Per-workstream metrics accumulators (written by worker thread, read by metrics handler)
@@ -476,10 +477,12 @@ class WebUI:
 
     def on_plan_review(self, content: str) -> str:
         self._plan_event.clear()
-        self._enqueue({"type": "plan_review", "content": content})
+        self._pending_plan_review = {"type": "plan_review", "content": content}
+        self._enqueue(self._pending_plan_review)
         if not self._plan_event.wait(timeout=3600):
             log.warning("Plan review timed out for ws_id=%s", self.ws_id)
             self._plan_result = ""
+        self._pending_plan_review = None
         return self._plan_result
 
     def on_info(self, message: str) -> None:
@@ -621,6 +624,7 @@ class WebUI:
 
     def resolve_plan(self, feedback: str) -> None:
         """Called by the HTTP handler when the user responds to a plan."""
+        self._pending_plan_review = None
         self._plan_result = feedback
         self._plan_event.set()
 
@@ -900,9 +904,11 @@ async def events_sse(request: Request) -> Response:
         history = _build_history(session, has_pending_approval=ui._pending_approval is not None)
         if history:
             yield {"data": json.dumps({"type": "history", "messages": history})}
-        # Re-inject pending approval
+        # Re-inject pending approval or plan review
         if ui._pending_approval is not None:
             yield {"data": json.dumps(ui._pending_approval)}
+        if ui._pending_plan_review is not None:
+            yield {"data": json.dumps(ui._pending_plan_review)}
 
         _metrics.record_sse_connect()
         try:
