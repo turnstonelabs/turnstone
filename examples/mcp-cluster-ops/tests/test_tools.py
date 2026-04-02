@@ -46,6 +46,7 @@ class TestListNodesImpl:
 
         mock_resp = MagicMock()
         mock_resp.nodes = [mock_node_a, mock_node_b]
+        mock_resp.total = 2
 
         with patch("mcp_cluster_ops.server.TurnstoneConsole") as mock_cls:
             mock_client = MagicMock()
@@ -60,6 +61,7 @@ class TestListNodesImpl:
     def test_empty_cluster(self):
         mock_resp = MagicMock()
         mock_resp.nodes = []
+        mock_resp.total = 0
 
         with patch("mcp_cluster_ops.server.TurnstoneConsole") as mock_cls:
             mock_client = MagicMock()
@@ -68,6 +70,39 @@ class TestListNodesImpl:
 
             result = asyncio.run(_list_nodes_impl(_CONSOLE_KW))
             assert result == []
+
+    def test_paginates_large_clusters(self):
+        """Clusters with >100 nodes are fetched across multiple pages."""
+
+        def _make_node(nid: str) -> MagicMock:
+            m = MagicMock()
+            m.model_dump.return_value = {"node_id": nid}
+            return m
+
+        page1_nodes = [_make_node(f"n-{i}") for i in range(100)]
+        page2_nodes = [_make_node(f"n-{i}") for i in range(100, 150)]
+
+        page1_resp = MagicMock()
+        page1_resp.nodes = page1_nodes
+        page1_resp.total = 150
+
+        page2_resp = MagicMock()
+        page2_resp.nodes = page2_nodes
+        page2_resp.total = 150
+
+        with patch("mcp_cluster_ops.server.TurnstoneConsole") as mock_cls:
+            mock_client = MagicMock()
+            mock_client.nodes.side_effect = [page1_resp, page2_resp]
+            _mock_console_ctx(mock_cls, mock_client)
+
+            result = asyncio.run(_list_nodes_impl(_CONSOLE_KW))
+            assert len(result) == 150
+            assert result[0]["node_id"] == "n-0"
+            assert result[149]["node_id"] == "n-149"
+            assert mock_client.nodes.call_count == 2
+            # Verify offset was passed correctly
+            mock_client.nodes.assert_any_call(limit=100, offset=0)
+            mock_client.nodes.assert_any_call(limit=100, offset=100)
 
 
 # ---------------------------------------------------------------------------

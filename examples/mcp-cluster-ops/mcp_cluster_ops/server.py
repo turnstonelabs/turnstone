@@ -237,10 +237,16 @@ async def _dispatch_parallel(
 
 
 def _list_nodes_sync(console_kw: dict[str, Any]) -> list[dict[str, Any]]:
-    """List active cluster nodes (blocking)."""
+    """List active cluster nodes (blocking), paginating if needed."""
+    page_size = 100
+    nodes: list[dict[str, Any]] = []
     with TurnstoneConsole(**console_kw) as console:
-        resp = console.nodes()
-        return [n.model_dump() for n in resp.nodes]
+        while True:
+            resp = console.nodes(limit=page_size, offset=len(nodes))
+            nodes.extend(n.model_dump() for n in resp.nodes)
+            if len(nodes) >= resp.total or not resp.nodes:
+                break
+    return nodes
 
 
 async def _list_nodes_impl(console_kw: dict[str, Any]) -> list[dict[str, Any]]:
