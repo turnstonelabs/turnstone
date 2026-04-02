@@ -912,7 +912,7 @@
 .admin-row {
   display: grid;
   padding: 8px 12px;
-  align-items: center;
+  align-items: start;
   border-radius: var(--radius-sm);
   transition: background 0.1s;
 }
@@ -1868,7 +1868,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   grid-template-columns: 200px 1fr auto;
   gap: 8px 16px;
   padding: 8px 12px;
-  align-items: center;
+  align-items: start;
   border-bottom: 1px solid var(--border);
 }
 .settings-row:hover { background: var(--row-alt, rgba(255,255,255,0.015)); }
@@ -1913,6 +1913,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 }
 
 /* Bool toggle */
+.settings-input .settings-toggle { margin-top: 2px; }
 .settings-toggle {
   position: relative;
   display: inline-block;
