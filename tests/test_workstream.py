@@ -713,6 +713,41 @@ class TestWebUI:
         assert ui._plan_result == "approved"
         t.join()
 
+    def test_pending_plan_review_stored_and_replayed(self):
+        """Plan review state is stored for SSE reconnection replay."""
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test")
+        assert ui._pending_plan_review is None
+
+        # Simulate on_plan_review in a background thread (it blocks)
+        def review():
+            ui.on_plan_review("Here is the plan")
+
+        t = threading.Thread(target=review)
+        t.start()
+        time.sleep(0.1)
+
+        # While blocking, pending state should be set
+        assert ui._pending_plan_review is not None
+        assert ui._pending_plan_review["type"] == "plan_review"
+        assert ui._pending_plan_review["content"] == "Here is the plan"
+
+        # Resolve — pending state should be cleared
+        ui.resolve_plan("looks good")
+        t.join(timeout=2)
+        assert ui._pending_plan_review is None
+        assert ui._plan_result == "looks good"
+
+    def test_pending_plan_review_cleared_on_resolve_before_wait_returns(self):
+        """resolve_plan clears pending state immediately, not just after wait."""
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test")
+        ui._pending_plan_review = {"type": "plan_review", "content": "test"}
+        ui.resolve_plan("ok")
+        assert ui._pending_plan_review is None
+
 
 # ---------------------------------------------------------------------------
 # WebUI SSE fan-out
