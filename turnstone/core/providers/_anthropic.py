@@ -543,9 +543,13 @@ class AnthropicProvider:
         if extra_params and "thinking_budget_tokens" in extra_params:
             budget = extra_params["thinking_budget_tokens"]
         if budget > 0:
-            # Budget must leave room for the response
+            # Budget must be strictly less than max_tokens (API requirement).
+            # If max_tokens is too small to fit even a minimal thinking
+            # budget alongside the response, disable thinking entirely.
             if budget >= max_tokens:
-                budget = max(1024, max_tokens - 1024)
+                budget = max_tokens - 1024
+            if budget < 1:
+                return {}
             return {"thinking": {"type": "enabled", "budget_tokens": budget}}
         return {}
 
