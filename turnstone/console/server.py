@@ -1167,10 +1167,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             import asyncio
 
             async def _console_heartbeat() -> None:
+                from turnstone.core.storage._registry import StorageUnavailableError
+
                 while True:
                     await asyncio.sleep(30)
                     try:
                         storage.heartbeat_service("console", "console")
+                    except StorageUnavailableError:
+                        pass  # already logged by storage layer
                     except Exception:
                         log.warning("console.heartbeat_failed", exc_info=True)
 

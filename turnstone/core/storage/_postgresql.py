@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -111,26 +112,40 @@ class PostgreSQLBackend:
             pool_pre_ping=True,
         )
         self._db_unavailable = False
+        self._db_unavailable_lock = threading.Lock()
         if create_tables:
             metadata.create_all(self._engine)
 
     @contextlib.contextmanager
     def _conn(self) -> Iterator[sa.engine.Connection]:
-        """Acquire a DB connection with clean logging on connectivity errors."""
+        """Acquire a DB connection with clean logging on connectivity errors.
+
+        On ``OperationalError`` during *connect* (connection refused,
+        timeout, etc.) this logs a single ``database.unavailable`` line
+        and raises ``StorageUnavailableError``.  Errors that occur
+        *after* a successful connect (mid-query failures, lock
+        contention) propagate as-is so callers see the real error.
+        """
+        from turnstone.core.storage._registry import StorageUnavailableError
+
         try:
-            with self._engine.connect() as conn:
+            conn_cm = self._engine.connect()
+        except sa.exc.OperationalError as exc:
+            with self._db_unavailable_lock:
+                if not self._db_unavailable:
+                    self._db_unavailable = True
+                    log.error(
+                        "database.unavailable",
+                        url=self._engine.url.render_as_string(hide_password=True),
+                    )
+            raise StorageUnavailableError(str(exc)) from exc
+
+        with conn_cm as conn:
+            with self._db_unavailable_lock:
                 if self._db_unavailable:
                     self._db_unavailable = False
                     log.info("database.connection_restored")
-                yield conn
-        except sa.exc.OperationalError:
-            if not self._db_unavailable:
-                self._db_unavailable = True
-                log.error(
-                    "database.unavailable",
-                    url=self._engine.url.render_as_string(hide_password=True),
-                )
-            raise
+            yield conn
 
     # -- Core conversation operations ------------------------------------------
 

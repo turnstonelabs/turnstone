@@ -15,6 +15,14 @@ log = get_logger(__name__)
 _storage: StorageBackend | None = None
 
 
+class StorageUnavailableError(Exception):
+    """Raised when the database is unreachable.
+
+    The storage layer has already logged a clean one-liner — callers
+    should catch this to avoid duplicate tracebacks.
+    """
+
+
 def init_storage(
     backend: str = "sqlite",
     *,

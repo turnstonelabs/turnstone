@@ -271,9 +271,13 @@ class WatchRunner:
     # -- Main loop -----------------------------------------------------------
 
     def _run(self) -> None:
+        from turnstone.core.storage._registry import StorageUnavailableError
+
         while not self._stop_event.is_set():
             try:
                 self._tick()
+            except StorageUnavailableError:
+                pass  # already logged by storage layer
             except Exception:
                 log.exception("watch_runner.tick_error")
             self._stop_event.wait(self._check_interval)

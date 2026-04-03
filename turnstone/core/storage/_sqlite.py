@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from turnstone.core.log import get_logger
 from turnstone.core.storage._schema import (
@@ -128,6 +133,8 @@ class SQLiteBackend:
                 log.warning("Failed to set SQLite WAL mode", exc_info=True)
 
         self._fts5_available = False
+        self._db_unavailable = False
+        self._db_unavailable_lock = threading.Lock()
         if create_tables:
             self._init_schema()
 
@@ -160,6 +167,27 @@ class SQLiteBackend:
             except Exception:
                 self._fts5_available = False
 
+    @contextlib.contextmanager
+    def _conn(self) -> Iterator[sa.engine.Connection]:
+        """Acquire a DB connection with clean logging on connectivity errors."""
+        from turnstone.core.storage._registry import StorageUnavailableError
+
+        try:
+            conn_cm = self._engine.connect()
+        except sa.exc.OperationalError as exc:
+            with self._db_unavailable_lock:
+                if not self._db_unavailable:
+                    self._db_unavailable = True
+                    log.error("database.unavailable", path=self._path)
+            raise StorageUnavailableError(str(exc)) from exc
+
+        with conn_cm as conn:
+            with self._db_unavailable_lock:
+                if self._db_unavailable:
+                    self._db_unavailable = False
+                    log.info("database.connection_restored")
+            yield conn
+
     # -- Core conversation operations ------------------------------------------
 
     def save_message(
@@ -175,7 +203,7 @@ class SQLiteBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
         provider_data = sanitize_text(provider_data)
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.insert(conversations),
                 {
@@ -208,7 +236,7 @@ class SQLiteBackend:
             conn.commit()
 
     def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     conversations.c.role,
@@ -225,7 +253,7 @@ class SQLiteBackend:
         return _reconstruct_messages(list(rows), ws_id)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             # Find the id of the first row to delete (the row at offset keep_count)
             cutoff_row = conn.execute(
                 sa.select(conversations.c.id)
@@ -264,7 +292,7 @@ class SQLiteBackend:
     # -- Workstream management -------------------------------------------------
 
     def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     sa.text(
@@ -283,7 +311,7 @@ class SQLiteBackend:
 
     def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
         orphans = stale = 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             # 1. Remove workstreams with no messages
             orphan_ids = [
                 row[0]
@@ -353,7 +381,7 @@ class SQLiteBackend:
         return (orphans, stale)
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             # 1. Exact alias match
             row = conn.execute(
                 sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias_or_id)
@@ -379,7 +407,7 @@ class SQLiteBackend:
     def save_workstream_config(self, ws_id: str, config: dict[str, str]) -> None:
         if not config:
             return
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.text(
                     "INSERT OR REPLACE INTO workstream_config "
@@ -390,7 +418,7 @@ class SQLiteBackend:
             conn.commit()
 
     def load_workstream_config(self, ws_id: str) -> dict[str, str]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(workstream_config.c.key, workstream_config.c.value).where(
                     workstream_config.c.ws_id == ws_id
@@ -401,7 +429,7 @@ class SQLiteBackend:
     # -- Workstream metadata ---------------------------------------------------
 
     def set_workstream_alias(self, ws_id: str, alias: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             existing = conn.execute(
                 sa.select(workstreams.c.ws_id).where(workstreams.c.alias == alias)
             ).fetchone()
@@ -414,7 +442,7 @@ class SQLiteBackend:
             return True
 
     def get_workstream_display_name(self, ws_id: str) -> str | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(workstreams.c.alias, workstreams.c.title).where(
                     workstreams.c.ws_id == ws_id
@@ -426,7 +454,7 @@ class SQLiteBackend:
         return None
 
     def update_workstream_title(self, ws_id: str, title: str) -> None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(title=title)
             )
@@ -447,7 +475,7 @@ class SQLiteBackend:
         skill_version: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
                 {
@@ -468,7 +496,7 @@ class SQLiteBackend:
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
@@ -478,7 +506,7 @@ class SQLiteBackend:
 
     def update_workstream_name(self, ws_id: str, name: str) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.update(workstreams)
                 .where(workstreams.c.ws_id == ws_id)
@@ -487,7 +515,7 @@ class SQLiteBackend:
             conn.commit()
 
     def delete_workstream(self, ws_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
             conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
             conn.execute(
@@ -498,7 +526,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = (
                 sa.select(
                     workstreams.c.ws_id,
@@ -522,7 +550,7 @@ class SQLiteBackend:
             return []
         capped = min(int(limit), 100)
         capped_offset = max(0, int(offset))
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             if self._fts5_available:
                 return list(
                     conn.execute(
@@ -553,7 +581,7 @@ class SQLiteBackend:
 
     def search_history_recent(self, limit: int = 20) -> list[Any]:
         capped = min(limit, 100)
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             return list(
                 conn.execute(
                     sa.text(
@@ -570,7 +598,7 @@ class SQLiteBackend:
         self, user_id: str, username: str, display_name: str, password_hash: str
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(users).prefix_with("OR IGNORE"),
                 {
@@ -588,7 +616,7 @@ class SQLiteBackend:
     ) -> bool:
         """Atomically create a user only if no users exist. Returns True if created."""
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.text(
                     "INSERT INTO users (user_id, username, display_name, password_hash, created) "
@@ -607,7 +635,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def get_user(self, user_id: str) -> dict[str, str] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     users.c.user_id,
@@ -628,7 +656,7 @@ class SQLiteBackend:
             return None
 
     def get_user_by_username(self, username: str) -> dict[str, str] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     users.c.user_id,
@@ -649,7 +677,7 @@ class SQLiteBackend:
             return None
 
     def list_users(self) -> list[dict[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     users.c.user_id,
@@ -665,7 +693,7 @@ class SQLiteBackend:
 
     def delete_user(self, user_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
@@ -685,7 +713,7 @@ class SQLiteBackend:
         expires: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(api_tokens),
                 {
@@ -702,7 +730,7 @@ class SQLiteBackend:
             conn.commit()
 
     def get_api_token_by_hash(self, token_hash: str) -> dict[str, str] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     api_tokens.c.token_id,
@@ -729,7 +757,7 @@ class SQLiteBackend:
             return None
 
     def list_api_tokens(self, user_id: str) -> list[dict[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     api_tokens.c.token_id,
@@ -759,7 +787,7 @@ class SQLiteBackend:
             return result
 
     def delete_api_token(self, token_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.delete(api_tokens).where(api_tokens.c.token_id == token_id))
             conn.commit()
             return result.rowcount > 0
@@ -769,7 +797,7 @@ class SQLiteBackend:
     def create_channel_user(self, channel_type: str, channel_user_id: str, user_id: str) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(channel_users).prefix_with("OR IGNORE"),
                 {
@@ -783,7 +811,7 @@ class SQLiteBackend:
 
     def get_channel_user(self, channel_type: str, channel_user_id: str) -> dict[str, str] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     channel_users.c.channel_type,
@@ -806,7 +834,7 @@ class SQLiteBackend:
 
     def list_channel_users_by_user(self, user_id: str) -> list[dict[str, str]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     channel_users.c.channel_type,
@@ -829,7 +857,7 @@ class SQLiteBackend:
 
     def delete_channel_user(self, channel_type: str, channel_user_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(channel_users).where(
                     (channel_users.c.channel_type == channel_type)
@@ -846,7 +874,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(channel_routes).prefix_with("OR IGNORE"),
                 {
@@ -861,7 +889,7 @@ class SQLiteBackend:
 
     def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     channel_routes.c.channel_type,
@@ -886,7 +914,7 @@ class SQLiteBackend:
 
     def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     channel_routes.c.channel_type,
@@ -908,7 +936,7 @@ class SQLiteBackend:
 
     def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     channel_routes.c.channel_type,
@@ -933,7 +961,7 @@ class SQLiteBackend:
 
     def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(channel_routes).where(
                     (channel_routes.c.channel_type == channel_type)
@@ -964,7 +992,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(scheduled_tasks).prefix_with("OR IGNORE"),
                 {
@@ -991,7 +1019,7 @@ class SQLiteBackend:
 
     def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(scheduled_tasks).where(scheduled_tasks.c.task_id == task_id)
             ).fetchone()
@@ -1001,7 +1029,7 @@ class SQLiteBackend:
 
     def list_scheduled_tasks(self) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(scheduled_tasks).order_by(scheduled_tasks.c.created.desc())
             ).fetchall()
@@ -1038,7 +1066,7 @@ class SQLiteBackend:
             fields["auto_approve_tools"] = ",".join(fields["auto_approve_tools"])
         if "enabled" in fields:
             fields["enabled"] = 1 if fields["enabled"] else 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(scheduled_tasks)
                 .where(scheduled_tasks.c.task_id == task_id)
@@ -1049,7 +1077,7 @@ class SQLiteBackend:
 
     def delete_scheduled_task(self, task_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.delete(scheduled_task_runs).where(scheduled_task_runs.c.task_id == task_id)
             )
@@ -1061,7 +1089,7 @@ class SQLiteBackend:
 
     def list_due_tasks(self, now: str) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(scheduled_tasks)
                 .where(
@@ -1086,7 +1114,7 @@ class SQLiteBackend:
         error: str,
     ) -> None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(scheduled_task_runs),
                 {
@@ -1104,7 +1132,7 @@ class SQLiteBackend:
 
     def list_task_runs(self, task_id: str, limit: int = 50) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(scheduled_task_runs)
                 .where(scheduled_task_runs.c.task_id == task_id)
@@ -1115,7 +1143,7 @@ class SQLiteBackend:
 
     def prune_task_runs(self, retention_days: int = 90) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(scheduled_task_runs).where(scheduled_task_runs.c.started < cutoff)
             )
@@ -1139,7 +1167,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(watches).prefix_with("OR IGNORE"),
                 {
@@ -1163,7 +1191,7 @@ class SQLiteBackend:
 
     def get_watch(self, watch_id: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(watches).where(watches.c.watch_id == watch_id)).fetchone()
             if row is None:
                 return None
@@ -1171,7 +1199,7 @@ class SQLiteBackend:
 
     def list_watches_for_ws(self, ws_id: str) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(watches)
                 .where((watches.c.ws_id == ws_id) & (watches.c.active == 1))
@@ -1181,7 +1209,7 @@ class SQLiteBackend:
 
     def list_watches_for_node(self, node_id: str) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(watches)
                 .where((watches.c.node_id == node_id) & (watches.c.active == 1))
@@ -1191,7 +1219,7 @@ class SQLiteBackend:
 
     def list_due_watches(self, now: str) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(watches)
                 .where(
@@ -1223,7 +1251,7 @@ class SQLiteBackend:
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         if "active" in fields:
             fields["active"] = 1 if fields["active"] else 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(watches).where(watches.c.watch_id == watch_id).values(**fields)
             )
@@ -1232,14 +1260,14 @@ class SQLiteBackend:
 
     def delete_watch(self, watch_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.delete(watches).where(watches.c.watch_id == watch_id))
             conn.commit()
             return result.rowcount > 0
 
     def delete_watches_for_ws(self, ws_id: str) -> int:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.delete(watches).where(watches.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount
@@ -1264,14 +1292,14 @@ class SQLiteBackend:
             index_elements=["service_type", "service_id"],
             set_={"url": url, "metadata": metadata, "last_heartbeat": now},
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def heartbeat_service(self, service_type: str, service_id: str) -> bool:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(services)
                 .where(
@@ -1288,7 +1316,7 @@ class SQLiteBackend:
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(services)
                 .where(
@@ -1301,7 +1329,7 @@ class SQLiteBackend:
 
     def deregister_service(self, service_type: str, service_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(services).where(
                     (services.c.service_type == service_type)
@@ -1314,7 +1342,7 @@ class SQLiteBackend:
     # -- Hash ring routing -----------------------------------------------------
 
     def list_ring_buckets(self) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(hash_ring_buckets).order_by(hash_ring_buckets.c.bucket)
             ).fetchall()
@@ -1324,7 +1352,7 @@ class SQLiteBackend:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
         chunk_size = 500
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             for i in range(0, len(assignments), chunk_size):
                 chunk = assignments[i : i + chunk_size]
                 stmt = sqlite_insert(hash_ring_buckets).values(
@@ -1342,7 +1370,7 @@ class SQLiteBackend:
         # SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk conservatively.
         chunk_size = 500
         total = 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             for i in range(0, len(buckets), chunk_size):
                 chunk = buckets[i : i + chunk_size]
                 result = conn.execute(
@@ -1357,7 +1385,7 @@ class SQLiteBackend:
     def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             stmt = sqlite_insert(bucket_stats).values(
                 bucket=bucket,
                 ws_count=1,
@@ -1382,14 +1410,14 @@ class SQLiteBackend:
                 (bucket_stats.c.active_count > 0, bucket_stats.c.active_count - 1),
                 else_=0,
             )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.update(bucket_stats).where(bucket_stats.c.bucket == bucket).values(**vals)
             )
             conn.commit()
 
     def adjust_bucket_active(self, bucket: int, delta: int) -> None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.update(bucket_stats)
                 .where(bucket_stats.c.bucket == bucket)
@@ -1406,7 +1434,7 @@ class SQLiteBackend:
             conn.commit()
 
     def list_bucket_stats(self) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(bucket_stats)
                 .where(bucket_stats.c.ws_count > 0)
@@ -1424,7 +1452,7 @@ class SQLiteBackend:
             index_elements=["bucket"],
             set_={"ws_count": ws_count, "active_count": active_count},
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
@@ -1439,12 +1467,12 @@ class SQLiteBackend:
             index_elements=["ws_id"],
             set_={"node_id": node_id, "reason": reason, "updated": now},
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def delete_workstream_override(self, ws_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
             )
@@ -1452,14 +1480,14 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_workstream_overrides(self) -> list[dict[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(workstream_overrides).order_by(workstream_overrides.c.ws_id)
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
     def list_workstream_routing_data(self) -> list[tuple[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.text(
                     "SELECT w.ws_id, w.state FROM workstreams w "
@@ -1480,7 +1508,7 @@ class SQLiteBackend:
         org_id: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(roles).prefix_with("OR IGNORE"),
                 {
@@ -1497,21 +1525,21 @@ class SQLiteBackend:
             conn.commit()
 
     def get_role(self, role_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(roles).where(roles.c.role_id == role_id)).fetchone()
             if row:
                 return _row_to_dict(row, "builtin")
             return None
 
     def get_role_by_name(self, name: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(roles).where(roles.c.name == name)).fetchone()
             if row:
                 return _row_to_dict(row, "builtin")
             return None
 
     def list_roles(self, org_id: str = "") -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(roles).order_by(roles.c.name.asc())
             if org_id:
                 q = q.where(roles.c.org_id == org_id)
@@ -1524,7 +1552,7 @@ class SQLiteBackend:
             log.warning("update_role: ignoring unknown fields: %s", dropped)
         fields = {k: v for k, v in fields.items() if k in _ROLE_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(roles).where(roles.c.role_id == role_id).values(**fields)
             )
@@ -1532,7 +1560,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_role(self, role_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(sa.delete(user_roles).where(user_roles.c.role_id == role_id))
             result = conn.execute(sa.delete(roles).where(roles.c.role_id == role_id))
             conn.commit()
@@ -1540,7 +1568,7 @@ class SQLiteBackend:
 
     def assign_role(self, user_id: str, role_id: str, assigned_by: str = "") -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(user_roles).prefix_with("OR IGNORE"),
                 {
@@ -1553,7 +1581,7 @@ class SQLiteBackend:
             conn.commit()
 
     def unassign_role(self, user_id: str, role_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(user_roles).where(
                     (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
@@ -1563,7 +1591,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def list_user_roles(self, user_id: str) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     roles.c.role_id,
@@ -1583,7 +1611,7 @@ class SQLiteBackend:
             return [_row_to_dict(r, "builtin") for r in rows]
 
     def get_user_permissions(self, user_id: str) -> set[str]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(roles.c.permissions)
                 .select_from(user_roles.join(roles, user_roles.c.role_id == roles.c.role_id))
@@ -1602,7 +1630,7 @@ class SQLiteBackend:
 
     def create_org(self, org_id: str, name: str, display_name: str, settings: str = "{}") -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(orgs).prefix_with("OR IGNORE"),
                 {
@@ -1617,14 +1645,14 @@ class SQLiteBackend:
             conn.commit()
 
     def get_org(self, org_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(orgs).where(orgs.c.org_id == org_id)).fetchone()
             if row:
                 return _row_to_dict(row)
             return None
 
     def list_orgs(self) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(sa.select(orgs).order_by(orgs.c.name)).fetchall()
             return [_row_to_dict(r) for r in rows]
 
@@ -1634,7 +1662,7 @@ class SQLiteBackend:
             log.warning("update_org: ignoring unknown fields: %s", dropped)
         fields = {k: v for k, v in fields.items() if k in _ORG_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.update(orgs).where(orgs.c.org_id == org_id).values(**fields))
             conn.commit()
             return result.rowcount > 0
@@ -1653,7 +1681,7 @@ class SQLiteBackend:
         created_by: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(tool_policies),
                 {
@@ -1672,7 +1700,7 @@ class SQLiteBackend:
             conn.commit()
 
     def get_tool_policy(self, policy_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(tool_policies).where(tool_policies.c.policy_id == policy_id)
             ).fetchone()
@@ -1681,7 +1709,7 @@ class SQLiteBackend:
             return None
 
     def list_tool_policies(self, org_id: str = "") -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(tool_policies).order_by(tool_policies.c.priority.desc())
             if org_id:
                 q = q.where(tool_policies.c.org_id == org_id)
@@ -1696,7 +1724,7 @@ class SQLiteBackend:
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         if "enabled" in fields:
             fields["enabled"] = int(fields["enabled"])
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(tool_policies)
                 .where(tool_policies.c.policy_id == policy_id)
@@ -1706,7 +1734,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_tool_policy(self, policy_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(tool_policies).where(tool_policies.c.policy_id == policy_id)
             )
@@ -1757,7 +1785,7 @@ class SQLiteBackend:
         # Scan skill content for risk signals
         scan_status, scan_report, scan_version = _scan_skill_content(content, allowed_tools)
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(prompt_templates),
                 {
@@ -1802,7 +1830,7 @@ class SQLiteBackend:
             conn.commit()
 
     def get_prompt_template(self, template_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(prompt_templates).where(prompt_templates.c.template_id == template_id)
             ).fetchone()
@@ -1811,7 +1839,7 @@ class SQLiteBackend:
             return None
 
     def get_prompt_template_by_name(self, name: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(prompt_templates).where(prompt_templates.c.name == name)
             ).fetchone()
@@ -1822,7 +1850,7 @@ class SQLiteBackend:
     def list_prompt_templates(
         self, org_id: str = "", limit: int = 0, offset: int = 0
     ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(prompt_templates).order_by(prompt_templates.c.name)
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
@@ -1836,14 +1864,14 @@ class SQLiteBackend:
             ]
 
     def count_prompt_templates(self, org_id: str = "") -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(sa.func.count()).select_from(prompt_templates)
             if org_id:
                 q = q.where(prompt_templates.c.org_id == org_id)
             return conn.execute(q).scalar() or 0
 
     def list_default_templates(self, org_id: str = "") -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = (
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.is_default == 1)
@@ -1858,7 +1886,7 @@ class SQLiteBackend:
             ]
 
     def list_prompt_templates_by_origin(self, origin: str) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.origin == origin)
@@ -1905,7 +1933,7 @@ class SQLiteBackend:
                 fields["scan_status"] = scan_status
                 fields["scan_report"] = scan_report
                 fields["scan_version"] = scan_version
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(prompt_templates)
                 .where(prompt_templates.c.template_id == template_id)
@@ -1915,7 +1943,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_prompt_template(self, template_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(prompt_templates).where(prompt_templates.c.template_id == template_id)
             )
@@ -1929,7 +1957,7 @@ class SQLiteBackend:
         enabled_only: bool = False,
         limit: int = 0,
     ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = (
                 sa.select(prompt_templates)
                 .where(prompt_templates.c.activation == activation)
@@ -1948,7 +1976,7 @@ class SQLiteBackend:
         return self.get_prompt_template_by_name(name)
 
     def get_skill_by_source_url(self, source_url: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(prompt_templates).where(prompt_templates.c.source_url == source_url)
             ).fetchone()
@@ -1957,7 +1985,7 @@ class SQLiteBackend:
             return None
 
     def list_installed_skill_urls(self) -> list[dict[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     prompt_templates.c.source_url,
@@ -1985,7 +2013,7 @@ class SQLiteBackend:
         content_type: str = "text/plain",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(skill_resources),
                 {
@@ -2000,7 +2028,7 @@ class SQLiteBackend:
             conn.commit()
 
     def list_skill_resources(self, skill_id: str) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(skill_resources)
                 .where(skill_resources.c.skill_id == skill_id)
@@ -2009,7 +2037,7 @@ class SQLiteBackend:
             return [dict(r._mapping) for r in rows]
 
     def get_skill_resource(self, skill_id: str, path: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(skill_resources)
                 .where(skill_resources.c.skill_id == skill_id)
@@ -2020,7 +2048,7 @@ class SQLiteBackend:
             return None
 
     def delete_skill_resources(self, skill_id: str) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(skill_resources).where(skill_resources.c.skill_id == skill_id)
             )
@@ -2028,7 +2056,7 @@ class SQLiteBackend:
             return result.rowcount
 
     def delete_skill_resource_by_path(self, skill_id: str, path: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(skill_resources).where(
                     sa.and_(
@@ -2046,7 +2074,7 @@ class SQLiteBackend:
         result: dict[str, int] = {}
         # Chunk to stay under SQLite's max variable limit (999)
         chunk_size = 900
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             for i in range(0, len(skill_ids), chunk_size):
                 chunk = skill_ids[i : i + chunk_size]
                 rows = conn.execute(
@@ -2071,7 +2099,7 @@ class SQLiteBackend:
         changed_by: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(skill_versions),
                 {
@@ -2085,7 +2113,7 @@ class SQLiteBackend:
             conn.commit()
 
     def list_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(skill_versions)
                 .where(skill_versions.c.skill_id == skill_id)
@@ -2094,7 +2122,7 @@ class SQLiteBackend:
             return [_row_to_dict(r) for r in rows]
 
     def delete_skill_versions(self, skill_id: str) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(skill_versions).where(skill_versions.c.skill_id == skill_id)
             )
@@ -2117,7 +2145,7 @@ class SQLiteBackend:
         cache_read_tokens: int = 0,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(usage_events),
                 {
@@ -2173,7 +2201,7 @@ class SQLiteBackend:
                 f"SUM(tool_calls_count), SUM(cache_creation_tokens), "
                 f"SUM(cache_read_tokens) FROM usage_events WHERE {where}"
             )
-            with self._engine.connect() as conn:
+            with self._conn() as conn:
                 row = conn.execute(sa.text(sql), params).fetchone()
                 if row:
                     return [
@@ -2201,7 +2229,7 @@ class SQLiteBackend:
             f"SUM(cache_read_tokens) FROM usage_events WHERE {where} "
             f"GROUP BY {key_expr} ORDER BY key ASC"
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(sa.text(sql), params).fetchall()
             return [
                 {
@@ -2217,7 +2245,7 @@ class SQLiteBackend:
 
     def prune_usage_events(self, retention_days: int = 90) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.delete(usage_events).where(usage_events.c.timestamp < cutoff))
             conn.commit()
             return result.rowcount
@@ -2235,7 +2263,7 @@ class SQLiteBackend:
         ip_address: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(audit_events),
                 {
@@ -2261,7 +2289,7 @@ class SQLiteBackend:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(
                 audit_events.c.event_id,
                 audit_events.c.timestamp,
@@ -2305,7 +2333,7 @@ class SQLiteBackend:
         since: str = "",
         until: str = "",
     ) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(sa.func.count()).select_from(audit_events)
             if action:
                 q = q.where(audit_events.c.action == action)
@@ -2320,7 +2348,7 @@ class SQLiteBackend:
 
     def prune_audit_events(self, retention_days: int = 365) -> int:
         cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(sa.delete(audit_events).where(audit_events.c.timestamp < cutoff))
             conn.commit()
             return result.rowcount
@@ -2345,7 +2373,7 @@ class SQLiteBackend:
         latency_ms: int,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(intent_verdicts),
                 {
@@ -2369,7 +2397,7 @@ class SQLiteBackend:
             conn.commit()
 
     def get_intent_verdict(self, verdict_id: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(intent_verdicts).where(intent_verdicts.c.verdict_id == verdict_id)
             ).fetchone()
@@ -2386,7 +2414,7 @@ class SQLiteBackend:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(intent_verdicts).order_by(
                 intent_verdicts.c.created.desc(), intent_verdicts.c.verdict_id.desc()
             )
@@ -2406,7 +2434,7 @@ class SQLiteBackend:
         fields = {k: v for k, v in fields.items() if k in _VERDICT_MUTABLE}
         if not fields:
             return False
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(intent_verdicts)
                 .where(intent_verdicts.c.verdict_id == verdict_id)
@@ -2422,7 +2450,7 @@ class SQLiteBackend:
         until: str = "",
         risk_level: str = "",
     ) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(sa.func.count()).select_from(intent_verdicts)
             if ws_id:
                 q = q.where(intent_verdicts.c.ws_id == ws_id)
@@ -2450,7 +2478,7 @@ class SQLiteBackend:
         redacted: bool,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(output_assessments),
                 {
@@ -2477,7 +2505,7 @@ class SQLiteBackend:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(output_assessments).order_by(
                 output_assessments.c.created.desc(),
                 output_assessments.c.assessment_id.desc(),
@@ -2501,7 +2529,7 @@ class SQLiteBackend:
         since: str = "",
         until: str = "",
     ) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(sa.func.count()).select_from(output_assessments)
             if ws_id:
                 q = q.where(output_assessments.c.ws_id == ws_id)
@@ -2527,7 +2555,7 @@ class SQLiteBackend:
         content: str,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(structured_memories),
                 {
@@ -2547,7 +2575,7 @@ class SQLiteBackend:
             conn.commit()
 
     def get_structured_memory(self, memory_id: str) -> dict[str, str] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(structured_memories).where(structured_memories.c.memory_id == memory_id)
             ).fetchone()
@@ -2556,7 +2584,7 @@ class SQLiteBackend:
     def get_structured_memory_by_name(
         self, name: str, scope: str = "global", scope_id: str = ""
     ) -> dict[str, str] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(structured_memories).where(
                     sa.and_(
@@ -2575,7 +2603,7 @@ class SQLiteBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         fields["updated"] = now
         fields["last_accessed"] = now
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(structured_memories)
                 .where(structured_memories.c.memory_id == memory_id)
@@ -2587,7 +2615,7 @@ class SQLiteBackend:
     def delete_structured_memory(
         self, name: str, scope: str = "global", scope_id: str = ""
     ) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(structured_memories).where(
                     sa.and_(
@@ -2601,7 +2629,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def delete_structured_memory_by_id(self, memory_id: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(structured_memories).where(structured_memories.c.memory_id == memory_id)
             )
@@ -2615,7 +2643,7 @@ class SQLiteBackend:
         scope_id: str = "",
         limit: int = 100,
     ) -> list[dict[str, str]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(structured_memories).order_by(structured_memories.c.updated.desc())
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
@@ -2640,7 +2668,7 @@ class SQLiteBackend:
                 mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
             )
         terms = query.split()
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             clauses = []
             params: dict[str, str] = {}
             for i, t in enumerate(terms):
@@ -2678,7 +2706,7 @@ class SQLiteBackend:
             return 0
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         total = 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             for name, scope, scope_id in keys:
                 result = conn.execute(
                     sa.update(structured_memories)
@@ -2701,7 +2729,7 @@ class SQLiteBackend:
     def count_structured_memories(
         self, mem_type: str = "", scope: str = "", scope_id: str = ""
     ) -> int:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(sa.func.count()).select_from(structured_memories)
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
@@ -2715,7 +2743,7 @@ class SQLiteBackend:
     # -- System settings -------------------------------------------------------
 
     def get_system_setting(self, key: str, node_id: str = "") -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(system_settings).where(
                     sa.and_(
@@ -2727,7 +2755,7 @@ class SQLiteBackend:
             return dict(row._mapping) if row else None
 
     def list_system_settings(self, node_id: str = "") -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(system_settings).order_by(system_settings.c.key)
             if node_id:
                 # Return both global and node-specific
@@ -2769,12 +2797,12 @@ class SQLiteBackend:
                 "updated": now,
             },
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def delete_system_setting(self, key: str, node_id: str = "") -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(system_settings).where(
                     sa.and_(
@@ -2787,7 +2815,7 @@ class SQLiteBackend:
             return result.rowcount > 0
 
     def get_system_settings_bulk(self, node_id: str = "") -> dict[str, str]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             if not node_id:
                 # Global only
                 rows = conn.execute(
@@ -2831,7 +2859,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(mcp_servers).prefix_with("OR IGNORE"),
                 {
@@ -2857,7 +2885,7 @@ class SQLiteBackend:
 
     def get_mcp_server(self, server_id: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(mcp_servers).where(mcp_servers.c.server_id == server_id)
             ).fetchone()
@@ -2867,7 +2895,7 @@ class SQLiteBackend:
 
     def get_mcp_server_by_name(self, name: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(mcp_servers).where(mcp_servers.c.name == name)).fetchone()
             if row is None:
                 return None
@@ -2875,7 +2903,7 @@ class SQLiteBackend:
 
     def get_mcp_server_by_registry_name(self, registry_name: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(mcp_servers).where(mcp_servers.c.registry_name == registry_name)
             ).fetchone()
@@ -2885,7 +2913,7 @@ class SQLiteBackend:
 
     def list_mcp_servers(self, enabled_only: bool = False) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(mcp_servers).order_by(mcp_servers.c.name)
             if enabled_only:
                 q = q.where(mcp_servers.c.enabled == 1)
@@ -2900,7 +2928,7 @@ class SQLiteBackend:
             fields["auto_approve"] = 1 if fields["auto_approve"] else 0
         if "enabled" in fields:
             fields["enabled"] = 1 if fields["enabled"] else 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(mcp_servers).where(mcp_servers.c.server_id == server_id).values(**fields)
             )
@@ -2909,7 +2937,7 @@ class SQLiteBackend:
 
     def delete_mcp_server(self, server_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(mcp_servers).where(mcp_servers.c.server_id == server_id)
             )
@@ -2933,7 +2961,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(model_definitions).prefix_with("OR IGNORE"),
                 {
@@ -2955,7 +2983,7 @@ class SQLiteBackend:
 
     def get_model_definition(self, definition_id: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(model_definitions).where(
                     model_definitions.c.definition_id == definition_id
@@ -2967,7 +2995,7 @@ class SQLiteBackend:
 
     def get_model_definition_by_alias(self, alias: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(model_definitions).where(model_definitions.c.alias == alias)
             ).fetchone()
@@ -2977,7 +3005,7 @@ class SQLiteBackend:
 
     def list_model_definitions(self, enabled_only: bool = False) -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(model_definitions).order_by(model_definitions.c.alias)
             if enabled_only:
                 q = q.where(model_definitions.c.enabled == 1)
@@ -2990,7 +3018,7 @@ class SQLiteBackend:
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         if "enabled" in fields:
             fields["enabled"] = 1 if fields["enabled"] else 0
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(model_definitions)
                 .where(model_definitions.c.definition_id == definition_id)
@@ -3001,7 +3029,7 @@ class SQLiteBackend:
 
     def delete_model_definition(self, definition_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(model_definitions).where(
                     model_definitions.c.definition_id == definition_id
@@ -3015,7 +3043,7 @@ class SQLiteBackend:
     def create_oidc_identity(self, issuer: str, subject: str, user_id: str, email: str) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(oidc_identities).prefix_with("OR IGNORE"),
                 {
@@ -3031,7 +3059,7 @@ class SQLiteBackend:
 
     def get_oidc_identity(self, issuer: str, subject: str) -> dict[str, str] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(
                     oidc_identities.c.issuer,
@@ -3058,7 +3086,7 @@ class SQLiteBackend:
     def update_oidc_identity_login(self, issuer: str, subject: str) -> bool:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.update(oidc_identities)
                 .where(
@@ -3071,7 +3099,7 @@ class SQLiteBackend:
 
     def list_oidc_identities_for_user(self, user_id: str) -> list[dict[str, str]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
                     oidc_identities.c.issuer,
@@ -3098,7 +3126,7 @@ class SQLiteBackend:
 
     def delete_oidc_identity(self, issuer: str, subject: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(oidc_identities).where(
                     (oidc_identities.c.issuer == issuer) & (oidc_identities.c.subject == subject)
@@ -3114,7 +3142,7 @@ class SQLiteBackend:
     ) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(
                 sa.insert(oidc_pending_states),
                 {
@@ -3134,7 +3162,7 @@ class SQLiteBackend:
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             # Acquire write lock before SELECT to prevent TOCTOU race
             conn.execute(sa.text("BEGIN IMMEDIATE"))
             row = conn.execute(
@@ -3167,7 +3195,7 @@ class SQLiteBackend:
         cutoff = (datetime.now(UTC) - timedelta(seconds=max_age_seconds)).strftime(
             "%Y-%m-%dT%H:%M:%S"
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(oidc_pending_states).where(oidc_pending_states.c.created_at < cutoff)
             )
@@ -3178,7 +3206,7 @@ class SQLiteBackend:
 
     def list_prompt_policies(self, org_id: str = "") -> list[dict[str, Any]]:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             q = sa.select(prompt_policies_t).order_by(prompt_policies_t.c.priority)
             if org_id:
                 q = q.where(prompt_policies_t.c.org_id == org_id)
@@ -3187,7 +3215,7 @@ class SQLiteBackend:
 
     def get_prompt_policy(self, policy_id: str) -> dict[str, Any] | None:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(prompt_policies_t).where(prompt_policies_t.c.policy_id == policy_id)
             ).fetchone()
@@ -3198,7 +3226,7 @@ class SQLiteBackend:
     def upsert_prompt_policy(self, policy: dict[str, Any]) -> None:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             existing = conn.execute(
                 sa.select(prompt_policies_t).where(
                     prompt_policies_t.c.policy_id == policy["policy_id"]
@@ -3234,7 +3262,7 @@ class SQLiteBackend:
 
     def delete_prompt_policy(self, policy_id: str) -> bool:
 
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(prompt_policies_t).where(prompt_policies_t.c.policy_id == policy_id)
             )
@@ -3252,12 +3280,12 @@ class SQLiteBackend:
             index_elements=["id"],
             set_={"key_pem": key_pem},
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def load_tls_account_key(self, key_id: str) -> str | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(tls_account_keys.c.key_pem).where(tls_account_keys.c.id == key_id)
             ).first()
@@ -3274,12 +3302,12 @@ class SQLiteBackend:
             index_elements=["name"],
             set_={"cert_pem": cert_pem, "key_pem": key_pem},
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def load_tls_ca(self, name: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(sa.select(tls_ca).where(tls_ca.c.name == name)).first()
             if not row:
                 return None
@@ -3317,12 +3345,12 @@ class SQLiteBackend:
                 "meta": meta,
             },
         )
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             conn.execute(stmt)
             conn.commit()
 
     def load_tls_cert(self, domain: str) -> dict[str, Any] | None:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 sa.select(tls_certificates).where(tls_certificates.c.domain == domain)
             ).first()
@@ -3331,14 +3359,14 @@ class SQLiteBackend:
             return _row_to_dict(row)
 
     def list_tls_certs(self) -> list[dict[str, Any]]:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 sa.select(tls_certificates).order_by(tls_certificates.c.domain)
             ).fetchall()
             return [_row_to_dict(r) for r in rows]
 
     def delete_tls_cert(self, domain: str) -> bool:
-        with self._engine.connect() as conn:
+        with self._conn() as conn:
             result = conn.execute(
                 sa.delete(tls_certificates).where(tls_certificates.c.domain == domain)
             )

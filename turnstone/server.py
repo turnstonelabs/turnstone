@@ -2389,10 +2389,14 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
 
         async def _heartbeat_loop() -> None:
             """Periodically update service heartbeat."""
+            from turnstone.core.storage._registry import StorageUnavailableError
+
             while True:
                 await asyncio.sleep(30)
                 try:
                     await asyncio.to_thread(_svc_storage.heartbeat_service, "server", _svc_node_id)
+                except StorageUnavailableError:
+                    pass  # already logged by storage layer
                 except Exception:
                     log.exception("server.heartbeat_failed")
 

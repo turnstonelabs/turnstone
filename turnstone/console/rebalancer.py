@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from turnstone.core.hash_ring import RING_SIZE, RingNode, bucket_of
+from turnstone.core.storage._registry import StorageUnavailableError
 
 if TYPE_CHECKING:
     from turnstone.console.collector import ClusterCollector
@@ -149,6 +150,8 @@ class Rebalancer:
                 result = self.rebalance_once(trigger=trigger)
                 self._last_result = result
                 self._record_result_metrics(result)
+            except StorageUnavailableError:
+                pass  # already logged by storage layer
             except Exception:
                 log.exception("rebalancer.error")
             finally:
