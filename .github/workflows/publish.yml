@@ -5,6 +5,10 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+concurrency:
+  group: publish-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
   id-token: write
