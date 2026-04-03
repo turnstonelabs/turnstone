@@ -216,13 +216,16 @@ class PostgreSQLBackend:
             ).fetchall()
             orphan_ids = [r[0] for r in orphan_rows]
             if orphan_ids:
-                conn.execute(
-                    sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(orphan_ids))
-                )
-                result = conn.execute(
-                    sa.delete(workstreams).where(workstreams.c.ws_id.in_(orphan_ids))
-                )
-                orphans = result.rowcount
+                chunk_size = 10_000
+                for i in range(0, len(orphan_ids), chunk_size):
+                    chunk = orphan_ids[i : i + chunk_size]
+                    conn.execute(
+                        sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
+                    )
+                    result = conn.execute(
+                        sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
+                    )
+                    orphans += result.rowcount
 
             # 2. Remove old unnamed workstreams
             if retention_days > 0:
@@ -237,16 +240,19 @@ class PostgreSQLBackend:
                 ).fetchall()
                 stale_ids = [r[0] for r in stale_rows]
                 if stale_ids:
-                    conn.execute(
-                        sa.delete(conversations).where(conversations.c.ws_id.in_(stale_ids))
-                    )
-                    conn.execute(
-                        sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(stale_ids))
-                    )
-                    result = conn.execute(
-                        sa.delete(workstreams).where(workstreams.c.ws_id.in_(stale_ids))
-                    )
-                    stale = result.rowcount
+                    chunk_size = 10_000
+                    for i in range(0, len(stale_ids), chunk_size):
+                        chunk = stale_ids[i : i + chunk_size]
+                        conn.execute(
+                            sa.delete(conversations).where(conversations.c.ws_id.in_(chunk))
+                        )
+                        conn.execute(
+                            sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
+                        )
+                        result = conn.execute(
+                            sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
+                        )
+                        stale += result.rowcount
 
             conn.commit()
         return (orphans, stale)
@@ -1254,14 +1260,22 @@ class PostgreSQLBackend:
     def assign_buckets(self, buckets: list[int], node_id: str) -> int:
         if not buckets:
             return 0
+        # De-duplicate so rowcount stays accurate across chunks.
+        buckets = list(dict.fromkeys(buckets))
+        # psycopg limits query parameters to 65 535; chunk to stay well under.
+        chunk_size = 10_000
+        total = 0
         with self._engine.connect() as conn:
-            result = conn.execute(
-                sa.update(hash_ring_buckets)
-                .where(hash_ring_buckets.c.bucket.in_(buckets))
-                .values(node_id=node_id)
-            )
+            for i in range(0, len(buckets), chunk_size):
+                chunk = buckets[i : i + chunk_size]
+                result = conn.execute(
+                    sa.update(hash_ring_buckets)
+                    .where(hash_ring_buckets.c.bucket.in_(chunk))
+                    .values(node_id=node_id)
+                )
+                total += result.rowcount
             conn.commit()
-            return result.rowcount
+            return total
 
     def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1966,16 +1980,22 @@ class PostgreSQLBackend:
     def count_skill_resources_bulk(self, skill_ids: list[str]) -> dict[str, int]:
         if not skill_ids:
             return {}
+        chunk_size = 10_000
+        result: dict[str, int] = {}
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.select(
-                    skill_resources.c.skill_id,
-                    sa.func.count().label("cnt"),
-                )
-                .where(skill_resources.c.skill_id.in_(skill_ids))
-                .group_by(skill_resources.c.skill_id)
-            ).fetchall()
-            return {r[0]: r[1] for r in rows}
+            for i in range(0, len(skill_ids), chunk_size):
+                chunk = skill_ids[i : i + chunk_size]
+                rows = conn.execute(
+                    sa.select(
+                        skill_resources.c.skill_id,
+                        sa.func.count().label("cnt"),
+                    )
+                    .where(skill_resources.c.skill_id.in_(chunk))
+                    .group_by(skill_resources.c.skill_id)
+                ).fetchall()
+                for r in rows:
+                    result[r[0]] = r[1]
+        return result
 
     # -- Skill versions --------------------------------------------------------
 

@@ -297,17 +297,20 @@ class SQLiteBackend:
                 ).fetchall()
             ]
             if orphan_ids:
-                placeholders = ",".join([":p" + str(i) for i in range(len(orphan_ids))])
-                params = {f"p{i}": oid for i, oid in enumerate(orphan_ids)}
-                conn.execute(
-                    sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
-                    params,
-                )
-                result = conn.execute(
-                    sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
-                    params,
-                )
-                orphans = result.rowcount
+                chunk_size = 500
+                for i in range(0, len(orphan_ids), chunk_size):
+                    chunk = orphan_ids[i : i + chunk_size]
+                    placeholders = ",".join([":p" + str(j) for j in range(len(chunk))])
+                    params = {f"p{j}": oid for j, oid in enumerate(chunk)}
+                    conn.execute(
+                        sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
+                        params,
+                    )
+                    result = conn.execute(
+                        sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
+                        params,
+                    )
+                    orphans += result.rowcount
 
             # 2. Remove old unnamed workstreams
             if retention_days > 0:
@@ -325,21 +328,26 @@ class SQLiteBackend:
                     ).fetchall()
                 ]
                 if stale_ids:
-                    placeholders = ",".join([":p" + str(i) for i in range(len(stale_ids))])
-                    params = {f"p{i}": sid for i, sid in enumerate(stale_ids)}
-                    conn.execute(
-                        sa.text(f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"),
-                        params,
-                    )
-                    conn.execute(
-                        sa.text(f"DELETE FROM conversations WHERE ws_id IN ({placeholders})"),
-                        params,
-                    )
-                    result = conn.execute(
-                        sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
-                        params,
-                    )
-                    stale = result.rowcount
+                    chunk_size = 500
+                    for i in range(0, len(stale_ids), chunk_size):
+                        chunk = stale_ids[i : i + chunk_size]
+                        placeholders = ",".join([":p" + str(j) for j in range(len(chunk))])
+                        params = {f"p{j}": sid for j, sid in enumerate(chunk)}
+                        conn.execute(
+                            sa.text(
+                                f"DELETE FROM workstream_config WHERE ws_id IN ({placeholders})"
+                            ),
+                            params,
+                        )
+                        conn.execute(
+                            sa.text(f"DELETE FROM conversations WHERE ws_id IN ({placeholders})"),
+                            params,
+                        )
+                        result = conn.execute(
+                            sa.text(f"DELETE FROM workstreams WHERE ws_id IN ({placeholders})"),
+                            params,
+                        )
+                        stale += result.rowcount
 
             conn.commit()
         return (orphans, stale)
@@ -1329,14 +1337,22 @@ class SQLiteBackend:
     def assign_buckets(self, buckets: list[int], node_id: str) -> int:
         if not buckets:
             return 0
+        # De-duplicate so rowcount stays accurate across chunks.
+        buckets = list(dict.fromkeys(buckets))
+        # SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk conservatively.
+        chunk_size = 500
+        total = 0
         with self._engine.connect() as conn:
-            result = conn.execute(
-                sa.update(hash_ring_buckets)
-                .where(hash_ring_buckets.c.bucket.in_(buckets))
-                .values(node_id=node_id)
-            )
+            for i in range(0, len(buckets), chunk_size):
+                chunk = buckets[i : i + chunk_size]
+                result = conn.execute(
+                    sa.update(hash_ring_buckets)
+                    .where(hash_ring_buckets.c.bucket.in_(chunk))
+                    .values(node_id=node_id)
+                )
+                total += result.rowcount
             conn.commit()
-            return result.rowcount
+            return total
 
     def increment_bucket_count(self, bucket: int, active: bool = False) -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
