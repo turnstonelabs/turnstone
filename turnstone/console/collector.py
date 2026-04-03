@@ -289,9 +289,13 @@ class ClusterCollector:
 
     def _discovery_loop(self) -> None:
         """Periodically scan the service registry for active nodes."""
+        from turnstone.core.storage._registry import StorageUnavailableError
+
         while self._running:
             try:
                 self._discover_nodes()
+            except StorageUnavailableError:
+                pass  # already logged by storage layer
             except Exception:
                 log.exception("Node discovery error")
             time.sleep(self._discovery_interval)

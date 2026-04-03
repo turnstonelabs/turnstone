@@ -282,10 +282,14 @@ def main() -> None:
 
             async def _heartbeat_loop() -> None:
                 """Periodically update service heartbeat."""
+                from turnstone.core.storage._registry import StorageUnavailableError
+
                 while True:
                     await asyncio.sleep(30)
                     try:
                         await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
+                    except StorageUnavailableError:
+                        pass  # already logged by storage layer
                     except Exception:
                         log.exception("channel.heartbeat_failed")
 
