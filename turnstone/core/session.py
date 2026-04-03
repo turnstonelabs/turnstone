@@ -1288,13 +1288,16 @@ class ChatSession:
 
         Threads ``reasoning_effort`` through both the direct keyword (for
         commercial providers) and ``extra_params`` (for local model servers)
-        so callers don't need to duplicate it.
+        so callers don't need to duplicate it.  ``max_tokens`` is clamped to
+        the model's advertised output limit so small models don't error.
         """
+        caps = self._get_capabilities()
+        clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
         return self._provider.create_completion(
             client=self.client,
             model=self.model,
             messages=messages,
-            max_tokens=max_tokens,
+            max_tokens=clamped,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             extra_params=self._provider_extra_params(reasoning_effort=reasoning_effort),
