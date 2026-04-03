@@ -759,6 +759,8 @@ class TestTitleRetry:
     """_generate_title resets _title_generated on failure."""
 
     def test_title_generated_reset_on_failure(self, tmp_db):
+        from turnstone.core.providers._protocol import ModelCapabilities
+
         session = _make_session()
         session._title_generated = True
         session.messages = [
@@ -767,6 +769,7 @@ class TestTitleRetry:
         ]
         # Mock provider to raise
         session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
         session._provider.create_completion.side_effect = RuntimeError("API error")
 
         session._generate_title()
@@ -774,6 +777,8 @@ class TestTitleRetry:
         assert session._title_generated is False
 
     def test_title_generated_stays_true_on_success(self, tmp_db):
+        from turnstone.core.providers._protocol import ModelCapabilities
+
         session = _make_session()
         session._title_generated = True
         session.messages = [
@@ -783,6 +788,7 @@ class TestTitleRetry:
         result = MagicMock()
         result.content = "Test Title"
         session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
         session._provider.create_completion.return_value = result
 
         with patch("turnstone.core.session.update_workstream_title"):
@@ -793,6 +799,8 @@ class TestTitleRetry:
 
     def test_title_skipped_after_resume_changes_ws_id(self, tmp_db):
         """If ws_id changes (via resume) during title generation, discard the result."""
+        from turnstone.core.providers._protocol import ModelCapabilities
+
         session = _make_session()
         session._title_generated = True
         session.messages = [
@@ -803,6 +811,7 @@ class TestTitleRetry:
         result = MagicMock()
         result.content = "Test Title"
         session._provider = MagicMock()
+        session._provider.get_capabilities.return_value = ModelCapabilities()
         session._provider.create_completion.return_value = result
 
         # Simulate resume() changing ws_id while title generation is in flight
