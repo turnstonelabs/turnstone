@@ -11,26 +11,43 @@ permissions:
 
 jobs:
   publish:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: pypi
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          TAG=$(git tag --points-at HEAD | grep '^v' | head -1)
+          if [ -z "$TAG" ]; then
+            echo "No v* tag at HEAD — skipping publish"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        if: steps.tag.outputs.skip == 'false'
         with:
           python-version: "3.14"
       - run: pip install build
+        if: steps.tag.outputs.skip == 'false'
       - run: python -m build
+        if: steps.tag.outputs.skip == 'false'
       - uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # release/v1
+        if: steps.tag.outputs.skip == 'false'
 
       - name: Create GitHub Release
+        if: steps.tag.outputs.skip == 'false'
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
-          tag_name: ${{ github.event.workflow_run.head_branch }}
+          tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.event.workflow_run.head_branch, 'a') || contains(github.event.workflow_run.head_branch, 'b') || contains(github.event.workflow_run.head_branch, 'rc') }}
+          prerelease: ${{ contains(steps.tag.outputs.tag, 'a') || contains(steps.tag.outputs.tag, 'b') || contains(steps.tag.outputs.tag, 'rc') }}
