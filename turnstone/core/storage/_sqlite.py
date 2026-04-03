@@ -1337,6 +1337,8 @@ class SQLiteBackend:
     def assign_buckets(self, buckets: list[int], node_id: str) -> int:
         if not buckets:
             return 0
+        # De-duplicate so rowcount stays accurate across chunks.
+        buckets = list(dict.fromkeys(buckets))
         # SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk conservatively.
         chunk_size = 500
         total = 0

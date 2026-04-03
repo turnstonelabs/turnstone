@@ -1260,6 +1260,8 @@ class PostgreSQLBackend:
     def assign_buckets(self, buckets: list[int], node_id: str) -> int:
         if not buckets:
             return 0
+        # De-duplicate so rowcount stays accurate across chunks.
+        buckets = list(dict.fromkeys(buckets))
         # psycopg limits query parameters to 65 535; chunk to stay well under.
         chunk_size = 10_000
         total = 0

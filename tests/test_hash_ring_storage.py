@@ -41,6 +41,21 @@ class TestHashRingBuckets:
         # Empty list returns 0
         assert storage.assign_buckets([], "node-x") == 0
 
+    def test_assign_large_list_exceeds_chunk_size(self, storage):
+        """Regression: lists larger than chunk_size must not hit param limits."""
+        n = 1200  # exceeds SQLite chunk_size (500) and exercises multi-chunk path
+        storage.seed_ring_buckets([(i, "node-a") for i in range(n)])
+        count = storage.assign_buckets(list(range(n)), "node-b")
+        assert count == n
+        rows = storage.list_ring_buckets()
+        assert all(r["node_id"] == "node-b" for r in rows)
+
+    def test_assign_deduplicates_input(self, storage):
+        """Duplicates in the input list should not inflate rowcount."""
+        storage.seed_ring_buckets([(0, "node-a"), (1, "node-a")])
+        count = storage.assign_buckets([0, 1, 0, 1, 0], "node-b")
+        assert count == 2
+
 
 class TestBucketStats:
     def test_increment_creates_row(self, storage):
