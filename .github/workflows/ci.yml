@@ -74,6 +74,53 @@ jobs:
         env:
           TURNSTONE_TEST_PG_URL: postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test
 
+  wheel-completeness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.14"
+      - run: pip install build
+      - run: python -m build --wheel
+      - name: Check all data files are in wheel
+        run: |
+          SOURCE=$(find turnstone -type f \
+            ! -name '*.py' ! -name '*.pyc' ! -path '*__pycache__*' \
+            | sort)
+          WHEEL=$(python -m zipfile -l dist/*.whl \
+            | awk '{print $1}' \
+            | grep -v '\.py$' | grep -v '\.dist-info' | grep -v '\.pyc' | grep -v '^File$' \
+            | sort)
+
+          # Files intentionally excluded from the wheel (one per line)
+          ALLOW="
+          turnstone/core/storage/migrations/script.py.mako
+          "
+
+          MISSING=$(comm -23 <(echo "$SOURCE") <(echo "$WHEEL") \
+            | grep -vFxf <(echo "$ALLOW" | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' ) || true)
+
+          if [ -n "$MISSING" ]; then
+            echo "::error::Data files in source tree but missing from wheel:"
+            echo "$MISSING"
+            echo ""
+            echo "Add them to [tool.hatch.build.targets.wheel] in pyproject.toml"
+            echo "or to the ALLOW list in this job if intentionally excluded."
+            exit 1
+          fi
+          echo "All source data files present in wheel"
+      - name: Smoke-test entry points from installed wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/turnstone --help
+          /tmp/smoke/bin/turnstone-server --help
+          /tmp/smoke/bin/turnstone-console --help
+          /tmp/smoke/bin/turnstone-admin --help
+          /tmp/smoke/bin/turnstone-channel --help
+          /tmp/smoke/bin/turnstone-bootstrap --help
+
   lock-check:
     runs-on: ubuntu-latest
     steps:
