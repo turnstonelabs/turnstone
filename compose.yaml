@@ -60,9 +60,7 @@ services:
   # turnstone-server — Web UI + chat workstreams + LLM interaction
   # -------------------------------------------------------------------
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: turnstone:local
     profiles:
       - production
     command:
@@ -115,6 +113,7 @@ services:
   # turnstone-console — Cluster dashboard
   # -------------------------------------------------------------------
   console:
+    image: turnstone:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -145,9 +144,7 @@ services:
   # Requires TURNSTONE_DISCORD_TOKEN to enable Discord adapter
   # -------------------------------------------------------------------
   channel:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: turnstone:local
     profiles:
       - production
       - cluster
