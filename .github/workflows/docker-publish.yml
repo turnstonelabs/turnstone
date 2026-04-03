@@ -5,6 +5,10 @@ on:
     workflows: ["CI"]
     types: [completed]
 
+concurrency:
+  group: docker-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
