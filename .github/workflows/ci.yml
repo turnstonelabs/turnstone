@@ -85,11 +85,6 @@ jobs:
       - run: python -m build --wheel
       - name: Check all data files are in wheel
         run: |
-          # Files intentionally excluded from the wheel
-          ALLOW="
-          turnstone/core/storage/migrations/script.py.mako
-          "
-
           SOURCE=$(find turnstone -type f \
             ! -name '*.py' ! -name '*.pyc' ! -path '*__pycache__*' \
             | sort)
@@ -98,8 +93,13 @@ jobs:
             | grep -v '\.py$' | grep -v '\.dist-info' | grep -v '\.pyc' | grep -v '^File$' \
             | sort)
 
+          # Files intentionally excluded from the wheel (one per line)
+          ALLOW="
+          turnstone/core/storage/migrations/script.py.mako
+          "
+
           MISSING=$(comm -23 <(echo "$SOURCE") <(echo "$WHEEL") \
-            | grep -vFf <(echo "$ALLOW") || true)
+            | grep -vFxf <(echo "$ALLOW" | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//' ) || true)
 
           if [ -n "$MISSING" ]; then
             echo "::error::Data files in source tree but missing from wheel:"
