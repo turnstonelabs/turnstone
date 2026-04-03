@@ -6,14 +6,20 @@ import socket
 from html import unescape as _html_unescape
 from urllib.parse import urlparse
 
+_RE_INVISIBLE = re.compile(
+    r"<(script|style|template|noscript)\b[^>]*>.*?</\1\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
 _RE_TAGS = re.compile(r"<[^>]+>")
 _RE_WS = re.compile(r"[ \t]+")
 _RE_BLANKLINES = re.compile(r"\n{3,}")
 
 
 def strip_html(html: str) -> str:
-    """Convert HTML to plain text: strip tags, decode entities, collapse whitespace."""
-    text = _RE_TAGS.sub("", html)
+    """Convert HTML to plain text: strip invisible elements, tags, decode entities."""
+    # Remove elements whose content should never appear as text
+    text = _RE_INVISIBLE.sub("", html)
+    text = _RE_TAGS.sub("", text)
     text = _html_unescape(text)
     text = _RE_WS.sub(" ", text)
     text = _RE_BLANKLINES.sub("\n\n", text)

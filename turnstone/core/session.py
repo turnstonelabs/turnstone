@@ -6167,21 +6167,27 @@ class ChatSession:
             return call_id, msg
 
         if not text.strip():
-            return call_id, "(empty response from URL)"
+            msg = "Error: fetch returned empty response"
+            self._report_tool_result(call_id, "web_fetch", msg, is_error=True)
+            return call_id, msg
 
         original_len = len(text)
         self.ui.on_info(f"fetched {original_len} chars, extracting...")
 
-        # Phase 2: truncate for summarization context
-        max_content = 50_000
+        # Phase 2: truncate for summarization context.
+        # Reserve ~25% of the context window for the extraction prompt
+        # overhead (system message, URL, question) and response tokens.
+        # Convert token budget to chars using the calibrated ratio.
+        max_content = int(self.context_window * self._chars_per_token * 0.75)
+        max_content = max(max_content, 50_000)  # floor: never below 50k
         if len(text) > max_content:
-            text = (
-                text[: max_content // 2]
-                + f"\n\n... [{len(text) - max_content} chars omitted] ...\n\n"
-                + text[-(max_content // 2) :]
-            )
+            # Prefer the beginning — page content is usually top-heavy.
+            text = text[:max_content] + f"\n\n... [{len(text) - max_content} chars truncated] ...\n"
 
-        # Phase 3: summarization API call
+        # Phase 3: summarization API call.
+        # Use a generous max_tokens so thinking models don't starve the
+        # visible answer, and pass reasoning_effort="low" to avoid wasting
+        # budget on deep reasoning for a simple extraction task.
         try:
             result = self._provider.create_completion(
                 client=self.client,
@@ -6206,11 +6212,14 @@ class ChatSession:
                         ),
                     },
                 ],
-                max_tokens=2000,
+                max_tokens=8192,
                 temperature=0.2,
-                extra_params=self._provider_extra_params(),
+                reasoning_effort="low",
+                extra_params=self._provider_extra_params(reasoning_effort="low"),
             )
-            answer = result.content or "(no answer)"
+            answer = result.content or ""
+            if not answer:
+                answer = "Error: extraction returned no answer"
         except Exception as e:
             answer = f"Extraction failed (page was fetched but summarization errored): {e}"
 
@@ -6218,7 +6227,7 @@ class ChatSession:
             call_id,
             "web_fetch",
             answer,
-            is_error=answer.startswith("Extraction failed"),
+            is_error=answer.startswith(("Error:", "Extraction failed")),
         )
 
         return call_id, answer
