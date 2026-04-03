@@ -924,10 +924,8 @@ class ChatSession:
             if asst_msg:
                 snippet += f"\nAssistant: {asst_msg}"
             snippet += "\n\nTitle:"
-            result = self._provider.create_completion(
-                client=self.client,
-                model=self.model,
-                messages=[
+            result = self._utility_completion(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -942,9 +940,6 @@ class ChatSession:
                     {"role": "user", "content": snippet},
                 ],
                 max_tokens=200,
-                temperature=0.3,
-                reasoning_effort="low",
-                extra_params=self._provider_extra_params(reasoning_effort="low"),
             )
             raw = (result.content or "").strip()
             # Take first line, strip quotes
@@ -1280,6 +1275,30 @@ class ChatSession:
                 kwargs["reasoning_effort"] = reasoning_effort
             return {"chat_template_kwargs": kwargs}
         return None
+
+    def _utility_completion(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+        reasoning_effort: str = "low",
+    ) -> CompletionResult:
+        """Run a lightweight internal completion (title gen, compaction, extraction).
+
+        Threads ``reasoning_effort`` through both the direct keyword (for
+        commercial providers) and ``extra_params`` (for local model servers)
+        so callers don't need to duplicate it.
+        """
+        return self._provider.create_completion(
+            client=self.client,
+            model=self.model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+            extra_params=self._provider_extra_params(reasoning_effort=reasoning_effort),
+        )
 
     # -- tool search helpers --------------------------------------------------
 
@@ -2482,14 +2501,9 @@ class ChatSession:
             result: CompletionResult | None = None
             for attempt in range(self._MAX_RETRIES + 1):
                 try:
-                    result = self._provider.create_completion(
-                        client=self.client,
-                        model=self.model,
-                        messages=summary_msgs,
+                    result = self._utility_completion(
+                        summary_msgs,
                         max_tokens=summary_max_tokens,
-                        temperature=0.3,
-                        reasoning_effort="low",
-                        extra_params=self._provider_extra_params(reasoning_effort="low"),
                     )
                     break
                 except Exception as e:
@@ -6189,10 +6203,8 @@ class ChatSession:
         # visible answer, and pass reasoning_effort="low" to avoid wasting
         # budget on deep reasoning for a simple extraction task.
         try:
-            result = self._provider.create_completion(
-                client=self.client,
-                model=self.model,
-                messages=[
+            result = self._utility_completion(
+                [
                     {
                         "role": "system",
                         "content": (
@@ -6214,8 +6226,6 @@ class ChatSession:
                 ],
                 max_tokens=8192,
                 temperature=0.2,
-                reasoning_effort="low",
-                extra_params=self._provider_extra_params(reasoning_effort="low"),
             )
             answer = result.content or ""
             if not answer:
