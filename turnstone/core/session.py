@@ -6193,7 +6193,7 @@ class ChatSession:
         # overhead (system message, URL, question) and response tokens.
         # Convert token budget to chars using the calibrated ratio.
         max_content = int(self.context_window * self._chars_per_token * 0.75)
-        max_content = max(max_content, 50_000)  # floor: never below 50k
+        max_content = min(max(max_content, 50_000), 500_000)  # 50k–500k
         if len(text) > max_content:
             # Prefer the beginning — page content is usually top-heavy.
             text = text[:max_content] + f"\n\n... [{len(text) - max_content} chars truncated] ...\n"
