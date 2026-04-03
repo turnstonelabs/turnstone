@@ -67,6 +67,7 @@ turnstone-bootstrap = "turnstone.bootstrap:main"
 [tool.hatch.build.targets.wheel]
 include = [
   "turnstone/**/*.py",
+  "turnstone/prompts/**/*.md",
   "turnstone/tools/*.json",
   "turnstone/ui/static/*.html",
   "turnstone/ui/static/*.css",
