@@ -559,9 +559,10 @@ class TurnstoneBot:
             # executing."  Both can coexist in the thread.
             for it in event.items:
                 name = it.get("func_name") or it.get("approval_label") or "tool"
+                name = discord.utils.escape_markdown(name)
                 raw_preview = it.get("preview", "")
-                # Sanitize preview: escape backticks to prevent markdown
-                # breakout and strip @-mentions.
+                # Escape backticks to prevent markdown breakout and
+                # strip @-mentions.
                 raw_preview = raw_preview.replace("`", "\\`")
                 raw_preview = discord.utils.escape_mentions(raw_preview)
                 preview = truncate(raw_preview, max_length=120) or None
@@ -614,7 +615,7 @@ class TurnstoneBot:
                 status = "Error" if event.is_error else "Done"
                 status_color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
                 status_embed = discord.Embed(
-                    title=f"{event.name} \u2014 {status}",
+                    title=f"{discord.utils.escape_markdown(event.name)} \u2014 {status}",
                     description=matched_preview or None,
                     color=status_color,
                 )
