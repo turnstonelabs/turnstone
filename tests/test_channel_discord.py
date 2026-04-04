@@ -1103,6 +1103,7 @@ class TestToolResultEvent:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
+        bot._http_client = MagicMock()
         bot._should_auto_approve = MagicMock(return_value=False)
         bot._on_ws_event = TurnstoneBot._on_ws_event.__get__(bot, TurnstoneBot)
         return bot

@@ -906,16 +906,24 @@ Pane.prototype.replayHistory = function (messages) {
           /^Blocked/.test(stripped);
         var isToolError = !!msg.is_error;
         if (stripped && !isDenied) {
-          var out = document.createElement("div");
-          out.className =
-            "tool-output" + (isToolError ? " tool-output-error" : "");
-          out.textContent = stripped;
-          if (stripped.split("\n").length > 10) {
-            makeCollapsible(out);
+          var media = !isToolError ? tryParseMedia(stripped) : null;
+          if (media) {
+            var embed = buildMediaEmbed(media, stripped);
+            var bdg = lastToolBlock.querySelector(".approval-badge");
+            if (bdg) lastToolBlock.insertBefore(embed, bdg);
+            else lastToolBlock.appendChild(embed);
+          } else {
+            var out = document.createElement("div");
+            out.className =
+              "tool-output" + (isToolError ? " tool-output-error" : "");
+            out.textContent = stripped;
+            if (stripped.split("\n").length > 10) {
+              makeCollapsible(out);
+            }
+            var bdg = lastToolBlock.querySelector(".approval-badge");
+            if (bdg) lastToolBlock.insertBefore(out, bdg);
+            else lastToolBlock.appendChild(out);
           }
-          var bdg = lastToolBlock.querySelector(".approval-badge");
-          if (bdg) lastToolBlock.insertBefore(out, bdg);
-          else lastToolBlock.appendChild(out);
         }
         if (isToolError && !lastToolBlock.classList.contains("denied")) {
           lastToolBlock.classList.add("error");
@@ -1220,6 +1228,17 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
 
   var stripped = stripAnsi(output || "").trim();
   if (!stripped) return;
+
+  // Detect structured media output and render interactive embed
+  if (!isError) {
+    var media = tryParseMedia(stripped);
+    if (media) {
+      var embed = buildMediaEmbed(media, stripped);
+      target.after(embed);
+      this.scrollToBottom();
+      return;
+    }
+  }
 
   // Style tool output as error when indicated by isError flag
   var out = document.createElement("div");
@@ -3169,6 +3188,329 @@ function makeCollapsible(el) {
     }
   });
 }
+
+// ===========================================================================
+//  12a. Media embed renderer (MCP tool output with stream_url / results)
+// ===========================================================================
+
+function tryParseMedia(text) {
+  try {
+    var obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  if (obj && typeof obj.stream_url === "string") return obj;
+  if (obj && obj.name && obj.type && obj.id) return obj;
+  if (obj && Array.isArray(obj.results) && obj.results.length > 0) return obj;
+  if (obj && Array.isArray(obj.sessions)) return obj;
+  return null;
+}
+
+function _formatRuntime(item) {
+  var mins = 0;
+  if (typeof item.runtime_minutes === "number") {
+    mins = Math.round(item.runtime_minutes);
+  } else if (typeof item.runtime_ticks === "number") {
+    mins = Math.round(item.runtime_ticks / 600000000);
+  }
+  if (!mins) return "";
+  var h = Math.floor(mins / 60);
+  var m = mins % 60;
+  return h > 0 ? h + "h " + m + "m" : m + "m";
+}
+
+function _redactApiKeys(text) {
+  return text.replace(/api_key=[^&\s"]+/g, "api_key=***");
+}
+
+function buildMediaEmbed(media, rawJson) {
+  var wrapper = document.createElement("div");
+  wrapper.className = "media-embed";
+
+  if (media.stream_url) {
+    var card = buildMediaCard(media);
+    card.querySelector(".media-card-info").appendChild(buildPlayButton(media));
+    wrapper.appendChild(card);
+  } else if (media.results) {
+    wrapper.appendChild(
+      buildMediaResultsList(media.results, media.total_count),
+    );
+  } else if (media.sessions) {
+    wrapper.appendChild(buildMediaResultsList(media.sessions, null));
+  } else if (media.name && media.type && media.id) {
+    wrapper.appendChild(buildMediaCard(media));
+  }
+
+  // Collapsed raw JSON for inspection (with redacted API keys)
+  var raw = document.createElement("div");
+  raw.className = "tool-output";
+  raw.textContent = _redactApiKeys(rawJson);
+  makeCollapsible(raw);
+  wrapper.appendChild(raw);
+
+  return wrapper;
+}
+
+function buildMediaCard(item) {
+  var card = document.createElement("div");
+  card.className = "media-card";
+
+  // Thumbnail
+  var thumbUrl = item.thumbnail_url || item.image_url || "";
+  if (thumbUrl) {
+    var img = document.createElement("img");
+    img.className = "media-card-thumb";
+    img.loading = "lazy";
+    img.alt = item.title || item.name || "Media thumbnail";
+    img.onerror = function () {
+      this.style.display = "none";
+    };
+    img.src = thumbUrl;
+    card.appendChild(img);
+  }
+
+  // Info container
+  var info = document.createElement("div");
+  info.className = "media-card-info";
+
+  // Title (Year)
+  var title = document.createElement("div");
+  title.className = "media-card-title";
+  var titleText = item.title || item.name || "Untitled";
+  if (item.year || item.production_year) {
+    titleText += " (" + (item.year || item.production_year) + ")";
+  }
+  title.textContent = titleText;
+  info.appendChild(title);
+
+  // Metadata line: type, runtime, genres
+  var metaParts = [];
+  if (item.type || item.media_type) {
+    metaParts.push(item.type || item.media_type);
+  }
+  var runtime = _formatRuntime(item);
+  if (runtime) metaParts.push(runtime);
+  if (item.genres && item.genres.length) {
+    metaParts.push(item.genres.join(", "));
+  }
+  if (metaParts.length) {
+    var meta = document.createElement("div");
+    meta.className = "media-card-meta";
+    meta.textContent = metaParts.join(" \u00b7 ");
+    info.appendChild(meta);
+  }
+
+  card.appendChild(info);
+  return card;
+}
+
+function buildPlayButton(media) {
+  var btn = document.createElement("button");
+  btn.className = "media-play-btn";
+  btn.type = "button";
+  btn.dataset.streamUrl = media.stream_url || "";
+  btn.dataset.hlsUrl = media.hls_url || "";
+  btn.dataset.audioOnly =
+    media.audio_only === true ||
+    (media.container &&
+      /^(mp3|flac|ogg|aac|wma|wav|m4a|opus)$/i.test(media.container))
+      ? "true"
+      : "false";
+  btn.dataset.directStream =
+    media.supports_direct_play || media.supports_direct_stream
+      ? "true"
+      : "false";
+
+  btn.setAttribute(
+    "aria-label",
+    "Play " + (media.title || media.name || "media"),
+  );
+
+  var icon = document.createElement("span");
+  icon.textContent = "\u25b6";
+  btn.appendChild(icon);
+  var label = document.createElement("span");
+  label.textContent = "Play";
+  btn.appendChild(label);
+  return btn;
+}
+
+function buildMediaResultsList(results, totalCount) {
+  var container = document.createElement("div");
+  container.className = "media-results-list";
+
+  for (var i = 0; i < results.length; i++) {
+    var item = results[i];
+    var row = document.createElement("div");
+    row.className = "media-result-row";
+
+    // Small thumbnail
+    var thumbUrl = item.thumbnail_url || item.image_url || "";
+    if (thumbUrl) {
+      var img = document.createElement("img");
+      img.className = "media-result-thumb";
+      img.loading = "lazy";
+      img.alt = item.name || item.title || "Media thumbnail";
+      img.onerror = function () {
+        this.style.display = "none";
+      };
+      img.src = thumbUrl;
+      row.appendChild(img);
+    }
+
+    // Title (Year)
+    var titleSpan = document.createElement("span");
+    titleSpan.className = "media-result-title";
+    var titleText = item.name || item.title || "Untitled";
+    if (item.year || item.production_year) {
+      titleText += " (" + (item.year || item.production_year) + ")";
+    }
+    titleSpan.textContent = titleText;
+    row.appendChild(titleSpan);
+
+    // Metadata: type, runtime or season info
+    var metaParts = [];
+    if (item.type || item.media_type) {
+      metaParts.push(item.type || item.media_type);
+    }
+    var runtime = _formatRuntime(item);
+    if (runtime) metaParts.push(runtime);
+    if (item.season_name) metaParts.push(item.season_name);
+    if (
+      typeof item.index_number === "number" &&
+      typeof item.parent_index_number === "number"
+    ) {
+      metaParts.push(
+        "S" +
+          String(item.parent_index_number).padStart(2, "0") +
+          "E" +
+          String(item.index_number).padStart(2, "0"),
+      );
+    }
+    if (metaParts.length) {
+      var metaSpan = document.createElement("span");
+      metaSpan.className = "media-result-meta";
+      metaSpan.textContent = " \u00b7 " + metaParts.join(" \u00b7 ");
+      row.appendChild(metaSpan);
+    }
+
+    container.appendChild(row);
+  }
+
+  // "showing X of Y results" footer
+  if (typeof totalCount === "number" && totalCount > results.length) {
+    var count = document.createElement("div");
+    count.className = "media-results-count";
+    count.textContent =
+      "showing " + results.length + " of " + totalCount + " results";
+    container.appendChild(count);
+  }
+
+  return container;
+}
+
+// ---------------------------------------------------------------------------
+//  HLS lazy-loader (follows mermaid.js pattern from renderer.js:724-751)
+// ---------------------------------------------------------------------------
+var _hlsState = "idle";
+var _hlsQueue = [];
+
+function _loadHls(callback) {
+  if (_hlsState === "ready") {
+    callback();
+    return;
+  }
+  _hlsQueue.push(callback);
+  if (_hlsState === "loading") return;
+  _hlsState = "loading";
+  var script = document.createElement("script");
+  script.src = "/shared/hls-1.6.15/hls.min.js";
+  script.onload = function () {
+    _hlsState = "ready";
+    var q = _hlsQueue;
+    _hlsQueue = [];
+    for (var i = 0; i < q.length; i++) q[i]();
+  };
+  script.onerror = function () {
+    _hlsState = "idle";
+    var q = _hlsQueue;
+    _hlsQueue = [];
+    // Fall through — _activatePlayer will use stream_url since Hls is undefined
+    for (var i = 0; i < q.length; i++) q[i]();
+  };
+  document.head.appendChild(script);
+}
+
+function _isHlsUrl(url) {
+  return typeof url === "string" && /\.m3u8(\?|$)/i.test(url);
+}
+
+// ---------------------------------------------------------------------------
+//  Click-to-play delegated handler (follows img-placeholder pattern)
+// ---------------------------------------------------------------------------
+function _activatePlayer(btn) {
+  var url = btn.dataset.streamUrl;
+  var hlsUrl = btn.dataset.hlsUrl;
+  var isAudio = btn.dataset.audioOnly === "true";
+  var directStream = btn.dataset.directStream === "true";
+
+  var player = document.createElement(isAudio ? "audio" : "video");
+  player.controls = true;
+  player.autoplay = true;
+  player.className = "media-player";
+
+  // Prefer direct stream when the source supports it; fall back to HLS
+  // only when transcoding is needed.
+  if (directStream && url) {
+    player.src = url;
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    typeof Hls !== "undefined" &&
+    Hls.isSupported()
+  ) {
+    var hls = new Hls();
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(player);
+  } else if (
+    hlsUrl &&
+    !isAudio &&
+    player.canPlayType("application/vnd.apple.mpegurl")
+  ) {
+    player.src = hlsUrl;
+  } else {
+    player.src = url;
+  }
+
+  btn.replaceWith(player);
+}
+
+document.addEventListener("click", function (e) {
+  var btn = e.target.closest(".media-play-btn");
+  if (!btn) return;
+  e.preventDefault();
+  btn.disabled = true;
+  btn.querySelector("span:last-child").textContent = "Loading\u2026";
+
+  var hlsUrl = btn.dataset.hlsUrl;
+  var isAudio = btn.dataset.audioOnly === "true";
+
+  // If HLS URL present and not audio, ensure hls.js is loaded first
+  if (hlsUrl && !isAudio && _isHlsUrl(hlsUrl)) {
+    _loadHls(function () {
+      _activatePlayer(btn);
+    });
+  } else {
+    _activatePlayer(btn);
+  }
+});
+
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Enter") return;
+  var btn = e.target.closest(".media-play-btn");
+  if (!btn) return;
+  btn.click();
+});
 
 // ===========================================================================
 //  13. Plan review dialog

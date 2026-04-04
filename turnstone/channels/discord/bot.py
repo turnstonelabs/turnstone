@@ -16,7 +16,7 @@ import contextlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -624,14 +624,36 @@ class TurnstoneBot:
                     log.debug("discord.tool_info_status_edit_failed", ws_id=ws_id)
 
             # Send the result as a separate message.
-            desc = format_tool_result(event.output)
-            color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
-            result_embed = discord.Embed(
-                title=event.name,
-                description=desc,
-                color=color,
-            )
-            await thread.send(embed=result_embed)
+            if not event.is_error:
+                from turnstone.channels._formatter import try_build_media_embed
+
+                media_result = await try_build_media_embed(
+                    event.name,
+                    event.output,
+                    http=self._http_client,
+                )
+                if media_result is not None:
+                    embed, file = media_result
+                    kwargs: dict[str, Any] = {"embed": embed}
+                    if file is not None:
+                        kwargs["file"] = file
+                    await thread.send(**kwargs)
+                else:
+                    desc = format_tool_result(event.output)
+                    result_embed = discord.Embed(
+                        title=event.name,
+                        description=desc,
+                        color=discord.Color.dark_grey(),
+                    )
+                    await thread.send(embed=result_embed)
+            else:
+                desc = format_tool_result(event.output)
+                result_embed = discord.Embed(
+                    title=event.name,
+                    description=desc,
+                    color=discord.Color.red(),
+                )
+                await thread.send(embed=result_embed)
 
         elif isinstance(event, ApproveRequestEvent):
             # Evaluate admin tool policies before auto-approve.
