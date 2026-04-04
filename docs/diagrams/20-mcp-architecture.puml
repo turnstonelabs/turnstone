@@ -152,10 +152,34 @@ MCPMgr -> MCPSrv : prompts/get
 MCPSrv --> MCPMgr : GetPromptResult
 MCPMgr --> Session : messages [{role, content}]
 
+== Resilience: Circuit Breaker & Stream Safety ==
+
+note over MCPMgr
+  **Per-server circuit breaker**
+  CLOSED --(3 failures)--> OPEN
+  OPEN --(cooldown expires)--> half-open probe
+  Probe success --> CLOSED (trip_count decays by 1)
+  Probe failure --> OPEN (cooldown doubles, max 5 min)
+
+  McpError (protocol) does NOT trip breaker.
+  BrokenPipeError / EOFError evicts dead session.
+  All sync methods cancel orphaned futures on timeout.
+  Transport streams pre-closed before stack teardown
+  to avoid anyio cancel-scope CPU busy-loop (SDK #2147).
+end note
+
+Session -> MCPMgr : call_tool_sync()
+MCPMgr -> MCPMgr : _cb_gate(server)\n[reject if circuit open]
+MCPMgr -> MCPMgr : _cb_auto_reconnect()\n[if session gone + cooldown expired]
+MCPMgr -> MCPSrv : tools/call
+MCPSrv --> MCPMgr : result or error
+MCPMgr -> MCPMgr : _cb_record_success()\nor _cb_record_failure()
+
 == Three-Tier Refresh ==
 
-group Push Notifications
+group Push Notifications (debounced 5s per server)
   MCPSrv -> MCPMgr : ToolListChangedNotification
+  MCPMgr -> MCPMgr : debounce check\n(skip if < 5s since last)
   MCPMgr -> MCPMgr : _refresh_server_tools()
 
   MCPSrv -> MCPMgr : ResourceListChangedNotification
@@ -172,6 +196,9 @@ group Periodic Polling (default 4h)
     Only polls capabilities
     without push support.
     Staggered per-server.
+    Disconnected servers get
+    reconnect attempts with
+    exponential backoff (60s-1h).
   end note
 end
 
