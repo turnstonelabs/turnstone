@@ -45,7 +45,11 @@ _MCP_ONLY_TOOLS = frozenset({"read_resource", "use_prompt"})
 
 def _detect_provider(base_url: str) -> str:
     """Infer provider name from a base URL."""
-    if "anthropic.com" in base_url:
+    from urllib.parse import urlparse
+
+    normalized = base_url if "://" in base_url else f"https://{base_url}"
+    hostname = urlparse(normalized).hostname or ""
+    if hostname == "anthropic.com" or hostname.endswith(".anthropic.com"):
         return "anthropic"
     return "openai"
 

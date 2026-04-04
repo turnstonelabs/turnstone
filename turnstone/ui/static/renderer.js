@@ -26,6 +26,7 @@ function inlineMarkdown(text) {
   text = text.replace(/~~(.+?)~~/g, "<del>$1</del>");
   // Images (must come before links — render as click-to-load placeholder)
   text = text.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, function (m, alt, url) {
+    if (!/^\s*(https?:\/\/|data:image\/)/i.test(url)) return m;
     var safeAlt = alt || "Image";
     var domain = "";
     try {
@@ -53,9 +54,9 @@ function inlineMarkdown(text) {
       "</span>"
     );
   });
-  // Links (block javascript: scheme)
+  // Links (allow http, https, and same-origin relative URLs only)
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function (m, label, url) {
-    if (/^\s*javascript:/i.test(url)) return m;
+    if (!/^\s*(https?:\/\/|\/(?!\/))/i.test(url)) return m;
     return (
       '<a href="' +
       url +
@@ -89,8 +90,16 @@ function inlineMarkdown(text) {
 document.addEventListener("click", function (e) {
   var ph = e.target.closest(".img-placeholder");
   if (!ph) return;
+  var raw = ph.getAttribute("data-src") || "";
+  if (!/^(https?:\/\/|data:image\/)/i.test(raw)) return;
+  var src;
+  try {
+    src = new URL(raw).href;
+  } catch (_e) {
+    return;
+  }
   var img = document.createElement("img");
-  img.src = ph.getAttribute("data-src");
+  img.src = src;
   img.alt = ph.getAttribute("data-alt");
   img.loading = "lazy";
   ph.replaceWith(img);

@@ -546,7 +546,11 @@ def _detect_openai_compat(
             result["context_window"] = known["context_window"]
 
     # Server type heuristics
-    if base_url and "api.openai.com" in base_url:
+    from urllib.parse import urlparse
+
+    _normalized = (base_url if "://" in base_url else f"https://{base_url}") if base_url else ""
+    _hostname = urlparse(_normalized).hostname or "" if _normalized else ""
+    if base_url and (_hostname == "api.openai.com" or _hostname.endswith(".openai.com")):
         result["server_type"] = "openai"
     elif meta is not None and "n_ctx_train" in meta:
         result["server_type"] = "llama.cpp"
