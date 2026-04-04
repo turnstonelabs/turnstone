@@ -768,7 +768,8 @@
   color: var(--fg-dim);
   padding: 12px 16px 4px;
 }
-.admin-sidebar-group:first-child .admin-sidebar-group-label {
+.admin-sidebar-group:first-child .admin-sidebar-group-label,
+.admin-sidebar-close + .admin-sidebar-group .admin-sidebar-group-label {
   padding-top: 4px;
 }
 
