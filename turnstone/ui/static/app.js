@@ -913,11 +913,8 @@ Pane.prototype.replayHistory = function (messages) {
             if (bdg) lastToolBlock.insertBefore(embed, bdg);
             else lastToolBlock.appendChild(embed);
           } else {
-            var out = document.createElement("div");
-            out.className =
-              "tool-output" + (isToolError ? " tool-output-error" : "");
-            out.textContent = stripped;
-            if (stripped.split("\n").length > 10) {
+            var out = renderToolOutput(stripped, isToolError);
+            if (out.textContent.split("\n").length > 10) {
               makeCollapsible(out);
             }
             var bdg = lastToolBlock.querySelector(".approval-badge");
@@ -1240,10 +1237,7 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     }
   }
 
-  // Style tool output as error when indicated by isError flag
-  var out = document.createElement("div");
-  out.className = "tool-output" + (isError ? " tool-output-error" : "");
-  out.textContent = stripped;
+  var out = renderToolOutput(stripped, isError);
 
   // Mark the parent approval block as errored
   if (isError) {
@@ -1258,7 +1252,7 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
     }
   }
 
-  if (stripped.split("\n").length > 10) {
+  if (out.textContent.split("\n").length > 10) {
     makeCollapsible(out);
   }
 
@@ -3220,7 +3214,44 @@ function _formatRuntime(item) {
 }
 
 function _redactApiKeys(text) {
-  return text.replace(/api_key=[^&\s"]+/g, "api_key=***");
+  return text.replace(
+    /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g,
+    function (m) {
+      return m.split("=")[0] + "=***";
+    },
+  );
+}
+
+/**
+ * Try to pretty-print JSON text with indentation and API key redaction.
+ * Returns a formatted string if valid JSON, otherwise null.
+ */
+function _tryPrettyJson(text) {
+  try {
+    var obj = JSON.parse(text);
+  } catch (e) {
+    return null;
+  }
+  return _redactApiKeys(JSON.stringify(obj, null, 2));
+}
+
+/**
+ * Render tool output text into a DOM element.
+ * If the text is valid JSON, pretty-prints it with indentation.
+ * Otherwise renders as plain text. Always redacts API keys.
+ */
+function renderToolOutput(stripped, isError) {
+  var out = document.createElement("div");
+  out.className = "tool-output" + (isError ? " tool-output-error" : "");
+  if (!isError) {
+    var pretty = _tryPrettyJson(stripped);
+    if (pretty) {
+      out.textContent = pretty;
+      return out;
+    }
+  }
+  out.textContent = _redactApiKeys(stripped);
+  return out;
 }
 
 function buildMediaEmbed(media, rawJson) {
@@ -3481,6 +3512,13 @@ function _activatePlayer(btn) {
   } else {
     player.src = url;
   }
+
+  player.addEventListener("error", function () {
+    var err = document.createElement("div");
+    err.className = "tool-output tool-output-error";
+    err.textContent = "Failed to load media stream";
+    player.replaceWith(err);
+  });
 
   btn.replaceWith(player);
 }
