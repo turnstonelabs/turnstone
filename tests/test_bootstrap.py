@@ -19,6 +19,7 @@ from turnstone.bootstrap import (
     _tool_generate_secret,
     _tool_read_file,
     _tool_validate_api_key,
+    _tool_write_compose,
     _tool_write_file,
     execute_tool,
 )
@@ -101,6 +102,52 @@ class TestWriteFile:
             result = _tool_write_file(tmp_path, {"path": "changed.txt", "content": "new\n"})
         assert "written successfully" in result
         assert (tmp_path / "changed.txt").read_text() == "new\n"
+
+
+class TestWriteCompose:
+    def test_writes_compose_file(self, tmp_path: Path) -> None:
+        with patch("builtins.input", return_value="y"):
+            result = _tool_write_compose(tmp_path, {})
+        assert "written successfully" in result
+        assert "ghcr.io" in result
+        content = (tmp_path / "compose.yaml").read_text()
+        assert "ghcr.io/turnstonelabs/turnstone" in content
+        assert "TURNSTONE_IMAGE_TAG" in content
+
+    def test_user_declines(self, tmp_path: Path) -> None:
+        with patch("builtins.input", return_value="n"):
+            result = _tool_write_compose(tmp_path, {})
+        assert "declined" in result
+        assert not (tmp_path / "compose.yaml").exists()
+
+    def test_identical_content_skipped(self, tmp_path: Path) -> None:
+        # Write it once
+        with patch("builtins.input", return_value="y"):
+            _tool_write_compose(tmp_path, {})
+        # Second call should skip
+        result = _tool_write_compose(tmp_path, {})
+        assert "already exists" in result
+
+    def test_no_build_blocks(self, tmp_path: Path) -> None:
+        with patch("builtins.input", return_value="y"):
+            _tool_write_compose(tmp_path, {})
+        content = (tmp_path / "compose.yaml").read_text()
+        assert "build:" not in content
+        assert "dockerfile:" not in content.lower()
+
+    def test_overwrites_different_content(self, tmp_path: Path) -> None:
+        (tmp_path / "compose.yaml").write_text("old content\n")
+        with patch("builtins.input", return_value="y"):
+            result = _tool_write_compose(tmp_path, {})
+        assert "written successfully" in result
+        content = (tmp_path / "compose.yaml").read_text()
+        assert "ghcr.io" in content
+
+    def test_no_local_image_references(self, tmp_path: Path) -> None:
+        with patch("builtins.input", return_value="y"):
+            _tool_write_compose(tmp_path, {})
+        content = (tmp_path / "compose.yaml").read_text()
+        assert "turnstone:local" not in content
 
 
 class TestGenerateSecret:
@@ -620,7 +667,7 @@ class TestConstants:
             assert func["parameters"]["type"] == "object"
 
     def test_tool_count(self) -> None:
-        assert len(TOOLS) == 7
+        assert len(TOOLS) == 8
 
     def test_all_tools_have_implementations(self) -> None:
         from turnstone.bootstrap import TOOL_FUNCTIONS

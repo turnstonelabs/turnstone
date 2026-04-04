@@ -1,16 +1,16 @@
 # =============================================================================
-# Turnstone Docker Compose Stack — Development
+# Turnstone Docker Compose Stack — Production
 #
-# This file is for local development from a git clone. It builds images
-# locally from the Dockerfile. If you installed via pip/pipx, run
-# `turnstone-bootstrap` instead — it writes a production compose.yaml
-# that pulls pre-built images from ghcr.io.
+# This file is bundled with the turnstone wheel and written by
+# turnstone-bootstrap for users who install via pip/pipx.
+# It pulls pre-built images from ghcr.io instead of building locally.
 #
 # Usage:
 #   Infra only:           docker compose up
 #   Single node:          docker compose --profile production up
 #   Production (PG):      DB_BACKEND=postgresql docker compose --profile production up
-#   10-node cluster:      docker compose --profile cluster up
+#
+# Set TURNSTONE_IMAGE_TAG in .env to pin the image version (default: latest).
 # =============================================================================
 
 name: turnstone
@@ -32,7 +32,6 @@ services:
     image: pgautoupgrade/pgautoupgrade:18-alpine
     profiles:
       - production
-      - cluster
     command:
       - postgres
       - -c
@@ -65,7 +64,7 @@ services:
   # turnstone-server — Web UI + chat workstreams + LLM interaction
   # -------------------------------------------------------------------
   server:
-    image: turnstone:local
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
     profiles:
       - production
     command:
@@ -118,10 +117,7 @@ services:
   # turnstone-console — Cluster dashboard
   # -------------------------------------------------------------------
   console:
-    image: turnstone:local
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
     command:
       - turnstone-console
       - --host=0.0.0.0
@@ -149,10 +145,9 @@ services:
   # Requires TURNSTONE_DISCORD_TOKEN to enable Discord adapter
   # -------------------------------------------------------------------
   channel:
-    image: turnstone:local
+    image: ghcr.io/turnstonelabs/turnstone:${TURNSTONE_IMAGE_TAG:-latest}
     profiles:
       - production
-      - cluster
     command:
       - sh
       - -c
@@ -175,90 +170,3 @@ services:
         condition: service_healthy
         required: false
     restart: unless-stopped
-
-  # ===================================================================
-  # 10-node cluster (profile: cluster)
-  #
-  # All nodes share the same PostgreSQL instance.
-  # Access via console at :8090.
-  #
-  # Start:  docker compose --profile cluster up
-  # ===================================================================
-
-  # -- cluster servers ------------------------------------------------
-
-  server-1: &cluster-server
-    image: turnstone:local
-    build: { context: ., dockerfile: Dockerfile }
-    profiles: [cluster]
-    command:
-      - sh
-      - -c
-      - >-
-        turnstone-server
-        --host 0.0.0.0
-        --port 8080
-        --base-url "$${LLM_BASE_URL}"
-        --api-key "$${OPENAI_API_KEY}"
-        $${MODEL:+--model $$MODEL}
-        $${SKIP_PERMISSIONS:+--skip-permissions}
-        $${MCP_CONFIG:+--mcp-config $$MCP_CONFIG}
-    volumes:
-      - turnstone-data:/data
-      - ${WORKSPACE_MOUNT:-workspace}:/workspace
-    environment: &cluster-server-env
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
-      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
-      SKIP_PERMISSIONS: ${SKIP_PERMISSIONS:-}
-      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
-      TURNSTONE_JWT_SECRET: ${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      MODEL: ${MODEL:-}
-      MCP_CONFIG: ${MCP_CONFIG:-}
-      TURNSTONE_DB_BACKEND: ${DB_BACKEND:-postgresql}
-      TURNSTONE_DB_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:?}@postgres:5432/turnstone}
-      TURNSTONE_NODE_ID: node-1
-      TURNSTONE_ADVERTISE_URL: http://server-1:8080
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    networks: [turnstone-net]
-    depends_on:
-      postgres: { condition: service_healthy }
-    healthcheck:
-      test: ["CMD", "python", "/usr/local/bin/healthcheck.py", "http://127.0.0.1:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 60s
-    deploy:
-      resources:
-        limits: { memory: 384M, cpus: '0.5' }
-    restart: unless-stopped
-
-  server-2:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-2, TURNSTONE_ADVERTISE_URL: "http://server-2:8080" }
-  server-3:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-3, TURNSTONE_ADVERTISE_URL: "http://server-3:8080" }
-  server-4:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-4, TURNSTONE_ADVERTISE_URL: "http://server-4:8080" }
-  server-5:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-5, TURNSTONE_ADVERTISE_URL: "http://server-5:8080" }
-  server-6:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-6, TURNSTONE_ADVERTISE_URL: "http://server-6:8080" }
-  server-7:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-7, TURNSTONE_ADVERTISE_URL: "http://server-7:8080" }
-  server-8:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-8, TURNSTONE_ADVERTISE_URL: "http://server-8:8080" }
-  server-9:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-9, TURNSTONE_ADVERTISE_URL: "http://server-9:8080" }
-  server-10:
-    <<: *cluster-server
-    environment: { <<: *cluster-server-env, TURNSTONE_NODE_ID: node-10, TURNSTONE_ADVERTISE_URL: "http://server-10:8080" }
-

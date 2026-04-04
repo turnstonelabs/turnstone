@@ -2,14 +2,15 @@
 
 Entry point: turnstone-bootstrap
 
-Walks users through configuring a single-node or multi-node Turnstone
-deployment via a conversational AI assistant. Generates .env files,
-docker-compose overrides, and post-start setup scripts.
+Walks users through configuring a Turnstone deployment via a conversational
+AI assistant. Generates compose.yaml, .env files, and post-start setup
+scripts.
 """
 
 from __future__ import annotations
 
 import getpass
+import importlib.resources
 import json
 import os
 import secrets
@@ -60,8 +61,6 @@ Turnstone is a multi-node AI orchestration platform. A deployment consists of:
 ## Deployment Profiles (compose.yaml)
 - **Default** (no flag): console only (infrastructure, good for running external servers)
 - **Production** (`--profile production`): 1 server + console + PostgreSQL + channel (single node)
-- **Cluster** (`--profile cluster`): 10-node server fleet + PostgreSQL + channel + console (multi-node)
-- **ddgCluster** (`--profile ddgCluster`): Cluster + DuckDuckGo Search MCP sidecar (web search via MCP, no API key needed)
 
 ## Environment Variables (.env)
 The compose.yaml reads these from a `.env` file:
@@ -78,9 +77,9 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 
 ### Database
 - `DB_BACKEND` — `sqlite` (default) or `postgresql`
-- `DATABASE_URL` — PostgreSQL connection string (production/cluster only)
+- `DATABASE_URL` — PostgreSQL connection string (production only)
 - `POSTGRES_USER` — PostgreSQL username (default: turnstone)
-- `POSTGRES_PASSWORD` — PostgreSQL password (required for production/cluster)
+- `POSTGRES_PASSWORD` — PostgreSQL password (required for production)
 
 ### Authentication (always enabled)
 - `TURNSTONE_JWT_SECRET` — JWT signing secret (required). All services must share the same secret. \
@@ -104,16 +103,15 @@ Generate with: `python -c "import secrets; print(secrets.token_hex(32))"`
 - `TURNSTONE_DISCORD_TOKEN` — Discord bot token
 - `TURNSTONE_DISCORD_GUILD` — Restrict to single guild ID
 
-### MCP Integration (optional)
-- `MCP_CONFIG` — Path to MCP server config inside the container \
-(e.g., `/etc/turnstone/mcp-ddg.json`). When set, servers connect to configured MCP servers on startup.
-- The `ddgCluster` profile runs a DuckDuckGo Search MCP sidecar (Python) that provides \
-`duckduckgo_web_search` and `duckduckgo_fetch_content` tools to every node. No API key required. \
-The sidecar uses MCP streamable-http transport with DNS rebinding protection disabled \
-(required for Docker internal networking) and binds to 0.0.0.0:3000 via FastMCP settings. \
-Safe search is disabled by default.
+### Docker Image
+- `TURNSTONE_IMAGE_TAG` — Docker image tag (default: `latest`). \
+Set this to pin the image version (e.g., `1.1.0a3`, `stable`, `experimental`).
 
-### Cluster
+### MCP Integration (optional)
+- `MCP_CONFIG` — Path to MCP server config inside the container. \
+When set, servers connect to configured MCP servers on startup.
+
+### Other
 - `APPROVAL_TIMEOUT` — Tool approval timeout in seconds (default: 3600)
 
 ## Auth Setup Flow
@@ -154,28 +152,28 @@ Categories like "engineering", "analysis", etc.
 ## Your Task
 Walk the user through setting up their deployment step by step:
 
-1. **First**: Call `check_docker` and `read_file` on `.env` to detect existing state.
-2. **Deployment mode**: Ask if they want single-node (`--profile production`) or multi-node \
-(`--profile cluster`). Explain trade-offs.
-3. **LLM provider for the deployment**: Which LLM backend their Turnstone will use \
+1. **First**: Call `check_docker`, `read_file` on `.env`, and `read_file` on `compose.yaml` \
+to detect existing state. If `compose.yaml` does not exist, call `write_compose` to \
+extract the bundled production compose file. This is essential — without it, \
+`docker compose` will fail.
+2. **LLM provider for the deployment**: Which LLM backend their Turnstone will use \
 (may differ from this wizard's model). Ask for base URL, API key, model name.
-4. **Database**: SQLite (dev/simple) vs PostgreSQL (production/cluster). \
-PostgreSQL is required for cluster mode.
-5. **Security**: Auth is always enabled and requires `TURNSTONE_JWT_SECRET`. \
+3. **Database**: SQLite (dev/simple) vs PostgreSQL (production). \
+PostgreSQL is recommended for production use.
+4. **Security**: Auth is always enabled and requires `TURNSTONE_JWT_SECRET`. \
 Use `generate_secret` for JWT secret and Postgres password. \
 Always set `TURNSTONE_JWT_SECRET` in the .env. \
 Ask for initial admin username and password. \
 If the user's deployment will use an external identity provider (Okta, Azure AD, Google, etc.), \
 offer to configure OIDC SSO. Ask for the issuer URL, client ID, and client secret. \
 Optionally configure role mapping and OIDC-only mode.
-6. **Ports**: Check defaults with `check_port`, suggest alternatives if conflicts.
-7. **Optional features**: Discord integration, web search (Tavily key), \
-DuckDuckGo Search MCP (for cluster — uses `ddgCluster` profile with \
-`MCP_CONFIG=/etc/turnstone/mcp-ddg.json`, no API key needed).
-8. **Generate .env**: Call `write_file` with the complete `.env` content.
-9. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
+5. **Ports**: Check defaults with `check_port`, suggest alternatives if conflicts.
+6. **Optional features**: Discord integration, web search (Tavily key).
+7. **Generate .env**: Call `write_file` with the complete `.env` content. \
+Include `TURNSTONE_IMAGE_TAG` set to the version matching the installed package.
+8. **Generate setup.sh**: Call `write_file` with a post-start script that creates the admin \
 user and any roles/policies/skills the user wants.
-10. **Finish**: Call the `finish` tool with a summary of what was configured and the \
+9. **Finish**: Call the `finish` tool with a summary of what was configured and the \
 exact commands to run next (e.g., `docker compose --profile production up -d` then `./setup.sh`).
 
 ## Rules
@@ -183,14 +181,9 @@ exact commands to run next (e.g., `docker compose --profile production up -d` th
 - NEVER echo API keys or passwords back to the user in your text responses.
 - ALWAYS use `generate_secret` for passwords and secrets — never invent them.
 - When writing files, use `write_file` — the user will see a preview and confirm.
+- If `compose.yaml` is missing, call `write_compose` before anything else. \
+The compose file uses pre-built images from ghcr.io — no local Docker build is needed.
 - If an existing .env is detected, summarize what's configured and ask what to change.
-- For cluster mode, the compose.yaml has a fixed 10-node fleet — no override needed.
-- For cluster + DuckDuckGo Search, use `--profile ddgCluster` instead of `--profile cluster`. \
-Set `MCP_CONFIG=/etc/turnstone/mcp-ddg.json` in `.env`. No API key needed. \
-The DuckDuckGo MCP sidecar starts automatically and all cluster nodes connect to it. \
-Note: the MCP SDK's DNS rebinding protection must be disabled for Docker-internal networking \
-(the compose.yaml handles this), and the server must bind to 0.0.0.0 (not 127.0.0.1) to be \
-reachable from other containers.
 - The `DATABASE_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
 - For local LLM backends (vLLM, llama.cpp, Ollama, etc.), set `OPENAI_API_KEY=dummy` in the \
@@ -334,6 +327,23 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Check if Docker and Docker Compose are installed and the Docker "
                 "daemon is running. Returns version info or error details."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_compose",
+            "description": (
+                "Write the production Docker Compose file to the project directory. "
+                "This extracts the compose.yaml bundled with Turnstone, which uses "
+                "pre-built images from ghcr.io (no local Docker build required). "
+                "The user will be shown a preview and asked to confirm."
             ),
             "parameters": {
                 "type": "object",
@@ -561,6 +571,54 @@ def _tool_check_docker(args: dict[str, Any]) -> str:
     return "\n".join(results)
 
 
+def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
+    """Extract the bundled production compose.yaml to the project directory."""
+    dest = project_dir / "compose.yaml"
+
+    # Read the bundled template
+    try:
+        ref = importlib.resources.files("turnstone.deploy").joinpath("compose.yaml")
+        content = ref.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"Error: could not read bundled compose template: {exc}"
+
+    # Skip if identical
+    if dest.exists():
+        try:
+            existing = dest.read_text(encoding="utf-8")
+            if existing == content:
+                return "compose.yaml already exists with identical content."
+        except (OSError, UnicodeDecodeError):
+            pass
+
+    line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+
+    # Show preview
+    print(f"\n{YELLOW} Writing compose.yaml ({line_count} lines){RESET}")
+    print(f"{DIM}{'─' * 50}{RESET}")
+    for line in content.split("\n")[:30]:
+        print(f"  {DIM}{line}{RESET}")
+    if line_count > 30:
+        print(f"  {DIM}... ({line_count - 30} more lines){RESET}")
+    print(f"{DIM}{'─' * 50}{RESET}")
+
+    try:
+        choice = input(f"{BOLD}Write this file? [Y/n]{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return "User cancelled the write."
+    if choice in ("n", "no"):
+        return "User declined to write compose.yaml."
+
+    dest.write_text(content, encoding="utf-8")
+
+    return (
+        f"compose.yaml written successfully. "
+        f"It uses ghcr.io/turnstonelabs/turnstone images. "
+        f"Add TURNSTONE_IMAGE_TAG={__version__} to .env to pin the image "
+        f"to the currently installed version, or omit it to use 'latest'."
+    )
+
+
 class _FinishError(Exception):
     """Raised by the finish tool to signal the wizard is done."""
 
@@ -581,11 +639,12 @@ TOOL_FUNCTIONS: dict[str, Any] = {
     "check_port": _tool_check_port,
     "validate_api_key": _tool_validate_api_key,
     "check_docker": _tool_check_docker,
+    "write_compose": _tool_write_compose,
     "finish": _tool_finish,
 }
 
 # Tools that need the project_dir argument
-_PROJECT_DIR_TOOLS = frozenset({"read_file", "write_file"})
+_PROJECT_DIR_TOOLS = frozenset({"read_file", "write_file", "write_compose"})
 
 
 def execute_tool(name: str, args: dict[str, Any], project_dir: Path) -> str:
