@@ -867,7 +867,7 @@ body { position: static; }
 .approval-tool { padding: 8px 12px; border-bottom: 1px solid var(--border); }
 .approval-tool:last-of-type { border-bottom: none; }
 .approval-tool .tool-name { color: var(--yellow); font-weight: 600; font-size: 11px; margin-bottom: 3px; }
-.approval-tool .tool-cmd { color: var(--fg-bright); white-space: pre-wrap; word-break: break-all; }
+.approval-tool .tool-cmd { color: var(--fg-bright); white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow: hidden; }
 .approval-tool .tool-cmd .dollar { color: var(--green); }
 .approval-tool .tool-diff { white-space: pre-wrap; font-size: 12px; margin-top: 4px; }
 .approval-tool .tool-diff .diff-del { color: var(--red); }
@@ -1034,6 +1034,12 @@ body { position: static; }
 }
 audio.media-player {
   max-height: 54px;
+}
+.media-player-error {
+  color: var(--red);
+  font-size: 12px;
+  padding: 8px 12px;
+  background: var(--code-bg);
 }
 .media-results-list {
   padding: 6px 12px;

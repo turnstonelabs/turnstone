@@ -861,13 +861,23 @@ Pane.prototype.replayHistory = function (messages) {
             cmd.className = "tool-cmd";
             try {
               var args = JSON.parse(tc.arguments);
-              var preview = Object.values(args)[0] || "";
               if (tc.name === "bash") {
+                var preview = Object.values(args)[0] || "";
                 cmd.innerHTML =
                   '<span class="dollar">$ </span>' +
                   escapeHtml(String(preview));
               } else {
-                cmd.textContent = String(preview).substring(0, 200);
+                var parts = [];
+                var keys = Object.keys(args);
+                for (var k = 0; k < keys.length; k++) {
+                  var val = args[keys[k]];
+                  var valStr =
+                    val === null || val === undefined ? "None" : String(val);
+                  if (valStr.length > 80)
+                    valStr = valStr.substring(0, 77) + "...";
+                  parts.push(keys[k] + ": " + valStr);
+                }
+                cmd.textContent = parts.join("\n");
               }
             } catch (e) {
               cmd.textContent = tc.arguments.substring(0, 100);
@@ -3275,7 +3285,7 @@ function buildMediaEmbed(media, rawJson) {
   // Collapsed raw JSON for inspection (with redacted API keys)
   var raw = document.createElement("div");
   raw.className = "tool-output";
-  raw.textContent = _redactApiKeys(rawJson);
+  raw.textContent = _tryPrettyJson(rawJson) || _redactApiKeys(rawJson);
   makeCollapsible(raw);
   wrapper.appendChild(raw);
 
@@ -3514,10 +3524,29 @@ function _activatePlayer(btn) {
   }
 
   player.addEventListener("error", function () {
+    var card = player.closest(".media-embed");
+    var titleEl = card ? card.querySelector(".media-card-title") : null;
+    var label = titleEl ? ": " + titleEl.textContent : "";
+
     var err = document.createElement("div");
-    err.className = "tool-output tool-output-error";
-    err.textContent = "Failed to load media stream";
-    player.replaceWith(err);
+    err.className = "media-player-error";
+    err.setAttribute("role", "alert");
+    err.textContent = "Failed to load stream" + label;
+
+    var retry = document.createElement("button");
+    retry.className = "media-play-btn";
+    retry.type = "button";
+    retry.dataset.streamUrl = url;
+    retry.dataset.hlsUrl = hlsUrl || "";
+    retry.dataset.audioOnly = String(isAudio);
+    retry.dataset.directStream = String(directStream);
+    retry.setAttribute("aria-label", "Retry" + label);
+    retry.appendChild(document.createTextNode("\u25b6 Retry"));
+
+    var container = document.createElement("div");
+    container.appendChild(err);
+    container.appendChild(retry);
+    player.replaceWith(container);
   });
 
   btn.replaceWith(player);
