@@ -93,14 +93,10 @@ document.addEventListener("click", function (e) {
   var raw = ph.getAttribute("data-src") || "";
   if (!/^(https?:\/\/|data:image\/)/i.test(raw)) return;
   var src;
-  if (/^data:/i.test(raw)) {
-    src = raw;
-  } else {
-    try {
-      src = new URL(raw).href;
-    } catch (_e) {
-      return;
-    }
+  try {
+    src = new URL(raw).href;
+  } catch (_e) {
+    return;
   }
   var img = document.createElement("img");
   img.src = src;
