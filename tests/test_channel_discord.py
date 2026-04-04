@@ -8,6 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# discord.utils.escape_markdown passes 'count' as positional to re.sub,
+# which is deprecated in Python 3.13+.  This is a discord.py bug (fixed
+# in newer releases); suppress here to keep the test output clean.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:.*'count' is passed as positional argument:DeprecationWarning"
+)
+
 discord = pytest.importorskip("discord")
 
 

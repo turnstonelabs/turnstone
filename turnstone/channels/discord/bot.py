@@ -558,8 +558,8 @@ class TurnstoneBot:
             # authorize this?" while the running embed says "this tool is
             # executing."  Both can coexist in the thread.
             for it in event.items:
-                name = it.get("func_name") or it.get("approval_label") or "tool"
-                name = discord.utils.escape_markdown(name)
+                raw_name = it.get("func_name") or it.get("approval_label") or "tool"
+                display_name = discord.utils.escape_markdown(raw_name)
                 raw_preview = it.get("preview", "")
                 # Escape backticks to prevent markdown breakout and
                 # strip @-mentions.
@@ -567,7 +567,7 @@ class TurnstoneBot:
                 raw_preview = discord.utils.escape_mentions(raw_preview)
                 preview = truncate(raw_preview, max_length=120) or None
                 embed = discord.Embed(
-                    title=name,
+                    title=display_name,
                     description=preview,
                     color=discord.Color.light_grey(),
                 )
@@ -582,8 +582,9 @@ class TurnstoneBot:
                 else:
                     msg = await thread.send(embed=embed)
                 call_id = it.get("call_id", "")
+                # Store raw (unescaped) name for matching against ToolResultEvent.name
                 self._tool_info_msgs.setdefault(ws_id, []).append(
-                    (call_id, name, preview or "", msg)
+                    (call_id, raw_name, preview or "", msg)
                 )
 
             # If no items consumed the thinking message (empty event), clean up.
