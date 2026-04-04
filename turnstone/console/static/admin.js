@@ -94,6 +94,29 @@ function showAdmin() {
 
   // Mobile: ensure sidebar starts hidden + inert; desktop: ensure it's accessible
   var sidebar = document.getElementById("admin-sidebar");
+
+  // Inject close header for mobile drawer (once)
+  if (!document.getElementById("admin-sidebar-close")) {
+    var closeHeader = document.createElement("div");
+    closeHeader.id = "admin-sidebar-close";
+    closeHeader.className = "admin-sidebar-close";
+    var label = document.createElement("span");
+    label.textContent = "Navigation";
+    var closeBtn = document.createElement("button");
+    closeBtn.setAttribute("aria-label", "Close navigation");
+    closeBtn.textContent = "\u00d7";
+    closeBtn.addEventListener("click", function () {
+      if (_mobileSidebarOpen) {
+        _toggleMobileSidebar();
+        var mt = document.getElementById("admin-mobile-toggle");
+        if (mt) mt.focus();
+      }
+    });
+    closeHeader.appendChild(label);
+    closeHeader.appendChild(closeBtn);
+    sidebar.insertBefore(closeHeader, sidebar.firstChild);
+  }
+
   if (window.innerWidth <= 700) {
     _mobileSidebarOpen = false;
     sidebar.classList.add("collapsed");
@@ -147,15 +170,20 @@ function _injectMobileToggle(tab) {
     toggle.id = "admin-mobile-toggle";
     toggle.className = "admin-mobile-toggle";
     toggle.setAttribute("aria-label", "Open navigation");
+    toggle.setAttribute("aria-expanded", "false");
     toggle.onclick = function () {
-      _mobileSidebarOpen = false;
       _toggleMobileSidebar();
     };
   }
   var panel = document.getElementById("admin-" + tab);
-  if (panel) {
-    var toolbar = panel.querySelector(".admin-toolbar");
-    if (toolbar) toolbar.insertBefore(toggle, toolbar.firstChild);
+  if (!panel) return;
+  var toolbar = panel.querySelector(".admin-toolbar");
+  if (toolbar) {
+    if (!toolbar.contains(toggle))
+      toolbar.insertBefore(toggle, toolbar.firstChild);
+  } else {
+    // Panel has no toolbar — prepend toggle directly so it remains accessible
+    if (!panel.contains(toggle)) panel.insertBefore(toggle, panel.firstChild);
   }
 }
 
@@ -169,6 +197,20 @@ function _toggleMobileSidebar() {
   else sidebar.setAttribute("inert", "");
   var backdrop = document.getElementById("admin-sidebar-backdrop");
   if (backdrop) backdrop.classList.toggle("visible", _mobileSidebarOpen);
+  // Update hamburger aria-label to reflect current state
+  var mt = document.getElementById("admin-mobile-toggle");
+  if (mt) {
+    mt.setAttribute(
+      "aria-label",
+      _mobileSidebarOpen ? "Close navigation" : "Open navigation",
+    );
+    mt.setAttribute("aria-expanded", _mobileSidebarOpen ? "true" : "false");
+  }
+  // Move focus into drawer on open; callers handle focus-return on close
+  if (_mobileSidebarOpen) {
+    var closeBtn = sidebar.querySelector(".admin-sidebar-close button");
+    if (closeBtn) closeBtn.focus();
+  }
 }
 
 function switchAdminTab(tab) {
@@ -238,6 +280,15 @@ function switchAdminTab(tab) {
   // On mobile, auto-close sidebar after tab selection
   if (window.innerWidth <= 700 && _mobileSidebarOpen) {
     _toggleMobileSidebar();
+    // Move focus to the newly active panel instead of leaving it in the inert sidebar
+    var panel = document.getElementById("admin-" + tab);
+    var focusTarget =
+      panel &&
+      panel.querySelector("h2, .section-header, button:not([disabled])");
+    if (focusTarget) {
+      focusTarget.setAttribute("tabindex", "-1");
+      focusTarget.focus();
+    }
   }
 }
 
@@ -2002,18 +2053,20 @@ document.addEventListener("keydown", function (e) {
       if (!sidebar) return;
       var isMobile = window.innerWidth <= 700;
       var backdrop = document.getElementById("admin-sidebar-backdrop");
-      if (isMobile && !_mobileSidebarOpen) {
+      if (!isMobile) {
+        // Crossed into desktop: close drawer cleanly if it was open
+        if (_mobileSidebarOpen) _toggleMobileSidebar();
+        sidebar.removeAttribute("aria-hidden");
+        sidebar.removeAttribute("inert");
+        sidebar.classList.remove("collapsed", "open");
+        if (backdrop) backdrop.classList.remove("visible");
+      } else if (!_mobileSidebarOpen) {
+        // Mobile with drawer closed: ensure collapsed state
         sidebar.setAttribute("aria-hidden", "true");
         sidebar.setAttribute("inert", "");
         sidebar.classList.add("collapsed");
         sidebar.classList.remove("open");
         if (backdrop) backdrop.classList.remove("visible");
-      } else if (!isMobile) {
-        sidebar.removeAttribute("aria-hidden");
-        sidebar.removeAttribute("inert");
-        sidebar.classList.remove("collapsed", "open");
-        if (backdrop) backdrop.classList.remove("visible");
-        _mobileSidebarOpen = false;
       }
     }, 150);
   });
