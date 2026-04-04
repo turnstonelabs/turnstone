@@ -356,9 +356,10 @@ class MCPClientManager:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
 
-        # Guard: if already connected, tear down the old session first so we
-        # don't leak stacks (can happen when manual refresh races with auto-reconnect).
-        if name in self._sessions:
+        # Guard: tear down stale session/stack so we don't leak.  Checks both
+        # _sessions and _per_server_stacks because transport errors in the sync
+        # dispatch methods evict the session but leave the stack behind.
+        if name in self._sessions or name in self._per_server_stacks:
             self._sessions.pop(name, None)
             await self._pre_close_streams(name)
             old_stack = self._per_server_stacks.pop(name, None)
@@ -1489,8 +1490,11 @@ class MCPClientManager:
                 f"Use '/mcp refresh {server_name}' to retry manually."
             )
         if cooldown_expired:
-            # Allow the next call through as a probe — remove deadline so
-            # concurrent callers aren't also rejected while probe is in-flight.
+            # Remove deadline so concurrent callers aren't rejected while the
+            # probe is in-flight.  This intentionally allows multiple callers
+            # through rather than a single probe: reconnects serialize on the
+            # event loop via _connect_one's guard, and if the server is truly
+            # broken the first failure re-trips the circuit immediately.
             self._circuit_open_until.pop(server_name, None)
 
     def _cb_auto_reconnect(self, server_name: str) -> Any:
