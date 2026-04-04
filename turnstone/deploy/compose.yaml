@@ -8,7 +8,8 @@
 # Usage:
 #   Infra only:           docker compose up
 #   Single node:          docker compose --profile production up
-#   Production (PG):      DB_BACKEND=postgresql docker compose --profile production up
+#   Production (PG):      docker compose --profile production up
+#                         (set DB_BACKEND, DATABASE_URL, POSTGRES_PASSWORD in .env)
 #
 # Set TURNSTONE_IMAGE_TAG in .env to pin the image version (default: latest).
 # =============================================================================
@@ -161,7 +162,7 @@ services:
       # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
       - TURNSTONE_DB_BACKEND=${DB_BACKEND:-postgresql}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
       - TURNSTONE_CHANNEL_ADVERTISE_URL=http://channel:8091
     networks:
       - turnstone-net

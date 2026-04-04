@@ -166,7 +166,7 @@ services:
       # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
       - TURNSTONE_DB_BACKEND=${DB_BACKEND:-postgresql}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
+      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
       - TURNSTONE_CHANNEL_ADVERTISE_URL=http://channel:8091
     networks:
       - turnstone-net
@@ -216,7 +216,7 @@ services:
       MODEL: ${MODEL:-}
       MCP_CONFIG: ${MCP_CONFIG:-}
       TURNSTONE_DB_BACKEND: ${DB_BACKEND:-postgresql}
-      TURNSTONE_DB_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:?}@postgres:5432/turnstone}
+      TURNSTONE_DB_URL: ${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:?}@postgres:5432/turnstone}
       TURNSTONE_NODE_ID: node-1
       TURNSTONE_ADVERTISE_URL: http://server-1:8080
     extra_hosts: ["host.docker.internal:host-gateway"]
