@@ -640,13 +640,11 @@ class TestExecReadImage:
         self._make_png(str(img))
 
         session = _make_session()
-        # Mock provider to report vision support
         mock_caps = MagicMock()
         mock_caps.supports_vision = True
-        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
-
-        item = {"call_id": "c1", "path": str(img), "offset": None, "limit": None}
-        call_id, output = session._exec_read_file(item)
+        with patch.object(session._provider, "get_capabilities", return_value=mock_caps):
+            item = {"call_id": "c1", "path": str(img), "offset": None, "limit": None}
+            call_id, output = session._exec_read_file(item)
 
         assert call_id == "c1"
         assert isinstance(output, list)
@@ -669,10 +667,9 @@ class TestExecReadImage:
         session = _make_session()
         mock_caps = MagicMock()
         mock_caps.supports_vision = False
-        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
-
-        item = {"call_id": "c2", "path": str(img), "offset": None, "limit": None}
-        call_id, output = session._exec_read_file(item)
+        with patch.object(session._provider, "get_capabilities", return_value=mock_caps):
+            item = {"call_id": "c2", "path": str(img), "offset": None, "limit": None}
+            call_id, output = session._exec_read_file(item)
 
         assert call_id == "c2"
         assert isinstance(output, str)
@@ -689,10 +686,9 @@ class TestExecReadImage:
         session = _make_session()
         mock_caps = MagicMock()
         mock_caps.supports_vision = True
-        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
-
-        item = {"call_id": "c3", "path": str(img), "offset": None, "limit": None}
-        call_id, output = session._exec_read_file(item)
+        with patch.object(session._provider, "get_capabilities", return_value=mock_caps):
+            item = {"call_id": "c3", "path": str(img), "offset": None, "limit": None}
+            call_id, output = session._exec_read_file(item)
 
         assert call_id == "c3"
         assert isinstance(output, str)
@@ -703,10 +699,14 @@ class TestExecReadImage:
         session = _make_session()
         mock_caps = MagicMock()
         mock_caps.supports_vision = True
-        session._provider.get_capabilities = MagicMock(return_value=mock_caps)
-
-        item = {"call_id": "c4", "path": str(tmp_path / "nope.png"), "offset": None, "limit": None}
-        call_id, output = session._exec_read_file(item)
+        with patch.object(session._provider, "get_capabilities", return_value=mock_caps):
+            item = {
+                "call_id": "c4",
+                "path": str(tmp_path / "nope.png"),
+                "offset": None,
+                "limit": None,
+            }
+            call_id, output = session._exec_read_file(item)
         assert isinstance(output, str)
         assert "not found" in output
 
@@ -742,9 +742,10 @@ class TestGetCapabilitiesOverride:
             default="qwen-vl",
         )
         session = _make_session(registry=registry, model_alias="qwen-vl")
-        # Ensure provider returns a real ModelCapabilities (not MagicMock)
-        session._provider.get_capabilities = MagicMock(return_value=ModelCapabilities())
-        caps = session._get_capabilities()
+        # Ensure provider returns a real ModelCapabilities (not MagicMock).
+        # Use patch.object so the singleton provider is restored after the test.
+        with patch.object(session._provider, "get_capabilities", return_value=ModelCapabilities()):
+            caps = session._get_capabilities()
         assert caps.supports_vision is True
 
     def test_no_override_uses_provider_default(self, tmp_db):
@@ -1027,3 +1028,47 @@ class TestAgentOutputGuard:
                 )
 
             mock_eval.assert_not_called()
+
+
+class TestProviderExtraParams:
+    """Tests for _provider_extra_params — local-only chat_template_kwargs."""
+
+    def _session_with_provider(self, provider_name: str, tmp_db) -> ChatSession:
+        from turnstone.core.providers import create_provider
+
+        session = _make_session(reasoning_effort="medium")
+        session._provider = create_provider(provider_name)
+        return session
+
+    def test_openai_compatible_returns_chat_template_kwargs(self, tmp_db):
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        result = session._provider_extra_params()
+        assert result is not None
+        assert "chat_template_kwargs" in result
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "medium"
+
+    def test_openai_commercial_returns_none(self, tmp_db):
+        session = self._session_with_provider("openai", tmp_db)
+        result = session._provider_extra_params()
+        assert result is None
+
+    def test_anthropic_returns_none(self, tmp_db):
+        session = self._session_with_provider("anthropic", tmp_db)
+        result = session._provider_extra_params()
+        assert result is None
+
+    def test_reasoning_effort_override(self, tmp_db):
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        result = session._provider_extra_params(reasoning_effort="high")
+        assert result is not None
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
+
+    def test_explicit_openai_provider_overrides_session(self, tmp_db):
+        """Passing an explicit commercial OpenAI provider returns None even
+        when the session's own provider is openai-compatible."""
+        from turnstone.core.providers import create_provider
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        openai_prov = create_provider("openai")
+        result = session._provider_extra_params(provider=openai_prov)
+        assert result is None

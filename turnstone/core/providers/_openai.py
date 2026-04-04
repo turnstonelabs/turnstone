@@ -169,11 +169,19 @@ _OPENAI_DEFAULT = ModelCapabilities()
 
 
 class OpenAIProvider:
-    """Provider for OpenAI-compatible APIs (OpenAI, vLLM, llama.cpp, etc.)."""
+    """Provider for OpenAI-compatible APIs (OpenAI, vLLM, llama.cpp, etc.).
+
+    ``provider_name`` distinguishes commercial OpenAI (``"openai"``) from
+    local model servers (``"openai-compatible"``).  This lets callers
+    decide whether to send local-only parameters like ``chat_template_kwargs``.
+    """
+
+    def __init__(self, provider_name: str = "openai") -> None:
+        self._provider_name = provider_name
 
     @property
     def provider_name(self) -> str:
-        return "openai"
+        return self._provider_name
 
     def get_capabilities(self, model: str) -> ModelCapabilities:
         return _lookup_capabilities(model, _OPENAI_CAPABILITIES, _OPENAI_DEFAULT)

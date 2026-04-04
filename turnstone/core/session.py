@@ -1071,7 +1071,6 @@ class ChatSession:
         self._chat_template_kwargs_base: dict[str, Any] = {
             "reasoning_effort": self.reasoning_effort,
         }
-        self._chat_template_kwargs: dict[str, Any] = dict(self._chat_template_kwargs_base)
 
         # -- Developer message --
         if self.creative_mode:
@@ -1277,9 +1276,14 @@ class ChatSession:
         reasoning_effort: str | None = None,
         provider: LLMProvider | None = None,
     ) -> dict[str, Any] | None:
-        """Build provider-specific extra parameters."""
+        """Build provider-specific extra parameters.
+
+        ``chat_template_kwargs`` is only meaningful for local model servers
+        (``openai-compatible``).  Commercial OpenAI rejects it as an unknown
+        parameter, and handles ``reasoning_effort`` natively.
+        """
         prov = provider or self._provider
-        if prov.provider_name == "openai":
+        if prov.provider_name == "openai-compatible":
             kwargs = dict(self._chat_template_kwargs_base)
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
@@ -4911,12 +4915,10 @@ class ChatSession:
             tools = _without_tool(tools, "web_search")
 
         # Build extra params for agent calls
-        agent_extra: dict[str, Any] | None = None
-        if agent_provider.provider_name == "openai":
-            agent_kwargs = dict(self._chat_template_kwargs_base)
-            if reasoning_effort:
-                agent_kwargs["reasoning_effort"] = reasoning_effort
-            agent_extra = {"chat_template_kwargs": agent_kwargs}
+        agent_extra = self._provider_extra_params(
+            reasoning_effort=reasoning_effort,
+            provider=agent_provider,
+        )
 
         def _api_call(
             messages: list[dict[str, Any]],

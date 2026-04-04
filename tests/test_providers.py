@@ -1040,6 +1040,22 @@ class TestProviderFactory:
 
         assert not isinstance(NotAProvider(), LLMProvider)
 
+    def test_create_provider_openai_compatible(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("openai-compatible")
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.provider_name == "openai-compatible"
+
+    def test_create_provider_openai_vs_compatible_distinct(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        openai = create_provider("openai")
+        compat = create_provider("openai-compatible")
+        assert openai is not compat
+        assert openai.provider_name == "openai"
+        assert compat.provider_name == "openai-compatible"
+
     def test_create_provider_returns_singleton(self) -> None:
         from turnstone.core.providers import create_provider
 
