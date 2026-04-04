@@ -200,8 +200,17 @@ def try_parse_media(output: str) -> dict[str, Any] | None:
     return None
 
 
+_BLOCKED_HOSTNAMES = frozenset({"localhost", "metadata.google.internal"})
+
+
 def _is_safe_image_url(url: str) -> bool:
-    """Validate that *url* uses http(s) and has no embedded credentials."""
+    """Validate that *url* uses http(s), has no embedded credentials, and does
+    not target loopback or cloud metadata endpoints.
+
+    Private/LAN IPs are intentionally allowed (media servers are typically
+    on the local network).
+    """
+    import ipaddress
     from urllib.parse import urlparse
 
     try:
@@ -212,7 +221,18 @@ def _is_safe_image_url(url: str) -> bool:
         return False
     if parsed.username or parsed.password:
         return False
-    return bool(parsed.hostname)
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname in _BLOCKED_HOSTNAMES:
+        return False
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_loopback or ip.is_link_local:
+            return False
+    except ValueError:
+        pass  # Not an IP literal — hostname is fine
+    return True
 
 
 async def _fetch_thumbnail(
@@ -387,7 +407,7 @@ def _build_search_results_embed(data: dict[str, Any]) -> Any:
         description="\n".join(lines),
         color=discord.Color.teal(),
     )
-    embed.set_footer(text=f"showing {min(len(results), 10)} of {total}")
+    embed.set_footer(text=f"showing {len(lines)} of {total}")
     return embed
 
 

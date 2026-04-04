@@ -872,7 +872,7 @@ Pane.prototype.replayHistory = function (messages) {
                 for (var k = 0; k < keys.length; k++) {
                   var val = args[keys[k]];
                   var valStr =
-                    val === null || val === undefined ? "None" : String(val);
+                    val === null || val === undefined ? "null" : String(val);
                   if (valStr.length > 80)
                     valStr = valStr.substring(0, 77) + "...";
                   parts.push(keys[k] + ": " + valStr);
@@ -3224,12 +3224,19 @@ function _formatRuntime(item) {
 }
 
 function _redactApiKeys(text) {
-  return text.replace(
+  // Query-string style: api_key=VALUE
+  var redacted = text.replace(
     /(?:api_key|apiKey|api-key|token)=[^&\s"]+/g,
     function (m) {
       return m.split("=")[0] + "=***";
     },
   );
+  // JSON style: "api_key": "VALUE"
+  redacted = redacted.replace(
+    /(["'](?:api_key|apiKey|api-key|token)["']\s*:\s*["'])([^"']*)(['"])/gi,
+    "$1***$3",
+  );
+  return redacted;
 }
 
 /**
@@ -3557,7 +3564,12 @@ document.addEventListener("click", function (e) {
   if (!btn) return;
   e.preventDefault();
   btn.disabled = true;
-  btn.querySelector("span:last-child").textContent = "Loading\u2026";
+  var labelEl = btn.querySelector("span:last-child");
+  if (labelEl) {
+    labelEl.textContent = "Loading\u2026";
+  } else {
+    btn.textContent = "\u25b6 Loading\u2026";
+  }
 
   var hlsUrl = btn.dataset.hlsUrl;
   var isAudio = btn.dataset.audioOnly === "true";
