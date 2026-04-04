@@ -160,8 +160,13 @@ case "$LIB" in
         echo "  Downloading hls.min.js..."
         curl -sSfL "${CDN}/hls.js@${VERSION}/dist/hls.min.js" -o "${NEW_DIR}/hls.min.js"
 
-        if [[ -f "${OLD_DIR}/LICENSE" ]]; then
-            cp "${OLD_DIR}/LICENSE" "${NEW_DIR}/LICENSE"
+        echo "  Downloading LICENSE..."
+        if ! curl -sSfL "${CDN}/hls.js@${VERSION}/LICENSE" -o "${NEW_DIR}/LICENSE" 2>/dev/null; then
+            if [[ -f "${OLD_DIR}/LICENSE" ]]; then
+                cp "${OLD_DIR}/LICENSE" "${NEW_DIR}/LICENSE"
+            else
+                echo "  WARNING: Could not obtain LICENSE for hls.js ${VERSION}"
+            fi
         fi
 
         update_refs "hls-${OLD_VERSION}" "hls-${VERSION}"

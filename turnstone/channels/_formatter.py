@@ -200,6 +200,21 @@ def try_parse_media(output: str) -> dict[str, Any] | None:
     return None
 
 
+def _is_safe_image_url(url: str) -> bool:
+    """Validate that *url* uses http(s) and has no embedded credentials."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    return bool(parsed.hostname)
+
+
 async def _fetch_thumbnail(
     http: httpx.AsyncClient,
     url: str,
@@ -210,25 +225,33 @@ async def _fetch_thumbnail(
     """Fetch a thumbnail image, returning ``(bytes, filename)`` or ``None``.
 
     Never raises — a failed image fetch must not break tool result
-    rendering.
+    rendering.  Private/LAN URLs are intentionally allowed (media servers
+    are typically on the local network), but scheme is restricted to
+    http(s) and userinfo is rejected.
     """
+    if not _is_safe_image_url(url):
+        return None
     try:
-        resp = await http.get(url, timeout=timeout)
-        if resp.status_code != 200:
-            return None
-        cl = resp.headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > max_bytes:
-            return None
-        content_type = resp.headers.get("content-type", "image/jpeg")
-        ext = "jpg"
-        if "png" in content_type:
-            ext = "png"
-        elif "webp" in content_type:
-            ext = "webp"
-        data = resp.content
-        if len(data) > max_bytes:
-            return None
-        return data, f"poster.{ext}"
+        async with http.stream("GET", url, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                return None
+            cl = resp.headers.get("content-length")
+            if cl and cl.isdigit() and int(cl) > max_bytes:
+                return None
+            content_type = resp.headers.get("content-type", "image/jpeg").lower()
+            if not content_type.startswith("image/"):
+                return None
+            ext = "jpg"
+            if "png" in content_type:
+                ext = "png"
+            elif "webp" in content_type:
+                ext = "webp"
+            data = bytearray()
+            async for chunk in resp.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > max_bytes:
+                    return None
+            return bytes(data), f"poster.{ext}"
     except Exception:  # noqa: BLE001
         return None
 

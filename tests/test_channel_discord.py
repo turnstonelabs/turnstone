@@ -887,6 +887,192 @@ class TestFormatToolResult:
 
 
 # ---------------------------------------------------------------------------
+# Media embed detection and rendering
+# ---------------------------------------------------------------------------
+
+
+class TestTryParseMedia:
+    """Tests for try_parse_media in _formatter.py."""
+
+    def test_stream_url_detected(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = json.dumps({"stream_url": "http://jf:8096/Videos/abc/stream", "container": "mp4"})
+        result = try_parse_media(data)
+        assert result is not None
+        assert result["stream_url"] == "http://jf:8096/Videos/abc/stream"
+
+    def test_media_details_detected(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = json.dumps({"id": "abc", "name": "Test Movie", "type": "Movie", "year": 2024})
+        result = try_parse_media(data)
+        assert result is not None
+        assert result["name"] == "Test Movie"
+
+    def test_search_results_detected(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = json.dumps({"results": [{"id": "1", "name": "Hit"}], "total_count": 1})
+        result = try_parse_media(data)
+        assert result is not None
+        assert len(result["results"]) == 1
+
+    def test_sessions_detected(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = json.dumps({"sessions": [{"id": "s1", "user_name": "ptrck"}]})
+        result = try_parse_media(data)
+        assert result is not None
+
+    def test_empty_results_returns_none(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        assert try_parse_media(json.dumps({"results": []})) is None
+
+    def test_plain_text_returns_none(self):
+        from turnstone.channels._formatter import try_parse_media
+
+        assert try_parse_media("just a string") is None
+
+    def test_non_dict_json_returns_none(self):
+        from turnstone.channels._formatter import try_parse_media
+
+        assert try_parse_media("[1, 2, 3]") is None
+
+    def test_unrelated_dict_returns_none(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        assert try_parse_media(json.dumps({"foo": "bar"})) is None
+
+
+class TestIsSafeImageUrl:
+    """Tests for _is_safe_image_url in _formatter.py."""
+
+    def test_http_url(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("http://jellyfin:8096/Items/abc/Images/Primary") is True
+
+    def test_https_url(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("https://jellyfin.example.com/Items/abc/Images/Primary") is True
+
+    def test_ftp_rejected(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("ftp://evil.com/image.jpg") is False
+
+    def test_file_rejected(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("file:///etc/passwd") is False
+
+    def test_userinfo_rejected(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("http://user:pass@jellyfin:8096/image") is False
+
+    def test_empty_rejected(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("") is False
+
+    def test_private_ip_allowed(self):
+        from turnstone.channels._formatter import _is_safe_image_url
+
+        assert _is_safe_image_url("http://192.168.0.6:8096/Items/abc/Images/Primary") is True
+
+
+class TestBuildMediaEmbed:
+    """Tests for try_build_media_embed and embed builders."""
+
+    def test_single_item_embed_uses_web_url_not_stream_url(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = {
+            "name": "Test Movie",
+            "type": "Movie",
+            "year": 2024,
+            "stream_url": "http://jf:8096/Videos/abc/stream?api_key=SECRET",
+            "web_url": "http://jf:8096/web/#/details?id=abc",
+            "overview": "A test movie.",
+        }
+        parsed = try_parse_media(json.dumps(data))
+        assert parsed is not None
+
+        from turnstone.channels._formatter import _build_single_media_embed
+
+        embed = _build_single_media_embed(parsed, "mcp__mediamcp__get_stream_url")
+        # web_url should be the embed URL, never stream_url
+        assert embed.url == "http://jf:8096/web/#/details?id=abc"
+        assert "SECRET" not in str(embed.to_dict())
+
+    def test_search_results_embed_format(self):
+        import json
+
+        from turnstone.channels._formatter import try_parse_media
+
+        data = {
+            "results": [
+                {"name": "Movie A", "year": 2020, "type": "Movie", "runtime_minutes": 120},
+                {"name": "Movie B", "year": 2021, "type": "Movie"},
+            ],
+            "total_count": 2,
+        }
+        parsed = try_parse_media(json.dumps(data))
+
+        from turnstone.channels._formatter import _build_search_results_embed
+
+        embed = _build_search_results_embed(parsed)
+        assert "Movie A" in embed.description
+        assert "Movie B" in embed.description
+        assert "2 of 2" in embed.footer.text
+
+    def test_build_media_embed_returns_none_for_plain_text(self):
+        from turnstone.channels._formatter import try_build_media_embed
+
+        http = MagicMock()
+        result = _run(try_build_media_embed("tool", "plain text", http=http))
+        assert result is None
+
+    def test_season_episode_string_values(self):
+        """Season/episode numbers as strings should not raise."""
+
+        from turnstone.channels._formatter import _build_search_results_embed
+
+        data = {
+            "results": [
+                {
+                    "name": "Pilot",
+                    "type": "Episode",
+                    "series_name": "Show",
+                    "season_number": "1",
+                    "episode_number": "1",
+                },
+            ],
+            "total_count": 1,
+        }
+        embed = _build_search_results_embed(data)
+        assert "S01E01" in embed.description
+
+
+# ---------------------------------------------------------------------------
 # Thinking indicator lifecycle
 # ---------------------------------------------------------------------------
 

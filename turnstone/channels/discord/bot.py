@@ -627,11 +627,15 @@ class TurnstoneBot:
             if not event.is_error:
                 from turnstone.channels._formatter import try_build_media_embed
 
-                media_result = await try_build_media_embed(
-                    event.name,
-                    event.output,
-                    http=self._http_client,
-                )
+                media_result = None
+                try:
+                    media_result = await try_build_media_embed(
+                        event.name,
+                        event.output,
+                        http=self._http_client,
+                    )
+                except Exception:
+                    log.debug("discord.media_embed_failed", ws_id=ws_id, tool=event.name)
                 if media_result is not None:
                     embed, file = media_result
                     kwargs: dict[str, Any] = {"embed": embed}
