@@ -172,13 +172,20 @@ Pane.prototype._createDOM = function () {
   this.inputEl = document.createElement("textarea");
   this.inputEl.className = "pane-input";
   this.inputEl.rows = 1;
-  this.inputEl.placeholder = "Type a message\u2026 (Shift+Enter for newline)";
+  this._isTouch = window.matchMedia(
+    "(hover: none) and (pointer: coarse)",
+  ).matches;
+  this.inputEl.placeholder = this._isTouch
+    ? "Type a message\u2026"
+    : "Type a message\u2026 (Shift+Enter for newline)";
   this.inputEl.setAttribute("aria-label", "Message input");
   this.inputEl.addEventListener("input", function () {
     self._autoResize();
   });
   this.inputEl.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    // On touch devices, let Enter insert newlines — users tap Send button.
+    // On desktop, Enter sends and Shift+Enter inserts a newline.
+    if (e.key === "Enter" && !e.shiftKey && !self._isTouch) {
       e.preventDefault();
       self.sendMessage();
     }
