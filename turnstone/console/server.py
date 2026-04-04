@@ -5485,7 +5485,8 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 base_url = row.get("base_url", "")
 
     # For commercial endpoints an api_key is required
-    _hostname = (urllib.parse.urlparse(base_url).hostname or "") if base_url else ""
+    _normalized = (base_url if "://" in base_url else f"https://{base_url}") if base_url else ""
+    _hostname = (urllib.parse.urlparse(_normalized).hostname or "") if _normalized else ""
     if not api_key and (
         not base_url
         or _hostname == "api.openai.com"
