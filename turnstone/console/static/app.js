@@ -720,7 +720,9 @@ function buildNodeRow(node) {
 function toggleGroup(prefix) {
   expandedGroups[prefix] = !expandedGroups[prefix];
   var body = document.querySelector(
-    '.node-group-body[data-prefix="' + prefix.replace(/"/g, '\\"') + '"]',
+    '.node-group-body[data-prefix="' +
+      prefix.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
+      '"]',
   );
   if (!body) return;
   var isExpanded = expandedGroups[prefix];

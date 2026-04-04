@@ -5485,8 +5485,13 @@ async def admin_detect_model(request: Request) -> JSONResponse:
                 base_url = row.get("base_url", "")
 
     # For commercial endpoints an api_key is required
+    _hostname = (urllib.parse.urlparse(base_url).hostname or "") if base_url else ""
     if not api_key and (
-        not base_url or "api.openai.com" in base_url or "api.anthropic.com" in base_url
+        not base_url
+        or _hostname == "api.openai.com"
+        or _hostname.endswith(".openai.com")
+        or _hostname == "api.anthropic.com"
+        or _hostname.endswith(".anthropic.com")
     ):
         return JSONResponse({"error": "api_key is required"}, status_code=400)
 
