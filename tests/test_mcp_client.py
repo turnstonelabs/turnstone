@@ -141,7 +141,7 @@ class TestMcpToOpenai:
         assert result["type"] == "function"
         func = result["function"]
         assert func["name"] == "mcp__github__search_repos"
-        assert "[MCP: github]" in func["description"]
+        assert func["description"] == "Search GitHub repos"
         assert func["parameters"]["type"] == "object"
         assert "query" in func["parameters"]["properties"]
 
@@ -164,7 +164,7 @@ class TestMcpToOpenai:
         tool.description = ""
         tool.inputSchema = {"type": "object", "properties": {}}
         result = _mcp_to_openai("test", tool)
-        assert result["function"]["description"] == "[MCP: test] "
+        assert result["function"]["description"] == ""
 
 
 # ---------------------------------------------------------------------------

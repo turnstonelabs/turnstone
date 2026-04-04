@@ -5,6 +5,7 @@
 #   scripts/update-vendored-js.sh katex 0.16.39
 #   scripts/update-vendored-js.sh hljs 11.12.0
 #   scripts/update-vendored-js.sh mermaid 11.14.0
+#   scripts/update-vendored-js.sh hls 1.6.15
 #
 # This script:
 #   1. Downloads the new version from CDN
@@ -18,7 +19,7 @@ STATIC_DIR="turnstone/shared_static"
 CDN="https://cdn.jsdelivr.net/npm"
 
 usage() {
-    echo "Usage: $0 <katex|hljs|mermaid> <version>"
+    echo "Usage: $0 <katex|hljs|mermaid|hls> <version>"
     echo "Example: $0 katex 0.16.39"
     exit 1
 }
@@ -143,6 +144,32 @@ case "$LIB" in
         fi
 
         update_refs "mermaid-${OLD_VERSION}" "mermaid-${VERSION}"
+        rm -rf "${OLD_DIR}"
+        echo "Done. Old directory removed: ${OLD_DIR}"
+        ;;
+
+    hls)
+        OLD_VERSION=$(detect_old_version "hls")
+        check_same_version "$OLD_VERSION" "$VERSION" "hls"
+        OLD_DIR="${STATIC_DIR}/hls-${OLD_VERSION}"
+        NEW_DIR="${STATIC_DIR}/hls-${VERSION}"
+
+        echo "Updating hls.js ${OLD_VERSION} -> ${VERSION}"
+        mkdir -p "${NEW_DIR}"
+
+        echo "  Downloading hls.min.js..."
+        curl -sSfL "${CDN}/hls.js@${VERSION}/dist/hls.min.js" -o "${NEW_DIR}/hls.min.js"
+
+        echo "  Downloading LICENSE..."
+        if ! curl -sSfL "${CDN}/hls.js@${VERSION}/LICENSE" -o "${NEW_DIR}/LICENSE" 2>/dev/null; then
+            if [[ -f "${OLD_DIR}/LICENSE" ]]; then
+                cp "${OLD_DIR}/LICENSE" "${NEW_DIR}/LICENSE"
+            else
+                echo "  WARNING: Could not obtain LICENSE for hls.js ${VERSION}"
+            fi
+        fi
+
+        update_refs "hls-${OLD_VERSION}" "hls-${VERSION}"
         rm -rf "${OLD_DIR}"
         echo "Done. Old directory removed: ${OLD_DIR}"
         ;;

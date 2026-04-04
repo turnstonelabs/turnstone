@@ -16,7 +16,7 @@ import contextlib
 import json
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -558,15 +558,16 @@ class TurnstoneBot:
             # authorize this?" while the running embed says "this tool is
             # executing."  Both can coexist in the thread.
             for it in event.items:
-                name = it.get("func_name") or it.get("approval_label") or "tool"
+                raw_name = it.get("func_name") or it.get("approval_label") or "tool"
+                display_name = discord.utils.escape_markdown(raw_name)
                 raw_preview = it.get("preview", "")
-                # Sanitize preview: escape backticks to prevent markdown
-                # breakout and strip @-mentions.
+                # Escape backticks to prevent markdown breakout and
+                # strip @-mentions.
                 raw_preview = raw_preview.replace("`", "\\`")
                 raw_preview = discord.utils.escape_mentions(raw_preview)
                 preview = truncate(raw_preview, max_length=120) or None
                 embed = discord.Embed(
-                    title=name,
+                    title=display_name,
                     description=preview,
                     color=discord.Color.light_grey(),
                 )
@@ -581,8 +582,9 @@ class TurnstoneBot:
                 else:
                     msg = await thread.send(embed=embed)
                 call_id = it.get("call_id", "")
+                # Store raw (unescaped) name for matching against ToolResultEvent.name
                 self._tool_info_msgs.setdefault(ws_id, []).append(
-                    (call_id, name, preview or "", msg)
+                    (call_id, raw_name, preview or "", msg)
                 )
 
             # If no items consumed the thinking message (empty event), clean up.
@@ -614,7 +616,7 @@ class TurnstoneBot:
                 status = "Error" if event.is_error else "Done"
                 status_color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
                 status_embed = discord.Embed(
-                    title=f"{event.name} \u2014 {status}",
+                    title=f"{discord.utils.escape_markdown(event.name)} \u2014 {status}",
                     description=matched_preview or None,
                     color=status_color,
                 )
@@ -624,14 +626,40 @@ class TurnstoneBot:
                     log.debug("discord.tool_info_status_edit_failed", ws_id=ws_id)
 
             # Send the result as a separate message.
-            desc = format_tool_result(event.output)
-            color = discord.Color.red() if event.is_error else discord.Color.dark_grey()
-            result_embed = discord.Embed(
-                title=event.name,
-                description=desc,
-                color=color,
-            )
-            await thread.send(embed=result_embed)
+            if not event.is_error:
+                from turnstone.channels._formatter import try_build_media_embed
+
+                media_result = None
+                try:
+                    media_result = await try_build_media_embed(
+                        event.name,
+                        event.output,
+                        http=self._http_client,
+                    )
+                except Exception:
+                    log.debug("discord.media_embed_failed", ws_id=ws_id, tool=event.name)
+                if media_result is not None:
+                    embed, file = media_result
+                    kwargs: dict[str, Any] = {"embed": embed}
+                    if file is not None:
+                        kwargs["file"] = file
+                    await thread.send(**kwargs)
+                else:
+                    desc = format_tool_result(event.output)
+                    result_embed = discord.Embed(
+                        title=event.name,
+                        description=desc,
+                        color=discord.Color.dark_grey(),
+                    )
+                    await thread.send(embed=result_embed)
+            else:
+                desc = format_tool_result(event.output)
+                result_embed = discord.Embed(
+                    title=event.name,
+                    description=desc,
+                    color=discord.Color.red(),
+                )
+                await thread.send(embed=result_embed)
 
         elif isinstance(event, ApproveRequestEvent):
             # Evaluate admin tool policies before auto-approve.

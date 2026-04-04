@@ -176,7 +176,8 @@ class TerminalUI(SessionUI):
                 else:
                     sys.stdout.write(f"  {yellow(item['header'])}\n")
                 if item.get("preview"):
-                    sys.stdout.write(item["preview"] + "\n")
+                    styled = dim(item["preview"]) if not item.get("error") else red(item["preview"])
+                    sys.stdout.write(styled + "\n")
                 verdict = item.get("_heuristic_verdict")
                 if verdict:
                     risk = verdict.get("risk_level", "medium")

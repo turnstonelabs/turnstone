@@ -2936,7 +2936,7 @@ class ChatSession:
                     "call_id": call_id,
                     "func_name": func_name,
                     "header": f"\u2717 {func_name}: {exc}",
-                    "preview": f"    {RED}{preview}{RESET}",
+                    "preview": f"    {preview}",
                     "needs_approval": False,
                     "error": (
                         f"JSON parse error for tool '{func_name}': {exc}\n"
@@ -3528,7 +3528,7 @@ class ChatSession:
                 "call_id": call_id,
                 "func_name": "man",
                 "header": "\u2717 man: invalid page name",
-                "preview": f"    {RED}{page}{RESET}",
+                "preview": f"    {page}",
                 "needs_approval": False,
                 "error": f"Error: invalid page name {page!r}",
             }
@@ -3574,7 +3574,7 @@ class ChatSession:
                 "call_id": call_id,
                 "func_name": "web_fetch",
                 "header": "\u2717 web_fetch: invalid url",
-                "preview": f"    {RED}{url}{RESET}",
+                "preview": f"    {url}",
                 "needs_approval": False,
                 "error": f"Error: URL must start with http:// or https:// (got {url!r})",
             }
@@ -3585,12 +3585,12 @@ class ChatSession:
                 "call_id": call_id,
                 "func_name": "web_fetch",
                 "header": "\u2717 web_fetch: blocked (private network)",
-                "preview": f"    {RED}{url}{RESET}",
+                "preview": f"    {url}",
                 "needs_approval": False,
                 "error": f"Error: {ssrf_err}",
             }
         q_preview = question[:200] + ("..." if len(question) > 200 else "")
-        preview = f"    {DIM}{url}\n    Q: {q_preview}{RESET}"
+        preview = f"    {url}\n    Q: {q_preview}"
         return {
             "call_id": call_id,
             "func_name": "web_fetch",
@@ -3636,7 +3636,7 @@ class ChatSession:
         if topic not in ("general", "news", "finance"):
             topic = "general"
         q_preview = query[:200] + ("..." if len(query) > 200 else "")
-        preview = f"    {DIM}{q_preview}{RESET}"
+        preview = f"    {q_preview}"
         return {
             "call_id": call_id,
             "func_name": "web_search",
@@ -3675,7 +3675,7 @@ class ChatSession:
             "call_id": call_id,
             "func_name": "tool_search",
             "header": f"\u2699 tool_search: {query[:80]}",
-            "preview": f"    {DIM}{query}{RESET}",
+            "preview": f"    {query}",
             "needs_approval": False,
             "execute": self._exec_tool_search,
             "query": query,
@@ -3709,7 +3709,7 @@ class ChatSession:
             "call_id": call_id,
             "func_name": "task_agent",
             "header": "\u2699 task_agent (autonomous agent)",
-            "preview": f"    {DIM}{preview_text}{RESET}",
+            "preview": f"    {preview_text}",
             "needs_approval": True,
             "approval_label": "task_agent",
             "execute": self._exec_task,
@@ -3733,7 +3733,7 @@ class ChatSession:
             "call_id": call_id,
             "func_name": "plan_agent",
             "header": "\u2699 plan_agent (planning agent)",
-            "preview": f"    {DIM}{preview_text}{RESET}",
+            "preview": f"    {preview_text}",
             "needs_approval": True,
             "approval_label": "plan_agent",
             "execute": self._exec_plan,
@@ -4287,7 +4287,7 @@ class ChatSession:
             "call_id": call_id,
             "func_name": func_name,
             "header": f"\u2699 mcp:{display}",
-            "preview": f"{DIM}{preview}{RESET}",
+            "preview": preview,
             "needs_approval": True,
             "approval_label": func_name,
             "execute": self._exec_mcp_tool,
@@ -4365,7 +4365,7 @@ class ChatSession:
             "call_id": call_id,
             "func_name": "read_resource",
             "header": "\u2699 read_resource",
-            "preview": f"{DIM}    uri: {uri}{RESET}",
+            "preview": f"    uri: {uri}",
             "needs_approval": True,
             "approval_label": f"mcp_resource__{self._normalize_resource_uri(uri)}",
             "execute": self._exec_read_resource,

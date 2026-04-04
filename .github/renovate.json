@@ -41,6 +41,14 @@
       "matchStrings": ["mermaid-(?<currentValue>[\\d.]+)/"],
       "depNameTemplate": "mermaid",
       "datasourceTemplate": "npm"
+    },
+    {
+      "customType": "regex",
+      "description": "Track vendored hls.js version",
+      "managerFilePatterns": ["/pyproject\\.toml$/"],
+      "matchStrings": ["hls-(?<currentValue>[\\d.]+)/"],
+      "depNameTemplate": "hls.js",
+      "datasourceTemplate": "npm"
     }
   ],
   "packageRules": [
@@ -91,7 +99,7 @@
     {
       "description": "Vendored JS — CI workflow downloads files automatically",
       "groupName": "Vendored JS",
-      "matchPackageNames": ["katex", "highlight.js", "mermaid"],
+      "matchPackageNames": ["katex", "highlight.js", "mermaid", "hls.js"],
       "schedule": ["before 9am on the first day of the month"],
       "automerge": false
     },

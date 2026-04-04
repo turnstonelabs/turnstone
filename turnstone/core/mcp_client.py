@@ -67,7 +67,7 @@ def _mcp_to_openai(server_name: str, tool: Any) -> dict[str, Any]:
         "type": "function",
         "function": {
             "name": f"mcp__{server_name}__{tool.name}",
-            "description": f"[MCP: {server_name}] {description}",
+            "description": description,
             "parameters": input_schema,
         },
     }
