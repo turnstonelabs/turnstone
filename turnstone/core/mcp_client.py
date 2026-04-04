@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 import mcp.types as mcp_types
-from mcp import ClientSession, StdioServerParameters
+from mcp import ClientSession, McpError, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -151,6 +151,22 @@ class MCPClientManager:
         self._refresh_interval = refresh_interval
         self._refresh_task: asyncio.Task[None] | None = None
 
+        # Circuit breaker (per-server) — prevents repeated calls to broken servers
+        self._consecutive_failures: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}  # monotonic timestamp
+        self._circuit_trip_count: dict[str, int] = {}  # backoff exponent
+
+        # Safe transport stream refs (pre-close before stack teardown to avoid
+        # the anyio cancel-scope CPU busy-loop — MCP SDK #2147)
+        self._server_streams: dict[str, tuple[Any, Any]] = {}
+
+        # Notification debounce (per-server)
+        self._last_notification_refresh: dict[str, float] = {}
+
+        # Periodic refresh backoff (per-server)
+        self._refresh_failures: dict[str, int] = {}
+        self._refresh_backoff_until: dict[str, float] = {}  # monotonic timestamp
+
     # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
@@ -181,6 +197,7 @@ class MCPClientManager:
             except Exception as exc:
                 log.warning("Failed to connect MCP server '%s'", name, exc_info=True)
                 self._set_error(name, f"{type(exc).__name__}: {exc}")
+                self._cb_record_failure(name)
 
         self._connected.set()
 
@@ -202,6 +219,94 @@ class MCPClientManager:
 
     _CONNECT_TIMEOUT = 30  # seconds — prevents hung connections on broken remotes
     _TCP_PROBE_TIMEOUT = 5  # seconds — fast TCP pre-flight for HTTP transports
+
+    # Circuit breaker constants
+    _CB_FAILURE_THRESHOLD = 3
+    _CB_BASE_COOLDOWN = 30.0  # seconds
+    _CB_MAX_COOLDOWN = 300.0  # 5 minutes
+
+    # Notification debounce
+    _NOTIFICATION_DEBOUNCE = 5.0  # seconds between refreshes per server
+
+    # Periodic refresh backoff
+    _REFRESH_BACKOFF_BASE = 60.0  # seconds
+    _REFRESH_BACKOFF_MAX = 3600.0  # 1 hour
+
+    # -- circuit breaker (per-server) -----------------------------------------
+
+    def _cb_check(self, name: str) -> tuple[bool, bool]:
+        """Check circuit breaker state for *name*.
+
+        Returns ``(is_open, cooldown_expired)``.  When the circuit is closed
+        both values are False.  When open, *cooldown_expired* indicates
+        whether a probe attempt is allowed.
+        """
+        deadline = self._circuit_open_until.get(name)
+        if deadline is None:
+            return False, False
+        now = time.monotonic()
+        if now >= deadline:
+            return True, True  # half-open: allow one probe
+        return True, False  # still in cooldown
+
+    def _cb_record_failure(self, name: str) -> None:
+        """Record a failure against *name*, potentially opening the circuit."""
+        count = self._consecutive_failures.get(name, 0) + 1
+        self._consecutive_failures[name] = count
+        # Guard: don't extend an already-open deadline.  Additional failures
+        # while open still accumulate in _consecutive_failures, so the circuit
+        # re-opens immediately after the next half-open probe fails (count is
+        # already >= threshold).
+        if count >= self._CB_FAILURE_THRESHOLD and name not in self._circuit_open_until:
+            trips = self._circuit_trip_count.get(name, 0)
+            cooldown = min(self._CB_BASE_COOLDOWN * (2**trips), self._CB_MAX_COOLDOWN)
+            # Per-server jitter seeded from server name (varies across process
+            # restarts via PYTHONHASHSEED, which is desirable — each cluster
+            # node gets different jitter to avoid thundering herd).
+            jitter = random.Random(hash(name)).random() * cooldown * 0.1
+            self._circuit_open_until[name] = time.monotonic() + cooldown + jitter
+            self._circuit_trip_count[name] = trips + 1
+            log.warning(
+                "MCP circuit open for '%s': %d consecutive failures, cooldown %.0fs",
+                name,
+                count,
+                cooldown + jitter,
+            )
+
+    def _cb_record_success(self, name: str) -> None:
+        """Record a successful operation for *name*, decaying circuit state.
+
+        Decays trip count by 1 rather than resetting to 0, so a chronically
+        flapping server escalates its backoff over time instead of always
+        restarting at the minimum cooldown.
+        """
+        self._consecutive_failures.pop(name, None)
+        self._circuit_open_until.pop(name, None)
+        trips = self._circuit_trip_count.get(name, 0)
+        if trips > 1:
+            self._circuit_trip_count[name] = trips - 1
+        else:
+            self._circuit_trip_count.pop(name, None)
+
+    def _cb_clear(self, name: str) -> None:
+        """Remove all circuit breaker state for *name*."""
+        self._consecutive_failures.pop(name, None)
+        self._circuit_open_until.pop(name, None)
+        self._circuit_trip_count.pop(name, None)
+
+    # -- safe transport helpers ------------------------------------------------
+
+    async def _pre_close_streams(self, name: str) -> None:
+        """Close MCP transport streams before stack teardown.
+
+        Pre-closing unblocks anyio transport tasks stuck on zero-buffer
+        ``send()`` calls, preventing the CPU busy-loop from SDK #2147.
+        """
+        streams = self._server_streams.pop(name, None)
+        if streams:
+            for s in streams:
+                with contextlib.suppress(Exception):
+                    await s.aclose()
 
     async def _tcp_probe(self, name: str, url: str) -> None:
         """Fast TCP connect check before entering the MCP transport context.
@@ -251,6 +356,15 @@ class MCPClientManager:
             log.error("MCP server name '%s' contains '__' (reserved delimiter), skipping", name)
             return
 
+        # Guard: if already connected, tear down the old session first so we
+        # don't leak stacks (can happen when manual refresh races with auto-reconnect).
+        if name in self._sessions:
+            self._sessions.pop(name, None)
+            await self._pre_close_streams(name)
+            old_stack = self._per_server_stacks.pop(name, None)
+            if old_stack:
+                await self._safe_close_stack(old_stack)
+
         # Per-server exit stack for clean per-server lifecycle management
         stack = AsyncExitStack()
         await stack.__aenter__()
@@ -271,6 +385,9 @@ class MCPClientManager:
                     ),
                     timeout=self._CONNECT_TIMEOUT,
                 )
+                # Stash stream refs so _pre_close_streams can unblock anyio
+                # transport tasks before the cancel scope fires (SDK #2147).
+                self._server_streams[name] = (read, write)
             else:
                 # Default: stdio transport
                 command = cfg.get("command", "")
@@ -287,24 +404,29 @@ class MCPClientManager:
                     env=env,
                 )
                 read, write = await stack.enter_async_context(stdio_client(params))
+                self._server_streams[name] = (read, write)
         except asyncio.CancelledError:
-            # Stray CancelledError from broken anyio cancel scope — treat as
+            # Stray CancelledError from broken anyio cancel scope -- treat as
             # connection failure.  But if the task is genuinely being cancelled
             # (shutdown), re-raise so we don't block teardown.
             task = asyncio.current_task()
             if task is not None and task.cancelling():
+                await self._pre_close_streams(name)
                 await self._safe_close_stack(stack)
                 raise
             log.warning("MCP server '%s' connection failed (anyio cancel)", name)
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise TimeoutError(f"Connection failed for '{name}'") from None
         except TimeoutError:
             log.warning(
                 "MCP server '%s' connection timed out after %ds", name, self._CONNECT_TIMEOUT
             )
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise TimeoutError(f"Connection timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise
 
@@ -316,15 +438,30 @@ class MCPClientManager:
             if not isinstance(msg, mcp_types.ServerNotification):
                 return
             root = msg.root
+
+            # Debounce: skip if we refreshed this server very recently
+            now = time.monotonic()
+            last = self._last_notification_refresh.get(name, 0.0)
+            if now - last < self._NOTIFICATION_DEBOUNCE:
+                log.debug(
+                    "Debouncing notification from '%s' (%.1fs since last refresh)",
+                    name,
+                    now - last,
+                )
+                return
+
             try:
                 if isinstance(root, mcp_types.ToolListChangedNotification):
                     log.info("Received tools/list_changed from '%s'", name)
+                    self._last_notification_refresh[name] = now
                     await self._refresh_server_tools(name)
                 elif isinstance(root, mcp_types.ResourceListChangedNotification):
                     log.info("Received resources/list_changed from '%s'", name)
+                    self._last_notification_refresh[name] = now
                     await self._refresh_server_resources(name)
                 elif isinstance(root, mcp_types.PromptListChangedNotification):
                     log.info("Received prompts/list_changed from '%s'", name)
+                    self._last_notification_refresh[name] = now
                     await self._refresh_server_prompts(name)
                 self._last_error.pop(name, None)
             except Exception as exc:
@@ -336,6 +473,7 @@ class MCPClientManager:
                 ClientSession(read, write, message_handler=_on_notification)  # type: ignore[arg-type]
             )
         except Exception:
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise
 
@@ -346,16 +484,20 @@ class MCPClientManager:
             self._per_server_stacks.pop(name, None)
             task = asyncio.current_task()
             if task is not None and task.cancelling():
+                await self._pre_close_streams(name)
                 await self._safe_close_stack(stack)
                 raise
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise TimeoutError(f"MCP handshake failed for '{name}'") from None
         except TimeoutError:
             self._per_server_stacks.pop(name, None)
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise TimeoutError(f"MCP handshake timed out after {self._CONNECT_TIMEOUT}s") from None
         except Exception:
             self._per_server_stacks.pop(name, None)
+            await self._pre_close_streams(name)
             await self._safe_close_stack(stack)
             raise
         self._sessions[name] = session
@@ -548,12 +690,14 @@ class MCPClientManager:
                     if cfg:
                         log.info("Reconnecting MCP server '%s'", name)
                         await self._connect_one(name, cfg)
+                        self._cb_record_success(name)
                         new_names = [
                             t["function"]["name"] for t in self._per_server_tools.get(name, [])
                         ]
                         results[name] = (new_names, [])
                     continue
                 added, removed = await self._refresh_server(name)
+                self._cb_record_success(name)
                 results[name] = (added, removed)
             except Exception as exc:
                 log.warning("Refresh failed for MCP server '%s'", name, exc_info=True)
@@ -577,10 +721,18 @@ class MCPClientManager:
         """
         assert self._loop is not None
         future = asyncio.run_coroutine_threadsafe(self._refresh_all(server_name), self._loop)
-        return future.result(timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            raise TimeoutError(f"MCP refresh timed out after {timeout}s") from None
 
     async def _periodic_refresh(self) -> None:
-        """Periodically refresh servers that lack push notifications."""
+        """Periodically refresh servers that lack push notifications.
+
+        Applies per-server exponential backoff on failure and attempts
+        reconnection for disconnected servers.
+        """
         # Stagger start using a launch-time seed so cluster nodes don't
         # all hit MCP servers simultaneously.
         seed = random.Random(time.monotonic_ns() ^ os.getpid()).random()
@@ -588,8 +740,42 @@ class MCPClientManager:
         await asyncio.sleep(initial_delay)
         while True:
             for name in list(self._server_configs):
+                now = time.monotonic()
+
+                # Check per-server backoff
+                backoff_until = self._refresh_backoff_until.get(name, 0.0)
+                if now < backoff_until:
+                    continue  # still in backoff
+
                 if name not in self._sessions:
-                    continue  # not connected — skip (reconnect on manual refresh)
+                    # Attempt reconnection for disconnected servers
+                    cfg = self._server_configs.get(name)
+                    if cfg:
+                        try:
+                            log.info("Periodic reconnect attempt for '%s'", name)
+                            await self._connect_one(name, cfg)
+                            self._refresh_failures.pop(name, None)
+                            self._refresh_backoff_until.pop(name, None)
+                            self._cb_record_success(name)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            failures = self._refresh_failures.get(name, 0) + 1
+                            self._refresh_failures[name] = failures
+                            backoff = min(
+                                self._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)),
+                                self._REFRESH_BACKOFF_MAX,
+                            )
+                            self._refresh_backoff_until[name] = time.monotonic() + backoff
+                            log.warning(
+                                "Periodic reconnect failed for '%s' (attempt %d, backoff %.0fs)",
+                                name,
+                                failures,
+                                backoff,
+                            )
+                            self._set_error(name, f"Reconnect failed: {exc}")
+                    continue
+
                 try:
                     if not self._supports_list_changed.get(name, False):
                         await self._refresh_server_tools(name)
@@ -598,9 +784,26 @@ class MCPClientManager:
                     if not self._supports_prompt_list_changed.get(name, False):
                         await self._refresh_server_prompts(name)
                     self._last_error.pop(name, None)
+                    self._refresh_failures.pop(name, None)
+                    self._refresh_backoff_until.pop(name, None)
                 except Exception as exc:
-                    log.warning("Periodic refresh failed for '%s'", name, exc_info=True)
+                    failures = self._refresh_failures.get(name, 0) + 1
+                    self._refresh_failures[name] = failures
+                    backoff = min(
+                        self._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)),
+                        self._REFRESH_BACKOFF_MAX,
+                    )
+                    self._refresh_backoff_until[name] = time.monotonic() + backoff
+                    log.warning(
+                        "Periodic refresh failed for '%s' (attempt %d, backoff %.0fs)",
+                        name,
+                        failures,
+                        backoff,
+                    )
                     self._set_error(name, f"Periodic refresh failed: {exc}")
+            # Note: per-server backoff (max 1h) is only meaningful when
+            # refresh_interval is shorter than _REFRESH_BACKOFF_MAX.  With
+            # the default 4h interval this sleep already bounds retry frequency.
             await asyncio.sleep(self._refresh_interval)
 
     # -- resource refresh ----------------------------------------------------
@@ -940,6 +1143,9 @@ class MCPClientManager:
         if self._loop and self._per_server_stacks:
 
             async def _close_all_stacks() -> None:
+                # Pre-close streams to prevent anyio CPU busy-loop during teardown
+                for srv_name in list(self._server_streams):
+                    await self._pre_close_streams(srv_name)
                 for stack in self._per_server_stacks.values():
                     await self._safe_close_stack(stack)
 
@@ -985,6 +1191,14 @@ class MCPClientManager:
         self._listeners.clear()
         self._resource_listeners.clear()
         self._prompt_listeners.clear()
+        # Clear resilience state
+        self._consecutive_failures.clear()
+        self._circuit_open_until.clear()
+        self._circuit_trip_count.clear()
+        self._server_streams.clear()
+        self._last_notification_refresh.clear()
+        self._refresh_failures.clear()
+        self._refresh_backoff_until.clear()
 
         log.info("MCP client shut down")
 
@@ -1049,6 +1263,7 @@ class MCPClientManager:
             async def _remove() -> None:
                 # Close session + transport via per-server stack
                 self._sessions.pop(name, None)
+                await self._pre_close_streams(name)
                 stack = self._per_server_stacks.pop(name, None)
                 if stack is not None:
                     await self._safe_close_stack(stack)
@@ -1062,6 +1277,10 @@ class MCPClientManager:
                 self._supports_prompts.pop(name, None)
                 self._supports_prompt_list_changed.pop(name, None)
                 self._last_error.pop(name, None)
+                self._last_notification_refresh.pop(name, None)
+                self._refresh_failures.pop(name, None)
+                self._refresh_backoff_until.pop(name, None)
+                self._cb_clear(name)
                 # Rebuild merged state (serialized with notification handlers)
                 self._rebuild_tools()
                 self._rebuild_resources()
@@ -1075,6 +1294,7 @@ class MCPClientManager:
         else:
             # No event loop (tests / pre-start) — mutate directly
             self._sessions.pop(name, None)
+            self._server_streams.pop(name, None)
             self._per_server_tools.pop(name, None)
             self._per_server_resources.pop(name, None)
             self._per_server_prompts.pop(name, None)
@@ -1084,6 +1304,10 @@ class MCPClientManager:
             self._supports_prompts.pop(name, None)
             self._supports_prompt_list_changed.pop(name, None)
             self._last_error.pop(name, None)
+            self._last_notification_refresh.pop(name, None)
+            self._refresh_failures.pop(name, None)
+            self._refresh_backoff_until.pop(name, None)
+            self._cb_clear(name)
             self._rebuild_tools()
             self._rebuild_resources()
             self._rebuild_prompts()
@@ -1107,6 +1331,8 @@ class MCPClientManager:
         connected = name in self._sessions
         cfg = self._server_configs.get(name, {})
         transport = cfg.get("type", "stdio")
+        cb_deadline = self._circuit_open_until.get(name)
+        cb_open = cb_deadline is not None and time.monotonic() < cb_deadline
         return {
             "connected": connected,
             "tools": len(self._per_server_tools.get(name, [])) if connected else 0,
@@ -1116,6 +1342,8 @@ class MCPClientManager:
             "transport": transport,
             "command": cfg.get("command", "") if transport == "stdio" else "",
             "url": cfg.get("url", "") if transport != "stdio" else "",
+            "circuit_open": cb_open,
+            "consecutive_failures": self._consecutive_failures.get(name, 0),
         }
 
     def get_all_server_status(self) -> dict[str, dict[str, Any]]:
@@ -1245,6 +1473,52 @@ class MCPClientManager:
 
     # -- tool invocation -----------------------------------------------------
 
+    def _cb_gate(self, server_name: str) -> None:
+        """Check circuit breaker before dispatching to *server_name*.
+
+        Raises ``RuntimeError`` if the circuit is open and cooldown has not
+        expired.  When the cooldown has expired (half-open), clears the
+        deadline so the probe attempt is allowed through.
+        """
+        is_open, cooldown_expired = self._cb_check(server_name)
+        if is_open and not cooldown_expired:
+            remaining = self._circuit_open_until.get(server_name, 0) - time.monotonic()
+            raise RuntimeError(
+                f"MCP server '{server_name}' circuit open "
+                f"(cooldown {remaining:.0f}s remaining). "
+                f"Use '/mcp refresh {server_name}' to retry manually."
+            )
+        if cooldown_expired:
+            # Allow the next call through as a probe — remove deadline so
+            # concurrent callers aren't also rejected while probe is in-flight.
+            self._circuit_open_until.pop(server_name, None)
+
+    def _cb_auto_reconnect(self, server_name: str) -> Any:
+        """Attempt reconnection for a disconnected server during half-open probe.
+
+        Returns the new session on success, or raises on failure.
+        """
+        cfg = self._server_configs.get(server_name)
+        if not cfg or self._loop is None:
+            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+        reconnect_future = asyncio.run_coroutine_threadsafe(
+            self._connect_one(server_name, cfg), self._loop
+        )
+        try:
+            reconnect_future.result(timeout=self._CONNECT_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            reconnect_future.cancel()
+            self._cb_record_failure(server_name)
+            raise RuntimeError(f"MCP server '{server_name}' reconnect timed out") from None
+        except Exception as exc:
+            self._cb_record_failure(server_name)
+            raise RuntimeError(f"MCP server '{server_name}' reconnect failed: {exc}") from None
+        session = self._sessions.get(server_name)
+        if session is None:
+            self._cb_record_failure(server_name)
+            raise RuntimeError(f"MCP server '{server_name}' reconnect produced no session")
+        return session
+
     def call_tool_sync(
         self,
         func_name: str,
@@ -1254,15 +1528,19 @@ class MCPClientManager:
         """Execute an MCP tool call synchronously (blocks the calling thread).
 
         Dispatches an async ``tools/call`` to the background event loop and
-        waits for the result.
+        waits for the result.  Includes circuit-breaker gating and automatic
+        reconnection for servers recovering from failure.
         """
         mapping = self._tool_map.get(func_name)
         if mapping is None:
             raise ValueError(f"Unknown MCP tool: {func_name}")
         server_name, original_name = mapping
+
+        self._cb_gate(server_name)
+
         session = self._sessions.get(server_name)
         if session is None:
-            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+            session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(
@@ -1271,7 +1549,19 @@ class MCPClientManager:
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP tool call timed out after {timeout}s") from None
+        except Exception as exc:
+            # Protocol errors (McpError) come from a healthy connection that
+            # rejected the request — only transport errors trip the breaker.
+            if not isinstance(exc, McpError):
+                self._cb_record_failure(server_name)
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
+                self._sessions.pop(server_name, None)
+            raise
+
+        self._cb_record_success(server_name)
 
         # Extract text from the content array
         texts: list[str] = []
@@ -1320,16 +1610,29 @@ class MCPClientManager:
         if mapping is None:
             raise ValueError(f"Unknown MCP resource: {uri}")
         server_name, _ = mapping
+
+        self._cb_gate(server_name)
+
         session = self._sessions.get(server_name)
         if session is None:
-            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+            session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(session.read_resource(uri), self._loop)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP resource read timed out after {timeout}s") from None
+        except Exception as exc:
+            if not isinstance(exc, McpError):
+                self._cb_record_failure(server_name)
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
+                self._sessions.pop(server_name, None)
+            raise
+
+        self._cb_record_success(server_name)
 
         parts: list[str] = []
         for item in result.contents:
@@ -1357,9 +1660,12 @@ class MCPClientManager:
         if mapping is None:
             raise ValueError(f"Unknown MCP prompt: {prefixed_name}")
         server_name, original_name = mapping
+
+        self._cb_gate(server_name)
+
         session = self._sessions.get(server_name)
         if session is None:
-            raise RuntimeError(f"MCP server '{server_name}' is not connected")
+            session = self._cb_auto_reconnect(server_name)
         assert self._loop is not None
 
         future = asyncio.run_coroutine_threadsafe(
@@ -1368,7 +1674,17 @@ class MCPClientManager:
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
+            future.cancel()
+            self._cb_record_failure(server_name)
             raise TimeoutError(f"MCP prompt retrieval timed out after {timeout}s") from None
+        except Exception as exc:
+            if not isinstance(exc, McpError):
+                self._cb_record_failure(server_name)
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
+                self._sessions.pop(server_name, None)
+            raise
+
+        self._cb_record_success(server_name)
 
         messages: list[dict[str, Any]] = []
         for msg in result.messages:

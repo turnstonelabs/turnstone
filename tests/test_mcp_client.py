@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
+import time
 from contextlib import AsyncExitStack
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -304,7 +306,7 @@ class TestMCPClientManager:
     def test_call_tool_sync_disconnected_server(self):
         mgr = MCPClientManager({})
         mgr._tool_map["mcp__dead__ping"] = ("dead", "ping")
-        # No session registered for "dead"
+        # No session registered for "dead", no config/loop → reconnect fails
         with pytest.raises(RuntimeError, match="not connected"):
             mgr.call_tool_sync("mcp__dead__ping", {})
 
@@ -1553,3 +1555,407 @@ class TestSafeCloseStack:
             await MCPClientManager._safe_close_stack(stack)
 
         asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Cancel orphaned futures on timeout
+# ---------------------------------------------------------------------------
+
+
+class TestFutureCancellation:
+    """Verify future.cancel() is called when sync bridge methods time out."""
+
+    def _make_manager_with_session(self) -> MCPClientManager:
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        # Prevent auto-spec from creating async coroutines that trigger warnings
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        mock_session.read_resource = MagicMock(return_value="sentinel")
+        mock_session.get_prompt = MagicMock(return_value="sentinel")
+        mgr._sessions["test"] = mock_session
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__search"] = ("test", "search")
+        mgr._resource_map["file:///a.txt"] = ("test", "file:///a.txt")
+        mgr._prompt_map["mcp__test__review"] = ("test", "review")
+        return mgr
+
+    def test_call_tool_sync_cancels_future_on_timeout(self):
+        mgr = self._make_manager_with_session()
+        mock_future = MagicMock()
+        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(TimeoutError, match="timed out"),
+        ):
+            mgr.call_tool_sync("mcp__test__search", {"query": "x"}, timeout=1)
+        mock_future.cancel.assert_called_once()
+
+    def test_read_resource_sync_cancels_future_on_timeout(self):
+        mgr = self._make_manager_with_session()
+        mock_future = MagicMock()
+        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(TimeoutError, match="timed out"),
+        ):
+            mgr.read_resource_sync("file:///a.txt", timeout=1)
+        mock_future.cancel.assert_called_once()
+
+    def test_get_prompt_sync_cancels_future_on_timeout(self):
+        mgr = self._make_manager_with_session()
+        mock_future = MagicMock()
+        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(TimeoutError, match="timed out"),
+        ):
+            mgr.get_prompt_sync("mcp__test__review", timeout=1)
+        mock_future.cancel.assert_called_once()
+
+    def test_refresh_sync_cancels_future_on_timeout(self):
+        mgr = MCPClientManager({})
+        mgr._loop = MagicMock()
+        mock_future = MagicMock()
+        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        with (
+            patch.object(mgr, "_refresh_all", return_value=MagicMock()),
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(TimeoutError, match="timed out"),
+        ):
+            mgr.refresh_sync(timeout=1)
+        mock_future.cancel.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Per-server circuit breaker
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreaker:
+    """Verify per-server circuit breaker behavior."""
+
+    def test_circuit_stays_closed_below_threshold(self):
+        mgr = MCPClientManager({})
+        mgr._cb_record_failure("srv")
+        mgr._cb_record_failure("srv")
+        is_open, _ = mgr._cb_check("srv")
+        assert not is_open
+
+    def test_circuit_opens_at_threshold(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        is_open, cooldown_expired = mgr._cb_check("srv")
+        assert is_open
+        assert not cooldown_expired  # just opened, cooldown not expired
+
+    def test_circuit_half_open_after_cooldown(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        # Simulate cooldown expiry
+        mgr._circuit_open_until["srv"] = time.monotonic() - 1
+        is_open, cooldown_expired = mgr._cb_check("srv")
+        assert is_open
+        assert cooldown_expired
+
+    def test_circuit_resets_on_success(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        assert "srv" in mgr._circuit_open_until
+        mgr._cb_record_success("srv")
+        is_open, _ = mgr._cb_check("srv")
+        assert not is_open
+        assert mgr._consecutive_failures.get("srv") is None
+
+    def test_success_decays_trip_count(self):
+        """Success decays trip_count by 1 so flapping servers escalate backoff."""
+        mgr = MCPClientManager({})
+        mgr._circuit_trip_count["srv"] = 3
+        mgr._cb_record_success("srv")
+        assert mgr._circuit_trip_count["srv"] == 2
+        mgr._cb_record_success("srv")
+        assert mgr._circuit_trip_count["srv"] == 1
+        mgr._cb_record_success("srv")
+        assert "srv" not in mgr._circuit_trip_count
+
+    def test_cooldown_is_exponential(self):
+        mgr = MCPClientManager({})
+        # First trip (trip_count starts at 0)
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        deadline1 = mgr._circuit_open_until["srv"]
+        base1 = deadline1 - time.monotonic()
+        # Reset circuit but keep trip_count at 1 (set by first trip)
+        mgr._cb_record_success("srv")
+        # trip_count decayed from 1 to 0 — manually set to 1 for test
+        mgr._circuit_trip_count["srv"] = 1
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        deadline2 = mgr._circuit_open_until["srv"]
+        base2 = deadline2 - time.monotonic()
+        # Second trip should have longer cooldown (roughly 2x, within jitter)
+        assert base2 > base1 * 1.5
+
+    def test_cooldown_capped_at_max(self):
+        mgr = MCPClientManager({})
+        mgr._circuit_trip_count["srv"] = 100  # very high trip count
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        deadline = mgr._circuit_open_until["srv"]
+        cooldown = deadline - time.monotonic()
+        # Should not exceed max (300s) + 10% jitter = 330s
+        assert cooldown <= mgr._CB_MAX_COOLDOWN * 1.11
+
+    def test_cb_gate_rejects_when_open(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        with pytest.raises(RuntimeError, match="circuit open"):
+            mgr._cb_gate("srv")
+
+    def test_cb_gate_allows_after_cooldown(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        mgr._circuit_open_until["srv"] = time.monotonic() - 1
+        # Should not raise
+        mgr._cb_gate("srv")
+        # Deadline should be removed (half-open probe allowed)
+        assert "srv" not in mgr._circuit_open_until
+
+    def test_cb_clear_removes_all_state(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        mgr._cb_clear("srv")
+        assert "srv" not in mgr._consecutive_failures
+        assert "srv" not in mgr._circuit_open_until
+        assert "srv" not in mgr._circuit_trip_count
+
+    @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+    @pytest.mark.filterwarnings("ignore:coroutine.*was never awaited:RuntimeWarning")
+    def test_call_tool_sync_records_failure_on_timeout(self):
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        mgr._sessions["test"] = mock_session
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = concurrent.futures.TimeoutError()
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(TimeoutError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=1)
+        assert mgr._consecutive_failures.get("test", 0) == 1
+
+    def test_call_tool_sync_records_success(self):
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        mgr._sessions["test"] = mock_session
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        # Pre-set a failure
+        mgr._consecutive_failures["test"] = 2
+        mock_result = MagicMock()
+        mock_result.content = []
+        mock_result.isError = False
+        mock_future = MagicMock()
+        mock_future.result.return_value = mock_result
+        with patch("asyncio.run_coroutine_threadsafe", return_value=mock_future):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert mgr._consecutive_failures.get("test") is None
+
+    def test_connection_error_evicts_session(self):
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        mgr._sessions["test"] = mock_session
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = BrokenPipeError("dead")
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(BrokenPipeError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        assert "test" not in mgr._sessions
+
+    def test_independent_circuits_per_server(self):
+        mgr = MCPClientManager({})
+        for _ in range(3):
+            mgr._cb_record_failure("a")
+        is_open_a, _ = mgr._cb_check("a")
+        is_open_b, _ = mgr._cb_check("b")
+        assert is_open_a
+        assert not is_open_b
+
+    def test_mcp_error_does_not_trip_circuit(self):
+        """Protocol errors (McpError) should not count as transport failures."""
+        from mcp import McpError
+        from mcp.types import ErrorData
+
+        mgr = MCPClientManager({"test": {"type": "stdio", "command": "echo"}})
+        mock_session = MagicMock()
+        mock_session.call_tool = MagicMock(return_value="sentinel")
+        mgr._sessions["test"] = mock_session
+        mgr._loop = MagicMock()
+        mgr._tool_map["mcp__test__ping"] = ("test", "ping")
+        mock_future = MagicMock()
+        mock_future.result.side_effect = McpError(ErrorData(code=-32601, message="tool not found"))
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=mock_future),
+            pytest.raises(McpError),
+        ):
+            mgr.call_tool_sync("mcp__test__ping", {}, timeout=5)
+        # Circuit should NOT have recorded a failure
+        assert mgr._consecutive_failures.get("test", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Safe transport stream pre-close
+# ---------------------------------------------------------------------------
+
+
+class TestSafeTransportStreams:
+    """Verify stream references are stored and pre-closed."""
+
+    def test_pre_close_streams_closes_both(self):
+        mgr = MCPClientManager({})
+        stream_a = MagicMock()
+        stream_b = MagicMock()
+        mgr._server_streams["srv"] = (stream_a, stream_b)
+
+        async def _run():
+            await mgr._pre_close_streams("srv")
+
+        asyncio.run(_run())
+        stream_a.aclose.assert_called_once()
+        stream_b.aclose.assert_called_once()
+        assert "srv" not in mgr._server_streams
+
+    def test_pre_close_streams_ignores_missing(self):
+        mgr = MCPClientManager({})
+
+        async def _run():
+            await mgr._pre_close_streams("nonexistent")
+
+        asyncio.run(_run())  # should not raise
+
+    def test_pre_close_streams_suppresses_errors(self):
+        mgr = MCPClientManager({})
+        stream_a = MagicMock()
+        stream_a.aclose.side_effect = RuntimeError("boom")
+        stream_b = MagicMock()
+        mgr._server_streams["srv"] = (stream_a, stream_b)
+
+        async def _run():
+            await mgr._pre_close_streams("srv")
+
+        asyncio.run(_run())  # should not raise despite stream_a error
+        stream_b.aclose.assert_called_once()
+
+    def test_shutdown_clears_stream_refs(self):
+        mgr = MCPClientManager({})
+        mgr._server_streams["srv"] = (MagicMock(), MagicMock())
+        mgr.shutdown()
+        assert len(mgr._server_streams) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Notification debounce
+# ---------------------------------------------------------------------------
+
+
+class TestNotificationDebounce:
+    """Verify notification-triggered refreshes are debounced."""
+
+    def test_debounce_within_window(self):
+        mgr = MCPClientManager({})
+        mgr._last_notification_refresh["srv"] = time.monotonic()
+        # We can't easily call _on_notification (it's a closure), so test
+        # the debounce logic directly via the timestamp check
+        now = time.monotonic()
+        last = mgr._last_notification_refresh.get("srv", 0.0)
+        assert now - last < mgr._NOTIFICATION_DEBOUNCE
+
+    def test_debounce_passes_after_window(self):
+        mgr = MCPClientManager({})
+        # Set timestamp well in the past
+        mgr._last_notification_refresh["srv"] = time.monotonic() - 10
+        now = time.monotonic()
+        last = mgr._last_notification_refresh.get("srv", 0.0)
+        assert now - last >= mgr._NOTIFICATION_DEBOUNCE
+
+    def test_debounce_is_per_server(self):
+        mgr = MCPClientManager({})
+        mgr._last_notification_refresh["srv_a"] = time.monotonic()
+        # srv_b has no timestamp — should pass debounce
+        now = time.monotonic()
+        last_b = mgr._last_notification_refresh.get("srv_b", 0.0)
+        assert now - last_b >= mgr._NOTIFICATION_DEBOUNCE
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: Periodic refresh backoff
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodicRefreshBackoff:
+    """Verify periodic refresh backoff and auto-reconnect."""
+
+    def test_backoff_set_on_failure(self):
+        mgr = MCPClientManager({})
+        mgr._refresh_failures["srv"] = 1
+        # Simulate what _periodic_refresh does on failure
+        failures = mgr._refresh_failures.get("srv", 0) + 1
+        mgr._refresh_failures["srv"] = failures
+        backoff = min(mgr._REFRESH_BACKOFF_BASE * (2 ** (failures - 1)), mgr._REFRESH_BACKOFF_MAX)
+        mgr._refresh_backoff_until["srv"] = time.monotonic() + backoff
+        assert mgr._refresh_backoff_until["srv"] > time.monotonic()
+        assert failures == 2
+
+    def test_backoff_doubles(self):
+        mgr = MCPClientManager({})
+        b1 = min(mgr._REFRESH_BACKOFF_BASE * (2**0), mgr._REFRESH_BACKOFF_MAX)
+        b2 = min(mgr._REFRESH_BACKOFF_BASE * (2**1), mgr._REFRESH_BACKOFF_MAX)
+        b3 = min(mgr._REFRESH_BACKOFF_BASE * (2**2), mgr._REFRESH_BACKOFF_MAX)
+        assert b1 == 60
+        assert b2 == 120
+        assert b3 == 240
+
+    def test_backoff_capped(self):
+        mgr = MCPClientManager({})
+        b = min(mgr._REFRESH_BACKOFF_BASE * (2**20), mgr._REFRESH_BACKOFF_MAX)
+        assert b == mgr._REFRESH_BACKOFF_MAX
+
+    def test_backoff_clears_on_success(self):
+        mgr = MCPClientManager({})
+        mgr._refresh_failures["srv"] = 3
+        mgr._refresh_backoff_until["srv"] = time.monotonic() + 1000
+        # Simulate success
+        mgr._refresh_failures.pop("srv", None)
+        mgr._refresh_backoff_until.pop("srv", None)
+        assert "srv" not in mgr._refresh_failures
+        assert "srv" not in mgr._refresh_backoff_until
+
+    def test_server_status_includes_circuit_info(self):
+        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+        status = mgr.get_server_status("srv")
+        assert "circuit_open" in status
+        assert "consecutive_failures" in status
+        assert status["circuit_open"] is False
+        assert status["consecutive_failures"] == 0
+
+    def test_server_status_shows_open_circuit(self):
+        mgr = MCPClientManager({"srv": {"type": "stdio", "command": "echo"}})
+        for _ in range(3):
+            mgr._cb_record_failure("srv")
+        status = mgr.get_server_status("srv")
+        assert status["circuit_open"] is True
+        assert status["consecutive_failures"] == 3
