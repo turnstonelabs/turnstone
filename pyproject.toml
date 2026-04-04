@@ -81,6 +81,7 @@ include = [
   "turnstone/shared_static/hljs-11.11.1/**/*",
   "turnstone/shared_static/mermaid-11.14.0/**/*",
   "turnstone/sdk/py.typed",
+  "turnstone/deploy/*.yaml",
 ]
 
 [tool.pytest.ini_options]
