@@ -90,8 +90,14 @@ function inlineMarkdown(text) {
 document.addEventListener("click", function (e) {
   var ph = e.target.closest(".img-placeholder");
   if (!ph) return;
-  var src = ph.getAttribute("data-src") || "";
-  if (!/^https?:/i.test(src)) return;
+  var raw = ph.getAttribute("data-src") || "";
+  if (!/^https?:/i.test(raw)) return;
+  var src;
+  try {
+    src = new URL(raw).href;
+  } catch (_e) {
+    return;
+  }
   var img = document.createElement("img");
   img.src = src;
   img.alt = ph.getAttribute("data-alt");
