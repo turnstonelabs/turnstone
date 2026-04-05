@@ -156,7 +156,7 @@ class HealthTrackerRegistry:
                     on_state_changed=_state_cb,
                 )
                 self._trackers[key] = tracker
-                log.info("Health tracker created for backend %s:%s", provider, base_url)
+                log.info("Health tracker created for backend %s:%s", key[0], key[1])
             return self._trackers[key]
 
     def get_tracker_for_alias(

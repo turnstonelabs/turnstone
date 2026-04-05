@@ -2152,7 +2152,7 @@ function pollHealth() {
       var el = document.getElementById("health-indicator");
       if (!el) return;
       if (data.status === "degraded") {
-        el.textContent = "backend down";
+        el.textContent = "backend degraded";
         el.className = "health-degraded";
         el.title =
           "Backend: " + ((data.backend && data.backend.status) || "unknown");

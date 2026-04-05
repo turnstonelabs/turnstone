@@ -5202,15 +5202,28 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         )
 
     # Include the effective default alias so the UI can highlight it.
-    # Prefer ConfigStore override, fall back to config.toml [model].default.
-    default_alias = ""
+    # Prefer ConfigStore override, fall back to config.toml [model].default,
+    # then validate against the actual enabled model list (same fallback
+    # rules as load_model_registry).
+    configured_default = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs:
-        default_alias = cs.get("model.default_alias") or ""
-    if not default_alias:
+        configured_default = cs.get("model.default_alias") or ""
+    if not configured_default:
         from turnstone.core.config import load_config as _load_cfg
 
-        default_alias = _load_cfg().get("model", {}).get("default", "default")
+        configured_default = _load_cfg().get("model", {}).get("default", "default")
+
+    enabled_aliases = [m["alias"] for m in result if m.get("alias") and m.get("enabled", True)]
+    enabled_set = set(enabled_aliases)
+    if configured_default in enabled_set:
+        default_alias = configured_default
+    elif "default" in enabled_set:
+        default_alias = "default"
+    elif enabled_aliases:
+        default_alias = enabled_aliases[0]
+    else:
+        default_alias = ""
 
     return JSONResponse({"models": result, "default_alias": default_alias})
 
