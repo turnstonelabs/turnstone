@@ -2749,23 +2749,34 @@ function switchJudgeSection(section) {
   for (var i = 0; i < sections.length; i++) sections[i].style.display = "none";
   var btns = document.querySelectorAll(".judge-section-btn");
   for (var i = 0; i < btns.length; i++) {
-    btns[i].classList.remove("active");
-    btns[i].setAttribute("aria-selected", "false");
-    btns[i].style.borderBottomColor = "transparent";
-    btns[i].style.color = "var(--fg-dim)";
+    var isActive = btns[i].getAttribute("data-section") === section;
+    btns[i].classList.toggle("active", isActive);
+    btns[i].setAttribute("aria-selected", isActive ? "true" : "false");
+    btns[i].setAttribute("tabindex", isActive ? "0" : "-1");
   }
   var target = document.getElementById(section + "-section");
   if (target) target.style.display = "";
-  var btn = document.querySelector(
-    '.judge-section-btn[data-section="' + section + '"]',
-  );
-  if (btn) {
-    btn.classList.add("active");
-    btn.setAttribute("aria-selected", "true");
-    btn.style.borderBottomColor = "var(--accent)";
-    btn.style.color = "var(--fg)";
-  }
 }
+
+// Arrow key navigation for judge sub-section tabs
+(function () {
+  var switcher = document.querySelector(".judge-section-switcher");
+  if (!switcher) return;
+  switcher.addEventListener("keydown", function (e) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    var btns = switcher.querySelectorAll(".judge-section-btn");
+    var secs = [];
+    for (var i = 0; i < btns.length; i++)
+      secs.push(btns[i].getAttribute("data-section"));
+    var current = switcher.querySelector(".judge-section-btn.active");
+    var idx = secs.indexOf(current ? current.getAttribute("data-section") : "");
+    if (e.key === "ArrowRight") idx = (idx + 1) % secs.length;
+    else idx = (idx - 1 + secs.length) % secs.length;
+    e.preventDefault();
+    switchJudgeSection(secs[idx]);
+    btns[idx].focus();
+  });
+})();
 
 // -- Load all judge data ----------------------------------------------------
 
@@ -3036,7 +3047,9 @@ function renderHeuristicRules() {
           : r.source === "builtin-disabled"
             ? '<span class="scope-badge scope-deny">disabled</span>'
             : '<span class="scope-badge scope-write">custom</span>';
-    var statusText = r.enabled ? "active" : "disabled";
+    var statusBadge = r.enabled
+      ? '<span class="scope-badge scope-scan-safe">active</span>'
+      : '<span class="scope-badge scope-deny">disabled</span>';
     var actions = "";
     if (r.rule_id) {
       actions =
@@ -3077,7 +3090,7 @@ function renderHeuristicRules() {
       sourceBadge +
       "</span>" +
       '<span class="admin-col">' +
-      statusText +
+      statusBadge +
       "</span>" +
       '<span class="admin-col">' +
       actions +
@@ -3307,7 +3320,9 @@ function renderOGPatterns() {
           : p.source === "builtin-disabled"
             ? '<span class="scope-badge scope-deny">disabled</span>'
             : '<span class="scope-badge scope-write">custom</span>';
-    var statusText = p.enabled ? "active" : "disabled";
+    var statusBadge = p.enabled
+      ? '<span class="scope-badge scope-scan-safe">active</span>'
+      : '<span class="scope-badge scope-deny">disabled</span>';
     var actions = "";
     if (p.pattern_id) {
       actions =
@@ -3345,7 +3360,7 @@ function renderOGPatterns() {
       sourceBadge +
       "</span>" +
       '<span class="admin-col">' +
-      statusText +
+      statusBadge +
       "</span>" +
       '<span class="admin-col">' +
       actions +

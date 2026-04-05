@@ -286,21 +286,21 @@
       </div>
 
       <!-- Sub-panel switcher -->
-      <div class="judge-section-switcher" role="tablist" aria-label="Judge sections" style="display:flex;gap:8px;margin:12px 0 16px;border-bottom:1px solid var(--border-strong)">
-        <button class="judge-section-btn active" role="tab" aria-selected="true" aria-controls="judge-settings-section" data-section="judge-settings" onclick="switchJudgeSection('judge-settings')" style="padding:6px 14px;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--fg);cursor:pointer;font-size:13px">Settings</button>
-        <button class="judge-section-btn" role="tab" aria-selected="false" aria-controls="judge-heuristic-section" data-section="judge-heuristic" onclick="switchJudgeSection('judge-heuristic')" style="padding:6px 14px;background:none;border:none;border-bottom:2px solid transparent;color:var(--fg-dim);cursor:pointer;font-size:13px">Heuristic Rules</button>
-        <button class="judge-section-btn" role="tab" aria-selected="false" aria-controls="judge-output-guard-section" data-section="judge-output-guard" onclick="switchJudgeSection('judge-output-guard')" style="padding:6px 14px;background:none;border:none;border-bottom:2px solid transparent;color:var(--fg-dim);cursor:pointer;font-size:13px">Output Guard</button>
+      <div class="judge-section-switcher" role="tablist" aria-label="Judge sections">
+        <button id="judge-tab-settings" class="judge-section-btn active" role="tab" aria-selected="true" aria-controls="judge-settings-section" tabindex="0" data-section="judge-settings" onclick="switchJudgeSection('judge-settings')">Settings</button>
+        <button id="judge-tab-heuristic" class="judge-section-btn" role="tab" aria-selected="false" aria-controls="judge-heuristic-section" tabindex="-1" data-section="judge-heuristic" onclick="switchJudgeSection('judge-heuristic')">Heuristic Rules</button>
+        <button id="judge-tab-output-guard" class="judge-section-btn" role="tab" aria-selected="false" aria-controls="judge-output-guard-section" tabindex="-1" data-section="judge-output-guard" onclick="switchJudgeSection('judge-output-guard')">Output Guard</button>
       </div>
 
       <!-- Settings section -->
-      <div id="judge-settings-section" class="judge-section" role="tabpanel" aria-labelledby="tab-judge">
+      <div id="judge-settings-section" class="judge-section" role="tabpanel" aria-labelledby="judge-tab-settings">
         <div id="judge-settings-container" style="max-width:600px">
           <div class="dashboard-empty">Loading settings...</div>
         </div>
       </div>
 
       <!-- Heuristic Rules section -->
-      <div id="judge-heuristic-section" class="judge-section" role="tabpanel" style="display:none">
+      <div id="judge-heuristic-section" class="judge-section" role="tabpanel" aria-labelledby="judge-tab-heuristic" style="display:none">
         <div class="admin-toolbar" style="margin-bottom:12px">
           <span style="font-size:13px;color:var(--fg-dim)">Pattern rules for pre-execution intent validation</span>
           <button class="admin-action-btn" onclick="showCreateHeuristicRuleModal()">+ Add rule</button>
@@ -315,13 +315,13 @@
           <span class="admin-col">STATUS</span>
           <span class="admin-col">ACTIONS</span>
         </div>
-        <div id="judge-heuristic-table-container">
+        <div id="judge-heuristic-table-container" role="list" aria-label="Heuristic rules" aria-live="polite">
           <div class="dashboard-empty">Loading rules...</div>
         </div>
       </div>
 
       <!-- Output Guard Patterns section -->
-      <div id="judge-output-guard-section" class="judge-section" role="tabpanel" style="display:none">
+      <div id="judge-output-guard-section" class="judge-section" role="tabpanel" aria-labelledby="judge-tab-output-guard" style="display:none">
         <div class="admin-toolbar" style="margin-bottom:12px">
           <span style="font-size:13px;color:var(--fg-dim)">Regex patterns for post-execution output scanning</span>
           <button class="admin-action-btn" onclick="showCreateOutputGuardPatternModal()">+ Add pattern</button>
@@ -335,7 +335,7 @@
           <span class="admin-col">STATUS</span>
           <span class="admin-col">ACTIONS</span>
         </div>
-        <div id="judge-og-table-container">
+        <div id="judge-og-table-container" role="list" aria-label="Output guard patterns" aria-live="polite">
           <div class="dashboard-empty">Loading patterns...</div>
         </div>
       </div>
