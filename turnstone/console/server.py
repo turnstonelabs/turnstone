@@ -2125,6 +2125,7 @@ _VALID_PERMISSIONS = frozenset(
         "admin.roles",
         "admin.orgs",
         "admin.policies",
+        "admin.prompt_policies",
         "admin.skills",
         "admin.audit",
         "admin.usage",

@@ -57,6 +57,7 @@ class _InjectAuthMiddleware(BaseHTTPMiddleware):
                     "admin.users",
                     "admin.orgs",
                     "admin.policies",
+                    "admin.prompt_policies",
                     "admin.skills",
                     "admin.usage",
                     "admin.audit",
