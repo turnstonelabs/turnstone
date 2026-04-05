@@ -281,11 +281,11 @@ def load_model_registry(
         if not model_name:
             log.warning("Model entry '%s' has no model name, skipping", alias)
             continue
-        entry_base_url = entry.get("base_url", base_url)
+        entry_base_url = _resolve_env_vars(entry.get("base_url", base_url))
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
-            api_key=entry.get("api_key", api_key),
+            api_key=_resolve_env_vars(entry.get("api_key", api_key)),
             model=model_name,
             context_window=entry.get("context_window", context_window),
             provider=_resolve_openai_provider(entry.get("provider", "openai"), entry_base_url),
