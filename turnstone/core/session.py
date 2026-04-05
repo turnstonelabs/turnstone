@@ -1378,11 +1378,9 @@ class ChatSession:
             if self._health_monitor:
                 self._health_monitor.record_success()
             return result
-        except BaseException as primary_err:
+        except Exception as primary_err:
             if self._health_monitor:
                 self._health_monitor.record_failure()
-            if isinstance(primary_err, (KeyboardInterrupt, SystemExit)):
-                raise
             if not self._registry or not self._registry.fallback:
                 raise
             # Try each fallback model.  Fallbacks may use different backends;
@@ -2804,7 +2802,8 @@ class ChatSession:
                 continue
 
             cid, output = results[i]
-            assert isinstance(output, str)  # plan always returns text
+            if not isinstance(output, str):
+                raise TypeError(f"plan_agent must return str, got {type(output).__name__}")
             plan_path = f".plan-{self._ws_id}.md"
 
             if not self.auto_approve:
@@ -3329,7 +3328,8 @@ class ChatSession:
                 "error": "Error: provide old_string/new_string or edits array, not both",
             }
         if has_batch:
-            assert isinstance(raw_edits, list)
+            if not isinstance(raw_edits, list):
+                raise TypeError(f"edits must be a list, got {type(raw_edits).__name__}")
             edits: list[dict[str, Any]] = []
             for i, e in enumerate(raw_edits):
                 if not isinstance(e, dict):
