@@ -24,6 +24,7 @@ def _make_mock_provider(
 ) -> MagicMock:
     """Create a mock LLM provider that returns a fixed response."""
     provider = MagicMock()
+    provider.provider_name = "openai"
     caps = MagicMock()
     caps.context_window = 100_000
     caps.max_output_tokens = 4096
@@ -63,6 +64,8 @@ def _make_judge(
         timeout=timeout,
     )
     client = MagicMock()
+    client.base_url = "https://api.openai.com/v1"
+    client.api_key = "test-key"
     return IntentJudge(
         config=config,
         session_provider=provider,
@@ -186,11 +189,16 @@ class TestErrorHandling:
                 [{"role": "user", "content": "test"}],
                 cancel_event=None,
                 executor=pool,
+                client=MagicMock(),
             )
         assert result is None
 
     def test_provider_error_heuristic_still_returned(self):
-        """When LLM fails, heuristic verdicts are still returned from evaluate()."""
+        """When LLM fails, heuristic verdicts are still returned from evaluate().
+
+        With fallback delivery, the callback *will* fire with a fallback
+        verdict, but heuristic verdicts are always returned synchronously.
+        """
         provider = _make_mock_provider(side_effect=RuntimeError("API down"))
         judge = _make_judge(provider)
 
@@ -204,8 +212,9 @@ class TestErrorHandling:
 
         assert len(heuristics) == 1
         assert heuristics[0].tier == "heuristic"
-        # Callback should not have been invoked (LLM failed)
-        assert len(callback_results) == 0
+        # Fallback verdict delivered via callback
+        assert len(callback_results) == 1
+        assert callback_results[0].tier == "llm_fallback"
 
     def test_empty_content_returns_none(self):
         """Provider returns empty content, no tool calls."""
@@ -221,6 +230,7 @@ class TestErrorHandling:
                 [{"role": "user", "content": "test"}],
                 cancel_event=None,
                 executor=pool,
+                client=MagicMock(),
             )
         assert result is None
 
@@ -234,6 +244,7 @@ class TestMultiTurnToolUse:
     def test_tool_call_then_verdict(self):
         """Provider requests read_file, then returns verdict."""
         provider = MagicMock()
+        provider.provider_name = "openai"
         caps = MagicMock()
         caps.context_window = 100_000
         caps.max_output_tokens = 4096
@@ -267,6 +278,7 @@ class TestMultiTurnToolUse:
                 [{"role": "user", "content": "test"}],
                 cancel_event=None,
                 executor=pool,
+                client=MagicMock(),
             )
         assert verdict is not None
         assert verdict.tier == "llm"
@@ -275,6 +287,7 @@ class TestMultiTurnToolUse:
     def test_max_turns_reached(self):
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
         provider = MagicMock()
+        provider.provider_name = "openai"
         caps = MagicMock()
         caps.context_window = 100_000
         caps.max_output_tokens = 4096
@@ -315,6 +328,7 @@ class TestMultiTurnToolUse:
                 [{"role": "user", "content": "test"}],
                 cancel_event=None,
                 executor=pool,
+                client=MagicMock(),
             )
         # Should have called create_completion exactly _JUDGE_MAX_TURNS times
         assert provider.create_completion.call_count == 5
@@ -335,12 +349,12 @@ class TestContextPreparation:
 
         result = judge._prepare_context(_make_item(), messages)
 
-        # Should have system message + some truncated history + user message
+        # Should have system message + single user message with transcript
+        assert len(result) == 2
         assert result[0]["role"] == "system"
-        assert result[-1]["role"] == "user"
-        assert "pending human approval" in result[-1]["content"]
-        # Should be fewer messages than the original 100
-        assert len(result) < 102  # system + 100 + user
+        assert result[1]["role"] == "user"
+        assert "pending human approval" in result[1]["content"]
+        assert "Conversation context:" in result[1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -369,8 +383,8 @@ class TestConfidenceArbitration:
         assert callback_results[0].tier == "llm"
         assert callback_results[0].confidence == 0.95
 
-    def test_llm_lower_confidence_no_callback(self):
-        """LLM confidence < heuristic confidence — no callback."""
+    def test_llm_lower_confidence_no_arbitration_block(self):
+        """LLM confidence < heuristic — callback still invoked (all verdicts delivered)."""
         provider = _make_mock_provider(response_content=_good_verdict_json(confidence=0.5))
         judge = _make_judge(provider)
 
@@ -384,8 +398,10 @@ class TestConfidenceArbitration:
         time.sleep(0.5)
 
         assert len(heuristics) == 1
-        # LLM confidence (0.5) < heuristic (0.85), so no callback
-        assert len(callback_results) == 0
+        # LLM verdict is always delivered regardless of confidence comparison
+        assert len(callback_results) == 1
+        assert callback_results[0].tier == "llm"
+        assert callback_results[0].confidence == 0.5
 
 
 # ---------------------------------------------------------------------------

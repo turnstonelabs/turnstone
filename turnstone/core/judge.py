@@ -82,6 +82,7 @@ class JudgeConfig:
     read_only_tools: bool = True
     output_guard: bool = True
     redact_secrets: bool = True
+    cancel_on_approval: bool = False  # True = abort remaining items on user approval
 
 
 # ---------------------------------------------------------------------------
@@ -910,7 +911,9 @@ class IntentJudge:
                 if model_registry.has_alias(config.model):
                     client, model_name, _ = model_registry.resolve(config.model)
                     self._provider = model_registry.get_provider(config.model)
-                    self._client = client
+                    self._client_factory_args = self._extract_client_config(
+                        client, self._provider.provider_name,
+                    )
                     self._model = model_name
                     caps = self._provider.get_capabilities(self._model)
                     self._judge_context_window = caps.context_window
@@ -921,16 +924,35 @@ class IntentJudge:
         if not resolved and config.model:
             # Model name override with session provider
             self._provider = session_provider
-            self._client = session_client
+            self._client_factory_args = self._extract_client_config(
+                session_client, session_provider.provider_name,
+            )
             self._model = config.model
             caps = self._provider.get_capabilities(self._model)
             self._judge_context_window = caps.context_window
         elif not resolved:
             # Self-consistency: same model as session
             self._provider = session_provider
-            self._client = session_client
+            self._client_factory_args = self._extract_client_config(
+                session_client, session_provider.provider_name,
+            )
             self._model = session_model
             self._judge_context_window = context_window
+
+    # -- Client lifecycle helpers -------------------------------------------
+
+    @staticmethod
+    def _extract_client_config(client: Any, provider_name: str) -> dict[str, str]:
+        """Extract connection config from an existing SDK client for re-creation."""
+        base_url = str(getattr(client, "base_url", getattr(client, "_base_url", "")))
+        api_key = getattr(client, "api_key", "") or ""
+        return {"provider_name": provider_name, "base_url": base_url, "api_key": api_key}
+
+    def _create_client(self) -> Any:
+        """Create a fresh HTTP client for a judge evaluation run."""
+        from turnstone.core.providers import create_client
+
+        return create_client(**self._client_factory_args)
 
     def evaluate(
         self,
@@ -995,26 +1017,66 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
     ) -> None:
-        """Daemon thread: run LLM judge for each item and invoke callback."""
-        # Evaluation-scoped executor — avoids sharing mutable state with
-        # other daemon threads from concurrent evaluate() calls.
+        """Daemon thread: run LLM judge for each item and invoke callback.
+
+        When ``cancel_on_approval`` is True, remaining evaluations are
+        aborted as soon as the user approves/denies.  When False (default),
+        every evaluation runs to completion so all verdicts are delivered.
+        """
+        client = self._create_client()
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
         try:
             for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
-                if cancel_event and cancel_event.is_set():
-                    log.debug("judge.cancelled", remaining=len(items) - idx)
+                if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
+                    log.info("judge.cancelled", remaining=len(items) - idx)
+                    self._deliver_fallbacks(
+                        items[idx:], heuristic_verdicts[idx:], callback,
+                        "judge cancelled by user approval",
+                    )
                     return
                 try:
-                    llm_verdict = self._evaluate_single(item, messages, cancel_event, executor)
-                    if cancel_event and cancel_event.is_set():
+                    llm_verdict = self._evaluate_single(
+                        item, messages, cancel_event, executor, client,
+                    )
+                    if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
+                        log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
+                        self._deliver_fallbacks(
+                            items[idx:], heuristic_verdicts[idx:], callback,
+                            "judge cancelled by user approval",
+                        )
                         return
-                    # Arbitrate: only callback when LLM upgrades the heuristic
-                    if llm_verdict and llm_verdict.confidence > h_verdict.confidence:
+                    if llm_verdict:
+                        log.info(
+                            "judge.verdict.llm",
+                            recommendation=llm_verdict.recommendation,
+                            confidence=llm_verdict.confidence,
+                            call_id=llm_verdict.call_id,
+                        )
                         callback(llm_verdict)
-                    # else: heuristic already delivered, no duplicate callback
+                    else:
+                        fallback = IntentVerdict(
+                            verdict_id=h_verdict.verdict_id,
+                            call_id=h_verdict.call_id,
+                            func_name=h_verdict.func_name,
+                            func_args=h_verdict.func_args,
+                            intent_summary=h_verdict.intent_summary,
+                            risk_level=h_verdict.risk_level,
+                            confidence=h_verdict.confidence,
+                            recommendation=h_verdict.recommendation,
+                            reasoning=h_verdict.reasoning + " (LLM judge did not return a verdict)",
+                            evidence=h_verdict.evidence,
+                            tier="llm_fallback",
+                            judge_model=self._model,
+                            latency_ms=h_verdict.latency_ms,
+                        )
+                        log.info(
+                            "judge.verdict.fallback",
+                            recommendation=fallback.recommendation,
+                            confidence=fallback.confidence,
+                            call_id=fallback.call_id,
+                        )
+                        callback(fallback)
                 except _ExecutorPoisonedError:
-                    # Timeout left the worker stuck — replace the executor
-                    # so subsequent items don't queue behind it.
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
                 except Exception:
@@ -1024,6 +1086,37 @@ class IntentJudge:
                     )
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
+            try:
+                if hasattr(client, "close"):
+                    client.close()
+            except Exception:
+                pass
+
+    def _deliver_fallbacks(
+        self,
+        remaining_items: list[dict[str, Any]],
+        remaining_verdicts: list[IntentVerdict],
+        callback: Callable[[IntentVerdict], None],
+        reason: str,
+    ) -> None:
+        """Deliver heuristic fallback verdicts for items the judge didn't complete."""
+        for item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
+            fallback = IntentVerdict(
+                verdict_id=h_verdict.verdict_id,
+                call_id=h_verdict.call_id,
+                func_name=h_verdict.func_name,
+                func_args=h_verdict.func_args,
+                intent_summary=h_verdict.intent_summary,
+                risk_level=h_verdict.risk_level,
+                confidence=h_verdict.confidence,
+                recommendation=h_verdict.recommendation,
+                reasoning=h_verdict.reasoning + f" ({reason})",
+                evidence=h_verdict.evidence,
+                tier="llm_fallback",
+                judge_model=self._model,
+                latency_ms=h_verdict.latency_ms,
+            )
+            callback(fallback)
 
     def _evaluate_single(
         self,
@@ -1031,6 +1124,7 @@ class IntentJudge:
         messages: list[dict[str, Any]],
         cancel_event: threading.Event | None,
         executor: ThreadPoolExecutor,
+        client: Any,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
         start = time.monotonic()
@@ -1052,17 +1146,25 @@ class IntentJudge:
 
         # Prepare tools (only if read_only_tools enabled).
         # Pass raw OpenAI-format schemas — create_completion handles conversion.
+        # Google's API requires thought_signature in function call round-trips
+        # which our normalized tool_calls don't preserve, so skip tools for Google.
         tools: list[dict[str, Any]] | None = None
-        if self._config.read_only_tools:
-            tools = _JUDGE_TOOL_SCHEMAS
+        if self._config.read_only_tools and self._provider.provider_name != "google":
+            tools = list(_JUDGE_TOOL_SCHEMAS)
 
         # Multi-turn judge loop
-        timeout_budget = self._config.timeout
         result = None  # will hold the last CompletionResult
+        empty_retries = 0  # track consecutive empty responses for retry
+        turn = 0
 
-        for turn in range(_JUDGE_MAX_TURNS):
-            if cancel_event and cancel_event.is_set():
-                return None
+        while turn < _JUDGE_MAX_TURNS:
+            log.info(
+                "judge.turn.start",
+                turn=turn + 1,
+                max_turns=_JUDGE_MAX_TURNS,
+                func_name=func_name,
+                call_id=call_id[:8],
+            )
 
             turn_start = time.monotonic()
 
@@ -1082,14 +1184,13 @@ class IntentJudge:
                     }
                 )
 
-            # Per-call timeout: cap each API call to the remaining budget.
-            # create_completion() is blocking and the SDK default timeout is
-            # 10 minutes — far too long for an advisory judge on local models.
-            per_call_timeout = max(timeout_budget, 5.0)  # at least 5s
+            # Per-turn timeout: each turn gets a fresh budget so local
+            # models aren't penalised for slow earlier turns.
+            per_call_timeout = max(self._config.timeout, 5.0)  # at least 5s
             try:
                 future = executor.submit(
                     self._provider.create_completion,
-                    client=self._client,
+                    client=client,
                     model=self._model,
                     messages=judge_messages,
                     tools=None if is_last_turn else tools,
@@ -1097,42 +1198,46 @@ class IntentJudge:
                     temperature=0.0,
                     reasoning_effort="medium",
                 )
-                # Poll in 1s increments so we notice cancellation promptly
+                # Poll in 1s increments so we notice timeout promptly
                 # instead of blocking for the full per_call_timeout.
                 deadline = time.monotonic() + per_call_timeout
                 while True:
                     remaining = deadline - time.monotonic()
-                    if cancel_event and cancel_event.is_set():
-                        future.cancel()
-                        return None
                     if remaining <= 0:
                         raise TimeoutError
                     try:
                         result = future.result(timeout=min(remaining, 1.0))
                         break
                     except TimeoutError:
-                        pass  # loop back to check remaining/cancel
+                        pass  # loop back to check remaining
             except TimeoutError:
-                log.warning("Judge LLM call timed out on turn %d (%.0fs)", turn, per_call_timeout)
-                raise _ExecutorPoisonedError from None
-            except Exception:
-                log.exception("Judge LLM call failed on turn %d", turn)
-                return None
-
-            turn_elapsed = time.monotonic() - turn_start
-            timeout_budget -= turn_elapsed
-
-            if timeout_budget <= 0:
-                log.warning("Judge timeout after turn %d", turn)
+                log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
+                # Safety net: if we have a partial result from a previous turn,
+                # try to parse a verdict from it before giving up.
                 if result and result.content:
-                    return self._parse_verdict(
+                    verdict = self._parse_verdict(
                         result.content,
                         func_name,
                         call_id,
                         int((time.monotonic() - start) * 1000),
                         func_args=func_args_json,
                     )
+                    if verdict:
+                        log.info("judge.verdict.from_partial", turn=turn + 1)
+                        return verdict
+                raise _ExecutorPoisonedError from None
+            except Exception as e:
+                log.info("judge.turn.failed", turn=turn + 1, error=str(e))
                 return None
+
+            turn_elapsed = time.monotonic() - turn_start
+            log.info(
+                "judge.turn.response",
+                turn=turn + 1,
+                chars=len(result.content or ""),
+                tools=len(result.tool_calls or []),
+                elapsed=round(turn_elapsed, 1),
+            )
 
             # Check for tool calls
             if result.tool_calls:
@@ -1163,6 +1268,7 @@ class IntentJudge:
                             "content": tool_result,
                         }
                     )
+                turn += 1
                 continue
 
             # No tool calls — parse the verdict from content
@@ -1175,6 +1281,11 @@ class IntentJudge:
                     func_args=func_args_json,
                 )
                 if verdict:
+                    log.info(
+                        "judge.verdict.success",
+                        recommendation=verdict.recommendation,
+                        confidence=verdict.confidence,
+                    )
                     return verdict
                 # Model produced text but no parseable verdict — on last turn
                 # this means the model refused to comply with the forcing message.
@@ -1195,7 +1306,26 @@ class IntentJudge:
                         ),
                     }
                 )
+                turn += 1
                 continue
+
+            # Empty response (0 chars, 0 tools) — retry up to 3 times
+            # without consuming the turn budget.
+            empty_retries += 1
+            if empty_retries <= 3:
+                log.info("judge.empty_response.retry", retry=empty_retries, max_retries=3)
+                judge_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You returned an empty response. "
+                            "Please analyze the tool call and respond with "
+                            "the JSON verdict object."
+                        ),
+                    }
+                )
+                continue
+            log.info("judge.empty_response.giving_up", retries=empty_retries)
             return None
 
         # Max turns reached without a final verdict
@@ -1256,27 +1386,48 @@ class IntentJudge:
             total_chars += msg_chars
         truncated.reverse()
 
-        # Filter to just role + content (strip internal keys)
-        clean_history: list[dict[str, Any]] = []
+        # Flatten history into a plaintext transcript inside a single user
+        # message.  This avoids multi-turn role sequences (consecutive user/
+        # assistant messages, tool results without matching tool_calls) that
+        # strict providers like Google reject with schema validation errors.
+        transcript_lines: list[str] = []
         for msg in truncated:
-            clean: dict[str, Any] = {"role": msg["role"]}
-            content = msg.get("content")
+            role = msg["role"]
+            content = msg.get("content", "")
+
             if content is not None:
-                clean["content"] = content if isinstance(content, str) else str(content)
+                content_str = content if isinstance(content, str) else str(content)
+            else:
+                content_str = ""
+
+            if role == "tool":
+                transcript_lines.append(f"[Tool Result]:\n{content_str}")
+                continue
+
             if msg.get("tool_calls"):
-                clean["tool_calls"] = msg["tool_calls"]
-            if msg.get("tool_call_id"):
-                clean["tool_call_id"] = msg["tool_call_id"]
-            if msg["role"] == "tool":
-                clean["content"] = msg.get("content", "")
-            clean_history.append(clean)
+                calls = []
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    calls.append(
+                        f"[Tool Call -> {fn.get('name')}\n"
+                        f"Args: {fn.get('arguments')}]"
+                    )
+                if content_str:
+                    content_str += "\n\n" + "\n".join(calls)
+                else:
+                    content_str = "\n".join(calls)
+
+            transcript_lines.append(f"{role.upper()}:\n{content_str}")
+
+        transcript = "\n\n".join(transcript_lines)
 
         return [
             {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-            *clean_history,
             {
                 "role": "user",
                 "content": (
+                    f"Conversation context:\n\n{transcript}\n\n"
+                    "---\n\n"
                     "Please evaluate the following tool call that is "
                     "pending human approval:\n\n"
                     f"{tool_detail}\n\n"
