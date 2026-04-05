@@ -5582,7 +5582,7 @@ async def admin_list_prompt_policies(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.policies")
+    err = require_permission(request, "admin.prompt_policies")
     if err:
         return err
 
@@ -5601,7 +5601,7 @@ async def admin_create_prompt_policy(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.policies")
+    err = require_permission(request, "admin.prompt_policies")
     if err:
         return err
 
@@ -5658,7 +5658,7 @@ async def admin_get_prompt_policy(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.policies")
+    err = require_permission(request, "admin.prompt_policies")
     if err:
         return err
 
@@ -5678,7 +5678,7 @@ async def admin_update_prompt_policy(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.policies")
+    err = require_permission(request, "admin.prompt_policies")
     if err:
         return err
 
@@ -5731,7 +5731,7 @@ async def admin_delete_prompt_policy(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
-    err = require_permission(request, "admin.policies")
+    err = require_permission(request, "admin.prompt_policies")
     if err:
         return err
 
