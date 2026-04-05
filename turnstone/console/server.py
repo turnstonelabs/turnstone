@@ -287,7 +287,7 @@ async def cluster_events_sse(request: Request) -> Response:
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
-                    pass
+                    pass  # poll timeout, retry
                 if await request.is_disconnected():
                     break
         finally:

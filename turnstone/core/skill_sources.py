@@ -199,7 +199,7 @@ async def _fetch_resource_contents(
                 if resp.status_code == 200:
                     return rf["path"], resp.text
             except httpx.HTTPError:
-                pass
+                pass  # best-effort fetch, skip on failure
         return None
 
     results = await asyncio.gather(*[_fetch_one(rf) for rf in resource_files])
@@ -399,7 +399,7 @@ async def fetch_skills_from_github_repo(url: str) -> list[SkillPackage]:
                     if r.status_code == 200 and len(r.content) <= _MAX_SKILL_MD_SIZE:
                         return p, r.text
                 except httpx.HTTPError:
-                    pass
+                    pass  # best-effort fetch, skip on failure
             return None
 
         md_results = await asyncio.gather(*[_fetch_skill_md(p) for p in skill_md_paths])

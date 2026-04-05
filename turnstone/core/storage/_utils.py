@@ -149,7 +149,7 @@ def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]
                     if not tools:
                         tools = None
             except (json.JSONDecodeError, TypeError):
-                pass
+                pass  # falls back to None (no tool filter)
         result = scan_skill(content, tools)
         return result.tier, json.dumps(result.to_dict(), ensure_ascii=False), SCANNER_VERSION
     except Exception:

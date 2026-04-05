@@ -369,7 +369,7 @@ class WatchRunner:
                     created_dt = datetime.fromisoformat(created).replace(tzinfo=UTC)
                     elapsed_secs = (now - created_dt).total_seconds()
                 except (ValueError, TypeError):
-                    pass
+                    pass  # elapsed stays 0.0
 
             message = format_watch_message(
                 name=watch_row["name"],

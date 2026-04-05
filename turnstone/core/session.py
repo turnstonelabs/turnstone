@@ -4226,7 +4226,7 @@ class ChatSession:
                     if isinstance(parsed, list):
                         return " ".join(str(t) for t in parsed)
                 except (ValueError, TypeError):
-                    pass
+                    pass  # falls back to raw string
                 return raw
 
             # Build corpus from name + description + tags + category

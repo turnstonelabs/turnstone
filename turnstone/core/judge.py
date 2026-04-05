@@ -1382,7 +1382,7 @@ class IntentJudge:
             confidence = float(data.get("confidence", 0.5))
             confidence = max(0.0, min(1.0, confidence))
         except (ValueError, TypeError):
-            pass
+            pass  # keeps default 0.5
 
         evidence = data.get("evidence", [])
         if isinstance(evidence, str):
@@ -1415,7 +1415,7 @@ class IntentJudge:
             if isinstance(data, dict):
                 return data
         except (json.JSONDecodeError, ValueError):
-            pass
+            pass  # falls through to strategy 2
 
         # Strategy 2: Markdown code block
         md_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
@@ -1425,7 +1425,7 @@ class IntentJudge:
                 if isinstance(data, dict):
                     return data
             except (json.JSONDecodeError, ValueError):
-                pass
+                pass  # falls through to strategy 3
 
         # Strategy 3: Find first { and matching }
         start = text.find("{")
@@ -1442,7 +1442,7 @@ class IntentJudge:
                             if isinstance(data, dict):
                                 return data
                         except (json.JSONDecodeError, ValueError):
-                            pass
+                            pass  # falls through to regex extraction
                         break
 
         # Strategy 4: Regex field extraction (last resort)

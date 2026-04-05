@@ -236,14 +236,14 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
             ):
                 ns[name] = getattr(sympy, name)
         except ImportError:
-            pass
+            pass  # optional dependency
 
         try:
             import numpy as _np
 
             ns["np"] = ns["numpy"] = _np
         except ImportError:
-            pass
+            pass  # optional dependency
 
         try:
             import scipy  # type: ignore[import-untyped]
@@ -260,7 +260,7 @@ def _math_exec_in_process(code: str, result_queue: multiprocessing.Queue[tuple[s
             ns["gamma"] = scipy.special.gamma
             ns["beta"] = scipy.special.beta
         except ImportError:
-            pass
+            pass  # optional dependency
 
         # Strip __builtins__ from all pre-imported modules so
         # module.__builtins__['__import__'] can't bypass _safe_import.

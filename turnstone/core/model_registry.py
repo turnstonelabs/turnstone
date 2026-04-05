@@ -241,7 +241,7 @@ def load_model_registry(
                         if isinstance(parsed, dict):
                             caps = parsed
                     except (_json.JSONDecodeError, TypeError):
-                        pass
+                        pass  # falls back to empty capabilities
                 row_provider = row.get("provider", "openai")
                 row_model = row["model"]
                 # 0 = auto-detect: inherit CLI-detected context_window,

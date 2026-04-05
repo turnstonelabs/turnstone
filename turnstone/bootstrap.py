@@ -437,7 +437,7 @@ def _tool_write_file(project_dir: Path, args: dict[str, Any]) -> str:
             if existing == content:
                 return f"File already exists with identical content: {args['path']}"
         except (OSError, UnicodeDecodeError):
-            pass
+            pass  # best-effort duplicate check
 
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 
@@ -589,7 +589,7 @@ def _tool_write_compose(project_dir: Path, args: dict[str, Any]) -> str:
             if existing == content:
                 return "compose.yaml already exists with identical content."
         except (OSError, UnicodeDecodeError):
-            pass
+            pass  # best-effort duplicate check
 
     line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
 

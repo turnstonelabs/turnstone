@@ -708,7 +708,7 @@ class AnthropicProvider:
                         parsed = json.loads(info["input_json"])
                         query = parsed.get("query", "")
                     except (json.JSONDecodeError, TypeError):
-                        pass
+                        pass  # best-effort query extraction for status
                     sc.info_delta = f"[Searching: {query}]" if query else "[Searching...]"
 
             elif event_type == "message_delta":

@@ -923,7 +923,7 @@ async def events_sse(request: Request) -> Response:
                         return
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
-                    pass
+                    pass  # poll timeout, retry
         finally:
             _metrics.record_sse_disconnect()
             ui._unregister_listener(client_queue)
@@ -1045,7 +1045,7 @@ async def global_events_sse(request: Request) -> Response:
                     )
                     yield {"data": json.dumps(event)}
                 except queue.Empty:
-                    pass
+                    pass  # poll timeout, retry
         finally:
             _metrics.record_sse_disconnect()
             with listeners_lock:
@@ -2684,7 +2684,7 @@ def main() -> None:
             if host and host != "localhost":
                 return f"{host}_{suffix}"
         except OSError:
-            pass
+            pass  # hostname unavailable, fall back to UUID
         return uuid.uuid4().hex[:12]
 
     _node_id = os.environ.get("TURNSTONE_NODE_ID") or _default_node_id()
