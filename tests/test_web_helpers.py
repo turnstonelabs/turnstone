@@ -98,3 +98,20 @@ class TestVersionHtml:
         html = '<script src="/static/app.js"></script>'
         result = version_html(html)
         assert f"?v={__version__}" in result
+
+    def test_double_apply_is_idempotent(self):
+        from turnstone import __version__
+        from turnstone.core.web_helpers import version_html
+
+        html = '<script src="/static/app.js"></script>'
+        once = version_html(html)
+        twice = version_html(once)
+        assert once == twice
+        assert twice.count("?v=") == 1
+
+    def test_existing_query_string_preserved(self):
+        from turnstone.core.web_helpers import version_html
+
+        html = '<script src="/static/app.js?foo=bar"></script>'
+        result = version_html(html)
+        assert result == html  # unchanged — already has query string

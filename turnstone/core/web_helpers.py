@@ -82,12 +82,13 @@ def cors_middleware(origins: list[str]) -> Middleware:
 
 # Matches src="/static/..." and href="/shared/..." (and vice-versa) but skips
 # vendored libraries whose directory names already contain a version number
-# (e.g. katex-0.16.44/, hljs-11.11.1/).
+# (e.g. katex-0.16.44/, hljs-11.11.1/) and URLs that already have a query
+# string (prevents double-append if called twice).
 _ASSET_RE = re.compile(
     r'(?P<attr>(?:src|href)=")'
     r"(?P<path>/(?:static|shared)/)"
     r"(?!(?:katex|hljs|hls|mermaid)-\d)"
-    r'(?P<file>[^"]+)"'
+    r'(?P<file>[^"?]+)"'
 )
 
 
@@ -95,6 +96,7 @@ def version_html(html: str) -> str:
     """Inject ``?v=VERSION`` into ``/static/`` and ``/shared/`` asset URLs.
 
     Vendored libraries with version-bearing directory names are skipped.
+    URLs that already contain a query string are left unchanged.
     Called once at startup when loading HTML into memory.
     """
     from turnstone import __version__

@@ -40,7 +40,7 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
-from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware, _version_slot
+from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware, jwt_version_slot
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
@@ -2534,7 +2534,7 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
         stack.append(cors_middleware(cors_origins))
     stack.extend(
         [
-            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER, jwt_version=_version_slot()),
+            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER, jwt_version=jwt_version_slot()),
             Middleware(RateLimitMiddleware),
         ]
     )

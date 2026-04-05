@@ -45,8 +45,8 @@ from turnstone.core.auth import (
     JWT_AUD_CONSOLE,
     JWT_AUD_SERVER,
     AuthMiddleware,
-    _version_slot,
     create_jwt,
+    jwt_version_slot,
 )
 from turnstone.core.hash_ring import NoAvailableNodeError
 
@@ -7451,7 +7451,7 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
 
         stack.append(cors_middleware(cors_origins))
     stack.append(
-        Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE, jwt_version=_version_slot())
+        Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE, jwt_version=jwt_version_slot())
     )
     return stack
 

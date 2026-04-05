@@ -1170,36 +1170,65 @@ class TestJWTVersionClaim:
         )
         assert "ver" not in payload
 
-    def test_validate_jwt_version_match(self):
+    def test_validate_jwt_carries_token_version(self):
         from turnstone.core.auth import create_jwt, validate_jwt
 
         token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
-        result = validate_jwt(token, self.SECRET, required_version="1.2")
+        result = validate_jwt(token, self.SECRET)
         assert result is not None
         assert result.user_id == "user1"
+        assert result.token_version == "1.2"
 
-    def test_validate_jwt_version_mismatch(self):
+    def test_validate_jwt_no_ver_returns_empty_token_version(self):
         from turnstone.core.auth import create_jwt, validate_jwt
 
-        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
-        result = validate_jwt(token, self.SECRET, required_version="1.3")
-        assert result is None
-
-    def test_validate_jwt_no_ver_backward_compat(self):
-        from turnstone.core.auth import create_jwt, validate_jwt
-
-        # Token without ver claim should be accepted when required_version is set
         token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
-        result = validate_jwt(token, self.SECRET, required_version="1.2")
+        result = validate_jwt(token, self.SECRET)
+        assert result is not None
+        assert result.token_version == ""
+
+    def test_check_request_accepts_matching_version(self):
+        from turnstone.core.auth import JWT_AUD_SERVER, check_request, create_jwt
+
+        token = create_jwt(
+            "user1",
+            frozenset({"read"}),
+            "test",
+            self.SECRET,
+            audience=JWT_AUD_SERVER,
+            version="1.2",
+        )
+        allowed, _status, _msg, result = check_request(
+            "GET",
+            "/v1/api/workstreams",
+            f"Bearer {token}",
+            jwt_secret=self.SECRET,
+            jwt_audience=JWT_AUD_SERVER,
+            jwt_version="1.2",
+        )
+        assert allowed
         assert result is not None
 
-    def test_validate_jwt_version_not_required(self):
-        from turnstone.core.auth import create_jwt, validate_jwt
+    def test_check_request_accepts_no_ver_backward_compat(self):
+        from turnstone.core.auth import JWT_AUD_SERVER, check_request, create_jwt
 
-        # Token with ver claim should be accepted when required_version is empty
-        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
-        result = validate_jwt(token, self.SECRET, required_version="")
-        assert result is not None
+        # Token without ver claim should be accepted (backward compat)
+        token = create_jwt(
+            "user1",
+            frozenset({"read"}),
+            "test",
+            self.SECRET,
+            audience=JWT_AUD_SERVER,
+        )
+        allowed, _status, _msg, _result = check_request(
+            "GET",
+            "/v1/api/workstreams",
+            f"Bearer {token}",
+            jwt_secret=self.SECRET,
+            jwt_audience=JWT_AUD_SERVER,
+            jwt_version="1.2",
+        )
+        assert allowed
 
     def test_check_request_rejects_old_version_jwt(self):
         from turnstone.core.auth import JWT_AUD_SERVER, check_request, create_jwt
@@ -1227,9 +1256,9 @@ class TestJWTVersionClaim:
 
 class TestVersionSlot:
     def test_returns_major_minor(self):
-        from turnstone.core.auth import _version_slot
+        from turnstone.core.auth import jwt_version_slot
 
-        slot = _version_slot()
+        slot = jwt_version_slot()
         parts = slot.split(".")
         assert len(parts) == 2
 
@@ -1237,9 +1266,9 @@ class TestVersionSlot:
         from unittest.mock import patch
 
         with patch("turnstone.__version__", "2.3.1a5"):
-            from turnstone.core.auth import _version_slot
+            from turnstone.core.auth import jwt_version_slot
 
-            assert _version_slot() == "2.3"
+            assert jwt_version_slot() == "2.3"
 
 
 class TestServiceTokenManager:
