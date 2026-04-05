@@ -5201,11 +5201,16 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
             }
         )
 
-    # Include the current default alias so the UI can highlight it
+    # Include the effective default alias so the UI can highlight it.
+    # Prefer ConfigStore override, fall back to config.toml [model].default.
     default_alias = ""
     cs = getattr(request.app.state, "config_store", None)
     if cs:
         default_alias = cs.get("model.default_alias") or ""
+    if not default_alias:
+        from turnstone.core.config import load_config as _load_cfg
+
+        default_alias = _load_cfg().get("model", {}).get("default", "default")
 
     return JSONResponse({"models": result, "default_alias": default_alias})
 

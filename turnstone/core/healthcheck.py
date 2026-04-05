@@ -65,7 +65,6 @@ class BackendHealthTracker:
             if self._degraded:
                 self._degraded = False
                 log.info("Backend recovered (was degraded)")
-                self._update_metrics()
                 state_to_dispatch = "healthy"
         self._fire_state_callback(state_to_dispatch)
 
@@ -80,7 +79,6 @@ class BackendHealthTracker:
                     "Backend degraded: %d consecutive failures",
                     self._consecutive_failures,
                 )
-                self._update_metrics()
                 state_to_dispatch = "degraded"
         self._fire_state_callback(state_to_dispatch)
 
@@ -100,14 +98,6 @@ class BackendHealthTracker:
     def consecutive_failures(self) -> int:
         with self._lock:
             return self._consecutive_failures
-
-    # -- metrics -------------------------------------------------------------
-
-    def _update_metrics(self) -> None:
-        """Push backend health to metrics collector. Called with lock held."""
-        from turnstone.core.metrics import metrics
-
-        metrics.set_backend_status(not self._degraded)
 
 
 # ---------------------------------------------------------------------------

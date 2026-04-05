@@ -1037,9 +1037,11 @@ class TestLoadModelRegistryDBOnly:
 
     def test_no_models_anywhere_raises(self) -> None:
         """ValueError when no models from CLI, config, or DB."""
-        with patch("turnstone.core.model_registry.load_config", return_value={}):
-            with pytest.raises(ValueError, match="No model definitions found"):
-                load_model_registry(model="")
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value={}),
+            pytest.raises(ValueError, match="No model definitions found"),
+        ):
+            load_model_registry(model="")
 
     def test_no_default_entry_created_when_model_empty(self) -> None:
         """When model='', no 'default' alias is created from CLI args."""

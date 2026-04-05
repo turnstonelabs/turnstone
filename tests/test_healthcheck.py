@@ -119,17 +119,13 @@ class TestBackendHealthTracker:
         t.record_success()
         assert events == []
 
-    def test_metrics_updated_on_degrade(self, mock_metrics: MagicMock) -> None:
+    def test_no_direct_metrics_calls(self) -> None:
+        """Tracker does not touch metrics — the server callback handles it."""
         t = _make_tracker(failure_threshold=1)
         t.record_failure()
-        mock_metrics.set_backend_status.assert_called_with(False)
-
-    def test_metrics_updated_on_recover(self, mock_metrics: MagicMock) -> None:
-        t = _make_tracker(failure_threshold=1)
-        t.record_failure()
-        mock_metrics.reset_mock()
         t.record_success()
-        mock_metrics.set_backend_status.assert_called_with(True)
+        # No assertion on metrics — the tracker delegates metric updates
+        # to the server-level callback via on_state_changed
 
 
 # ---------------------------------------------------------------------------

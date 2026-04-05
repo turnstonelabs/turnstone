@@ -1218,7 +1218,15 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
     registry = getattr(app_state, "registry", None)
     tracker = None
     if health_reg and registry:
-        tracker = health_reg.get_tracker_for_alias(registry, registry.default)
+        # Prefer ConfigStore runtime override, fall back to registry default
+        config_store = getattr(app_state, "config_store", None)
+        effective_alias = None
+        if config_store:
+            effective_alias = config_store.get("model.default_alias") or None
+        if effective_alias:
+            tracker = health_reg.get_tracker_for_alias(registry, effective_alias)
+        if tracker is None:
+            tracker = health_reg.get_tracker_for_alias(registry, registry.default)
     backend_ok = tracker.is_healthy if tracker else True
     data: dict[str, Any] = {
         "status": "ok" if backend_ok else "degraded",
@@ -2230,12 +2238,20 @@ async def internal_migrate(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _emit_health_changed(status: str, gq: queue.Queue[dict[str, Any]]) -> None:
+def _emit_health_changed(
+    status: str, gq: queue.Queue[dict[str, Any]], app_state: Any = None
+) -> None:
     """Push a health_changed event onto the global SSE queue.
 
     Called from the BackendHealthTracker callback on state transitions.
     *status* is ``"healthy"`` or ``"degraded"``.
+
+    Also updates the global ``turnstone_backend_up`` metric using the
+    effective default backend's health (not the backend that triggered
+    this callback, which may be a non-default fallback).
     """
+    if app_state is not None:
+        _update_backend_metric(app_state)
     with contextlib.suppress(queue.Full):
         gq.put_nowait(
             {
@@ -2243,6 +2259,30 @@ def _emit_health_changed(status: str, gq: queue.Queue[dict[str, Any]]) -> None:
                 "backend_status": status,
             }
         )
+
+
+def _update_backend_metric(app_state: Any) -> None:
+    """Update ``turnstone_backend_up`` from the effective default's tracker.
+
+    Called on any backend state change.  Only the effective default
+    backend drives this global metric — fallback backend transitions
+    do not affect it.
+    """
+    health_reg = getattr(app_state, "health_registry", None)
+    registry = getattr(app_state, "registry", None)
+    if not health_reg or not registry:
+        return
+    config_store = getattr(app_state, "config_store", None)
+    effective = None
+    if config_store:
+        effective = config_store.get("model.default_alias") or None
+    tracker = None
+    if effective:
+        tracker = health_reg.get_tracker_for_alias(registry, effective)
+    if tracker is None:
+        tracker = health_reg.get_tracker_for_alias(registry, registry.default)
+    if tracker is not None:
+        _metrics.set_backend_status(tracker.is_healthy)
 
 
 def _aggregate_emitter_thread(
@@ -2815,9 +2855,15 @@ def main() -> None:
     global_listeners_lock = threading.Lock()
     WebUI._global_queue = global_queue
 
+    # Mutable ref so the health callback can access app.state after app
+    # creation (same pattern as _mcp_ref).
+    _app_ref: list[Any] = [None]
+
     health_registry = HealthTrackerRegistry(
         failure_threshold=config_store.get("health.failure_threshold"),
-        on_state_changed=lambda _backend, state: _emit_health_changed(state, global_queue),
+        on_state_changed=lambda _backend, state: _emit_health_changed(
+            state, global_queue, _app_ref[0].state if _app_ref[0] else None
+        ),
     )
 
     # Eagerly create trackers for all registered backends.  Sessions use
@@ -2895,6 +2941,9 @@ def main() -> None:
         client_type: str = "",
     ) -> ChatSession:
         assert ui is not None
+        # Resolve the effective alias once and use it consistently
+        # for both client resolution and ChatSession.model_alias.
+        model_alias = model_alias or _effective_default_alias()
         r_client, r_model, r_cfg = registry.resolve(model_alias)
         # Read MCP client from shared ref — may have been replaced after startup
         # by internal_mcp_reload (Sync to Nodes) when no --mcp-config was passed.
@@ -2935,7 +2984,7 @@ def main() -> None:
             tool_truncation=config_store.get("tools.truncation"),
             mcp_client=live_mcp_client,
             registry=registry,
-            model_alias=model_alias or _effective_default_alias(),
+            model_alias=model_alias,
             health_registry=health_registry,
             node_id=_node_id,
             ws_id=ws_id,
@@ -3072,6 +3121,9 @@ def main() -> None:
         config_store=config_store,
         advertise_url=_advertise_url,
     )
+
+    # Wire app ref so health callbacks can access app.state for metrics
+    _app_ref[0] = app
 
     # Store CLI model args for hot-reload (internal_model_reload reads these)
     app.state.cli_model_args = {
