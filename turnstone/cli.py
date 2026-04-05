@@ -7,6 +7,7 @@ model auto-detection, workstream management, and the main() REPL entry point.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import readline
 import sys
@@ -165,8 +166,6 @@ class TerminalUI(SessionUI):
                             it for it in items if it.get("needs_approval") and not it.get("error")
                         ]
             except Exception:
-                import logging
-
                 logging.getLogger(__name__).debug("Policy evaluation unavailable", exc_info=True)
 
         with self._print_lock:

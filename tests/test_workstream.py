@@ -130,54 +130,54 @@ class TestWorkstream:
 class TestManagerCreation:
     def test_create_first_sets_active(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert mgr.active_id == ws.id
         assert mgr.get_active() is ws
 
     def test_create_second_does_not_change_active(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        mgr.create(ui_factory=FakeUI)
         assert mgr.active_id == ws1.id
 
     def test_create_assigns_session(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert isinstance(ws.session, FakeSession)
 
     def test_create_assigns_ui(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert isinstance(ws.ui, FakeUI)
         assert ws.ui.ws_id == ws.id
 
     def test_create_custom_name(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(name="research", ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(name="research", ui_factory=FakeUI)
         assert ws.name == "research"
 
     def test_create_default_name(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert ws.name.startswith("ws-")
 
     def test_create_max_workstreams_all_active(self):
         mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws3 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
+        ws3 = mgr.create(ui_factory=FakeUI)
         # Mark all as non-idle so eviction cannot help
         mgr.set_state(ws1.id, WorkstreamState.THINKING)
         mgr.set_state(ws2.id, WorkstreamState.RUNNING)
         mgr.set_state(ws3.id, WorkstreamState.ATTENTION)
         with pytest.raises(RuntimeError, match="All 3 workstreams are active"):
-            mgr.create(ui_factory=lambda wid: FakeUI(wid))
+            mgr.create(ui_factory=FakeUI)
 
 
 class TestManagerLookup:
     def test_get_existing(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert mgr.get(ws.id) is ws
 
     def test_get_nonexistent(self):
@@ -186,16 +186,16 @@ class TestManagerLookup:
 
     def test_list_all_creation_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="a", ui_factory=FakeUI)
+        mgr.create(name="b", ui_factory=FakeUI)
+        mgr.create(name="c", ui_factory=FakeUI)
         result = mgr.list_all()
         assert [w.name for w in result] == ["a", "b", "c"]
 
     def test_index_of(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
         assert mgr.index_of(ws1.id) == 1
         assert mgr.index_of(ws2.id) == 2
         assert mgr.index_of("nonexistent") == 0
@@ -203,9 +203,9 @@ class TestManagerLookup:
     def test_count(self):
         mgr = WorkstreamManager(_fake_factory)
         assert mgr.count == 0
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.count == 1
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.count == 2
 
 
@@ -217,8 +217,8 @@ class TestManagerLookup:
 class TestManagerSwitching:
     def test_switch_by_id(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
         assert mgr.active_id == ws1.id
 
         result = mgr.switch(ws2.id)
@@ -227,13 +227,13 @@ class TestManagerSwitching:
 
     def test_switch_nonexistent_returns_none(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.switch("bad-id") is None
 
     def test_switch_by_index(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
 
         result = mgr.switch_by_index(2)
         assert result is ws2
@@ -241,7 +241,7 @@ class TestManagerSwitching:
 
     def test_switch_by_index_out_of_range(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.switch_by_index(0) is None
         assert mgr.switch_by_index(5) is None
 
@@ -254,8 +254,8 @@ class TestManagerSwitching:
 class TestManagerClose:
     def test_close_removes_workstream(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
 
         closed = mgr.close(ws2.id)
         assert closed is True
@@ -264,22 +264,22 @@ class TestManagerClose:
 
     def test_close_last_returns_false(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         closed = mgr.close(ws.id)
         assert closed is False
         assert mgr.count == 1
 
     def test_close_nonexistent_returns_false(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
+        mgr.create(ui_factory=FakeUI)
         closed = mgr.close("nonexistent")
         assert closed is False
 
     def test_close_active_switches_to_first(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
         mgr.switch(ws2.id)
 
         mgr.close(ws2.id)
@@ -287,9 +287,9 @@ class TestManagerClose:
 
     def test_close_updates_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="a", ui_factory=FakeUI)
+        ws2 = mgr.create(name="b", ui_factory=FakeUI)
+        mgr.create(name="c", ui_factory=FakeUI)
 
         mgr.close(ws2.id)
         names = [w.name for w in mgr.list_all()]
@@ -298,7 +298,7 @@ class TestManagerClose:
     def test_close_unblocks_approval_event(self):
         """Closing a workstream whose UI has a pending approval should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
 
         # Create a workstream with a WebUI-like approval mechanism
         from turnstone.server import WebUI
@@ -313,7 +313,7 @@ class TestManagerClose:
     def test_close_unblocks_plan_event(self):
         """Closing a workstream with pending plan review should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
 
         from turnstone.server import WebUI
 
@@ -334,13 +334,13 @@ class TestManagerEviction:
     def test_evict_oldest_idle_on_create(self):
         """At capacity with idle workstreams, create() succeeds by evicting the oldest idle."""
         mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
-        ws1 = mgr.create(name="oldest", ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(name="middle", ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(name="newest", ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(name="oldest", ui_factory=FakeUI)
+        ws2 = mgr.create(name="middle", ui_factory=FakeUI)
+        mgr.create(name="newest", ui_factory=FakeUI)
         # All three are IDLE.  Mark ws2 as RUNNING so it won't be evicted.
         mgr.set_state(ws2.id, WorkstreamState.RUNNING)
         # ws1 is oldest idle, ws3 is newer idle.  Creating should evict ws1.
-        ws4 = mgr.create(name="four", ui_factory=lambda wid: FakeUI(wid))
+        ws4 = mgr.create(name="four", ui_factory=FakeUI)
         assert mgr.count == 3
         assert mgr.get(ws1.id) is None, "oldest idle should have been evicted"
         assert mgr.get(ws4.id) is ws4
@@ -352,35 +352,35 @@ class TestManagerEviction:
     def test_create_fails_when_all_active(self):
         """At capacity with ALL non-idle workstreams, create() raises RuntimeError."""
         mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
         mgr.set_state(ws1.id, WorkstreamState.THINKING)
         mgr.set_state(ws2.id, WorkstreamState.RUNNING)
         with pytest.raises(RuntimeError, match="All 2 workstreams are active"):
-            mgr.create(ui_factory=lambda wid: FakeUI(wid))
+            mgr.create(ui_factory=FakeUI)
 
     def test_configurable_max(self):
         """Constructor accepts max_workstreams param and respects it."""
         mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
-        ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws1 = mgr.create(ui_factory=FakeUI)
+        ws2 = mgr.create(ui_factory=FakeUI)
         mgr.set_state(ws1.id, WorkstreamState.RUNNING)
         mgr.set_state(ws2.id, WorkstreamState.RUNNING)
         with pytest.raises(RuntimeError):
-            mgr.create(ui_factory=lambda wid: FakeUI(wid))
+            mgr.create(ui_factory=FakeUI)
         assert mgr.count == 2
 
     def test_eviction_counter(self):
         """eviction_count increments on each auto-eviction."""
         mgr = WorkstreamManager(_fake_factory, max_workstreams=2)
         assert mgr.eviction_count == 0
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
+        mgr.create(ui_factory=FakeUI)
         # Both IDLE — create should evict the oldest
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.eviction_count == 1
         # Again — evict another idle one
-        mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=FakeUI)
         assert mgr.eviction_count == 2
         assert mgr.count == 2
 
@@ -393,7 +393,7 @@ class TestManagerEviction:
 class TestManagerState:
     def test_set_state(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
         assert ws.state == WorkstreamState.IDLE
 
         mgr.set_state(ws.id, WorkstreamState.THINKING)
@@ -401,7 +401,7 @@ class TestManagerState:
 
     def test_set_state_with_error(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
 
         mgr.set_state(ws.id, WorkstreamState.ERROR, error_msg="API timeout")
         assert ws.state == WorkstreamState.ERROR
@@ -413,7 +413,7 @@ class TestManagerState:
 
     def test_on_state_change_callback(self):
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
 
         changes = []
         mgr._on_state_change = lambda wid, state: changes.append((wid, state))
@@ -436,7 +436,7 @@ class TestManagerThreadSafety:
 
         def do_create():
             try:
-                ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+                ws = mgr.create(ui_factory=FakeUI)
                 # Mark as non-idle immediately so auto-eviction cannot reclaim it
                 mgr.set_state(ws.id, WorkstreamState.RUNNING)
                 created.append(ws.id)
@@ -459,7 +459,7 @@ class TestManagerThreadSafety:
         mgr = WorkstreamManager(_fake_factory)
         ids = []
         for _ in range(5):
-            ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+            ws = mgr.create(ui_factory=FakeUI)
             ids.append(ws.id)
 
         def do_switch(wid):
@@ -479,10 +479,10 @@ class TestManagerThreadSafety:
         """close() and list_all() running concurrently should not crash."""
         mgr = WorkstreamManager(_fake_factory)
         # Keep one alive to prevent closing the last
-        anchor = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        anchor = mgr.create(ui_factory=FakeUI)
         targets = []
         for _ in range(5):
-            ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+            ws = mgr.create(ui_factory=FakeUI)
             targets.append(ws.id)
 
         def do_close():
@@ -881,7 +881,7 @@ class TestStateTransitions:
     def test_full_lifecycle(self):
         """Verify the expected state transition sequence."""
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
 
         # Simulate the state transitions that ChatSession.send() would emit
         mgr.set_state(ws.id, WorkstreamState.THINKING)
@@ -902,7 +902,7 @@ class TestStateTransitions:
     def test_error_recovery(self):
         """After an error, sending again should transition back to thinking."""
         mgr = WorkstreamManager(_fake_factory)
-        ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        ws = mgr.create(ui_factory=FakeUI)
 
         mgr.set_state(ws.id, WorkstreamState.ERROR, "API failed")
         assert ws.state == WorkstreamState.ERROR

@@ -3337,10 +3337,10 @@ class ChatSession:
                 "error": "Error: provide old_string/new_string or edits array, not both",
             }
         if has_batch:
-            if not isinstance(raw_edits, list):
-                raise TypeError(f"edits must be a list, got {type(raw_edits).__name__}")
+            # raw_edits is guaranteed to be a list by the has_batch check above
+            batch_edits: list[Any] = raw_edits  # type: ignore[assignment]
             edits: list[dict[str, Any]] = []
-            for i, e in enumerate(raw_edits):
+            for i, e in enumerate(batch_edits):
                 if not isinstance(e, dict):
                     return {
                         "call_id": call_id,
