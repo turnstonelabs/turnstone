@@ -5201,7 +5201,13 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
             }
         )
 
-    return JSONResponse({"models": result})
+    # Include the current default alias so the UI can highlight it
+    default_alias = ""
+    cs = getattr(request.app.state, "config_store", None)
+    if cs:
+        default_alias = cs.get("model.default_alias") or ""
+
+    return JSONResponse({"models": result, "default_alias": default_alias})
 
 
 async def admin_create_model_definition(request: Request) -> JSONResponse:
