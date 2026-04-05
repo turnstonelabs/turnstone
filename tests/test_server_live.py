@@ -138,6 +138,8 @@ def tmp_db():
 
 def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, RecordingUI]:
     """Create a ChatSession with RecordingUI and sensible test defaults."""
+    from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
     ui = RecordingUI()
     defaults = dict(
         client=client,
@@ -151,6 +153,8 @@ def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, Reco
     )
     defaults.update(kwargs)
     session = ChatSession(**defaults)
+    # Mock-based tests use Chat Completions format (client.chat.completions)
+    session._provider = OpenAIChatCompletionsProvider()
     session.auto_approve = True
     return session, ui
 

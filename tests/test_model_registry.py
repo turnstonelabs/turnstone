@@ -762,8 +762,12 @@ class TestSessionAgentModel:
     def test_agent_model_resolved(self) -> None:
         reg = ModelRegistry(
             models={
-                "main": ModelConfig("main", "http://m/v1", "k", "main-model"),
-                "agent": ModelConfig("agent", "http://a/v1", "k", "agent-model"),
+                "main": ModelConfig(
+                    "main", "http://m/v1", "k", "main-model", provider="openai-compatible"
+                ),
+                "agent": ModelConfig(
+                    "agent", "http://a/v1", "k", "agent-model", provider="openai-compatible"
+                ),
             },
             default="main",
             agent_model="agent",

@@ -922,8 +922,10 @@ class TestAgentOutputGuard:
     def test_agent_loop_calls_evaluate_output(self):
         """_run_agent passes tool output through _evaluate_output when output_guard is enabled."""
         from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         session = _make_session(judge_config=JudgeConfig(output_guard=True))
+        session._provider = OpenAIChatCompletionsProvider()
 
         with patch.object(session, "_evaluate_output", wraps=lambda cid, o, fn: o) as mock_eval:
             # Simulate _run_agent getting a tool call response then a text response
@@ -981,8 +983,10 @@ class TestAgentOutputGuard:
     def test_agent_loop_skips_guard_when_disabled(self):
         """_run_agent does not call _evaluate_output when output_guard is disabled."""
         from turnstone.core.judge import JudgeConfig
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
         session = _make_session(judge_config=JudgeConfig(output_guard=False))
+        session._provider = OpenAIChatCompletionsProvider()
 
         with patch.object(session, "_evaluate_output") as mock_eval:
             call_count = [0]

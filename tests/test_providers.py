@@ -9,9 +9,18 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import pytest
 
 from turnstone.core.providers._openai import OpenAIProvider
+from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._openai_common import (
+    apply_cache_retention,
+    apply_temperature_and_effort,
+    apply_tool_search,
+    format_citations,
+    sanitize_messages,
+)
 from turnstone.core.providers._protocol import (
     CompletionResult,
     LLMProvider,
+    ModelCapabilities,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
@@ -133,38 +142,38 @@ def _anthropic_event(
 
 
 class TestOpenAIProvider:
-    """Tests for the OpenAI-compatible provider adapter."""
+    """Tests for the OpenAI Chat Completions provider adapter."""
 
     def setup_method(self) -> None:
         self.provider = OpenAIProvider()
 
     def test_provider_name(self) -> None:
-        assert self.provider.provider_name == "openai"
+        assert self.provider.provider_name == "openai-compatible"
 
     # -- _sanitize_messages ---------------------------------------------------
 
     def test_sanitize_messages_none_content_no_tool_calls(self) -> None:
         msgs = [{"role": "assistant", "content": None}]
-        assert self.provider._sanitize_messages(msgs) == [{"role": "assistant", "content": ""}]
+        assert sanitize_messages(msgs) == [{"role": "assistant", "content": ""}]
 
     def test_sanitize_messages_none_content_with_tool_calls(self) -> None:
         msgs = [{"role": "assistant", "content": None, "tool_calls": [{"id": "1"}]}]
-        result = self.provider._sanitize_messages(msgs)
+        result = sanitize_messages(msgs)
         assert result[0]["content"] is None
         assert result[0]["tool_calls"] == [{"id": "1"}]
 
     def test_sanitize_messages_empty_string_passthrough(self) -> None:
         msgs = [{"role": "assistant", "content": ""}]
-        assert self.provider._sanitize_messages(msgs) == msgs
+        assert sanitize_messages(msgs) == msgs
 
     def test_sanitize_messages_non_assistant_unchanged(self) -> None:
         msgs = [{"role": "user", "content": None}]
-        result = self.provider._sanitize_messages(msgs)
+        result = sanitize_messages(msgs)
         assert result[0]["content"] is None
 
     def test_sanitize_messages_does_not_mutate_original(self) -> None:
         original = {"role": "assistant", "content": None}
-        self.provider._sanitize_messages([original])
+        sanitize_messages([original])
         assert original["content"] is None
 
     # -- convert_tools --------------------------------------------------------
@@ -992,10 +1001,10 @@ class TestProviderFactory:
     """Tests for create_provider and create_client factory functions."""
 
     def test_create_provider_openai(self) -> None:
-        from turnstone.core.providers import create_provider
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
 
         provider = create_provider("openai")
-        assert isinstance(provider, OpenAIProvider)
+        assert isinstance(provider, OpenAIResponsesProvider)
         assert provider.provider_name == "openai"
 
     def test_create_provider_anthropic(self) -> None:
@@ -1044,16 +1053,18 @@ class TestProviderFactory:
         from turnstone.core.providers import create_provider
 
         provider = create_provider("openai-compatible")
-        assert isinstance(provider, OpenAIProvider)
+        assert isinstance(provider, OpenAIChatCompletionsProvider)
         assert provider.provider_name == "openai-compatible"
 
     def test_create_provider_openai_vs_compatible_distinct(self) -> None:
-        from turnstone.core.providers import create_provider
+        from turnstone.core.providers import OpenAIResponsesProvider, create_provider
 
-        openai = create_provider("openai")
+        openai_prov = create_provider("openai")
         compat = create_provider("openai-compatible")
-        assert openai is not compat
-        assert openai.provider_name == "openai"
+        assert openai_prov is not compat
+        assert isinstance(openai_prov, OpenAIResponsesProvider)
+        assert isinstance(compat, OpenAIChatCompletionsProvider)
+        assert openai_prov.provider_name == "openai"
         assert compat.provider_name == "openai-compatible"
 
     def test_create_provider_returns_singleton(self) -> None:
@@ -1127,7 +1138,7 @@ class TestOpenAIParameterGating:
         """Unknown/local models should NOT receive top-level reasoning_effort."""
         caps = self.provider.get_capabilities("my-local-model")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "reasoning_effort" not in kwargs
         assert kwargs["temperature"] == 0.7
 
@@ -1135,7 +1146,7 @@ class TestOpenAIParameterGating:
         """GPT-5 base: no temperature, reasoning_effort sent."""
         caps = self.provider.get_capabilities("gpt-5")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
@@ -1143,7 +1154,7 @@ class TestOpenAIParameterGating:
         """GPT-5.1: temperature only when reasoning_effort='none'."""
         caps = self.provider.get_capabilities("gpt-5.1")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
         assert "reasoning_effort" not in kwargs  # "none" is skipped
 
@@ -1151,7 +1162,7 @@ class TestOpenAIParameterGating:
         """GPT-5.1: no temperature when reasoning is active."""
         caps = self.provider.get_capabilities("gpt-5.1")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"
 
@@ -1159,7 +1170,7 @@ class TestOpenAIParameterGating:
         """O-series: no temperature, no reasoning_effort."""
         caps = self.provider.get_capabilities("o3")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "temperature" not in kwargs
         assert "reasoning_effort" not in kwargs
 
@@ -1167,7 +1178,7 @@ class TestOpenAIParameterGating:
         """GPT-5 pro only supports 'high'; unsupported values fall back to default."""
         caps = self.provider.get_capabilities("gpt-5-pro")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="medium")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="medium")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "high"  # fell back to default
 
@@ -1175,7 +1186,7 @@ class TestOpenAIParameterGating:
         """GPT-5 pro accepts 'high' directly."""
         caps = self.provider.get_capabilities("gpt-5-pro")
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="high")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="high")
         assert kwargs["reasoning_effort"] == "high"
 
     def test_gpt54_1m_context_and_effort(self) -> None:
@@ -1183,11 +1194,11 @@ class TestOpenAIParameterGating:
         caps = self.provider.get_capabilities("gpt-5.4")
         assert caps.context_window == 1050000
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="none")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="none")
         assert kwargs["temperature"] == 0.7
         assert "reasoning_effort" not in kwargs
         kwargs2: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
+        apply_temperature_and_effort(kwargs2, caps, temperature=0.7, reasoning_effort="xhigh")
         assert "temperature" not in kwargs2
         assert kwargs2["reasoning_effort"] == "xhigh"
 
@@ -1196,7 +1207,7 @@ class TestOpenAIParameterGating:
         caps = self.provider.get_capabilities("gpt-5.4-pro")
         assert caps.context_window == 1050000
         kwargs: dict[str, Any] = {}
-        self.provider._apply_model_params(kwargs, caps, temperature=0.7, reasoning_effort="low")
+        apply_temperature_and_effort(kwargs, caps, temperature=0.7, reasoning_effort="low")
         assert "temperature" not in kwargs
         assert kwargs["reasoning_effort"] == "medium"  # fell back from unsupported "low"
 
@@ -1843,7 +1854,7 @@ class TestOpenAIWebSearch:
         ann.url_citation = citation
 
         content = "Some search result text."
-        result = OpenAIProvider._format_citations(content, [ann])
+        result = format_citations(content, [ann])
         assert "Sources:" in result
         assert "[Example Page](https://example.com)" in result
 
@@ -1858,7 +1869,7 @@ class TestOpenAIWebSearch:
         ann2.url_citation = MagicMock(title="Page Again", url="https://example.com")
 
         content = "Text."
-        result = OpenAIProvider._format_citations(content, [ann1, ann2])
+        result = format_citations(content, [ann1, ann2])
         assert result.count("example.com") == 1
 
     def test_format_citations_skips_non_url_citation(self) -> None:
@@ -1867,7 +1878,7 @@ class TestOpenAIWebSearch:
         ann.type = "something_else"
 
         content = "Text."
-        result = OpenAIProvider._format_citations(content, [ann])
+        result = format_citations(content, [ann])
         assert "Sources:" not in result
 
     def test_format_citations_empty_title(self) -> None:
@@ -1876,7 +1887,7 @@ class TestOpenAIWebSearch:
         ann.type = "url_citation"
         ann.url_citation = MagicMock(title="", url="https://example.com")
 
-        result = OpenAIProvider._format_citations("Text.", [ann])
+        result = format_citations("Text.", [ann])
         assert "https://example.com" in result
         # Should not have markdown link format when title is empty
         assert "[](https://example.com)" not in result
@@ -1887,7 +1898,7 @@ class TestOpenAIWebSearch:
         ann.type = "url_citation"
         ann.url_citation = None
 
-        result = OpenAIProvider._format_citations("Text.", [ann])
+        result = format_citations("Text.", [ann])
         assert "Sources:" not in result
 
     def test_apply_web_search_with_no_tools(self) -> None:
@@ -2361,7 +2372,7 @@ class TestOpenAIToolSearch:
             },
         ]
         deferred = frozenset(["mcp__slack__send"])
-        result = provider._apply_tool_search(caps, tools, deferred)
+        result = apply_tool_search(caps, tools, deferred)
         assert result is not None
         # bash not deferred
         assert result[0].get("defer_loading") is None or result[0].get("defer_loading") is False
@@ -2373,7 +2384,7 @@ class TestOpenAIToolSearch:
         tools = [
             {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
         ]
-        result = provider._apply_tool_search(caps, tools, None)
+        result = apply_tool_search(caps, tools, None)
         assert result == tools
 
     def test_apply_tool_search_no_op_on_unsupported_model(self, provider):
@@ -2382,7 +2393,7 @@ class TestOpenAIToolSearch:
             {"type": "function", "function": {"name": "bash", "description": "Run commands"}},
         ]
         deferred = frozenset(["some_tool"])
-        result = provider._apply_tool_search(caps, tools, deferred)
+        result = apply_tool_search(caps, tools, deferred)
         assert result == tools
 
 
@@ -2715,14 +2726,14 @@ class TestOpenAIPromptCaching:
         """GPT-5.x models get prompt_cache_retention=24h."""
         for model in ("gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5-mini", "gpt-5-pro"):
             kwargs: dict[str, Any] = {}
-            self.provider._apply_cache_retention(kwargs, model)
+            apply_cache_retention(kwargs, model)
             assert kwargs.get("prompt_cache_retention") == "24h", f"Failed for {model}"
 
     def test_cache_retention_not_set_for_non_gpt5(self) -> None:
         """Non-GPT-5 models do not get cache retention."""
         for model in ("o3", "o4-mini", "local-model", "gpt-4o"):
             kwargs: dict[str, Any] = {}
-            self.provider._apply_cache_retention(kwargs, model)
+            apply_cache_retention(kwargs, model)
             assert "prompt_cache_retention" not in kwargs, f"Unexpected retention for {model}"
 
     def test_streaming_cached_tokens_from_usage(self) -> None:
@@ -2861,3 +2872,530 @@ class TestMetricsCacheTokens:
         assert 'turnstone_tokens_total{type="cache_creation"} 800' in text
         assert 'turnstone_tokens_total{type="cache_read"} 200' in text
         assert 'turnstone_tokens_total{type="prompt"} 1000' in text
+
+
+# ===========================================================================
+# TestOpenAIResponsesProvider — Responses API provider
+# ===========================================================================
+
+
+class TestOpenAIResponsesProvider:
+    """Tests for the OpenAI Responses API provider."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_provider_name(self) -> None:
+        assert self.provider.provider_name == "openai"
+
+    def test_get_capabilities(self) -> None:
+        caps = self.provider.get_capabilities("gpt-5.4")
+        assert caps.context_window == 1050000
+        assert caps.supports_tool_search is True
+
+
+class TestResponsesMessageConversion:
+    """Tests for _convert_messages — Chat Completions format to Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_system_message_to_instructions(self) -> None:
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        instructions, items = self.provider._convert_messages(messages)
+        assert instructions == "You are helpful."
+        assert len(items) == 1
+        assert items[0]["role"] == "user"
+        assert items[0]["content"] == "Hello"
+
+    def test_multiple_system_messages_concatenated(self) -> None:
+        messages = [
+            {"role": "system", "content": "Rule 1"},
+            {"role": "developer", "content": "Rule 2"},
+            {"role": "user", "content": "Hi"},
+        ]
+        instructions, items = self.provider._convert_messages(messages)
+        assert instructions == "Rule 1\n\nRule 2"
+        assert len(items) == 1
+
+    def test_assistant_text_message(self) -> None:
+        messages = [
+            {"role": "assistant", "content": "Hello back"},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 1
+        assert items[0]["type"] == "message"
+        assert items[0]["role"] == "assistant"
+        assert items[0]["content"][0]["type"] == "output_text"
+        assert items[0]["content"][0]["text"] == "Hello back"
+
+    def test_assistant_tool_calls(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "/tmp"}'},
+                    }
+                ],
+            },
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 1
+        assert items[0]["type"] == "function_call"
+        assert items[0]["call_id"] == "call_1"
+        assert items[0]["name"] == "read_file"
+        assert items[0]["arguments"] == '{"path": "/tmp"}'
+
+    def test_tool_result(self) -> None:
+        messages = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 1
+        assert items[0]["type"] == "function_call_output"
+        assert items[0]["call_id"] == "call_1"
+        assert items[0]["output"] == "file contents"
+
+    def test_provider_content_ignored_with_store_false(self) -> None:
+        """With store=False, provider_content is ignored — rebuild from content."""
+        provider_items = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Hi"}],
+            },
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        ]
+        messages = [
+            {"role": "assistant", "content": "Hi", "_provider_content": provider_items},
+        ]
+        _, items = self.provider._convert_messages(messages)
+        # Should rebuild from content, not passthrough provider_content
+        assert len(items) == 1
+        assert items[0]["type"] == "message"
+        assert items[0]["content"][0]["text"] == "Hi"
+
+    def test_no_system_returns_none_instructions(self) -> None:
+        messages = [{"role": "user", "content": "Hello"}]
+        instructions, _ = self.provider._convert_messages(messages)
+        assert instructions is None
+
+    def test_assistant_with_content_and_tool_calls(self) -> None:
+        """Assistant message with both text and tool calls emits separate items."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I'll read that file",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {"name": "read_file", "arguments": '{"path": "/tmp"}'},
+                    }
+                ],
+            },
+        ]
+        _, items = self.provider._convert_messages(messages)
+        assert len(items) == 2
+        assert items[0]["type"] == "message"
+        assert items[0]["content"][0]["text"] == "I'll read that file"
+        assert items[1]["type"] == "function_call"
+        assert items[1]["name"] == "read_file"
+
+
+class TestResponsesToolConversion:
+    """Tests for _convert_tools — Chat Completions tool format to Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_function_tool_conversion(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+        caps = ModelCapabilities()
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["type"] == "function"
+        assert result[0]["name"] == "read_file"
+        assert result[0]["description"] == "Read a file"
+        assert result[0]["strict"] is False
+
+    def test_web_search_replaced_with_native(self) -> None:
+        tools = [
+            {"type": "function", "function": {"name": "web_search", "description": "Search"}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read"}},
+        ]
+        caps = ModelCapabilities(supports_web_search=True)
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        names = [t.get("name", t.get("type")) for t in result]
+        assert "web_search" in names  # native web_search tool
+        assert "read_file" in names
+
+    def test_none_tools_returns_none(self) -> None:
+        caps = ModelCapabilities()
+        assert self.provider._convert_tools(None, caps) is None
+
+    def test_defer_loading_preserved(self) -> None:
+        tools = [
+            {"type": "function", "function": {"name": "f"}, "defer_loading": True},
+        ]
+        caps = ModelCapabilities()
+        result = self.provider._convert_tools(tools, caps)
+        assert result is not None
+        assert result[0].get("defer_loading") is True
+
+
+class TestResponsesParamBuilding:
+    """Tests for _build_kwargs — parameter construction for Responses API."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def test_reasoning_effort_as_dict(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="high",
+            deferred_names=None,
+        )
+        assert kwargs["reasoning"] == {"effort": "high"}
+        assert "reasoning_effort" not in kwargs
+
+    def test_no_reasoning_when_none_effort(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert "reasoning" not in kwargs
+
+    def test_store_is_false(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["store"] is False
+
+    def test_cache_retention_for_gpt5(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="medium",
+            deferred_names=None,
+        )
+        assert kwargs["prompt_cache_retention"] == "24h"
+
+    def test_instructions_from_system_messages(self) -> None:
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5.4",
+            messages=[
+                {"role": "system", "content": "Be helpful"},
+                {"role": "user", "content": "Hi"},
+            ],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert kwargs["instructions"] == "Be helpful"
+
+    def test_web_search_injected_with_no_tools(self) -> None:
+        """Search-capable models get web_search tool even when tools=None."""
+        kwargs = self.provider._build_kwargs(
+            model="gpt-5-search-api",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            max_tokens=4096,
+            temperature=0.5,
+            reasoning_effort="none",
+            deferred_names=None,
+        )
+        assert "tools" in kwargs
+        tool_types = [t.get("type") for t in kwargs["tools"]]
+        assert "web_search" in tool_types
+
+
+class TestResponsesCitationFormat:
+    """Test format_citations handles Responses API flat annotation format."""
+
+    def test_responses_api_flat_annotation(self) -> None:
+        """Responses API annotations have title/url directly on the object."""
+
+        class FlatAnnotation:
+            type = "url_citation"
+            url_citation = None  # Not present in Responses API
+            title = "Example"
+            url = "https://example.com"
+
+        result = format_citations("Text.", [FlatAnnotation()])
+        assert "Sources:" in result
+        assert "[Example](https://example.com)" in result
+
+
+class TestResponsesStreaming:
+    """Tests for Responses API streaming event handling."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def _make_event(self, event_type: str, **attrs: Any) -> MagicMock:
+        event = MagicMock()
+        event.type = event_type
+        for k, v in attrs.items():
+            setattr(event, k, v)
+        return event
+
+    def test_text_delta(self) -> None:
+        events = [
+            self._make_event("response.output_text.delta", delta="Hello"),
+            self._make_event("response.output_text.delta", delta=" world"),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        text_chunks = [c for c in chunks if c.content_delta]
+        assert len(text_chunks) == 2
+        assert text_chunks[0].content_delta == "Hello"
+        assert text_chunks[0].is_first is True
+        assert text_chunks[1].content_delta == " world"
+
+    def test_reasoning_delta(self) -> None:
+        events = [
+            self._make_event("response.reasoning_text.delta", delta="thinking..."),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        reasoning = [c for c in chunks if c.reasoning_delta]
+        assert len(reasoning) == 1
+        assert reasoning[0].reasoning_delta == "thinking..."
+        assert reasoning[0].is_first is True
+
+    def test_tool_call_streaming(self) -> None:
+        item = MagicMock()
+        item.type = "function_call"
+        item.id = "fc_abc123"
+        item.call_id = "call_1"
+        item.name = "read_file"
+
+        events = [
+            self._make_event("response.output_item.added", item=item),
+            self._make_event(
+                "response.function_call_arguments.delta",
+                item_id="fc_abc123",
+                delta='{"path":',
+            ),
+            self._make_event(
+                "response.function_call_arguments.delta",
+                item_id="fc_abc123",
+                delta='"/tmp"}',
+            ),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        tc_chunks = [c for c in chunks if c.tool_call_deltas]
+        assert len(tc_chunks) == 3
+        # First chunk: tool call added with name
+        assert tc_chunks[0].tool_call_deltas[0].name == "read_file"
+        assert tc_chunks[0].tool_call_deltas[0].id == "call_1"
+        # Argument deltas
+        assert tc_chunks[1].tool_call_deltas[0].arguments_delta == '{"path":'
+        assert tc_chunks[2].tool_call_deltas[0].arguments_delta == '"/tmp"}'
+
+    def test_completed_event_with_usage(self) -> None:
+        usage = MagicMock()
+        usage.input_tokens = 100
+        usage.output_tokens = 50
+        usage.total_tokens = 150
+        usage.input_tokens_details = MagicMock(cached_tokens=80)
+        # Ensure Chat Completions attributes are not present
+        del usage.prompt_tokens
+        del usage.completion_tokens
+        del usage.prompt_tokens_details
+
+        events = [
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=usage,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        final = [c for c in chunks if c.finish_reason]
+        assert len(final) == 1
+        assert final[0].finish_reason == "stop"
+        assert final[0].usage is not None
+        assert final[0].usage.prompt_tokens == 100
+        assert final[0].usage.completion_tokens == 50
+        assert final[0].usage.cache_read_tokens == 80
+
+    def test_web_search_events(self) -> None:
+        events = [
+            self._make_event("response.web_search_call.searching"),
+            self._make_event("response.web_search_call.completed"),
+            self._make_event(
+                "response.completed",
+                response=MagicMock(
+                    status="completed",
+                    usage=None,
+                ),
+            ),
+        ]
+        chunks = list(self.provider._iter_stream(iter(events)))
+        info = [c for c in chunks if c.info_delta]
+        assert len(info) == 2
+        assert "Searching" in info[0].info_delta
+        assert "complete" in info[1].info_delta
+
+
+class TestResponsesCompletion:
+    """Tests for non-streaming Responses API completion."""
+
+    def setup_method(self) -> None:
+        from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+
+        self.provider = OpenAIResponsesProvider()
+
+    def _make_response(
+        self,
+        text: str = "Hello",
+        tool_calls: list[dict[str, Any]] | None = None,
+        status: str = "completed",
+    ) -> MagicMock:
+        resp = MagicMock()
+        resp.status = status
+        resp.usage = MagicMock()
+        resp.usage.input_tokens = 10
+        resp.usage.output_tokens = 5
+        resp.usage.total_tokens = 15
+        resp.usage.input_tokens_details = MagicMock(cached_tokens=0)
+        # Remove Chat Completions attributes
+        del resp.usage.prompt_tokens
+        del resp.usage.completion_tokens
+        del resp.usage.prompt_tokens_details
+
+        output: list[Any] = []
+        if text:
+            msg = MagicMock()
+            msg.type = "message"
+            text_part = MagicMock()
+            text_part.type = "output_text"
+            text_part.text = text
+            text_part.annotations = []
+            msg.content = [text_part]
+            msg.model_dump.return_value = {
+                "type": "message",
+                "content": [{"type": "output_text", "text": text}],
+            }
+            output.append(msg)
+        if tool_calls:
+            for tc in tool_calls:
+                item = MagicMock()
+                item.type = "function_call"
+                item.call_id = tc["id"]
+                item.name = tc["name"]
+                item.arguments = tc["arguments"]
+                item.model_dump.return_value = {
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["name"],
+                    "arguments": tc["arguments"],
+                }
+                output.append(item)
+        resp.output = output
+        return resp
+
+    def test_basic_text_completion(self) -> None:
+        resp = self._make_response(text="Hello world")
+        result = self.provider._parse_response(resp)
+        assert result.content == "Hello world"
+        assert result.tool_calls is None
+        assert result.finish_reason == "stop"
+
+    def test_completion_with_tool_calls(self) -> None:
+        resp = self._make_response(
+            text="",
+            tool_calls=[{"id": "call_1", "name": "read_file", "arguments": '{"path": "/tmp"}'}],
+        )
+        result = self.provider._parse_response(resp)
+        assert result.tool_calls is not None
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["id"] == "call_1"
+        assert result.tool_calls[0]["function"]["name"] == "read_file"
+
+    def test_provider_blocks_captured(self) -> None:
+        resp = self._make_response(text="Hello")
+        result = self.provider._parse_response(resp)
+        assert len(result.provider_blocks) > 0
+        assert result.provider_blocks[0]["type"] == "message"
+
+    def test_incomplete_status_maps_to_length(self) -> None:
+        resp = self._make_response(text="Partial", status="incomplete")
+        result = self.provider._parse_response(resp)
+        assert result.finish_reason == "length"
+
+    def test_usage_extraction(self) -> None:
+        resp = self._make_response(text="Hi")
+        result = self.provider._parse_response(resp)
+        assert result.usage is not None
+        assert result.usage.prompt_tokens == 10
+        assert result.usage.completion_tokens == 5

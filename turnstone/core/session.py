@@ -4858,6 +4858,12 @@ class ChatSession:
             label_b = "(provided content)"
             lines_b = (content_b or "").splitlines(keepends=True)
 
+        # When content_b is a baseline, swap so diff reads as "what changed"
+        # (--- old/baseline, +++ new/current file).
+        if content_b is not None:
+            lines_a, lines_b = lines_b, lines_a
+            path_a, label_b = label_b, path_a
+
         # Stream diff with early cutoff to avoid large allocations
         max_chars = self.tool_truncation or 262_144
         chunks: list[str] = []
