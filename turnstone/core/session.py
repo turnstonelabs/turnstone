@@ -909,7 +909,9 @@ class ChatSession:
         limit = self.tool_truncation
         if remaining_budget_tokens is not None:
             budget_chars = int(remaining_budget_tokens * self._chars_per_token)
-            limit = min(limit, max(256, budget_chars))
+            limit = min(limit, budget_chars)
+        if limit <= 0:
+            return f"[Output truncated — {len(output)} chars exceeded context budget]"
         if len(output) <= limit:
             return output
         half = limit // 2
@@ -1625,9 +1627,13 @@ class ChatSession:
                             type(ctx_err).__name__,
                         )
                         self.ui.on_info("\n[Context overflow — auto-compacting and retrying]")
+                        # Stop thinking indicator before compact (which has
+                        # its own thinking start/stop) to avoid nested spinners.
+                        self.ui.on_thinking_stop()
                         try:
                             self._compact_messages(auto=True)
                             msgs = self._full_messages()
+                            self.ui.on_thinking_start()
                             stream = self._create_stream_with_retry(msgs)
                         except Exception:
                             log.warning(
