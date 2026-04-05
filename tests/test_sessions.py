@@ -335,8 +335,6 @@ class TestSaveMessageUpdatesWorkstream:
     def test_updated_timestamp_bumped(self, tmp_db):
         register_workstream("s1")
         save_message("s1", "user", "first")
-        rows = list_workstreams_with_history()
-        _original_updated = rows[0][4]
 
         import time
 

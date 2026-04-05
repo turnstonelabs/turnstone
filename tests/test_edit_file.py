@@ -154,7 +154,7 @@ class TestSingleEdit:
         )
         assert result["needs_approval"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "applied 1 edit" in msg
         with open(path) as f:
             assert f.read() == "foo\nbar\nbaz\n"
@@ -172,7 +172,7 @@ class TestSingleEdit:
         assert result["needs_approval"]
         assert "deletion" in result["preview"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         with open(sample_file) as f:
             assert f.read() == "line1\nline2\nline4\nline5\n"
 
@@ -196,7 +196,7 @@ class TestBatchEdit:
         assert result["needs_approval"]
         assert "2 edits" in result["header"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "applied 2 edits" in msg
         with open(sample_file) as f:
             assert f.read() == "first\nline2\nline3\nline4\nlast\n"
@@ -216,7 +216,7 @@ class TestBatchEdit:
         )
         assert result["needs_approval"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "applied 3 edits" in msg
         with open(sample_file) as f:
             assert f.read() == "line1\nsecond\nthird\nfourth\nline5\n"
@@ -238,7 +238,7 @@ class TestBatchEdit:
         )
         assert result["needs_approval"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "overlap" in msg.lower()
         # File should be untouched
         with open(path) as f:
@@ -305,7 +305,7 @@ class TestBatchEdit:
         )
         assert result["needs_approval"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "applied 2 edits" in msg
         with open(path) as f:
             assert f.read() == "first_foo\nbar\nsecond_foo\nbaz\n"
@@ -324,7 +324,7 @@ class TestBatchEdit:
         )
         assert result["needs_approval"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         with open(sample_file) as f:
             assert f.read() == "line1\nline3\nline5\n"
 
@@ -344,7 +344,7 @@ class TestBatchEdit:
         # Single edit — no "(N edits)" count in header
         assert "edits)" not in result["header"]
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "applied 1 edit" in msg
         with open(sample_file) as f:
             assert f.read() == "line1\nline2\nmiddle\nline4\nline5\n"
@@ -414,7 +414,7 @@ class TestExecEdgeCases:
         with open(sample_file, "w") as f:
             f.write("completely different content\n")
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "no longer found" in msg
 
     def test_file_deleted_between_prepare_and_exec(self, session, sample_file):
@@ -431,7 +431,7 @@ class TestExecEdgeCases:
 
         os.unlink(sample_file)
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "Error" in msg
 
     def test_batch_file_changed_partial_match(self, session, sample_file):
@@ -453,7 +453,7 @@ class TestExecEdgeCases:
         with open(sample_file, "w") as f:
             f.write("line1\nline2\nline3\nline4\n")
 
-        call_id, msg = session._exec_edit_file(result)
+        _, msg = session._exec_edit_file(result)
         assert "no longer found" in msg
         # line1 should NOT have been edited (atomic failure)
         with open(sample_file) as f:

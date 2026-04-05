@@ -244,7 +244,7 @@ class ChannelRouter:
                     self._node_urls[ws_id] = node_url.rstrip("/")
                     return self._node_urls[ws_id]
             except Exception:
-                pass
+                log.debug("Console route lookup failed for ws %s", ws_id, exc_info=True)
         return self._server_url
 
     # -- user resolution -----------------------------------------------------

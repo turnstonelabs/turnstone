@@ -403,7 +403,7 @@ class TestMCPTemplates:
 
 
 class TestResumeDeletedTemplate:
-    def test_resume_with_deleted_template_degrades_gracefully(self, tmp_db, capsys):
+    def test_resume_with_deleted_template_degrades_gracefully(self, tmp_db, caplog):
         from turnstone.core.memory import save_message
         from turnstone.core.storage import get_storage
 
@@ -430,8 +430,7 @@ class TestResumeDeletedTemplate:
         content = _sys_content(session2)
         assert "EPHEMERAL_CONTENT" not in content
         # Warning should be logged via structlog
-        captured = capsys.readouterr()
-        assert "not_found" in captured.out or "not_found" in captured.err
+        assert "not_found" in caplog.text
 
 
 # ---------------------------------------------------------------------------

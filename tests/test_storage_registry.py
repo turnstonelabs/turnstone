@@ -57,7 +57,6 @@ class TestResetStorage:
         s1 = get_storage()
         reset_storage()
         # After reset, get_storage() auto-inits a new instance
-        monkeypatch_not_needed = True  # noqa: F841
         init_storage("sqlite", path=str(tmp_path / "test2.db"), run_migrations=False)
         s2 = get_storage()
         assert s1 is not s2

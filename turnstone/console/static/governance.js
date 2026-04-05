@@ -2185,8 +2185,7 @@ function searchSkillDiscover() {
   var searchBtn = document.getElementById("skill-discover-search-btn");
   if (searchBtn) searchBtn.disabled = true;
 
-  var url = "/v1/api/admin/skills/discover?limit=20";
-  if (q) url += "&q=" + encodeURIComponent(q);
+  var url = "/v1/api/admin/skills/discover?limit=20&q=" + encodeURIComponent(q);
 
   authFetch(url)
     .then(function (r) {
