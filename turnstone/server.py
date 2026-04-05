@@ -2892,9 +2892,6 @@ def main() -> None:
         return JudgeConfig(
             enabled=config_store.get("judge.enabled"),
             model=config_store.get("judge.model"),
-            provider=config_store.get("judge.provider"),
-            base_url=config_store.get("judge.base_url"),
-            api_key=config_store.get("judge.api_key"),
             confidence_threshold=config_store.get("judge.confidence_threshold"),
             max_context_ratio=config_store.get("judge.max_context_ratio"),
             timeout=config_store.get("judge.timeout"),

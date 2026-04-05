@@ -903,7 +903,7 @@ class IntentJudge:
         self._context_window = context_window
         self._rule_registry = rule_registry
 
-        # Resolve judge model: try model alias via ModelRegistry first
+        # Resolve judge model via ModelRegistry alias, falling back to session
         resolved = False
         if config.model and model_registry is not None:
             try:
@@ -918,7 +918,8 @@ class IntentJudge:
             except Exception:
                 log.debug("Model alias resolution failed for %r, falling back", config.model)
 
-            # Model override but same provider
+        if not resolved and config.model:
+            # Model name override with session provider
             self._provider = session_provider
             self._client = session_client
             self._model = config.model

@@ -2845,7 +2845,7 @@ function renderJudgeSettings() {
         " onchange=\"saveJudgeSetting('" +
         s.key +
         '\',this.checked)" style="width:16px;height:16px">' +
-        '<span style="font-size:13px">' +
+        '<span style="font-size:12px">' +
         (currentVal ? "Enabled" : "Disabled") +
         "</span></label>";
     } else if (s.type === "float") {
@@ -2935,9 +2935,9 @@ function renderJudgeSettings() {
       : "";
 
     html +=
-      '<div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border-strong)">' +
+      '<div style="margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border-strong)">' +
       '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
-      '<code style="font-size:13px;color:var(--accent)">' +
+      '<code style="font-family:var(--font-display);font-size:12px;font-weight:600;color:var(--fg)">' +
       shortKey +
       "</code>" +
       (isDefault
@@ -2945,7 +2945,7 @@ function renderJudgeSettings() {
         : '<span style="font-size:11px;color:var(--green)">customized</span>') +
       resetBtn +
       "</div>" +
-      '<div style="font-size:12px;color:var(--fg-dim);margin-bottom:6px">' +
+      '<div style="font-size:11px;color:var(--fg-dim);margin-bottom:5px">' +
       escapeHtml(s.help || s.description || "") +
       "</div>" +
       inputHtml +
