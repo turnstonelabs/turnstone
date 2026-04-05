@@ -512,6 +512,10 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+#toast.toast-error {
+  border-color: var(--red, #c44);
+  color: var(--red, #c44);
+}
 #toast.show {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
