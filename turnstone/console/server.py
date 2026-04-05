@@ -64,13 +64,17 @@ log = logging.getLogger("turnstone.console.server")
 _STATIC_DIR = Path(__file__).parent / "static"
 _SHARED_DIR = Path(__file__).parent.parent / "shared_static"
 _HTML = ""
+_HTML_ETAG = ""
 
 
 def _load_static() -> None:
+    import hashlib
+
     from turnstone.core.web_helpers import version_html
 
-    global _HTML
+    global _HTML, _HTML_ETAG
     _HTML = version_html((_STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+    _HTML_ETAG = '"' + hashlib.md5(_HTML.encode()).hexdigest()[:16] + '"'  # noqa: S324
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +214,12 @@ def _pick_best_node(collector: ClusterCollector) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def index(request: Request) -> HTMLResponse:
+async def index(request: Request) -> Response:
+    if request.headers.get("If-None-Match") == _HTML_ETAG:
+        return Response(status_code=304, headers={"ETag": _HTML_ETAG, "Cache-Control": "no-cache"})
     resp = HTMLResponse(_HTML)
     resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["ETag"] = _HTML_ETAG
     return resp
 
 
@@ -918,7 +925,9 @@ async def proxy_index(request: Request) -> Response:
             + "</script>"
         )
         page = page.replace("<body>", "<body>" + banner + _CONSOLE_PROXY_STYLE + shim, 1)
-        return HTMLResponse(page)
+        html_resp = HTMLResponse(page)
+        html_resp.headers["Cache-Control"] = "no-cache"
+        return html_resp
     except httpx.HTTPError as exc:
         log.debug("Proxy index error for %s: %s", node_id, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)

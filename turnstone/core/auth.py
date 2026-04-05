@@ -514,7 +514,7 @@ def check_request(
     # Version gate — reject tokens minted by a different major.minor.
     # Tokens without a ``ver`` claim are accepted (backward compat).
     if jwt_version and result.token_version and result.token_version != jwt_version:
-        return False, 401, "Unauthorized: session expired after server upgrade", None
+        return False, 401, "version_mismatch", None
 
     # Check scope
     needed = required_scope(method, path)
@@ -808,7 +808,11 @@ class AuthMiddleware:
             storage=storage,
         )
         if not allowed:
-            response = JSONResponse({"error": msg}, status_code=status)
+            body: dict[str, Any] = {"error": msg}
+            if msg == "version_mismatch":
+                body["error"] = "Unauthorized: session expired after server upgrade"
+                body["code"] = "version_mismatch"
+            response = JSONResponse(body, status_code=status)
             await response(scope, receive, send)
             return
 

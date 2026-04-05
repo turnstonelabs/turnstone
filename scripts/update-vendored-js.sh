@@ -181,6 +181,10 @@ case "$LIB" in
 esac
 
 echo ""
+echo "NOTE: If you added a NEW library (not just updating a version), also update"
+echo "  the _ASSET_RE regex in turnstone/core/web_helpers.py — its negative lookahead"
+echo "  skips vendored directories to avoid double-versioning static asset URLs."
+echo ""
 echo "Verify the update:"
 echo "  git diff --stat"
 echo "  python -m turnstone.server  # test locally"

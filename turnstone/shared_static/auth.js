@@ -14,6 +14,22 @@ var _loginBusy = false;
 var _authMode = "login"; // "login", "setup", "token"
 var _authUpgradeReload = false;
 
+// Cross-tab auth sync — when one tab logs in/out, others follow.
+var _authChannel =
+  typeof BroadcastChannel !== "undefined"
+    ? new BroadcastChannel("turnstone_auth")
+    : null;
+if (_authChannel) {
+  _authChannel.onmessage = function (e) {
+    if (e.data === "login") {
+      hideLogin();
+      if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
+    } else if (e.data === "logout") {
+      showLogin();
+    }
+  };
+}
+
 async function authFetch(url, opts) {
   var maxRetries = 2;
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
@@ -21,7 +37,7 @@ async function authFetch(url, opts) {
     if (r.status === 401) {
       try {
         var body = await r.clone().json();
-        if (body && body.error && body.error.indexOf("upgrade") !== -1) {
+        if (body && body.code === "version_mismatch") {
           _authUpgradeReload = true;
           showLogin("upgrade");
           throw new Error("auth");
@@ -493,12 +509,14 @@ function _onSuccess() {
   hideLogin();
   var logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "";
+  if (_authChannel) _authChannel.postMessage("login");
   if (typeof window.onLoginSuccess === "function") window.onLoginSuccess();
 }
 
 function logout() {
   fetch("/v1/api/auth/logout", { method: "POST" }).then(function () {
     sessionStorage.removeItem("turnstone_permissions");
+    if (_authChannel) _authChannel.postMessage("logout");
     if (typeof window.onLogout === "function") window.onLogout();
     showLogin();
   });

@@ -1449,6 +1449,16 @@ class TestSharedStatic:
         resp = client.get("/")
         assert resp.headers.get("cache-control") == "no-cache"
 
+    def test_index_etag_present(self, client):
+        resp = client.get("/")
+        assert resp.headers.get("etag")
+
+    def test_index_etag_304(self, client):
+        resp = client.get("/")
+        etag = resp.headers.get("etag")
+        resp2 = client.get("/", headers={"If-None-Match": etag})
+        assert resp2.status_code == 304
+
 
 class TestProxySharedStatic:
     """Tests for proxy rewriting of /shared/ paths."""

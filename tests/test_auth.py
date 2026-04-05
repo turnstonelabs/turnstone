@@ -1251,7 +1251,7 @@ class TestJWTVersionClaim:
         )
         assert not allowed
         assert status == 401
-        assert "upgrade" in msg
+        assert msg == "version_mismatch"
 
 
 class TestVersionSlot:
