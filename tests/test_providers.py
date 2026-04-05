@@ -2933,8 +2933,7 @@ class TestResponsesMessageConversion:
         assert len(items) == 1
         assert items[0]["type"] == "message"
         assert items[0]["role"] == "assistant"
-        assert items[0]["content"][0]["type"] == "output_text"
-        assert items[0]["content"][0]["text"] == "Hello back"
+        assert items[0]["content"] == "Hello back"
 
     def test_assistant_tool_calls(self) -> None:
         messages = [
@@ -2983,7 +2982,7 @@ class TestResponsesMessageConversion:
         # Should rebuild from content, not passthrough provider_content
         assert len(items) == 1
         assert items[0]["type"] == "message"
-        assert items[0]["content"][0]["text"] == "Hi"
+        assert items[0]["content"] == "Hi"
 
     def test_no_system_returns_none_instructions(self) -> None:
         messages = [{"role": "user", "content": "Hello"}]
@@ -3007,7 +3006,7 @@ class TestResponsesMessageConversion:
         _, items = self.provider._convert_messages(messages)
         assert len(items) == 2
         assert items[0]["type"] == "message"
-        assert items[0]["content"][0]["text"] == "I'll read that file"
+        assert items[0]["content"] == "I'll read that file"
         assert items[1]["type"] == "function_call"
         assert items[1]["name"] == "read_file"
 

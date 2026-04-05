@@ -312,7 +312,7 @@ class ChatSession:
         self._provider: LLMProvider = (
             registry.get_provider(model_alias)
             if registry and model_alias
-            else create_provider("openai")
+            else create_provider("openai-compatible")
         )
         self._cached_capabilities: ModelCapabilities | None = None
         self.ui = ui

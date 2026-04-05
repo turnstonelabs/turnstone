@@ -199,6 +199,18 @@ def _resolve_env_vars(value: str) -> str:
     return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, value)
 
 
+def _resolve_openai_provider(provider: str, base_url: str) -> str:
+    """Distinguish commercial OpenAI from local OpenAI-compatible servers.
+
+    When ``provider`` is ``"openai"`` but the ``base_url`` does not point to
+    ``api.openai.com``, the model is on a local server (vLLM, llama.cpp, etc.)
+    and should use the Chat Completions provider (``"openai-compatible"``).
+    """
+    if provider == "openai" and base_url and "api.openai.com" not in base_url:
+        return "openai-compatible"
+    return provider
+
+
 def load_model_registry(
     base_url: str,
     api_key: str,
@@ -242,14 +254,15 @@ def load_model_registry(
                             caps = parsed
                     except (_json.JSONDecodeError, TypeError):
                         pass  # falls back to empty capabilities
-                row_provider = row.get("provider", "openai")
+                row_base_url = _resolve_env_vars(row.get("base_url", ""))
+                row_provider = _resolve_openai_provider(row.get("provider", "openai"), row_base_url)
                 row_model = row["model"]
                 # 0 = auto-detect: inherit CLI-detected context_window,
                 # same fallback chain as config.toml models
                 row_ctx = row.get("context_window", 0) or context_window
                 configs[alias] = ModelConfig(
                     alias=alias,
-                    base_url=_resolve_env_vars(row.get("base_url", "")),
+                    base_url=row_base_url,
                     api_key=_resolve_env_vars(row.get("api_key", "")),
                     model=row_model,
                     context_window=row_ctx,
@@ -268,13 +281,14 @@ def load_model_registry(
         if not model_name:
             log.warning("Model entry '%s' has no model name, skipping", alias)
             continue
+        entry_base_url = entry.get("base_url", base_url)
         configs[alias] = ModelConfig(
             alias=alias,
-            base_url=entry.get("base_url", base_url),
+            base_url=entry_base_url,
             api_key=entry.get("api_key", api_key),
             model=model_name,
             context_window=entry.get("context_window", context_window),
-            provider=entry.get("provider", "openai"),
+            provider=_resolve_openai_provider(entry.get("provider", "openai"), entry_base_url),
             capabilities=entry.get("capabilities", {})
             if isinstance(entry.get("capabilities"), dict)
             else {},
@@ -290,7 +304,7 @@ def load_model_registry(
             api_key=api_key,
             model=model,
             context_window=context_window,
-            provider=provider,
+            provider=_resolve_openai_provider(provider, base_url),
         )
 
     # Determine default alias

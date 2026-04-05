@@ -116,13 +116,13 @@ class OpenAIResponsesProvider:
                 # (output format != input format, and IDs aren't persisted).
                 # Rebuild from the normalized content/tool_calls instead.
 
-                # Text content → output_text item within a message
+                # Text content → assistant message (plain string for input)
                 if content:
                     items.append(
                         {
                             "type": "message",
                             "role": "assistant",
-                            "content": [{"type": "output_text", "text": content}],
+                            "content": content,
                         }
                     )
 
