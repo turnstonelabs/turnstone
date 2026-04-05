@@ -87,6 +87,10 @@ class AsyncTurnstoneServer(_BaseClient):
     async def dashboard(self) -> DashboardResponse:
         return await self._request("GET", "/v1/api/dashboard", response_model=DashboardResponse)
 
+    async def list_models(self) -> dict[str, Any]:
+        """GET /v1/api/models — available model aliases and defaults."""
+        return await self._request("GET", "/v1/api/models")
+
     async def create_workstream(
         self,
         *,
@@ -466,6 +470,9 @@ class TurnstoneServer:
 
     def dashboard(self) -> DashboardResponse:
         return self._runner.run(self._async.dashboard())
+
+    def list_models(self) -> dict[str, Any]:
+        return self._runner.run(self._async.list_models())
 
     def create_workstream(
         self,

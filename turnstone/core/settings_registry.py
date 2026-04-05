@@ -283,6 +283,17 @@ def _build_registry() -> dict[str, SettingDef]:
             "database. Each node only connects to the servers it needs, so this "
             "limit is on definitions, not active connections.",
         ),
+        # -- channels -------------------------------------------------------
+        SettingDef(
+            "channels.default_model_alias",
+            "str",
+            "",
+            "Default model alias for channel workstreams (empty = use server default)",
+            "channels",
+            help="Which model alias to use when a channel adapter (Discord, etc.) "
+            "creates a new workstream without an explicit model. When empty, falls "
+            "back to the server-wide model.default_alias.",
+        ),
         # -- mcp ------------------------------------------------------------
         SettingDef(
             "mcp.config_path",

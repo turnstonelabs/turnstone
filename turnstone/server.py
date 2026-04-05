@@ -1195,7 +1195,28 @@ async def list_available_models(request: Request) -> JSONResponse:
                 "provider": cfg.provider,
             }
         )
-    return JSONResponse({"models": models})
+    # Include effective defaults for clients (web UI, channel gateway).
+    cs = getattr(request.app.state, "config_store", None)
+    default_alias = ""
+    channel_default_alias = ""
+    if cs is not None:
+        default_alias = cs.get("model.default_alias") or ""
+        channel_default_alias = cs.get("channels.default_model_alias") or ""
+    if not default_alias:
+        default_alias = registry.default
+    # Clear defaults that point to unknown/disabled aliases.
+    enabled_aliases = set(registry.list_aliases())
+    if default_alias and default_alias not in enabled_aliases:
+        default_alias = ""
+    if channel_default_alias and channel_default_alias not in enabled_aliases:
+        channel_default_alias = ""
+    return JSONResponse(
+        {
+            "models": models,
+            "default_alias": default_alias,
+            "channel_default_alias": channel_default_alias,
+        }
+    )
 
 
 def _count_ws_states(wss: list[Workstream]) -> dict[str, int]:

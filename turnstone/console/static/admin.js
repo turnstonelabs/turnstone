@@ -2135,6 +2135,7 @@ var _settingsSectionOrder = [
   "tools",
   "server",
   "cluster",
+  "channels",
   "mcp",
   "ratelimit",
   "health",
@@ -2150,6 +2151,7 @@ function _settingsSectionLabel(section) {
     tools: "Tools",
     server: "Server",
     cluster: "Cluster",
+    channels: "Channels",
     mcp: "MCP",
     ratelimit: "Rate Limiting",
     health: "Health",
@@ -2347,10 +2349,15 @@ function loadSettings() {
       if (!r.ok) throw new Error("Failed to load schema");
       return r.json();
     }),
+    authFetch("/v1/api/admin/model-definitions").then(function (r) {
+      if (!r.ok) return { models: [] };
+      return r.json();
+    }),
   ])
     .then(function (results) {
       var valuesArr = results[0].settings || [];
       var schemaArr = results[1].schema || [];
+      var modelDefs = results[2].models || [];
 
       // Build schema lookup
       var schemaMap = {};
@@ -2384,6 +2391,20 @@ function loadSettings() {
         };
       }
 
+      // Inject dynamic choices for model alias settings from model definitions.
+      var enabledAliases = [""];
+      for (var m = 0; m < modelDefs.length; m++) {
+        if (modelDefs[m].enabled) enabledAliases.push(modelDefs[m].alias);
+      }
+      if (enabledAliases.length > 1) {
+        if (merged["model.default_alias"]) {
+          merged["model.default_alias"].choices = enabledAliases;
+        }
+        if (merged["channels.default_model_alias"]) {
+          merged["channels.default_model_alias"].choices = enabledAliases;
+        }
+      }
+
       _settingsOriginal = {};
 
       // Group by section
@@ -2399,6 +2420,7 @@ function loadSettings() {
       _renderSettings(el, grouped);
     })
     .catch(function (err) {
+      // NOTE: escapeHtml sanitises err.message before insertion.
       el.innerHTML =
         '<div class="dashboard-empty">Failed to load settings: ' +
         escapeHtml(err.message || String(err)) +
@@ -2519,9 +2541,15 @@ function _renderSettingRow(item) {
   html += '<div class="settings-input">';
   if (item.is_secret) {
     html +=
-      '<span class="settings-secret" role="note" aria-label="' +
+      '<input type="password" data-setting-key="' +
+      escapedKey +
+      '" aria-label="Secret value for ' +
       escapedShort +
-      ': managed via config file or environment variable">(managed via config file / env)</span>';
+      '" autocomplete="off" value="" placeholder="' +
+      (item.source === "storage" ? "***" : "not set") +
+      '" oninput="_onSettingChange(\'' +
+      escapedKey +
+      "')\">";
   } else if (item.type === "bool") {
     var checked =
       item.value === true || item.value === "true" ? " checked" : "";
@@ -2546,8 +2574,17 @@ function _renderSettingRow(item) {
       "')\">";
     for (var c = 0; c < item.choices.length; c++) {
       var sel = item.choices[c] === String(item.value) ? " selected" : "";
-      var label =
-        item.choices[c] === "" ? "(none)" : escapeHtml(item.choices[c]);
+      var label;
+      if (item.choices[c] !== "") {
+        label = escapeHtml(item.choices[c]);
+      } else if (
+        item.key === "model.default_alias" ||
+        item.key === "channels.default_model_alias"
+      ) {
+        label = "(server default)";
+      } else {
+        label = "(none)";
+      }
       html +=
         '<option value="' +
         escapeHtml(item.choices[c]) +
@@ -2617,14 +2654,12 @@ function _renderSettingRow(item) {
   }
 
   // Save button (hidden until value changes)
-  if (!item.is_secret) {
-    html +=
-      '<button class="settings-save-btn" data-save-key="' +
-      escapedKey +
-      '" onclick="_saveSettingValue(\'' +
-      escapedKey +
-      "')\">save</button>";
-  }
+  html +=
+    '<button class="settings-save-btn" data-save-key="' +
+    escapedKey +
+    '" onclick="_saveSettingValue(\'' +
+    escapedKey +
+    "')\">save</button>";
 
   // Reset link (when stored — including secrets, to clear legacy overrides)
   if (item.source === "storage") {
@@ -2738,6 +2773,13 @@ function _saveSettingValue(key) {
       return;
     }
     value = Number(inp.value);
+  } else if (inp.type === "password") {
+    if (inp.value === "") {
+      // Nothing to save — user didn't enter a value.
+      if (saveBtn) saveBtn.classList.remove("visible");
+      return;
+    }
+    value = inp.value;
   } else {
     value = inp.value;
   }
@@ -2763,6 +2805,11 @@ function _saveSettingValue(key) {
       // Update original so dirty detection resets
       if (inp.type === "checkbox") {
         _settingsOriginal[key] = inp.checked;
+      } else if (inp.type === "password") {
+        // Clear the field after save; show "***" placeholder.
+        inp.value = "";
+        inp.placeholder = "***";
+        _settingsOriginal[key] = "";
       } else {
         _settingsOriginal[key] = inp.value;
       }
@@ -2806,7 +2853,10 @@ function _saveSettingValue(key) {
       }
 
       // Brief row flash for visual feedback
-      if (row) {
+      if (
+        row &&
+        !window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      ) {
         row.style.background = "var(--accent-glow)";
         setTimeout(function () {
           row.style.background = "";

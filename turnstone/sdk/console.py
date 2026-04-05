@@ -185,6 +185,12 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=ConsoleCreateWsResponse,
         )
 
+    # -- models --------------------------------------------------------------
+
+    async def list_models(self) -> dict[str, Any]:
+        """GET /v1/api/models — available model aliases and defaults."""
+        return await self._request("GET", "/v1/api/models")
+
     # -- routing proxy -------------------------------------------------------
 
     async def route_create_workstream(
@@ -1049,6 +1055,11 @@ class TurnstoneConsole:
                 user_id=user_id,
             )
         )
+
+    # -- models --------------------------------------------------------------
+
+    def list_models(self) -> dict[str, Any]:
+        return self._runner.run(self._async.list_models())
 
     # -- routing proxy -------------------------------------------------------
 

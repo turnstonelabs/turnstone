@@ -8,7 +8,8 @@ backend for persistent channel-to-workstream mappings.
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 _WS_CREATE_TIMEOUT = 30.0  # seconds
+_CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
 
 
 class ChannelRouter:
@@ -83,6 +85,10 @@ class ChannelRouter:
                 timeout=_WS_CREATE_TIMEOUT,
             )
 
+        # Cached channel default alias (TTL-based).
+        self._channel_default_alias: str = ""
+        self._channel_default_ts: float = 0.0
+
     # -- lifecycle -----------------------------------------------------------
 
     async def aclose(self) -> None:
@@ -92,6 +98,29 @@ class ChannelRouter:
         if self._console:
             await self._console.aclose()
         log.info("channel_router.closed")
+
+    # -- model listing -------------------------------------------------------
+
+    async def list_models(self) -> dict[str, Any]:
+        """Fetch available model aliases and defaults from the server/console."""
+        if self._console:
+            return await self._console.list_models()
+        assert self._server is not None
+        return await self._server.list_models()
+
+    async def get_channel_default_alias(self) -> str:
+        """Return the channel default model alias (cached with TTL)."""
+        now = time.monotonic()
+        if (now - self._channel_default_ts) < _CHANNEL_DEFAULT_TTL:
+            return self._channel_default_alias
+        try:
+            data = await self.list_models()
+            self._channel_default_alias = data.get("channel_default_alias", "")
+        except Exception:
+            log.debug("channel_router.channel_default_fetch_failed", exc_info=True)
+        # Update timestamp on both success and failure to avoid hammering.
+        self._channel_default_ts = now
+        return self._channel_default_alias
 
     # -- internal helpers ----------------------------------------------------
 

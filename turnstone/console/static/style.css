@@ -1991,6 +1991,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 /* Input column */
 .settings-input input[type="text"],
 .settings-input input[type="number"],
+.settings-input input[type="password"],
 .settings-input select {
   background: var(--bg);
   color: var(--fg);
@@ -2168,17 +2169,6 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 }
 .settings-help-ref:hover { text-decoration: underline; }
 
-/* Secret field — match input box height for grid alignment */
-.settings-secret {
-  color: var(--fg-dim);
-  font-style: italic;
-  font-size: 11px;
-  cursor: not-allowed;
-  display: inline-block;
-  padding: 4px 0;
-  border: 1px solid transparent; /* invisible border matches input's 1px border */
-}
-
 /* Docs link in toolbar */
 .settings-docs-link {
   font-family: var(--font-display);
@@ -2201,6 +2191,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .settings-desc { display: none; }
   .settings-input input[type="text"],
   .settings-input input[type="number"],
+  .settings-input input[type="password"],
   .settings-input select { max-width: 100%; }
 }
 

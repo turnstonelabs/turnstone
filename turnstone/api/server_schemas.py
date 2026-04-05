@@ -270,3 +270,5 @@ class AvailableModelInfo(BaseModel):
 
 class ListAvailableModelsResponse(BaseModel):
     models: list[AvailableModelInfo] = Field(default_factory=list)
+    default_alias: str = ""
+    channel_default_alias: str = ""

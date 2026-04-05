@@ -261,6 +261,90 @@ class TestMessageCog:
 
 
 # ---------------------------------------------------------------------------
+# /ask command — model selection
+# ---------------------------------------------------------------------------
+
+
+class TestAskModelSelection:
+    """Tests for the /ask command's model parameter and channel default."""
+
+    def _make_cog_and_interaction(self):
+        from turnstone.channels.discord.cog import MessageCog
+
+        bot = MagicMock()
+        bot.user = MagicMock()
+        bot.user.id = 99999
+
+        ts = MagicMock()
+        ts.router = MagicMock()
+        ts.router.resolve_user = AsyncMock(return_value="u_abc")
+        ts.router.get_or_create_workstream = AsyncMock(return_value=("ws-1", True))
+        ts.router.send_message = AsyncMock()
+        ts.router.get_channel_default_alias = AsyncMock(return_value="")
+        ts.subscribe_ws = AsyncMock()
+        ts.config = MagicMock()
+        ts.config.model = "cli-model"
+        ts.config.thread_auto_archive = 1440
+        bot.turnstone = ts
+
+        cog = MessageCog(bot)
+
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.user = MagicMock()
+        interaction.user.id = 67890
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        thread = AsyncMock(spec=discord.Thread)
+        thread.id = 111
+        thread.mention = "<#111>"
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.create_thread = AsyncMock(return_value=thread)
+        interaction.channel = channel
+
+        return cog, ts, interaction
+
+    def test_explicit_model_overrides_all(self):
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_channel_default_alias = AsyncMock(return_value="channel-default")
+
+        _run(cog._cmd_ask(interaction, "hello", model="explicit-model"))
+
+        _, kwargs = ts.router.get_or_create_workstream.call_args
+        assert kwargs["model"] == "explicit-model"
+
+    def test_channel_default_used_when_no_explicit_model(self):
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_channel_default_alias = AsyncMock(return_value="channel-default")
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        _, kwargs = ts.router.get_or_create_workstream.call_args
+        assert kwargs["model"] == "channel-default"
+
+    def test_cli_model_fallback(self):
+        cog, ts, interaction = self._make_cog_and_interaction()
+        # Channel default is empty → fall back to CLI --model.
+        ts.router.get_channel_default_alias = AsyncMock(return_value="")
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        _, kwargs = ts.router.get_or_create_workstream.call_args
+        assert kwargs["model"] == "cli-model"
+
+    def test_empty_model_when_no_defaults(self):
+        cog, ts, interaction = self._make_cog_and_interaction()
+        ts.router.get_channel_default_alias = AsyncMock(return_value="")
+        ts.config.model = ""
+
+        _run(cog._cmd_ask(interaction, "hello"))
+
+        _, kwargs = ts.router.get_or_create_workstream.call_args
+        assert kwargs["model"] == ""
+
+
+# ---------------------------------------------------------------------------
 # _parse_footer (views.py)
 # ---------------------------------------------------------------------------
 

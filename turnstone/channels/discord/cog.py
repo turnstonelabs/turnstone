@@ -13,6 +13,7 @@ from turnstone.core.log import get_logger
 
 if TYPE_CHECKING:
     import discord
+    from discord import app_commands
     from discord.ext import commands
 
     from turnstone.channels.discord.bot import TurnstoneBot
@@ -60,9 +61,25 @@ class MessageCog:
                 await cog_self._cmd_unlink(interaction)
 
             @app_commands.command(name="ask", description="Start a new Turnstone workstream")
-            @app_commands.describe(message="Your message to the assistant")
-            async def ask(self_cog: _Cog, interaction: discord.Interaction, message: str) -> None:  # noqa: N805
-                await cog_self._cmd_ask(interaction, message)
+            @app_commands.describe(
+                message="Your message to the assistant",
+                model="Model alias (leave blank for default)",
+            )
+            async def ask(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                message: str,
+                model: str = "",
+            ) -> None:
+                await cog_self._cmd_ask(interaction, message, model=model)
+
+            @ask.autocomplete("model")
+            async def _model_autocomplete(
+                self_cog: _Cog,  # noqa: N805
+                interaction: discord.Interaction,
+                current: str,
+            ) -> list[app_commands.Choice[str]]:
+                return await cog_self._autocomplete_model(interaction, current)
 
             @app_commands.command(name="status", description="Show workstream status")
             async def status(self_cog: _Cog, interaction: discord.Interaction) -> None:  # noqa: N805
@@ -187,11 +204,14 @@ class MessageCog:
             # first, then send the message.  With SSE the event stream is
             # reliable once connected, but we still subscribe first for
             # consistency.
+            mention_model = await self.ts.router.get_channel_default_alias()
+            if not mention_model:
+                mention_model = self.ts.config.model
             ws_id, _is_new = await self.ts.router.get_or_create_workstream(
                 channel_type="discord",
                 channel_id=str(thread.id),
                 name=thread_name,
-                model=self.ts.config.model,
+                model=mention_model,
                 initial_message="",
                 client_type="chat",
             )
@@ -331,7 +351,9 @@ class MessageCog:
                 ephemeral=True,
             )
 
-    async def _cmd_ask(self, interaction: discord.Interaction, message: str) -> None:
+    async def _cmd_ask(
+        self, interaction: discord.Interaction, message: str, *, model: str = ""
+    ) -> None:
         """Create a new thread and workstream with an initial message."""
         import discord
 
@@ -366,11 +388,18 @@ class MessageCog:
             )
             return
 
+        # Resolve model: explicit > channel default > CLI --model > server default.
+        effective_model = model
+        if not effective_model:
+            effective_model = await self.ts.router.get_channel_default_alias()
+        if not effective_model:
+            effective_model = self.ts.config.model
+
         ws_id, _is_new = await self.ts.router.get_or_create_workstream(
             channel_type="discord",
             channel_id=str(thread.id),
             name=thread_name,
-            model=self.ts.config.model,
+            model=effective_model,
             initial_message="",
             client_type="chat",
         )
@@ -388,6 +417,28 @@ class MessageCog:
             thread_id=thread.id,
             author=str(interaction.user),
         )
+
+    async def _autocomplete_model(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Return model alias suggestions for the /ask autocomplete."""
+        from discord import app_commands
+
+        try:
+            data = await self.ts.router.list_models()
+        except Exception:
+            return []
+        choices: list[app_commands.Choice[str]] = []
+        for m in data.get("models", []):
+            alias = m.get("alias", "")
+            if not alias:
+                continue
+            if current and current.lower() not in alias.lower():
+                continue
+            choices.append(app_commands.Choice(name=alias, value=alias))
+            if len(choices) >= 25:
+                break
+        return choices
 
     async def _cmd_status(self, interaction: discord.Interaction) -> None:
         """Show workstream status for the current thread."""
