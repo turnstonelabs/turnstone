@@ -17,7 +17,10 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # -- Priority 1: Prompt injection markers (HIGH) ---------------------------
 
@@ -735,7 +738,7 @@ def evaluate_output(
     func_name: str = "",
     call_id: str = "",
     budget_seconds: float = 5.0,
-    patterns: dict[str, tuple[OutputGuardPatternDef, ...]] | None = None,
+    patterns: Mapping[str, tuple[OutputGuardPatternDef, ...]] | None = None,
 ) -> OutputAssessment:
     """Evaluate tool output for security signals.
 
