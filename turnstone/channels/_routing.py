@@ -25,6 +25,7 @@ log = get_logger(__name__)
 
 _WS_CREATE_TIMEOUT = 30.0  # seconds
 _CHANNEL_DEFAULT_TTL = 300.0  # cache channel default alias for 5 minutes
+_MODELS_CACHE_TTL = 30.0  # cache model list for autocomplete
 
 
 class ChannelRouter:
@@ -88,6 +89,9 @@ class ChannelRouter:
         # Cached channel default alias (TTL-based).
         self._channel_default_alias: str = ""
         self._channel_default_ts: float = 0.0
+        # Cached model list for autocomplete (shorter TTL).
+        self._models_cache: dict[str, Any] = {}
+        self._models_cache_ts: float = 0.0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -101,25 +105,44 @@ class ChannelRouter:
 
     # -- model listing -------------------------------------------------------
 
-    async def list_models(self) -> dict[str, Any]:
-        """Fetch available model aliases and defaults from the server/console."""
+    async def list_models(self, *, cached: bool = False) -> dict[str, Any]:
+        """Fetch available model aliases and defaults from the server/console.
+
+        When *cached* is True, returns a TTL-cached result to avoid
+        per-keystroke HTTP traffic during autocomplete.
+        """
+        if cached:
+            now = time.monotonic()
+            if self._models_cache and (now - self._models_cache_ts) < _MODELS_CACHE_TTL:
+                return self._models_cache
+
         if self._console:
-            return await self._console.list_models()
-        assert self._server is not None
-        return await self._server.list_models()
+            resp: Any = await self._console.list_models()
+        else:
+            assert self._server is not None
+            resp = await self._server.list_models()
+        # SDK returns a Pydantic model; convert to dict for callers.
+        data: dict[str, Any] = resp.model_dump() if hasattr(resp, "model_dump") else resp
+
+        # Update cache regardless of `cached` flag — a fresh fetch is
+        # always worth caching for subsequent callers.
+        self._models_cache = data
+        self._models_cache_ts = time.monotonic()
+        return data
 
     async def get_channel_default_alias(self) -> str:
         """Return the channel default model alias (cached with TTL)."""
         now = time.monotonic()
         if (now - self._channel_default_ts) < _CHANNEL_DEFAULT_TTL:
             return self._channel_default_alias
+        # Mark refresh window before awaiting so concurrent callers
+        # reuse the cached value instead of triggering duplicate fetches.
+        self._channel_default_ts = now
         try:
             data = await self.list_models()
             self._channel_default_alias = data.get("channel_default_alias", "")
         except Exception:
             log.debug("channel_router.channel_default_fetch_failed", exc_info=True)
-        # Update timestamp on both success and failure to avoid hammering.
-        self._channel_default_ts = now
         return self._channel_default_alias
 
     # -- internal helpers ----------------------------------------------------

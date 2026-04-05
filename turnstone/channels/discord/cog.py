@@ -425,7 +425,7 @@ class MessageCog:
         from discord import app_commands
 
         try:
-            data = await self.ts.router.list_models()
+            data = await self.ts.router.list_models(cached=True)
         except Exception:
             return []
         choices: list[app_commands.Choice[str]] = []
