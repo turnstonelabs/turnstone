@@ -1105,7 +1105,7 @@ class ChatSession:
                 if storage:
                     db_policies = storage.list_prompt_policies()
             except Exception:
-                pass
+                log.debug("Failed to load prompt policies from storage", exc_info=True)
             now = datetime.now().astimezone()
             ctx = SessionContext(
                 current_datetime=now.strftime("%Y-%m-%dT%H:%M"),
@@ -2857,7 +2857,10 @@ class ChatSession:
                     with open(plan_path, "w") as f:
                         f.write(output)
                 except OSError:
-                    pass
+                    log.warning("Failed to write plan to %s", plan_path, exc_info=True)
+                    output += "\n\n---\nPlan could not be saved to disk."
+                    results[i] = (cid, output)
+                    continue
 
             # Always include file path in the tool result so the
             # outer model knows where the plan lives on disk.

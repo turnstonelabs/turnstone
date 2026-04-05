@@ -1192,7 +1192,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
                 jwks_data = await fetch_jwks(oidc_config.jwks_uri)
                 request.app.state.jwks_data = jwks_data
             except OIDCError:
-                pass
+                log.warning("JWKS fetch failed from %s", oidc_config.jwks_uri, exc_info=True)
         if jwks_data is None:
             return RedirectResponse("/?oidc_error=OIDC+temporarily+unavailable", status_code=302)
 

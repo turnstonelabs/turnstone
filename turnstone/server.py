@@ -1752,7 +1752,7 @@ async def create_workstream(request: Request) -> JSONResponse:
 
                     _gs().set_workstream_override(ws.id, node_id, reason="local")
                 except Exception:
-                    pass  # best-effort; routing will still work via resume
+                    log.debug("Failed to set routing override for %s", ws.id, exc_info=True)
 
         # If an initial_message was provided, send it as the first user message.
         # This replaces the old bridge behavior where CreateWorkstreamMessage
@@ -2901,7 +2901,7 @@ def main() -> None:
                     if _u:
                         _username = _u.get("username", "")
             except Exception:
-                pass
+                log.debug("Failed to resolve username for uid %s", uid, exc_info=True)
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
         live_memory_config = _build_memory_config()
