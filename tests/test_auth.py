@@ -1145,6 +1145,103 @@ class TestJWTAudienceIssuer:
             create_jwt("user1", frozenset({"read"}), "test", self.SECRET, expiry_seconds=-1)
 
 
+class TestJWTVersionClaim:
+    SECRET = "test-secret-that-is-at-least-32-chars"
+
+    def test_create_jwt_with_version(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import create_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert payload["ver"] == "1.2"
+
+    def test_create_jwt_without_version(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import create_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
+        payload = pyjwt.decode(
+            token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert "ver" not in payload
+
+    def test_validate_jwt_version_match(self):
+        from turnstone.core.auth import create_jwt, validate_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
+        result = validate_jwt(token, self.SECRET, required_version="1.2")
+        assert result is not None
+        assert result.user_id == "user1"
+
+    def test_validate_jwt_version_mismatch(self):
+        from turnstone.core.auth import create_jwt, validate_jwt
+
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
+        result = validate_jwt(token, self.SECRET, required_version="1.3")
+        assert result is None
+
+    def test_validate_jwt_no_ver_backward_compat(self):
+        from turnstone.core.auth import create_jwt, validate_jwt
+
+        # Token without ver claim should be accepted when required_version is set
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET)
+        result = validate_jwt(token, self.SECRET, required_version="1.2")
+        assert result is not None
+
+    def test_validate_jwt_version_not_required(self):
+        from turnstone.core.auth import create_jwt, validate_jwt
+
+        # Token with ver claim should be accepted when required_version is empty
+        token = create_jwt("user1", frozenset({"read"}), "test", self.SECRET, version="1.2")
+        result = validate_jwt(token, self.SECRET, required_version="")
+        assert result is not None
+
+    def test_check_request_rejects_old_version_jwt(self):
+        from turnstone.core.auth import JWT_AUD_SERVER, check_request, create_jwt
+
+        token = create_jwt(
+            "user1",
+            frozenset({"read"}),
+            "test",
+            self.SECRET,
+            audience=JWT_AUD_SERVER,
+            version="1.1",
+        )
+        allowed, status, msg, _result = check_request(
+            "GET",
+            "/v1/api/workstreams",
+            f"Bearer {token}",
+            jwt_secret=self.SECRET,
+            jwt_audience=JWT_AUD_SERVER,
+            jwt_version="1.2",
+        )
+        assert not allowed
+        assert status == 401
+        assert "upgrade" in msg
+
+
+class TestVersionSlot:
+    def test_returns_major_minor(self):
+        from turnstone.core.auth import _version_slot
+
+        slot = _version_slot()
+        parts = slot.split(".")
+        assert len(parts) == 2
+
+    def test_strips_patch_and_prerelease(self):
+        from unittest.mock import patch
+
+        with patch("turnstone.__version__", "2.3.1a5"):
+            from turnstone.core.auth import _version_slot
+
+            assert _version_slot() == "2.3"
+
+
 class TestServiceTokenManager:
     SECRET = "test-secret-that-is-at-least-32-chars"
 
@@ -1223,6 +1320,22 @@ class TestServiceTokenManager:
             mgr.token, self.SECRET, algorithms=["HS256"], audience=JWT_AUD_SERVER
         )
         assert payload["aud"] == JWT_AUD_SERVER
+
+    def test_service_token_no_version_claim(self):
+        import jwt as pyjwt
+
+        from turnstone.core.auth import ServiceTokenManager
+
+        mgr = ServiceTokenManager(
+            user_id="svc",
+            scopes=frozenset({"read"}),
+            source="test",
+            secret=self.SECRET,
+        )
+        payload = pyjwt.decode(
+            mgr.token, self.SECRET, algorithms=["HS256"], options={"verify_aud": False}
+        )
+        assert "ver" not in payload
 
 
 class TestIsSecureRequest:

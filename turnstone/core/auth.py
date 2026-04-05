@@ -54,6 +54,19 @@ _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve", "service"})
 
+
+def _version_slot() -> str:
+    """Return ``major.minor`` from ``__version__`` for JWT version claims.
+
+    Only major.minor is used so that patch/pre-release bumps do not
+    force every user to re-authenticate.
+    """
+    from turnstone import __version__
+
+    parts = __version__.split(".")
+    return f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else __version__
+
+
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 USERNAME_MAX_LEN = 64
 
@@ -310,6 +323,7 @@ def create_jwt(
     audience: str = "",
     permissions: frozenset[str] = frozenset(),
     expiry_seconds: int | None = None,
+    version: str | None = None,
 ) -> str:
     """Create a signed JWT with user identity, scopes, and permissions."""
     import jwt
@@ -330,15 +344,26 @@ def create_jwt(
         payload["aud"] = audience
     if permissions:
         payload["permissions"] = ",".join(sorted(permissions))
+    if version:
+        payload["ver"] = version
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
-def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | None:
+def validate_jwt(
+    token: str,
+    secret: str,
+    audience: str = "",
+    required_version: str = "",
+) -> AuthResult | None:
     """Validate a JWT and return an AuthResult, or None on failure.
 
     When *audience* is non-empty the ``aud`` claim is verified.  Tokens
     without an ``aud`` claim are accepted when *audience* is empty (backward
     compatibility during the rollout window).
+
+    When *required_version* is non-empty, tokens that carry a ``ver`` claim
+    differing from *required_version* are rejected.  Tokens without a ``ver``
+    claim are accepted (backward compatibility for pre-upgrade sessions).
     """
     import jwt
 
@@ -355,6 +380,12 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
         )
     except jwt.InvalidTokenError:
         return None
+
+    # Version gate — reject tokens minted by a different major.minor
+    if required_version:
+        token_ver = payload.get("ver", "")
+        if token_ver and token_ver != required_version:
+            return None
 
     user_id = payload.get("sub", "")
     scopes_str = payload.get("scopes", "")
@@ -454,6 +485,7 @@ def check_request(
     *,
     jwt_secret: str = "",
     jwt_audience: str = "",
+    jwt_version: str = "",
     storage: Any = None,
 ) -> tuple[bool, int, str, AuthResult | None]:
     """Validate a request.
@@ -479,9 +511,24 @@ def check_request(
 
     # Authenticate
     result = _authenticate_token(
-        raw_token, jwt_secret=jwt_secret, jwt_audience=jwt_audience, storage=storage
+        raw_token,
+        jwt_secret=jwt_secret,
+        jwt_audience=jwt_audience,
+        jwt_version=jwt_version,
+        storage=storage,
     )
     if result is None:
+        # Distinguish version-mismatch from other auth failures so the
+        # frontend can show a contextual "server was updated" message.
+        if jwt_version and raw_token and "." in raw_token:
+            unversioned = _authenticate_token(
+                raw_token,
+                jwt_secret=jwt_secret,
+                jwt_audience=jwt_audience,
+                storage=storage,
+            )
+            if unversioned is not None:
+                return False, 401, "Unauthorized: session expired after server upgrade", None
         return False, 401, "Unauthorized: missing or invalid token", None
 
     # Check scope
@@ -497,13 +544,16 @@ def _authenticate_token(
     *,
     jwt_secret: str = "",
     jwt_audience: str = "",
+    jwt_version: str = "",
     storage: Any = None,
 ) -> AuthResult | None:
     """Identify token type and authenticate it."""
     # 1. JWT (contains dots) — attempt validation, fall through on failure
     if "." in token and jwt_secret:
         try:
-            jwt_result = validate_jwt(token, jwt_secret, audience=jwt_audience)
+            jwt_result = validate_jwt(
+                token, jwt_secret, audience=jwt_audience, required_version=jwt_version
+            )
         except Exception:
             jwt_result = None
         if jwt_result is not None:
@@ -740,9 +790,10 @@ class AuthMiddleware:
     server (``JWT_AUD_SERVER``) and the console (``JWT_AUD_CONSOLE``).
     """
 
-    def __init__(self, app: ASGIApp, jwt_audience: str = "") -> None:
+    def __init__(self, app: ASGIApp, jwt_audience: str = "", jwt_version: str = "") -> None:
         self.app = app
         self._jwt_audience = jwt_audience
+        self._jwt_version = jwt_version
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -771,6 +822,7 @@ class AuthMiddleware:
             cookie_header,
             jwt_secret=jwt_secret,
             jwt_audience=self._jwt_audience,
+            jwt_version=self._jwt_version,
             storage=storage,
         )
         if not allowed:
@@ -880,6 +932,7 @@ async def handle_auth_login(request: Request, audience: str) -> Response:
             secret=jwt_secret,
             audience=audience,
             permissions=result.permissions,
+            version=_version_slot(),
         )
 
     role = "full" if result.has_scope("write") else "read"
@@ -1023,6 +1076,7 @@ async def handle_auth_setup(request: Request, audience: str) -> Response:
             secret=jwt_secret,
             audience=audience,
             permissions=frozenset(perms),
+            version=_version_slot(),
         )
 
     resp_body: dict[str, str] = {
@@ -1249,6 +1303,7 @@ async def handle_oidc_callback(request: Request, audience: str) -> Response:
             secret=jwt_secret,
             audience=jwt_audience,
             permissions=frozenset(perms),
+            version=_version_slot(),
         )
 
     # Set cookie and redirect to app

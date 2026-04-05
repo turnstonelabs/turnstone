@@ -41,7 +41,13 @@ from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.console.collector import ClusterCollector
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
-from turnstone.core.auth import JWT_AUD_CONSOLE, JWT_AUD_SERVER, AuthMiddleware, create_jwt
+from turnstone.core.auth import (
+    JWT_AUD_CONSOLE,
+    JWT_AUD_SERVER,
+    AuthMiddleware,
+    _version_slot,
+    create_jwt,
+)
 from turnstone.core.hash_ring import NoAvailableNodeError
 
 if TYPE_CHECKING:
@@ -61,8 +67,10 @@ _HTML = ""
 
 
 def _load_static() -> None:
+    from turnstone.core.web_helpers import version_html
+
     global _HTML
-    _HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    _HTML = version_html((_STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +211,9 @@ def _pick_best_node(collector: ClusterCollector) -> str:
 
 
 async def index(request: Request) -> HTMLResponse:
-    return HTMLResponse(_HTML)
+    resp = HTMLResponse(_HTML)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 async def cluster_overview(request: Request) -> JSONResponse:
@@ -7440,7 +7450,9 @@ def _build_console_middleware(cors_origins: list[str] | None = None) -> list[Mid
         from turnstone.core.web_helpers import cors_middleware
 
         stack.append(cors_middleware(cors_origins))
-    stack.append(Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE))
+    stack.append(
+        Middleware(AuthMiddleware, jwt_audience=JWT_AUD_CONSOLE, jwt_version=_version_slot())
+    )
     return stack
 
 

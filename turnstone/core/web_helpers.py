@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -73,3 +74,32 @@ def cors_middleware(origins: list[str]) -> Middleware:
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["Content-Type", "Authorization"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Static asset cache-busting
+# ---------------------------------------------------------------------------
+
+# Matches src="/static/..." and href="/shared/..." (and vice-versa) but skips
+# vendored libraries whose directory names already contain a version number
+# (e.g. katex-0.16.44/, hljs-11.11.1/).
+_ASSET_RE = re.compile(
+    r'(?P<attr>(?:src|href)=")'
+    r"(?P<path>/(?:static|shared)/)"
+    r"(?!(?:katex|hljs|hls|mermaid)-\d)"
+    r'(?P<file>[^"]+)"'
+)
+
+
+def version_html(html: str) -> str:
+    """Inject ``?v=VERSION`` into ``/static/`` and ``/shared/`` asset URLs.
+
+    Vendored libraries with version-bearing directory names are skipped.
+    Called once at startup when loading HTML into memory.
+    """
+    from turnstone import __version__
+
+    def _repl(m: re.Match[str]) -> str:
+        return f'{m.group("attr")}{m.group("path")}{m.group("file")}?v={__version__}"'
+
+    return _ASSET_RE.sub(_repl, html)

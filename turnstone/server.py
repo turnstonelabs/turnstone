@@ -40,12 +40,13 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
-from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware
+from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware, _version_slot
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
+from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import Workstream, WorkstreamManager, WorkstreamState
 from turnstone.prompts import ClientType
 
@@ -62,7 +63,7 @@ log = get_logger(__name__)
 
 _STATIC_DIR = Path(__file__).parent / "ui" / "static"
 _SHARED_DIR = Path(__file__).parent / "shared_static"
-_HTML = (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
+_HTML = _version_html((_STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 _VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -846,7 +847,9 @@ def _audit_context(request: Request) -> tuple[str, str]:
 
 async def index(request: Request) -> HTMLResponse:
     """GET / — serve the embedded HTML client."""
-    return HTMLResponse(_HTML)
+    resp = HTMLResponse(_HTML)
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 async def events_sse(request: Request) -> Response:
@@ -2531,7 +2534,7 @@ def _build_middleware(cors_origins: list[str] | None = None) -> list[Middleware]
         stack.append(cors_middleware(cors_origins))
     stack.extend(
         [
-            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER),
+            Middleware(AuthMiddleware, jwt_audience=JWT_AUD_SERVER, jwt_version=_version_slot()),
             Middleware(RateLimitMiddleware),
         ]
     )

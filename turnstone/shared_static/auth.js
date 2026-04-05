@@ -12,12 +12,23 @@ var _AUTH_TITLE = window.TURNSTONE_AUTH_TITLE || "turnstone";
 var _loginTrapHandler = null;
 var _loginBusy = false;
 var _authMode = "login"; // "login", "setup", "token"
+var _authUpgradeReload = false;
 
 async function authFetch(url, opts) {
   var maxRetries = 2;
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
     var r = await fetch(url, opts);
     if (r.status === 401) {
+      try {
+        var body = await r.clone().json();
+        if (body && body.error && body.error.indexOf("upgrade") !== -1) {
+          _authUpgradeReload = true;
+          showLogin("upgrade");
+          throw new Error("auth");
+        }
+      } catch (e) {
+        if (e.message === "auth") throw e;
+      }
       showLogin();
       throw new Error("auth");
     }
@@ -79,7 +90,7 @@ function initLogin() {
 
 function _buildLoginHTML() {
   return (
-    '<form id="login-box">' +
+    '<form id="login-box" aria-describedby="login-subtitle">' +
     '<h2 id="login-title">' +
     escapeHtml(_AUTH_TITLE) +
     "</h2>" +
@@ -232,7 +243,7 @@ function _showError(msg) {
   }
 }
 
-function showLogin() {
+function showLogin(reason) {
   var overlay = document.getElementById("login-overlay");
   if (!overlay) return;
   overlay.style.display = "flex";
@@ -242,6 +253,7 @@ function showLogin() {
   _clearError();
 
   // Check auth status to determine mode
+  var _loginReason = reason;
   fetch("/v1/api/auth/status")
     .then(function (r) {
       return r.json();
@@ -251,6 +263,12 @@ function showLogin() {
         _switchMode("setup");
       } else {
         _switchMode("login");
+        if (_loginReason === "upgrade") {
+          var subtitle = document.getElementById("login-subtitle");
+          if (subtitle)
+            subtitle.textContent =
+              "The server was updated \u2014 please sign in again";
+        }
       }
       _updateOIDCUI(data);
     })
@@ -465,6 +483,13 @@ function _setBusy(busy, label) {
 }
 
 function _onSuccess() {
+  // After a version-triggered re-auth, reload the page to pick up fresh
+  // JS/CSS via the updated ?v= query strings in the new HTML.
+  if (_authUpgradeReload) {
+    _authUpgradeReload = false;
+    window.location.reload();
+    return;
+  }
   hideLogin();
   var logoutBtn = document.getElementById("logout-btn");
   if (logoutBtn) logoutBtn.style.display = "";

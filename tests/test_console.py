@@ -1427,7 +1427,7 @@ class TestSharedStatic:
     def test_index_imports_shared_base_css(self, client):
         resp = client.get("/")
         assert resp.status_code == 200
-        assert '/shared/base.css"' in resp.text
+        assert "/shared/base.css?v=" in resp.text
 
     def test_index_imports_shared_scripts(self, client):
         resp = client.get("/")
@@ -1444,6 +1444,10 @@ class TestSharedStatic:
         shared_pos = body.find("/shared/utils.js")
         app_pos = body.find("/static/app.js")
         assert shared_pos < app_pos
+
+    def test_index_cache_control_no_cache(self, client):
+        resp = client.get("/")
+        assert resp.headers.get("cache-control") == "no-cache"
 
 
 class TestProxySharedStatic:
