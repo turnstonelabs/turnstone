@@ -1093,6 +1093,17 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         except Exception:
             log.warning("Failed to initialise ConfigStore", exc_info=True)
     app.state.config_store = config_store
+
+    # Initialize rule registry for configurable judge rules
+    app.state.rule_registry = None
+    if config_store is not None:
+        try:
+            from turnstone.core.rule_registry import RuleRegistry
+
+            app.state.rule_registry = RuleRegistry(storage=config_store.storage)
+        except Exception:
+            log.warning("Failed to initialise RuleRegistry", exc_info=True)
+
     fan_out = (
         config_store.get("cluster.node_fan_out_limit") if config_store else _NODE_FAN_OUT_LIMIT
     )
@@ -5787,6 +5798,7 @@ async def admin_delete_prompt_policy(request: Request) -> JSONResponse:
 
 _JUDGE_RULE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 _VALID_RISK_LEVELS = frozenset({"critical", "high", "medium", "low"})
+_VALID_OG_RISK_LEVELS = frozenset({"high", "medium", "low"})  # no "critical" in output guard
 _VALID_RECOMMENDATIONS = frozenset({"approve", "review", "deny"})
 _VALID_TIERS = frozenset({"critical", "high", "medium", "low"})
 _VALID_CATEGORIES = frozenset(
@@ -5824,10 +5836,13 @@ def _validate_regex_pattern(pattern: str, flags: int = 0) -> str | None:
         from concurrent.futures import ThreadPoolExecutor
         from concurrent.futures import TimeoutError as FuturesTimeout
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
             pool.submit(_probe).result(timeout=0.5)
-    except FuturesTimeout:
-        return "Regex appears to have catastrophic backtracking"
+        except FuturesTimeout:
+            return "Regex appears to have catastrophic backtracking"
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
     except Exception:
         return "Regex caused an error during test"
     return None
@@ -6482,9 +6497,10 @@ async def admin_create_output_guard_pattern(request: Request) -> JSONResponse:
         )
 
     risk_level = str(body.get("risk_level", "medium"))
-    if risk_level not in _VALID_RISK_LEVELS:
+    if risk_level not in _VALID_OG_RISK_LEVELS:
         return JSONResponse(
-            {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"}, status_code=400
+            {"error": f"risk_level must be one of {sorted(_VALID_OG_RISK_LEVELS)}"},
+            status_code=400,
         )
 
     flag_name = str(body.get("flag_name", ""))
@@ -6598,13 +6614,8 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
             )
         fields["name"] = name
 
-    if "pattern" in body:
-        pattern = str(body["pattern"])
-        err_msg = _validate_regex_pattern(pattern)
-        if err_msg:
-            return JSONResponse({"error": err_msg}, status_code=400)
-        fields["pattern"] = pattern
-
+    # Resolve pattern_flags first (needed for pattern validation)
+    re_flags = 0
     if "pattern_flags" in body:
         pf_raw = body["pattern_flags"]
         if isinstance(pf_raw, list):
@@ -6621,7 +6632,20 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
                     },
                     status_code=400,
                 )
+        for flag in pf_list:
+            re_flags |= {
+                "IGNORECASE": re.IGNORECASE,
+                "MULTILINE": re.MULTILINE,
+                "DOTALL": re.DOTALL,
+            }[flag]
         fields["pattern_flags"] = ",".join(pf_list)
+
+    if "pattern" in body:
+        pattern = str(body["pattern"])
+        err_msg = _validate_regex_pattern(pattern, re_flags)
+        if err_msg:
+            return JSONResponse({"error": err_msg}, status_code=400)
+        fields["pattern"] = pattern
 
     if "category" in body:
         if body["category"] not in _VALID_CATEGORIES:
@@ -6631,9 +6655,9 @@ async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
         fields["category"] = body["category"]
 
     if "risk_level" in body:
-        if body["risk_level"] not in _VALID_RISK_LEVELS:
+        if body["risk_level"] not in _VALID_OG_RISK_LEVELS:
             return JSONResponse(
-                {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"},
+                {"error": f"risk_level must be one of {sorted(_VALID_OG_RISK_LEVELS)}"},
                 status_code=400,
             )
         fields["risk_level"] = body["risk_level"]

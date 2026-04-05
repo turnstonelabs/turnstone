@@ -779,13 +779,15 @@ def evaluate_output(
                     parent,
                 )
                 risk = _max_risk(risk, pat_risk)
-                if pat_sanitized and sanitized is None:
-                    sanitized = pat_sanitized
+                if pat_sanitized:
+                    sanitized = pat_sanitized if sanitized is None else pat_sanitized
             # Run hard-coded complex checks for categories that need them
             if cat == "credentials":
-                cred_risk, cred_san = _check_credentials_complex(output, flags, ann)
+                # Chain redaction: apply complex checks to already-sanitized text
+                cred_input = sanitized if sanitized is not None else output
+                cred_risk, cred_san = _check_credentials_complex(cred_input, flags, ann)
                 risk = _max_risk(risk, cred_risk)
-                if cred_san and sanitized is None:
+                if cred_san:
                     sanitized = cred_san
             elif cat == "encoded_payloads":
                 risk = _max_risk(

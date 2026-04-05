@@ -21,9 +21,9 @@ class TestHeuristicRuleStorage:
             name="dangerous-exec",
             risk_level="critical",
             confidence=0.95,
-            recommendation="Block execution of arbitrary code",
+            recommendation="deny",
             tool_pattern="execute_code",
-            arg_patterns='[{"key": "code", "pattern": ".*"}]',
+            arg_patterns='[".*exec.*", ".*eval.*"]',
             intent_template="User wants to run code",
             reasoning_template="Executing arbitrary code is dangerous",
             tier="critical",
@@ -38,9 +38,9 @@ class TestHeuristicRuleStorage:
         assert r["name"] == "dangerous-exec"
         assert r["risk_level"] == "critical"
         assert r["confidence"] == 0.95
-        assert r["recommendation"] == "Block execution of arbitrary code"
+        assert r["recommendation"] == "deny"
         assert r["tool_pattern"] == "execute_code"
-        assert r["arg_patterns"] == '[{"key": "code", "pattern": ".*"}]'
+        assert r["arg_patterns"] == '[".*exec.*", ".*eval.*"]'
         assert r["intent_template"] == "User wants to run code"
         assert r["reasoning_template"] == "Executing arbitrary code is dangerous"
         assert r["tier"] == "critical"
@@ -56,7 +56,7 @@ class TestHeuristicRuleStorage:
             name="by-name-lookup",
             risk_level="high",
             confidence=0.8,
-            recommendation="Review carefully",
+            recommendation="review",
             tool_pattern="file_write",
         )
         r = db.get_heuristic_rule_by_name("by-name-lookup")
@@ -73,7 +73,7 @@ class TestHeuristicRuleStorage:
             name="low-tier-rule",
             risk_level="low",
             confidence=0.5,
-            recommendation="Informational",
+            recommendation="approve",
             tool_pattern="read_file",
             tier="low",
             priority=10,
@@ -83,7 +83,7 @@ class TestHeuristicRuleStorage:
             name="critical-tier-rule",
             risk_level="critical",
             confidence=0.99,
-            recommendation="Block immediately",
+            recommendation="deny",
             tool_pattern="delete_all",
             tier="critical",
             priority=50,
@@ -93,7 +93,7 @@ class TestHeuristicRuleStorage:
             name="medium-tier-rule",
             risk_level="medium",
             confidence=0.7,
-            recommendation="Review",
+            recommendation="review",
             tool_pattern="web_search",
             tier="medium",
             priority=20,
@@ -111,7 +111,7 @@ class TestHeuristicRuleStorage:
             name="enabled-rule",
             risk_level="medium",
             confidence=0.7,
-            recommendation="Active",
+            recommendation="approve",
             tool_pattern="tool_a",
             enabled=True,
         )
@@ -120,7 +120,7 @@ class TestHeuristicRuleStorage:
             name="disabled-rule",
             risk_level="low",
             confidence=0.3,
-            recommendation="Inactive",
+            recommendation="deny",
             tool_pattern="tool_b",
             enabled=False,
         )
@@ -136,7 +136,7 @@ class TestHeuristicRuleStorage:
             name="orig-name",
             risk_level="low",
             confidence=0.5,
-            recommendation="Original recommendation",
+            recommendation="review",
             tool_pattern="orig_tool",
         )
         ok = db.update_heuristic_rule(
@@ -144,7 +144,7 @@ class TestHeuristicRuleStorage:
             name="updated-name",
             risk_level="high",
             confidence=0.9,
-            recommendation="Updated recommendation",
+            recommendation="deny",
             enabled=False,
             builtin=True,
         )
@@ -154,7 +154,7 @@ class TestHeuristicRuleStorage:
         assert r["name"] == "updated-name"
         assert r["risk_level"] == "high"
         assert r["confidence"] == 0.9
-        assert r["recommendation"] == "Updated recommendation"
+        assert r["recommendation"] == "deny"
         assert r["enabled"] is False
         assert r["builtin"] is True
 
@@ -169,7 +169,7 @@ class TestHeuristicRuleStorage:
             name="delete-me",
             risk_level="low",
             confidence=0.3,
-            recommendation="Temporary",
+            recommendation="review",
             tool_pattern="temp_tool",
         )
         ok = db.delete_heuristic_rule(rid)
@@ -187,7 +187,7 @@ class TestHeuristicRuleStorage:
             name="first-insert",
             risk_level="high",
             confidence=0.8,
-            recommendation="Original",
+            recommendation="approve",
             tool_pattern="tool_orig",
         )
         # Second insert with same ID should be no-op (OR IGNORE)
@@ -196,7 +196,7 @@ class TestHeuristicRuleStorage:
             name="second-insert",
             risk_level="low",
             confidence=0.1,
-            recommendation="Overwritten?",
+            recommendation="deny",
             tool_pattern="tool_new",
         )
         r = db.get_heuristic_rule(rid)
@@ -212,7 +212,7 @@ class TestHeuristicRuleStorage:
             name="defaults-test",
             risk_level="medium",
             confidence=0.5,
-            recommendation="Check",
+            recommendation="review",
             tool_pattern="some_tool",
         )
         r = db.get_heuristic_rule(rid)
@@ -234,7 +234,7 @@ class TestOutputGuardPatternStorage:
             pattern_id=pid,
             name="aws-key-pattern",
             category="credentials",
-            risk_level="critical",
+            risk_level="high",
             pattern=r"AKIA[0-9A-Z]{16}",
             flag_name="aws_access_key",
             annotation="AWS access key detected",
@@ -251,7 +251,7 @@ class TestOutputGuardPatternStorage:
         assert p["pattern_id"] == pid
         assert p["name"] == "aws-key-pattern"
         assert p["category"] == "credentials"
-        assert p["risk_level"] == "critical"
+        assert p["risk_level"] == "high"
         assert p["pattern"] == r"AKIA[0-9A-Z]{16}"
         assert p["flag_name"] == "aws_access_key"
         assert p["annotation"] == "AWS access key detected"
@@ -268,7 +268,7 @@ class TestOutputGuardPatternStorage:
         db.create_output_guard_pattern(
             pattern_id=pid,
             name="lookup-by-name",
-            category="secrets",
+            category="credentials",
             risk_level="high",
             pattern=r"ghp_[A-Za-z0-9_]{36}",
             flag_name="github_pat",
@@ -286,7 +286,7 @@ class TestOutputGuardPatternStorage:
         db.create_output_guard_pattern(
             pattern_id=_make_id(),
             name="secrets-high",
-            category="secrets",
+            category="credentials",
             risk_level="high",
             pattern=r"secret_.*",
             flag_name="generic_secret",
@@ -295,9 +295,9 @@ class TestOutputGuardPatternStorage:
         )
         db.create_output_guard_pattern(
             pattern_id=_make_id(),
-            name="credentials-critical",
+            name="credentials-high",
             category="credentials",
-            risk_level="critical",
+            risk_level="high",
             pattern=r"password=.*",
             flag_name="password",
             annotation="Password detected",
@@ -316,9 +316,9 @@ class TestOutputGuardPatternStorage:
         patterns = db.list_output_guard_patterns()
         assert len(patterns) == 3
         # Ordered by category then priority desc
-        assert patterns[0]["name"] == "credentials-critical"
-        assert patterns[1]["name"] == "credentials-low"
-        assert patterns[2]["name"] == "secrets-high"
+        assert patterns[0]["name"] == "credentials-high"
+        assert patterns[1]["name"] == "secrets-high"
+        assert patterns[2]["name"] == "credentials-low"
 
     def test_list_output_guard_patterns_enabled_only(self, db: SQLiteBackend) -> None:
         db.create_output_guard_pattern(
@@ -334,7 +334,7 @@ class TestOutputGuardPatternStorage:
         db.create_output_guard_pattern(
             pattern_id=_make_id(),
             name="inactive-pattern",
-            category="secrets",
+            category="credentials",
             risk_level="low",
             pattern=r"test_.*",
             flag_name="test",
@@ -361,8 +361,8 @@ class TestOutputGuardPatternStorage:
         ok = db.update_output_guard_pattern(
             pid,
             name="updated-pattern",
-            category="secrets",
-            risk_level="critical",
+            category="credentials",
+            risk_level="high",
             pattern=r"new_pattern",
             flag_name="new_flag",
             annotation="Updated annotation",
@@ -374,8 +374,8 @@ class TestOutputGuardPatternStorage:
         p = db.get_output_guard_pattern(pid)
         assert p is not None
         assert p["name"] == "updated-pattern"
-        assert p["category"] == "secrets"
-        assert p["risk_level"] == "critical"
+        assert p["category"] == "credentials"
+        assert p["risk_level"] == "high"
         assert p["pattern"] == r"new_pattern"
         assert p["flag_name"] == "new_flag"
         assert p["annotation"] == "Updated annotation"

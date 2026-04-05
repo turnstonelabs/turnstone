@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import types
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -32,18 +33,6 @@ log = logging.getLogger(__name__)
 
 # -- Public dataclasses ------------------------------------------------------
 
-_VALID_RISK_LEVELS = frozenset({"critical", "high", "medium", "low"})
-_VALID_TIERS = frozenset({"critical", "high", "medium", "low"})
-_VALID_RECOMMENDATIONS = frozenset({"approve", "review", "deny"})
-_VALID_CATEGORIES = frozenset(
-    {
-        "prompt_injection",
-        "credentials",
-        "encoded_payloads",
-        "adversarial_urls",
-        "info_disclosure",
-    }
-)
 _TIER_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _RE_FLAGS_MAP = {
     "IGNORECASE": re.IGNORECASE,
@@ -110,9 +99,11 @@ class RuleRegistry:
         return self._heuristic_rules
 
     @property
-    def output_patterns(self) -> dict[str, tuple[OutputGuardPatternDef, ...]]:
+    def output_patterns(
+        self,
+    ) -> types.MappingProxyType[str, tuple[OutputGuardPatternDef, ...]]:
         """Immutable snapshot of output guard patterns grouped by category."""
-        return self._output_patterns
+        return types.MappingProxyType(self._output_patterns)
 
     @property
     def version(self) -> int:
