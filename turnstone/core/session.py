@@ -886,9 +886,30 @@ class ChatSession:
             self._tool_error_flags[call_id] = True
         self.ui.on_tool_result(call_id, name, output, is_error=is_error)
 
-    def _truncate_output(self, output: str) -> str:
-        """Truncate tool output to self.tool_truncation chars, keeping head + tail."""
+    def _remaining_token_budget(self) -> int:
+        """Estimate how many tokens are available for new content.
+
+        Reserves space for ``max_tokens`` (model response) and a 5% safety
+        margin.  Returns at least 0.
+        """
+        used = self._system_tokens + sum(self._msg_tokens)
+        reserved = self.max_tokens + int(self.context_window * 0.05)
+        return max(0, self.context_window - used - reserved)
+
+    def _truncate_output(self, output: str, remaining_budget_tokens: int | None = None) -> str:
+        """Truncate tool output, keeping head + tail.
+
+        The effective limit is the *minimum* of:
+        - ``self.tool_truncation`` (fixed cap, defaults to 50% of context)
+        - ``remaining_budget_tokens`` converted to chars (if provided)
+
+        This ensures a single tool result cannot overflow the context window
+        even when the conversation is already partially full.
+        """
         limit = self.tool_truncation
+        if remaining_budget_tokens is not None:
+            budget_chars = int(remaining_budget_tokens * self._chars_per_token)
+            limit = min(limit, max(256, budget_chars))
         if len(output) <= limit:
             return output
         half = limit // 2
@@ -1580,7 +1601,40 @@ class ChatSession:
                 self._emit_state("thinking")
                 self.ui.on_thinking_start()
                 try:
-                    stream = self._create_stream_with_retry(msgs)
+                    try:
+                        stream = self._create_stream_with_retry(msgs)
+                    except Exception as ctx_err:
+                        # Context overflow recovery: if the API rejects the
+                        # request due to exceeding the context window, compact
+                        # the conversation and retry once.
+                        err_text = str(ctx_err).lower()
+                        is_ctx_overflow = any(
+                            s in err_text
+                            for s in (
+                                "context length",
+                                "maximum context",
+                                "too many tokens",
+                                "prompt is too long",
+                                "input tokens",
+                            )
+                        )
+                        if not is_ctx_overflow:
+                            raise
+                        log.warning(
+                            "Context overflow detected (%s), compacting and retrying",
+                            type(ctx_err).__name__,
+                        )
+                        self.ui.on_info("\n[Context overflow — auto-compacting and retrying]")
+                        try:
+                            self._compact_messages(auto=True)
+                            msgs = self._full_messages()
+                            stream = self._create_stream_with_retry(msgs)
+                        except Exception:
+                            log.warning(
+                                "Compact-and-retry failed, raising original error",
+                                exc_info=True,
+                            )
+                            raise ctx_err from None
                     assistant_msg = self._stream_response(stream, my_generation)
                 finally:
                     # Only clear if this generation is still active —
@@ -1745,6 +1799,12 @@ class ChatSession:
                                     p["text"] = self._evaluate_output(
                                         tc_id, p["text"], _tc_names.get(tc_id, "")
                                     )
+
+                    # Safety truncation: clamp output to remaining context budget
+                    # so a single large result cannot overflow the context window.
+                    if isinstance(output, str):
+                        budget = self._remaining_token_budget()
+                        output = self._truncate_output(output, remaining_budget_tokens=budget)
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
@@ -6286,6 +6346,7 @@ class ChatSession:
             self._report_tool_result(call_id, "web_search", msg, is_error=True)
             return call_id, msg
 
+        output = self._truncate_output(output)
         self._report_tool_result(call_id, "web_search", output)
         return call_id, output
 
