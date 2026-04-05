@@ -756,7 +756,6 @@ class TestServerHealthMetrics:
         data = json.loads(body)
         assert "backend" in data
         assert data["backend"]["status"] in ("up", "down")
-        assert data["backend"]["circuit_state"] in ("closed", "open", "half_open")
 
     def test_metrics_contains_sse_connections(self):
         _, _, body = self._get("/metrics")
@@ -770,9 +769,10 @@ class TestServerHealthMetrics:
         _, _, body = self._get("/metrics")
         assert "turnstone_backend_up" in body
 
-    def test_metrics_contains_circuit_state(self):
+    def test_metrics_no_circuit_state(self):
+        """Circuit state metric was removed (passive health tracking only)."""
         _, _, body = self._get("/metrics")
-        assert "turnstone_circuit_state" in body
+        assert "turnstone_circuit_state" not in body
 
     def test_metrics_contains_eviction_counter(self):
         _, _, body = self._get("/metrics")

@@ -2155,12 +2155,11 @@ function pollHealth() {
         el.textContent = "backend down";
         el.className = "health-degraded";
         el.title =
-          "Circuit: " +
-          ((data.backend && data.backend.circuit_state) || "unknown");
+          "Backend: " + ((data.backend && data.backend.status) || "unknown");
         el.setAttribute(
           "aria-label",
-          "Backend degraded. Circuit: " +
-            ((data.backend && data.backend.circuit_state) || "unknown"),
+          "Backend degraded: " +
+            ((data.backend && data.backend.status) || "unknown"),
         );
       } else {
         el.textContent = "";
@@ -2825,12 +2824,7 @@ function updateDashFooter(agg) {
     parts.push(formatUptime(agg.uptime_seconds) + " uptime");
   statsEl.textContent = parts.join(" \u00b7 ");
   if (_lastHealth && _lastHealth.status === "degraded") {
-    statsEl.textContent +=
-      " \u00b7 backend down (circuit " +
-      (_lastHealth.backend && _lastHealth.backend.circuit_state
-        ? _lastHealth.backend.circuit_state
-        : "unknown") +
-      ")";
+    statsEl.textContent += " \u00b7 backend degraded";
   }
 }
 

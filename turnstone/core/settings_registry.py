@@ -44,6 +44,17 @@ def _build_registry() -> dict[str, SettingDef]:
             help="Which AI model to use for conversations. Leave empty to use the provider's default.",
         ),
         SettingDef(
+            "model.default_alias",
+            "str",
+            "",
+            "Default model alias for new sessions (empty = use config.toml [model].default)",
+            "model",
+            help="Which named model alias to use for new sessions. When empty, falls back to "
+            "the [model].default setting in config.toml (which defaults to 'default'). "
+            "Change this at runtime to switch all new sessions to a different model "
+            "without restarting.",
+        ),
+        SettingDef(
             "model.temperature",
             "float",
             0.5,
@@ -335,43 +346,15 @@ def _build_registry() -> dict[str, SettingDef]:
         ),
         # -- health ---------------------------------------------------------
         SettingDef(
-            "health.backend_probe_interval",
-            "int",
-            30,
-            "Backend health probe interval in seconds",
-            "health",
-            min_value=5,
-            help="How often to check whether the AI model backend (e.g. OpenAI API) is reachable.",
-        ),
-        SettingDef(
-            "health.backend_probe_timeout",
+            "health.failure_threshold",
             "int",
             5,
-            "Backend health probe timeout in seconds",
+            "Consecutive failures before backend is marked degraded",
             "health",
             min_value=1,
-        ),
-        SettingDef(
-            "health.circuit_breaker_threshold",
-            "int",
-            5,
-            "Consecutive failures before circuit opens",
-            "health",
-            min_value=1,
-            help="If the AI backend fails this many times in a row, the circuit breaker trips "
-            "and stops sending requests for a cooldown period. This prevents cascading failures "
-            "and wasted API calls when the backend is down.",
-            reference_url="https://martinfowler.com/bliki/CircuitBreaker.html",
-        ),
-        SettingDef(
-            "health.circuit_breaker_cooldown",
-            "int",
-            60,
-            "Seconds before half-open retry",
-            "health",
-            min_value=5,
-            help="After the circuit breaker trips, wait this long before sending a single test "
-            "request to see if the backend has recovered.",
+            help="If the AI backend fails this many times in a row, it is marked as degraded. "
+            "Degraded backends are deprioritised in the fallback chain but requests are never "
+            "blocked. The backend recovers automatically when a request succeeds.",
         ),
         # -- judge ----------------------------------------------------------
         SettingDef(

@@ -212,9 +212,9 @@ def _resolve_openai_provider(provider: str, base_url: str) -> str:
 
 
 def load_model_registry(
-    base_url: str,
-    api_key: str,
-    model: str,
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
     context_window: int = 32768,
     provider: str = "openai",
     storage: Any | None = None,
@@ -296,8 +296,9 @@ def load_model_registry(
         )
 
     # 3. Ensure a "default" entry from CLI args (only if not already defined
-    # by config.toml or DB — those take precedence)
-    if "default" not in configs:
+    # by config.toml or DB — those take precedence, and only when a CLI
+    # model was actually provided)
+    if "default" not in configs and model:
         configs["default"] = ModelConfig(
             alias="default",
             base_url=base_url,
@@ -307,11 +308,24 @@ def load_model_registry(
             provider=_resolve_openai_provider(provider, base_url),
         )
 
+    if not configs:
+        raise ValueError(
+            "No model definitions found. Provide --model, configure [models.*] "
+            "in config.toml, or add model definitions in the admin panel."
+        )
+
     # Determine default alias
     default_alias = model_section.get("default", "default")
     if default_alias not in configs:
-        log.warning("Configured default model '%s' not found, using 'default'", default_alias)
-        default_alias = "default"
+        if "default" in configs:
+            default_alias = "default"
+        else:
+            default_alias = next(iter(configs))
+            log.info(
+                "No '%s' model alias; using '%s' as default",
+                model_section.get("default", "default"),
+                default_alias,
+            )
 
     # Fallback chain
     fallback_raw = model_section.get("fallback", [])

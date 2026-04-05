@@ -29,7 +29,6 @@ class MetricsCollector:
         self._context_ratio: float = 0.0
         self._sse_connections: int = 0  # gauge: active SSE connections
         self._backend_up: bool = True  # gauge: 1 if up, 0 if down
-        self._circuit_state: int = 0  # gauge: 0=closed, 1=open, 2=half_open
         # counters (continued)
         self._ratelimit_rejects: int = 0  # counter: total 429 responses
         self._evictions: int = 0  # counter: workstreams evicted
@@ -101,11 +100,6 @@ class MetricsCollector:
         with self._lock:
             self._backend_up = up
 
-    def set_circuit_state(self, state: int) -> None:
-        """0=closed, 1=open, 2=half_open."""
-        with self._lock:
-            self._circuit_state = state
-
     def record_eviction(self) -> None:
         with self._lock:
             self._evictions += 1
@@ -172,7 +166,6 @@ class MetricsCollector:
             sse_connections = self._sse_connections
             ratelimit_rejects = self._ratelimit_rejects
             backend_up = self._backend_up
-            circuit_state = self._circuit_state
             evictions = self._evictions
             judge_verdicts = dict(self._judge_verdicts)
             judge_latency = dict(self._judge_latency)
@@ -275,13 +268,6 @@ class MetricsCollector:
             "turnstone_backend_up",
             "Whether the LLM backend is reachable (1=up, 0=down)",
             1 if backend_up else 0,
-        )
-
-        # turnstone_circuit_state
-        gauge(
-            "turnstone_circuit_state",
-            "Circuit breaker state (0=closed, 1=open, 2=half_open)",
-            circuit_state,
         )
 
         # turnstone_workstreams_evicted_total

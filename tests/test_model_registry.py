@@ -952,71 +952,113 @@ class TestExtractContextWindow:
         m.model_dump.return_value = {}
         assert _extract_context_window(m, "openai") is None
 
+    # Model-change detection via active probes was removed.
+    # Backend health is now tracked passively (see test_healthcheck.py).
 
-class TestHealthMonitorModelChange:
-    def test_model_change_fires_callback(self) -> None:
-        from turnstone.core.healthcheck import BackendHealthMonitor
 
-        changes: list[tuple[str, int | None]] = []
+# ---------------------------------------------------------------------------
+# load_model_registry — DB-only startup (no CLI model)
+# ---------------------------------------------------------------------------
 
-        def on_change(model_id: str, ctx: int | None) -> None:
-            changes.append((model_id, ctx))
 
-        client = MagicMock()
-        monitor = BackendHealthMonitor(
-            client=client,
-            provider="openai",
-            initial_model="model-a",
-            on_model_changed=on_change,
+class TestLoadModelRegistryDBOnly:
+    """Tests for starting the server with models defined only in DB/config,
+    without any CLI --model argument."""
+
+    def test_db_only_no_cli_model(self) -> None:
+        """Registry builds from DB models when model='' (no CLI model)."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "cloud",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+            ]
         )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(model="", storage=storage)
+        assert reg.count == 1
+        assert reg.has_alias("cloud")
+        # "cloud" should be picked as default since "default" doesn't exist
+        assert reg.default == "cloud"
 
-        # Simulate probe returning a different model
-        resp = MagicMock()
-        m = MagicMock()
-        m.id = "model-b"
-        m.model_dump.return_value = {"max_model_len": 131072}
-        resp.data = [m]
-
-        monitor._check_model_change(resp)
-        assert len(changes) == 1
-        assert changes[0] == ("model-b", 131072)
-        assert monitor._last_detected_model == "model-b"
-
-    def test_same_model_no_callback(self) -> None:
-        from turnstone.core.healthcheck import BackendHealthMonitor
-
-        changes: list[tuple[str, int | None]] = []
-
-        def on_change(model_id: str, ctx: int | None) -> None:
-            changes.append((model_id, ctx))
-
-        client = MagicMock()
-        monitor = BackendHealthMonitor(
-            client=client,
-            provider="openai",
-            initial_model="model-a",
-            on_model_changed=on_change,
+    def test_db_only_with_config_default(self) -> None:
+        """Config [model].default is respected when it matches a DB alias."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "fast",
+                    "model": "gpt-4o-mini",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+                {
+                    "alias": "smart",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+            ]
         )
+        fake_cfg: dict[str, Any] = {"model": {"default": "smart"}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(model="", storage=storage)
+        assert reg.default == "smart"
 
-        resp = MagicMock()
-        m = MagicMock()
-        m.id = "model-a"
-        m.model_dump.return_value = {}
-        resp.data = [m]
+    def test_config_toml_only_no_cli_model(self) -> None:
+        """Registry builds from config.toml [models.*] when model=''."""
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "local": {
+                    "model": "qwen3-32b",
+                    "base_url": "http://localhost:8000/v1",
+                    "api_key": "dummy",
+                },
+            },
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry(model="")
+        assert reg.count == 1
+        assert reg.default == "local"
 
-        monitor._check_model_change(resp)
-        assert len(changes) == 0
+    def test_no_models_anywhere_raises(self) -> None:
+        """ValueError when no models from CLI, config, or DB."""
+        with (
+            patch("turnstone.core.model_registry.load_config", return_value={}),
+            pytest.raises(ValueError, match="No model definitions found"),
+        ):
+            load_model_registry(model="")
 
-    def test_no_callback_configured(self) -> None:
-        from turnstone.core.healthcheck import BackendHealthMonitor
-
-        client = MagicMock()
-        monitor = BackendHealthMonitor(client=client, initial_model="model-a")
-
-        resp = MagicMock()
-        m = MagicMock()
-        m.id = "model-b"
-        resp.data = [m]
-
-        # Should not raise
-        monitor._check_model_change(resp)
+    def test_no_default_entry_created_when_model_empty(self) -> None:
+        """When model='', no 'default' alias is created from CLI args."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "cloud",
+                    "model": "gpt-5",
+                    "provider": "openai",
+                    "base_url": "https://api.openai.com/v1",
+                    "api_key": "sk-test",
+                    "context_window": 128000,
+                    "capabilities": "{}",
+                    "enabled": True,
+                },
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry(model="", storage=storage)
+        assert not reg.has_alias("default")

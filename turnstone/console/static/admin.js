@@ -4098,6 +4098,7 @@ function _pollInstallStatus(serverId, serverName, attempt) {
 // ---------------------------------------------------------------------------
 
 var _modelDefs = [];
+var _modelDefaultAlias = "";
 var _modelCreateTrap = null;
 var _modelCreateTrigger = null;
 
@@ -4109,6 +4110,7 @@ function loadAdminModels() {
     })
     .then(function (data) {
       _modelDefs = data.models || [];
+      _modelDefaultAlias = data.default_alias || "";
       _renderModels(_modelDefs);
     })
     .catch(function () {
@@ -4161,7 +4163,8 @@ function _renderModels(items) {
     row.className = "admin-row models-grid " + rowClass;
     row.setAttribute("role", "listitem");
 
-    // Alias + source badge
+    // Alias + source badge + default badge
+    var isDefault = m.alias === _modelDefaultAlias;
     var colAlias = document.createElement("span");
     colAlias.className = "admin-col";
     colAlias.textContent = m.alias;
@@ -4172,6 +4175,13 @@ function _renderModels(items) {
     badge.textContent = isConfig ? "config" : "db";
     colAlias.appendChild(document.createTextNode(" "));
     colAlias.appendChild(badge);
+    if (isDefault) {
+      var defBadge = document.createElement("span");
+      defBadge.className = "scope-badge scope-default";
+      defBadge.textContent = "default";
+      colAlias.appendChild(document.createTextNode(" "));
+      colAlias.appendChild(defBadge);
+    }
     row.appendChild(colAlias);
 
     // Model ID
@@ -4210,11 +4220,21 @@ function _renderModels(items) {
     // Actions
     var colActions = document.createElement("span");
     colActions.className = "admin-col";
+    if (!isDefault && m.enabled) {
+      var defBtn = document.createElement("button");
+      defBtn.className = "admin-btn-action";
+      defBtn.textContent = "set default";
+      defBtn.setAttribute("data-model-set-default", m.alias);
+      defBtn.setAttribute("aria-label", "Set " + m.alias + " as default model");
+      defBtn.setAttribute("title", "Set " + m.alias + " as default model");
+      colActions.appendChild(defBtn);
+    }
     if (!isConfig) {
       var editBtn = document.createElement("button");
       editBtn.className = "admin-btn-action";
       editBtn.textContent = "edit";
       editBtn.setAttribute("data-model-edit", m.definition_id);
+      editBtn.setAttribute("title", "Edit " + m.alias);
       colActions.appendChild(editBtn);
 
       var delBtn = document.createElement("button");
@@ -4222,6 +4242,7 @@ function _renderModels(items) {
       delBtn.textContent = "del";
       delBtn.setAttribute("data-model-delete", m.definition_id);
       delBtn.setAttribute("data-model-alias", m.alias);
+      delBtn.setAttribute("title", "Delete " + m.alias);
       colActions.appendChild(delBtn);
     }
     row.appendChild(colActions);
@@ -4230,6 +4251,30 @@ function _renderModels(items) {
   }
 
   // Bind event handlers
+  el.querySelectorAll("[data-model-set-default]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var alias = this.getAttribute("data-model-set-default");
+      var self = this;
+      self.disabled = true;
+      self.textContent = "setting\u2026";
+      authFetch("/v1/api/admin/settings/model.default_alias", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ value: alias }),
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error();
+          showToast("Default model set to " + alias);
+          _flagModelSyncPending();
+          loadAdminModels();
+        })
+        .catch(function () {
+          showToast("Failed to set default model");
+          self.disabled = false;
+          self.textContent = "set default";
+        });
+    });
+  });
   el.querySelectorAll("[data-model-edit]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       showEditModelModal(this.getAttribute("data-model-edit"));

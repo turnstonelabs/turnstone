@@ -653,25 +653,21 @@ function buildNodeRow(node) {
         '%"></span>'
       : "";
 
-  var circuitTitle = "";
+  var healthTitle = "";
   if (node.health && node.health.backend) {
-    circuitTitle =
-      "backend: " +
-      node.health.backend.status +
-      ", circuit: " +
-      node.health.backend.circuit_state;
+    healthTitle = "backend: " + node.health.backend.status;
   }
   var degradedBadge = isDegraded
     ? '<span class="node-degraded-badge" title="' +
-      escapeHtml(circuitTitle) +
+      escapeHtml(healthTitle) +
       '" aria-label="' +
-      escapeHtml(circuitTitle) +
+      escapeHtml(healthTitle) +
       '">degraded</span>'
     : "";
 
   row.innerHTML =
     '<span class="node-cell node-cell-name"' +
-    (circuitTitle ? ' title="' + escapeHtml(circuitTitle) + '"' : "") +
+    (healthTitle ? ' title="' + escapeHtml(healthTitle) + '"' : "") +
     '><span class="' +
     dotClass +
     '"></span>' +

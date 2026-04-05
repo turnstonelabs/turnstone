@@ -1,4 +1,4 @@
-"""Tests for turnstone.core.healthcheck — backend health monitor with circuit breaker."""
+"""Tests for turnstone.core.healthcheck — passive backend health tracking."""
 
 from __future__ import annotations
 
@@ -10,39 +10,16 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-from turnstone.core.healthcheck import BackendHealthMonitor, CircuitState
+from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
 
 # ---------------------------------------------------------------------------
-# CircuitState enum
+# Fixtures
 # ---------------------------------------------------------------------------
-
-
-class TestCircuitState:
-    def test_closed(self) -> None:
-        assert CircuitState.CLOSED.value == "closed"
-
-    def test_open(self) -> None:
-        assert CircuitState.OPEN.value == "open"
-
-    def test_half_open(self) -> None:
-        assert CircuitState.HALF_OPEN.value == "half_open"
-
-
-# ---------------------------------------------------------------------------
-# BackendHealthMonitor
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def mock_client() -> MagicMock:
-    client = MagicMock()
-    client.models.list.return_value.data = [MagicMock(id="test-model")]
-    return client
 
 
 @pytest.fixture
 def mock_metrics() -> Generator[MagicMock]:
-    """Patch the metrics singleton so set_backend_status / set_circuit_state exist."""
+    """Patch the metrics singleton so set_backend_status exists."""
     m = MagicMock()
     with (
         patch("turnstone.core.healthcheck.metrics", m, create=True),
@@ -51,240 +28,185 @@ def mock_metrics() -> Generator[MagicMock]:
         yield m
 
 
-def _make_monitor(
-    client: MagicMock,
-    failure_threshold: int = 3,
-    cooldown: float = 60.0,
-) -> BackendHealthMonitor:
-    return BackendHealthMonitor(
-        client=client,
-        probe_interval=1.0,
-        probe_timeout=1.0,
-        failure_threshold=failure_threshold,
-        cooldown=cooldown,
-    )
+def _make_tracker(failure_threshold: int = 3) -> BackendHealthTracker:
+    return BackendHealthTracker(failure_threshold=failure_threshold)
 
 
-class TestBackendHealthMonitor:
-    def test_starts_closed(self, mock_client: MagicMock) -> None:
-        mon = _make_monitor(mock_client)
-        assert mon.circuit_state == CircuitState.CLOSED
-        assert mon.is_healthy is True
+# ---------------------------------------------------------------------------
+# BackendHealthTracker
+# ---------------------------------------------------------------------------
 
-    def test_record_failure_increments(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """Failures below threshold do not open the circuit."""
-        mon = _make_monitor(mock_client, failure_threshold=5)
+
+class TestBackendHealthTracker:
+    def test_starts_healthy(self) -> None:
+        t = _make_tracker()
+        assert t.is_healthy is True
+        assert t.is_degraded is False
+        assert t.consecutive_failures == 0
+
+    def test_failures_below_threshold(self, mock_metrics: MagicMock) -> None:
+        """Failures below threshold do not degrade."""
+        t = _make_tracker(failure_threshold=5)
         for _ in range(4):
-            mon.record_failure()
-        assert mon.circuit_state == CircuitState.CLOSED
+            t.record_failure()
+        assert t.is_healthy is True
+        assert t.consecutive_failures == 4
 
-    def test_opens_after_threshold(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        mon = _make_monitor(mock_client, failure_threshold=3)
+    def test_degrades_at_threshold(self, mock_metrics: MagicMock) -> None:
+        t = _make_tracker(failure_threshold=3)
         for _ in range(3):
-            mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
-        assert mon.is_healthy is False
+            t.record_failure()
+        assert t.is_degraded is True
+        assert t.is_healthy is False
 
-    def test_should_reject_when_open(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        mon = _make_monitor(mock_client, failure_threshold=1, cooldown=9999.0)
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
-        assert mon.acquire_request_permit() is False
+    def test_stays_degraded_on_more_failures(self, mock_metrics: MagicMock) -> None:
+        t = _make_tracker(failure_threshold=2)
+        for _ in range(5):
+            t.record_failure()
+        assert t.is_degraded is True
+        assert t.consecutive_failures == 5
 
-    @patch("turnstone.core.healthcheck.time")
-    def test_half_open_after_cooldown(
-        self, mock_time: MagicMock, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """After cooldown elapses, should_allow_request transitions to HALF_OPEN."""
-        t = 1000.0
-        mock_time.monotonic.return_value = t
+    def test_success_clears_degraded(self, mock_metrics: MagicMock) -> None:
+        t = _make_tracker(failure_threshold=2)
+        t.record_failure()
+        t.record_failure()
+        assert t.is_degraded is True
+        t.record_success()
+        assert t.is_healthy is True
+        assert t.consecutive_failures == 0
 
-        mon = _make_monitor(mock_client, failure_threshold=1, cooldown=60.0)
-        # Override _last_state_change to use our mocked time
-        mon._last_state_change = t
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+    def test_success_resets_failure_count(self, mock_metrics: MagicMock) -> None:
+        t = _make_tracker(failure_threshold=5)
+        for _ in range(4):
+            t.record_failure()
+        t.record_success()
+        assert t.consecutive_failures == 0
+        # Should need 5 more failures to degrade
+        for _ in range(4):
+            t.record_failure()
+        assert t.is_healthy is True
 
-        # Advance past cooldown
-        mock_time.monotonic.return_value = t + 61.0
-        assert mon.acquire_request_permit() is True
-        assert mon.circuit_state == CircuitState.HALF_OPEN  # type: ignore[comparison-overlap]
+    def test_state_changed_callback_on_degrade(self, mock_metrics: MagicMock) -> None:
+        events: list[str] = []
+        t = BackendHealthTracker(failure_threshold=2, on_state_changed=events.append)
+        t.record_failure()
+        assert events == []
+        t.record_failure()
+        assert events == ["degraded"]
 
-    def test_success_resets(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        """record_success resets failures and closes circuit from any state."""
-        mon = _make_monitor(mock_client, failure_threshold=1)
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+    def test_state_changed_callback_on_recover(self, mock_metrics: MagicMock) -> None:
+        events: list[str] = []
+        t = BackendHealthTracker(failure_threshold=1, on_state_changed=events.append)
+        t.record_failure()
+        assert events == ["degraded"]
+        t.record_success()
+        assert events == ["degraded", "healthy"]
 
-        mon.record_success()
-        assert mon.circuit_state == CircuitState.CLOSED  # type: ignore[comparison-overlap]
-        assert mon.is_healthy is True
-        # Internal counter should be reset
-        assert mon._consecutive_failures == 0
+    def test_no_callback_when_already_degraded(self, mock_metrics: MagicMock) -> None:
+        """Extra failures after degraded don't fire again."""
+        events: list[str] = []
+        t = BackendHealthTracker(failure_threshold=1, on_state_changed=events.append)
+        t.record_failure()
+        t.record_failure()
+        t.record_failure()
+        assert events == ["degraded"]  # only once
 
-    def test_should_allow_when_closed(self, mock_client: MagicMock) -> None:
-        mon = _make_monitor(mock_client)
-        assert mon.acquire_request_permit() is True
+    def test_no_callback_when_already_healthy(self, mock_metrics: MagicMock) -> None:
+        """Success while healthy doesn't fire."""
+        events: list[str] = []
+        t = BackendHealthTracker(failure_threshold=3, on_state_changed=events.append)
+        t.record_success()
+        t.record_success()
+        assert events == []
 
-    def test_half_open_allows_only_one_request(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """HALF_OPEN permits exactly one probe; subsequent callers are blocked."""
-        mon = _make_monitor(mock_client, failure_threshold=1)
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+    def test_no_direct_metrics_calls(self) -> None:
+        """Tracker does not touch metrics — the server callback handles it."""
+        t = _make_tracker(failure_threshold=1)
+        t.record_failure()
+        t.record_success()
+        # No assertion on metrics — the tracker delegates metric updates
+        # to the server-level callback via on_state_changed
 
-        # Force into HALF_OPEN with permit
-        with mon._lock:
-            mon._state = CircuitState.HALF_OPEN
-            mon._half_open_permit = True
 
-        # First caller gets through
-        assert mon.acquire_request_permit() is True
-        # Second caller is blocked
-        assert mon.acquire_request_permit() is False
-        # Third caller is also blocked
-        assert mon.acquire_request_permit() is False
+# ---------------------------------------------------------------------------
+# HealthTrackerRegistry
+# ---------------------------------------------------------------------------
 
-    def test_half_open_success_reopens_to_all(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """After probe succeeds in HALF_OPEN, circuit closes and all requests pass."""
-        mon = _make_monitor(mock_client, failure_threshold=1)
-        mon.record_failure()
-        with mon._lock:
-            mon._state = CircuitState.HALF_OPEN
-            mon._half_open_permit = False  # permit already consumed
 
-        # Probe succeeds
-        mon.record_success()
-        assert mon.circuit_state == CircuitState.CLOSED  # type: ignore[comparison-overlap]
-        # All callers pass now
-        assert mon.acquire_request_permit() is True
-        assert mon.acquire_request_permit() is True
+class TestHealthTrackerRegistry:
+    def test_same_backend_shares_tracker(self, mock_metrics: MagicMock) -> None:
+        """Two aliases on the same (provider, base_url) share a tracker."""
+        reg = HealthTrackerRegistry(failure_threshold=5)
+        t1 = reg.get_tracker("openai", "https://api.openai.com/v1")
+        t2 = reg.get_tracker("openai", "https://api.openai.com/v1")
+        assert t1 is t2
 
-    def test_half_open_failure_blocks_all(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """After probe fails in HALF_OPEN, circuit reopens and all requests blocked."""
-        mon = _make_monitor(mock_client, failure_threshold=1, cooldown=9999.0)
-        mon.record_failure()
-        with mon._lock:
-            mon._state = CircuitState.HALF_OPEN
-            mon._half_open_permit = False
+    def test_different_backends_independent(self, mock_metrics: MagicMock) -> None:
+        """Different (provider, base_url) pairs get independent trackers."""
+        reg = HealthTrackerRegistry(failure_threshold=5)
+        t_cloud = reg.get_tracker("openai", "https://api.openai.com/v1")
+        t_local = reg.get_tracker("openai-compatible", "http://localhost:8000/v1")
+        assert t_cloud is not t_local
 
-        # Probe fails
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
-        assert mon.acquire_request_permit() is False
+    def test_trailing_slash_normalized(self, mock_metrics: MagicMock) -> None:
+        """Trailing slashes on base_url are normalized away."""
+        reg = HealthTrackerRegistry(failure_threshold=5)
+        t1 = reg.get_tracker("openai", "https://api.openai.com/v1/")
+        t2 = reg.get_tracker("openai", "https://api.openai.com/v1")
+        assert t1 is t2
 
-    def test_half_open_failure_reopens(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """A failure in HALF_OPEN re-opens the circuit immediately."""
-        mon = _make_monitor(mock_client, failure_threshold=1)
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+    def test_degraded_isolation(self, mock_metrics: MagicMock) -> None:
+        """Degrading one backend does not affect another."""
+        reg = HealthTrackerRegistry(failure_threshold=2)
+        t_cloud = reg.get_tracker("openai", "https://api.openai.com/v1")
+        t_local = reg.get_tracker("openai-compatible", "http://localhost:8000/v1")
+        # Degrade the cloud tracker
+        t_cloud.record_failure()
+        t_cloud.record_failure()
+        assert t_cloud.is_degraded is True
+        # Local should be unaffected
+        assert t_local.is_healthy is True
 
-        # Force into HALF_OPEN
-        with mon._lock:
-            mon._state = CircuitState.HALF_OPEN
-            mon._update_metrics()
+    def test_get_tracker_for_alias(self, mock_metrics: MagicMock) -> None:
+        """get_tracker_for_alias looks up by model config's backend."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
 
-        # Another failure should reopen
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+        models = {
+            "cloud": ModelConfig(
+                "cloud", "https://api.openai.com/v1", "sk", "gpt-4o", provider="openai"
+            ),
+            "local": ModelConfig(
+                "local", "http://localhost:8000/v1", "x", "qwen", provider="openai-compatible"
+            ),
+        }
+        model_reg = ModelRegistry(models=models, default="cloud")
 
-    def test_probe_success_closes(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        """A successful probe closes the circuit."""
-        mon = _make_monitor(mock_client, failure_threshold=1)
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+        reg = HealthTrackerRegistry(failure_threshold=5)
+        # No tracker created yet — should return None
+        assert reg.get_tracker_for_alias(model_reg, "cloud") is None
 
-        # Simulate probe success
-        assert mon._probe_once() is True
-        mon.record_success()
-        assert mon.circuit_state == CircuitState.CLOSED  # type: ignore[comparison-overlap]
+        # Create a tracker for the cloud backend
+        t = reg.get_tracker("openai", "https://api.openai.com/v1")
+        assert reg.get_tracker_for_alias(model_reg, "cloud") is t
 
-    def test_probe_failure_opens(self, mock_client: MagicMock, mock_metrics: MagicMock) -> None:
-        """Enough probe failures open the circuit."""
-        mock_client.with_options.return_value.models.list.side_effect = ConnectionError("down")
-        mon = _make_monitor(mock_client, failure_threshold=2)
+        # Local alias should still return None (no tracker for that backend)
+        assert reg.get_tracker_for_alias(model_reg, "local") is None
 
-        assert mon._probe_once() is False
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.CLOSED  # only 1 failure
-
-        assert mon._probe_once() is False
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN  # type: ignore[comparison-overlap]
-
-    def test_probe_loop_autonomous_recovery(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """_probe_loop transitions OPEN → HALF_OPEN → CLOSED without user requests."""
-        # Use very short intervals so the test is fast
-        mon = BackendHealthMonitor(
-            client=mock_client,
-            probe_interval=0.05,
-            probe_timeout=1.0,
-            failure_threshold=1,
-            cooldown=0.1,
+    def test_state_changed_callback(self, mock_metrics: MagicMock) -> None:
+        """on_state_changed fires with backend key and state."""
+        events: list[tuple[str, str]] = []
+        reg = HealthTrackerRegistry(
+            failure_threshold=2,
+            on_state_changed=lambda backend, state: events.append((backend, state)),
         )
-        # Trip the circuit
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
+        t = reg.get_tracker("openai", "https://api.openai.com/v1")
+        t.record_failure()
+        t.record_failure()  # triggers degraded
+        assert len(events) == 1
+        assert events[0][0] == "openai:https://api.openai.com/v1"
+        assert events[0][1] == "degraded"
 
-        # Backend is healthy — probe_once will succeed
-        mock_client.with_options.return_value.models.list.return_value = MagicMock()
-
-        # Start the probe loop and wait for autonomous recovery
-        mon.start()
-        try:
-            import time
-
-            deadline = time.monotonic() + 5.0
-            while mon.circuit_state != CircuitState.CLOSED and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert mon.circuit_state == CircuitState.CLOSED
-            # User requests should flow again without anyone calling acquire_request_permit
-            assert mon.acquire_request_permit() is True
-        finally:
-            mon.stop()
-            if mon._thread:
-                mon._thread.join(timeout=2.0)
-
-    def test_probe_loop_no_user_permit_during_probe(
-        self, mock_client: MagicMock, mock_metrics: MagicMock
-    ) -> None:
-        """While background probe is in HALF_OPEN, user requests are blocked."""
-        mon = BackendHealthMonitor(
-            client=mock_client,
-            probe_interval=0.05,
-            probe_timeout=1.0,
-            failure_threshold=1,
-            cooldown=0.1,
-        )
-        mon.record_failure()
-        assert mon.circuit_state == CircuitState.OPEN
-
-        # Force into HALF_OPEN as the probe loop would
-        with mon._lock:
-            mon._state = CircuitState.HALF_OPEN
-            mon._half_open_permit = False  # probe consumes it
-
-        # User requests should be blocked — only the probe gets through
-        assert mon.acquire_request_permit() is False
-
-    def test_stop_thread(self, mock_client: MagicMock) -> None:
-        """stop() signals the probe loop to exit."""
-        mon = _make_monitor(mock_client)
-        mon.start()
-        assert mon._thread is not None
-        assert mon._thread.is_alive()
-
-        mon.stop()
-        mon._thread.join(timeout=3.0)
-        assert not mon._thread.is_alive()
+    def test_backend_key_static(self) -> None:
+        """backend_key is a static method returning normalized tuple."""
+        key = HealthTrackerRegistry.backend_key("anthropic", "https://api.anthropic.com/")
+        assert key == ("anthropic", "https://api.anthropic.com")
