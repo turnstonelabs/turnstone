@@ -133,10 +133,7 @@ _CONFIG_MAP: dict[str, dict[str, str]] = {
         "trusted_proxies": "ratelimit_trusted_proxies",
     },
     "health": {
-        "backend_probe_interval": "health_probe_interval",
-        "backend_probe_timeout": "health_probe_timeout",
-        "circuit_breaker_threshold": "circuit_breaker_threshold",
-        "circuit_breaker_cooldown": "circuit_breaker_cooldown",
+        "failure_threshold": "health_failure_threshold",
     },
     "database": {
         "backend": "db_backend",

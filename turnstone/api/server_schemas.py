@@ -145,7 +145,6 @@ class ListSavedWorkstreamsResponse(BaseModel):
 
 class BackendStatus(BaseModel):
     status: str = Field(examples=["up", "down"])
-    circuit_state: str = Field(examples=["closed", "open", "half_open"])
 
 
 class WorkstreamCounts(BaseModel):

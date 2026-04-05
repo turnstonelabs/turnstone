@@ -313,10 +313,10 @@ class NodeSnapshotEvent(ClusterEvent):
 
 @dataclass
 class HealthChangedEvent(ClusterEvent):
-    """Circuit breaker state transition on a server node."""
+    """Backend health state transition on a server node."""
 
     type: str = "health_changed"
-    circuit_state: str = ""
+    backend_status: str = ""  # "healthy" or "degraded"
 
 
 @dataclass

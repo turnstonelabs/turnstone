@@ -418,13 +418,12 @@ class TestCollectorDelta:
         c._nodes["node-a"] = NodeSnapshot(
             node_id="node-a",
             server_url="http://a:8080",
-            health={"status": "ok", "backend": {"status": "up", "circuit_state": "closed"}},
+            health={"status": "ok", "backend": {"status": "up"}},
         )
 
-        c._apply_delta("node-a", {"type": "health_changed", "circuit_state": "open"})
+        c._apply_delta("node-a", {"type": "health_changed", "backend_status": "degraded"})
 
         health = c._nodes["node-a"].health
-        assert health["backend"]["circuit_state"] == "open"
         assert health["backend"]["status"] == "down"
         assert health["status"] == "degraded"
 

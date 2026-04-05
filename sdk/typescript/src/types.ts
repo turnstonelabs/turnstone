@@ -284,7 +284,6 @@ export interface CreateSkillResourceRequest {
 
 export interface BackendStatus {
   status: string;
-  circuit_state: string;
 }
 
 export interface WorkstreamCounts {

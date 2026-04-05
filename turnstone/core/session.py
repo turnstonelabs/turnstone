@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from turnstone.core.config_store import ConfigStore
-    from turnstone.core.healthcheck import BackendHealthMonitor
+    from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
@@ -288,7 +288,7 @@ class ChatSession:
         mcp_client: MCPClientManager | None = None,
         registry: ModelRegistry | None = None,
         model_alias: str | None = None,
-        health_monitor: BackendHealthMonitor | None = None,
+        health_registry: HealthTrackerRegistry | None = None,
         node_id: str | None = None,
         ws_id: str | None = None,
         tool_search: str = "auto",
@@ -307,7 +307,7 @@ class ChatSession:
         self.model = model
         self._registry = registry
         self._model_alias = model_alias
-        self._health_monitor = health_monitor
+        self._health_registry = health_registry
         # Resolve provider for the current model
         self._provider: LLMProvider = (
             registry.get_provider(model_alias)
@@ -1401,42 +1401,89 @@ class ChatSession:
     _MAX_RETRIES = 3
     _RETRY_BASE_DELAY = 1.0  # seconds
 
+    def _get_health_tracker(self) -> BackendHealthTracker | None:
+        """Get the health tracker for this session's current backend.
+
+        Uses a read-only lookup — only returns trackers that were already
+        created eagerly at startup or during model reload.
+
+        Returns ``None`` when no health registry is configured, the model
+        alias is unknown, or no tracker exists for this backend yet.
+        """
+        if not self._health_registry or not self._registry or not self._model_alias:
+            return None
+        return self._health_registry.get_tracker_for_alias(self._registry, self._model_alias)
+
     def _create_stream_with_retry(self, msgs: list[dict[str, Any]]) -> Iterator[StreamChunk]:
         """Create a streaming request with retry on transient errors.
 
         If all retries fail and a fallback chain is configured, tries each
-        fallback model in order before giving up.  Checks the circuit breaker
-        before attempting a call — fast-fails when the backend is unreachable.
+        fallback model in order before giving up.  Records success/failure
+        on the per-backend health tracker for observability.
         """
-        # Circuit breaker check — fast-fail if backend is known to be down
-        if self._health_monitor and not self._health_monitor.acquire_request_permit():
-            raise ConnectionError("Backend unreachable (circuit breaker open)")
+        tracker = self._get_health_tracker()
 
         try:
             result = self._try_stream(self.client, self.model, msgs)
-            if self._health_monitor:
-                self._health_monitor.record_success()
+            if tracker:
+                tracker.record_success()
             return result
         except Exception as primary_err:
-            if self._health_monitor:
-                self._health_monitor.record_failure()
+            if tracker:
+                tracker.record_failure()
             if not self._registry or not self._registry.fallback:
                 raise
-            # Try each fallback model.  Fallbacks may use different backends;
-            # we intentionally do NOT call record_success/failure for fallbacks —
-            # recovery of the primary backend is detected by the background probe.
+            # Try each fallback model.  Prefer non-degraded backends first,
+            # but still try degraded ones as a last resort.
+            degraded_fallbacks: list[str] = []
             for alias in self._registry.fallback:
                 if alias == self._model_alias:
                     continue
-                try:
-                    fb_client, fb_model, _ = self._registry.resolve(alias)
-                    fb_provider = self._registry.get_provider(alias)
-                    self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
-                    return self._try_stream(fb_client, fb_model, msgs, provider=fb_provider)
-                except Exception as fb_err:
-                    self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
-                    continue
+                # Skip degraded backends on the first pass
+                if self._health_registry:
+                    fb_tracker = self._health_registry.get_tracker_for_alias(self._registry, alias)
+                    if fb_tracker and fb_tracker.is_degraded:
+                        degraded_fallbacks.append(alias)
+                        continue
+                stream = self._try_fallback(alias, msgs)
+                if stream is not None:
+                    return stream
+            # Second pass: try degraded backends as last resort
+            for alias in degraded_fallbacks:
+                self.ui.on_info(f"[Fallback {alias} is degraded, trying anyway]")
+                stream = self._try_fallback(alias, msgs)
+                if stream is not None:
+                    return stream
             raise primary_err
+
+    def _try_fallback(self, alias: str, msgs: list[dict[str, Any]]) -> Iterator[StreamChunk] | None:
+        """Attempt a single fallback model. Returns stream or None.
+
+        Records success/failure on the fallback's health tracker so
+        the two-pass ordering (healthy-first, then degraded) learns
+        across request cycles.
+
+        Caller must ensure ``self._registry`` is not ``None``.
+        """
+        assert self._registry is not None
+        fb_tracker = (
+            self._health_registry.get_tracker_for_alias(self._registry, alias)
+            if self._health_registry
+            else None
+        )
+        try:
+            fb_client, fb_model, _ = self._registry.resolve(alias)
+            fb_provider = self._registry.get_provider(alias)
+            self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
+            result = self._try_stream(fb_client, fb_model, msgs, provider=fb_provider)
+            if fb_tracker:
+                fb_tracker.record_success()
+            return result
+        except Exception as fb_err:
+            if fb_tracker:
+                fb_tracker.record_failure()
+            self.ui.on_info(f"[Fallback {alias} also failed: {fb_err}]")
+            return None
 
     def _try_stream(
         self,

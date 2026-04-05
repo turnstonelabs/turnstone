@@ -1214,8 +1214,12 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
     mgr: WorkstreamManager = app_state.workstreams
     wss = mgr.list_all()
     states = _count_ws_states(wss)
-    monitor = getattr(app_state, "health_monitor", None)
-    backend_ok = monitor.is_healthy if monitor else True
+    health_reg = getattr(app_state, "health_registry", None)
+    registry = getattr(app_state, "registry", None)
+    tracker = None
+    if health_reg and registry:
+        tracker = health_reg.get_tracker_for_alias(registry, registry.default)
+    backend_ok = tracker.is_healthy if tracker else True
     data: dict[str, Any] = {
         "status": "ok" if backend_ok else "degraded",
         "version": __version__,
@@ -1226,7 +1230,6 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
         "workstreams": {"total": len(wss), **states},
         "backend": {
             "status": "up" if backend_ok else "down",
-            "circuit_state": monitor.circuit_state.value if monitor else "closed",
         },
     }
     mc = getattr(app_state, "mcp_client", None)
@@ -2149,10 +2152,18 @@ def internal_model_reload(request: Request) -> JSONResponse:
         provider=cli_args["provider"],
         storage=get_storage(),
     )
+    # Allow runtime override of the default alias via ConfigStore
+    effective_default = new_registry.default
+    cs = getattr(request.app.state, "config_store", None)
+    if cs:
+        cs_alias = cs.get("model.default_alias")
+        if cs_alias and cs_alias in new_registry.models:
+            effective_default = cs_alias
+
     try:
         registry.reload(
             new_registry.models,
-            new_registry.default,
+            effective_default,
             new_registry.fallback,
             new_registry.agent_model,
         )
@@ -2160,6 +2171,14 @@ def internal_model_reload(request: Request) -> JSONResponse:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
     finally:
         new_registry.shutdown()
+
+    # Ensure health trackers exist for any newly-added backends
+    health_reg = getattr(request.app.state, "health_registry", None)
+    if health_reg:
+        for alias in registry.list_aliases():
+            cfg = registry.get_config(alias)
+            health_reg.get_tracker(provider=cfg.provider, base_url=cfg.base_url)
+
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 
 
@@ -2211,13 +2230,19 @@ async def internal_migrate(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
-def _emit_health_changed(circuit_state: str, gq: queue.Queue[dict[str, Any]]) -> None:
+def _emit_health_changed(status: str, gq: queue.Queue[dict[str, Any]]) -> None:
     """Push a health_changed event onto the global SSE queue.
 
-    Called from the BackendHealthMonitor callback on circuit breaker transitions.
+    Called from the BackendHealthTracker callback on state transitions.
+    *status* is ``"healthy"`` or ``"degraded"``.
     """
     with contextlib.suppress(queue.Full):
-        gq.put_nowait({"type": "health_changed", "circuit_state": circuit_state})
+        gq.put_nowait(
+            {
+                "type": "health_changed",
+                "backend_status": status,
+            }
+        )
 
 
 def _aggregate_emitter_thread(
@@ -2420,8 +2445,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         await tls_client.stop_renewal()
     if app.state.watch_runner:
         app.state.watch_runner.stop()
-    if app.state.health_monitor:
-        app.state.health_monitor.stop()
+    # health_registry is stateless (no background threads) — nothing to stop
     if app.state.mcp_client:
         app.state.mcp_client.shutdown()
     if app.state.registry:
@@ -2462,7 +2486,7 @@ def create_app(
     skip_permissions: bool,
     jwt_secret: str = "",
     auth_storage: Any = None,
-    health_monitor: Any = None,
+    health_registry: Any = None,
     rate_limiter: Any = None,
     mcp_client: Any = None,
     mcp_ref: list[Any] | None = None,
@@ -2542,7 +2566,7 @@ def create_app(
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
-    app.state.health_monitor = health_monitor
+    app.state.health_registry = health_registry
     app.state.rate_limiter = rate_limiter
     app.state.mcp_client = mcp_client
     app.state.mcp_ref = mcp_ref
@@ -2735,10 +2759,10 @@ def main() -> None:
 
         model, detected_ctx = detect_model(client, provider=provider_name, fatal=False)
         if model is None:
-            # LLM backend unreachable — start with a placeholder model name.
-            # The health monitor will report degraded and the circuit breaker
-            # will prevent requests until the backend comes up.
-            model = "unavailable"
+            # LLM backend unreachable — no CLI model specified.
+            # Set empty so load_model_registry skips the CLI "default"
+            # entry and relies on DB / config.toml models instead.
+            model = ""
 
     # Use detected context window, fall back to ConfigStore override or 32768
     cfg_ctx = config_store.get("model.context_window")
@@ -2763,6 +2787,11 @@ def main() -> None:
         storage=_get_storage(),
     )
 
+    # Apply runtime default alias override from ConfigStore (if set)
+    cs_default_alias = config_store.get("model.default_alias")
+    if cs_default_alias and registry.has_alias(cs_default_alias):
+        registry.reload(registry.models, cs_default_alias, registry.fallback, registry.agent_model)
+
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
 
@@ -2776,56 +2805,27 @@ def main() -> None:
     # including ones created by internal_mcp_reload after startup.
     _mcp_ref: list[Any] = [mcp_client]
 
-    # Backend health monitor with circuit breaker
-    from turnstone.core.healthcheck import BackendHealthMonitor
-
-    def _handle_model_change(new_model_id: str, new_ctx: int | None) -> None:
-        """Called from health probe thread when backend model changes."""
-        cli_args = getattr(getattr(app, "state", None), "cli_model_args", None)
-        if not cli_args or cli_args.get("_user_specified_model"):
-            return
-        old_model = cli_args["model"]
-        ctx = new_ctx or cli_args["context_window"]
-        log.info("Backend model changed: %s -> %s (ctx=%s)", old_model, new_model_id, ctx)
-        new_reg = None
-        try:
-            new_reg = load_model_registry(
-                base_url=cli_args["base_url"],
-                api_key=cli_args["api_key"],
-                model=new_model_id,
-                context_window=ctx,
-                provider=cli_args["provider"],
-                storage=get_storage(),
-            )
-            registry.reload(new_reg.models, new_reg.default, new_reg.fallback, new_reg.agent_model)
-            # Update cli_model_args only after successful reload
-            cli_args["model"] = new_model_id
-            cli_args["context_window"] = ctx
-        except Exception:
-            log.warning("Model change reload failed", exc_info=True)
-        finally:
-            if new_reg is not None:
-                new_reg.shutdown()
+    # Per-backend passive health tracking (no active probes / circuit breakers)
+    from turnstone.core.healthcheck import HealthTrackerRegistry
 
     # Set up global event queue for state-change broadcasts (created early so
-    # the health monitor callback can reference it).
+    # the health tracker callback can reference it).
     global_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=10000)
     global_listeners: list[queue.Queue[dict[str, Any]]] = []
     global_listeners_lock = threading.Lock()
     WebUI._global_queue = global_queue
 
-    health_monitor = BackendHealthMonitor(
-        client=client,
-        probe_interval=config_store.get("health.backend_probe_interval"),
-        probe_timeout=config_store.get("health.backend_probe_timeout"),
-        failure_threshold=config_store.get("health.circuit_breaker_threshold"),
-        cooldown=config_store.get("health.circuit_breaker_cooldown"),
-        provider=provider_name,
-        initial_model=model,
-        on_model_changed=_handle_model_change,
-        on_state_changed=lambda state: _emit_health_changed(state, global_queue),
+    health_registry = HealthTrackerRegistry(
+        failure_threshold=config_store.get("health.failure_threshold"),
+        on_state_changed=lambda _backend, state: _emit_health_changed(state, global_queue),
     )
-    health_monitor.start()
+
+    # Eagerly create trackers for all registered backends.  Sessions use
+    # read-only lookups (get_tracker_for_alias) and never create trackers
+    # on the hot path, so every backend must be registered here.
+    for _alias in registry.list_aliases():
+        _cfg = registry.get_config(_alias)
+        health_registry.get_tracker(provider=_cfg.provider, base_url=_cfg.base_url)
 
     # Per-IP rate limiter
     from turnstone.core.ratelimit import RateLimiter
@@ -2875,6 +2875,17 @@ def main() -> None:
         )
 
     # Session factory — captures shared config (including config_store for hot-reload)
+    def _effective_default_alias() -> str:
+        """Return the runtime-effective default model alias.
+
+        Checks ConfigStore for a ``model.default_alias`` override first,
+        then falls back to the registry's static default.
+        """
+        cs_alias: str = config_store.get("model.default_alias")
+        if cs_alias and registry.has_alias(cs_alias):
+            return cs_alias
+        return registry.default
+
     def session_factory(
         ui: SessionUI | None,
         model_alias: str | None = None,
@@ -2924,8 +2935,8 @@ def main() -> None:
             tool_truncation=config_store.get("tools.truncation"),
             mcp_client=live_mcp_client,
             registry=registry,
-            model_alias=model_alias or registry.default,
-            health_monitor=health_monitor,
+            model_alias=model_alias or _effective_default_alias(),
+            health_registry=health_registry,
             node_id=_node_id,
             ws_id=ws_id,
             tool_search=config_store.get("tools.search"),
@@ -3048,7 +3059,7 @@ def main() -> None:
         skip_permissions=_skip_perms,
         jwt_secret=jwt_secret,
         auth_storage=get_storage(),
-        health_monitor=health_monitor,
+        health_registry=health_registry,
         rate_limiter=rate_limiter,
         mcp_client=mcp_client,
         mcp_ref=_mcp_ref,
@@ -3083,9 +3094,8 @@ def main() -> None:
             log.info("MCP tools: %d from %d server(s)", len(mcp_tools), mcp_client.server_count)
         mcp_client.set_storage(get_storage())
     log.info(
-        "Health monitor: probe every %ss, circuit breaker threshold=%s",
-        config_store.get("health.backend_probe_interval"),
-        config_store.get("health.circuit_breaker_threshold"),
+        "Health tracking: failure_threshold=%s",
+        config_store.get("health.failure_threshold"),
     )
     if rate_limiter.enabled:
         log.info(

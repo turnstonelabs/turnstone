@@ -524,15 +524,14 @@ class ClusterCollector:
                 pending_events.append({"type": "ws_rename", "ws_id": ws_id, "name": name})
 
             elif etype == "health_changed":
-                # Update the health dict's circuit state in-place
-                circuit = data.get("circuit_state", "")
-                if circuit:
+                # Update the health dict's backend status in-place
+                bstatus = data.get("backend_status", "")
+                if bstatus:
                     if not node.health:
                         node.health = {}
                     backend = node.health.setdefault("backend", {})
-                    backend["circuit_state"] = circuit
-                    backend["status"] = "up" if circuit == "closed" else "down"
-                    node.health["status"] = "ok" if circuit == "closed" else "degraded"
+                    backend["status"] = "up" if bstatus == "healthy" else "down"
+                    node.health["status"] = "ok" if bstatus == "healthy" else "degraded"
                 # Not forwarded to cluster SSE — next snapshot refreshes UI
 
             elif etype == "aggregate":

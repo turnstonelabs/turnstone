@@ -655,11 +655,7 @@ function buildNodeRow(node) {
 
   var circuitTitle = "";
   if (node.health && node.health.backend) {
-    circuitTitle =
-      "backend: " +
-      node.health.backend.status +
-      ", circuit: " +
-      node.health.backend.circuit_state;
+    circuitTitle = "backend: " + node.health.backend.status;
   }
   var degradedBadge = isDegraded
     ? '<span class="node-degraded-badge" title="' +
