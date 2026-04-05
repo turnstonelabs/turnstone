@@ -2583,7 +2583,6 @@ class ChatSession:
             return None
         if self._judge is not None:
             return self._judge
-            return None
         # Frozen config required for IntentJudge init (LLM client fields).
         # _judge_cfg already returns None when _judge_config is None, but
         # this guard makes the dependency explicit for type narrowing.
