@@ -1737,6 +1737,14 @@ def _normalize_task_dict(task: dict[str, Any]) -> dict[str, Any]:
     task["auto_approve_tools"] = [s.strip() for s in tools_str.split(",") if s.strip()]
     task["auto_approve"] = bool(task.get("auto_approve", 0))
     task["enabled"] = bool(task.get("enabled", 1))
+    # Normalize notify_targets from JSON string to list
+    import json as _json
+
+    raw_nt = task.get("notify_targets", "[]")
+    try:
+        task["notify_targets"] = _json.loads(raw_nt) if isinstance(raw_nt, str) else raw_nt
+    except (_json.JSONDecodeError, TypeError):
+        task["notify_targets"] = []
     return task
 
 
@@ -1833,6 +1841,18 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
     skill_name = str(body.get("skill", "")).strip()[:256]
     enabled = bool(body.get("enabled", True))
 
+    # Validate notify_targets
+    from turnstone.server import _validate_notify_targets
+
+    raw_nt = body.get("notify_targets", "[]")
+    if isinstance(raw_nt, list):
+        import json as _json
+
+        raw_nt = _json.dumps(raw_nt)
+    notify_targets, nt_err = _validate_notify_targets(raw_nt)
+    if nt_err:
+        return JSONResponse({"error": nt_err}, status_code=400)
+
     if not name:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not initial_message:
@@ -1874,6 +1894,7 @@ async def admin_create_schedule(request: Request) -> JSONResponse:
         created_by=created_by,
         next_run=next_run if enabled else "",
         skill=skill_name,
+        notify_targets=notify_targets,
     )
 
     if not enabled:
@@ -1955,6 +1976,18 @@ async def admin_update_schedule(request: Request) -> JSONResponse:
         updates["skill"] = skill_val
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
+    if "notify_targets" in body:
+        from turnstone.server import _validate_notify_targets
+
+        raw_nt = body["notify_targets"]
+        if isinstance(raw_nt, list):
+            import json as _json
+
+            raw_nt = _json.dumps(raw_nt)
+        nt_str, nt_err = _validate_notify_targets(raw_nt)
+        if nt_err:
+            return JSONResponse({"error": nt_err}, status_code=400)
+        updates["notify_targets"] = nt_str
 
     # Validate schedule fields if changed
     stype = updates.get("schedule_type", existing["schedule_type"])

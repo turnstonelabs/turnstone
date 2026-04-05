@@ -210,6 +210,34 @@ class TestNotifyEndpoint:
         results = resp.json()["results"]
         assert results[0]["status"] == "failed"
 
+    def test_adapter_timeout(self, storage, mock_adapter, monkeypatch):
+        """Adapter calls that exceed the timeout return timeout status."""
+        import asyncio
+
+        async def _hang(*_args: object) -> str:
+            await asyncio.sleep(300)
+            return ""
+
+        mock_adapter.send = _hang
+
+        # Use a very short timeout to keep the test fast
+        from turnstone.channels import _http as _http_mod
+
+        monkeypatch.setattr(_http_mod, "_NOTIFY_ADAPTER_TIMEOUT", 0.1)
+        app = create_channel_app({"discord": mock_adapter}, storage, jwt_secret=_JWT_SECRET)
+        tc = TestClient(app)
+        resp = tc.post(
+            "/v1/api/notify",
+            json={
+                "target": {"channel_type": "discord", "channel_id": "123456"},
+                "message": "Hello!",
+            },
+            headers=_auth_headers(),
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        assert results[0]["status"] == "timeout"
+
     def test_invalid_json(self, client):
         resp = client.post(
             "/v1/api/notify",

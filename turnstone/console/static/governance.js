@@ -890,6 +890,7 @@ function showCreateTemplateModal() {
   document.getElementById("csk-auto-approve").checked = false;
   document.getElementById("csk-allowed-tools").value = "";
   document.getElementById("csk-allowed-tools").disabled = false;
+  document.getElementById("csk-notify-on-complete").value = "";
   document.getElementById("csk-enabled").checked = true;
   document.getElementById("csk-auto-approve").onchange = function () {
     document.getElementById("csk-allowed-tools").disabled = this.checked;
@@ -949,6 +950,23 @@ function submitCreateTemplate() {
         })
         .filter(Boolean)
     : [];
+  var csNotifyRaw = (
+    document.getElementById("csk-notify-on-complete").value || ""
+  ).trim();
+  var csNotifyVal = "[]";
+  if (csNotifyRaw) {
+    try {
+      var csNotifyParsed = JSON.parse(csNotifyRaw);
+      if (!Array.isArray(csNotifyParsed))
+        throw new Error("must be a JSON array");
+      csNotifyVal = JSON.stringify(csNotifyParsed);
+    } catch (ne) {
+      var ne2 = document.getElementById("create-template-error");
+      ne2.textContent = "Notify on completion: " + ne.message;
+      ne2.style.display = "";
+      return;
+    }
+  }
   document.getElementById("ctm-submit").disabled = true;
   var csVersion = (document.getElementById("skill-version").value || "").trim();
   var createBody = {
@@ -975,6 +993,7 @@ function submitCreateTemplate() {
     token_budget: csBudget ? parseInt(csBudget, 10) : 0,
     agent_max_turns: csMaxTurns ? parseInt(csMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(csAllowedArr),
+    notify_on_complete: csNotifyVal,
     enabled: document.getElementById("csk-enabled").checked,
   };
   if (csVersion) createBody.version = csVersion;
@@ -1097,6 +1116,9 @@ function showEditTemplateModal(tmplId) {
   document.getElementById("esk-allowed-tools").disabled =
     tmpl.auto_approve || false;
   document.getElementById("esk-enabled").checked = tmpl.enabled !== false;
+  var notifyVal = tmpl.notify_on_complete || "[]";
+  document.getElementById("esk-notify-on-complete").value =
+    notifyVal && notifyVal !== "[]" ? notifyVal : "";
   document.getElementById("esk-auto-approve").onchange = function () {
     document.getElementById("esk-allowed-tools").disabled = this.checked;
   };
@@ -1553,6 +1575,23 @@ function submitEditTemplate() {
         })
         .filter(Boolean)
     : [];
+  var esNotifyRaw = (
+    document.getElementById("esk-notify-on-complete").value || ""
+  ).trim();
+  var esNotifyVal = "[]";
+  if (esNotifyRaw) {
+    try {
+      var esNotifyParsed = JSON.parse(esNotifyRaw);
+      if (!Array.isArray(esNotifyParsed))
+        throw new Error("must be a JSON array");
+      esNotifyVal = JSON.stringify(esNotifyParsed);
+    } catch (ne) {
+      var ne3 = document.getElementById("edit-template-error");
+      ne3.textContent = "Notify on completion: " + ne.message;
+      ne3.style.display = "";
+      return;
+    }
+  }
   document.getElementById("etm-submit").disabled = true;
   var esVersion = (document.getElementById("etm-version").value || "").trim();
   var updateBody = {
@@ -1579,6 +1618,7 @@ function submitEditTemplate() {
     token_budget: esBudget ? parseInt(esBudget, 10) : 0,
     agent_max_turns: esMaxTurns ? parseInt(esMaxTurns, 10) : null,
     allowed_tools: JSON.stringify(esAllowedArr),
+    notify_on_complete: esNotifyVal,
     enabled: document.getElementById("esk-enabled").checked,
   };
   if (esVersion) updateBody.version = esVersion;

@@ -352,6 +352,7 @@ class StorageBackend(Protocol):
         created_by: str,
         next_run: str,
         skill: str = "",
+        notify_targets: str = "[]",
     ) -> None:
         """Create a scheduled task. No-op if task_id already exists."""
         ...

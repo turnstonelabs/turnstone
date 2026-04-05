@@ -107,6 +107,7 @@ class AsyncTurnstoneServer(_BaseClient):
         user_id: str = "",
         ws_id: str = "",
         client_type: str = "",
+        notify_targets: str = "",
     ) -> CreateWorkstreamResponse:
         body: dict[str, Any] = {}
         if name:
@@ -129,6 +130,8 @@ class AsyncTurnstoneServer(_BaseClient):
             body["ws_id"] = ws_id
         if client_type:
             body["client_type"] = client_type
+        if notify_targets and notify_targets != "[]":
+            body["notify_targets"] = notify_targets
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -490,6 +493,7 @@ class TurnstoneServer:
         user_id: str = "",
         ws_id: str = "",
         client_type: str = "",
+        notify_targets: str = "",
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -503,6 +507,7 @@ class TurnstoneServer:
                 user_id=user_id,
                 ws_id=ws_id,
                 client_type=client_type,
+                notify_targets=notify_targets,
             )
         )
 

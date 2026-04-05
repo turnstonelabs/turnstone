@@ -57,6 +57,13 @@ class CreateWorkstreamRequest(BaseModel):
         description="Workstream ID to resume atomically during creation (empty = fresh start)",
     )
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    notify_targets: str | list[dict[str, str]] = Field(
+        default="[]",
+        description=(
+            "Notification targets, accepted as either a JSON string or a structured "
+            "array of objects containing channel_type + channel_id/user_id"
+        ),
+    )
     client_type: str = Field(
         default="",
         description="Client surface type (web, cli, chat). Defaults to web for server-created sessions.",

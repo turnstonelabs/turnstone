@@ -926,6 +926,7 @@ class PostgreSQLBackend:
         created_by: str,
         next_run: str,
         skill: str = "",
+        notify_targets: str = "[]",
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -946,6 +947,7 @@ class PostgreSQLBackend:
                     auto_approve=1 if auto_approve else 0,
                     auto_approve_tools=",".join(auto_approve_tools),
                     skill=skill,
+                    notify_targets=notify_targets,
                     enabled=1,
                     created_by=created_by,
                     next_run=next_run,
@@ -987,6 +989,7 @@ class PostgreSQLBackend:
             "auto_approve",
             "auto_approve_tools",
             "skill",
+            "notify_targets",
             "enabled",
             "last_run",
             "next_run",

@@ -862,12 +862,15 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <div class="modal-col">
         <div class="modal-col-heading">Execution</div>
         <label for="cs-model">Model <span class="label-hint">optional</span></label>
-        <input id="cs-model" type="text" placeholder="Default model" autocomplete="off">
+        <select id="cs-model"><option value="">Default model</option></select>
         <label for="cs-template">Skill <span class="label-hint">optional</span></label>
-        <input id="cs-template" type="text" placeholder="Skill name" autocomplete="off">
+        <select id="cs-template"><option value="">None</option></select>
         <label for="cs-message">Initial message</label>
         <textarea id="cs-message" rows="3" placeholder="What should the workstream do?"></textarea>
         <label class="admin-checkbox"><input id="cs-autoapprove" type="checkbox"> Auto-approve tool calls</label>
+        <label>Notify on completion <span class="label-hint">optional</span></label>
+        <div id="cs-notify-rows"></div>
+        <button type="button" class="admin-inline-add" onclick="_addNotifyRow('cs')" aria-label="Add notification target">+ Add target</button>
       </div>
     </div>
     <div class="modal-buttons">
@@ -918,13 +921,16 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <div class="modal-col">
         <div class="modal-col-heading">Execution</div>
         <label for="es-model">Model</label>
-        <input id="es-model" type="text" autocomplete="off">
+        <select id="es-model"><option value="">Default model</option></select>
         <label for="es-template">Skill <span class="label-hint">optional</span></label>
-        <input id="es-template" type="text" autocomplete="off">
+        <select id="es-template"><option value="">None</option></select>
         <label for="es-message">Initial message</label>
         <textarea id="es-message" rows="3"></textarea>
         <label class="admin-checkbox"><input id="es-autoapprove" type="checkbox"> Auto-approve tool calls</label>
         <label class="admin-checkbox"><input id="es-enabled" type="checkbox"> Enabled</label>
+        <label>Notify on completion <span class="label-hint">optional</span></label>
+        <div id="es-notify-rows"></div>
+        <button type="button" class="admin-inline-add" onclick="_addNotifyRow('es')" aria-label="Add notification target">+ Add target</button>
       </div>
     </div>
     <div class="modal-buttons">
@@ -1180,6 +1186,9 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <label class="admin-checkbox"><input id="csk-auto-approve" type="checkbox"> Auto-approve all tools</label>
       <label for="csk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="csk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
+      <label for="csk-notify-on-complete">Notify on completion <span class="label-hint">optional</span></label>
+      <textarea id="csk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."}]' spellcheck="false" aria-describedby="csk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
+      <span id="csk-notify-hint" class="label-hint" style="display:block;margin-top:3px">JSON array. Each: channel_type + channel_id or user_id</span>
       <label class="admin-checkbox"><input id="csk-enabled" type="checkbox" checked> Enabled</label>
     </details>
     <details class="admin-details">
@@ -1296,6 +1305,9 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <label class="admin-checkbox"><input id="esk-auto-approve" type="checkbox"> Auto-approve all tools</label>
       <label for="esk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="esk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
+      <label for="esk-notify-on-complete">Notify on completion <span class="label-hint">optional</span></label>
+      <textarea id="esk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."}]' spellcheck="false" aria-describedby="esk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
+      <span id="esk-notify-hint" class="label-hint" style="display:block;margin-top:3px">JSON array. Each: channel_type + channel_id or user_id</span>
       <label class="admin-checkbox"><input id="esk-enabled" type="checkbox" checked> Enabled</label>
     </details>
     <div id="etm-scan-section" style="display:none" class="admin-field">

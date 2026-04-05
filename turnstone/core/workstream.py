@@ -63,6 +63,7 @@ class Workstream:
     worker_thread: threading.Thread | None = None
     error_message: str = ""
     last_active: float = field(default_factory=time.monotonic, repr=False)
+    notify_targets: str = "[]"
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:

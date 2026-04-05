@@ -1629,6 +1629,178 @@ async def command(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 
+# ---------------------------------------------------------------------------
+# Notification helpers — completion delivery for scheduled workstreams
+# ---------------------------------------------------------------------------
+
+_MAX_NOTIFY_TARGETS = 10
+
+
+def _validate_notify_targets(raw: Any) -> tuple[str, str]:
+    """Validate and normalize notify_targets input.
+
+    Returns (json_string, error_message). Error is empty on success.
+    """
+    if not raw:
+        return "[]", ""
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return "[]", "notify_targets must be valid JSON"
+    elif isinstance(raw, list):
+        parsed = raw
+    else:
+        return "[]", "notify_targets must be a JSON array or string"
+
+    if not isinstance(parsed, list):
+        return "[]", "notify_targets must be a JSON array"
+
+    if len(parsed) > _MAX_NOTIFY_TARGETS:
+        return "[]", f"notify_targets limited to {_MAX_NOTIFY_TARGETS} entries"
+
+    normalized: list[dict[str, str]] = []
+    for i, t in enumerate(parsed):
+        if not isinstance(t, dict):
+            return "[]", f"notify_targets[{i}] must be an object"
+        if "channel_type" not in t:
+            return "[]", f"notify_targets[{i}] missing channel_type"
+
+        has_channel_id = "channel_id" in t and t.get("channel_id") is not None
+        has_user_id = "user_id" in t and t.get("user_id") is not None
+        if has_channel_id and has_user_id:
+            return "[]", f"notify_targets[{i}] must specify only one of channel_id or user_id"
+        if not has_channel_id and not has_user_id:
+            return "[]", f"notify_targets[{i}] requires channel_id or user_id"
+
+        normalized_target: dict[str, str] = {}
+        for key in ("channel_type", "channel_id", "user_id"):
+            val = t.get(key)
+            if val is None:
+                continue
+            if not isinstance(val, str):
+                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
+            stripped = val.strip()
+            if not stripped:
+                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
+            if len(stripped) > 256:
+                return "[]", f"notify_targets[{i}].{key} must be a non-empty string <= 256 chars"
+            normalized_target[key] = stripped
+
+        normalized.append(normalized_target)
+
+    return json.dumps(normalized), ""
+
+
+def _extract_last_assistant_content(session: Any) -> str:
+    """Return the text content of the last assistant message."""
+    for msg in reversed(session.messages):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text:
+                            parts.append(text)
+                return "\n".join(parts)
+    return ""
+
+
+def _fire_notify_targets(ws: Any, content: str) -> None:
+    """Send completion notifications to all configured targets."""
+    if not content or not ws.notify_targets:
+        return
+
+    try:
+        targets = json.loads(ws.notify_targets)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not targets or not isinstance(targets, list):
+        return
+
+    from turnstone.core.session import _notify_auth_headers
+    from turnstone.core.storage import get_storage
+
+    storage = get_storage()
+    auth_headers = _notify_auth_headers()
+    task_name = ws.name or ws.id[:8]
+
+    for target in targets:
+        if not isinstance(target, dict):
+            continue
+        channel_type = target.get("channel_type", "")
+        resolved: dict[str, str] = {}
+        if "channel_id" in target:
+            resolved = {"channel_type": channel_type, "channel_id": target["channel_id"]}
+        elif "user_id" in target:
+            resolved = {"channel_type": channel_type, "channel_id": target["user_id"]}
+        else:
+            continue
+
+        payload = {
+            "target": resolved,
+            "message": content,
+            "title": f"Schedule: {task_name}",
+            "ws_id": ws.id,
+        }
+
+        _deliver_notification(storage, payload, auth_headers)
+
+
+def _deliver_notification(
+    storage: Any,
+    payload: dict[str, Any],
+    auth_headers: dict[str, str],
+) -> None:
+    """POST to channel gateway /v1/api/notify with retry."""
+    import httpx
+
+    for attempt in range(3):
+        services = storage.list_services("channel", max_age_seconds=120)
+        if not services:
+            if attempt < 2:
+                time.sleep(1.0 if attempt == 0 else 3.0)
+                continue
+            log.warning("notify_completion.no_services")
+            return
+
+        for svc in services:
+            url = svc["url"].rstrip("/") + "/v1/api/notify"
+            if not url.startswith(("http://", "https://")):
+                continue
+            try:
+                resp = httpx.post(url, json=payload, timeout=10, headers=auth_headers)
+                if resp.status_code < 300:
+                    # Verify at least one target was delivered (mirrors _exec_notify)
+                    try:
+                        data = resp.json()
+                        results = data.get("results") if isinstance(data, dict) else None
+                        if isinstance(results, list) and any(
+                            isinstance(r, dict) and r.get("status") == "sent" for r in results
+                        ):
+                            log.info("notify_completion.delivered", ws_id=payload.get("ws_id"))
+                            return
+                    except Exception:
+                        log.debug("notify_completion.response_parse_error", url=url, exc_info=True)
+                    log.warning("notify_completion.no_successful_delivery", url=url)
+                    continue
+                log.warning(
+                    "notify_completion.failed",
+                    status=resp.status_code,
+                    url=url,
+                )
+            except Exception:
+                log.exception("notify_completion.error", url=url)
+                continue
+
+        if attempt < 2:
+            time.sleep(1.0 if attempt == 0 else 3.0)
+
+
 async def create_workstream(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/new — create a new workstream."""
     from turnstone.core.web_helpers import read_json_or_400
@@ -1780,6 +1952,22 @@ async def create_workstream(request: Request) -> JSONResponse:
                 sess._applied_skill_content = skill_data["content"]
             sess._save_config()
 
+        # Resolve notify_targets: schedule targets override skill targets
+        notify_targets_raw = body.get("notify_targets", "[]")
+        if isinstance(notify_targets_raw, list):
+            notify_targets_raw = json.dumps(notify_targets_raw)
+        nt_str, nt_err = _validate_notify_targets(notify_targets_raw)
+        if nt_err:
+            return JSONResponse({"error": nt_err}, status_code=400)
+        # Skill fallback (only if schedule didn't specify targets)
+        if nt_str == "[]" and skill_data:
+            skill_notify = skill_data.get("notify_on_complete", "[]")
+            if skill_notify and skill_notify != "{}" and skill_notify != "[]":
+                fallback_str, fallback_err = _validate_notify_targets(skill_notify)
+                if not fallback_err:
+                    nt_str = fallback_str
+        ws.notify_targets = nt_str
+
         # Pin locally-created workstreams so the console routes to this node.
         # Console-routed creates pass ws_id in the request body — those are
         # already bucket-aligned and don't need an override. Direct creates
@@ -1809,6 +1997,12 @@ async def create_workstream(request: Request) -> JSONResponse:
                     if isinstance(ws.ui, WebUI):
                         ws.ui.on_stream_end()
                         ws.ui.on_state_change("idle")
+                finally:
+                    try:
+                        last_content = _extract_last_assistant_content(session)
+                        _fire_notify_targets(ws, last_content)
+                    except Exception:
+                        log.warning("notify_completion.hook_error", ws_id=ws.id, exc_info=True)
 
             t = threading.Thread(target=_run_initial, daemon=True, name=f"ws-init-{ws.id[:8]}")
             ws.worker_thread = t

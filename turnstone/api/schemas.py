@@ -195,6 +195,10 @@ class CreateScheduleRequest(BaseModel):
     auto_approve: bool = Field(default=False)
     auto_approve_tools: list[str] = Field(default_factory=list)
     skill: str = Field(default="", description="Skill name (replaces default skills)")
+    notify_targets: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Notification targets on completion (channel_type + channel_id/user_id)",
+    )
     enabled: bool = Field(default=True)
 
 
@@ -212,6 +216,7 @@ class UpdateScheduleRequest(BaseModel):
     auto_approve: bool | None = None
     auto_approve_tools: list[str] | None = None
     skill: str | None = None
+    notify_targets: list[dict[str, str]] | None = None
     enabled: bool | None = None
 
 
@@ -230,6 +235,7 @@ class ScheduleInfo(BaseModel):
     auto_approve: bool = False
     auto_approve_tools: list[str] = Field(default_factory=list)
     skill: str = ""
+    notify_targets: list[dict[str, str]] = Field(default_factory=list)
     enabled: bool = True
     created_by: str = ""
     last_run: str | None = None

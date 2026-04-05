@@ -1202,6 +1202,30 @@
 .admin-modal [role="alert"] { display: none; color: var(--red); font-size: 12px; margin-bottom: 8px; }
 .admin-modal [role="alert"].is-visible { display: block; }
 
+.admin-inline-add {
+  background: none; border: 1px dashed var(--border-strong); border-radius: var(--radius-sm);
+  color: var(--fg-dim); font: inherit; font-size: 12px; padding: 5px 10px; cursor: pointer;
+  width: 100%; margin-top: 6px; transition: border-color 0.15s, color 0.15s;
+}
+.admin-inline-add:hover { border-color: var(--accent); color: var(--accent); }
+.admin-inline-add:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.notify-row {
+  display: flex; gap: 6px; margin-bottom: 4px; align-items: center;
+}
+.notify-row select, .notify-row input {
+  padding: 7px 8px;
+  background: var(--bg); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); color: var(--fg); font: inherit; font-size: 12px;
+}
+.notify-row select { width: 90px; flex-shrink: 0; }
+.notify-row input { flex: 1; min-width: 0; }
+.notify-row-remove {
+  background: none; border: none; color: var(--fg-dim); cursor: pointer;
+  font-size: 16px; padding: 0 4px; line-height: 1; flex-shrink: 0;
+}
+.notify-row-remove:hover { color: var(--red); }
+.notify-row-remove:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+
 .admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
 .admin-details[open] { padding-bottom: 12px; }
 .admin-details summary {

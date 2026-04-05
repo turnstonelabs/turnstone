@@ -943,10 +943,10 @@ function _renderSchedules(schedules) {
     var schedule =
       s.schedule_type === "cron"
         ? s.cron_expr
-        : (s.at_time || "").slice(0, 16).replace("T", " ");
+        : _utcToLocalDatetime(s.at_time).replace("T", " ");
     var target = s.target_mode;
     var nextRun = s.next_run
-      ? escapeHtml(s.next_run).slice(0, 16).replace("T", " ")
+      ? _utcToLocalDatetime(s.next_run).replace("T", " ")
       : "\u2014";
     var enabled = s.enabled;
     var statusCls = enabled ? "sched-active" : "sched-disabled";
@@ -1078,6 +1078,140 @@ function confirmDeleteSchedule(taskId, name) {
   );
 }
 
+// --- Schedule helpers: dropdowns, notify rows, timezone ---
+
+function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
+  var sel = document.getElementById(selectId);
+  // Keep the first option (placeholder) and remove the rest
+  while (sel.options.length > 1) sel.remove(1);
+  // Add temporary option for pre-selected value so form is correct before fetch completes
+  if (opts && opts.selected) {
+    var tmp = document.createElement("option");
+    tmp.value = opts.selected;
+    tmp.textContent = opts.selected;
+    tmp.dataset.temporary = "1";
+    sel.appendChild(tmp);
+    sel.value = opts.selected;
+  }
+  authFetch(url)
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      var temp = sel.querySelector("[data-temporary]");
+      if (temp) temp.remove();
+      var items = opts && opts.listKey ? data[opts.listKey] : data;
+      if (!Array.isArray(items)) return;
+      items.forEach(function (item) {
+        var opt = document.createElement("option");
+        opt.value = item[valueKey];
+        opt.textContent =
+          opts && opts.display ? opts.display(item) : item[labelKey];
+        sel.appendChild(opt);
+      });
+      if (opts && opts.selected) sel.value = opts.selected;
+    })
+    .catch(function () {
+      /* dropdown stays with placeholder or temporary option */
+    });
+}
+
+function _addNotifyRow(prefix, targetType, targetId) {
+  var container = document.getElementById(prefix + "-notify-rows");
+  var row = document.createElement("div");
+  row.className = "notify-row";
+
+  var typeSel = document.createElement("select");
+  typeSel.setAttribute("aria-label", "Target type");
+  var optCh = document.createElement("option");
+  optCh.value = "channel_id";
+  optCh.textContent = "Channel";
+  var optUsr = document.createElement("option");
+  optUsr.value = "user_id";
+  optUsr.textContent = "User DM";
+  typeSel.appendChild(optCh);
+  typeSel.appendChild(optUsr);
+  if (targetType) typeSel.value = targetType;
+
+  var idInput = document.createElement("input");
+  idInput.type = "text";
+  idInput.placeholder = "Discord ID";
+  idInput.setAttribute("aria-label", "Discord ID");
+  idInput.spellcheck = false;
+  if (targetId) idInput.value = targetId;
+
+  var removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.className = "notify-row-remove";
+  removeBtn.setAttribute("aria-label", "Remove target");
+  removeBtn.textContent = "\u00d7";
+  removeBtn.onclick = function () {
+    row.remove();
+  };
+
+  row.appendChild(typeSel);
+  row.appendChild(idInput);
+  row.appendChild(removeBtn);
+  container.appendChild(row);
+  idInput.focus();
+}
+
+function _collectNotifyTargets(prefix) {
+  var rows = document
+    .getElementById(prefix + "-notify-rows")
+    .querySelectorAll(".notify-row");
+  var targets = [];
+  for (var i = 0; i < rows.length; i++) {
+    var type = rows[i].querySelector("select").value;
+    var id = (rows[i].querySelector("input").value || "").trim();
+    if (!id) continue;
+    var t = { channel_type: "discord" };
+    t[type] = id;
+    targets.push(t);
+  }
+  return targets;
+}
+
+function _populateNotifyRows(prefix, targets) {
+  var container = document.getElementById(prefix + "-notify-rows");
+  while (container.firstChild) container.removeChild(container.firstChild);
+  if (!Array.isArray(targets)) return;
+  targets.forEach(function (t) {
+    var targetType = "channel_id" in t ? "channel_id" : "user_id";
+    var targetId = t[targetType] || "";
+    _addNotifyRow(prefix, targetType, targetId);
+  });
+}
+
+function _localToUtcIso(localDatetimeStr) {
+  // datetime-local gives "YYYY-MM-DDTHH:MM" in browser local time
+  // Convert to UTC ISO string for the server
+  var d = new Date(localDatetimeStr);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
+}
+
+function _utcToLocalDatetime(utcStr) {
+  // Convert UTC ISO string to datetime-local format in browser local time
+  if (!utcStr) return "";
+  var d = new Date(utcStr);
+  if (isNaN(d.getTime())) return utcStr.slice(0, 16);
+  var pad = function (n) {
+    return n < 10 ? "0" + n : "" + n;
+  };
+  return (
+    d.getFullYear() +
+    "-" +
+    pad(d.getMonth() + 1) +
+    "-" +
+    pad(d.getDate()) +
+    "T" +
+    pad(d.getHours()) +
+    ":" +
+    pad(d.getMinutes())
+  );
+}
+
 // --- Create Schedule Modal ---
 
 function toggleScheduleTypeFields() {
@@ -1108,10 +1242,29 @@ function showCreateScheduleModal() {
   document.getElementById("cs-at").value = "";
   document.getElementById("cs-target").value = "auto";
   document.getElementById("cs-node").value = "";
-  document.getElementById("cs-model").value = "";
-  document.getElementById("cs-template").value = "";
   document.getElementById("cs-message").value = "";
   document.getElementById("cs-autoapprove").checked = false;
+  _populateNotifyRows("cs", []);
+  // Populate model dropdown
+  _populateScheduleSelect("cs-model", "/v1/api/models", "alias", "alias", {
+    listKey: "models",
+    display: function (m) {
+      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+    },
+  });
+  // Populate skill dropdown
+  _populateScheduleSelect(
+    "cs-template",
+    "/v1/api/admin/skills",
+    "name",
+    "name",
+    {
+      listKey: "skills",
+      display: function (s) {
+        return s.name;
+      },
+    },
+  );
   toggleScheduleTypeFields();
   toggleScheduleNodeField();
   document.getElementById("cs-submit").disabled = false;
@@ -1144,6 +1297,7 @@ function submitCreateSchedule() {
   var message = (document.getElementById("cs-message").value || "").trim();
   var skill = (document.getElementById("cs-template").value || "").trim();
   var autoApprove = document.getElementById("cs-autoapprove").checked;
+  var notifyTargets = _collectNotifyTargets("cs");
   var errEl = document.getElementById("create-schedule-error");
 
   if (!name) return _showModalError(errEl, "Name is required");
@@ -1153,11 +1307,9 @@ function submitCreateSchedule() {
   if (schedType === "at" && !atTime)
     return _showModalError(errEl, "Run time is required");
 
-  // Normalize datetime-local to "YYYY-MM-DDTHH:MM:SS+00:00" (UTC)
+  // Convert browser local time to UTC for the server
   if (schedType === "at" && atTime) {
-    if (atTime.length === 16) atTime += ":00";
-    else if (atTime.length > 19) atTime = atTime.slice(0, 19);
-    atTime += "+00:00";
+    atTime = _localToUtcIso(atTime);
   }
 
   if (targetMode === "node") targetMode = nodeId;
@@ -1180,6 +1332,7 @@ function submitCreateSchedule() {
       initial_message: message,
       auto_approve: autoApprove,
       skill: skill,
+      notify_targets: notifyTargets,
     }),
   })
     .then(function (r) {
@@ -1233,7 +1386,7 @@ function showEditScheduleModal(taskId) {
       document.getElementById("es-desc").value = s.description || "";
       document.getElementById("es-type").value = s.schedule_type;
       document.getElementById("es-cron").value = s.cron_expr || "";
-      document.getElementById("es-at").value = (s.at_time || "").slice(0, 16);
+      document.getElementById("es-at").value = _utcToLocalDatetime(s.at_time);
       var isSpecificNode =
         s.target_mode &&
         s.target_mode !== "auto" &&
@@ -1245,11 +1398,32 @@ function showEditScheduleModal(taskId) {
       document.getElementById("es-node").value = isSpecificNode
         ? s.target_mode
         : "";
-      document.getElementById("es-model").value = s.model || "";
-      document.getElementById("es-template").value = s.skill || "";
+      // Populate model dropdown with current value pre-selected
+      _populateScheduleSelect("es-model", "/v1/api/models", "alias", "alias", {
+        listKey: "models",
+        selected: s.model || "",
+        display: function (m) {
+          return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+        },
+      });
+      // Populate skill dropdown with current value pre-selected
+      _populateScheduleSelect(
+        "es-template",
+        "/v1/api/admin/skills",
+        "name",
+        "name",
+        {
+          listKey: "skills",
+          selected: s.skill || "",
+          display: function (sk) {
+            return sk.name;
+          },
+        },
+      );
       document.getElementById("es-message").value = s.initial_message || "";
       document.getElementById("es-autoapprove").checked = !!s.auto_approve;
       document.getElementById("es-enabled").checked = !!s.enabled;
+      _populateNotifyRows("es", s.notify_targets || []);
       toggleEditScheduleTypeFields();
       toggleEditScheduleNodeField();
       document.getElementById("edit-schedule-error").style.display = "none";
@@ -1289,12 +1463,8 @@ function submitEditSchedule() {
   if (targetMode === "node")
     targetMode = (document.getElementById("es-node").value || "").trim();
   var atTime = document.getElementById("es-at").value || "";
-  if (atTime) {
-    if (atTime.length === 16) atTime += ":00";
-    else if (atTime.length > 19) atTime = atTime.slice(0, 19);
-    atTime += "+00:00";
-  }
 
+  var editNotifyTargets = _collectNotifyTargets("es");
   var errEl = document.getElementById("edit-schedule-error");
 
   if (!name) return _showModalError(errEl, "Name is required");
@@ -1304,6 +1474,11 @@ function submitEditSchedule() {
   if (schedType === "at" && !atTime)
     return _showModalError(errEl, "Run time is required");
 
+  // Convert browser local time to UTC for the server
+  if (schedType === "at" && atTime) {
+    atTime = _localToUtcIso(atTime);
+  }
+
   var btn = document.getElementById("es-submit");
   btn.disabled = true;
   btn.textContent = "Saving\u2026";
@@ -1312,19 +1487,18 @@ function submitEditSchedule() {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      name: (document.getElementById("es-name").value || "").trim(),
+      name: name,
       description: (document.getElementById("es-desc").value || "").trim(),
-      schedule_type: document.getElementById("es-type").value,
-      cron_expr: (document.getElementById("es-cron").value || "").trim(),
+      schedule_type: schedType,
+      cron_expr: cronExpr,
       at_time: atTime,
       target_mode: targetMode,
       model: (document.getElementById("es-model").value || "").trim(),
       skill: (document.getElementById("es-template").value || "").trim(),
-      initial_message: (
-        document.getElementById("es-message").value || ""
-      ).trim(),
+      initial_message: message,
       auto_approve: document.getElementById("es-autoapprove").checked,
       enabled: document.getElementById("es-enabled").checked,
+      notify_targets: editNotifyTargets,
     }),
   })
     .then(function (r) {

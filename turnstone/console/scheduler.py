@@ -318,6 +318,7 @@ class TaskScheduler:
                 auto_approve_tools=",".join(self._parse_tools(task)),
                 user_id=task.get("created_by", ""),
                 skill=task.get("skill", ""),
+                notify_targets=task.get("notify_targets", "[]"),
             )
             ws_id = resp.ws_id
         except Exception:

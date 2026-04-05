@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+_NOTIFY_ADAPTER_TIMEOUT: float = 30.0
+
 # ws_id is a hex string (8–32 chars depending on entry point).
 _WS_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 
@@ -131,10 +133,12 @@ async def _handle_notify(request: Request) -> JSONResponse:
             )
             continue
         try:
-            if ws_id:
-                msg_id = await adapter.send_notification(channel_id, content, ws_id)
-            else:
-                msg_id = await adapter.send(channel_id, content)
+            coro = (
+                adapter.send_notification(channel_id, content, ws_id)
+                if ws_id
+                else adapter.send(channel_id, content)
+            )
+            msg_id = await asyncio.wait_for(coro, timeout=_NOTIFY_ADAPTER_TIMEOUT)
             results.append(
                 {
                     "channel_type": channel_type,
@@ -148,6 +152,19 @@ async def _handle_notify(request: Request) -> JSONResponse:
                 channel_type=channel_type,
                 channel_id=channel_id,
                 message_id=msg_id,
+            )
+        except TimeoutError:
+            log.warning(
+                "notify.timeout",
+                channel_type=channel_type,
+                channel_id=channel_id,
+            )
+            results.append(
+                {
+                    "channel_type": channel_type,
+                    "channel_id": channel_id,
+                    "status": "timeout",
+                }
             )
         except Exception:
             log.exception(

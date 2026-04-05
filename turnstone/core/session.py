@@ -1258,6 +1258,10 @@ class ChatSession:
         except Exception:
             log.warning("session.skill_catalog_failed", exc_info=True)
             search_skills = []
+        # Exclude the already-applied skill from the catalog so the model
+        # doesn't suggest activating a skill that is already loaded.
+        applied_name = self._skill_name or ""
+        search_skills = [sk for sk in search_skills if sk.get("name", "") != applied_name]
         if search_skills:
             catalog_lines = ["<available-skills>"]
             for sk in search_skills[:30]:
