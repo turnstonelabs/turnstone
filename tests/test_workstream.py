@@ -137,7 +137,7 @@ class TestManagerCreation:
     def test_create_second_does_not_change_active(self):
         mgr = WorkstreamManager(_fake_factory)
         ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        _ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
         assert mgr.active_id == ws1.id
 
     def test_create_assigns_session(self):
@@ -186,9 +186,9 @@ class TestManagerLookup:
 
     def test_list_all_creation_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
-        _ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        _ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
         result = mgr.list_all()
         assert [w.name for w in result] == ["a", "b", "c"]
 
@@ -232,7 +232,7 @@ class TestManagerSwitching:
 
     def test_switch_by_index(self):
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         result = mgr.switch_by_index(2)
@@ -254,7 +254,7 @@ class TestManagerSwitching:
 class TestManagerClose:
     def test_close_removes_workstream(self):
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         closed = mgr.close(ws2.id)
@@ -287,9 +287,9 @@ class TestManagerClose:
 
     def test_close_updates_order(self):
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="a", ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(name="b", ui_factory=lambda wid: FakeUI(wid))
-        _ws3 = mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="c", ui_factory=lambda wid: FakeUI(wid))
 
         mgr.close(ws2.id)
         names = [w.name for w in mgr.list_all()]
@@ -298,7 +298,7 @@ class TestManagerClose:
     def test_close_unblocks_approval_event(self):
         """Closing a workstream whose UI has a pending approval should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         # Create a workstream with a WebUI-like approval mechanism
         from turnstone.server import WebUI
@@ -313,7 +313,7 @@ class TestManagerClose:
     def test_close_unblocks_plan_event(self):
         """Closing a workstream with pending plan review should unblock it."""
         mgr = WorkstreamManager(_fake_factory)
-        _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
         from turnstone.server import WebUI
 
@@ -336,7 +336,7 @@ class TestManagerEviction:
         mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
         ws1 = mgr.create(name="oldest", ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(name="middle", ui_factory=lambda wid: FakeUI(wid))
-        _ws3 = mgr.create(name="newest", ui_factory=lambda wid: FakeUI(wid))
+        mgr.create(name="newest", ui_factory=lambda wid: FakeUI(wid))
         # All three are IDLE.  Mark ws2 as RUNNING so it won't be evicted.
         mgr.set_state(ws2.id, WorkstreamState.RUNNING)
         # ws1 is oldest idle, ws3 is newer idle.  Creating should evict ws1.
