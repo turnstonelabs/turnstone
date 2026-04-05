@@ -39,7 +39,7 @@ class MockStorage:
         self.services: list[dict[str, str]] = []
 
     def list_services(self, service_type: str, max_age_seconds: int = 120) -> list[dict[str, str]]:
-        return [s for s in self.services if True]  # all services match
+        return list(self.services)
 
 
 # ---------------------------------------------------------------------------
