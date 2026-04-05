@@ -100,7 +100,6 @@ class TestVersionHtml:
         assert f"?v={__version__}" in result
 
     def test_double_apply_is_idempotent(self):
-        from turnstone import __version__
         from turnstone.core.web_helpers import version_html
 
         html = '<script src="/static/app.js"></script>'
