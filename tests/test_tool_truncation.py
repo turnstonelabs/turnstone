@@ -110,6 +110,30 @@ class TestRemainingTokenBudget:
         session._msg_tokens = [8000]
         assert session._remaining_token_budget() == 0
 
+    def test_max_tokens_equals_context_window(self, tmp_db, mock_openai_client):
+        """Regression: max_tokens >= context_window must not zero the budget."""
+        s = ChatSession(
+            client=mock_openai_client,
+            model="test-model",
+            ui=MagicMock(),
+            instructions=None,
+            temperature=0.5,
+            tool_timeout=10,
+            context_window=32_768,
+            max_tokens=32_768,
+        )
+        s._system_tokens = 500
+        s._msg_tokens = [1000]
+        budget = s._remaining_token_budget()
+        # response_reserve = min(32768, 32768//4) = 8192
+        # safety = 32768 * 0.05 = 1638
+        # budget = 32768 - 500 - 1000 - 8192 - 1638 = 21438
+        assert budget > 20_000
+        # Tool output should NOT be collapsed to a placeholder
+        big = "x" * 5000
+        result = s._truncate_output(big, remaining_budget_tokens=budget)
+        assert result == big  # 5000 chars fits easily in 21K+ token budget
+
 
 # ---------------------------------------------------------------------------
 # Context overflow recovery

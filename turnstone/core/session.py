@@ -889,12 +889,14 @@ class ChatSession:
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.
 
-        Reserves space for ``max_tokens`` (model response) and a 5% safety
-        margin.  Returns at least 0.
+        Reserves a response budget (capped at 25% of context window, since
+        ``max_tokens`` is an upper bound, not guaranteed consumption) plus
+        a 5% safety margin.  Returns at least 0.
         """
         used = self._system_tokens + sum(self._msg_tokens)
-        reserved = self.max_tokens + int(self.context_window * 0.05)
-        return max(0, self.context_window - used - reserved)
+        response_reserve = min(self.max_tokens, self.context_window // 4)
+        safety_margin = int(self.context_window * 0.05)
+        return max(0, self.context_window - used - response_reserve - safety_margin)
 
     def _truncate_output(self, output: str, remaining_budget_tokens: int | None = None) -> str:
         """Truncate tool output, keeping head + tail.
