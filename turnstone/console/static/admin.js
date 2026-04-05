@@ -60,6 +60,7 @@ function showAdmin() {
     roles: "admin.roles",
     policies: "admin.policies",
     "prompt-policies": "admin.prompt_policies",
+    judge: "admin.judge",
     skills: "admin.skills",
     usage: "admin.usage",
     audit: "admin.audit",
@@ -242,6 +243,7 @@ function switchAdminTab(tab) {
     "tls",
     "mcp",
     "prompt-policies",
+    "judge",
   ];
   for (var p = 0; p < panels.length; p++) {
     var el = document.getElementById("admin-" + panels[p]);
@@ -267,6 +269,7 @@ function switchAdminTab(tab) {
   if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
   if (tab === "prompt-policies") loadPromptPolicies();
+  if (tab === "judge") loadJudgeTab();
 
   // Update breadcrumb with active tab label
   var activeNav = document.querySelector('.admin-nav[data-tab="' + tab + '"]');
@@ -2355,6 +2358,7 @@ function loadSettings() {
       var merged = {};
       for (var j = 0; j < valuesArr.length; j++) {
         var v = valuesArr[j];
+        if (v.key.startsWith("judge.")) continue;
         var s = schemaMap[v.key] || {};
         merged[v.key] = {
           key: v.key,

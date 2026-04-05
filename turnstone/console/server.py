@@ -5781,6 +5781,998 @@ async def admin_delete_prompt_policy(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "policy_id": policy_id})
 
 
+# ---------------------------------------------------------------------------
+# Admin: Judge (heuristic rules, output guard patterns, settings)
+# ---------------------------------------------------------------------------
+
+_JUDGE_RULE_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+_VALID_RISK_LEVELS = frozenset({"critical", "high", "medium", "low"})
+_VALID_RECOMMENDATIONS = frozenset({"approve", "review", "deny"})
+_VALID_TIERS = frozenset({"critical", "high", "medium", "low"})
+_VALID_CATEGORIES = frozenset(
+    {
+        "prompt_injection",
+        "credentials",
+        "encoded_payloads",
+        "adversarial_urls",
+        "info_disclosure",
+    }
+)
+_VALID_PATTERN_FLAGS = frozenset({"IGNORECASE", "MULTILINE", "DOTALL"})
+_FLAG_NAME_RE = re.compile(r"^[a-z][a-z_]*$")
+
+
+def _validate_regex_pattern(pattern: str, flags: int = 0) -> str | None:
+    """Validate a regex pattern. Returns error message or None if valid.
+
+    Compiles the pattern with the given flags, then probes against several
+    test strings with a timeout to detect catastrophic backtracking.
+    """
+    try:
+        compiled = re.compile(pattern, flags)
+    except re.error as exc:
+        return f"Invalid regex: {exc}"
+
+    # Probe against several string shapes to detect catastrophic backtracking.
+    test_strings = ["a" * 1000, "b" * 30 + "!", "A1b2C3" * 100]
+
+    def _probe() -> None:
+        for s in test_strings:
+            compiled.search(s)
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(_probe).result(timeout=0.5)
+    except FuturesTimeout:
+        return "Regex appears to have catastrophic backtracking"
+    except Exception:
+        return "Regex caused an error during test"
+    return None
+
+
+# -- Judge settings ---------------------------------------------------------
+
+
+async def admin_list_judge_settings(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/judge/settings — list judge settings with schema."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS, deserialize_value
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    stored = {r["key"]: r for r in storage.list_system_settings() if r.get("node_id", "") == ""}
+
+    result: list[dict[str, Any]] = []
+    for key, defn in sorted(SETTINGS.items()):
+        if not key.startswith("judge."):
+            continue
+        row = stored.get(key)
+        if row:
+            try:
+                val = deserialize_value(key, row["value"])
+            except (ValueError, KeyError):
+                val = row["value"]
+            entry = {
+                "key": key,
+                "type": defn.type,
+                "default": defn.default,
+                "description": defn.description,
+                "help": defn.help,
+                "value": "***" if defn.is_secret else val,
+                "source": "storage",
+                "is_secret": defn.is_secret,
+                "min_value": defn.min_value,
+                "max_value": defn.max_value,
+                "choices": defn.choices,
+                "restart_required": defn.restart_required,
+            }
+        else:
+            entry = {
+                "key": key,
+                "type": defn.type,
+                "default": defn.default,
+                "description": defn.description,
+                "help": defn.help,
+                "value": "***" if defn.is_secret else defn.default,
+                "source": "default",
+                "is_secret": defn.is_secret,
+                "min_value": defn.min_value,
+                "max_value": defn.max_value,
+                "choices": defn.choices,
+                "restart_required": defn.restart_required,
+            }
+        result.append(entry)
+    return JSONResponse({"settings": result})
+
+
+async def admin_update_judge_setting(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/judge/settings/{key} — update a judge setting."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    if not key.startswith("judge."):
+        return JSONResponse({"error": "Only judge.* settings allowed"}, status_code=400)
+
+    defn = SETTINGS.get(key)
+    if defn is None:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    value = body.get("value")
+    if value is None:
+        return JSONResponse({"error": "value is required"}, status_code=400)
+
+    # Use ConfigStore for validation and persistence
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store is None:
+        return JSONResponse({"error": "ConfigStore not available"}, status_code=503)
+
+    # Handle secret sentinel
+    if defn.is_secret and value == "***":
+        return JSONResponse({"status": "ok", "key": key, "value": "***"})
+
+    audit_uid, ip = _audit_context(request)
+    try:
+        config_store.set(key, value, changed_by=audit_uid)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    record_audit(
+        storage,
+        audit_uid,
+        "setting.update",
+        "setting",
+        key,
+        {"value": "***" if defn.is_secret else value},
+        ip,
+    )
+    await _publish_config_change(request)
+
+    effective = config_store.get(key, defn.default)
+    return JSONResponse(
+        {"status": "ok", "key": key, "value": "***" if defn.is_secret else effective}
+    )
+
+
+async def admin_delete_judge_setting(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/judge/settings/{key} — reset a judge setting to default."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.settings_registry import SETTINGS
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    key = request.path_params["key"]
+    if not key.startswith("judge."):
+        return JSONResponse({"error": "Only judge.* settings allowed"}, status_code=400)
+
+    defn = SETTINGS.get(key)
+    if defn is None:
+        return JSONResponse({"error": f"Unknown setting: {key}"}, status_code=404)
+
+    config_store = getattr(request.app.state, "config_store", None)
+    if config_store:
+        config_store.delete(key)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(storage, audit_uid, "setting.delete", "setting", key, {}, ip)
+    await _publish_config_change(request)
+
+    return JSONResponse({"status": "ok", "key": key, "default": defn.default})
+
+
+# -- Heuristic rules -------------------------------------------------------
+
+
+async def admin_list_heuristic_rules(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/judge/heuristic-rules — list merged heuristic rules."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    # Get DB rules
+    db_rules = storage.list_heuristic_rules()
+
+    # Get built-in rules
+    from turnstone.core.judge import _HEURISTIC_RULES
+
+    # Build merged list
+    result: list[dict[str, Any]] = []
+
+    # Start with DB rules
+    seen_names: set[str] = set()
+    for row in db_rules:
+        name = row["name"]
+        seen_names.add(name)
+        entry = dict(row)
+        if row.get("builtin"):
+            entry["source"] = "builtin-overridden" if row.get("enabled") else "builtin-disabled"
+        else:
+            entry["source"] = "db"
+        result.append(entry)
+
+    # Add built-ins not overridden in DB
+    import json as _json
+
+    for rule in _HEURISTIC_RULES:
+        if rule.name not in seen_names:
+            result.append(
+                {
+                    "rule_id": "",
+                    "name": rule.name,
+                    "risk_level": rule.risk_level,
+                    "confidence": rule.confidence,
+                    "recommendation": rule.recommendation,
+                    "tool_pattern": rule.tool_pattern,
+                    "arg_patterns": _json.dumps(rule.arg_patterns),
+                    "intent_template": rule.intent_template,
+                    "reasoning_template": rule.reasoning_template,
+                    "tier": rule.risk_level,
+                    "priority": 0,
+                    "builtin": True,
+                    "enabled": True,
+                    "source": "builtin",
+                    "created_by": "",
+                    "created": "",
+                    "updated": "",
+                }
+            )
+
+    return JSONResponse({"rules": result})
+
+
+async def admin_create_heuristic_rule(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/judge/heuristic-rules — create a heuristic rule."""
+    import json as _json
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:64]
+    if not name or not _JUDGE_RULE_NAME_RE.match(name):
+        return JSONResponse(
+            {"error": "name must match [a-z][a-z0-9_-]* (max 64 chars)"},
+            status_code=400,
+        )
+
+    # Check uniqueness
+    if storage.get_heuristic_rule_by_name(name):
+        return JSONResponse({"error": f"Rule with name '{name}' already exists"}, status_code=409)
+
+    risk_level = str(body.get("risk_level", "medium"))
+    if risk_level not in _VALID_RISK_LEVELS:
+        return JSONResponse(
+            {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"}, status_code=400
+        )
+
+    recommendation = str(body.get("recommendation", "review"))
+    if recommendation not in _VALID_RECOMMENDATIONS:
+        return JSONResponse(
+            {"error": f"recommendation must be one of {sorted(_VALID_RECOMMENDATIONS)}"},
+            status_code=400,
+        )
+
+    tier = str(body.get("tier", risk_level))
+    if tier not in _VALID_TIERS:
+        return JSONResponse(
+            {"error": f"tier must be one of {sorted(_VALID_TIERS)}"}, status_code=400
+        )
+
+    try:
+        confidence = float(body.get("confidence", 0.7))
+        if not 0.0 <= confidence <= 1.0:
+            raise ValueError
+    except (ValueError, TypeError):
+        return JSONResponse(
+            {"error": "confidence must be a float between 0.0 and 1.0"}, status_code=400
+        )
+
+    tool_pattern = str(body.get("tool_pattern", "*"))
+    if not tool_pattern:
+        return JSONResponse({"error": "tool_pattern is required"}, status_code=400)
+
+    # Validate arg_patterns
+    arg_patterns = body.get("arg_patterns", [])
+    if isinstance(arg_patterns, str):
+        try:
+            arg_patterns = _json.loads(arg_patterns)
+        except _json.JSONDecodeError:
+            return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
+    if not isinstance(arg_patterns, list):
+        return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
+    for i, pat in enumerate(arg_patterns):
+        err_msg = _validate_regex_pattern(str(pat))
+        if err_msg:
+            return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
+
+    try:
+        priority = int(body.get("priority", 0))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+
+    rule_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    storage.create_heuristic_rule(
+        rule_id=rule_id,
+        name=name,
+        risk_level=risk_level,
+        confidence=confidence,
+        recommendation=recommendation,
+        tool_pattern=tool_pattern,
+        arg_patterns=_json.dumps(arg_patterns),
+        intent_template=str(body.get("intent_template", "")),
+        reasoning_template=str(body.get("reasoning_template", "")),
+        tier=tier,
+        priority=priority,
+        builtin=bool(body.get("builtin", False)),
+        enabled=bool(body.get("enabled", True)),
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage, audit_uid, "heuristic_rule.create", "heuristic_rule", rule_id, {"name": name}, ip
+    )
+
+    # Reload rule registry
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse(storage.get_heuristic_rule(rule_id) or {}, status_code=201)
+
+
+async def admin_get_heuristic_rule(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/judge/heuristic-rules/{rule_id}."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    rule_id = request.path_params["rule_id"]
+    rule = storage.get_heuristic_rule(rule_id)
+    if rule is None:
+        return JSONResponse({"error": "Heuristic rule not found"}, status_code=404)
+    return JSONResponse(rule)
+
+
+async def admin_update_heuristic_rule(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/judge/heuristic-rules/{rule_id}."""
+    import json as _json
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    rule_id = request.path_params["rule_id"]
+    existing = storage.get_heuristic_rule(rule_id)
+    if existing is None:
+        return JSONResponse({"error": "Heuristic rule not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    fields: dict[str, Any] = {}
+
+    if "name" in body:
+        name = str(body["name"]).strip()[:64]
+        if not _JUDGE_RULE_NAME_RE.match(name):
+            return JSONResponse({"error": "name must match [a-z][a-z0-9_-]*"}, status_code=400)
+        existing_by_name = storage.get_heuristic_rule_by_name(name)
+        if existing_by_name and existing_by_name.get("rule_id") != rule_id:
+            return JSONResponse(
+                {"error": f"Rule with name '{name}' already exists"}, status_code=409
+            )
+        fields["name"] = name
+
+    if "risk_level" in body:
+        if body["risk_level"] not in _VALID_RISK_LEVELS:
+            return JSONResponse(
+                {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"},
+                status_code=400,
+            )
+        fields["risk_level"] = body["risk_level"]
+
+    if "recommendation" in body:
+        if body["recommendation"] not in _VALID_RECOMMENDATIONS:
+            return JSONResponse(
+                {"error": f"recommendation must be one of {sorted(_VALID_RECOMMENDATIONS)}"},
+                status_code=400,
+            )
+        fields["recommendation"] = body["recommendation"]
+
+    if "tier" in body:
+        if body["tier"] not in _VALID_TIERS:
+            return JSONResponse(
+                {"error": f"tier must be one of {sorted(_VALID_TIERS)}"}, status_code=400
+            )
+        fields["tier"] = body["tier"]
+
+    if "confidence" in body:
+        try:
+            conf = float(body["confidence"])
+            if not 0.0 <= conf <= 1.0:
+                raise ValueError
+            fields["confidence"] = conf
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "confidence must be 0.0-1.0"}, status_code=400)
+
+    if "tool_pattern" in body:
+        fields["tool_pattern"] = str(body["tool_pattern"])
+
+    if "arg_patterns" in body:
+        ap = body["arg_patterns"]
+        if isinstance(ap, str):
+            try:
+                ap = _json.loads(ap)
+            except _json.JSONDecodeError:
+                return JSONResponse({"error": "arg_patterns must be a JSON array"}, status_code=400)
+        if not isinstance(ap, list):
+            return JSONResponse({"error": "arg_patterns must be a list"}, status_code=400)
+        for i, pat in enumerate(ap):
+            err_msg = _validate_regex_pattern(str(pat))
+            if err_msg:
+                return JSONResponse({"error": f"arg_patterns[{i}]: {err_msg}"}, status_code=400)
+        fields["arg_patterns"] = _json.dumps(ap)
+
+    if "intent_template" in body:
+        fields["intent_template"] = str(body["intent_template"])
+    if "reasoning_template" in body:
+        fields["reasoning_template"] = str(body["reasoning_template"])
+    if "priority" in body:
+        try:
+            fields["priority"] = int(body["priority"])
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+    if "builtin" in body:
+        fields["builtin"] = bool(body["builtin"])
+    if "enabled" in body:
+        fields["enabled"] = bool(body["enabled"])
+
+    if fields:
+        storage.update_heuristic_rule(rule_id, **fields)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "heuristic_rule.update",
+        "heuristic_rule",
+        rule_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse(storage.get_heuristic_rule(rule_id) or {})
+
+
+async def admin_delete_heuristic_rule(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/judge/heuristic-rules/{rule_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    rule_id = request.path_params["rule_id"]
+    existing = storage.get_heuristic_rule(rule_id)
+    if existing is None:
+        return JSONResponse({"error": "Heuristic rule not found"}, status_code=404)
+
+    storage.delete_heuristic_rule(rule_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "heuristic_rule.delete",
+        "heuristic_rule",
+        rule_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse({"status": "ok", "rule_id": rule_id})
+
+
+# -- Output guard patterns --------------------------------------------------
+
+
+async def admin_list_output_guard_patterns(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/judge/output-guard-patterns — list merged output guard patterns."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    # Get DB patterns
+    db_patterns = storage.list_output_guard_patterns()
+
+    # Get built-in patterns
+    from turnstone.core.output_guard import _BUILTIN_OG_PATTERNS
+
+    # Build merged list
+    result: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for row in db_patterns:
+        name = row["name"]
+        seen_names.add(name)
+        entry = dict(row)
+        if row.get("builtin"):
+            entry["source"] = "builtin-overridden" if row.get("enabled") else "builtin-disabled"
+        else:
+            entry["source"] = "db"
+        result.append(entry)
+
+    # Add built-ins not overridden in DB
+    for pat in _BUILTIN_OG_PATTERNS:
+        if pat.name not in seen_names:
+            result.append(
+                {
+                    "pattern_id": "",
+                    "name": pat.name,
+                    "category": pat.category,
+                    "risk_level": pat.risk_level,
+                    "pattern": pat.compiled.pattern,
+                    "pattern_flags": "",
+                    "flag_name": pat.flag_name,
+                    "annotation": pat.annotation,
+                    "is_credential": pat.is_credential,
+                    "redact_label": pat.redact_label,
+                    "priority": pat.priority,
+                    "builtin": True,
+                    "enabled": True,
+                    "source": "builtin",
+                    "created_by": "",
+                    "created": "",
+                    "updated": "",
+                }
+            )
+
+    return JSONResponse({"patterns": result})
+
+
+async def admin_create_output_guard_pattern(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/judge/output-guard-patterns — create an output guard pattern."""
+    import uuid
+
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    name = str(body.get("name", "")).strip()[:64]
+    if not name or not _JUDGE_RULE_NAME_RE.match(name):
+        return JSONResponse(
+            {"error": "name must match [a-z][a-z0-9_-]* (max 64 chars)"},
+            status_code=400,
+        )
+
+    # Check uniqueness
+    if storage.get_output_guard_pattern_by_name(name):
+        return JSONResponse(
+            {"error": f"Pattern with name '{name}' already exists"}, status_code=409
+        )
+
+    # Validate pattern_flags first (needed for pattern validation)
+    pattern_flags_raw = body.get("pattern_flags", "")
+    if isinstance(pattern_flags_raw, list):
+        pattern_flags_list = pattern_flags_raw
+    elif isinstance(pattern_flags_raw, str) and pattern_flags_raw:
+        pattern_flags_list = [f.strip() for f in pattern_flags_raw.split(",") if f.strip()]
+    else:
+        pattern_flags_list = []
+    re_flags = 0
+    for flag in pattern_flags_list:
+        if flag not in _VALID_PATTERN_FLAGS:
+            return JSONResponse(
+                {
+                    "error": f"Invalid pattern_flag '{flag}'; must be one of {sorted(_VALID_PATTERN_FLAGS)}"
+                },
+                status_code=400,
+            )
+        re_flags |= {"IGNORECASE": re.IGNORECASE, "MULTILINE": re.MULTILINE, "DOTALL": re.DOTALL}[
+            flag
+        ]
+    pattern_flags = ",".join(pattern_flags_list)
+
+    pattern = str(body.get("pattern", ""))
+    if not pattern:
+        return JSONResponse({"error": "pattern is required"}, status_code=400)
+    err_msg = _validate_regex_pattern(pattern, re_flags)
+    if err_msg:
+        return JSONResponse({"error": err_msg}, status_code=400)
+
+    category = str(body.get("category", ""))
+    if category not in _VALID_CATEGORIES:
+        return JSONResponse(
+            {"error": f"category must be one of {sorted(_VALID_CATEGORIES)}"}, status_code=400
+        )
+
+    risk_level = str(body.get("risk_level", "medium"))
+    if risk_level not in _VALID_RISK_LEVELS:
+        return JSONResponse(
+            {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"}, status_code=400
+        )
+
+    flag_name = str(body.get("flag_name", ""))
+    if not flag_name or not _FLAG_NAME_RE.match(flag_name):
+        return JSONResponse({"error": "flag_name must match [a-z][a-z_]*"}, status_code=400)
+
+    annotation = str(body.get("annotation", ""))
+
+    is_credential = bool(body.get("is_credential", False))
+    redact_label = str(body.get("redact_label", ""))
+    if is_credential and not redact_label:
+        return JSONResponse(
+            {"error": "redact_label is required when is_credential is true"}, status_code=400
+        )
+
+    try:
+        priority = int(body.get("priority", 0))
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+
+    pattern_id = uuid.uuid4().hex
+    audit_uid, ip = _audit_context(request)
+
+    storage.create_output_guard_pattern(
+        pattern_id=pattern_id,
+        name=name,
+        category=category,
+        risk_level=risk_level,
+        pattern=pattern,
+        flag_name=flag_name,
+        annotation=annotation,
+        pattern_flags=pattern_flags,
+        is_credential=is_credential,
+        redact_label=redact_label,
+        priority=priority,
+        builtin=bool(body.get("builtin", False)),
+        enabled=bool(body.get("enabled", True)),
+        created_by=audit_uid,
+    )
+
+    record_audit(
+        storage,
+        audit_uid,
+        "output_guard_pattern.create",
+        "output_guard_pattern",
+        pattern_id,
+        {"name": name},
+        ip,
+    )
+
+    # Reload rule registry
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {}, status_code=201)
+
+
+async def admin_get_output_guard_pattern(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/judge/output-guard-patterns/{pattern_id}."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    pattern_id = request.path_params["pattern_id"]
+    pattern = storage.get_output_guard_pattern(pattern_id)
+    if pattern is None:
+        return JSONResponse({"error": "Output guard pattern not found"}, status_code=404)
+    return JSONResponse(pattern)
+
+
+async def admin_update_output_guard_pattern(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/judge/output-guard-patterns/{pattern_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400, require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    pattern_id = request.path_params["pattern_id"]
+    existing = storage.get_output_guard_pattern(pattern_id)
+    if existing is None:
+        return JSONResponse({"error": "Output guard pattern not found"}, status_code=404)
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    fields: dict[str, Any] = {}
+
+    if "name" in body:
+        name = str(body["name"]).strip()[:64]
+        if not _JUDGE_RULE_NAME_RE.match(name):
+            return JSONResponse({"error": "name must match [a-z][a-z0-9_-]*"}, status_code=400)
+        existing_by_name = storage.get_output_guard_pattern_by_name(name)
+        if existing_by_name and existing_by_name.get("pattern_id") != pattern_id:
+            return JSONResponse(
+                {"error": f"Pattern with name '{name}' already exists"}, status_code=409
+            )
+        fields["name"] = name
+
+    if "pattern" in body:
+        pattern = str(body["pattern"])
+        err_msg = _validate_regex_pattern(pattern)
+        if err_msg:
+            return JSONResponse({"error": err_msg}, status_code=400)
+        fields["pattern"] = pattern
+
+    if "pattern_flags" in body:
+        pf_raw = body["pattern_flags"]
+        if isinstance(pf_raw, list):
+            pf_list = pf_raw
+        elif isinstance(pf_raw, str) and pf_raw:
+            pf_list = [f.strip() for f in pf_raw.split(",") if f.strip()]
+        else:
+            pf_list = []
+        for flag in pf_list:
+            if flag not in _VALID_PATTERN_FLAGS:
+                return JSONResponse(
+                    {
+                        "error": f"Invalid pattern_flag '{flag}'; must be one of {sorted(_VALID_PATTERN_FLAGS)}"
+                    },
+                    status_code=400,
+                )
+        fields["pattern_flags"] = ",".join(pf_list)
+
+    if "category" in body:
+        if body["category"] not in _VALID_CATEGORIES:
+            return JSONResponse(
+                {"error": f"category must be one of {sorted(_VALID_CATEGORIES)}"}, status_code=400
+            )
+        fields["category"] = body["category"]
+
+    if "risk_level" in body:
+        if body["risk_level"] not in _VALID_RISK_LEVELS:
+            return JSONResponse(
+                {"error": f"risk_level must be one of {sorted(_VALID_RISK_LEVELS)}"},
+                status_code=400,
+            )
+        fields["risk_level"] = body["risk_level"]
+
+    if "flag_name" in body:
+        fn = str(body["flag_name"])
+        if not _FLAG_NAME_RE.match(fn):
+            return JSONResponse({"error": "flag_name must match [a-z][a-z_]*"}, status_code=400)
+        fields["flag_name"] = fn
+
+    if "annotation" in body:
+        fields["annotation"] = str(body["annotation"])
+
+    if "is_credential" in body:
+        fields["is_credential"] = bool(body["is_credential"])
+    if "redact_label" in body:
+        fields["redact_label"] = str(body["redact_label"])
+
+    # Cross-field validation: is_credential requires redact_label
+    final_is_cred = fields.get("is_credential", existing.get("is_credential", False))
+    final_redact = fields.get("redact_label", existing.get("redact_label", ""))
+    if final_is_cred and not final_redact:
+        return JSONResponse(
+            {"error": "redact_label is required when is_credential is true"}, status_code=400
+        )
+
+    if "priority" in body:
+        try:
+            fields["priority"] = int(body["priority"])
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "priority must be an integer"}, status_code=400)
+    if "builtin" in body:
+        fields["builtin"] = bool(body["builtin"])
+    if "enabled" in body:
+        fields["enabled"] = bool(body["enabled"])
+
+    if fields:
+        storage.update_output_guard_pattern(pattern_id, **fields)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "output_guard_pattern.update",
+        "output_guard_pattern",
+        pattern_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse(storage.get_output_guard_pattern(pattern_id) or {})
+
+
+async def admin_delete_output_guard_pattern(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/judge/output-guard-patterns/{pattern_id}."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import require_storage_or_503
+
+    storage, err = require_storage_or_503(request)
+    if err:
+        return err
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    pattern_id = request.path_params["pattern_id"]
+    existing = storage.get_output_guard_pattern(pattern_id)
+    if existing is None:
+        return JSONResponse({"error": "Output guard pattern not found"}, status_code=404)
+
+    storage.delete_output_guard_pattern(pattern_id)
+
+    audit_uid, ip = _audit_context(request)
+    record_audit(
+        storage,
+        audit_uid,
+        "output_guard_pattern.delete",
+        "output_guard_pattern",
+        pattern_id,
+        {"name": existing.get("name", "")},
+        ip,
+    )
+
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+    await _publish_config_change(request)
+
+    return JSONResponse({"status": "ok", "pattern_id": pattern_id})
+
+
+# -- Judge utility endpoints ------------------------------------------------
+
+
+async def admin_judge_reload(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/judge/reload — reload rule registry on all nodes."""
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    rule_registry = getattr(request.app.state, "rule_registry", None)
+    if rule_registry:
+        rule_registry.reload()
+
+    await _publish_config_change(request)
+    return JSONResponse({"status": "ok"})
+
+
+async def admin_validate_regex(request: Request) -> JSONResponse:
+    """POST /v1/api/admin/judge/validate-regex — test-compile a regex."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = require_permission(request, "admin.judge")
+    if err:
+        return err
+
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+
+    pattern = str(body.get("pattern", ""))
+    if not pattern:
+        return JSONResponse({"error": "pattern is required"}, status_code=400)
+
+    err_msg = _validate_regex_pattern(pattern)
+    if err_msg:
+        return JSONResponse({"valid": False, "error": err_msg})
+    return JSONResponse({"valid": True})
+
+
 async def admin_ring_status(request: Request) -> JSONResponse:
     """GET /v1/api/admin/ring/status — hash ring rebalancer status."""
     from turnstone.core.auth import require_permission
@@ -6237,6 +7229,70 @@ def create_app(
                         "/api/admin/prompt-policies/{policy_id}",
                         admin_delete_prompt_policy,
                         methods=["DELETE"],
+                    ),
+                    # Governance: Judge Rules
+                    Route("/api/admin/judge/settings", admin_list_judge_settings),
+                    Route(
+                        "/api/admin/judge/settings/{key:path}",
+                        admin_update_judge_setting,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/judge/settings/{key:path}",
+                        admin_delete_judge_setting,
+                        methods=["DELETE"],
+                    ),
+                    Route("/api/admin/judge/heuristic-rules", admin_list_heuristic_rules),
+                    Route(
+                        "/api/admin/judge/heuristic-rules",
+                        admin_create_heuristic_rule,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/judge/heuristic-rules/{rule_id}",
+                        admin_get_heuristic_rule,
+                    ),
+                    Route(
+                        "/api/admin/judge/heuristic-rules/{rule_id}",
+                        admin_update_heuristic_rule,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/judge/heuristic-rules/{rule_id}",
+                        admin_delete_heuristic_rule,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/admin/judge/output-guard-patterns", admin_list_output_guard_patterns
+                    ),
+                    Route(
+                        "/api/admin/judge/output-guard-patterns",
+                        admin_create_output_guard_pattern,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/judge/output-guard-patterns/{pattern_id}",
+                        admin_get_output_guard_pattern,
+                    ),
+                    Route(
+                        "/api/admin/judge/output-guard-patterns/{pattern_id}",
+                        admin_update_output_guard_pattern,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/judge/output-guard-patterns/{pattern_id}",
+                        admin_delete_output_guard_pattern,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/admin/judge/reload",
+                        admin_judge_reload,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/admin/judge/validate-regex",
+                        admin_validate_regex,
+                        methods=["POST"],
                     ),
                     # Governance: Usage & Audit
                     Route("/api/admin/usage", admin_usage),

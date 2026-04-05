@@ -55,6 +55,11 @@ class ConfigStore:
         self.reload()
 
     @property
+    def storage(self) -> StorageBackend:
+        """Read-only access to the underlying storage backend."""
+        return self._storage
+
+    @property
     def version(self) -> int:
         """Monotonic counter incremented on every cache update."""
         return self._version

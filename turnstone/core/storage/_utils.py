@@ -109,6 +109,38 @@ MODEL_DEFINITION_MUTABLE = frozenset(
     }
 )
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})
+HEURISTIC_RULE_MUTABLE = frozenset(
+    {
+        "name",
+        "risk_level",
+        "confidence",
+        "recommendation",
+        "tool_pattern",
+        "arg_patterns",
+        "intent_template",
+        "reasoning_template",
+        "tier",
+        "priority",
+        "builtin",
+        "enabled",
+    }
+)
+OUTPUT_GUARD_PATTERN_MUTABLE = frozenset(
+    {
+        "name",
+        "category",
+        "risk_level",
+        "pattern",
+        "pattern_flags",
+        "flag_name",
+        "annotation",
+        "is_credential",
+        "redact_label",
+        "priority",
+        "builtin",
+        "enabled",
+    }
+)
 VERDICT_MUTABLE = frozenset(
     {
         "user_decision",

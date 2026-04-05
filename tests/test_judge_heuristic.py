@@ -453,3 +453,66 @@ class TestEdgeCases:
     def test_cargo_install(self):
         v = evaluate_heuristic("bash", {"command": "cargo install ripgrep"}, "bash")
         _assert_verdict(v, risk_level="medium", recommendation="review")
+
+
+# ---------------------------------------------------------------------------
+# Custom rules parameter
+# ---------------------------------------------------------------------------
+
+
+class TestCustomRulesParam:
+    """Tests for evaluate_heuristic() with custom rules kwarg."""
+
+    def test_custom_rules_override_builtins(self):
+        """Custom rules list is used instead of built-in rules."""
+        from turnstone.core.judge import _HeuristicRule, evaluate_heuristic
+
+        custom = [
+            _HeuristicRule(
+                name="custom-test",
+                risk_level="high",
+                confidence=0.95,
+                recommendation="deny",
+                tool_pattern="bash",
+                arg_patterns=[r"custom_dangerous_cmd"],
+                intent_template="Custom danger: {arg_snippet}",
+                reasoning_template="Custom rule matched.",
+            ),
+        ]
+        # Should match custom rule
+        verdict = evaluate_heuristic(
+            "bash",
+            {"command": "custom_dangerous_cmd --flag"},
+            "bash",
+            rules=custom,
+        )
+        assert verdict.risk_level == "high"
+        assert verdict.recommendation == "deny"
+        assert "custom-test" in verdict.evidence[0]
+
+    def test_custom_rules_no_match_default(self):
+        """When custom rules don't match, default medium/review verdict returned."""
+        from turnstone.core.judge import evaluate_heuristic
+
+        verdict = evaluate_heuristic(
+            "bash",
+            {"command": "ls"},
+            "bash",
+            rules=[],
+        )
+        assert verdict.risk_level == "medium"
+        assert verdict.recommendation == "review"
+        assert verdict.confidence == 0.5
+
+    def test_none_rules_uses_builtins(self):
+        """When rules=None, built-in rules are used (backward compat)."""
+        from turnstone.core.judge import evaluate_heuristic
+
+        verdict = evaluate_heuristic(
+            "bash",
+            {"command": "rm -rf /etc"},
+            "bash",
+            rules=None,
+        )
+        assert verdict.risk_level == "critical"
+        assert "rm-root" in verdict.evidence[0]

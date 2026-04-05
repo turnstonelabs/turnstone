@@ -652,3 +652,59 @@ tls_certificates = sa.Table(
     sa.Column("expires_at", sa.Text, nullable=False),
     sa.Column("meta", sa.Text, nullable=True),
 )
+
+# ---------------------------------------------------------------------------
+# Heuristic rules — configurable intent validation patterns (admin-managed)
+# ---------------------------------------------------------------------------
+
+heuristic_rules = sa.Table(
+    "heuristic_rules",
+    metadata,
+    sa.Column("rule_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("risk_level", sa.Text, nullable=False),
+    sa.Column("confidence", sa.Float, nullable=False),
+    sa.Column("recommendation", sa.Text, nullable=False),
+    sa.Column("tool_pattern", sa.Text, nullable=False),
+    sa.Column("arg_patterns", sa.Text, nullable=False, server_default="[]"),
+    sa.Column("intent_template", sa.Text, nullable=False),
+    sa.Column("reasoning_template", sa.Text, nullable=False),
+    sa.Column("tier", sa.Text, nullable=False),
+    sa.Column("priority", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("builtin", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_heuristic_rules_enabled", heuristic_rules.c.enabled)
+sa.Index("idx_heuristic_rules_tier", heuristic_rules.c.tier)
+
+# ---------------------------------------------------------------------------
+# Output guard patterns — configurable output scanning patterns (admin-managed)
+# ---------------------------------------------------------------------------
+
+output_guard_patterns = sa.Table(
+    "output_guard_patterns",
+    metadata,
+    sa.Column("pattern_id", sa.Text, primary_key=True),
+    sa.Column("name", sa.Text, nullable=False, unique=True),
+    sa.Column("category", sa.Text, nullable=False),
+    sa.Column("risk_level", sa.Text, nullable=False),
+    sa.Column("pattern", sa.Text, nullable=False),
+    sa.Column("pattern_flags", sa.Text, nullable=False, server_default=""),
+    sa.Column("flag_name", sa.Text, nullable=False),
+    sa.Column("annotation", sa.Text, nullable=False),
+    sa.Column("is_credential", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("redact_label", sa.Text, nullable=False, server_default=""),
+    sa.Column("priority", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("builtin", sa.Integer, nullable=False, server_default="0"),
+    sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
+    sa.Column("created_by", sa.Text, nullable=False, server_default=""),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+)
+
+sa.Index("idx_ogp_enabled", output_guard_patterns.c.enabled)
+sa.Index("idx_ogp_category", output_guard_patterns.c.category)

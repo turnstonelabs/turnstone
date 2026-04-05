@@ -687,6 +687,8 @@ def evaluate_heuristic(
     func_args: dict[str, object],
     approval_label: str,
     call_id: str = "",
+    *,
+    rules: list[_HeuristicRule] | tuple[Any, ...] | None = None,
 ) -> IntentVerdict:
     """Evaluate a tool call against the heuristic rule table.
 
@@ -701,6 +703,10 @@ def evaluate_heuristic(
         approval_label: Granular approval identifier (may differ from
             func_name for MCP tools).
         call_id: The tool call ID from the provider, used for correlation.
+        rules: Optional rule list override. When provided, these rules
+            are used instead of the built-in ``_HEURISTIC_RULES``.
+            Accepts both ``_HeuristicRule`` and ``HeuristicRuleDef``
+            instances (duck-typed on shared field names).
 
     Returns:
         An :class:`IntentVerdict` with tier ``"heuristic"``.
@@ -714,7 +720,7 @@ def evaluate_heuristic(
     except (TypeError, ValueError):
         func_args_json = str(func_args)
 
-    for rule in _HEURISTIC_RULES:
+    for rule in rules if rules is not None else _HEURISTIC_RULES:
         if _match_rule(rule, func_name, func_args, approval_label, arg_text):
             elapsed_ms = int((time.monotonic() - start) * 1000)
             return IntentVerdict(
@@ -893,12 +899,29 @@ class IntentJudge:
         session_client: Any,
         session_model: str,
         context_window: int = 200_000,
+        rule_registry: Any | None = None,
+        model_registry: Any | None = None,
     ) -> None:
         self._config = config
         self._context_window = context_window
+        self._rule_registry = rule_registry
 
-        # Resolve judge model: use config override or session model
-        if config.model and config.provider:
+        # Resolve judge model: try model alias via ModelRegistry first
+        resolved = False
+        if config.model and model_registry is not None:
+            try:
+                if model_registry.has_alias(config.model):
+                    client, model_name, _ = model_registry.resolve(config.model)
+                    self._provider = model_registry.get_provider(config.model)
+                    self._client = client
+                    self._model = model_name
+                    caps = self._provider.get_capabilities(self._model)
+                    self._judge_context_window = caps.context_window
+                    resolved = True
+            except Exception:
+                log.debug("Model alias resolution failed for %r, falling back", config.model)
+
+        if not resolved and config.model and config.provider:
             from turnstone.core.providers import create_client, create_provider
 
             self._provider = create_provider(config.provider)
@@ -919,14 +942,14 @@ class IntentJudge:
             self._model = config.model
             caps = self._provider.get_capabilities(self._model)
             self._judge_context_window = caps.context_window
-        elif config.model:
+        elif not resolved and config.model:
             # Model override but same provider
             self._provider = session_provider
             self._client = session_client
             self._model = config.model
             caps = self._provider.get_capabilities(self._model)
             self._judge_context_window = caps.context_window
-        else:
+        elif not resolved:
             # Self-consistency: same model as session
             self._provider = session_provider
             self._client = session_client
@@ -971,7 +994,10 @@ class IntentJudge:
             approval_label = item.get("approval_label", func_name)
             call_id = item.get("call_id", item.get("tool_call_id", ""))
 
-            verdict = evaluate_heuristic(func_name, func_args, approval_label, call_id)
+            registry_rules = self._rule_registry.heuristic_rules if self._rule_registry else None
+            verdict = evaluate_heuristic(
+                func_name, func_args, approval_label, call_id, rules=registry_rules
+            )
             heuristic_verdicts.append(verdict)
 
         # Spawn daemon thread for LLM judge

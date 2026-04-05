@@ -340,6 +340,15 @@ class ChatSession:
         self._username = username
         self._client_type = client_type
         self._config_store = config_store
+        # Initialize rule registry for configurable judge rules
+        self._rule_registry = None
+        if config_store is not None:
+            try:
+                from turnstone.core.rule_registry import RuleRegistry
+
+                self._rule_registry = RuleRegistry(storage=config_store.storage)
+            except Exception:
+                log.debug("rule_registry.init_failed", exc_info=True)
         self._memory_config = memory_config or MemoryConfig()
         self._ws_id = ws_id or uuid.uuid4().hex
         self._title_generated = False
@@ -2727,6 +2736,8 @@ class ChatSession:
                 session_client=self.client,
                 session_model=self.model,
                 context_window=caps.context_window,
+                rule_registry=self._rule_registry,
+                model_registry=self._registry,
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -2812,7 +2823,13 @@ class ChatSession:
         """
         from turnstone.core.output_guard import evaluate_output
 
-        assessment = evaluate_output(output, func_name=func_name, call_id=call_id)
+        og_patterns = None
+        rule_reg = self._rule_registry
+        if rule_reg is not None:
+            og_patterns = rule_reg.output_patterns
+        assessment = evaluate_output(
+            output, func_name=func_name, call_id=call_id, patterns=og_patterns
+        )
         if assessment.risk_level == "none":
             return output
 

@@ -1066,6 +1066,90 @@ class StorageBackend(Protocol):
         """Delete a prompt policy. Returns True if existed."""
         ...
 
+    # -- Heuristic rules -------------------------------------------------------
+
+    def create_heuristic_rule(
+        self,
+        rule_id: str,
+        name: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        tool_pattern: str,
+        arg_patterns: str = "[]",
+        intent_template: str = "",
+        reasoning_template: str = "",
+        tier: str = "medium",
+        priority: int = 0,
+        builtin: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        """Create a heuristic rule. No-op if rule_id already exists."""
+        ...
+
+    def get_heuristic_rule(self, rule_id: str) -> dict[str, Any] | None:
+        """Return heuristic rule dict or None."""
+        ...
+
+    def get_heuristic_rule_by_name(self, name: str) -> dict[str, Any] | None:
+        """Return heuristic rule dict by name or None."""
+        ...
+
+    def list_heuristic_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """Return heuristic rules ordered by tier priority then rule priority."""
+        ...
+
+    def update_heuristic_rule(self, rule_id: str, **fields: Any) -> bool:
+        """Update specified fields on a heuristic rule. Returns True if found."""
+        ...
+
+    def delete_heuristic_rule(self, rule_id: str) -> bool:
+        """Delete a heuristic rule. Returns True if existed."""
+        ...
+
+    # -- Output guard patterns -------------------------------------------------
+
+    def create_output_guard_pattern(
+        self,
+        pattern_id: str,
+        name: str,
+        category: str,
+        risk_level: str,
+        pattern: str,
+        flag_name: str,
+        annotation: str,
+        pattern_flags: str = "",
+        is_credential: bool = False,
+        redact_label: str = "",
+        priority: int = 0,
+        builtin: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+        """Create an output guard pattern. No-op if pattern_id already exists."""
+        ...
+
+    def get_output_guard_pattern(self, pattern_id: str) -> dict[str, Any] | None:
+        """Return output guard pattern dict or None."""
+        ...
+
+    def get_output_guard_pattern_by_name(self, name: str) -> dict[str, Any] | None:
+        """Return output guard pattern dict by name or None."""
+        ...
+
+    def list_output_guard_patterns(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        """Return output guard patterns ordered by category then priority."""
+        ...
+
+    def update_output_guard_pattern(self, pattern_id: str, **fields: Any) -> bool:
+        """Update specified fields on an output guard pattern. Returns True if found."""
+        ...
+
+    def delete_output_guard_pattern(self, pattern_id: str) -> bool:
+        """Delete an output guard pattern. Returns True if existed."""
+        ...
+
     # -- TLS / ACME (lacme Store) ----------------------------------------------
 
     def save_tls_account_key(self, key_id: str, key_pem: str) -> None:

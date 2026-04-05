@@ -168,6 +168,225 @@ def _clean() -> OutputAssessment:
     return OutputAssessment()
 
 
+@dataclass(frozen=True)
+class OutputGuardPatternDef:
+    """A pattern definition for output guard scanning."""
+
+    name: str
+    category: str  # prompt_injection/credentials/encoded_payloads/adversarial_urls/info_disclosure
+    risk_level: str  # high/medium/low
+    compiled: re.Pattern[str]  # pre-compiled regex
+    flag_name: str  # e.g. "prompt_injection", "credential_leak"
+    annotation: str  # human-readable message
+    is_credential: bool = False  # triggers redaction
+    redact_label: str = ""  # e.g. "api_key"
+    priority: int = 0  # order within category (higher = first)
+
+
+# -- Built-in pattern definitions (consumed by rule_registry.RuleRegistry) ---
+
+_BUILTIN_OG_PATTERNS: list[OutputGuardPatternDef] = [
+    # -- prompt_injection (priority 1, high) --
+    OutputGuardPatternDef(
+        name="override_phrases",
+        category="prompt_injection",
+        risk_level="high",
+        compiled=_RE_OVERRIDE_PHRASES,
+        flag_name="prompt_injection",
+        annotation="Output contains phrases that attempt to override agent instructions.",
+        priority=40,
+    ),
+    OutputGuardPatternDef(
+        name="role_injection",
+        category="prompt_injection",
+        risk_level="high",
+        compiled=_RE_ROLE_INJECTION,
+        flag_name="role_injection",
+        annotation="Output contains role/message injection markers.",
+        priority=30,
+    ),
+    OutputGuardPatternDef(
+        name="instruction_override",
+        category="prompt_injection",
+        risk_level="high",
+        compiled=_RE_INSTRUCTION_OVERRIDE,
+        flag_name="instruction_override",
+        annotation="Output contains instruction-override keywords (MANDATORY, OVERRIDE, etc.).",
+        priority=20,
+    ),
+    OutputGuardPatternDef(
+        name="meta_injection",
+        category="prompt_injection",
+        risk_level="high",
+        compiled=_RE_META_INJECTION,
+        flag_name="meta_injection",
+        annotation="Output attempts to redefine the agent's identity or persona.",
+        priority=10,
+    ),
+    # -- credentials (priority 2, high) --
+    OutputGuardPatternDef(
+        name="credential_sk_proj",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"sk-proj-[a-zA-Z0-9\-]{20,}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=90,
+    ),
+    OutputGuardPatternDef(
+        name="credential_sk",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"sk-[a-zA-Z0-9]{20,}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=80,
+    ),
+    OutputGuardPatternDef(
+        name="credential_ghp",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"ghp_[a-zA-Z0-9]{36}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=70,
+    ),
+    OutputGuardPatternDef(
+        name="credential_gho",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"gho_[a-zA-Z0-9]{36}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=60,
+    ),
+    OutputGuardPatternDef(
+        name="credential_akia",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"AKIA[0-9A-Z]{16}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=50,
+    ),
+    OutputGuardPatternDef(
+        name="credential_aiza",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"AIza[a-zA-Z0-9_\-]{35}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=40,
+    ),
+    OutputGuardPatternDef(
+        name="credential_bearer",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"Bearer\s+[a-zA-Z0-9._~+/=\-]{20,}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=30,
+    ),
+    OutputGuardPatternDef(
+        name="credential_token_param",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"token=[a-zA-Z0-9]{20,}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=20,
+    ),
+    OutputGuardPatternDef(
+        name="credential_key_param",
+        category="credentials",
+        risk_level="high",
+        compiled=re.compile(r"key=[a-zA-Z0-9]{20,}"),
+        flag_name="credential_leak",
+        annotation="Output contains what appears to be an API key or token.",
+        is_credential=True,
+        redact_label="api_key",
+        priority=10,
+    ),
+    # NOTE: private_key_block and connection_string are NOT in _BUILTIN_OG_PATTERNS
+    # because they require custom redaction logic (preserve protocol/username in
+    # connection strings, match PEM block boundaries).  They are handled by
+    # _check_credentials_complex() instead.
+    # -- encoded_payloads (priority 3, medium) --
+    OutputGuardPatternDef(
+        name="script_data_uri",
+        category="encoded_payloads",
+        risk_level="medium",
+        compiled=_RE_SCRIPT_DATA_URI,
+        flag_name="script_data_uri",
+        annotation="Output contains a data URI with executable content.",
+        priority=30,
+    ),
+    OutputGuardPatternDef(
+        name="hex_shellcode",
+        category="encoded_payloads",
+        risk_level="medium",
+        compiled=_RE_HEX_SHELLCODE,
+        flag_name="hex_shellcode",
+        annotation="Output contains hex-encoded byte sequences resembling shellcode.",
+        priority=20,
+    ),
+    # -- adversarial_urls (priority 4, medium) --
+    OutputGuardPatternDef(
+        name="url_cred_param",
+        category="adversarial_urls",
+        risk_level="medium",
+        compiled=_RE_URL_CRED_PARAM,
+        flag_name="url_credential_param",
+        annotation="Output contains URLs with credential-bearing query parameters.",
+        priority=20,
+    ),
+    OutputGuardPatternDef(
+        name="cloud_metadata",
+        category="adversarial_urls",
+        risk_level="medium",
+        compiled=_RE_CLOUD_METADATA,
+        flag_name="cloud_metadata_access",
+        annotation="Output references cloud metadata endpoints.",
+        priority=10,
+    ),
+    # -- info_disclosure (priority 5, low) --
+    OutputGuardPatternDef(
+        name="cloud_identity_doc",
+        category="info_disclosure",
+        risk_level="low",
+        compiled=_RE_CLOUD_IDENTITY_DOC,
+        flag_name="cloud_identity_disclosure",
+        annotation="Output contains cloud instance identity metadata.",
+        priority=20,
+    ),
+    OutputGuardPatternDef(
+        name="sensitive_path",
+        category="info_disclosure",
+        risk_level="low",
+        compiled=_RE_SENSITIVE_PATH,
+        flag_name="sensitive_path_disclosure",
+        annotation="Output references sensitive file paths (.env, .ssh/, .aws/, etc.).",
+        priority=10,
+    ),
+]
+
+
 # -- Check functions (one per priority tier) --------------------------------
 
 
@@ -276,6 +495,168 @@ def _redact_credentials(text: str) -> str:
     return result
 
 
+# -- Configurable-mode helpers (used when patterns kwarg is provided) --------
+
+# Category → parent flag (idempotently added for each pattern match in that category)
+_CATEGORY_PARENT_FLAGS: dict[str, str] = {
+    "prompt_injection": "prompt_injection",
+    "credentials": "credential_leak",
+}
+
+
+def _check_patterns(
+    text: str,
+    category_patterns: tuple[OutputGuardPatternDef, ...],
+    flags: list[str],
+    ann: list[str],
+    parent_flag: str = "",
+) -> tuple[str, str | None]:
+    """Run configurable patterns for a category.  Returns (risk, sanitized_or_None)."""
+    risk = "none"
+    sanitized: str | None = None
+    need_redact = False
+    for pat in category_patterns:
+        if pat.compiled.search(text):
+            if parent_flag:
+                _add_flag(flags, parent_flag)
+            _add_flag(flags, pat.flag_name)
+            if pat.annotation not in ann:
+                ann.append(pat.annotation)
+            risk = _max_risk(risk, pat.risk_level)
+            if pat.is_credential:
+                need_redact = True
+    if need_redact:
+        sanitized = _redact_with_patterns(text, category_patterns)
+    return risk, sanitized
+
+
+def _redact_with_patterns(
+    text: str,
+    patterns: tuple[OutputGuardPatternDef, ...],
+) -> str:
+    """Redact text using credential patterns from the given pattern set."""
+    result = text
+    for pat in patterns:
+        if pat.is_credential and pat.redact_label:
+            result = pat.compiled.sub(f"[REDACTED:{pat.redact_label}]", result)
+    return result
+
+
+def _check_credentials_complex(
+    text: str,
+    flags: list[str],
+    ann: list[str],
+) -> tuple[str, str | None]:
+    """Complex credential checks that require custom redaction logic.
+
+    Handles private key blocks, connection strings (need targeted sub-replacement
+    to preserve protocol/username), env-line parsing (two-regex pipeline), and
+    JSON secret detection (capture group redaction).
+    """
+    risk = "none"
+    found = False
+
+    if _RE_PRIVATE_KEY_BLOCK.search(text):
+        _add_flag(flags, "credential_leak")
+        _add_flag(flags, "private_key_leak")
+        ann.append("Output contains a PEM-encoded private key block.")
+        found = True
+        risk = "high"
+
+    if _RE_CONNECTION_STRING.search(text):
+        _add_flag(flags, "credential_leak")
+        _add_flag(flags, "connection_string_leak")
+        ann.append("Output contains a connection string with embedded credentials.")
+        found = True
+        risk = "high"
+
+    env_lines = _RE_ENV_SECRET_LINE.findall(text)
+    if any(_RE_ENV_SECRET_KEY.search(ln.split("=", 1)[0]) for ln in env_lines):
+        _add_flag(flags, "credential_leak")
+        _add_flag(flags, "env_file_leak")
+        ann.append("Output contains .env-style assignments with secret-bearing keys.")
+        found = True
+        risk = "high"
+
+    if _RE_JSON_SECRET.search(text):
+        _add_flag(flags, "credential_leak")
+        _add_flag(flags, "json_secret_leak")
+        ann.append(
+            "Output contains JSON with secret-bearing keys (api_key, password, token, etc.)."
+        )
+        found = True
+        risk = "high"
+
+    sanitized = _redact_credentials_complex(text) if found else None
+    return risk, sanitized
+
+
+def _redact_credentials_complex(text: str) -> str:
+    """Redact private keys, connection strings, env-lines, and JSON secrets.
+
+    Uses targeted sub-replacement to preserve context (protocol, username)
+    in connection strings and PEM block boundaries.
+    """
+    result = _RE_PRIVATE_KEY_BLOCK.sub("[REDACTED:private_key]", text)
+
+    def _redact_conn(m: re.Match[str]) -> str:
+        return re.sub(r"://([^:@\s]+):([^@\s]+)@", r"://\1:[REDACTED:password]@", m.group())
+
+    result = _RE_CONNECTION_STRING.sub(_redact_conn, result)
+
+    def _redact_env(m: re.Match[str]) -> str:
+        key = m.group().split("=", 1)[0]
+        return key + "=[REDACTED:secret]" if _RE_ENV_SECRET_KEY.search(key) else m.group()
+
+    result = _RE_ENV_SECRET_LINE.sub(_redact_env, result)
+
+    def _redact_json_secret(m: re.Match[str]) -> str:
+        start = m.start(1) - m.start()
+        end = m.end(1) - m.start()
+        full = m.group()
+        return full[:start] + "[REDACTED:secret]" + full[end:]
+
+    result = _RE_JSON_SECRET.sub(_redact_json_secret, result)
+    return result
+
+
+def _check_encoded_payloads_complex(
+    text: str,
+    flags: list[str],
+    ann: list[str],
+) -> str:
+    """Complex encoded payload check (base64 context analysis)."""
+    risk = "none"
+    for m in _RE_LARGE_BASE64.finditer(text):
+        ctx = text[max(0, m.start() - 100) : m.start()].lower()
+        if _RE_BASE64_IMAGE_CONTEXT.search(ctx):
+            continue
+        if _RE_BASE64_EXEC_CONTEXT.search(ctx):
+            _add_flag(flags, "encoded_payload")
+            ann.append("Output contains a large base64 block in an executable context.")
+            risk = _max_risk(risk, "medium")
+            break
+    return risk
+
+
+def _check_info_disclosure_complex(
+    text: str,
+    flags: list[str],
+    ann: list[str],
+) -> str:
+    """Complex info disclosure check (private IP with 127.0.0.1 exclusion)."""
+    risk = "none"
+    private_ips = [ip for ip in _RE_PRIVATE_IP.findall(text) if ip != "127.0.0.1"]
+    if private_ips:
+        _add_flag(flags, "private_ip_disclosure")
+        ann.append("Output contains internal/private IP addresses (RFC 1918 ranges).")
+        risk = "low"
+    return risk
+
+
+# -- Legacy check functions (one per priority tier) -------------------------
+
+
 def _check_encoded_payloads(text: str, flags: list[str], ann: list[str]) -> str:
     """Priority 3: encoded / obfuscated payloads."""
     risk = "none"
@@ -339,12 +720,22 @@ def _check_info_disclosure(text: str, flags: list[str], ann: list[str]) -> str:
 # -- Public API -------------------------------------------------------------
 
 
+_CATEGORY_ORDER = (
+    "prompt_injection",
+    "credentials",
+    "encoded_payloads",
+    "adversarial_urls",
+    "info_disclosure",
+)
+
+
 def evaluate_output(
     output: str,
     *,
     func_name: str = "",
     call_id: str = "",
     budget_seconds: float = 5.0,
+    patterns: dict[str, tuple[OutputGuardPatternDef, ...]] | None = None,
 ) -> OutputAssessment:
     """Evaluate tool output for security signals.
 
@@ -356,6 +747,10 @@ def evaluate_output(
         func_name: Name of the tool that produced the output (for future use).
         call_id: Unique call identifier (for future correlation).
         budget_seconds: Maximum wall-clock seconds to spend on evaluation.
+        patterns: Optional category-grouped patterns from :class:`RuleRegistry`.
+            When provided, configurable patterns are used instead of the
+            hard-coded check functions.  Complex multi-step checks (env-line
+            parsing, base64 context analysis, etc.) always run regardless.
 
     Returns:
         Frozen OutputAssessment with flags, risk level, annotations, and
@@ -369,6 +764,44 @@ def evaluate_output(
     ann: list[str] = []
     risk = "none"
     sanitized: str | None = None
+
+    if patterns is not None:
+        # Configurable mode: use registry patterns + complex checks
+        for cat in _CATEGORY_ORDER:
+            cat_pats = patterns.get(cat, ())
+            if cat_pats:
+                parent = _CATEGORY_PARENT_FLAGS.get(cat, "")
+                pat_risk, pat_sanitized = _check_patterns(
+                    output,
+                    cat_pats,
+                    flags,
+                    ann,
+                    parent,
+                )
+                risk = _max_risk(risk, pat_risk)
+                if pat_sanitized and sanitized is None:
+                    sanitized = pat_sanitized
+            # Run hard-coded complex checks for categories that need them
+            if cat == "credentials":
+                cred_risk, cred_san = _check_credentials_complex(output, flags, ann)
+                risk = _max_risk(risk, cred_risk)
+                if cred_san and sanitized is None:
+                    sanitized = cred_san
+            elif cat == "encoded_payloads":
+                risk = _max_risk(
+                    risk,
+                    _check_encoded_payloads_complex(output, flags, ann),
+                )
+            elif cat == "info_disclosure":
+                risk = _max_risk(
+                    risk,
+                    _check_info_disclosure_complex(output, flags, ann),
+                )
+            if time.monotonic() > deadline:
+                return _build(flags, risk, ann, sanitized)
+        return _build(flags, risk, ann, sanitized)
+
+    # Legacy mode: hard-coded patterns (backward compat)
 
     # Priority 1: prompt injection (always run, highest priority)
     risk = _max_risk(risk, _check_prompt_injection(output, flags, ann))

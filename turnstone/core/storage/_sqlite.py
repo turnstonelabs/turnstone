@@ -21,6 +21,7 @@ from turnstone.core.storage._schema import (
     channel_users,
     conversations,
     hash_ring_buckets,
+    heuristic_rules,
     intent_verdicts,
     mcp_servers,
     metadata,
@@ -29,6 +30,7 @@ from turnstone.core.storage._schema import (
     oidc_pending_states,
     orgs,
     output_assessments,
+    output_guard_patterns,
     prompt_templates,
     roles,
     scheduled_task_runs,
@@ -54,6 +56,9 @@ from turnstone.core.storage._schema import (
     prompt_policies as prompt_policies_t,
 )
 from turnstone.core.storage._utils import (
+    HEURISTIC_RULE_MUTABLE as _HEURISTIC_RULE_MUTABLE,
+)
+from turnstone.core.storage._utils import (
     MCP_SERVER_MUTABLE as _MCP_SERVER_MUTABLE,
 )
 from turnstone.core.storage._utils import (
@@ -61,6 +66,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     ORG_MUTABLE as _ORG_MUTABLE,
+)
+from turnstone.core.storage._utils import (
+    OUTPUT_GUARD_PATTERN_MUTABLE as _OGP_MUTABLE,
 )
 from turnstone.core.storage._utils import (
     POLICY_MUTABLE as _POLICY_MUTABLE,
@@ -3265,6 +3273,221 @@ class SQLiteBackend:
         with self._conn() as conn:
             result = conn.execute(
                 sa.delete(prompt_policies_t).where(prompt_policies_t.c.policy_id == policy_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Heuristic rules -------------------------------------------------------
+
+    def create_heuristic_rule(
+        self,
+        rule_id: str,
+        name: str,
+        risk_level: str,
+        confidence: float,
+        recommendation: str,
+        tool_pattern: str,
+        arg_patterns: str = "[]",
+        intent_template: str = "",
+        reasoning_template: str = "",
+        tier: str = "medium",
+        priority: int = 0,
+        builtin: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.insert(heuristic_rules).prefix_with("OR IGNORE"),
+                {
+                    "rule_id": rule_id,
+                    "name": name,
+                    "risk_level": risk_level,
+                    "confidence": confidence,
+                    "recommendation": recommendation,
+                    "tool_pattern": tool_pattern,
+                    "arg_patterns": arg_patterns,
+                    "intent_template": intent_template,
+                    "reasoning_template": reasoning_template,
+                    "tier": tier,
+                    "priority": priority,
+                    "builtin": 1 if builtin else 0,
+                    "enabled": 1 if enabled else 0,
+                    "created_by": created_by,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_heuristic_rule(self, rule_id: str) -> dict[str, Any] | None:
+
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(heuristic_rules).where(heuristic_rules.c.rule_id == rule_id)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled", "builtin")
+
+    def get_heuristic_rule_by_name(self, name: str) -> dict[str, Any] | None:
+
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(heuristic_rules).where(heuristic_rules.c.name == name)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled", "builtin")
+
+    def list_heuristic_rules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+
+        tier_order = sa.case(
+            (heuristic_rules.c.tier == "critical", 0),
+            (heuristic_rules.c.tier == "high", 1),
+            (heuristic_rules.c.tier == "medium", 2),
+            (heuristic_rules.c.tier == "low", 3),
+            else_=4,
+        )
+        with self._conn() as conn:
+            q = sa.select(heuristic_rules).order_by(tier_order, heuristic_rules.c.priority.desc())
+            if enabled_only:
+                q = q.where(heuristic_rules.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "enabled", "builtin") for r in rows]
+
+    def update_heuristic_rule(self, rule_id: str, **fields: Any) -> bool:
+
+        fields = {k: v for k, v in fields.items() if k in _HEURISTIC_RULE_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        if "builtin" in fields:
+            fields["builtin"] = 1 if fields["builtin"] else 0
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(heuristic_rules)
+                .where(heuristic_rules.c.rule_id == rule_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_heuristic_rule(self, rule_id: str) -> bool:
+
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(heuristic_rules).where(heuristic_rules.c.rule_id == rule_id)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    # -- Output guard patterns -------------------------------------------------
+
+    def create_output_guard_pattern(
+        self,
+        pattern_id: str,
+        name: str,
+        category: str,
+        risk_level: str,
+        pattern: str,
+        flag_name: str,
+        annotation: str,
+        pattern_flags: str = "",
+        is_credential: bool = False,
+        redact_label: str = "",
+        priority: int = 0,
+        builtin: bool = False,
+        enabled: bool = True,
+        created_by: str = "",
+    ) -> None:
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.insert(output_guard_patterns).prefix_with("OR IGNORE"),
+                {
+                    "pattern_id": pattern_id,
+                    "name": name,
+                    "category": category,
+                    "risk_level": risk_level,
+                    "pattern": pattern,
+                    "pattern_flags": pattern_flags,
+                    "flag_name": flag_name,
+                    "annotation": annotation,
+                    "is_credential": 1 if is_credential else 0,
+                    "redact_label": redact_label,
+                    "priority": priority,
+                    "builtin": 1 if builtin else 0,
+                    "enabled": 1 if enabled else 0,
+                    "created_by": created_by,
+                    "created": now,
+                    "updated": now,
+                },
+            )
+            conn.commit()
+
+    def get_output_guard_pattern(self, pattern_id: str) -> dict[str, Any] | None:
+
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(output_guard_patterns).where(
+                    output_guard_patterns.c.pattern_id == pattern_id
+                )
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled", "builtin", "is_credential")
+
+    def get_output_guard_pattern_by_name(self, name: str) -> dict[str, Any] | None:
+
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(output_guard_patterns).where(output_guard_patterns.c.name == name)
+            ).fetchone()
+            if row is None:
+                return None
+            return _row_to_dict(row, "enabled", "builtin", "is_credential")
+
+    def list_output_guard_patterns(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+
+        with self._conn() as conn:
+            q = sa.select(output_guard_patterns).order_by(
+                output_guard_patterns.c.category, output_guard_patterns.c.priority.desc()
+            )
+            if enabled_only:
+                q = q.where(output_guard_patterns.c.enabled == 1)
+            rows = conn.execute(q).fetchall()
+            return [_row_to_dict(r, "enabled", "builtin", "is_credential") for r in rows]
+
+    def update_output_guard_pattern(self, pattern_id: str, **fields: Any) -> bool:
+
+        fields = {k: v for k, v in fields.items() if k in _OGP_MUTABLE}
+        fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        if "enabled" in fields:
+            fields["enabled"] = 1 if fields["enabled"] else 0
+        if "builtin" in fields:
+            fields["builtin"] = 1 if fields["builtin"] else 0
+        if "is_credential" in fields:
+            fields["is_credential"] = 1 if fields["is_credential"] else 0
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.update(output_guard_patterns)
+                .where(output_guard_patterns.c.pattern_id == pattern_id)
+                .values(**fields)
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_output_guard_pattern(self, pattern_id: str) -> bool:
+
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(output_guard_patterns).where(
+                    output_guard_patterns.c.pattern_id == pattern_id
+                )
             )
             conn.commit()
             return result.rowcount > 0
