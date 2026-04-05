@@ -305,6 +305,16 @@
           <span style="font-size:13px;color:var(--fg-dim)">Pattern rules for pre-execution intent validation</span>
           <button class="admin-action-btn" onclick="showCreateHeuristicRuleModal()">+ Add rule</button>
         </div>
+        <div class="admin-colheaders" aria-hidden="true">
+          <span class="admin-col">NAME</span>
+          <span class="admin-col admin-col-htier">TIER</span>
+          <span class="admin-col admin-col-hrisk">RISK</span>
+          <span class="admin-col">TOOL</span>
+          <span class="admin-col admin-col-hrec">REC.</span>
+          <span class="admin-col">SOURCE</span>
+          <span class="admin-col">STATUS</span>
+          <span class="admin-col">ACTIONS</span>
+        </div>
         <div id="judge-heuristic-table-container">
           <div class="dashboard-empty">Loading rules...</div>
         </div>
@@ -316,8 +326,93 @@
           <span style="font-size:13px;color:var(--fg-dim)">Regex patterns for post-execution output scanning</span>
           <button class="admin-action-btn" onclick="showCreateOutputGuardPatternModal()">+ Add pattern</button>
         </div>
+        <div class="admin-colheaders" aria-hidden="true">
+          <span class="admin-col">NAME</span>
+          <span class="admin-col">CATEGORY</span>
+          <span class="admin-col admin-col-ogrisk">RISK</span>
+          <span class="admin-col admin-col-ogflag">FLAG</span>
+          <span class="admin-col">SOURCE</span>
+          <span class="admin-col">STATUS</span>
+          <span class="admin-col">ACTIONS</span>
+        </div>
         <div id="judge-og-table-container">
           <div class="dashboard-empty">Loading patterns...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Judge: Create Heuristic Rule Modal -->
+    <div id="create-hr-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-hr-title">
+      <div id="create-hr-box" class="admin-modal admin-modal-wide">
+        <h2 id="create-hr-title">Create Heuristic Rule</h2>
+        <div id="create-hr-error" role="alert" aria-live="assertive"></div>
+        <label for="hr-name">Name</label>
+        <input id="hr-name" type="text" placeholder="my-custom-rule" autocomplete="off" spellcheck="false">
+        <div style="display:flex;gap:12px">
+          <div style="flex:1">
+            <label for="hr-tier">Tier</label>
+            <select id="hr-tier"><option>critical</option><option>high</option><option selected>medium</option><option>low</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="hr-risk">Risk Level</label>
+            <select id="hr-risk"><option>critical</option><option>high</option><option selected>medium</option><option>low</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="hr-rec">Recommendation</label>
+            <select id="hr-rec"><option>approve</option><option selected>review</option><option>deny</option></select>
+          </div>
+        </div>
+        <label for="hr-tool">Tool Pattern <span class="label-hint">fnmatch syntax: bash, write_file, mcp__*</span></label>
+        <input id="hr-tool" type="text" value="bash" autocomplete="off" spellcheck="false">
+        <label for="hr-args">Arg Patterns <span class="label-hint">one regex per line</span></label>
+        <textarea id="hr-args" rows="3" style="font-family:var(--font-mono);font-size:12px"></textarea>
+        <label for="hr-conf">Confidence <span class="label-hint">0.0 – 1.0</span></label>
+        <input id="hr-conf" type="number" step="0.05" value="0.8" min="0" max="1" style="width:100px">
+        <label for="hr-intent">Intent Description</label>
+        <input id="hr-intent" type="text" placeholder="Detected dangerous operation: {arg_snippet}" autocomplete="off">
+        <label for="hr-reason">Reasoning</label>
+        <input id="hr-reason" type="text" placeholder="Explain why this is risky" autocomplete="off">
+        <div class="modal-buttons">
+          <button class="modal-cancel" onclick="hideCreateHRModal()">Cancel</button>
+          <button id="hr-submit" class="modal-submit" onclick="submitCreateHeuristicRule()">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Judge: Create Output Guard Pattern Modal -->
+    <div id="create-ogp-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="create-ogp-title">
+      <div id="create-ogp-box" class="admin-modal admin-modal-wide">
+        <h2 id="create-ogp-title">Create Output Guard Pattern</h2>
+        <div id="create-ogp-error" role="alert" aria-live="assertive"></div>
+        <label for="ogp-name">Name</label>
+        <input id="ogp-name" type="text" placeholder="my-pattern" autocomplete="off" spellcheck="false">
+        <div style="display:flex;gap:12px">
+          <div style="flex:1">
+            <label for="ogp-cat">Category</label>
+            <select id="ogp-cat"><option>prompt_injection</option><option>credentials</option><option>encoded_payloads</option><option>adversarial_urls</option><option>info_disclosure</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="ogp-risk">Risk Level</label>
+            <select id="ogp-risk"><option>high</option><option selected>medium</option><option>low</option></select>
+          </div>
+        </div>
+        <label for="ogp-pattern">Regex Pattern</label>
+        <input id="ogp-pattern" type="text" autocomplete="off" spellcheck="false" style="font-family:var(--font-mono);font-size:12px">
+        <button class="admin-btn-action" style="margin:4px 0 8px" onclick="validateOGRegex()">Validate regex</button>
+        <span id="ogp-regex-result" role="status" aria-live="polite" style="font-size:11px;margin-left:8px"></span>
+        <label for="ogp-flag">Flag Name</label>
+        <input id="ogp-flag" type="text" placeholder="my_flag" autocomplete="off" spellcheck="false">
+        <label for="ogp-ann">Annotation</label>
+        <input id="ogp-ann" type="text" placeholder="Human-readable description" autocomplete="off">
+        <label for="ogp-flags">Pattern Flags <span class="label-hint">comma-separated: IGNORECASE, MULTILINE, DOTALL</span></label>
+        <input id="ogp-flags" type="text" autocomplete="off">
+        <div style="display:flex;gap:16px;margin:8px 0">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="ogp-cred" type="checkbox"> Is Credential</label>
+          <label style="font-size:12px">Redact Label <input id="ogp-redact" type="text" placeholder="api_key" style="width:100px;margin-left:4px"></label>
+        </div>
+        <div class="modal-buttons">
+          <button class="modal-cancel" onclick="hideCreateOGPModal()">Cancel</button>
+          <button id="ogp-submit" class="modal-submit" onclick="submitCreateOGPattern()">Create</button>
         </div>
       </div>
     </div>

@@ -2737,6 +2737,10 @@ var _judgeSettings = [];
 var _judgeHeuristicRules = [];
 var _judgeOGPatterns = [];
 var _judgeModelDefs = [];
+var _chrTrapHandler = null; // create heuristic rule
+var _cogpTrapHandler = null; // create output guard pattern
+var _chrTriggerEl = null;
+var _cogpTriggerEl = null;
 
 // -- Sub-section switcher ---------------------------------------------------
 
@@ -3021,68 +3025,64 @@ function renderHeuristicRules() {
     c.innerHTML = '<div class="dashboard-empty">No rules found</div>';
     return;
   }
-  var html =
-    '<table class="admin-table"><thead><tr>' +
-    "<th>Name</th><th>Tier</th><th>Risk</th><th>Tool</th><th>Rec.</th><th>Source</th><th>Status</th><th></th>" +
-    "</tr></thead><tbody>";
+  var html = "";
   for (var i = 0; i < _judgeHeuristicRules.length; i++) {
     var r = _judgeHeuristicRules[i];
     var sourceBadge =
       r.source === "builtin"
-        ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#333;color:#aaa">built-in</span>'
+        ? '<span class="scope-badge">built-in</span>'
         : r.source === "builtin-overridden"
-          ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#1b5e20;color:#a5d6a7">overridden</span>'
+          ? '<span class="scope-badge scope-scan-safe">overridden</span>'
           : r.source === "builtin-disabled"
-            ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#b71c1c;color:#ef9a9a">disabled</span>'
-            : '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#0d47a1;color:#90caf9">custom</span>';
+            ? '<span class="scope-badge scope-deny">disabled</span>'
+            : '<span class="scope-badge scope-write">custom</span>';
     var statusText = r.enabled ? "active" : "disabled";
     var actions = "";
     if (r.rule_id) {
       actions =
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="toggleHeuristicRule(\'' +
+        '<button class="admin-btn-action" onclick="toggleHeuristicRule(\'' +
         r.rule_id +
         "\'," +
         !r.enabled +
         ')">' +
         (r.enabled ? "Disable" : "Enable") +
         "</button> " +
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="deleteHeuristicRule(\'' +
+        '<button class="admin-btn-danger" onclick="deleteHeuristicRule(\'' +
         r.rule_id +
         "')\">Delete</button>";
     } else {
-      // Built-in without DB override — offer "Customize" to create DB override
       actions =
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="overrideBuiltinHeuristicRule(\'' +
+        '<button class="admin-btn-action" onclick="overrideBuiltinHeuristicRule(\'' +
         escapeHtml(r.name) +
         "')\">Customize</button>";
     }
     html +=
-      "<tr><td><code>" +
+      '<div class="admin-row">' +
+      '<span class="admin-col"><code>' +
       escapeHtml(r.name) +
-      "</code></td>" +
-      "<td>" +
+      "</code></span>" +
+      '<span class="admin-col admin-col-htier">' +
       escapeHtml(r.tier || r.risk_level) +
-      "</td>" +
-      "<td>" +
+      "</span>" +
+      '<span class="admin-col admin-col-hrisk">' +
       escapeHtml(r.risk_level) +
-      "</td>" +
-      "<td><code>" +
+      "</span>" +
+      '<span class="admin-col"><code>' +
       escapeHtml(r.tool_pattern) +
-      "</code></td>" +
-      "<td>" +
+      "</code></span>" +
+      '<span class="admin-col admin-col-hrec">' +
       escapeHtml(r.recommendation) +
-      "</td>" +
-      "<td>" +
+      "</span>" +
+      '<span class="admin-col">' +
       sourceBadge +
-      "</td>" +
-      "<td>" +
+      "</span>" +
+      '<span class="admin-col">' +
       statusText +
-      "</td>" +
-      "<td style='white-space:nowrap'>" +
+      "</span>" +
+      '<span class="admin-col">' +
       actions +
-      "</td></tr>";
+      "</span></div>";
   }
-  html += "</tbody></table>";
   c.innerHTML = html;
 }
 
@@ -3113,26 +3113,32 @@ function toggleHeuristicRule(ruleId, enabled) {
 }
 
 function deleteHeuristicRule(ruleId) {
-  if (!confirm("Delete this rule?")) return;
-  fetch("/api/admin/judge/heuristic-rules/" + ruleId, {
-    method: "DELETE",
-    credentials: "same-origin",
-    headers: { Authorization: "Bearer " + _adminToken },
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
+  showConfirmModal(
+    "Delete Rule",
+    "Delete this heuristic rule? This action cannot be undone.",
+    "Delete",
+    function () {
+      fetch("/api/admin/judge/heuristic-rules/" + ruleId, {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: { Authorization: "Bearer " + _adminToken },
+      })
+        .then(function (r) {
+          if (!r.ok)
+            return r.json().then(function (d) {
+              throw new Error(d.error || "Failed");
+            });
+          return r.json();
+        })
+        .then(function () {
+          showToast("Rule deleted");
+          loadJudgeHeuristicRules();
+        })
+        .catch(function (e) {
+          showToast("Error: " + e.message);
         });
-      return r.json();
-    })
-    .then(function () {
-      showToast("Rule deleted");
-      loadJudgeHeuristicRules();
-    })
-    .catch(function (e) {
-      showToast("Error: " + e.message);
-    });
+    },
+  );
 }
 
 function overrideBuiltinHeuristicRule(name) {
@@ -3186,33 +3192,29 @@ function overrideBuiltinHeuristicRule(name) {
 }
 
 function showCreateHeuristicRuleModal() {
-  var html =
-    '<div id="create-hr-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000" onclick="if(event.target===this)this.remove()">' +
-    '<div style="background:var(--bg-surface);border:1px solid var(--border-strong);border-radius:6px;padding:20px;width:500px;max-height:80vh;overflow-y:auto">' +
-    '<h3 style="margin:0 0 16px;color:var(--fg)">Create Heuristic Rule</h3>' +
-    '<div id="create-hr-error" style="display:none;color:var(--red);margin-bottom:8px;font-size:13px"></div>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Name' +
-    '<input id="hr-name" type="text" placeholder="my-custom-rule" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<div style="display:flex;gap:8px;margin-bottom:8px">' +
-    '<label style="flex:1;font-size:13px;color:var(--fg-dim)">Tier<select id="hr-tier" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"><option>critical</option><option>high</option><option selected>medium</option><option>low</option></select></label>' +
-    '<label style="flex:1;font-size:13px;color:var(--fg-dim)">Risk Level<select id="hr-risk" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"><option>critical</option><option>high</option><option selected>medium</option><option>low</option></select></label>' +
-    '<label style="flex:1;font-size:13px;color:var(--fg-dim)">Recommendation<select id="hr-rec" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"><option>approve</option><option selected>review</option><option>deny</option></select></label></div>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Tool Pattern (fnmatch)' +
-    '<input id="hr-tool" type="text" value="bash" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Arg Patterns (one regex per line)' +
-    '<textarea id="hr-args" rows="3" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;font-family:monospace;font-size:12px;box-sizing:border-box"></textarea></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Confidence (0.0-1.0)' +
-    '<input id="hr-conf" type="number" step="0.05" value="0.8" min="0" max="1" style="display:block;width:100px;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Intent Description' +
-    '<input id="hr-intent" type="text" placeholder="Detected dangerous operation: {arg_snippet}" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<label style="display:block;margin-bottom:16px;font-size:13px;color:var(--fg-dim)">Reasoning' +
-    '<input id="hr-reason" type="text" placeholder="Explain why this is risky" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<div style="display:flex;gap:8px;justify-content:flex-end">' +
-    '<button class="admin-action-btn" onclick="document.getElementById(\'create-hr-modal\').remove()">Cancel</button>' +
-    '<button class="admin-action-btn" id="hr-submit-btn" onclick="submitCreateHeuristicRule()">Create</button></div>' +
-    "</div></div>";
-  document.body.insertAdjacentHTML("beforeend", html);
+  _chrTriggerEl = document.activeElement;
+  var ov = document.getElementById("create-hr-overlay");
+  ov.style.display = "flex";
+  document.getElementById("hr-name").value = "";
+  document.getElementById("hr-tier").value = "medium";
+  document.getElementById("hr-risk").value = "medium";
+  document.getElementById("hr-rec").value = "review";
+  document.getElementById("hr-tool").value = "bash";
+  document.getElementById("hr-args").value = "";
+  document.getElementById("hr-conf").value = "0.8";
+  document.getElementById("hr-intent").value = "";
+  document.getElementById("hr-reason").value = "";
+  document.getElementById("create-hr-error").style.display = "none";
+  document.getElementById("hr-submit").disabled = false;
   document.getElementById("hr-name").focus();
+  _chrTrapHandler = _installTrap("create-hr-overlay", "create-hr-box");
+}
+
+function hideCreateHRModal() {
+  document.getElementById("create-hr-overlay").style.display = "none";
+  _chrTrapHandler = _removeTrap(_chrTrapHandler);
+  if (_chrTriggerEl && _chrTriggerEl.focus) _chrTriggerEl.focus();
+  _chrTriggerEl = null;
 }
 
 function submitCreateHeuristicRule() {
@@ -3236,7 +3238,7 @@ function submitCreateHeuristicRule() {
     reasoning_template: document.getElementById("hr-reason").value.trim(),
     enabled: true,
   };
-  var btn = document.getElementById("hr-submit-btn");
+  var btn = document.getElementById("hr-submit");
   btn.disabled = true;
   fetch("/api/admin/judge/heuristic-rules", {
     method: "POST",
@@ -3255,7 +3257,7 @@ function submitCreateHeuristicRule() {
       return r.json();
     })
     .then(function () {
-      document.getElementById("create-hr-modal").remove();
+      hideCreateHRModal();
       showToast("Rule created");
       loadJudgeHeuristicRules();
     })
@@ -3294,64 +3296,61 @@ function renderOGPatterns() {
     c.innerHTML = '<div class="dashboard-empty">No patterns found</div>';
     return;
   }
-  var html =
-    '<table class="admin-table"><thead><tr>' +
-    "<th>Name</th><th>Category</th><th>Risk</th><th>Flag</th><th>Source</th><th>Status</th><th></th>" +
-    "</tr></thead><tbody>";
+  var html = "";
   for (var i = 0; i < _judgeOGPatterns.length; i++) {
     var p = _judgeOGPatterns[i];
     var sourceBadge =
       p.source === "builtin"
-        ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#333;color:#aaa">built-in</span>'
+        ? '<span class="scope-badge">built-in</span>'
         : p.source === "builtin-overridden"
-          ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#1b5e20;color:#a5d6a7">overridden</span>'
+          ? '<span class="scope-badge scope-scan-safe">overridden</span>'
           : p.source === "builtin-disabled"
-            ? '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#b71c1c;color:#ef9a9a">disabled</span>'
-            : '<span style="font-size:11px;padding:1px 6px;border-radius:3px;background:#0d47a1;color:#90caf9">custom</span>';
+            ? '<span class="scope-badge scope-deny">disabled</span>'
+            : '<span class="scope-badge scope-write">custom</span>';
     var statusText = p.enabled ? "active" : "disabled";
     var actions = "";
     if (p.pattern_id) {
       actions =
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="toggleOGPattern(\'' +
+        '<button class="admin-btn-action" onclick="toggleOGPattern(\'' +
         p.pattern_id +
         "\'," +
         !p.enabled +
         ')">' +
         (p.enabled ? "Disable" : "Enable") +
         "</button> " +
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="deleteOGPattern(\'' +
+        '<button class="admin-btn-danger" onclick="deleteOGPattern(\'' +
         p.pattern_id +
         "')\">Delete</button>";
     } else {
       actions =
-        '<button class="admin-action-btn" style="font-size:11px;padding:2px 6px" onclick="overrideBuiltinOGPattern(\'' +
+        '<button class="admin-btn-action" onclick="overrideBuiltinOGPattern(\'' +
         escapeHtml(p.name) +
         "')\">Customize</button>";
     }
     html +=
-      "<tr><td><code>" +
+      '<div class="admin-row">' +
+      '<span class="admin-col"><code>' +
       escapeHtml(p.name) +
-      "</code></td>" +
-      "<td>" +
+      "</code></span>" +
+      '<span class="admin-col">' +
       escapeHtml(p.category) +
-      "</td>" +
-      "<td>" +
+      "</span>" +
+      '<span class="admin-col admin-col-ogrisk">' +
       escapeHtml(p.risk_level) +
-      "</td>" +
-      "<td><code>" +
+      "</span>" +
+      '<span class="admin-col admin-col-ogflag"><code>' +
       escapeHtml(p.flag_name) +
-      "</code></td>" +
-      "<td>" +
+      "</code></span>" +
+      '<span class="admin-col">' +
       sourceBadge +
-      "</td>" +
-      "<td>" +
+      "</span>" +
+      '<span class="admin-col">' +
       statusText +
-      "</td>" +
-      "<td style='white-space:nowrap'>" +
+      "</span>" +
+      '<span class="admin-col">' +
       actions +
-      "</td></tr>";
+      "</span></div>";
   }
-  html += "</tbody></table>";
   c.innerHTML = html;
 }
 
@@ -3382,26 +3381,32 @@ function toggleOGPattern(patternId, enabled) {
 }
 
 function deleteOGPattern(patternId) {
-  if (!confirm("Delete this pattern?")) return;
-  fetch("/api/admin/judge/output-guard-patterns/" + patternId, {
-    method: "DELETE",
-    credentials: "same-origin",
-    headers: { Authorization: "Bearer " + _adminToken },
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
+  showConfirmModal(
+    "Delete Pattern",
+    "Delete this output guard pattern? This action cannot be undone.",
+    "Delete",
+    function () {
+      fetch("/api/admin/judge/output-guard-patterns/" + patternId, {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: { Authorization: "Bearer " + _adminToken },
+      })
+        .then(function (r) {
+          if (!r.ok)
+            return r.json().then(function (d) {
+              throw new Error(d.error || "Failed");
+            });
+          return r.json();
+        })
+        .then(function () {
+          showToast("Pattern deleted");
+          loadJudgeOGPatterns();
+        })
+        .catch(function (e) {
+          showToast("Error: " + e.message);
         });
-      return r.json();
-    })
-    .then(function () {
-      showToast("Pattern deleted");
-      loadJudgeOGPatterns();
-    })
-    .catch(function (e) {
-      showToast("Error: " + e.message);
-    });
+    },
+  );
 }
 
 function overrideBuiltinOGPattern(name) {
@@ -3453,35 +3458,30 @@ function overrideBuiltinOGPattern(name) {
 }
 
 function showCreateOutputGuardPatternModal() {
-  var html =
-    '<div id="create-ogp-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000" onclick="if(event.target===this)this.remove()">' +
-    '<div style="background:var(--bg-surface);border:1px solid var(--border-strong);border-radius:6px;padding:20px;width:500px;max-height:80vh;overflow-y:auto">' +
-    '<h3 style="margin:0 0 16px;color:var(--fg)">Create Output Guard Pattern</h3>' +
-    '<div id="create-ogp-error" style="display:none;color:var(--red);margin-bottom:8px;font-size:13px"></div>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Name' +
-    '<input id="ogp-name" type="text" placeholder="my-pattern" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<div style="display:flex;gap:8px;margin-bottom:8px">' +
-    '<label style="flex:1;font-size:13px;color:var(--fg-dim)">Category<select id="ogp-cat" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"><option>prompt_injection</option><option>credentials</option><option>encoded_payloads</option><option>adversarial_urls</option><option>info_disclosure</option></select></label>' +
-    '<label style="flex:1;font-size:13px;color:var(--fg-dim)">Risk Level<select id="ogp-risk" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"><option>high</option><option selected>medium</option><option>low</option></select></label></div>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Regex Pattern' +
-    '<input id="ogp-pattern" type="text" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;font-family:monospace;box-sizing:border-box">' +
-    '<button class="admin-action-btn" style="margin-top:4px;font-size:11px" onclick="validateOGRegex()">Validate</button>' +
-    '<span id="ogp-regex-result" style="margin-left:8px;font-size:11px"></span></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Flag Name' +
-    '<input id="ogp-flag" type="text" placeholder="my_flag" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Annotation' +
-    '<input id="ogp-ann" type="text" placeholder="Human-readable description" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<label style="display:block;margin-bottom:8px;font-size:13px;color:var(--fg-dim)">Flags (comma-separated: IGNORECASE, MULTILINE, DOTALL)' +
-    '<input id="ogp-flags" type="text" placeholder="" style="display:block;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px;box-sizing:border-box"></label>' +
-    '<div style="display:flex;gap:16px;margin-bottom:16px">' +
-    '<label style="font-size:13px;color:var(--fg-dim);display:flex;align-items:center;gap:4px"><input id="ogp-cred" type="checkbox"> Is Credential</label>' +
-    '<label style="font-size:13px;color:var(--fg-dim)">Redact Label <input id="ogp-redact" type="text" placeholder="api_key" style="width:100px;padding:4px 6px;background:var(--bg);border:1px solid var(--border-strong);color:var(--fg);border-radius:3px"></label></div>' +
-    '<div style="display:flex;gap:8px;justify-content:flex-end">' +
-    '<button class="admin-action-btn" onclick="document.getElementById(\'create-ogp-modal\').remove()">Cancel</button>' +
-    '<button class="admin-action-btn" id="ogp-submit-btn" onclick="submitCreateOGPattern()">Create</button></div>' +
-    "</div></div>";
-  document.body.insertAdjacentHTML("beforeend", html);
+  _cogpTriggerEl = document.activeElement;
+  var ov = document.getElementById("create-ogp-overlay");
+  ov.style.display = "flex";
+  document.getElementById("ogp-name").value = "";
+  document.getElementById("ogp-cat").value = "prompt_injection";
+  document.getElementById("ogp-risk").value = "medium";
+  document.getElementById("ogp-pattern").value = "";
+  document.getElementById("ogp-flag").value = "";
+  document.getElementById("ogp-ann").value = "";
+  document.getElementById("ogp-flags").value = "";
+  document.getElementById("ogp-cred").checked = false;
+  document.getElementById("ogp-redact").value = "";
+  document.getElementById("ogp-regex-result").textContent = "";
+  document.getElementById("create-ogp-error").style.display = "none";
+  document.getElementById("ogp-submit").disabled = false;
   document.getElementById("ogp-name").focus();
+  _cogpTrapHandler = _installTrap("create-ogp-overlay", "create-ogp-box");
+}
+
+function hideCreateOGPModal() {
+  document.getElementById("create-ogp-overlay").style.display = "none";
+  _cogpTrapHandler = _removeTrap(_cogpTrapHandler);
+  if (_cogpTriggerEl && _cogpTriggerEl.focus) _cogpTriggerEl.focus();
+  _cogpTriggerEl = null;
 }
 
 function validateOGRegex() {
@@ -3533,7 +3533,7 @@ function submitCreateOGPattern() {
     redact_label: document.getElementById("ogp-redact").value.trim(),
     enabled: true,
   };
-  var btn = document.getElementById("ogp-submit-btn");
+  var btn = document.getElementById("ogp-submit");
   btn.disabled = true;
   fetch("/api/admin/judge/output-guard-patterns", {
     method: "POST",
@@ -3552,7 +3552,7 @@ function submitCreateOGPattern() {
       return r.json();
     })
     .then(function () {
-      document.getElementById("create-ogp-modal").remove();
+      hideCreateOGPModal();
       showToast("Pattern created");
       loadJudgeOGPatterns();
     })
