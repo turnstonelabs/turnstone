@@ -76,9 +76,6 @@ class JudgeConfig:
 
     enabled: bool = True
     model: str = ""  # empty = use session model
-    provider: str = ""  # empty = use session provider
-    base_url: str = ""
-    api_key: str = ""
     confidence_threshold: float = 0.7
     max_context_ratio: float = 0.5
     timeout: float = 60.0
@@ -921,28 +918,6 @@ class IntentJudge:
             except Exception:
                 log.debug("Model alias resolution failed for %r, falling back", config.model)
 
-        if not resolved and config.model and config.provider:
-            from turnstone.core.providers import create_client, create_provider
-
-            self._provider = create_provider(config.provider)
-            self._client = create_client(
-                config.provider,
-                base_url=config.base_url
-                or (
-                    "https://api.openai.com/v1"
-                    if config.provider == "openai"
-                    else "https://api.anthropic.com"
-                ),
-                api_key=config.api_key
-                or os.environ.get(
-                    "OPENAI_API_KEY" if config.provider == "openai" else "ANTHROPIC_API_KEY",
-                    "",
-                ),
-            )
-            self._model = config.model
-            caps = self._provider.get_capabilities(self._model)
-            self._judge_context_window = caps.context_window
-        elif not resolved and config.model:
             # Model override but same provider
             self._provider = session_provider
             self._client = session_client

@@ -377,16 +377,6 @@ def _build_registry() -> dict[str, SettingDef]:
             "to use the same model (self-consistency), or specify a different model for "
             "cross-model evaluation.",
         ),
-        SettingDef("judge.provider", "str", "", "Provider for judge model", "judge"),
-        SettingDef("judge.base_url", "str", "", "Base URL for judge model API", "judge"),
-        SettingDef(
-            "judge.api_key",
-            "str",
-            "",
-            "API key for judge model",
-            "judge",
-            is_secret=True,
-        ),
         SettingDef(
             "judge.confidence_threshold",
             "float",

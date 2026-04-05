@@ -465,7 +465,7 @@ class ChatSession:
     def _judge_cfg(self) -> JudgeConfig | None:
         """Live judge behavioral config — reads from ConfigStore when available.
 
-        LLM client fields (model, provider, base_url, api_key) stay frozen
+        The model alias stays frozen
         from session creation time since changing them would require tearing
         down and rebuilding the IntentJudge instance.
         """
@@ -480,9 +480,6 @@ class ChatSession:
         return JudgeConfig(
             enabled=cs.get("judge.enabled"),
             model=jc.model,
-            provider=jc.provider,
-            base_url=jc.base_url,
-            api_key=jc.api_key,
             confidence_threshold=cs.get("judge.confidence_threshold"),
             max_context_ratio=cs.get("judge.max_context_ratio"),
             timeout=cs.get("judge.timeout"),
