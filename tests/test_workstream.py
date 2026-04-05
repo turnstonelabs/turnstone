@@ -257,21 +257,24 @@ class TestManagerClose:
         _ws1 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
         ws2 = mgr.create(ui_factory=lambda wid: FakeUI(wid))
 
-        assert mgr.close(ws2.id) is True
+        closed = mgr.close(ws2.id)
+        assert closed is True
         assert mgr.count == 1
         assert mgr.get(ws2.id) is None
 
     def test_close_last_returns_false(self):
         mgr = WorkstreamManager(_fake_factory)
         ws = mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        assert mgr.close(ws.id) is False
+        closed = mgr.close(ws.id)
+        assert closed is False
         assert mgr.count == 1
 
     def test_close_nonexistent_returns_false(self):
         mgr = WorkstreamManager(_fake_factory)
         mgr.create(ui_factory=lambda wid: FakeUI(wid))
         mgr.create(ui_factory=lambda wid: FakeUI(wid))
-        assert mgr.close("nonexistent") is False
+        closed = mgr.close("nonexistent")
+        assert closed is False
 
     def test_close_active_switches_to_first(self):
         mgr = WorkstreamManager(_fake_factory)

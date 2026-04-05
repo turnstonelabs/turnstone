@@ -105,7 +105,8 @@ class TestDelete:
         assert store.get("tools.timeout") == defn.default
 
     def test_returns_false_for_non_existent(self, store):
-        assert store.delete("tools.timeout") is False
+        result = store.delete("tools.timeout")
+        assert result is False
 
     def test_rejects_unknown_key(self, store):
         with pytest.raises(ValueError, match="Unknown setting"):
