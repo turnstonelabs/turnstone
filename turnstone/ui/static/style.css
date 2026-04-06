@@ -116,15 +116,17 @@
   color: var(--fg-dim);
   font-size: 11px;
   cursor: pointer;
-  padding: 0 2px;
+  padding: 4px 6px;
   line-height: 1;
   opacity: 0;
-  transition: opacity 0.15s, color 0.1s;
+  transition: opacity 0.15s, color 0.1s, background 0.1s;
+  border-radius: var(--radius-sm);
+  margin-right: -4px;
 }
 .ws-tab:hover .tab-chevron, .ws-tab:focus-within .tab-chevron, .ws-tab .tab-chevron:focus-visible { opacity: 1; }
 .ws-tab.active .tab-chevron { opacity: 0.7; }
 .ws-tab .tab-chevron[aria-expanded="true"] { opacity: 1; color: var(--fg-bright); }
-.ws-tab .tab-chevron:hover { color: var(--fg-bright); }
+.ws-tab .tab-chevron:hover { color: var(--fg-bright); background: rgba(255, 255, 255, 0.06); }
 
 /* Subtle ws_id badge in tabs */
 .tab-wsid {
@@ -183,6 +185,7 @@
 #split-btn.hidden { display: none; }
 
 /* Tab dropdown menu */
+@keyframes dropdown-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 .ws-tab-dropdown {
   position: fixed;
   background: var(--bg-surface);
@@ -193,6 +196,7 @@
   z-index: 300;
   overflow: hidden;
   padding: 4px 0;
+  animation: dropdown-in 0.1s ease-out;
 }
 [data-theme="light"] .ws-tab-dropdown { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
 .ws-tab-dropdown-item {
@@ -213,11 +217,12 @@
   white-space: nowrap;
   transition: background 0.1s;
 }
-.ws-tab-dropdown-item:hover { background: var(--bg-highlight); color: var(--fg-bright); }
+.ws-tab-dropdown-item:hover:not([aria-disabled="true"]) { background: var(--bg-highlight); color: var(--fg-bright); }
 .ws-tab-dropdown-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.ws-tab-dropdown-item.destructive:hover,
-.ws-tab-dropdown-item.destructive:focus-visible { color: var(--red); background: rgba(248, 113, 113, 0.08); }
-.ws-tab-dropdown-item.destructive:focus-visible { outline-color: var(--red); }
+.ws-tab-dropdown-item[aria-disabled="true"] { color: var(--fg-dim); opacity: 0.55; cursor: not-allowed; }
+.ws-tab-dropdown-item.destructive:hover:not([aria-disabled="true"]),
+.ws-tab-dropdown-item.destructive:focus-visible:not([aria-disabled="true"]) { color: var(--red); background: rgba(248, 113, 113, 0.08); }
+.ws-tab-dropdown-item.destructive:focus-visible:not([aria-disabled="true"]) { outline-color: var(--red); }
 .ws-tab-dropdown-label { flex: 1; }
 .ws-tab-dropdown-key {
   font-family: var(--font-mono);
@@ -1847,4 +1852,5 @@ audio.media-player {
   #new-ws-box input, #new-ws-box select,
   .split-handle, .pane-action-btn,
   .pane-ctx-item, .ws-tab-dropdown-item { transition: none; }
+  .ws-tab-dropdown { animation: none; }
 }

@@ -2146,17 +2146,33 @@ function showTabDropdown(chevronEl, wsId) {
     e.preventDefault();
   });
 
+  var isLastWs = Object.keys(workstreams).length <= 1;
   var items = [
     {
       label: "Refresh title",
       cls: "mobile-hide",
-      action: refreshWorkstreamTitle,
+      action: function () {
+        refreshWorkstreamTitle(wsId);
+      },
     },
-    { label: "Edit title", key: "Ctrl+Shift+E", action: editWorkstreamTitle },
-    { label: "Fork", key: "Ctrl+Shift+F", action: forkWorkstream },
+    {
+      label: "Edit title",
+      key: "Ctrl+Shift+E",
+      action: function () {
+        editWorkstreamTitle(wsId);
+      },
+    },
+    {
+      label: "Fork",
+      key: "Ctrl+Shift+F",
+      action: function () {
+        forkWorkstream(wsId);
+      },
+    },
     {
       label: "Close",
       key: "Ctrl+W",
+      disabled: isLastWs,
       action: function () {
         closeWorkstream(wsId);
       },
@@ -2166,7 +2182,10 @@ function showTabDropdown(chevronEl, wsId) {
       label: "Delete",
       key: "Ctrl+Shift+X",
       cls: "destructive",
-      action: confirmDeleteWorkstream,
+      disabled: isLastWs,
+      action: function () {
+        confirmDeleteWorkstream(wsId);
+      },
     },
   ];
 
@@ -2182,6 +2201,13 @@ function showTabDropdown(chevronEl, wsId) {
     btn.className = "ws-tab-dropdown-item" + (item.cls ? " " + item.cls : "");
     btn.setAttribute("role", "menuitem");
     btn.setAttribute("tabindex", "-1");
+    if (item.disabled) {
+      btn.setAttribute("aria-disabled", "true");
+      btn.setAttribute(
+        "title",
+        "Cannot " + item.label.toLowerCase() + " the last workstream",
+      );
+    }
     var labelSpan = document.createElement("span");
     labelSpan.className = "ws-tab-dropdown-label";
     labelSpan.textContent = item.label;
@@ -2194,6 +2220,7 @@ function showTabDropdown(chevronEl, wsId) {
       btn.appendChild(keySpan);
     }
     btn.onclick = function () {
+      if (this.getAttribute("aria-disabled") === "true") return;
       closeTabDropdown();
       item.action();
     };
@@ -2243,10 +2270,13 @@ function showTabDropdown(chevronEl, wsId) {
       closeTabDropdown();
     }
   };
+  var closeHandler = _tabDropdownCloseHandler;
+  var activeMenu = menu;
   setTimeout(function () {
-    document.addEventListener("mousedown", _tabDropdownCloseHandler);
-    document.addEventListener("keydown", _tabDropdownCloseHandler);
-    var first = menu.querySelector(".ws-tab-dropdown-item");
+    if (_tabDropdown !== activeMenu || !closeHandler) return;
+    document.addEventListener("mousedown", closeHandler);
+    document.addEventListener("keydown", closeHandler);
+    var first = activeMenu.querySelector(".ws-tab-dropdown-item");
     if (first) first.focus();
   }, 0);
 }
@@ -3479,8 +3509,8 @@ function confirmWsDelete() {
 
 var _lastActiveWsId = null;
 
-function refreshWorkstreamTitle() {
-  var wsId = getCurrentWsId();
+function refreshWorkstreamTitle(optWsId) {
+  var wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
 
   var url =
@@ -3502,8 +3532,8 @@ function refreshWorkstreamTitle() {
 
 var _editTitleTrap = null;
 
-function editWorkstreamTitle() {
-  var wsId = getCurrentWsId();
+function editWorkstreamTitle(optWsId) {
+  var wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   var currentTitle = "";
   var tabEl = document.querySelector(
@@ -3602,9 +3632,10 @@ function submitEditTitle() {
 var _pendingDeleteWsId = null;
 var _deleteWsTrap = null;
 
-function confirmDeleteWorkstream() {
-  var wsId = getCurrentWsId();
+function confirmDeleteWorkstream(optWsId) {
+  var wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
+  if (Object.keys(workstreams).length <= 1) return;
   var tabEl = document.querySelector(
     '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
   );
@@ -3696,8 +3727,8 @@ function getCurrentWsId() {
   return "";
 }
 
-function forkWorkstream() {
-  var wsId = getCurrentWsId();
+function forkWorkstream(optWsId) {
+  var wsId = optWsId || getCurrentWsId();
   if (!wsId) return;
   showNewWsModal(wsId);
 }
@@ -4667,7 +4698,11 @@ document.addEventListener("keydown", function (e) {
       return;
     }
     // X not D — D conflicts with Chrome DevTools
-    if (wsActionKey === "x" && activeWsId) {
+    if (
+      wsActionKey === "x" &&
+      activeWsId &&
+      Object.keys(workstreams).length > 1
+    ) {
       e.preventDefault();
       confirmDeleteWorkstream();
       return;
