@@ -129,21 +129,36 @@ _JS_PROXY_SHIM = """\
 """
 
 _CONSOLE_BANNER_TEMPLATE = (
-    '<div style="background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);'
-    "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
-    'display:flex;align-items:center;gap:12px;position:relative;z-index:9999">'
-    '<a href="/" style="color:#8a93ad;text-decoration:none;font-weight:500;'
-    'padding:2px 0" '
-    "onmouseover=\"this.style.color='#e5a042'\" "
-    "onmouseout=\"this.style.color='#8a93ad'\">"
-    "&larr; Console</a>"
-    '<span style="color:#3b4463">\u2502</span>'
-    '<span style="color:#8a93ad;font-size:11px">NODE_ID_PLACEHOLDER</span>'
+    '<div class="console-banner">'
+    '<a href="/" class="console-banner-link">&larr; Console</a>'
+    '<span class="console-banner-sep">\u2502</span>'
+    '<a href="NODE_LINK_PLACEHOLDER" class="console-banner-node">'
+    "NODE_ID_PLACEHOLDER</a>"
     "</div>"
 )
 
-# Injected <style> offsets fixed-position overlays below the console banner.
-_CONSOLE_PROXY_STYLE = "<style>.dashboard-overlay{top:32px!important}</style>"
+# Injected <style>: offsets fixed-position overlays and provides theme-aware
+# banner styling so the banner adapts to light/dark without inline colours.
+_CONSOLE_PROXY_STYLE = (
+    "<style>"
+    ".dashboard-overlay{top:32px!important}"
+    ".console-banner{background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);"
+    "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
+    "display:flex;align-items:center;gap:12px;position:relative;z-index:9999}"
+    ".console-banner-link,.console-banner-node{color:#8a93ad;text-decoration:none}"
+    ".console-banner-link{font-weight:500;padding:2px 0}"
+    ".console-banner-node{font-size:11px}"
+    ".console-banner-sep{color:#3b4463}"
+    ".console-banner-link:hover,.console-banner-node:hover{color:#e5a042}"
+    ':root[data-theme="light"] .console-banner{background:#f8fafc;'
+    "border-bottom-color:rgba(229,160,66,0.5)}"
+    ':root[data-theme="light"] .console-banner-link,'
+    ':root[data-theme="light"] .console-banner-node{color:#64748b}'
+    ':root[data-theme="light"] .console-banner-sep{color:#cbd5e1}'
+    ':root[data-theme="light"] .console-banner-link:hover,'
+    ':root[data-theme="light"] .console-banner-node:hover{color:#e5a042}'
+    "</style>"
+)
 
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
@@ -446,6 +461,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     raw_node_id = body.get("node_id", "")
     raw_name = body.get("name", "")
     raw_model = body.get("model", "")
+    raw_judge_model = body.get("judge_model", "")
     raw_initial_message = body.get("initial_message", "")
     raw_skill = body.get("skill", "")
     raw_resume_ws = body.get("resume_ws", "")
@@ -455,6 +471,8 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_name = "" if raw_name is None else None
     if not isinstance(raw_model, str):
         raw_model = "" if raw_model is None else None
+    if not isinstance(raw_judge_model, str):
+        raw_judge_model = "" if raw_judge_model is None else None
     if not isinstance(raw_initial_message, str):
         raw_initial_message = "" if raw_initial_message is None else None
     if not isinstance(raw_skill, str):
@@ -465,19 +483,21 @@ async def create_workstream(request: Request) -> JSONResponse:
         raw_node_id is None
         or raw_name is None
         or raw_model is None
+        or raw_judge_model is None
         or raw_initial_message is None
         or raw_skill is None
         or raw_resume_ws is None
     ):
         return JSONResponse(
             {
-                "error": "node_id, name, model, initial_message, skill, and resume_ws must be strings"
+                "error": "node_id, name, model, judge_model, initial_message, skill, and resume_ws must be strings"
             },
             status_code=400,
         )
     node_id = raw_node_id
     name = raw_name[:256]
     model = raw_model[:128]
+    judge_model = raw_judge_model[:128]
     initial_message = raw_initial_message[:4096]
     skill = raw_skill[:256]
     resume_ws = raw_resume_ws[:64]
@@ -509,6 +529,7 @@ async def create_workstream(request: Request) -> JSONResponse:
     ws_body = {
         "name": name,
         "model": model,
+        "judge_model": judge_model,
         "initial_message": initial_message,
         "skill": skill,
         "resume_ws": resume_ws,
@@ -918,7 +939,7 @@ async def proxy_index(request: Request) -> Response:
         page = page.replace('href="/shared/', f'href="{prefix}/shared/')
         page = page.replace('src="/shared/', f'src="{prefix}/shared/')
         # Inject console-return banner + proxy shim after <body>
-        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", html.escape(node_id))
+        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", html.escape(node_id)).replace("NODE_LINK_PLACEHOLDER", html.escape(prefix + "/"))
         shim = (
             "<script>"
             + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
@@ -5151,7 +5172,12 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 _MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
-_MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible"})
+_MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible", "google"})
+_PROVIDER_DEFAULT_URLS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai/",
+}
 
 
 def _mask_model_secrets(model: dict[str, Any]) -> dict[str, Any]:
@@ -5590,6 +5616,10 @@ async def admin_detect_model(request: Request) -> JSONResponse:
             api_key = row.get("api_key", "")
             if not base_url:
                 base_url = row.get("base_url", "")
+
+    # Apply provider default URL if still empty
+    if not base_url:
+        base_url = _PROVIDER_DEFAULT_URLS.get(provider, "")
 
     # For commercial endpoints an api_key is required
     _normalized = (base_url if "://" in base_url else f"https://{base_url}") if base_url else ""

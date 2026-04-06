@@ -403,8 +403,8 @@ function confirmDeleteUser(userId, username) {
   showConfirmModal(
     "Delete User",
     "Delete user \u2018" +
-      username +
-      "\u2019 and all their tokens and channel links? This cannot be undone.",
+    username +
+    "\u2019 and all their tokens and channel links? This cannot be undone.",
     "Delete",
     function () {
       authFetch("/v1/api/admin/users/" + encodeURIComponent(userId), {
@@ -570,19 +570,19 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
   showConfirmModal(
     "Unlink OIDC Identity",
     "Unlink " +
-      shortIssuer +
-      " identity \u2018" +
-      shortSubject +
-      "\u2019 from user " +
-      username +
-      "?\n\nThe user will need to log in via OIDC again to re-link.",
+    shortIssuer +
+    " identity \u2018" +
+    shortSubject +
+    "\u2019 from user " +
+    username +
+    "?\n\nThe user will need to log in via OIDC again to re-link.",
     "Unlink",
     function () {
       authFetch(
         "/v1/api/admin/oidc-identities?issuer=" +
-          encodeURIComponent(issuer) +
-          "&subject=" +
-          encodeURIComponent(subject),
+        encodeURIComponent(issuer) +
+        "&subject=" +
+        encodeURIComponent(subject),
         { method: "DELETE" },
       )
         .then(function (r) {
@@ -608,8 +608,8 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
                   '<span class="oidc-detail-empty">Loading\u2026</span>';
               authFetch(
                 "/v1/api/admin/users/" +
-                  encodeURIComponent(userId) +
-                  "/oidc-identities",
+                encodeURIComponent(userId) +
+                "/oidc-identities",
               )
                 .then(function (r2) {
                   if (!r2.ok) throw new Error("Failed");
@@ -878,17 +878,17 @@ function confirmUnlinkChannel(channelType, channelUserId) {
   showConfirmModal(
     "Unlink Channel",
     "Unlink " +
-      channelType +
-      " account \u2018" +
-      channelUserId +
-      "\u2019? The user will need to re-link via /link to interact with the bot.",
+    channelType +
+    " account \u2018" +
+    channelUserId +
+    "\u2019? The user will need to re-link via /link to interact with the bot.",
     "Unlink",
     function () {
       authFetch(
         "/v1/api/admin/channels/" +
-          encodeURIComponent(channelType) +
-          "/" +
-          encodeURIComponent(channelUserId),
+        encodeURIComponent(channelType) +
+        "/" +
+        encodeURIComponent(channelUserId),
         { method: "DELETE" },
       )
         .then(function (r) {
@@ -1059,8 +1059,8 @@ function confirmDeleteSchedule(taskId, name) {
   showConfirmModal(
     "Delete Schedule",
     "Delete schedule \u2018" +
-      name +
-      "\u2019 and its run history? This cannot be undone.",
+    name +
+    "\u2019 and its run history? This cannot be undone.",
     "Delete",
     function () {
       authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
@@ -1671,12 +1671,12 @@ function _renderWatches(watches) {
     var statusDot = active ? "\u25cf " : "\u25cb ";
     var cancelBtn = active
       ? '<button class="admin-btn-danger" data-cancel-watch="' +
-        escapeHtml(w.watch_id) +
-        '" data-watch-node="' +
-        escapeHtml(w.node_id || "") +
-        '" data-watch-name="' +
-        escapeHtml(name) +
-        '" title="Cancel watch">cancel</button>'
+      escapeHtml(w.watch_id) +
+      '" data-watch-node="' +
+      escapeHtml(w.node_id || "") +
+      '" data-watch-name="' +
+      escapeHtml(name) +
+      '" title="Cancel watch">cancel</button>'
       : "";
     html +=
       '<div class="admin-row" role="listitem">' +
@@ -1797,8 +1797,8 @@ function submitCreateChannel() {
 
   authFetch(
     "/v1/api/admin/users/" +
-      encodeURIComponent(_adminChannelUserId) +
-      "/channels",
+    encodeURIComponent(_adminChannelUserId) +
+    "/channels",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3044,6 +3044,22 @@ function _saveSettingValue(key) {
       showToast(
         "Saved " + key + (restartBadge ? " \u2014 restart required" : ""),
       );
+
+      // If this is a theme setting, apply it immediately
+      if (key === "interface.theme") {
+        var newTheme = value;
+        document.documentElement.dataset.theme =
+          newTheme === "light" ? "light" : "";
+        localStorage.setItem(
+          "turnstone-theme",
+          newTheme === "light" ? "light" : "dark",
+        );
+        var themeBtn = document.getElementById("theme-toggle");
+        if (themeBtn) {
+          themeBtn.textContent =
+            newTheme === "light" ? "\u2600" : "\u263E";
+        }
+      }
     })
     .catch(function (err) {
       if (saveBtn) {
@@ -3058,8 +3074,8 @@ function _resetSetting(key) {
   showConfirmModal(
     "Reset Setting",
     "Reset \u2018" +
-      key +
-      "\u2019 to its default value? The stored override will be removed.",
+    key +
+    "\u2019 to its default value? The stored override will be removed.",
     "Reset",
     function () {
       authFetch("/v1/api/admin/settings/" + encodeURIComponent(key), {
@@ -3202,13 +3218,13 @@ function _renderMcpServers(items) {
     var actions = isConfig
       ? ""
       : '<button class="admin-btn-action" data-mcp-edit="' +
-        escapeHtml(s.server_id) +
-        '">edit</button>' +
-        '<button class="admin-btn-danger" data-mcp-delete="' +
-        escapeHtml(s.server_id) +
-        '" data-mcp-name="' +
-        escapeHtml(s.name) +
-        '">del</button>';
+      escapeHtml(s.server_id) +
+      '">edit</button>' +
+      '<button class="admin-btn-danger" data-mcp-delete="' +
+      escapeHtml(s.server_id) +
+      '" data-mcp-name="' +
+      escapeHtml(s.name) +
+      '">del</button>';
 
     html +=
       '<div class="admin-row mcp-grid ' +
@@ -3404,11 +3420,11 @@ function _parseMcpForm() {
     var argsText = document.getElementById("mcp-args").value.trim();
     payload.args = argsText
       ? argsText
-          .split("\n")
-          .map(function (l) {
-            return l.trim();
-          })
-          .filter(Boolean)
+        .split("\n")
+        .map(function (l) {
+          return l.trim();
+        })
+        .filter(Boolean)
       : [];
     var envText = document.getElementById("mcp-env").value.trim();
     var envObj = {};
@@ -3560,7 +3576,7 @@ function _openMcpDetail(s) {
           '<p style="font-size:12px;color:var(--fg-dim)">Args: <code>' +
           escapeHtml(a.join(" ")) +
           "</code></p>";
-    } catch (e) {}
+    } catch (e) { }
   } else {
     html +=
       '<p style="font-size:12px;color:var(--fg-dim)">URL: <code>' +
@@ -3599,7 +3615,7 @@ function _openMcpDetail(s) {
           escapeHtml(meta.website_url) +
           "</a></p>";
       }
-    } catch (e) {}
+    } catch (e) { }
     html += "</div>";
   }
   html += "</div>";
@@ -3891,8 +3907,8 @@ function _renderRegistryResults() {
       "</div>" +
       (srv.description
         ? '<div class="mcp-reg-card-desc">' +
-          escapeHtml(srv.description) +
-          "</div>"
+        escapeHtml(srv.description) +
+        "</div>"
         : "") +
       '<div class="mcp-reg-card-meta">' +
       sourceBadges +
@@ -3900,8 +3916,8 @@ function _renderRegistryResults() {
       '<div class="mcp-reg-card-actions">' +
       (srv.version
         ? '<span class="mcp-reg-card-version">v' +
-          escapeHtml(srv.version) +
-          "</span>"
+        escapeHtml(srv.version) +
+        "</span>"
         : "") +
       actionHtml +
       "</div></div>";
@@ -3924,9 +3940,9 @@ function _renderRegistryResults() {
     moreBtn.style.display = "";
     countEl.textContent = isFiltered
       ? visibleCount +
-        " of " +
-        _registryResults.length +
-        " loaded (more available)"
+      " of " +
+      _registryResults.length +
+      " loaded (more available)"
       : "Showing " + visibleCount + " results";
   } else {
     pagEl.style.display = visibleCount > 0 ? "" : "none";
@@ -4004,8 +4020,8 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
     "</div>" +
     (srv.description
       ? '<div class="mcp-install-summary-desc">' +
-        escapeHtml(srv.description) +
-        "</div>"
+      escapeHtml(srv.description) +
+      "</div>"
       : "");
 
   // Source selector (only if both remote AND package)
@@ -4325,7 +4341,7 @@ function _pollInstallStatus(serverId, serverName, attempt) {
           _pollInstallStatus(serverId, serverName, attempt + 1);
         }
       })
-      .catch(function () {});
+      .catch(function () { });
   }, 3000);
 }
 
@@ -4570,6 +4586,7 @@ function showCreateModelModal() {
   document.getElementById("model-detect-btn").disabled = false;
   document.getElementById("model-detect-btn").textContent = "Detect";
   _refreshModelSuggestions();
+  _applyProviderDefaults();
   document.getElementById("model-alias").focus();
   _modelCreateTrap = _installTrap("model-create-overlay", "model-create-box");
 }
@@ -4606,6 +4623,7 @@ function showEditModelModal(definitionId) {
       if (caps === "{}") caps = "";
       document.getElementById("model-capabilities").value = caps;
       document.getElementById("model-enabled").checked = m.enabled !== false;
+      _applyProviderDefaults();
     })
     .catch(function () {
       showToast("Failed to load model details");
@@ -4780,6 +4798,18 @@ function detectModel() {
         }
         resultDiv.appendChild(_detectResultLine(msg, "yellow"));
       }
+
+      if (d.available_models && d.available_models.length > 0) {
+        var dl = document.getElementById("model-name-suggestions");
+        if (dl) {
+          dl.textContent = "";
+          d.available_models.forEach(function (m) {
+            var opt = document.createElement("option");
+            opt.value = m;
+            dl.appendChild(opt);
+          });
+        }
+      }
       if (d.context_window) {
         resultDiv.appendChild(
           _detectResultLine(
@@ -4826,9 +4856,9 @@ function _onModelFieldChange() {
     if (!modelName) return;
     authFetch(
       "/v1/api/admin/model-capabilities?provider=" +
-        encodeURIComponent(provider) +
-        "&model=" +
-        encodeURIComponent(modelName),
+      encodeURIComponent(provider) +
+      "&model=" +
+      encodeURIComponent(modelName),
     )
       .then(function (r) {
         return r.json();
@@ -4859,6 +4889,23 @@ function _onModelFieldChange() {
       });
   }, 500);
 }
+/* Provider-specific placeholder hints for base_url and model ID fields. */
+var _providerDefaults = {
+  openai: { urlPlaceholder: "https://api.openai.com/v1", modelPlaceholder: "gpt-5" },
+  anthropic: { urlPlaceholder: "https://api.anthropic.com", modelPlaceholder: "claude-" },
+  google: { urlPlaceholder: "https://generativelanguage.googleapis.com/v1beta/openai/", modelPlaceholder: "gemini-" },
+  "openai-compatible": { urlPlaceholder: "e.g. https://your-provider.com/v1", modelPlaceholder: "GLM5" },
+};
+
+/* Update placeholders when provider changes. */
+function _applyProviderDefaults() {
+  var provider = document.getElementById("model-provider").value;
+  var def = _providerDefaults[provider];
+  if (!def) return;
+  document.getElementById("model-base-url").placeholder = def.urlPlaceholder;
+  document.getElementById("model-name").placeholder = def.modelPlaceholder;
+}
+
 /* Populate the model name datalist with known model prefixes for the
    selected provider.  Called on page load and provider change. */
 function _refreshModelSuggestions() {
@@ -4867,7 +4914,7 @@ function _refreshModelSuggestions() {
   var provider = document.getElementById("model-provider").value;
   authFetch(
     "/v1/api/admin/model-capabilities/known?provider=" +
-      encodeURIComponent(provider),
+    encodeURIComponent(provider),
   )
     .then(function (r) {
       return r.json();
@@ -4894,6 +4941,7 @@ function _refreshModelSuggestions() {
     provEl.addEventListener("change", _onModelFieldChange);
     provEl.addEventListener("change", _refreshModelSuggestions);
     provEl.addEventListener("change", _clearDetectResult);
+    provEl.addEventListener("change", _applyProviderDefaults);
   }
   /* Clear stale detect results when probe-relevant inputs change */
   ["model-base-url", "model-api-key"].forEach(function (id) {

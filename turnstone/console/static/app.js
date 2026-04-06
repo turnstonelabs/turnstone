@@ -11,6 +11,13 @@ window.onLogout = function () {
 window.onThemeChange = function (next) {
   var btn = document.getElementById("theme-toggle");
   if (btn) btn.textContent = next === "light" ? "\u2600" : "\u263E";
+  // Persist to server so admin settings and node UIs see the change
+  var themeValue = next === "light" ? "light" : "dark";
+  authFetch("/v1/api/admin/settings/interface.theme", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: themeValue }),
+  }).catch(function () {});
 };
 // Set initial theme button text
 (function () {
@@ -1114,7 +1121,7 @@ function renderWsTable(container, wsList) {
     // NAME
     var nameCell = document.createElement("span");
     nameCell.className = "dash-cell-name";
-    nameCell.textContent = ws.name || ws.id || "";
+    nameCell.textContent = ws.name || ws.title || ws.id || "";
     main.appendChild(nameCell);
 
     // MODEL
@@ -1281,11 +1288,20 @@ function showNewWsModal() {
     });
   // Populate model dropdown
   var modelSelect = document.getElementById("new-ws-model");
+  var judgeSelect = document.getElementById("new-ws-judge");
   modelSelect.textContent = "";
+  judgeSelect.textContent = "";
+  
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";
   defaultOpt.textContent = "Default model";
   modelSelect.appendChild(defaultOpt);
+  
+  var defaultJudgeOpt = document.createElement("option");
+  defaultJudgeOpt.value = "";
+  defaultJudgeOpt.textContent = "Default (same as agent)";
+  judgeSelect.appendChild(defaultJudgeOpt);
+
   authFetch("/v1/api/models")
     .then(function (r) {
       return r.json();
@@ -1297,6 +1313,11 @@ function showNewWsModal() {
         opt.textContent =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         modelSelect.appendChild(opt);
+        
+        var jOpt = document.createElement("option");
+        jOpt.value = m.alias;
+        jOpt.textContent = opt.textContent;
+        judgeSelect.appendChild(jOpt);
       });
     })
     .catch(function () {
@@ -1304,6 +1325,7 @@ function showNewWsModal() {
     });
   document.getElementById("new-ws-name").value = "";
   modelSelect.value = "";
+  judgeSelect.value = "";
   var taskEl = document.getElementById("new-ws-task");
   taskEl.value = "";
   var mod =
@@ -1363,6 +1385,7 @@ function submitNewWs() {
   var nodeId = document.getElementById("new-ws-node").value;
   var name = document.getElementById("new-ws-name").value.trim();
   var model = document.getElementById("new-ws-model").value.trim();
+  var judgeModel = document.getElementById("new-ws-judge").value.trim();
   var skill = document.getElementById("new-ws-skill").value;
   var task = document.getElementById("new-ws-task").value.trim();
   var errEl = document.getElementById("new-ws-error");
@@ -1376,6 +1399,7 @@ function submitNewWs() {
   if (nodeId) body.node_id = nodeId;
   if (name) body.name = name;
   if (model) body.model = model;
+  if (judgeModel) body.judge_model = judgeModel;
   if (task) body.initial_message = task;
   if (skill) body.skill = skill;
 

@@ -791,6 +791,10 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <select id="new-ws-skill">
       <option value="">Use defaults</option>
     </select>
+    <label for="new-ws-judge">Judge Model <span class="label-hint">optional</span></label>
+    <select id="new-ws-judge">
+      <option value="">Default (same as agent)</option>
+    </select>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
@@ -1521,6 +1525,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <select id="model-provider">
       <option value="openai">openai</option>
       <option value="anthropic">anthropic</option>
+      <option value="google">google</option>
       <option value="openai-compatible">openai-compatible</option>
     </select>
     <label for="model-base-url">Base URL <span style="font-weight:400;text-transform:none">(empty = provider default)</span></label>

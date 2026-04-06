@@ -394,7 +394,8 @@ class ClusterCollector:
                 {
                     "type": "ws_created",
                     "ws_id": ws_id,
-                    "name": ws.get("name", ""),
+                    "name": ws.get("title", "") or ws.get("name", ""),
+                    "title": ws.get("title", ""),
                     "node_id": node_id,
                 }
             )
@@ -418,8 +419,8 @@ class ClusterCollector:
                         "content": new_w.get("content", ""),
                     }
                 )
-            old_name = old_ws.get("name", "")
-            new_name = new_w.get("name", "")
+            old_name = old_ws.get("title", "") or old_ws.get("name", "")
+            new_name = new_w.get("title", "") or new_w.get("name", "")
             if old_name != new_name and new_name:
                 pending.append({"type": "ws_rename", "ws_id": ws_id, "name": new_name})
         node.workstreams = new_ws
