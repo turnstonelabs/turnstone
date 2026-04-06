@@ -53,6 +53,7 @@ from turnstone.core.memory import (
     normalize_key,
     resolve_workstream,
     save_message,
+    save_messages_bulk,
     save_structured_memory,
     save_workstream_config,
     search_history,
@@ -1152,13 +1153,9 @@ class ChatSession:
         # When forking, persist the copied messages and restored config under
         # the fork's own ws_id so they survive restarts.
         if fork:
+            # Bulk-insert all messages in a single transaction for performance.
+            bulk_rows: list[dict[str, Any]] = []
             for msg in self.messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                name = msg.get("name")
-                tool_call_id = msg.get("tool_call_id")
-                # Preserve tool_calls and provider_data so the fork
-                # reconstructs the full message structure after restart.
                 tc = msg.get("tool_calls")
                 tc_json = json.dumps(tc) if tc else None
                 pd = msg.get("provider_data")
@@ -1166,15 +1163,18 @@ class ChatSession:
                     pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
                 except (TypeError, ValueError):
                     pd_str = None
-                save_message(
-                    self._ws_id,
-                    role,
-                    content,
-                    name,
-                    tool_call_id=tool_call_id,
-                    tool_calls=tc_json,
-                    provider_data=pd_str,
+                bulk_rows.append(
+                    {
+                        "ws_id": self._ws_id,
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content", ""),
+                        "tool_name": msg.get("name"),
+                        "tool_call_id": msg.get("tool_call_id"),
+                        "tool_calls": tc_json,
+                        "provider_data": pd_str,
+                    }
                 )
+            save_messages_bulk(bulk_rows)
             self._save_config()
             self._title_generated = False  # allow auto-title for the fork
             log.info(

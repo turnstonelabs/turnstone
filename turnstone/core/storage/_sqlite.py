@@ -243,6 +243,45 @@ class SQLiteBackend:
             )
             conn.commit()
 
+    def save_messages_bulk(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        # Single timestamp for all rows — ordering is preserved by auto-increment id.
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        insert_rows = []
+        ws_ids: set[str] = set()
+        for row in rows:
+            ws_ids.add(row["ws_id"])
+            insert_rows.append(
+                {
+                    "ws_id": row["ws_id"],
+                    "timestamp": now,
+                    "role": row["role"],
+                    "content": sanitize_text(row["content"]),
+                    "tool_name": row.get("tool_name"),
+                    "tool_call_id": row.get("tool_call_id"),
+                    "provider_data": sanitize_text(row.get("provider_data")),
+                    "tool_calls": row.get("tool_calls"),
+                }
+            )
+        with self._conn() as conn:
+            conn.execute(sa.insert(conversations), insert_rows)
+            for wid in ws_ids:
+                conn.execute(
+                    sa.update(workstreams).where(workstreams.c.ws_id == wid).values(updated=now)
+                )
+            # Rebuild FTS5 index so bulk-inserted messages are searchable.
+            if self._fts5_available:
+                try:
+                    conn.execute(
+                        sa.text(
+                            "INSERT INTO conversations_fts(conversations_fts) VALUES ('rebuild')"
+                        )
+                    )
+                except Exception:
+                    self._fts5_available = False
+            conn.commit()
+
     def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
         with self._conn() as conn:
             rows = conn.execute(

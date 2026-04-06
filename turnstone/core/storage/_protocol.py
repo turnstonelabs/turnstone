@@ -28,6 +28,17 @@ class StorageBackend(Protocol):
         """Log a message to the conversations table."""
         ...
 
+    def save_messages_bulk(self, rows: list[dict[str, Any]]) -> None:
+        """Insert multiple conversation rows in a single transaction.
+
+        Each dict must include ``ws_id``, ``role``, and ``content``
+        (which may be ``None`` for assistant messages with only tool_calls).
+        Optional keys: ``tool_name``, ``tool_call_id``, ``provider_data``,
+        ``tool_calls``.  Timestamp and workstream
+        updated-at are handled internally.
+        """
+        ...
+
     def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
         """Load messages for a workstream and reconstruct OpenAI message format."""
         ...

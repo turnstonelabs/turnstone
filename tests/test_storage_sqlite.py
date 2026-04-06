@@ -96,6 +96,55 @@ class TestSaveAndLoadMessages:
         assert backend.load_messages("nonexistent") == []
 
 
+class TestSaveMessagesBulk:
+    def test_bulk_roundtrip(self, backend):
+        backend.register_workstream("s1")
+        backend.save_messages_bulk(
+            [
+                {"ws_id": "s1", "role": "user", "content": "hello"},
+                {"ws_id": "s1", "role": "assistant", "content": "hi there"},
+                {"ws_id": "s1", "role": "user", "content": "bye"},
+            ]
+        )
+        msgs = backend.load_messages("s1")
+        assert len(msgs) == 3
+        assert msgs[0]["content"] == "hello"
+        assert msgs[2]["content"] == "bye"
+
+    def test_bulk_preserves_tool_calls(self, backend):
+        import json
+
+        backend.register_workstream("s1")
+        tc = json.dumps(
+            [{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]
+        )
+        backend.save_messages_bulk(
+            [
+                {"ws_id": "s1", "role": "user", "content": "do it"},
+                {"ws_id": "s1", "role": "assistant", "content": None, "tool_calls": tc},
+                {"ws_id": "s1", "role": "tool", "content": "ok", "tool_call_id": "c1"},
+            ]
+        )
+        msgs = backend.load_messages("s1")
+        assert len(msgs) == 3
+        assert msgs[1]["tool_calls"][0]["id"] == "c1"
+
+    def test_bulk_empty_is_noop(self, backend):
+        backend.save_messages_bulk([])
+
+    def test_bulk_updates_workstream_timestamp(self, backend):
+        backend.register_workstream("s1")
+        # Save a message to establish an initial updated timestamp
+        backend.save_message("s1", "user", "seed")
+        rows_before = backend.list_workstreams_with_history()
+        updated_before = rows_before[0][5]  # updated column
+
+        backend.save_messages_bulk([{"ws_id": "s1", "role": "user", "content": "bulk"}])
+        rows_after = backend.list_workstreams_with_history()
+        updated_after = rows_after[0][5]
+        assert updated_after >= updated_before
+
+
 class TestListWorkstreamsWithHistory:
     def test_lists_workstreams_with_messages(self, backend):
         backend.register_workstream("s1")

@@ -57,6 +57,14 @@ def save_message(
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
 
 
+def save_messages_bulk(rows: list[dict[str, Any]]) -> None:
+    """Insert multiple conversation rows in a single transaction."""
+    try:
+        get_storage().save_messages_bulk(rows)
+    except Exception:
+        log.warning("Failed to bulk-save %d messages", len(rows), exc_info=True)
+
+
 def load_messages(ws_id: str) -> list[dict[str, Any]]:
     """Load messages for a workstream and reconstruct OpenAI message format."""
     try:
