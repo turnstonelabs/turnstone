@@ -2084,7 +2084,9 @@ function _installTrap(overlayId, boxId, trapRef) {
         else if (overlayId === "edit-ppolicy-overlay")
           hideEditPromptPolicyModal();
         else if (overlayId === "create-hr-overlay") hideCreateHRModal();
+        else if (overlayId === "edit-hr-overlay") hideEditHRModal();
         else if (overlayId === "create-ogp-overlay") hideCreateOGPModal();
+        else if (overlayId === "edit-ogp-overlay") hideEditOGPModal();
       }
     };
   }
@@ -2177,7 +2179,9 @@ document.addEventListener("keydown", function (e) {
     ["create-ppolicy-overlay", hideCreatePromptPolicyModal],
     ["edit-ppolicy-overlay", hideEditPromptPolicyModal],
     ["create-hr-overlay", hideCreateHRModal],
+    ["edit-hr-overlay", hideEditHRModal],
     ["create-ogp-overlay", hideCreateOGPModal],
+    ["edit-ogp-overlay", hideEditOGPModal],
   ];
   for (var gi = 0; gi < govOverlays.length; gi++) {
     var govEl = document.getElementById(govOverlays[gi][0]);

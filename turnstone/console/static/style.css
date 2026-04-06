@@ -1033,6 +1033,22 @@
 .admin-btn-danger:hover { opacity: 1; background: rgba(248, 113, 113, 0.1); }
 .admin-btn-danger:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
 
+.admin-btn-caution {
+  background: none;
+  border: 1px solid var(--yellow);
+  color: var(--yellow);
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s, background 0.15s;
+}
+.admin-btn-caution:hover { opacity: 1; background: rgba(251, 191, 36, 0.1); }
+.admin-btn-caution:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+
 .admin-btn-action {
   background: none;
   border: 1px solid var(--border-strong);
@@ -1433,7 +1449,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
 #github-import-overlay,
 #model-create-overlay,
-#create-hr-overlay, #create-ogp-overlay {
+#create-hr-overlay, #edit-hr-overlay, #create-ogp-overlay, #edit-ogp-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.7);
@@ -1489,14 +1505,14 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   /* Judge: Heuristic Rules - hide Tier, Risk, Rec on mobile */
   #judge-heuristic-section .admin-colheaders,
   #judge-heuristic-section .admin-row {
-    grid-template-columns: 1fr 100px 90px 60px 120px;
+    grid-template-columns: 1fr 100px 90px 60px 160px;
   }
   .admin-col-htier, .admin-col-hrisk, .admin-col-hrec { display: none; }
 
   /* Judge: Output Guard - hide Risk, Flag on mobile */
   #judge-output-guard-section .admin-colheaders,
   #judge-output-guard-section .admin-row {
-    grid-template-columns: 1fr 120px 90px 60px 120px;
+    grid-template-columns: 1fr 120px 90px 60px 160px;
   }
   .admin-col-ogrisk, .admin-col-ogflag { display: none; }
 }
@@ -1668,12 +1684,12 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
    ========================================================================== */
 #judge-heuristic-section .admin-colheaders,
 #judge-heuristic-section .admin-row {
-  grid-template-columns: 1.2fr 70px 70px 100px 70px 90px 60px 120px;
+  grid-template-columns: 1.2fr 70px 70px 100px 70px 90px 60px 170px;
 }
 /* Judge: Output Guard Patterns grid */
 #judge-output-guard-section .admin-colheaders,
 #judge-output-guard-section .admin-row {
-  grid-template-columns: 1.2fr 120px 60px 100px 90px 60px 120px;
+  grid-template-columns: 1.2fr 120px 60px 100px 90px 60px 170px;
 }
 
 /* Audit action badges */
@@ -2466,7 +2482,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .node-link, .dash-cell-node, .pagination button { transition: none; }
   .dash-row.has-link::after, .node-group-header::before { transition: none; }
   #new-ws-box select, #new-ws-box input, #new-ws-buttons button { transition: none; }
-  .admin-nav, .admin-row, .admin-btn-danger, .admin-btn-action, .judge-section-btn { transition: none; }
+  .admin-nav, .admin-row, .admin-btn-danger, .admin-btn-caution, .admin-btn-action, .judge-section-btn { transition: none; }
   .settings-toggle-slider, .settings-toggle-slider::before { transition: none; }
   .settings-save-btn, .settings-reset-btn, .settings-docs-link, .settings-help-btn { transition: none; }
   .admin-sidebar, .admin-sidebar-backdrop { transition: none; }

@@ -2781,6 +2781,10 @@ var _chrTrapHandler = null; // create heuristic rule
 var _cogpTrapHandler = null; // create output guard pattern
 var _chrTriggerEl = null;
 var _cogpTriggerEl = null;
+var _ehrTrapHandler = null; // edit heuristic rule
+var _eogpTrapHandler = null; // edit output guard pattern
+var _ehrTriggerEl = null;
+var _eogpTriggerEl = null;
 
 // -- Sub-section switcher ---------------------------------------------------
 
@@ -3073,34 +3077,80 @@ function renderHeuristicRules() {
       r.source === "builtin"
         ? '<span class="scope-badge">built-in</span>'
         : r.source === "builtin-overridden"
-          ? '<span class="scope-badge scope-scan-safe">overridden</span>'
+          ? '<span class="scope-badge scope-channel">modified</span>'
           : r.source === "builtin-disabled"
-            ? '<span class="scope-badge scope-deny">disabled</span>'
+            ? '<span class="scope-badge">built-in</span>'
             : '<span class="scope-badge scope-write">custom</span>';
     var statusBadge = r.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
+    // Note: all dynamic values are escaped via escapeHtml() — safe for innerHTML
     var actions = "";
-    if (r.rule_id) {
+    var eName = escapeHtml(r.name);
+    if (!r.rule_id) {
+      // Pure built-in: Disable + Edit
       actions =
-        '<button class="admin-btn-action" onclick="toggleHeuristicRule(\'' +
+        '<button class="admin-btn-action" data-disable-builtin-hr="' +
+        eName +
+        '" aria-label="Disable ' +
+        eName +
+        '">Disable</button> ' +
+        '<button class="admin-btn-action" data-edit-hr-builtin="' +
+        eName +
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button>';
+    } else if (r.builtin) {
+      // Overridden or disabled built-in: Enable/Disable + Edit + Reset
+      actions =
+        '<button class="admin-btn-action" data-toggle-hr="' +
         r.rule_id +
-        "\'," +
+        '" data-enabled="' +
         !r.enabled +
-        ')">' +
+        '" aria-label="' +
+        (r.enabled ? "Disable" : "Enable") +
+        " " +
+        eName +
+        '">' +
         (r.enabled ? "Disable" : "Enable") +
         "</button> " +
-        '<button class="admin-btn-danger" onclick="deleteHeuristicRule(\'' +
+        '<button class="admin-btn-action" data-edit-hr="' +
         r.rule_id +
-        "')\">Delete</button>";
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button> ' +
+        '<button class="admin-btn-caution" data-reset-hr="' +
+        r.rule_id +
+        '" aria-label="Reset ' +
+        eName +
+        '">Reset</button>';
     } else {
+      // Custom rule: Enable/Disable + Edit + Delete
       actions =
-        '<button class="admin-btn-action" onclick="overrideBuiltinHeuristicRule(\'' +
-        escapeHtml(r.name) +
-        "')\">Customize</button>";
+        '<button class="admin-btn-action" data-toggle-hr="' +
+        r.rule_id +
+        '" data-enabled="' +
+        !r.enabled +
+        '" aria-label="' +
+        (r.enabled ? "Disable" : "Enable") +
+        " " +
+        eName +
+        '">' +
+        (r.enabled ? "Disable" : "Enable") +
+        "</button> " +
+        '<button class="admin-btn-action" data-edit-hr="' +
+        r.rule_id +
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button> ' +
+        '<button class="admin-btn-danger" data-delete-hr="' +
+        r.rule_id +
+        '" aria-label="Delete ' +
+        eName +
+        '">Delete</button>';
     }
     html +=
-      '<div class="admin-row">' +
+      '<div class="admin-row" role="listitem">' +
       '<span class="admin-col"><code>' +
       escapeHtml(r.name) +
       "</code></span>" +
@@ -3127,6 +3177,42 @@ function renderHeuristicRules() {
       "</span></div>";
   }
   c.innerHTML = html;
+  // Bind data-attribute event handlers
+  c.querySelectorAll("[data-disable-builtin-hr]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      disableBuiltinHeuristicRule(this.getAttribute("data-disable-builtin-hr"));
+    });
+  });
+  c.querySelectorAll("[data-toggle-hr]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      toggleHeuristicRule(
+        this.getAttribute("data-toggle-hr"),
+        this.getAttribute("data-enabled") === "true",
+      );
+    });
+  });
+  c.querySelectorAll("[data-edit-hr-builtin]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditBuiltinHeuristicRuleModal(
+        this.getAttribute("data-edit-hr-builtin"),
+      );
+    });
+  });
+  c.querySelectorAll("[data-edit-hr]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditHeuristicRuleModal(this.getAttribute("data-edit-hr"));
+    });
+  });
+  c.querySelectorAll("[data-reset-hr]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      resetHeuristicRule(this.getAttribute("data-reset-hr"));
+    });
+  });
+  c.querySelectorAll("[data-delete-hr]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      deleteHeuristicRule(this.getAttribute("data-delete-hr"));
+    });
+  });
 }
 
 function toggleHeuristicRule(ruleId, enabled) {
@@ -3152,9 +3238,16 @@ function toggleHeuristicRule(ruleId, enabled) {
 }
 
 function deleteHeuristicRule(ruleId) {
+  var ruleName = "";
+  for (var j = 0; j < _judgeHeuristicRules.length; j++) {
+    if (_judgeHeuristicRules[j].rule_id === ruleId) {
+      ruleName = _judgeHeuristicRules[j].name;
+      break;
+    }
+  }
   showConfirmModal(
     "Delete Rule",
-    "Delete this heuristic rule? This action cannot be undone.",
+    'Delete custom rule "' + ruleName + '"? This action cannot be undone.',
     "Delete",
     function () {
       authFetch("/v1/api/admin/judge/heuristic-rules/" + ruleId, {
@@ -3176,52 +3269,6 @@ function deleteHeuristicRule(ruleId) {
         });
     },
   );
-}
-
-function overrideBuiltinHeuristicRule(name) {
-  // Find the built-in rule data
-  var rule = null;
-  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
-    if (_judgeHeuristicRules[i].name === name) {
-      rule = _judgeHeuristicRules[i];
-      break;
-    }
-  }
-  if (!rule) return;
-  // Create a DB copy marked as builtin override, initially disabled
-  var payload = {
-    name: rule.name,
-    risk_level: rule.risk_level,
-    confidence: rule.confidence,
-    recommendation: rule.recommendation,
-    tool_pattern: rule.tool_pattern,
-    arg_patterns: rule.arg_patterns,
-    intent_template: rule.intent_template || "",
-    reasoning_template: rule.reasoning_template || "",
-    tier: rule.tier || rule.risk_level,
-    priority: rule.priority || 0,
-    builtin: true,
-    enabled: false,
-  };
-  authFetch("/v1/api/admin/judge/heuristic-rules", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      showToast("Built-in rule overridden (disabled)");
-      loadJudgeHeuristicRules();
-    })
-    .catch(function (e) {
-      showToast("Error: " + e.message);
-    });
 }
 
 function showCreateHeuristicRuleModal() {
@@ -3299,6 +3346,220 @@ function submitCreateHeuristicRule() {
     });
 }
 
+// -- Heuristic Rule: disable / edit / reset ---------------------------------
+
+function disableBuiltinHeuristicRule(name) {
+  var rule = null;
+  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+    if (_judgeHeuristicRules[i].name === name) {
+      rule = _judgeHeuristicRules[i];
+      break;
+    }
+  }
+  if (!rule) return;
+  var payload = {
+    name: rule.name,
+    risk_level: rule.risk_level,
+    confidence: rule.confidence,
+    recommendation: rule.recommendation,
+    tool_pattern: rule.tool_pattern,
+    arg_patterns: rule.arg_patterns,
+    intent_template: rule.intent_template || "",
+    reasoning_template: rule.reasoning_template || "",
+    tier: rule.tier || rule.risk_level,
+    priority: rule.priority || 0,
+    builtin: true,
+    enabled: false,
+  };
+  authFetch("/v1/api/admin/judge/heuristic-rules", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      showToast("Built-in rule disabled \u2014 Reset to restore defaults");
+      loadJudgeHeuristicRules();
+    })
+    .catch(function (e) {
+      showToast("Error: " + e.message);
+    });
+}
+
+function resetHeuristicRule(ruleId) {
+  var ruleName = "";
+  for (var j = 0; j < _judgeHeuristicRules.length; j++) {
+    if (_judgeHeuristicRules[j].rule_id === ruleId) {
+      ruleName = _judgeHeuristicRules[j].name;
+      break;
+    }
+  }
+  showConfirmModal(
+    "Reset to Built-in",
+    'Reset "' +
+      ruleName +
+      '" to its built-in defaults? Your customizations will be removed.',
+    "Reset",
+    function () {
+      authFetch("/v1/api/admin/judge/heuristic-rules/" + ruleId, {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok)
+            return r.json().then(function (d) {
+              throw new Error(d.error || "Failed");
+            });
+          return r.json();
+        })
+        .then(function () {
+          showToast("Rule reset to built-in defaults");
+          loadJudgeHeuristicRules();
+        })
+        .catch(function (e) {
+          showToast("Error: " + e.message);
+        });
+    },
+  );
+}
+
+function _populateEditHRModal(rule, isBuiltin) {
+  document.getElementById("ehr-id").value = rule.rule_id || "";
+  document.getElementById("ehr-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("ehr-name").value = rule.name;
+  document.getElementById("ehr-name").disabled = isBuiltin;
+  document.getElementById("ehr-tier").value = rule.tier || rule.risk_level;
+  document.getElementById("ehr-risk").value = rule.risk_level;
+  document.getElementById("ehr-rec").value = rule.recommendation;
+  document.getElementById("ehr-tool").value = rule.tool_pattern;
+  // arg_patterns comes as JSON string from API
+  var args = rule.arg_patterns || "[]";
+  if (typeof args === "string") {
+    try {
+      args = JSON.parse(args);
+    } catch (e) {
+      args = [];
+    }
+  }
+  document.getElementById("ehr-args").value = args.join("\n");
+  document.getElementById("ehr-conf").value = rule.confidence;
+  document.getElementById("ehr-intent").value = rule.intent_template || "";
+  document.getElementById("ehr-reason").value = rule.reasoning_template || "";
+  document.getElementById("edit-hr-error").style.display = "none";
+  document.getElementById("ehr-submit").disabled = false;
+}
+
+function showEditHeuristicRuleModal(ruleId) {
+  _ehrTriggerEl = document.activeElement;
+  var rule = null;
+  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+    if (_judgeHeuristicRules[i].rule_id === ruleId) {
+      rule = _judgeHeuristicRules[i];
+      break;
+    }
+  }
+  if (!rule) return;
+  _populateEditHRModal(rule, !!rule.builtin);
+  var ov = document.getElementById("edit-hr-overlay");
+  ov.style.display = "flex";
+  document.getElementById("ehr-tier").focus();
+  _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
+}
+
+function showEditBuiltinHeuristicRuleModal(name) {
+  _ehrTriggerEl = document.activeElement;
+  var rule = null;
+  for (var i = 0; i < _judgeHeuristicRules.length; i++) {
+    if (
+      _judgeHeuristicRules[i].name === name &&
+      !_judgeHeuristicRules[i].rule_id
+    ) {
+      rule = _judgeHeuristicRules[i];
+      break;
+    }
+  }
+  if (!rule) return;
+  _populateEditHRModal(rule, true);
+  var ov = document.getElementById("edit-hr-overlay");
+  ov.style.display = "flex";
+  document.getElementById("ehr-tier").focus();
+  _ehrTrapHandler = _installTrap("edit-hr-overlay", "edit-hr-box");
+}
+
+function hideEditHRModal() {
+  document.getElementById("edit-hr-overlay").style.display = "none";
+  _ehrTrapHandler = _removeTrap(_ehrTrapHandler);
+  if (_ehrTriggerEl && _ehrTriggerEl.focus) _ehrTriggerEl.focus();
+  _ehrTriggerEl = null;
+}
+
+function submitEditHeuristicRule() {
+  var errEl = document.getElementById("edit-hr-error");
+  errEl.style.display = "none";
+  var argsText = document.getElementById("ehr-args").value.trim();
+  var argPatterns = argsText
+    ? argsText.split("\n").filter(function (l) {
+        return l.trim();
+      })
+    : [];
+  var ruleId = document.getElementById("ehr-id").value;
+  var payload = {
+    name: document.getElementById("ehr-name").value.trim(),
+    tier: document.getElementById("ehr-tier").value,
+    risk_level: document.getElementById("ehr-risk").value,
+    recommendation: document.getElementById("ehr-rec").value,
+    tool_pattern: document.getElementById("ehr-tool").value.trim(),
+    arg_patterns: argPatterns,
+    confidence: parseFloat(document.getElementById("ehr-conf").value) || 0.8,
+    intent_template: document.getElementById("ehr-intent").value.trim(),
+    reasoning_template: document.getElementById("ehr-reason").value.trim(),
+  };
+  var btn = document.getElementById("ehr-submit");
+  btn.disabled = true;
+
+  var url, method;
+  if (ruleId) {
+    // Existing DB row — update in place
+    url = "/v1/api/admin/judge/heuristic-rules/" + ruleId;
+    method = "PUT";
+  } else {
+    // Pure built-in first edit — create override
+    url = "/v1/api/admin/judge/heuristic-rules";
+    method = "POST";
+    payload.builtin = true;
+    payload.enabled = true;
+  }
+  authFetch(url, {
+    method: method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideEditHRModal();
+      showToast(ruleId ? "Rule updated" : "Rule overridden");
+      loadJudgeHeuristicRules();
+    })
+    .catch(function (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = "";
+    })
+    .finally(function () {
+      btn.disabled = false;
+    });
+}
+
 // -- Output Guard Patterns section ------------------------------------------
 
 function loadJudgeOGPatterns() {
@@ -3330,34 +3591,80 @@ function renderOGPatterns() {
       p.source === "builtin"
         ? '<span class="scope-badge">built-in</span>'
         : p.source === "builtin-overridden"
-          ? '<span class="scope-badge scope-scan-safe">overridden</span>'
+          ? '<span class="scope-badge scope-channel">modified</span>'
           : p.source === "builtin-disabled"
-            ? '<span class="scope-badge scope-deny">disabled</span>'
+            ? '<span class="scope-badge">built-in</span>'
             : '<span class="scope-badge scope-write">custom</span>';
     var statusBadge = p.enabled
       ? '<span class="scope-badge scope-scan-safe">active</span>'
       : '<span class="scope-badge scope-deny">disabled</span>';
+    // Note: all dynamic values are escaped via escapeHtml() — safe for innerHTML
     var actions = "";
-    if (p.pattern_id) {
+    var eName = escapeHtml(p.name);
+    if (!p.pattern_id) {
+      // Pure built-in: Disable + Edit
       actions =
-        '<button class="admin-btn-action" onclick="toggleOGPattern(\'' +
+        '<button class="admin-btn-action" data-disable-builtin-ogp="' +
+        eName +
+        '" aria-label="Disable ' +
+        eName +
+        '">Disable</button> ' +
+        '<button class="admin-btn-action" data-edit-ogp-builtin="' +
+        eName +
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button>';
+    } else if (p.builtin) {
+      // Overridden or disabled built-in: Enable/Disable + Edit + Reset
+      actions =
+        '<button class="admin-btn-action" data-toggle-ogp="' +
         p.pattern_id +
-        "\'," +
+        '" data-enabled="' +
         !p.enabled +
-        ')">' +
+        '" aria-label="' +
+        (p.enabled ? "Disable" : "Enable") +
+        " " +
+        eName +
+        '">' +
         (p.enabled ? "Disable" : "Enable") +
         "</button> " +
-        '<button class="admin-btn-danger" onclick="deleteOGPattern(\'' +
+        '<button class="admin-btn-action" data-edit-ogp="' +
         p.pattern_id +
-        "')\">Delete</button>";
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button> ' +
+        '<button class="admin-btn-caution" data-reset-ogp="' +
+        p.pattern_id +
+        '" aria-label="Reset ' +
+        eName +
+        '">Reset</button>';
     } else {
+      // Custom rule: Enable/Disable + Edit + Delete
       actions =
-        '<button class="admin-btn-action" onclick="overrideBuiltinOGPattern(\'' +
-        escapeHtml(p.name) +
-        "')\">Customize</button>";
+        '<button class="admin-btn-action" data-toggle-ogp="' +
+        p.pattern_id +
+        '" data-enabled="' +
+        !p.enabled +
+        '" aria-label="' +
+        (p.enabled ? "Disable" : "Enable") +
+        " " +
+        eName +
+        '">' +
+        (p.enabled ? "Disable" : "Enable") +
+        "</button> " +
+        '<button class="admin-btn-action" data-edit-ogp="' +
+        p.pattern_id +
+        '" aria-label="Edit ' +
+        eName +
+        '">Edit</button> ' +
+        '<button class="admin-btn-danger" data-delete-ogp="' +
+        p.pattern_id +
+        '" aria-label="Delete ' +
+        eName +
+        '">Delete</button>';
     }
     html +=
-      '<div class="admin-row">' +
+      '<div class="admin-row" role="listitem">' +
       '<span class="admin-col"><code>' +
       escapeHtml(p.name) +
       "</code></span>" +
@@ -3381,6 +3688,40 @@ function renderOGPatterns() {
       "</span></div>";
   }
   c.innerHTML = html;
+  // Bind data-attribute event handlers
+  c.querySelectorAll("[data-disable-builtin-ogp]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      disableBuiltinOGPattern(this.getAttribute("data-disable-builtin-ogp"));
+    });
+  });
+  c.querySelectorAll("[data-toggle-ogp]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      toggleOGPattern(
+        this.getAttribute("data-toggle-ogp"),
+        this.getAttribute("data-enabled") === "true",
+      );
+    });
+  });
+  c.querySelectorAll("[data-edit-ogp-builtin]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditBuiltinOGPatternModal(this.getAttribute("data-edit-ogp-builtin"));
+    });
+  });
+  c.querySelectorAll("[data-edit-ogp]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      showEditOGPatternModal(this.getAttribute("data-edit-ogp"));
+    });
+  });
+  c.querySelectorAll("[data-reset-ogp]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      resetOGPattern(this.getAttribute("data-reset-ogp"));
+    });
+  });
+  c.querySelectorAll("[data-delete-ogp]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      deleteOGPattern(this.getAttribute("data-delete-ogp"));
+    });
+  });
 }
 
 function toggleOGPattern(patternId, enabled) {
@@ -3406,9 +3747,16 @@ function toggleOGPattern(patternId, enabled) {
 }
 
 function deleteOGPattern(patternId) {
+  var patName = "";
+  for (var j = 0; j < _judgeOGPatterns.length; j++) {
+    if (_judgeOGPatterns[j].pattern_id === patternId) {
+      patName = _judgeOGPatterns[j].name;
+      break;
+    }
+  }
   showConfirmModal(
     "Delete Pattern",
-    "Delete this output guard pattern? This action cannot be undone.",
+    'Delete custom pattern "' + patName + '"? This action cannot be undone.',
     "Delete",
     function () {
       authFetch("/v1/api/admin/judge/output-guard-patterns/" + patternId, {
@@ -3430,50 +3778,6 @@ function deleteOGPattern(patternId) {
         });
     },
   );
-}
-
-function overrideBuiltinOGPattern(name) {
-  var pat = null;
-  for (var i = 0; i < _judgeOGPatterns.length; i++) {
-    if (_judgeOGPatterns[i].name === name) {
-      pat = _judgeOGPatterns[i];
-      break;
-    }
-  }
-  if (!pat) return;
-  var payload = {
-    name: pat.name,
-    category: pat.category,
-    risk_level: pat.risk_level,
-    pattern: pat.pattern || "",
-    flag_name: pat.flag_name,
-    annotation: pat.annotation || "",
-    pattern_flags: pat.pattern_flags || "",
-    is_credential: pat.is_credential || false,
-    redact_label: pat.redact_label || "",
-    priority: pat.priority || 0,
-    builtin: true,
-    enabled: false,
-  };
-  authFetch("/v1/api/admin/judge/output-guard-patterns", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  })
-    .then(function (r) {
-      if (!r.ok)
-        return r.json().then(function (d) {
-          throw new Error(d.error || "Failed");
-        });
-      return r.json();
-    })
-    .then(function () {
-      showToast("Built-in pattern overridden (disabled)");
-      loadJudgeOGPatterns();
-    })
-    .catch(function (e) {
-      showToast("Error: " + e.message);
-    });
 }
 
 function showCreateOutputGuardPatternModal() {
@@ -3566,6 +3870,233 @@ function submitCreateOGPattern() {
     .then(function () {
       hideCreateOGPModal();
       showToast("Pattern created");
+      loadJudgeOGPatterns();
+    })
+    .catch(function (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = "";
+    })
+    .finally(function () {
+      btn.disabled = false;
+    });
+}
+
+// -- Output Guard Pattern: disable / edit / reset ---------------------------
+
+function disableBuiltinOGPattern(name) {
+  var pat = null;
+  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+    if (_judgeOGPatterns[i].name === name) {
+      pat = _judgeOGPatterns[i];
+      break;
+    }
+  }
+  if (!pat) return;
+  var payload = {
+    name: pat.name,
+    category: pat.category,
+    risk_level: pat.risk_level,
+    pattern: pat.pattern || "",
+    flag_name: pat.flag_name,
+    annotation: pat.annotation || "",
+    pattern_flags: pat.pattern_flags || "",
+    is_credential: pat.is_credential || false,
+    redact_label: pat.redact_label || "",
+    priority: pat.priority || 0,
+    builtin: true,
+    enabled: false,
+  };
+  authFetch("/v1/api/admin/judge/output-guard-patterns", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      showToast("Built-in pattern disabled \u2014 Reset to restore defaults");
+      loadJudgeOGPatterns();
+    })
+    .catch(function (e) {
+      showToast("Error: " + e.message);
+    });
+}
+
+function resetOGPattern(patternId) {
+  var patName = "";
+  for (var j = 0; j < _judgeOGPatterns.length; j++) {
+    if (_judgeOGPatterns[j].pattern_id === patternId) {
+      patName = _judgeOGPatterns[j].name;
+      break;
+    }
+  }
+  showConfirmModal(
+    "Reset to Built-in",
+    'Reset "' +
+      patName +
+      '" to its built-in defaults? Your customizations will be removed.',
+    "Reset",
+    function () {
+      authFetch("/v1/api/admin/judge/output-guard-patterns/" + patternId, {
+        method: "DELETE",
+      })
+        .then(function (r) {
+          if (!r.ok)
+            return r.json().then(function (d) {
+              throw new Error(d.error || "Failed");
+            });
+          return r.json();
+        })
+        .then(function () {
+          showToast("Pattern reset to built-in defaults");
+          loadJudgeOGPatterns();
+        })
+        .catch(function (e) {
+          showToast("Error: " + e.message);
+        });
+    },
+  );
+}
+
+function _populateEditOGPModal(pat, isBuiltin) {
+  document.getElementById("eogp-id").value = pat.pattern_id || "";
+  document.getElementById("eogp-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("eogp-name").value = pat.name;
+  document.getElementById("eogp-name").disabled = isBuiltin;
+  document.getElementById("eogp-cat").value = pat.category;
+  document.getElementById("eogp-risk").value = pat.risk_level;
+  document.getElementById("eogp-pattern").value = pat.pattern || "";
+  document.getElementById("eogp-flag").value = pat.flag_name || "";
+  document.getElementById("eogp-flag").disabled = isBuiltin;
+  document.getElementById("eogp-ann").value = pat.annotation || "";
+  document.getElementById("eogp-flags").value = pat.pattern_flags || "";
+  document.getElementById("eogp-cred").checked = !!pat.is_credential;
+  document.getElementById("eogp-redact").value = pat.redact_label || "";
+  document.getElementById("eogp-regex-result").textContent = "";
+  document.getElementById("edit-ogp-error").style.display = "none";
+  document.getElementById("eogp-submit").disabled = false;
+}
+
+function showEditOGPatternModal(patternId) {
+  _eogpTriggerEl = document.activeElement;
+  var pat = null;
+  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+    if (_judgeOGPatterns[i].pattern_id === patternId) {
+      pat = _judgeOGPatterns[i];
+      break;
+    }
+  }
+  if (!pat) return;
+  _populateEditOGPModal(pat, !!pat.builtin);
+  var ov = document.getElementById("edit-ogp-overlay");
+  ov.style.display = "flex";
+  document.getElementById("eogp-cat").focus();
+  _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
+}
+
+function showEditBuiltinOGPatternModal(name) {
+  _eogpTriggerEl = document.activeElement;
+  var pat = null;
+  for (var i = 0; i < _judgeOGPatterns.length; i++) {
+    if (_judgeOGPatterns[i].name === name && !_judgeOGPatterns[i].pattern_id) {
+      pat = _judgeOGPatterns[i];
+      break;
+    }
+  }
+  if (!pat) return;
+  _populateEditOGPModal(pat, true);
+  var ov = document.getElementById("edit-ogp-overlay");
+  ov.style.display = "flex";
+  document.getElementById("eogp-cat").focus();
+  _eogpTrapHandler = _installTrap("edit-ogp-overlay", "edit-ogp-box");
+}
+
+function hideEditOGPModal() {
+  document.getElementById("edit-ogp-overlay").style.display = "none";
+  _eogpTrapHandler = _removeTrap(_eogpTrapHandler);
+  if (_eogpTriggerEl && _eogpTriggerEl.focus) _eogpTriggerEl.focus();
+  _eogpTriggerEl = null;
+}
+
+function validateEditOGRegex() {
+  var pattern = document.getElementById("eogp-pattern").value;
+  var resultEl = document.getElementById("eogp-regex-result");
+  if (!pattern) {
+    resultEl.textContent = "";
+    return;
+  }
+  authFetch("/v1/api/admin/judge/validate-regex", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pattern: pattern }),
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error("Validation failed");
+      return r.json();
+    })
+    .then(function (d) {
+      if (d.valid) {
+        resultEl.textContent = "Valid";
+        resultEl.style.color = "var(--green)";
+      } else {
+        resultEl.textContent = d.error || "Invalid";
+        resultEl.style.color = "var(--red)";
+      }
+    })
+    .catch(function () {
+      resultEl.textContent = "Validation failed";
+      resultEl.style.color = "var(--red)";
+    });
+}
+
+function submitEditOGPattern() {
+  var errEl = document.getElementById("edit-ogp-error");
+  errEl.style.display = "none";
+  var patternId = document.getElementById("eogp-id").value;
+  var payload = {
+    name: document.getElementById("eogp-name").value.trim(),
+    category: document.getElementById("eogp-cat").value,
+    risk_level: document.getElementById("eogp-risk").value,
+    pattern: document.getElementById("eogp-pattern").value,
+    flag_name: document.getElementById("eogp-flag").value.trim(),
+    annotation: document.getElementById("eogp-ann").value.trim(),
+    pattern_flags: document.getElementById("eogp-flags").value.trim(),
+    is_credential: document.getElementById("eogp-cred").checked,
+    redact_label: document.getElementById("eogp-redact").value.trim(),
+  };
+  var btn = document.getElementById("eogp-submit");
+  btn.disabled = true;
+
+  var url, method;
+  if (patternId) {
+    url = "/v1/api/admin/judge/output-guard-patterns/" + patternId;
+    method = "PUT";
+  } else {
+    url = "/v1/api/admin/judge/output-guard-patterns";
+    method = "POST";
+    payload.builtin = true;
+    payload.enabled = true;
+  }
+  authFetch(url, {
+    method: method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+    .then(function (r) {
+      if (!r.ok)
+        return r.json().then(function (d) {
+          throw new Error(d.error || "Failed");
+        });
+      return r.json();
+    })
+    .then(function () {
+      hideEditOGPModal();
+      showToast(patternId ? "Pattern updated" : "Pattern overridden");
       loadJudgeOGPatterns();
     })
     .catch(function (e) {

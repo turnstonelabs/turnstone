@@ -417,6 +417,86 @@
       </div>
     </div>
 
+    <!-- Judge: Edit Heuristic Rule Modal -->
+    <div id="edit-hr-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-hr-title">
+      <div id="edit-hr-box" class="admin-modal admin-modal-wide">
+        <h2 id="edit-hr-title">Edit Heuristic Rule</h2>
+        <div id="edit-hr-error" role="alert" aria-live="assertive"></div>
+        <input id="ehr-id" type="hidden">
+        <input id="ehr-builtin" type="hidden">
+        <label for="ehr-name">Name</label>
+        <input id="ehr-name" type="text" autocomplete="off" spellcheck="false">
+        <div style="display:flex;gap:12px">
+          <div style="flex:1">
+            <label for="ehr-tier">Tier</label>
+            <select id="ehr-tier"><option>critical</option><option>high</option><option>medium</option><option>low</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="ehr-risk">Risk Level</label>
+            <select id="ehr-risk"><option>critical</option><option>high</option><option>medium</option><option>low</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="ehr-rec">Recommendation</label>
+            <select id="ehr-rec"><option>approve</option><option>review</option><option>deny</option></select>
+          </div>
+        </div>
+        <label for="ehr-tool">Tool Pattern <span class="label-hint">fnmatch syntax: bash, write_file, mcp__*</span></label>
+        <input id="ehr-tool" type="text" autocomplete="off" spellcheck="false">
+        <label for="ehr-args">Arg Patterns <span class="label-hint">one regex per line</span></label>
+        <textarea id="ehr-args" rows="3" style="font-family:var(--font-mono);font-size:12px"></textarea>
+        <label for="ehr-conf">Confidence <span class="label-hint">0.0 – 1.0</span></label>
+        <input id="ehr-conf" type="number" step="0.05" min="0" max="1" style="width:100px">
+        <label for="ehr-intent">Intent Description</label>
+        <input id="ehr-intent" type="text" autocomplete="off">
+        <label for="ehr-reason">Reasoning</label>
+        <input id="ehr-reason" type="text" autocomplete="off">
+        <div class="modal-buttons">
+          <button class="modal-cancel" onclick="hideEditHRModal()">Cancel</button>
+          <button id="ehr-submit" class="modal-submit" onclick="submitEditHeuristicRule()">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Judge: Edit Output Guard Pattern Modal -->
+    <div id="edit-ogp-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="edit-ogp-title">
+      <div id="edit-ogp-box" class="admin-modal admin-modal-wide">
+        <h2 id="edit-ogp-title">Edit Output Guard Pattern</h2>
+        <div id="edit-ogp-error" role="alert" aria-live="assertive"></div>
+        <input id="eogp-id" type="hidden">
+        <input id="eogp-builtin" type="hidden">
+        <label for="eogp-name">Name</label>
+        <input id="eogp-name" type="text" autocomplete="off" spellcheck="false">
+        <div style="display:flex;gap:12px">
+          <div style="flex:1">
+            <label for="eogp-cat">Category</label>
+            <select id="eogp-cat"><option>prompt_injection</option><option>credentials</option><option>encoded_payloads</option><option>adversarial_urls</option><option>info_disclosure</option></select>
+          </div>
+          <div style="flex:1">
+            <label for="eogp-risk">Risk Level</label>
+            <select id="eogp-risk"><option>high</option><option>medium</option><option>low</option></select>
+          </div>
+        </div>
+        <label for="eogp-pattern">Regex Pattern</label>
+        <input id="eogp-pattern" type="text" autocomplete="off" spellcheck="false" style="font-family:var(--font-mono);font-size:12px">
+        <button class="admin-btn-action" style="margin:4px 0 8px" onclick="validateEditOGRegex()">Validate regex</button>
+        <span id="eogp-regex-result" role="status" aria-live="polite" style="font-size:11px;margin-left:8px"></span>
+        <label for="eogp-flag">Flag Name</label>
+        <input id="eogp-flag" type="text" autocomplete="off" spellcheck="false">
+        <label for="eogp-ann">Annotation</label>
+        <input id="eogp-ann" type="text" autocomplete="off">
+        <label for="eogp-flags">Pattern Flags <span class="label-hint">comma-separated: IGNORECASE, MULTILINE, DOTALL</span></label>
+        <input id="eogp-flags" type="text" autocomplete="off">
+        <div style="display:flex;gap:16px;margin:8px 0">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px"><input id="eogp-cred" type="checkbox"> Is Credential</label>
+          <label style="font-size:12px">Redact Label <input id="eogp-redact" type="text" placeholder="api_key" style="width:100px;margin-left:4px"></label>
+        </div>
+        <div class="modal-buttons">
+          <button class="modal-cancel" onclick="hideEditOGPModal()">Cancel</button>
+          <button id="eogp-submit" class="modal-submit" onclick="submitEditOGPattern()">Save</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Skills Tab -->
     <div id="admin-skills" class="admin-panel" role="tabpanel" aria-labelledby="tab-skills" style="display:none">
       <div class="admin-toolbar">
