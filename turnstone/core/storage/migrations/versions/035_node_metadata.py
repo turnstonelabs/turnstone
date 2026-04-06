@@ -27,7 +27,24 @@ def upgrade() -> None:
     )
     op.create_index("idx_node_metadata_key", "node_metadata", ["key"])
 
+    # Grant admin.nodes permission to the built-in admin role
+    conn = op.get_bind()
+    conn.execute(
+        sa.text(
+            "UPDATE roles SET permissions = permissions || ',admin.nodes' "
+            "WHERE role_id = 'builtin-admin' "
+            "AND permissions NOT LIKE '%admin.nodes%'"
+        )
+    )
+
 
 def downgrade() -> None:
+    conn = op.get_bind()
+    conn.execute(
+        sa.text(
+            "UPDATE roles SET permissions = REPLACE(permissions, ',admin.nodes', '') "
+            "WHERE role_id = 'builtin-admin'"
+        )
+    )
     op.drop_index("idx_node_metadata_key", table_name="node_metadata")
     op.drop_table("node_metadata")

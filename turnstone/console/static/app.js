@@ -1493,7 +1493,7 @@ function _loadNodeMetadataPanel(nodeId) {
   if (!section || !table) return;
   section.style.display = "none";
   table.textContent = "";
-  authFetch("/v1/api/admin/nodes/" + encodeURIComponent(nodeId) + "/metadata")
+  authFetch("/v1/api/cluster/node/" + encodeURIComponent(nodeId))
     .then(function (r) {
       return r.ok ? r.json() : null;
     })
