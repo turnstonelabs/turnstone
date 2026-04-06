@@ -53,6 +53,12 @@
       <span class="dash-col dash-col-ctx">CTX</span>
     </div>
     <div id="node-ws-table" class="dash-table" role="group" aria-label="Workstreams" aria-live="polite"></div>
+    <div id="node-metadata-section" style="margin-top:16px;display:none">
+      <div class="dash-header">
+        <span class="dash-header-title">METADATA</span>
+      </div>
+      <div id="node-metadata-table" style="font-size:.85rem"></div>
+    </div>
     <a id="node-link" class="node-link">Open node UI</a>
   </div>
 
@@ -112,6 +118,7 @@
         <div class="admin-sidebar-group" data-group="system" role="group" aria-label="System">
           <div class="admin-sidebar-group-label" aria-hidden="true">System</div>
           <button id="tab-models" class="admin-nav" data-tab="models" role="tab" aria-selected="false" aria-controls="admin-models" tabindex="-1" onclick="switchAdminTab('models')">Models</button>
+          <button id="tab-node-metadata" class="admin-nav" data-tab="node-metadata" role="tab" aria-selected="false" aria-controls="admin-node-metadata" tabindex="-1" onclick="switchAdminTab('node-metadata')">Nodes</button>
           <button id="tab-settings" class="admin-nav" data-tab="settings" role="tab" aria-selected="false" aria-controls="admin-settings" tabindex="-1" onclick="switchAdminTab('settings')">Settings</button>
           <button id="tab-tls" class="admin-nav" data-tab="tls" role="tab" aria-selected="false" aria-controls="admin-tls" tabindex="-1" onclick="switchAdminTab('tls')">TLS</button>
         </div>
@@ -652,6 +659,16 @@
       </div>
       <div id="admin-models-table" role="list" aria-label="Model definitions" aria-live="polite">
         <div class="dashboard-empty">Loading...</div>
+      </div>
+    </div>
+
+    <!-- Node Metadata Tab -->
+    <div id="admin-node-metadata" class="admin-panel" role="tabpanel" aria-labelledby="tab-node-metadata" style="display:none">
+      <div class="admin-toolbar">
+        <span class="section-header" style="margin:0">NODE METADATA</span>
+      </div>
+      <div id="admin-node-metadata-content" role="list" aria-label="Node metadata" aria-live="polite">
+        <div class="dashboard-empty">Loading&hellip;</div>
       </div>
     </div>
 

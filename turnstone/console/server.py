@@ -250,7 +250,31 @@ async def cluster_nodes(request: Request) -> JSONResponse:
     sort_by = params.get("sort", "activity")
     limit = _parse_int(params, "limit", 100, minimum=1, maximum=1000)
     offset = _parse_int(params, "offset", 0)
-    nodes, total = collector.get_nodes(sort_by=sort_by, limit=limit, offset=offset)
+
+    # Extract meta.* filters for node metadata filtering
+    meta_filters = {k[5:]: v for k, v in params.items() if k.startswith("meta.") and k[5:]}
+    node_ids: set[str] | None = None
+    if meta_filters:
+        import json as _mf_json
+
+        from turnstone.core.storage import get_storage as _get_mf_storage
+
+        # Values in the DB are JSON-encoded.  Try to use raw value if it is
+        # already valid JSON (e.g. meta.cpu_count=4), otherwise wrap as string.
+        encoded = {}
+        for mk, mv in meta_filters.items():
+            try:
+                _mf_json.loads(mv)
+                encoded[mk] = mv
+            except (ValueError, TypeError):
+                encoded[mk] = _mf_json.dumps(mv)
+        node_ids = _get_mf_storage().filter_nodes_by_metadata(encoded)
+        if not node_ids:
+            return JSONResponse({"nodes": [], "total": 0})
+
+    nodes, total = collector.get_nodes(
+        sort_by=sort_by, limit=limit, offset=offset, node_ids=node_ids
+    )
     return JSONResponse({"nodes": nodes, "total": total})
 
 
@@ -289,9 +313,24 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     if not node_id or "/" in node_id or len(node_id) > 256:
         return JSONResponse({"error": "Invalid node ID"}, status_code=400)
     detail = collector.get_node_detail(node_id)
-    if detail:
-        return JSONResponse(detail)
-    return JSONResponse({"error": "Node not found"}, status_code=404)
+    if not detail:
+        return JSONResponse({"error": "Node not found"}, status_code=404)
+
+    # Attach metadata if available
+    import json as _nd_json
+
+    from turnstone.core.storage import get_storage as _get_nd_storage
+
+    try:
+        raw = _get_nd_storage().get_node_metadata(node_id)
+        detail["metadata"] = [
+            {"key": r["key"], "value": _nd_json.loads(r["value"]), "source": r["source"]}
+            for r in raw
+        ]
+    except Exception:
+        log.warning("cluster.node_metadata_load_failed", node_id=node_id, exc_info=True)
+        detail["metadata"] = []
+    return JSONResponse(detail)
 
 
 async def cluster_snapshot(request: Request) -> JSONResponse:
@@ -6917,6 +6956,145 @@ async def admin_validate_regex(request: Request) -> JSONResponse:
     return JSONResponse({"valid": True})
 
 
+def _validate_node_id(node_id: str) -> JSONResponse | None:
+    """Return an error response if node_id is invalid, else None."""
+    if not node_id or "/" in node_id or len(node_id) > 256:
+        return JSONResponse({"error": "Invalid node ID"}, status_code=400)
+    return None
+
+
+async def admin_get_node_metadata(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/nodes/{node_id}/metadata — all metadata for a node."""
+    import json as _nm_json
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage as _get_nm_storage
+
+    err = require_permission(request, "admin.settings")
+    if err:
+        return err
+    node_id = request.path_params["node_id"]
+    nv = _validate_node_id(node_id)
+    if nv:
+        return nv
+    rows = _get_nm_storage().get_node_metadata(node_id)
+    metadata = [
+        {"key": r["key"], "value": _nm_json.loads(r["value"]), "source": r["source"]} for r in rows
+    ]
+    return JSONResponse({"node_id": node_id, "metadata": metadata})
+
+
+async def admin_set_node_metadata(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/nodes/{node_id}/metadata — bulk set user metadata."""
+    import json as _nm_json
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage as _get_nm_storage
+
+    err = require_permission(request, "admin.settings.write")
+    if err:
+        return err
+    node_id = request.path_params["node_id"]
+    nv = _validate_node_id(node_id)
+    if nv:
+        return nv
+    body = await request.json()
+    entries = body.get("entries", [])
+    if not entries:
+        return JSONResponse({"error": "No entries provided"}, status_code=400)
+
+    storage = _get_nm_storage()
+
+    # Validate entries
+    existing = {r["key"]: r["source"] for r in storage.get_node_metadata(node_id)}
+    for e in entries:
+        key = e.get("key", "")
+        if not key:
+            return JSONResponse({"error": "Empty key"}, status_code=400)
+        if len(key) > 128:
+            return JSONResponse(
+                {"error": f"Key too long (max 128): {key[:32]}..."}, status_code=400
+            )
+        if "value" not in e:
+            return JSONResponse({"error": f"Missing value for key: {key}"}, status_code=400)
+        if existing.get(key) == "auto":
+            return JSONResponse(
+                {"error": f"Cannot overwrite auto-populated key: {key}"},
+                status_code=400,
+            )
+
+    bulk = [(e["key"], _nm_json.dumps(e["value"]), "user") for e in entries]
+    storage.set_node_metadata_bulk(node_id, bulk)
+    return JSONResponse({"ok": True, "count": len(bulk)})
+
+
+async def admin_set_node_metadata_key(request: Request) -> JSONResponse:
+    """PUT /v1/api/admin/nodes/{node_id}/metadata/{key} — set single key."""
+    import json as _nm_json
+
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage as _get_nm_storage
+
+    err = require_permission(request, "admin.settings.write")
+    if err:
+        return err
+    node_id = request.path_params["node_id"]
+    nv = _validate_node_id(node_id)
+    if nv:
+        return nv
+    key = request.path_params["key"]
+    if not key:
+        return JSONResponse({"error": "Empty key"}, status_code=400)
+    if len(key) > 128:
+        return JSONResponse({"error": "Key too long (max 128)"}, status_code=400)
+
+    storage = _get_nm_storage()
+    existing = storage.get_node_metadata(node_id)
+    for r in existing:
+        if r["key"] == key and r["source"] == "auto":
+            return JSONResponse(
+                {"error": f"Cannot overwrite auto-populated key: {key}"},
+                status_code=400,
+            )
+
+    body = await request.json()
+    if "value" not in body:
+        return JSONResponse({"error": "Missing value"}, status_code=400)
+    storage.set_node_metadata(node_id, key, _nm_json.dumps(body["value"]), source="user")
+    return JSONResponse({"ok": True})
+
+
+async def admin_delete_node_metadata_key(request: Request) -> JSONResponse:
+    """DELETE /v1/api/admin/nodes/{node_id}/metadata/{key} — delete single key."""
+    from turnstone.core.auth import require_permission
+    from turnstone.core.storage import get_storage as _get_nm_storage
+
+    err = require_permission(request, "admin.settings.write")
+    if err:
+        return err
+    node_id = request.path_params["node_id"]
+    nv = _validate_node_id(node_id)
+    if nv:
+        return nv
+    key = request.path_params["key"]
+    if not key:
+        return JSONResponse({"error": "Empty key"}, status_code=400)
+
+    storage = _get_nm_storage()
+    existing = storage.get_node_metadata(node_id)
+    for r in existing:
+        if r["key"] == key and r["source"] == "auto":
+            return JSONResponse(
+                {"error": f"Cannot delete auto-populated key: {key}"},
+                status_code=400,
+            )
+
+    deleted = storage.delete_node_metadata(node_id, key)
+    if not deleted:
+        return JSONResponse({"error": "Key not found"}, status_code=404)
+    return JSONResponse({"ok": True})
+
+
 async def admin_ring_status(request: Request) -> JSONResponse:
     """GET /v1/api/admin/ring/status — hash ring rebalancer status."""
     from turnstone.core.auth import require_permission
@@ -7448,6 +7626,23 @@ def create_app(
                         "/api/admin/skills/{skill_id}/rescan",
                         admin_rescan_skill,
                         methods=["POST"],
+                    ),
+                    # Node metadata
+                    Route(
+                        "/api/admin/nodes/{node_id}/metadata/{key}",
+                        admin_set_node_metadata_key,
+                        methods=["PUT"],
+                    ),
+                    Route(
+                        "/api/admin/nodes/{node_id}/metadata/{key}",
+                        admin_delete_node_metadata_key,
+                        methods=["DELETE"],
+                    ),
+                    Route("/api/admin/nodes/{node_id}/metadata", admin_get_node_metadata),
+                    Route(
+                        "/api/admin/nodes/{node_id}/metadata",
+                        admin_set_node_metadata,
+                        methods=["PUT"],
                     ),
                     # Hash ring
                     Route("/api/admin/ring/status", admin_ring_status),

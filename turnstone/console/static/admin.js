@@ -239,6 +239,7 @@ function switchAdminTab(tab) {
     "audit",
     "memories",
     "models",
+    "node-metadata",
     "settings",
     "tls",
     "mcp",
@@ -265,6 +266,7 @@ function switchAdminTab(tab) {
   }
   if (tab === "memories") loadAdminMemories();
   if (tab === "models") loadAdminModels();
+  if (tab === "node-metadata") loadAdminNodeMetadata();
   if (tab === "settings") loadSettings();
   if (tab === "tls") loadTlsCerts();
   if (tab === "mcp") loadAdminMcp();
@@ -5005,4 +5007,244 @@ function reloadModelNodes() {
       btn.disabled = false;
       btn.textContent = "Sync to Nodes";
     });
+}
+
+// ---------------------------------------------------------------------------
+// Node Metadata tab
+// ---------------------------------------------------------------------------
+
+var _nodeMetaCache = {};
+
+function loadAdminNodeMetadata() {
+  var container = document.getElementById("admin-node-metadata-content");
+  if (!container) return;
+  container.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
+
+  // Fetch nodes list first, then metadata for each
+  authFetch("/v1/api/cluster/nodes?limit=1000")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (data) {
+      var nodes = data.nodes || [];
+      if (!nodes.length) {
+        container.innerHTML =
+          '<div class="dashboard-empty">No nodes registered</div>';
+        return;
+      }
+      // Fetch metadata for all nodes in parallel
+      var promises = nodes.map(function (n) {
+        return authFetch(
+          "/v1/api/admin/nodes/" + encodeURIComponent(n.node_id) + "/metadata",
+        )
+          .then(function (r) {
+            return r.ok ? r.json() : { node_id: n.node_id, metadata: [] };
+          })
+          .catch(function () {
+            return { node_id: n.node_id, metadata: [] };
+          });
+      });
+      return Promise.all(promises);
+    })
+    .then(function (results) {
+      if (!results) return;
+      _nodeMetaCache = {};
+      results.forEach(function (r) {
+        _nodeMetaCache[r.node_id] = r.metadata || [];
+      });
+      _renderNodeMetadata();
+    })
+    .catch(function () {
+      container.innerHTML =
+        '<div class="dashboard-empty">Failed to load node metadata</div>';
+    });
+}
+
+function _renderNodeMetadata() {
+  var container = document.getElementById("admin-node-metadata-content");
+  if (!container) return;
+  var nodeIds = Object.keys(_nodeMetaCache).sort();
+  if (!nodeIds.length) {
+    container.innerHTML =
+      '<div class="dashboard-empty">No nodes registered</div>';
+    return;
+  }
+
+  var html = "";
+  nodeIds.forEach(function (nid) {
+    var meta = _nodeMetaCache[nid] || [];
+    html +=
+      '<div class="settings-section" data-section="nm-' +
+      escapeHtml(nid) +
+      '" data-collapsed>';
+    html +=
+      '<div class="settings-section-header" onclick="_toggleSettingsSection(this)" ';
+    html += 'onkeydown="_onSettingsHeaderKey(event,this)" ';
+    html += 'role="button" tabindex="0" aria-expanded="false" ';
+    html += 'aria-controls="nm-body-' + escapeHtml(nid) + '">';
+    html +=
+      "<span>" +
+      escapeHtml(nid) +
+      " <small>(" +
+      meta.length +
+      " keys)</small></span>";
+    html += "</div>";
+    html +=
+      '<div class="settings-section-body" id="nm-body-' +
+      escapeHtml(nid) +
+      '">';
+
+    // Table of metadata — all values passed through escapeHtml()
+    if (meta.length) {
+      html += '<table class="nm-table">';
+      html +=
+        '<caption class="sr-only">Metadata for node ' +
+        escapeHtml(nid) +
+        "</caption>";
+      html += '<thead><tr><th scope="col">Key</th>';
+      html += '<th scope="col">Value</th>';
+      html += '<th scope="col">Source</th>';
+      html +=
+        '<th scope="col"><span class="sr-only">Actions</span></th></tr></thead><tbody>';
+      meta.forEach(function (m) {
+        var valStr =
+          typeof m.value === "object"
+            ? JSON.stringify(m.value)
+            : String(m.value);
+        var isAuto = m.source === "auto";
+        html += "<tr>";
+        html += '<td class="nm-key">' + escapeHtml(m.key) + "</td>";
+        html +=
+          '<td class="nm-val" title="' +
+          escapeHtml(valStr) +
+          '">' +
+          escapeHtml(valStr) +
+          "</td>";
+        html +=
+          '<td><span class="nm-source-badge nm-source-' +
+          escapeHtml(m.source) +
+          '">' +
+          escapeHtml(m.source) +
+          "</span></td>";
+        html += "<td>";
+        if (!isAuto) {
+          html +=
+            '<button class="admin-btn-danger" aria-label="Delete ' +
+            escapeHtml(m.key) +
+            '" onclick="_deleteNodeMeta(\'' +
+            escapeHtml(nid) +
+            "','" +
+            escapeHtml(m.key) +
+            "')\">Del</button>";
+        }
+        html += "</td></tr>";
+      });
+      html += "</tbody></table>";
+    } else {
+      html +=
+        '<div class="dashboard-empty" style="padding:8px">No metadata</div>';
+    }
+
+    // Add metadata form
+    html += '<div class="nm-add-row">';
+    html +=
+      '<input id="nm-key-' +
+      escapeHtml(nid) +
+      '" type="text" placeholder="key" aria-label="Metadata key">';
+    html +=
+      '<input id="nm-val-' +
+      escapeHtml(nid) +
+      '" type="text" placeholder="value (JSON or string)" aria-label="Metadata value">';
+    html +=
+      '<button class="admin-btn-action" onclick="_addNodeMeta(\'' +
+      escapeHtml(nid) +
+      '\')" style="white-space:nowrap">Add</button>';
+    html += "</div>";
+
+    html += "</div></div>";
+  });
+  container.innerHTML = html;
+}
+
+function _addNodeMeta(nodeId) {
+  var keyEl = document.getElementById("nm-key-" + nodeId);
+  var valEl = document.getElementById("nm-val-" + nodeId);
+  if (!keyEl || !valEl) return;
+  var key = keyEl.value.trim();
+  var rawVal = valEl.value.trim();
+  if (!key) {
+    showToast("Key is required", "error");
+    return;
+  }
+
+  var value;
+  try {
+    value = JSON.parse(rawVal);
+  } catch (e) {
+    value = rawVal;
+  }
+
+  authFetch(
+    "/v1/api/admin/nodes/" +
+      encodeURIComponent(nodeId) +
+      "/metadata/" +
+      encodeURIComponent(key),
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value: value }),
+    },
+  )
+    .then(function (r) {
+      if (!r.ok)
+        return r
+          .json()
+          .catch(function () {
+            return {};
+          })
+          .then(function (d) {
+            throw new Error(d.error || "Failed");
+          });
+      showToast("Metadata set");
+      loadAdminNodeMetadata();
+    })
+    .catch(function (e) {
+      showToast(e.message, "error");
+    });
+}
+
+function _deleteNodeMeta(nodeId, key) {
+  showConfirmModal(
+    "Delete Metadata",
+    'Delete key "' + key + '" from node ' + nodeId + "?",
+    "Delete",
+    function () {
+      authFetch(
+        "/v1/api/admin/nodes/" +
+          encodeURIComponent(nodeId) +
+          "/metadata/" +
+          encodeURIComponent(key),
+        {
+          method: "DELETE",
+        },
+      )
+        .then(function (r) {
+          if (!r.ok)
+            return r
+              .json()
+              .catch(function () {
+                return {};
+              })
+              .then(function (d) {
+                throw new Error(d.error || "Failed");
+              });
+          showToast("Metadata deleted");
+          loadAdminNodeMetadata();
+        })
+        .catch(function (e) {
+          showToast(e.message, "error");
+        });
+    },
+  );
 }

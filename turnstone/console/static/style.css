@@ -2499,3 +2499,88 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
   .mcp-reg-card-repo { transition: none; }
   .mcp-sync-pending, .model-sync-pending { animation: none; }
 }
+
+/* Node metadata */
+.nm-source-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-size: .75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.nm-source-auto { background: var(--green-glow); color: var(--green); }
+.nm-source-user { background: var(--cyan-glow); color: var(--cyan); }
+.nm-source-config { background: var(--yellow-glow); color: var(--yellow); }
+
+.nm-table { width: 100%; border-collapse: collapse; }
+.nm-table th {
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
+  padding: 4px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.nm-table td {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--fg);
+  border-bottom: 1px solid var(--border);
+}
+.nm-key {
+  font-family: var(--font-mono);
+  color: var(--fg-bright);
+}
+.nm-val {
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nm-add-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+}
+.nm-add-row input[type="text"] {
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.nm-add-row input[type="text"]:first-of-type { width: 120px; }
+.nm-add-row input[type="text"]:nth-of-type(2) { flex: 1; }
+.nm-add-row input[type="text"]:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.nm-add-row input[type="text"]::placeholder {
+  color: var(--fg-dim);
+  opacity: 0.6;
+}
+.nm-add-row input[type="text"]:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+@media (max-width: 700px) {
+  .nm-add-row { flex-wrap: wrap; }
+  .nm-add-row input[type="text"] { width: 100% !important; flex: none; }
+  .nm-val { max-width: 150px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nm-add-row input[type="text"] { transition: none; }
+}

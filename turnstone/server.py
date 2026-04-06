@@ -2978,6 +2978,27 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         _svc_storage.register_service("server", _svc_node_id, _svc_url)
         log.info("server.service_registered", node_id=_svc_node_id, url=_svc_url)
 
+        # Collect and store node metadata (auto + config)
+        try:
+            from turnstone.core.config import load_config as _load_meta_config
+            from turnstone.core.node_info import collect_node_info
+
+            _auto_info = collect_node_info()
+            _meta_entries: list[tuple[str, str, str]] = [
+                (k, json.dumps(v), "auto") for k, v in _auto_info.items()
+            ]
+            _cfg_meta = _load_meta_config("metadata")
+            _meta_entries.extend((k, json.dumps(v), "config") for k, v in _cfg_meta.items())
+            if _meta_entries:
+                _svc_storage.set_node_metadata_bulk(_svc_node_id, _meta_entries)
+                log.info(
+                    "server.node_metadata_stored",
+                    node_id=_svc_node_id,
+                    count=len(_meta_entries),
+                )
+        except Exception:
+            log.warning("server.node_metadata_failed", node_id=_svc_node_id, exc_info=True)
+
         async def _heartbeat_loop() -> None:
             """Periodically update service heartbeat."""
             from turnstone.core.storage._registry import StorageUnavailableError
@@ -3001,7 +3022,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         from turnstone.core.storage import get_storage as _get_svc_dereg
 
         try:
-            await asyncio.to_thread(_get_svc_dereg().deregister_service, "server", _svc_node_id)
+            _dereg_storage = _get_svc_dereg()
+            await asyncio.to_thread(_dereg_storage.deregister_service, "server", _svc_node_id)
+            await asyncio.to_thread(
+                _dereg_storage.delete_node_metadata_by_source, _svc_node_id, "auto"
+            )
             log.info("server.service_deregistered", node_id=_svc_node_id)
         except Exception:
             log.exception("server.deregister_failed")

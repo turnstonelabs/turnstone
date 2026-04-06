@@ -234,6 +234,24 @@ services = sa.Table(
 sa.Index("idx_services_type_heartbeat", services.c.service_type, services.c.last_heartbeat)
 
 # ---------------------------------------------------------------------------
+# Node metadata (per-node key/value with source tracking)
+# ---------------------------------------------------------------------------
+
+node_metadata = sa.Table(
+    "node_metadata",
+    metadata,
+    sa.Column("node_id", sa.Text, nullable=False),
+    sa.Column("key", sa.Text, nullable=False),
+    sa.Column("value", sa.Text, nullable=False),
+    sa.Column("source", sa.Text, nullable=False, server_default="user"),
+    sa.Column("created", sa.Text, nullable=False),
+    sa.Column("updated", sa.Text, nullable=False),
+    sa.PrimaryKeyConstraint("node_id", "key"),
+)
+
+sa.Index("idx_node_metadata_key", node_metadata.c.key)
+
+# ---------------------------------------------------------------------------
 # Hash ring routing tables
 # ---------------------------------------------------------------------------
 

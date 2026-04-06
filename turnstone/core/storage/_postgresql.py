@@ -1337,6 +1337,120 @@ class PostgreSQLBackend:
             conn.commit()
             return result.rowcount > 0
 
+    # -- Node metadata ---------------------------------------------------------
+
+    def get_node_metadata(self, node_id: str) -> list[dict[str, Any]]:
+        from turnstone.core.storage._schema import node_metadata
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(node_metadata)
+                .where(node_metadata.c.node_id == node_id)
+                .order_by(node_metadata.c.key)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_all_node_metadata(self) -> dict[str, list[dict[str, Any]]]:
+        from turnstone.core.storage._schema import node_metadata
+
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(node_metadata).order_by(node_metadata.c.node_id, node_metadata.c.key)
+            ).fetchall()
+            result: dict[str, list[dict[str, Any]]] = {}
+            for r in rows:
+                d = dict(r._mapping)
+                result.setdefault(d["node_id"], []).append(d)
+            return result
+
+    def set_node_metadata(self, node_id: str, key: str, value: str, source: str = "user") -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from turnstone.core.storage._schema import node_metadata
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        stmt = pg_insert(node_metadata).values(
+            node_id=node_id,
+            key=key,
+            value=value,
+            source=source,
+            created=now,
+            updated=now,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[node_metadata.c.node_id, node_metadata.c.key],
+            set_={"value": value, "source": source, "updated": now},
+        )
+        with self._conn() as conn:
+            conn.execute(stmt)
+            conn.commit()
+
+    def set_node_metadata_bulk(self, node_id: str, entries: list[tuple[str, str, str]]) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        from turnstone.core.storage._schema import node_metadata
+
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            for key, value, source in entries:
+                stmt = pg_insert(node_metadata).values(
+                    node_id=node_id,
+                    key=key,
+                    value=value,
+                    source=source,
+                    created=now,
+                    updated=now,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[node_metadata.c.node_id, node_metadata.c.key],
+                    set_={"value": value, "source": source, "updated": now},
+                )
+                conn.execute(stmt)
+            conn.commit()
+
+    def delete_node_metadata(self, node_id: str, key: str) -> bool:
+        from turnstone.core.storage._schema import node_metadata
+
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(node_metadata).where(
+                    (node_metadata.c.node_id == node_id) & (node_metadata.c.key == key)
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def delete_node_metadata_by_source(self, node_id: str, source: str) -> int:
+        from turnstone.core.storage._schema import node_metadata
+
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(node_metadata).where(
+                    (node_metadata.c.node_id == node_id) & (node_metadata.c.source == source)
+                )
+            )
+            conn.commit()
+            return result.rowcount
+
+    def filter_nodes_by_metadata(self, filters: dict[str, str]) -> set[str]:
+        from turnstone.core.storage._schema import node_metadata
+
+        if not filters:
+            return set()
+        conditions = [
+            sa.and_(node_metadata.c.key == k, node_metadata.c.value == v)
+            for k, v in filters.items()
+        ]
+        stmt = (
+            sa.select(node_metadata.c.node_id)
+            .where(sa.or_(*conditions))
+            .group_by(node_metadata.c.node_id)
+            .having(sa.func.count() == len(filters))
+        )
+        with self._conn() as conn:
+            rows = conn.execute(stmt).fetchall()
+            return {r[0] for r in rows}
+
     # -- Hash ring routing -----------------------------------------------------
 
     def list_ring_buckets(self) -> list[dict[str, Any]]:

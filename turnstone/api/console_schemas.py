@@ -898,3 +898,28 @@ class RouteCreateResponse(BaseModel):
     ws_id: str = ""
     node_url: str = ""
     node_id: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Node metadata
+# ---------------------------------------------------------------------------
+
+
+class NodeMetadataEntry(BaseModel):
+    key: str
+    value: Any
+    source: str = "user"
+
+
+class NodeMetadataResponse(BaseModel):
+    node_id: str
+    metadata: list[NodeMetadataEntry] = Field(default_factory=list)
+
+
+class SetNodeMetadataRequest(BaseModel):
+    key: str
+    value: Any
+
+
+class BulkSetNodeMetadataRequest(BaseModel):
+    entries: list[SetNodeMetadataRequest] = Field(default_factory=list)

@@ -609,15 +609,22 @@ class ClusterCollector:
         }
 
     def get_nodes(
-        self, sort_by: str = "activity", limit: int | None = 100, offset: int = 0
+        self,
+        sort_by: str = "activity",
+        limit: int | None = 100,
+        offset: int = 0,
+        node_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Return sorted, paginated node list with per-node counts.
 
         Pass ``limit=None`` to return all nodes (no pagination).
+        Pass ``node_ids`` to restrict results to the given set.
         """
         with self._lock:
             items = []
             for node in self._nodes.values():
+                if node_ids is not None and node.node_id not in node_ids:
+                    continue
                 ws_states = {
                     "running": 0,
                     "thinking": 0,

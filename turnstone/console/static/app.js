@@ -967,6 +967,7 @@ function drillDownToNode(nodeId, serverUrl) {
       '<div class="dashboard-empty">Loading workstreams...</div>';
     loadNodeDetail(nodeId);
   }
+  _loadNodeMetadataPanel(nodeId);
   document.getElementById("breadcrumb-home").focus();
   if (!_navigatingFromPopstate)
     history.pushState(
@@ -1484,3 +1485,60 @@ function _ensureSSE() {
 history.replaceState({ view: "overview" }, "");
 initLogin();
 loadOverview();
+
+// --- Node Metadata Panel (read-only in node detail view) ---
+function _loadNodeMetadataPanel(nodeId) {
+  var section = document.getElementById("node-metadata-section");
+  var table = document.getElementById("node-metadata-table");
+  if (!section || !table) return;
+  section.style.display = "none";
+  table.textContent = "";
+  authFetch("/v1/api/admin/nodes/" + encodeURIComponent(nodeId) + "/metadata")
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (!data || !data.metadata || !data.metadata.length) return;
+      section.style.display = "";
+      var tbl = document.createElement("table");
+      tbl.className = "nm-table";
+      var thead = document.createElement("thead");
+      var hr = document.createElement("tr");
+      ["Key", "Value", "Source"].forEach(function (h) {
+        var th = document.createElement("th");
+        th.setAttribute("scope", "col");
+        th.textContent = h;
+        hr.appendChild(th);
+      });
+      thead.appendChild(hr);
+      tbl.appendChild(thead);
+      var tbody = document.createElement("tbody");
+      data.metadata.forEach(function (m) {
+        var tr = document.createElement("tr");
+        var tdKey = document.createElement("td");
+        tdKey.className = "nm-key";
+        tdKey.textContent = m.key;
+        tr.appendChild(tdKey);
+        var tdVal = document.createElement("td");
+        tdVal.className = "nm-val";
+        tdVal.textContent =
+          typeof m.value === "object"
+            ? JSON.stringify(m.value)
+            : String(m.value);
+        tdVal.title = tdVal.textContent;
+        tr.appendChild(tdVal);
+        var tdSrc = document.createElement("td");
+        var badge = document.createElement("span");
+        badge.className = "nm-source-badge nm-source-" + m.source;
+        badge.textContent = m.source;
+        tdSrc.appendChild(badge);
+        tr.appendChild(tdSrc);
+        tbody.appendChild(tr);
+      });
+      tbl.appendChild(tbody);
+      table.appendChild(tbl);
+    })
+    .catch(function () {
+      /* silent — metadata is supplementary */
+    });
+}

@@ -293,6 +293,74 @@ def _cmd_tls_list(args: argparse.Namespace) -> None:
         print(f"{c['domain']:<30s} {c['issued_at']:<22s} {c['expires_at']:<22s}")
 
 
+def _cmd_list_node_metadata(args: argparse.Namespace) -> None:
+    """List metadata for a node."""
+    import json
+
+    storage = _get_storage()
+    rows = storage.get_node_metadata(args.node_id)
+    if not rows:
+        print(f"No metadata for node: {args.node_id}")
+        return
+
+    print(f"{'KEY':<20s} {'VALUE':<40s} {'SOURCE':<8s} {'UPDATED':<20s}")
+    print("-" * 88)
+    for r in rows:
+        val = r["value"]
+        try:
+            parsed = json.loads(val)
+            val_str = json.dumps(parsed) if isinstance(parsed, (dict, list)) else str(parsed)
+        except (json.JSONDecodeError, TypeError):
+            val_str = val
+        if len(val_str) > 38:
+            val_str = val_str[:35] + "..."
+        key_str = r["key"]
+        if len(key_str) > 18:
+            key_str = key_str[:15] + "..."
+        print(f"{key_str:<20s} {val_str:<40s} {r['source']:<8s} {r['updated']:<20s}")
+
+
+def _cmd_set_node_metadata(args: argparse.Namespace) -> None:
+    """Set a metadata key on a node."""
+    import json
+
+    storage = _get_storage()
+
+    # Check for auto-source conflict
+    existing = storage.get_node_metadata(args.node_id)
+    for r in existing:
+        if r["key"] == args.key and r["source"] == "auto":
+            print(f"Error: cannot overwrite auto-populated key: {args.key}", file=sys.stderr)
+            sys.exit(1)
+
+    # Try JSON parse, fall back to string
+    try:
+        value = json.loads(args.value)
+    except (json.JSONDecodeError, TypeError):
+        value = args.value
+
+    storage.set_node_metadata(args.node_id, args.key, json.dumps(value), source="user")
+    print(f"Set {args.key}={json.dumps(value)} on {args.node_id}")
+
+
+def _cmd_delete_node_metadata(args: argparse.Namespace) -> None:
+    """Delete a metadata key from a node."""
+    storage = _get_storage()
+
+    existing = storage.get_node_metadata(args.node_id)
+    for r in existing:
+        if r["key"] == args.key and r["source"] == "auto":
+            print(f"Error: cannot delete auto-populated key: {args.key}", file=sys.stderr)
+            sys.exit(1)
+
+    deleted = storage.delete_node_metadata(args.node_id, args.key)
+    if deleted:
+        print(f"Deleted {args.key} from {args.node_id}")
+    else:
+        print(f"Key not found: {args.key} on {args.node_id}", file=sys.stderr)
+        sys.exit(1)
+
+
 def _discover_console_url() -> str:
     """Discover console URL from the services table."""
     from turnstone.core.storage import get_storage
@@ -378,6 +446,19 @@ def main() -> None:
     p_tlslist = sub.add_parser("tls-list", help="List issued certificates")
     p_tlslist.add_argument("--console-url", default="", help="Console URL")
 
+    # Node metadata commands
+    p_lnm = sub.add_parser("list-node-metadata", help="List metadata for a node")
+    p_lnm.add_argument("node_id", help="Node ID")
+
+    p_snm = sub.add_parser("set-node-metadata", help="Set a metadata key on a node")
+    p_snm.add_argument("node_id", help="Node ID")
+    p_snm.add_argument("key", help="Metadata key")
+    p_snm.add_argument("value", help="Value (JSON or plain string)")
+
+    p_dnm = sub.add_parser("delete-node-metadata", help="Delete a metadata key from a node")
+    p_dnm.add_argument("node_id", help="Node ID")
+    p_dnm.add_argument("key", help="Metadata key")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -393,5 +474,8 @@ def main() -> None:
         "tls-issue": _cmd_tls_issue,
         "tls-ca-cert": _cmd_tls_ca_cert,
         "tls-list": _cmd_tls_list,
+        "list-node-metadata": _cmd_list_node_metadata,
+        "set-node-metadata": _cmd_set_node_metadata,
+        "delete-node-metadata": _cmd_delete_node_metadata,
     }
     dispatch[args.command](args)

@@ -480,6 +480,36 @@ class StorageBackend(Protocol):
         """Remove a service registration. Returns True if existed."""
         ...
 
+    # -- Node metadata ---------------------------------------------------------
+
+    def get_node_metadata(self, node_id: str) -> list[dict[str, Any]]:
+        """Return all metadata rows for a node."""
+        ...
+
+    def get_all_node_metadata(self) -> dict[str, list[dict[str, Any]]]:
+        """Return metadata grouped by node_id for all nodes."""
+        ...
+
+    def set_node_metadata(self, node_id: str, key: str, value: str, source: str = "user") -> None:
+        """Upsert a single metadata key for a node."""
+        ...
+
+    def set_node_metadata_bulk(self, node_id: str, entries: list[tuple[str, str, str]]) -> None:
+        """Upsert multiple (key, value, source) entries for a node. Atomic."""
+        ...
+
+    def delete_node_metadata(self, node_id: str, key: str) -> bool:
+        """Delete a single metadata key. Returns True if existed."""
+        ...
+
+    def delete_node_metadata_by_source(self, node_id: str, source: str) -> int:
+        """Delete all metadata for a node with the given source. Returns count."""
+        ...
+
+    def filter_nodes_by_metadata(self, filters: dict[str, str]) -> set[str]:
+        """Return node_ids where ALL key=value filters match (exact match)."""
+        ...
+
     # -- Hash ring routing ---
 
     def list_ring_buckets(self) -> list[dict[str, Any]]:
