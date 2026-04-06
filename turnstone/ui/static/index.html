@@ -20,7 +20,7 @@
 <button id="refresh-title-btn" class="header-btn ws-action-btn" onclick="refreshWorkstreamTitle()" aria-label="Regenerate title" title="Regenerate title" style="display:none">&#x21bb;</button>
 <button id="edit-title-btn" class="header-btn ws-action-btn" onclick="editWorkstreamTitle()" aria-label="Edit title" title="Edit title" style="display:none">&#x270E;</button>
 <button id="fork-ws-btn" class="header-btn ws-action-btn" onclick="forkWorkstream()" aria-label="Fork workstream" title="Fork workstream" style="display:none">&#x2442;</button>
-<button id="delete-ws-btn" class="header-btn ws-action-btn ws-action-btn-danger" onclick="confirmDeleteWorkstream()" aria-label="Delete workstream" title="Delete workstream" style="display:none">&#x1f5d1;</button>
+<button id="delete-ws-btn" class="header-btn ws-action-btn ws-action-btn-danger" onclick="confirmDeleteWorkstream()" aria-label="Delete workstream" title="Delete workstream" style="display:none"><span aria-hidden="true">&#x1f5d1;</span></button>
   <span class="header-spacer"></span>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
 </div>
@@ -59,11 +59,11 @@
     <section class="dashboard-section" id="dashboard-saved-ws" aria-label="Saved workstreams">
       <div class="dashboard-section-header">
         <h2 class="dashboard-section-title">Saved Workstreams</h2>
-        <button id="ws-delete-btn" class="ws-delete-btn" onclick="startWsDeleteMode()" title="Delete workstreams">&#x1f5d1; Delete</button>
+        <button id="ws-delete-btn" class="ws-delete-btn" onclick="startWsDeleteMode()" title="Delete workstreams"><span aria-hidden="true">&#x1f5d1;</span> Delete</button>
       </div>
       <div class="dashboard-cards" id="dashboard-saved-cards"></div>
       <div id="ws-delete-bar" class="ws-delete-bar">
-        <span class="ws-delete-count-label" id="ws-delete-bar-count">0 selected</span>
+        <span class="ws-delete-count-label" id="ws-delete-bar-count" role="status" aria-live="polite" aria-atomic="true">0 selected</span>
         <button class="ws-delete-cancel-btn" onclick="cancelWsDeleteMode()">Cancel</button>
         <button class="ws-delete-cancel-btn" id="ws-delete-bar-select-all" onclick="toggleSelectAll()">Select All</button>
         <button class="ws-delete-bar-btn" id="ws-delete-bar-delete" onclick="confirmWsDeleteSelection()" disabled>Delete Selected</button>
@@ -84,7 +84,7 @@
     <label for="new-ws-model">Model <span class="nws-hint">optional</span></label>
     <select id="new-ws-model"><option value="">Default model</option></select>
     <label for="new-ws-judge-model">Judge Model <span class="nws-hint">optional</span></label>
-    <select id="new-ws-judge-model"><option value="">Default model</option></select>
+    <select id="new-ws-judge-model"><option value="">Default — use workstream's agent model</option></select>
     <label for="new-ws-skill">Skill <span class="nws-hint">optional</span></label>
     <select id="new-ws-skill"><option value="">Use defaults</option></select>
     <div id="new-ws-buttons">

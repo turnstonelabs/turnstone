@@ -434,6 +434,13 @@ def required_scope(method: str, path: str) -> str:
         and normalized.endswith("/cancel")
     ):
         return "write"
+    # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}
+    if (
+        method == "POST"
+        and normalized.startswith("/api/workstreams/")
+        and normalized.rsplit("/", 1)[-1] in {"delete", "open", "refresh-title", "title"}
+    ):
+        return "write"
     # Memory delete: /api/memories/{name}
     if method == "DELETE" and normalized.startswith("/api/memories/"):
         return "write"
@@ -445,6 +452,14 @@ def required_scope(method: str, path: str) -> str:
             if proxied in APPROVE_PATHS:
                 return "approve"
             if proxied in WRITE_PATHS:
+                return "write"
+            # Parametric workstream sub-resource mutations
+            if proxied.startswith("/api/workstreams/") and proxied.rsplit("/", 1)[-1] in {
+                "delete",
+                "open",
+                "refresh-title",
+                "title",
+            }:
                 return "write"
 
     return "read"

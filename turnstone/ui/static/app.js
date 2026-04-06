@@ -1320,7 +1320,7 @@ Pane.prototype.updateVerdictBadge = function (verdict) {
     var func = verdict.func_name || "";
     showToast(
       "Judge verdict for " + func + ": " + rec + " (" + conf + "%)",
-      rec === "approve" ? "success" : rec === "deny" ? "error" : "warning"
+      rec === "approve" ? "success" : rec === "deny" ? "error" : "warning",
     );
     return;
   }
@@ -1385,7 +1385,10 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
     var recEl = badges[i].querySelector(".verdict-rec");
     if (recEl) {
       var r = recEl.textContent;
-      if (r === "deny") { worst = "deny"; break; }
+      if (r === "deny") {
+        worst = "deny";
+        break;
+      }
       if (r === "review" && worst !== "deny") worst = "review";
     }
   }
@@ -1395,8 +1398,7 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
     "verdict-glow-deny",
     "verdict-glow-review",
   );
-  if (worst === "approve")
-    prompt.classList.add("verdict-glow-approve");
+  if (worst === "approve") prompt.classList.add("verdict-glow-approve");
   else if (worst === "deny") prompt.classList.add("verdict-glow-deny");
   else prompt.classList.add("verdict-glow-review");
 };
@@ -2249,7 +2251,7 @@ window.onThemeChange = function (next) {
   // Persist theme to server settings so it propagates to other clients
   var themeValue = next === "light" ? "light" : "dark";
   authFetch("/v1/api/admin/settings/interface.theme", {
-    method: "POST",
+    method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value: themeValue }),
   }).catch(function () {});
@@ -2320,6 +2322,10 @@ function renderTabBar() {
     close.className = "tab-close";
     close.innerHTML = "&times;";
     close.title = "Close workstream";
+    close.setAttribute(
+      "aria-label",
+      "Close " + (ws.name || wsId.substring(0, 6)),
+    );
     close.onclick = function (e) {
       e.stopPropagation();
       closeWorkstream(wsId);
@@ -2462,21 +2468,21 @@ function showNewWsModal(forkFromWsId) {
 
   // Populate model dropdown
   var modelSelect = document.getElementById("new-ws-model");
-  var judgeSelect = document.getElementById("new-ws-judge-model"); // NEW
+  var judgeSelect = document.getElementById("new-ws-judge-model");
   var fp = getFocusedPane();
   var curModel = fp ? fp.modelAlias || fp.model || "" : "";
   modelSelect.textContent = "";
-  judgeSelect.textContent = ""; // NEW
+  judgeSelect.textContent = "";
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";
   defaultOpt.textContent = curModel
     ? "Default (" + curModel + ")"
     : "Default model";
   modelSelect.appendChild(defaultOpt);
-  var defJudgeOpt = document.createElement("option"); // NEW
-  defJudgeOpt.value = ""; // NEW
-  defJudgeOpt.textContent = "Default Judge"; // NEW
-  judgeSelect.appendChild(defJudgeOpt); // NEW
+  var defJudgeOpt = document.createElement("option");
+  defJudgeOpt.value = "";
+  defJudgeOpt.textContent = "Default \u2014 use workstream's agent model";
+  judgeSelect.appendChild(defJudgeOpt);
   authFetch("/v1/api/models")
     .then(function (r) {
       return r.json();
@@ -2488,11 +2494,11 @@ function showNewWsModal(forkFromWsId) {
         opt.textContent =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         modelSelect.appendChild(opt);
-        
-        var judgeOpt = document.createElement("option"); // NEW
-        judgeOpt.value = m.alias; // NEW
-        judgeOpt.textContent = opt.textContent; // NEW
-        judgeSelect.appendChild(judgeOpt); // NEW
+
+        var judgeOpt = document.createElement("option");
+        judgeOpt.value = m.alias;
+        judgeOpt.textContent = opt.textContent;
+        judgeSelect.appendChild(judgeOpt);
       });
     })
     .catch(function () {
@@ -2526,7 +2532,7 @@ function showNewWsModal(forkFromWsId) {
   errEl.textContent = "";
   var submitBtn = document.getElementById("new-ws-submit");
   submitBtn.disabled = false;
-  submitBtn.textContent = "Create";
+  submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
 
   document.getElementById("new-ws-cancel").onclick = hideNewWsModal;
   submitBtn.onclick = submitNewWs;
@@ -2626,7 +2632,9 @@ function submitNewWs() {
       }
     })
     .catch(function () {
-      errEl.textContent = _forkFromWsId ? "Failed to fork workstream" : "Failed to create workstream";
+      errEl.textContent = _forkFromWsId
+        ? "Failed to fork workstream"
+        : "Failed to create workstream";
       errEl.style.display = "block";
       submitBtn.disabled = false;
       submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
@@ -2644,7 +2652,11 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
 
   // Determine target ws based on close_tab_action setting
   var action = "last_used";
-  try { action = localStorage.getItem("turnstone_interface.close_tab_action") || "last_used"; } catch (_) {}
+  try {
+    action =
+      localStorage.getItem("turnstone_interface.close_tab_action") ||
+      "last_used";
+  } catch (_) {}
 
   if (action === "dashboard" && remaining.length > 0) {
     // Show dashboard, but still need to reassign panes to valid ws
@@ -2671,7 +2683,11 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
   // Determine preferred target ws_id
   var preferredWsId = null;
   if (action === "last_used") {
-    if (_lastActiveWsId && _lastActiveWsId !== closedWsId && workstreams[_lastActiveWsId]) {
+    if (
+      _lastActiveWsId &&
+      _lastActiveWsId !== closedWsId &&
+      workstreams[_lastActiveWsId]
+    ) {
       preferredWsId = _lastActiveWsId;
     }
   } else if (action === "nearest_left" || action === "nearest_right") {
@@ -2680,21 +2696,33 @@ function _reassignPanesForClosedWs(closedWsId, tabIdsBeforeClose) {
       if (action === "nearest_left") {
         // Walk left, then right
         for (var li = idx - 1; li >= 0; li--) {
-          if (workstreams[tabIdsBeforeClose[li]]) { preferredWsId = tabIdsBeforeClose[li]; break; }
+          if (workstreams[tabIdsBeforeClose[li]]) {
+            preferredWsId = tabIdsBeforeClose[li];
+            break;
+          }
         }
         if (!preferredWsId) {
           for (var ri = idx + 1; ri < tabIdsBeforeClose.length; ri++) {
-            if (workstreams[tabIdsBeforeClose[ri]]) { preferredWsId = tabIdsBeforeClose[ri]; break; }
+            if (workstreams[tabIdsBeforeClose[ri]]) {
+              preferredWsId = tabIdsBeforeClose[ri];
+              break;
+            }
           }
         }
       } else {
         // Walk right, then left
         for (var ri2 = idx + 1; ri2 < tabIdsBeforeClose.length; ri2++) {
-          if (workstreams[tabIdsBeforeClose[ri2]]) { preferredWsId = tabIdsBeforeClose[ri2]; break; }
+          if (workstreams[tabIdsBeforeClose[ri2]]) {
+            preferredWsId = tabIdsBeforeClose[ri2];
+            break;
+          }
         }
         if (!preferredWsId) {
           for (var li2 = idx - 1; li2 >= 0; li2--) {
-            if (workstreams[tabIdsBeforeClose[li2]]) { preferredWsId = tabIdsBeforeClose[li2]; break; }
+            if (workstreams[tabIdsBeforeClose[li2]]) {
+              preferredWsId = tabIdsBeforeClose[li2];
+              break;
+            }
           }
         }
       }
@@ -2781,6 +2809,8 @@ function closeWorkstream(wsId) {
           showDashboard();
         }
         updateWsActionButtons();
+      } else if (data.error) {
+        showToast(data.error, "warning");
       }
     });
 }
@@ -2867,8 +2897,8 @@ function renderDashboardTable(wsList, agg) {
   wsList.forEach(function (ws) {
     var liveState =
       (workstreams[ws.id] && workstreams[ws.id].state) || ws.state || "idle";
-    var liveName = ws.name ||
-      (workstreams[ws.id] && workstreams[ws.id].name) || ws.id;
+    var liveName =
+      (workstreams[ws.id] && workstreams[ws.id].name) || ws.name || ws.id;
     var sd = STATE_DISPLAY[liveState] || STATE_DISPLAY.idle;
 
     var row = document.createElement("div");
@@ -3001,10 +3031,14 @@ function renderSavedWorkstreams(items) {
   }
   items.forEach(function (sess) {
     var card = document.createElement("div");
-    card.className = "dashboard-card" + (_wsDeleteMode ? " ws-delete-mode" : "");
+    card.className =
+      "dashboard-card" + (_wsDeleteMode ? " ws-delete-mode" : "");
     card.dataset.wsId = sess.ws_id;
     var label = sess.alias || sess.title || sess.ws_id;
-    card.setAttribute("aria-label", _wsDeleteMode ? "Select: " + label : "Resume: " + label);
+    card.setAttribute(
+      "aria-label",
+      _wsDeleteMode ? "Select: " + label : "Resume: " + label,
+    );
 
     if (_wsDeleteMode) {
       var chk = document.createElement("input");
@@ -3038,7 +3072,8 @@ function renderSavedWorkstreams(items) {
       };
     }
 
-    var title = sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
+    var title =
+      sess.alias || sess.title || sess.name || sess.ws_id.substring(0, 12);
     var meta = sess.message_count + " msgs";
     if (sess.updated) meta += " \u00b7 " + formatRelativeTime(sess.updated);
     var inner = document.createElement("div");
@@ -3048,7 +3083,9 @@ function renderSavedWorkstreams(items) {
       "</div>" +
       '<div class="card-meta">' +
       escapeHtml(meta) +
-      ' <span class="card-wsid">' + escapeHtml(sess.ws_id.substring(0, 7)) + '</span>' +
+      ' <span class="card-wsid">' +
+      escapeHtml(sess.ws_id.substring(0, 7)) +
+      "</span>" +
       "</div>";
     while (inner.firstChild) card.appendChild(inner.firstChild);
 
@@ -3093,21 +3130,28 @@ function updateWsDeleteBar() {
   if (delBtn) delBtn.disabled = count === 0;
   var selBtn = document.getElementById("ws-delete-bar-select-all");
   if (selBtn) {
-    var allSelected = count === _wsSavedItems.length && _wsSavedItems.length > 0;
+    var allSelected =
+      count === _wsSavedItems.length && _wsSavedItems.length > 0;
     selBtn.textContent = allSelected ? "Deselect All" : "Select All";
   }
 }
 
 function toggleSelectAll() {
-  var allSelected = Object.keys(_wsDeleteSelected).length === _wsSavedItems.length && _wsSavedItems.length > 0;
+  var allSelected =
+    Object.keys(_wsDeleteSelected).length === _wsSavedItems.length &&
+    _wsSavedItems.length > 0;
   if (allSelected) {
     _wsDeleteSelected = {};
   } else {
-    _wsSavedItems.forEach(function (s) { _wsDeleteSelected[s.ws_id] = true; });
+    _wsSavedItems.forEach(function (s) {
+      _wsDeleteSelected[s.ws_id] = true;
+    });
   }
   renderSavedWorkstreams(_wsSavedItems);
   updateWsDeleteBar();
 }
+
+var _wsDeleteBatchTrap = null;
 
 function confirmWsDeleteSelection() {
   var selected = Object.keys(_wsDeleteSelected);
@@ -3120,21 +3164,63 @@ function confirmWsDeleteSelection() {
   var listEl = document.getElementById("ws-delete-list");
   var errorEl = document.getElementById("ws-delete-error");
   errorEl.textContent = "";
-  countEl.textContent = selected.length + " workstream(s) will be permanently deleted:";
+  countEl.textContent =
+    selected.length + " workstream(s) will be permanently deleted:";
   listEl.innerHTML = "";
   selected.forEach(function (wsId) {
-    var item = _wsSavedItems.find(function (s) { return s.ws_id === wsId; });
-    var name = item ? (item.alias || item.title || wsId) : wsId;
+    var item = _wsSavedItems.find(function (s) {
+      return s.ws_id === wsId;
+    });
+    var name = item ? item.alias || item.title || wsId : wsId;
     var div = document.createElement("div");
     div.className = "ws-delete-item";
     div.textContent = name;
     listEl.appendChild(div);
   });
+  // Reset confirm button handler (may have been overwritten to "Close" by previous run)
+  var delBtn = document.getElementById("ws-delete-confirm-btn");
+  if (delBtn) {
+    delBtn.textContent = "Delete";
+    delBtn.disabled = false;
+    delBtn.onclick = confirmWsDelete;
+  }
+  var cancelBtn = document.getElementById("ws-delete-cancel-btn");
+  if (cancelBtn) cancelBtn.disabled = false;
   overlay.style.display = "flex";
+
+  // Focus trap + Escape
+  if (_wsDeleteBatchTrap)
+    document.removeEventListener("keydown", _wsDeleteBatchTrap);
+  _wsDeleteBatchTrap = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelWsDelete();
+      return;
+    }
+    if (e.key === "Tab") {
+      var box = document.getElementById("ws-delete-box");
+      var focusable = box.querySelectorAll("button:not(:disabled)");
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _wsDeleteBatchTrap);
+  if (cancelBtn) cancelBtn.focus();
 }
 
 function cancelWsDelete() {
   document.getElementById("ws-delete-overlay").style.display = "none";
+  if (_wsDeleteBatchTrap) {
+    document.removeEventListener("keydown", _wsDeleteBatchTrap);
+    _wsDeleteBatchTrap = null;
+  }
 }
 
 function confirmWsDelete() {
@@ -3149,14 +3235,19 @@ function confirmWsDelete() {
   errorEl.textContent = "";
 
   // Disable buttons during deletion
-  if (delBtn) { delBtn.disabled = true; delBtn.textContent = "Deleting..."; }
+  if (delBtn) {
+    delBtn.disabled = true;
+    delBtn.textContent = "Deleting...";
+  }
   if (cancelBtn) cancelBtn.disabled = true;
 
   var results = [];
   var promises = selected.map(function (wsId) {
     var shortId = wsId.substring(0, 8);
-    var item = _wsSavedItems.find(function (s) { return s.ws_id === wsId; });
-    var name = item ? (item.alias || item.title || wsId) : wsId;
+    var item = _wsSavedItems.find(function (s) {
+      return s.ws_id === wsId;
+    });
+    var name = item ? item.alias || item.title || wsId : wsId;
     var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/delete";
 
     return authFetch(url, { method: "POST" })
@@ -3174,15 +3265,27 @@ function confirmWsDelete() {
             try {
               var j = JSON.parse(body);
               if (j.error) errMsg = shortId + ": " + j.error;
-            } catch (_) { /* fall through */ }
+            } catch (_) {
+              /* fall through */
+            }
           } else if (body) {
             errMsg = shortId + ": " + body.substring(0, 200);
           }
-          results.push({ name: name, shortId: shortId, ok: false, error: errMsg });
+          results.push({
+            name: name,
+            shortId: shortId,
+            ok: false,
+            error: errMsg,
+          });
         });
       })
       .catch(function (err) {
-        results.push({ name: name, shortId: shortId, ok: false, error: shortId + ": " + err.message });
+        results.push({
+          name: name,
+          shortId: shortId,
+          ok: false,
+          error: shortId + ": " + err.message,
+        });
       });
   });
 
@@ -3192,15 +3295,30 @@ function confirmWsDelete() {
     results.forEach(function (r) {
       var div = document.createElement("div");
       div.className = "ws-delete-item" + (r.ok ? "" : " ws-delete-error");
-      div.textContent = (r.ok ? "\u2713 " : "\u2717 ") + r.name + (r.error ? " — " + r.error : "");
+      div.textContent =
+        (r.ok ? "\u2713 " : "\u2717 ") +
+        r.name +
+        (r.error ? " — " + r.error : "");
       listEl.appendChild(div);
     });
 
-    var okCount = results.filter(function (r) { return r.ok; }).length;
-    var failCount = results.filter(function (r) { return !r.ok; }).length;
+    var okCount = results.filter(function (r) {
+      return r.ok;
+    }).length;
+    var failCount = results.filter(function (r) {
+      return !r.ok;
+    }).length;
     countEl.textContent = okCount + " deleted, " + failCount + " failed";
 
-    if (delBtn) { delBtn.disabled = false; delBtn.textContent = "Close"; delBtn.onclick = function () { cancelWsDelete(); cancelWsDeleteMode(); loadDashboard(); }; }
+    if (delBtn) {
+      delBtn.disabled = false;
+      delBtn.textContent = "Close";
+      delBtn.onclick = function () {
+        cancelWsDelete();
+        cancelWsDeleteMode();
+        loadDashboard();
+      };
+    }
     if (cancelBtn) cancelBtn.disabled = false;
   });
 }
@@ -3215,11 +3333,13 @@ function refreshWorkstreamTitle() {
 
   _setTitleState(wsId, "refreshing");
 
-  var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/refresh-title";
+  var url =
+    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/refresh-title";
 
   authFetch(url, { method: "POST" })
     .then(function (r) {
-      if (!r.ok) throw new Error("Failed to refresh title (HTTP " + r.status + ")");
+      if (!r.ok)
+        throw new Error("Failed to refresh title (HTTP " + r.status + ")");
       return r.json();
     })
     .then(function (data) {
@@ -3252,7 +3372,10 @@ function _applyTitleButtonState() {
   } else if (state === "error") {
     btn.innerHTML = "&#x2717;";
     btn.disabled = false;
-    btn.onclick = function () { _setTitleState(wsId, "idle"); refreshWorkstreamTitle(); };
+    btn.onclick = function () {
+      _setTitleState(wsId, "idle");
+      refreshWorkstreamTitle();
+    };
     return;
   } else {
     btn.innerHTML = "&#x21bb;";
@@ -3261,22 +3384,63 @@ function _applyTitleButtonState() {
   }
 }
 
+var _editTitleTrap = null;
+
 function editWorkstreamTitle() {
   var wsId = getCurrentWsId();
   if (!wsId) return;
   var currentTitle = "";
-  var tabEl = document.querySelector('.ws-tab[data-ws-id="' + wsId + '"] .tab-name');
+  var tabEl = document.querySelector(
+    '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
+  );
   if (tabEl) currentTitle = tabEl.textContent.trim();
 
   var overlay = document.getElementById("edit-title-overlay");
   var input = document.getElementById("edit-title-input");
   input.value = currentTitle;
   overlay.style.display = "flex";
-  setTimeout(function () { input.focus(); input.select(); }, 50);
+  overlay.onclick = function (e) {
+    if (e.target === overlay) cancelEditTitle();
+  };
+
+  // Focus trap + Escape
+  if (_editTitleTrap) document.removeEventListener("keydown", _editTitleTrap);
+  _editTitleTrap = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEditTitle();
+      return;
+    }
+    if (e.key === "Tab") {
+      var box = document.getElementById("edit-title-box");
+      var focusable = box.querySelectorAll("input, button");
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _editTitleTrap);
+
+  setTimeout(function () {
+    input.focus();
+    input.select();
+  }, 50);
 }
 
 function cancelEditTitle() {
   document.getElementById("edit-title-overlay").style.display = "none";
+  if (_editTitleTrap) {
+    document.removeEventListener("keydown", _editTitleTrap);
+    _editTitleTrap = null;
+  }
+  var btn = document.getElementById("edit-title-btn");
+  if (btn) btn.focus();
 }
 
 function submitEditTitle() {
@@ -3284,14 +3448,17 @@ function submitEditTitle() {
   if (!wsId) return;
   var input = document.getElementById("edit-title-input");
   var newTitle = input.value.trim();
-  if (!newTitle) { showToast("Title cannot be empty", "warning"); return; }
+  if (!newTitle) {
+    showToast("Title cannot be empty", "warning");
+    return;
+  }
 
   var url = "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/title";
 
   authFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ title: newTitle })
+    body: JSON.stringify({ title: newTitle }),
   })
     .then(function (r) {
       if (!r.ok) throw new Error("Failed to set title (HTTP " + r.status + ")");
@@ -3299,6 +3466,14 @@ function submitEditTitle() {
     })
     .then(function (data) {
       cancelEditTitle();
+      // Optimistic update — SSE ws_rename will confirm
+      var nameEls = document.querySelectorAll(
+        '[data-ws-id="' + wsId + '"] .tab-name',
+      );
+      nameEls.forEach(function (el) {
+        el.textContent = newTitle;
+      });
+      if (workstreams[wsId]) workstreams[wsId].name = newTitle;
       showToast("Title updated", "success");
     })
     .catch(function (err) {
@@ -3309,23 +3484,64 @@ function submitEditTitle() {
 // --- Workstream deletion ---
 
 var _pendingDeleteWsId = null;
+var _deleteWsTrap = null;
 
 function confirmDeleteWorkstream() {
   var wsId = getCurrentWsId();
   if (!wsId) return;
-  var tabEl = document.querySelector('.ws-tab[data-ws-id="' + wsId + '"] .tab-name');
+  var tabEl = document.querySelector(
+    '.ws-tab[data-ws-id="' + wsId + '"] .tab-name',
+  );
   var name = tabEl ? tabEl.textContent.trim() : wsId.substring(0, 12);
 
   _pendingDeleteWsId = wsId;
   var overlay = document.getElementById("delete-ws-overlay");
   var msg = document.getElementById("delete-ws-message");
-  msg.textContent = "Delete \"" + name + "\"? This cannot be undone.";
+  msg.textContent = 'Delete "' + name + '"? This cannot be undone.';
   overlay.style.display = "flex";
+
+  // Focus trap + Escape
+  if (_deleteWsTrap) document.removeEventListener("keydown", _deleteWsTrap);
+  _deleteWsTrap = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelDeleteWs();
+      return;
+    }
+    if (e.key === "Tab") {
+      var box = document.getElementById("delete-ws-box");
+      var focusable = box.querySelectorAll("button");
+      var first = focusable[0];
+      var last = focusable[focusable.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+  document.addEventListener("keydown", _deleteWsTrap);
+
+  var cancelBtn = overlay.querySelector("button");
+  if (cancelBtn) cancelBtn.focus();
 }
 
 function cancelDeleteWs() {
   _pendingDeleteWsId = null;
   document.getElementById("delete-ws-overlay").style.display = "none";
+  if (_deleteWsTrap) {
+    document.removeEventListener("keydown", _deleteWsTrap);
+    _deleteWsTrap = null;
+  }
+  var btn = document.getElementById("delete-ws-btn");
+  if (btn && btn.offsetParent !== null) {
+    btn.focus();
+  } else {
+    var fallback = document.getElementById("new-tab-btn");
+    if (fallback) fallback.focus();
+  }
 }
 
 function executeDeleteWs() {
@@ -3337,11 +3553,21 @@ function executeDeleteWs() {
 
   authFetch(url, { method: "POST" })
     .then(function (r) {
-      if (!r.ok) throw new Error("Failed to delete workstream (HTTP " + r.status + ")");
+      if (!r.ok)
+        throw new Error("Failed to delete workstream (HTTP " + r.status + ")");
       return r.json();
     })
     .then(function () {
-      closeWorkstream(wsId);
+      // Update local state directly — don't call closeWorkstream which
+      // would send a redundant POST to /close for an already-deleted ws.
+      delete workstreams[wsId];
+      renderTabBar();
+      _reassignPanesForClosedWs(wsId, []);
+      if (!Object.keys(workstreams).length) {
+        loadDashboard();
+        showDashboard();
+      }
+      updateWsActionButtons();
       showToast("Workstream deleted", "success");
     })
     .catch(function (err) {
@@ -3357,7 +3583,12 @@ function getCurrentWsId() {
 
 function updateWsActionButtons() {
   var hasActiveWs = !!getCurrentWsId();
-  var ids = ["refresh-title-btn", "edit-title-btn", "fork-ws-btn", "delete-ws-btn"];
+  var ids = [
+    "refresh-title-btn",
+    "edit-title-btn",
+    "fork-ws-btn",
+    "delete-ws-btn",
+  ];
   ids.forEach(function (id) {
     var el = document.getElementById(id);
     if (el) el.style.display = hasActiveWs ? "" : "none";
@@ -3524,15 +3755,15 @@ function connectGlobalSSE() {
       workstreams[data.ws_id].name = data.name || data.ws_id.slice(0, 6);
       workstreams[data.ws_id].state = "idle";
       renderTabBar();
-} else if (data.type === "ws_closed") {
-  var wsId = data.ws_id;
-  // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
-  var sseTabIds = Array.from(
-    document.querySelectorAll("#tab-list .ws-tab"),
-  ).map(function (tab) {
-    return tab.dataset.wsId;
-  });
-  // Disconnect per-ws SSE on affected panes immediately so stale
+    } else if (data.type === "ws_closed") {
+      var wsId = data.ws_id;
+      // Capture tab order from DOM (visual order) before deletion for close_tab_action=nearest_left/right
+      var sseTabIds = Array.from(
+        document.querySelectorAll("#tab-list .ws-tab"),
+      ).map(function (tab) {
+        return tab.dataset.wsId;
+      });
+      // Disconnect per-ws SSE on affected panes immediately so stale
       // events from the dying workstream don't leak into reassigned panes.
       for (var cid in panes) {
         if (panes[cid].wsId === wsId) panes[cid].disconnectSSE();
@@ -4485,13 +4716,17 @@ initWorkstreams();
 
 function loadInterfaceSettings() {
   authFetch("/v1/api/admin/settings")
-    .then(function (r) { return r.json(); })
+    .then(function (r) {
+      return r.json();
+    })
     .then(function (data) {
       var settings = data.settings || [];
       for (var i = 0; i < settings.length; i++) {
         var s = settings[i];
         if (s.key && s.key.indexOf("interface.") === 0) {
-          try { localStorage.setItem("turnstone_" + s.key, s.value); } catch (_) {}
+          try {
+            localStorage.setItem("turnstone_" + s.key, s.value);
+          } catch (_) {}
         }
       }
       var theme = localStorage.getItem("turnstone_interface.theme");
@@ -4500,11 +4735,13 @@ function loadInterfaceSettings() {
         var effectiveTheme = theme === "light" ? "light" : "";
         if (effectiveTheme !== currentTheme) {
           document.documentElement.dataset.theme = effectiveTheme;
-          localStorage.setItem("turnstone-theme", theme);
           var btn = document.getElementById("theme-toggle");
           if (btn) {
-            btn.innerHTML = theme === "light" ? "&#9728;" : "&#9790;";
-            btn.title = theme === "light" ? "Switch to dark theme" : "Switch to light theme";
+            btn.textContent = theme === "light" ? "\u2600" : "\u263E";
+            btn.title =
+              theme === "light"
+                ? "Switch to dark theme"
+                : "Switch to light theme";
           }
           reRenderAllMermaid();
         }

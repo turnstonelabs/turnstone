@@ -31,7 +31,10 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
     except (ValueError, json.JSONDecodeError):
         return _JSONResponse({"error": "Invalid JSON body"}, status_code=400)
     except Exception:
-        return _JSONResponse({"error": "Failed to read request body"}, status_code=400)
+        import structlog
+
+        structlog.get_logger(__name__).warning("read_json_or_400.unexpected", exc_info=True)
+        return _JSONResponse({"error": "Failed to read request body"}, status_code=500)
 
 
 def require_storage_or_503(

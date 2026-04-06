@@ -506,7 +506,8 @@ class ClusterCollector:
                     {
                         "type": "ws_created",
                         "ws_id": ws_id,
-                        "name": data.get("name", ""),
+                        "name": data.get("title", "") or data.get("name", ""),
+                        "title": data.get("title", ""),
                         "node_id": node_id,
                     }
                 )

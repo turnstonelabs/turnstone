@@ -2468,6 +2468,8 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 .model-provider-badge{display:inline-block;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;padding:1px 6px;border-radius:2px;background:var(--bg-highlight);border:1px solid var(--border)}
 .model-provider-openai{color:var(--blue);border-color:rgba(56,189,248,.2)}
 .model-provider-anthropic{color:var(--magenta);border-color:rgba(192,132,252,.25)}
+.model-provider-google{color:var(--green);border-color:rgba(52,211,153,.2)}
+.model-provider-compat{color:var(--fg-dim);border-color:var(--border-strong)}
 
 /* Model source badge */
 .scope-db{color:var(--blue);border-color:rgba(56,189,248,.2)}

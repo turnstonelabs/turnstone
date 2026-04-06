@@ -197,6 +197,35 @@ class TestRequiredScope:
         """Only POST is elevated — GET falls through to read."""
         assert required_scope("GET", "/api/_internal/mcp-reload") == "read"
 
+    # Workstream sub-resource mutations (parametric paths)
+    def test_ws_delete_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc123/delete") == "write"
+
+    def test_ws_open_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc123/open") == "write"
+
+    def test_ws_refresh_title_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc123/refresh-title") == "write"
+
+    def test_ws_title_needs_write(self):
+        assert required_scope("POST", "/api/workstreams/abc123/title") == "write"
+
+    def test_v1_ws_delete_needs_write(self):
+        assert required_scope("POST", "/v1/api/workstreams/abc123/delete") == "write"
+
+    def test_proxy_ws_delete_needs_write(self):
+        assert required_scope("POST", "/node/n1/v1/api/workstreams/abc123/delete") == "write"
+
+    def test_proxy_ws_open_needs_write(self):
+        assert required_scope("POST", "/node/n1/v1/api/workstreams/abc123/open") == "write"
+
+    def test_proxy_ws_title_needs_write(self):
+        assert required_scope("POST", "/node/n1/v1/api/workstreams/abc123/title") == "write"
+
+    def test_ws_get_is_still_read(self):
+        """GET on workstream sub-resource is not elevated."""
+        assert required_scope("GET", "/api/workstreams/abc123/delete") == "read"
+
 
 # ---------------------------------------------------------------------------
 # TestExtractBearer

@@ -10,21 +10,35 @@ window.onLogout = function () {
 };
 window.onThemeChange = function (next) {
   var btn = document.getElementById("theme-toggle");
-  if (btn) btn.textContent = next === "light" ? "\u2600" : "\u263E";
+  if (btn) {
+    var isLight = next === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
+      "aria-label",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
+    );
+  }
   // Persist to server so admin settings and node UIs see the change
   var themeValue = next === "light" ? "light" : "dark";
   authFetch("/v1/api/admin/settings/interface.theme", {
-    method: "POST",
+    method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ value: themeValue }),
   }).catch(function () {});
 };
-// Set initial theme button text
+// Set initial theme button text and aria
 (function () {
   var btn = document.getElementById("theme-toggle");
-  if (btn)
-    btn.textContent =
-      document.documentElement.dataset.theme === "light" ? "\u2600" : "\u263E";
+  if (btn) {
+    var isLight = document.documentElement.dataset.theme === "light";
+    btn.textContent = isLight ? "\u2600" : "\u263E";
+    btn.title = isLight ? "Switch to dark theme" : "Switch to light theme";
+    btn.setAttribute(
+      "aria-label",
+      isLight ? "Switch to dark theme" : "Switch to light theme",
+    );
+  }
 })();
 
 // --- State ---
@@ -1291,15 +1305,15 @@ function showNewWsModal() {
   var judgeSelect = document.getElementById("new-ws-judge");
   modelSelect.textContent = "";
   judgeSelect.textContent = "";
-  
+
   var defaultOpt = document.createElement("option");
   defaultOpt.value = "";
   defaultOpt.textContent = "Default model";
   modelSelect.appendChild(defaultOpt);
-  
+
   var defaultJudgeOpt = document.createElement("option");
   defaultJudgeOpt.value = "";
-  defaultJudgeOpt.textContent = "Default (same as agent)";
+  defaultJudgeOpt.textContent = "Default \u2014 use workstream's agent model";
   judgeSelect.appendChild(defaultJudgeOpt);
 
   authFetch("/v1/api/models")
@@ -1313,7 +1327,7 @@ function showNewWsModal() {
         opt.textContent =
           m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
         modelSelect.appendChild(opt);
-        
+
         var jOpt = document.createElement("option");
         jOpt.value = m.alias;
         jOpt.textContent = opt.textContent;
@@ -1345,6 +1359,11 @@ function showNewWsModal() {
   if (_newWsTrapHandler)
     document.removeEventListener("keydown", _newWsTrapHandler);
   _newWsTrapHandler = function (e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      hideNewWsModal();
+      return;
+    }
     if (e.key === "Tab") {
       var box = document.getElementById("new-ws-box");
       var focusable = box.querySelectorAll("select, input, textarea, button");

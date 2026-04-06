@@ -1074,6 +1074,72 @@ class TestProviderFactory:
         p2 = create_provider("openai")
         assert p1 is p2
 
+    # -- Google provider -------------------------------------------------------
+
+    def test_create_provider_google(self) -> None:
+        from turnstone.core.providers import create_provider
+        from turnstone.core.providers._google import GoogleProvider
+
+        provider = create_provider("google")
+        assert isinstance(provider, GoogleProvider)
+        assert provider.provider_name == "google"
+
+    def test_create_provider_google_singleton(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        p1 = create_provider("google")
+        p2 = create_provider("google")
+        assert p1 is p2
+
+    @patch("openai.OpenAI")
+    def test_create_client_google_default_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+        from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("google", base_url="", api_key="test-key")
+        mock_openai_cls.assert_called_once_with(
+            base_url=GOOGLE_DEFAULT_BASE_URL, api_key="test-key"
+        )
+
+    @patch("openai.OpenAI")
+    def test_create_client_google_custom_base_url(self, mock_openai_cls: MagicMock) -> None:
+        from turnstone.core.providers import create_client
+
+        mock_openai_cls.return_value = MagicMock()
+        create_client("google", base_url="http://custom:8080/v1", api_key="k")
+        mock_openai_cls.assert_called_once_with(base_url="http://custom:8080/v1", api_key="k")
+
+    def test_google_capabilities_defaults(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("google")
+        caps = provider.get_capabilities("gemini-2.5-pro")
+        assert caps.context_window == 2_000_000
+        assert caps.max_output_tokens == 65_536
+        assert caps.token_param == "max_tokens"
+        assert caps.supports_temperature is True
+        assert caps.supports_vision is True
+
+    def test_google_capabilities_same_for_all_models(self) -> None:
+        from turnstone.core.providers import create_provider
+
+        provider = create_provider("google")
+        c1 = provider.get_capabilities("gemini-2.5-pro")
+        c2 = provider.get_capabilities("gemini-2.0-flash")
+        c3 = provider.get_capabilities("")
+        assert c1 is c2 is c3
+
+    def test_list_known_models_google_empty(self) -> None:
+        from turnstone.core.providers import list_known_models
+
+        assert list_known_models("google") == []
+
+    def test_lookup_model_capabilities_google_returns_none(self) -> None:
+        from turnstone.core.providers import lookup_model_capabilities
+
+        assert lookup_model_capabilities("google", "gemini-2.5-pro") is None
+
 
 # ===========================================================================
 # TestDataclasses

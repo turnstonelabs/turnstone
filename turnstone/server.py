@@ -224,7 +224,8 @@ class WebUI:
 
     def approve_tools(self, items: list[dict[str, Any]]) -> tuple[bool, str | None]:
         self._last_verdict_decision = ""  # reset for new approval cycle
-        self._llm_verdicts.clear()  # clear stale verdicts from prior cycle
+        with self._ws_lock:
+            self._llm_verdicts.clear()  # clear stale verdicts from prior cycle
         pending = [it for it in items if it.get("needs_approval") and not it.get("error")]
 
         # Always send tool info to the browser
@@ -526,11 +527,12 @@ class WebUI:
         # Cache for replay on SSE reconnect (tab switching)
         call_id = verdict.get("call_id", "")
         if call_id:
-            # Evict oldest entry if cache is full (defensive cap of 50)
-            if len(self._llm_verdicts) >= 50 and call_id not in self._llm_verdicts:
-                oldest_key = next(iter(self._llm_verdicts))
-                del self._llm_verdicts[oldest_key]
-            self._llm_verdicts[call_id] = verdict
+            with self._ws_lock:
+                # Evict oldest entry if cache is full (defensive cap of 50)
+                if len(self._llm_verdicts) >= 50 and call_id not in self._llm_verdicts:
+                    oldest_key = next(iter(self._llm_verdicts))
+                    del self._llm_verdicts[oldest_key]
+                self._llm_verdicts[call_id] = verdict
         self._enqueue({"type": "intent_verdict", **verdict})
         # Persist the LLM verdict (fire-and-forget)
         try:
@@ -928,7 +930,9 @@ async def events_sse(request: Request) -> Response:
         if ui._pending_approval is not None:
             yield {"data": json.dumps(ui._pending_approval)}
             # Replay any LLM verdicts received since the approval was sent
-            for v in ui._llm_verdicts.values():
+            with ui._ws_lock:
+                cached_verdicts = list(ui._llm_verdicts.values())
+            for v in cached_verdicts:
                 yield {"data": json.dumps({"type": "intent_verdict", **v})}
         if ui._pending_plan_review is not None:
             yield {"data": json.dumps(ui._pending_plan_review)}
@@ -1081,6 +1085,7 @@ async def global_events_sse(request: Request) -> Response:
 async def list_workstreams(request: Request) -> JSONResponse:
     """GET /v1/api/workstreams — list all workstreams."""
     from turnstone.core.memory import get_workstream_display_name
+
     mgr: WorkstreamManager = request.app.state.workstreams
     result = []
     for ws in mgr.list_all():
@@ -1948,9 +1953,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 # Broadcast a rename so the tab picks up the correct fork name
                 # (the ws_created event fired before fork with the pre-fork name).
                 with contextlib.suppress(queue.Full):
-                    gq.put_nowait(
-                        {"type": "ws_rename", "ws_id": ws.id, "name": ws.name}
-                    )
+                    gq.put_nowait({"type": "ws_rename", "ws_id": ws.id, "name": ws.name})
 
         # Apply skill session config (only for new workstreams with a skill)
         if skill_data and not resumed and ws.session:
@@ -2065,12 +2068,18 @@ async def close_workstream(request: Request) -> JSONResponse:
         return body
     ws_id = str(body.get("ws_id", ""))
     mgr = request.app.state.workstreams
+    # Distinguish "last workstream" (400) from "not found" (404).
+    # Note: get() and close() acquire the manager lock independently, so a
+    # concurrent close between the two could produce a wrong error code.
+    # The failure mode is cosmetic (400 instead of 404), not data corruption.
+    if not mgr.get(ws_id):
+        return JSONResponse({"error": "Workstream not found"}, status_code=404)
     if mgr.close(ws_id):
         gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
         with contextlib.suppress(queue.Full):
             gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
         return JSONResponse({"status": "ok"})
-    return JSONResponse({"error": "Workstream not found"}, status_code=404)
+    return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
 
 
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
@@ -2091,7 +2100,7 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
     except Exception as e:
         log.exception("ws.delete.error", ws_id=ws_id[:8], error=str(e))
-        return JSONResponse({"error": f"Delete failed: {e!s}"}, status_code=500)
+        return JSONResponse({"error": "Delete failed"}, status_code=500)
 
 
 async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONResponse:
@@ -2113,14 +2122,8 @@ async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONRes
         return JSONResponse({"error": "Workstream not found or not active"}, status_code=404)
     # Fetch current title so the LLM can generate something different
     current_title = get_workstream_display_name(ws_id) or ""
-    log.info("ws.title.refresh_reset_flag", ws_id=ws_id[:8], current_title=current_title[:50])
-    ws.session._title_generated = False
-    threading.Thread(
-        target=ws.session._generate_title,
-        args=(current_title,),
-        daemon=True,
-    ).start()
-    log.info("ws.title.refresh_triggered", ws_id=ws_id[:8])
+    log.info("ws.title.refresh_triggered", ws_id=ws_id[:8], current_title=current_title[:50])
+    ws.session.request_title_refresh(current_title)
     return JSONResponse({"status": "ok"})
 
 
@@ -2184,11 +2187,13 @@ async def open_workstream(request: Request) -> JSONResponse:
     mgr: WorkstreamManager = request.app.state.workstreams
 
     if mgr.get(resolved_id):
-        return JSONResponse({
-            "ws_id": resolved_id,
-            "name": get_workstream_display_name(resolved_id) or resolved_id,
-            "already_loaded": True,
-        })
+        return JSONResponse(
+            {
+                "ws_id": resolved_id,
+                "name": get_workstream_display_name(resolved_id) or resolved_id,
+                "already_loaded": True,
+            }
+        )
 
     _st = _get_storage()
     ws_row = _st.get_workstream_metadata(resolved_id)
@@ -2212,14 +2217,13 @@ async def open_workstream(request: Request) -> JSONResponse:
         msg = f"Expected WebUI, got {type(ws.ui).__name__}"
         raise TypeError(msg)
 
-    if ws.session is not None:
-        if ws.session.resume(resolved_id):
-            ws.name = get_workstream_display_name(resolved_id) or ws.name
-            ui = ws.ui
-            ui._enqueue({"type": "clear_ui"})
-            history = _build_history(ws.session)
-            if history:
-                ui._enqueue({"type": "history", "messages": history})
+    if ws.session is not None and ws.session.resume(resolved_id):
+        ws.name = get_workstream_display_name(resolved_id) or ws.name
+        ui = ws.ui
+        ui._enqueue({"type": "clear_ui"})
+        history = _build_history(ws.session)
+        if history:
+            ui._enqueue({"type": "history", "messages": history})
 
     gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
     with contextlib.suppress(queue.Full):
@@ -2534,14 +2538,16 @@ def list_interface_settings(request: Request) -> JSONResponse:
         if not key.startswith("interface."):
             continue
         value = cs.get(key) if cs else defn.default
-        settings.append({
-            "key": key,
-            "value": value,
-            "source": "storage" if cs and key in cs._cache else "default",
-            "type": defn.type,
-            "description": defn.description,
-            "section": defn.section,
-        })
+        settings.append(
+            {
+                "key": key,
+                "value": value,
+                "source": "storage" if cs and key in cs.stored_keys() else "default",
+                "type": defn.type,
+                "description": defn.description,
+                "section": defn.section,
+            }
+        )
     return JSONResponse({"settings": settings})
 
 
@@ -3076,9 +3082,17 @@ def create_app(
                     Route("/api/workstreams/saved", list_saved_workstreams),
                     Route("/api/workstreams/new", create_workstream, methods=["POST"]),
                     Route("/api/workstreams/close", close_workstream, methods=["POST"]),
-                    Route("/api/workstreams/{ws_id}/delete", delete_workstream_endpoint, methods=["POST"]),
+                    Route(
+                        "/api/workstreams/{ws_id}/delete",
+                        delete_workstream_endpoint,
+                        methods=["POST"],
+                    ),
                     Route("/api/workstreams/{ws_id}/open", open_workstream, methods=["POST"]),
-                    Route("/api/workstreams/{ws_id}/refresh-title", refresh_workstream_title, methods=["POST"]),
+                    Route(
+                        "/api/workstreams/{ws_id}/refresh-title",
+                        refresh_workstream_title,
+                        methods=["POST"],
+                    ),
                     Route("/api/workstreams/{ws_id}/title", set_workstream_title, methods=["POST"]),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
@@ -3101,7 +3115,11 @@ def create_app(
                     Route("/api/auth/oidc/authorize", oidc_authorize),
                     Route("/api/auth/oidc/callback", oidc_callback),
                     Route("/api/admin/settings", list_interface_settings),
-                    Route("/api/admin/settings/{key:path}", update_interface_setting, methods=["POST"]),
+                    Route(
+                        "/api/admin/settings/{key:path}",
+                        update_interface_setting,
+                        methods=["POST", "PUT"],
+                    ),
                     Route("/api/_internal/config-reload", config_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-reload", internal_mcp_reload, methods=["POST"]),
                     Route("/api/_internal/mcp-status", internal_mcp_status),

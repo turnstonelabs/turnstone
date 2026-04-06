@@ -53,6 +53,9 @@
 @media (max-width: 600px) {
   .ws-tab .tab-close { opacity: 1; padding: 4px 6px; font-size: 16px; }
   #split-btn { display: none; }
+  #refresh-title-btn { display: none; }
+  .ws-action-btn { padding: 4px 6px; margin: 0 1px; font-size: 13px; }
+  .tab-wsid { display: none; }
 }
 
 /* ==========================================================================
@@ -126,11 +129,14 @@
 .tab-wsid {
   font-size: 9px;
   color: var(--fg-dim);
-  opacity: 0.45;
+  opacity: 0;
   margin-left: 4px;
   font-family: 'IBM Plex Mono', monospace;
   letter-spacing: 0.02em;
+  transition: opacity 0.15s;
 }
+.ws-tab:hover .tab-wsid,
+.ws-tab.active .tab-wsid { opacity: 0.45; }
 
 /* Subtle ws_id badge in saved workstream cards */
 .card-wsid {
@@ -214,7 +220,7 @@
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  background: var(--bg-input);
+  background: var(--bg);
   color: var(--fg-bright);
   font-size: 14px;
   font-family: inherit;
@@ -1438,7 +1444,10 @@ audio.media-player {
 }
 .dashboard-card.ws-selected {
   border-color: var(--red);
-  background: rgba(255, 60, 60, 0.06);
+  background: rgba(248, 113, 113, 0.08);
+}
+[data-theme="light"] .dashboard-card.ws-selected {
+  background: rgba(220, 38, 38, 0.08);
 }
 .ws-delete-bar {
   display: none;
@@ -1462,7 +1471,9 @@ audio.media-player {
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
+  transition: filter 0.15s;
 }
+.ws-delete-bar .ws-delete-bar-btn:hover:not(:disabled) { filter: brightness(1.1); }
 .ws-delete-bar .ws-delete-bar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .ws-delete-bar .ws-delete-cancel-btn {
   background: transparent;
@@ -1472,6 +1483,11 @@ audio.media-player {
   padding: 6px 12px;
   font-size: 12px;
   cursor: pointer;
+}
+.ws-delete-bar .ws-delete-cancel-btn:hover {
+  color: var(--fg-bright);
+  border-color: var(--border-strong);
+  background: var(--bg-highlight);
 }
 
 /* Delete modal */

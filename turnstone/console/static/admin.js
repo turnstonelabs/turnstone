@@ -403,8 +403,8 @@ function confirmDeleteUser(userId, username) {
   showConfirmModal(
     "Delete User",
     "Delete user \u2018" +
-    username +
-    "\u2019 and all their tokens and channel links? This cannot be undone.",
+      username +
+      "\u2019 and all their tokens and channel links? This cannot be undone.",
     "Delete",
     function () {
       authFetch("/v1/api/admin/users/" + encodeURIComponent(userId), {
@@ -570,19 +570,19 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
   showConfirmModal(
     "Unlink OIDC Identity",
     "Unlink " +
-    shortIssuer +
-    " identity \u2018" +
-    shortSubject +
-    "\u2019 from user " +
-    username +
-    "?\n\nThe user will need to log in via OIDC again to re-link.",
+      shortIssuer +
+      " identity \u2018" +
+      shortSubject +
+      "\u2019 from user " +
+      username +
+      "?\n\nThe user will need to log in via OIDC again to re-link.",
     "Unlink",
     function () {
       authFetch(
         "/v1/api/admin/oidc-identities?issuer=" +
-        encodeURIComponent(issuer) +
-        "&subject=" +
-        encodeURIComponent(subject),
+          encodeURIComponent(issuer) +
+          "&subject=" +
+          encodeURIComponent(subject),
         { method: "DELETE" },
       )
         .then(function (r) {
@@ -608,8 +608,8 @@ function _confirmUnlinkOidc(issuer, subject, username, userId) {
                   '<span class="oidc-detail-empty">Loading\u2026</span>';
               authFetch(
                 "/v1/api/admin/users/" +
-                encodeURIComponent(userId) +
-                "/oidc-identities",
+                  encodeURIComponent(userId) +
+                  "/oidc-identities",
               )
                 .then(function (r2) {
                   if (!r2.ok) throw new Error("Failed");
@@ -878,17 +878,17 @@ function confirmUnlinkChannel(channelType, channelUserId) {
   showConfirmModal(
     "Unlink Channel",
     "Unlink " +
-    channelType +
-    " account \u2018" +
-    channelUserId +
-    "\u2019? The user will need to re-link via /link to interact with the bot.",
+      channelType +
+      " account \u2018" +
+      channelUserId +
+      "\u2019? The user will need to re-link via /link to interact with the bot.",
     "Unlink",
     function () {
       authFetch(
         "/v1/api/admin/channels/" +
-        encodeURIComponent(channelType) +
-        "/" +
-        encodeURIComponent(channelUserId),
+          encodeURIComponent(channelType) +
+          "/" +
+          encodeURIComponent(channelUserId),
         { method: "DELETE" },
       )
         .then(function (r) {
@@ -1059,8 +1059,8 @@ function confirmDeleteSchedule(taskId, name) {
   showConfirmModal(
     "Delete Schedule",
     "Delete schedule \u2018" +
-    name +
-    "\u2019 and its run history? This cannot be undone.",
+      name +
+      "\u2019 and its run history? This cannot be undone.",
     "Delete",
     function () {
       authFetch("/v1/api/admin/schedules/" + encodeURIComponent(taskId), {
@@ -1671,12 +1671,12 @@ function _renderWatches(watches) {
     var statusDot = active ? "\u25cf " : "\u25cb ";
     var cancelBtn = active
       ? '<button class="admin-btn-danger" data-cancel-watch="' +
-      escapeHtml(w.watch_id) +
-      '" data-watch-node="' +
-      escapeHtml(w.node_id || "") +
-      '" data-watch-name="' +
-      escapeHtml(name) +
-      '" title="Cancel watch">cancel</button>'
+        escapeHtml(w.watch_id) +
+        '" data-watch-node="' +
+        escapeHtml(w.node_id || "") +
+        '" data-watch-name="' +
+        escapeHtml(name) +
+        '" title="Cancel watch">cancel</button>'
       : "";
     html +=
       '<div class="admin-row" role="listitem">' +
@@ -1797,8 +1797,8 @@ function submitCreateChannel() {
 
   authFetch(
     "/v1/api/admin/users/" +
-    encodeURIComponent(_adminChannelUserId) +
-    "/channels",
+      encodeURIComponent(_adminChannelUserId) +
+      "/channels",
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3045,19 +3045,26 @@ function _saveSettingValue(key) {
         "Saved " + key + (restartBadge ? " \u2014 restart required" : ""),
       );
 
-      // If this is a theme setting, apply it immediately
+      // If this is a theme setting, apply it immediately.  Don't call
+      // onThemeChange — it would fire a redundant PUT since the settings
+      // save above already persisted the value.
       if (key === "interface.theme") {
-        var newTheme = value;
-        document.documentElement.dataset.theme =
-          newTheme === "light" ? "light" : "";
+        var isLight = value === "light";
+        document.documentElement.dataset.theme = isLight ? "light" : "";
         localStorage.setItem(
-          "turnstone-theme",
-          newTheme === "light" ? "light" : "dark",
+          "turnstone_interface.theme",
+          isLight ? "light" : "dark",
         );
         var themeBtn = document.getElementById("theme-toggle");
         if (themeBtn) {
-          themeBtn.textContent =
-            newTheme === "light" ? "\u2600" : "\u263E";
+          themeBtn.textContent = isLight ? "\u2600" : "\u263E";
+          themeBtn.title = isLight
+            ? "Switch to dark theme"
+            : "Switch to light theme";
+          themeBtn.setAttribute(
+            "aria-label",
+            isLight ? "Switch to dark theme" : "Switch to light theme",
+          );
         }
       }
     })
@@ -3074,8 +3081,8 @@ function _resetSetting(key) {
   showConfirmModal(
     "Reset Setting",
     "Reset \u2018" +
-    key +
-    "\u2019 to its default value? The stored override will be removed.",
+      key +
+      "\u2019 to its default value? The stored override will be removed.",
     "Reset",
     function () {
       authFetch("/v1/api/admin/settings/" + encodeURIComponent(key), {
@@ -3218,13 +3225,13 @@ function _renderMcpServers(items) {
     var actions = isConfig
       ? ""
       : '<button class="admin-btn-action" data-mcp-edit="' +
-      escapeHtml(s.server_id) +
-      '">edit</button>' +
-      '<button class="admin-btn-danger" data-mcp-delete="' +
-      escapeHtml(s.server_id) +
-      '" data-mcp-name="' +
-      escapeHtml(s.name) +
-      '">del</button>';
+        escapeHtml(s.server_id) +
+        '">edit</button>' +
+        '<button class="admin-btn-danger" data-mcp-delete="' +
+        escapeHtml(s.server_id) +
+        '" data-mcp-name="' +
+        escapeHtml(s.name) +
+        '">del</button>';
 
     html +=
       '<div class="admin-row mcp-grid ' +
@@ -3420,11 +3427,11 @@ function _parseMcpForm() {
     var argsText = document.getElementById("mcp-args").value.trim();
     payload.args = argsText
       ? argsText
-        .split("\n")
-        .map(function (l) {
-          return l.trim();
-        })
-        .filter(Boolean)
+          .split("\n")
+          .map(function (l) {
+            return l.trim();
+          })
+          .filter(Boolean)
       : [];
     var envText = document.getElementById("mcp-env").value.trim();
     var envObj = {};
@@ -3576,7 +3583,7 @@ function _openMcpDetail(s) {
           '<p style="font-size:12px;color:var(--fg-dim)">Args: <code>' +
           escapeHtml(a.join(" ")) +
           "</code></p>";
-    } catch (e) { }
+    } catch (e) {}
   } else {
     html +=
       '<p style="font-size:12px;color:var(--fg-dim)">URL: <code>' +
@@ -3615,7 +3622,7 @@ function _openMcpDetail(s) {
           escapeHtml(meta.website_url) +
           "</a></p>";
       }
-    } catch (e) { }
+    } catch (e) {}
     html += "</div>";
   }
   html += "</div>";
@@ -3907,8 +3914,8 @@ function _renderRegistryResults() {
       "</div>" +
       (srv.description
         ? '<div class="mcp-reg-card-desc">' +
-        escapeHtml(srv.description) +
-        "</div>"
+          escapeHtml(srv.description) +
+          "</div>"
         : "") +
       '<div class="mcp-reg-card-meta">' +
       sourceBadges +
@@ -3916,8 +3923,8 @@ function _renderRegistryResults() {
       '<div class="mcp-reg-card-actions">' +
       (srv.version
         ? '<span class="mcp-reg-card-version">v' +
-        escapeHtml(srv.version) +
-        "</span>"
+          escapeHtml(srv.version) +
+          "</span>"
         : "") +
       actionHtml +
       "</div></div>";
@@ -3940,9 +3947,9 @@ function _renderRegistryResults() {
     moreBtn.style.display = "";
     countEl.textContent = isFiltered
       ? visibleCount +
-      " of " +
-      _registryResults.length +
-      " loaded (more available)"
+        " of " +
+        _registryResults.length +
+        " loaded (more available)"
       : "Showing " + visibleCount + " results";
   } else {
     pagEl.style.display = visibleCount > 0 ? "" : "none";
@@ -4020,8 +4027,8 @@ function _showInstallMcpModal(srv, hasRemote, hasPackage) {
     "</div>" +
     (srv.description
       ? '<div class="mcp-install-summary-desc">' +
-      escapeHtml(srv.description) +
-      "</div>"
+        escapeHtml(srv.description) +
+        "</div>"
       : "");
 
   // Source selector (only if both remote AND package)
@@ -4341,7 +4348,7 @@ function _pollInstallStatus(serverId, serverName, attempt) {
           _pollInstallStatus(serverId, serverName, attempt + 1);
         }
       })
-      .catch(function () { });
+      .catch(function () {});
   }, 3000);
 }
 
@@ -4408,7 +4415,11 @@ function _renderModels(items) {
     var providerCls =
       m.provider === "anthropic"
         ? "model-provider-anthropic"
-        : "model-provider-openai";
+        : m.provider === "google"
+          ? "model-provider-google"
+          : m.provider === "openai-compatible"
+            ? "model-provider-compat"
+            : "model-provider-openai";
 
     // Build row via DOM
     var row = document.createElement("div");
@@ -4856,9 +4867,9 @@ function _onModelFieldChange() {
     if (!modelName) return;
     authFetch(
       "/v1/api/admin/model-capabilities?provider=" +
-      encodeURIComponent(provider) +
-      "&model=" +
-      encodeURIComponent(modelName),
+        encodeURIComponent(provider) +
+        "&model=" +
+        encodeURIComponent(modelName),
     )
       .then(function (r) {
         return r.json();
@@ -4889,12 +4900,26 @@ function _onModelFieldChange() {
       });
   }, 500);
 }
-/* Provider-specific placeholder hints for base_url and model ID fields. */
+/* Provider-specific placeholder hints for base_url and model ID fields.
+   Keep URLs in sync with _PROVIDER_DEFAULT_URLS in console/server.py
+   and GOOGLE_DEFAULT_BASE_URL in core/providers/_google.py. */
 var _providerDefaults = {
-  openai: { urlPlaceholder: "https://api.openai.com/v1", modelPlaceholder: "gpt-5" },
-  anthropic: { urlPlaceholder: "https://api.anthropic.com", modelPlaceholder: "claude-" },
-  google: { urlPlaceholder: "https://generativelanguage.googleapis.com/v1beta/openai/", modelPlaceholder: "gemini-" },
-  "openai-compatible": { urlPlaceholder: "e.g. https://your-provider.com/v1", modelPlaceholder: "GLM5" },
+  openai: {
+    urlPlaceholder: "https://api.openai.com/v1",
+    modelPlaceholder: "gpt-5",
+  },
+  anthropic: {
+    urlPlaceholder: "https://api.anthropic.com",
+    modelPlaceholder: "claude-",
+  },
+  google: {
+    urlPlaceholder: "https://generativelanguage.googleapis.com/v1beta/openai/",
+    modelPlaceholder: "gemini-",
+  },
+  "openai-compatible": {
+    urlPlaceholder: "e.g. https://your-provider.com/v1",
+    modelPlaceholder: "GLM5",
+  },
 };
 
 /* Update placeholders when provider changes. */
@@ -4914,7 +4939,7 @@ function _refreshModelSuggestions() {
   var provider = document.getElementById("model-provider").value;
   authFetch(
     "/v1/api/admin/model-capabilities/known?provider=" +
-    encodeURIComponent(provider),
+      encodeURIComponent(provider),
   )
     .then(function (r) {
       return r.json();

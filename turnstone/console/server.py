@@ -130,9 +130,10 @@ _JS_PROXY_SHIM = """\
 
 _CONSOLE_BANNER_TEMPLATE = (
     '<div class="console-banner">'
-    '<a href="/" class="console-banner-link">&larr; Console</a>'
+    '<a href="/" class="console-banner-link" aria-label="Return to console">&larr; Console</a>'
     '<span class="console-banner-sep">\u2502</span>'
-    '<a href="NODE_LINK_PLACEHOLDER" class="console-banner-node">'
+    '<a href="NODE_LINK_PLACEHOLDER" class="console-banner-node"'
+    ' aria-label="Node: NODE_ID_PLACEHOLDER">'
     "NODE_ID_PLACEHOLDER</a>"
     "</div>"
 )
@@ -144,8 +145,8 @@ _CONSOLE_PROXY_STYLE = (
     ".dashboard-overlay{top:32px!important}"
     ".console-banner{background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);"
     "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
-    "display:flex;align-items:center;gap:12px;position:relative;z-index:9999}"
-    ".console-banner-link,.console-banner-node{color:#8a93ad;text-decoration:none}"
+    "display:flex;align-items:center;gap:12px;position:relative;z-index:200}"
+    ".console-banner-link,.console-banner-node{color:#9aa0b8;text-decoration:none}"
     ".console-banner-link{font-weight:500;padding:2px 0}"
     ".console-banner-node{font-size:11px}"
     ".console-banner-sep{color:#3b4463}"
@@ -156,7 +157,7 @@ _CONSOLE_PROXY_STYLE = (
     ':root[data-theme="light"] .console-banner-node{color:#64748b}'
     ':root[data-theme="light"] .console-banner-sep{color:#cbd5e1}'
     ':root[data-theme="light"] .console-banner-link:hover,'
-    ':root[data-theme="light"] .console-banner-node:hover{color:#e5a042}'
+    ':root[data-theme="light"] .console-banner-node:hover{color:#8c5e1b}'
     "</style>"
 )
 
@@ -939,7 +940,9 @@ async def proxy_index(request: Request) -> Response:
         page = page.replace('href="/shared/', f'href="{prefix}/shared/')
         page = page.replace('src="/shared/', f'src="{prefix}/shared/')
         # Inject console-return banner + proxy shim after <body>
-        banner = _CONSOLE_BANNER_TEMPLATE.replace("NODE_ID_PLACEHOLDER", html.escape(node_id)).replace("NODE_LINK_PLACEHOLDER", html.escape(prefix + "/"))
+        banner = _CONSOLE_BANNER_TEMPLATE.replace(
+            "NODE_ID_PLACEHOLDER", html.escape(node_id)
+        ).replace("NODE_LINK_PLACEHOLDER", html.escape(prefix + "/"))
         shim = (
             "<script>"
             + _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
@@ -1020,7 +1023,7 @@ async def proxy_api(request: Request) -> Response:
     if request.method == "GET" and path in ("events", "events/global"):
         return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
 
-    if request.method == "POST":
+    if request.method in ("POST", "PUT"):
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
     return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
@@ -1057,7 +1060,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
 async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
-    """Forward a POST request to the target server."""
+    """Forward a POST/PUT request to the target server."""
     client: httpx.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
@@ -1065,16 +1068,21 @@ async def _proxy_post(
     if request.url.query:
         target += f"?{request.url.query}"
     try:
-        post_headers = {"Content-Type": content_type}
-        post_headers.update(_proxy_auth_headers(request))
-        resp = await client.post(target, content=body, headers=post_headers)
+        headers = {"Content-Type": content_type}
+        headers.update(_proxy_auth_headers(request))
+        resp = await client.request(
+            request.method,
+            target,
+            content=body,
+            headers=headers,
+        )
         return Response(
             content=resp.content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
         )
     except httpx.HTTPError as exc:
-        log.debug("Proxy POST error for %s/%s: %s", api_prefix, path, exc)
+        log.debug("Proxy %s error for %s/%s: %s", request.method, api_prefix, path, exc)
         return JSONResponse({"error": "Node unreachable"}, status_code=502)
 
 
@@ -5173,6 +5181,7 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
 _MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible", "google"})
+# Keep in sync with turnstone.core.providers._google.GOOGLE_DEFAULT_BASE_URL
 _PROVIDER_DEFAULT_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
     "anthropic": "https://api.anthropic.com",
@@ -5630,6 +5639,7 @@ async def admin_detect_model(request: Request) -> JSONResponse:
         or _hostname.endswith(".openai.com")
         or _hostname == "api.anthropic.com"
         or _hostname.endswith(".anthropic.com")
+        or _hostname.endswith(".googleapis.com")
     ):
         return JSONResponse({"error": "api_key is required"}, status_code=400)
 

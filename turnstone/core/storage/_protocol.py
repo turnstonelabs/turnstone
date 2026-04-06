@@ -75,6 +75,10 @@ class StorageBackend(Protocol):
         """Return the alias (or title) for a workstream, or None if unset."""
         ...
 
+    def get_workstream_metadata(self, ws_id: str) -> dict[str, Any] | None:
+        """Return workstream metadata dict or None if not found."""
+        ...
+
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         """Set or update the auto-generated title for a workstream."""
         ...

@@ -793,7 +793,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
     </select>
     <label for="new-ws-judge">Judge Model <span class="label-hint">optional</span></label>
     <select id="new-ws-judge">
-      <option value="">Default (same as agent)</option>
+      <option value="">Default — use workstream's agent model</option>
     </select>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
@@ -1540,7 +1540,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <label style="margin:0;font-size:12px;color:var(--fg-dim)"><input type="checkbox" id="model-enabled" checked style="margin-right:5px">Enabled</label>
     </div>
     <div id="model-detect-area" style="margin-top:14px">
-      <button type="button" id="model-detect-btn" class="modal-cancel" onclick="detectModel()" style="width:auto;padding:7px 16px;font-size:12px" title="Probe endpoint to verify connectivity and discover models">Detect</button>
+      <button type="button" id="model-detect-btn" class="admin-action-btn" onclick="detectModel()" style="width:auto;padding:7px 16px;font-size:12px" title="Probe endpoint to verify connectivity and discover models">Detect</button>
       <div id="model-detect-result" role="status" aria-live="polite" style="display:none;margin-top:8px;padding:10px 12px;border-radius:6px;font-size:12px;border:1px solid var(--border);word-break:break-word"></div>
     </div>
     <div class="modal-buttons">

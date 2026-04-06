@@ -72,13 +72,19 @@ class IntentVerdict:
 
 @dataclass
 class JudgeConfig:
-    """Configuration for the intent validation judge."""
+    """Configuration for the intent validation judge.
+
+    The *timeout* value applies **per turn**, not as a total budget across
+    all turns.  With the default of 60 s and a maximum of 5 turns, a
+    single tool-call evaluation can take up to 300 s in the worst case
+    (e.g. a multi-turn tool-use exchange with a slow local model).
+    """
 
     enabled: bool = True
     model: str = ""  # empty = use session model
     confidence_threshold: float = 0.7
     max_context_ratio: float = 0.5
-    timeout: float = 60.0
+    timeout: float = 60.0  # per-turn timeout in seconds (see class docstring)
     read_only_tools: bool = True
     output_guard: bool = True
     redact_secrets: bool = True
@@ -912,7 +918,8 @@ class IntentJudge:
                     client, model_name, _ = model_registry.resolve(config.model)
                     self._provider = model_registry.get_provider(config.model)
                     self._client_factory_args = self._extract_client_config(
-                        client, self._provider.provider_name,
+                        client,
+                        self._provider.provider_name,
                     )
                     self._model = model_name
                     caps = self._provider.get_capabilities(self._model)
@@ -925,7 +932,8 @@ class IntentJudge:
             # Model name override with session provider
             self._provider = session_provider
             self._client_factory_args = self._extract_client_config(
-                session_client, session_provider.provider_name,
+                session_client,
+                session_provider.provider_name,
             )
             self._model = config.model
             caps = self._provider.get_capabilities(self._model)
@@ -934,7 +942,8 @@ class IntentJudge:
             # Self-consistency: same model as session
             self._provider = session_provider
             self._client_factory_args = self._extract_client_config(
-                session_client, session_provider.provider_name,
+                session_client,
+                session_provider.provider_name,
             )
             self._model = session_model
             self._judge_context_window = context_window
@@ -1030,21 +1039,20 @@ class IntentJudge:
                 if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
                     log.info("judge.cancelled", remaining=len(items) - idx)
                     self._deliver_fallbacks(
-                        items[idx:], heuristic_verdicts[idx:], callback,
+                        items[idx:],
+                        heuristic_verdicts[idx:],
+                        callback,
                         "judge cancelled by user approval",
                     )
                     return
                 try:
                     llm_verdict = self._evaluate_single(
-                        item, messages, cancel_event, executor, client,
+                        item,
+                        messages,
+                        cancel_event,
+                        executor,
+                        client,
                     )
-                    if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
-                        log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
-                        self._deliver_fallbacks(
-                            items[idx:], heuristic_verdicts[idx:], callback,
-                            "judge cancelled by user approval",
-                        )
-                        return
                     if llm_verdict:
                         log.info(
                             "judge.verdict.llm",
@@ -1076,6 +1084,17 @@ class IntentJudge:
                             call_id=fallback.call_id,
                         )
                         callback(fallback)
+                    # After delivering this item's verdict, check if we should
+                    # abort remaining items due to user approval.
+                    if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
+                        log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
+                        self._deliver_fallbacks(
+                            items[idx + 1 :],
+                            heuristic_verdicts[idx + 1 :],
+                            callback,
+                            "judge cancelled by user approval",
+                        )
+                        return
                 except _ExecutorPoisonedError:
                     executor.shutdown(wait=False, cancel_futures=True)
                     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge-api")
@@ -1100,7 +1119,7 @@ class IntentJudge:
         reason: str,
     ) -> None:
         """Deliver heuristic fallback verdicts for items the judge didn't complete."""
-        for item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
+        for _item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
             fallback = IntentVerdict(
                 verdict_id=h_verdict.verdict_id,
                 call_id=h_verdict.call_id,
@@ -1198,18 +1217,21 @@ class IntentJudge:
                     temperature=0.0,
                     reasoning_effort="medium",
                 )
-                # Poll in 1s increments so we notice timeout promptly
+                # Poll in 1s increments so we notice cancellation promptly
                 # instead of blocking for the full per_call_timeout.
                 deadline = time.monotonic() + per_call_timeout
                 while True:
                     remaining = deadline - time.monotonic()
+                    if cancel_event and cancel_event.is_set():
+                        future.cancel()
+                        return None
                     if remaining <= 0:
                         raise TimeoutError
                     try:
                         result = future.result(timeout=min(remaining, 1.0))
                         break
                     except TimeoutError:
-                        pass  # loop back to check remaining
+                        pass  # loop back to check remaining/cancel
             except TimeoutError:
                 log.info("judge.turn.timeout", turn=turn + 1, timeout=per_call_timeout)
                 # Safety net: if we have a partial result from a previous turn,
@@ -1238,6 +1260,10 @@ class IntentJudge:
                 tools=len(result.tool_calls or []),
                 elapsed=round(turn_elapsed, 1),
             )
+
+            # Reset empty-response counter after any non-empty response
+            if result.content or result.tool_calls:
+                empty_retries = 0
 
             # Check for tool calls
             if result.tool_calls:
@@ -1309,8 +1335,15 @@ class IntentJudge:
                 turn += 1
                 continue
 
-            # Empty response (0 chars, 0 tools) — retry up to 3 times
-            # without consuming the turn budget.
+            # Empty response (0 chars, 0 tools).  If the model hit the
+            # output token limit the finish_reason will be "length" — retrying
+            # with the same prompt and max_tokens is pointless.
+            if result.finish_reason == "length":
+                log.info("judge.empty_response.length_stop", turn=turn + 1)
+                return None
+
+            # Transient empty response — retry up to 3 times without
+            # consuming the turn budget.
             empty_retries += 1
             if empty_retries <= 3:
                 log.info("judge.empty_response.retry", retry=empty_retries, max_retries=3)
@@ -1408,10 +1441,7 @@ class IntentJudge:
                 calls = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
-                    calls.append(
-                        f"[Tool Call -> {fn.get('name')}\n"
-                        f"Args: {fn.get('arguments')}]"
-                    )
+                    calls.append(f"[Tool Call -> {fn.get('name')}\nArgs: {fn.get('arguments')}]")
                 if content_str:
                     content_str += "\n\n" + "\n".join(calls)
                 else:

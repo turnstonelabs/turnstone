@@ -73,6 +73,10 @@ def create_client(provider_name: str, *, base_url: str, api_key: str) -> Any:
     if provider_name in ("openai", "openai-compatible", "google"):
         from openai import OpenAI
 
+        if not base_url and provider_name == "google":
+            from turnstone.core.providers._google import GOOGLE_DEFAULT_BASE_URL
+
+            base_url = GOOGLE_DEFAULT_BASE_URL
         if base_url:
             return OpenAI(base_url=base_url, api_key=api_key)
         return OpenAI(api_key=api_key)

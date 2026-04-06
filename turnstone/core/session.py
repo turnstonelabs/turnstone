@@ -941,6 +941,21 @@ class ChatSession:
             + output[-half:]
         )
 
+    def request_title_refresh(self, current_title: str = "") -> None:
+        """Request a title regeneration (thread-safe public API).
+
+        Resets the title-generated flag and spawns a background thread
+        to produce a new title via LLM.  Safe to call from server endpoints.
+        """
+        self._title_generated = False
+        import threading
+
+        threading.Thread(
+            target=self._generate_title,
+            args=(current_title,),
+            daemon=True,
+        ).start()
+
     def _generate_title(self, current_title: str = "") -> None:
         """Generate a short title for this session via a background LLM call.
 
@@ -981,7 +996,7 @@ class ChatSession:
                 snippet += f"\nAssistant: {asst_msg}"
             if current_title:
                 snippet += (
-                    f"\n\nThe current title is: \"{current_title}\"\n"
+                    f'\n\nThe current title is: "{current_title}"\n'
                     "The user wants a DIFFERENT title. Generate a new, distinct title "
                     "that is NOT the same as the current one."
                 )
@@ -1142,7 +1157,24 @@ class ChatSession:
                 content = msg.get("content", "")
                 name = msg.get("name")
                 tool_call_id = msg.get("tool_call_id")
-                save_message(self._ws_id, role, content, name, tool_call_id=tool_call_id)
+                # Preserve tool_calls and provider_data so the fork
+                # reconstructs the full message structure after restart.
+                tc = msg.get("tool_calls")
+                tc_json = json.dumps(tc) if tc else None
+                pd = msg.get("provider_data")
+                try:
+                    pd_str = json.dumps(pd) if pd and not isinstance(pd, str) else pd
+                except (TypeError, ValueError):
+                    pd_str = None
+                save_message(
+                    self._ws_id,
+                    role,
+                    content,
+                    name,
+                    tool_call_id=tool_call_id,
+                    tool_calls=tc_json,
+                    provider_data=pd_str,
+                )
             self._save_config()
             self._title_generated = False  # allow auto-title for the fork
             log.info(

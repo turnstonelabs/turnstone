@@ -234,6 +234,27 @@ class TestErrorHandling:
             )
         assert result is None
 
+    def test_empty_content_length_stop_no_retry(self):
+        """When finish_reason is 'length', don't retry — return None immediately."""
+        provider = _make_mock_provider(response_content="")
+        result_mock = provider.create_completion.return_value
+        result_mock.tool_calls = None
+        result_mock.content = ""
+        result_mock.finish_reason = "length"
+
+        judge = _make_judge(provider)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = judge._evaluate_single(
+                _make_item(),
+                [{"role": "user", "content": "test"}],
+                cancel_event=None,
+                executor=pool,
+                client=MagicMock(),
+            )
+        assert result is None
+        # Should have been called exactly once — no retries
+        assert provider.create_completion.call_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Multi-turn tool use

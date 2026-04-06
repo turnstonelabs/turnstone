@@ -4,12 +4,15 @@
 function toggleTheme() {
   var next = document.documentElement.dataset.theme === "light" ? "" : "light";
   document.documentElement.dataset.theme = next;
-  localStorage.setItem("turnstone-theme", next || "dark");
+  localStorage.setItem("turnstone_interface.theme", next || "dark");
   if (typeof window.onThemeChange === "function") window.onThemeChange(next);
 }
 
 (function initTheme() {
-  var stored = localStorage.getItem("turnstone-theme");
+  // Check both keys for backwards compatibility (old key: "turnstone-theme")
+  var stored =
+    localStorage.getItem("turnstone_interface.theme") ||
+    localStorage.getItem("turnstone-theme");
   if (stored === "light") {
     document.documentElement.dataset.theme = "light";
   } else if (
