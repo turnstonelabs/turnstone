@@ -2149,7 +2149,6 @@ function showTabDropdown(chevronEl, wsId) {
   var items = [
     {
       label: "Refresh title",
-      key: "Ctrl+Shift+R",
       cls: "mobile-hide",
       action: refreshWorkstreamTitle,
     },
@@ -4657,11 +4656,6 @@ document.addEventListener("keydown", function (e) {
     closeTabDropdown();
     var wsActionKey = e.key.toLowerCase();
     var activeWsId = !dashboardVisible && getCurrentWsId();
-    if (wsActionKey === "r" && activeWsId) {
-      e.preventDefault();
-      refreshWorkstreamTitle();
-      return;
-    }
     if (wsActionKey === "e" && activeWsId) {
       e.preventDefault();
       editWorkstreamTitle();
