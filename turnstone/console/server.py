@@ -328,7 +328,7 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
             for r in raw
         ]
     except Exception:
-        log.warning("cluster.node_metadata_load_failed", node_id=node_id, exc_info=True)
+        log.warning("cluster.node_metadata_load_failed node_id=%s", node_id, exc_info=True)
         detail["metadata"] = []
     return JSONResponse(detail)
 

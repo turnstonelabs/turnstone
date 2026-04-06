@@ -757,7 +757,9 @@ class TestConsoleHTTPEndpoints:
         assert status == 200
         assert len(data["nodes"]) == 1
         assert data["total"] == 1
-        mock_collector.get_nodes.assert_called_once_with(sort_by="activity", limit=10, offset=0)
+        mock_collector.get_nodes.assert_called_once_with(
+            sort_by="activity", limit=10, offset=0, node_ids=None
+        )
 
     def test_get_workstreams(self, client, mock_collector):
         status, data = self._get(

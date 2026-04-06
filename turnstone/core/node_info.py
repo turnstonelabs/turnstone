@@ -31,7 +31,7 @@ def _collect_interfaces() -> dict[str, list[str]]:
         if ips:
             result[hostname] = ips
     except OSError:
-        pass
+        log.debug("node_info: interface collection failed", exc_info=True)
     return result
 
 
