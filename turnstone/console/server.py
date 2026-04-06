@@ -6473,8 +6473,17 @@ async def admin_list_output_guard_patterns(request: Request) -> JSONResponse:
         result.append(entry)
 
     # Add built-ins not overridden in DB
+    import re as _re
+
+    _flags_reverse = {
+        _re.IGNORECASE: "IGNORECASE",
+        _re.MULTILINE: "MULTILINE",
+        _re.DOTALL: "DOTALL",
+    }
     for pat in _BUILTIN_OG_PATTERNS:
         if pat.name not in seen_names:
+            # Derive pattern_flags from compiled regex so overrides preserve them
+            pf = ",".join(n for f, n in _flags_reverse.items() if pat.compiled.flags & f)
             result.append(
                 {
                     "pattern_id": "",
@@ -6482,7 +6491,7 @@ async def admin_list_output_guard_patterns(request: Request) -> JSONResponse:
                     "category": pat.category,
                     "risk_level": pat.risk_level,
                     "pattern": pat.compiled.pattern,
-                    "pattern_flags": "",
+                    "pattern_flags": pf,
                     "flag_name": pat.flag_name,
                     "annotation": pat.annotation,
                     "is_credential": pat.is_credential,

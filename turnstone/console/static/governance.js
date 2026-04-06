@@ -3431,6 +3431,7 @@ function resetHeuristicRule(ruleId) {
 function _populateEditHRModal(rule, isBuiltin) {
   document.getElementById("ehr-id").value = rule.rule_id || "";
   document.getElementById("ehr-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("ehr-priority").value = rule.priority || 0;
   document.getElementById("ehr-name").value = rule.name;
   document.getElementById("ehr-name").disabled = isBuiltin;
   document.getElementById("ehr-tier").value = rule.tier || rule.risk_level;
@@ -3518,6 +3519,7 @@ function submitEditHeuristicRule() {
     confidence: parseFloat(document.getElementById("ehr-conf").value) || 0.8,
     intent_template: document.getElementById("ehr-intent").value.trim(),
     reasoning_template: document.getElementById("ehr-reason").value.trim(),
+    priority: parseInt(document.getElementById("ehr-priority").value, 10) || 0,
   };
   var btn = document.getElementById("ehr-submit");
   btn.disabled = true;
@@ -3966,6 +3968,7 @@ function resetOGPattern(patternId) {
 function _populateEditOGPModal(pat, isBuiltin) {
   document.getElementById("eogp-id").value = pat.pattern_id || "";
   document.getElementById("eogp-builtin").value = isBuiltin ? "true" : "false";
+  document.getElementById("eogp-priority").value = pat.priority || 0;
   document.getElementById("eogp-name").value = pat.name;
   document.getElementById("eogp-name").disabled = isBuiltin;
   document.getElementById("eogp-cat").value = pat.category;
@@ -4068,6 +4071,7 @@ function submitEditOGPattern() {
     pattern_flags: document.getElementById("eogp-flags").value.trim(),
     is_credential: document.getElementById("eogp-cred").checked,
     redact_label: document.getElementById("eogp-redact").value.trim(),
+    priority: parseInt(document.getElementById("eogp-priority").value, 10) || 0,
   };
   var btn = document.getElementById("eogp-submit");
   btn.disabled = true;
