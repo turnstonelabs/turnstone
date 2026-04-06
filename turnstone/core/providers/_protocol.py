@@ -22,6 +22,9 @@ class ToolCallDelta:
     id: str = ""
     name: str = ""
     arguments_delta: str = ""
+    # Provider-specific extra fields that must survive the tool-call →
+    # tool-result round-trip (e.g. Gemini's ``thought_signature``).
+    extra_fields: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +84,14 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    # When True the provider adapter captures the full ``model_dump()``
+    # of each tool-call object and stores the extra keys in
+    # ``ToolCallDelta.extra_fields`` / the ``_extra`` key of the
+    # accumulated tool-call dict.  ``sanitize_messages`` re-promotes
+    # those keys so they appear at the top level of each tool-call
+    # object in subsequent API requests (required by Gemini for
+    # ``thought_signature`` round-tripping).
+    preserve_tool_metadata: bool = False
 
 
 def _lookup_capabilities(

@@ -487,6 +487,7 @@ class ChatSession:
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
             redact_secrets=cs.get("judge.redact_secrets"),
+            cancel_on_approval=cs.get("judge.cancel_on_approval"),
         )
 
     def _get_web_search_backend(self) -> str:
@@ -1425,10 +1426,18 @@ class ChatSession:
 
         ``chat_template_kwargs`` is only meaningful for local model servers
         (``openai-compatible``).  Commercial OpenAI rejects it as an unknown
-        parameter, and handles ``reasoning_effort`` natively.
+        parameter, and handles ``reasoning_effort`` natively.  Google's
+        ``googleapis.com`` endpoint also rejects it, so we guard against
+        both provider name and base_url to be resilient against
+        misclassified models.
         """
         prov = provider or self._provider
         if prov.provider_name == "openai-compatible":
+            # Guard: googleapis.com endpoints reject chat_template_kwargs
+            # even when the model is misclassified as openai-compatible.
+            base_url = str(getattr(self.client, "base_url", ""))
+            if "googleapis.com" in base_url:
+                return None
             kwargs = dict(self._chat_template_kwargs_base)
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort
@@ -2389,6 +2398,12 @@ class ChatSession:
                             tc["function"]["name"] = tcd.name
                         if tcd.arguments_delta:
                             tc["function"]["arguments"] += tcd.arguments_delta
+                        # Merge provider-specific extra fields (e.g. Gemini
+                        # thought_signature) so they survive the round-trip.
+                        _extra = getattr(tcd, "extra_fields", None)
+                        if _extra:
+                            extra = tc.setdefault("_extra", {})
+                            extra.update(_extra)
 
                 # Informational messages (e.g. server-side web search status)
                 if chunk.info_delta:

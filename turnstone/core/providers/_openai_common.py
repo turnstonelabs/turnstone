@@ -309,15 +309,35 @@ def sanitize_messages(
     OpenAI-compatible APIs reject assistant messages that have neither.
     This is a defensive catch-all; the upstream layers should already
     guarantee well-formed messages.
+
+    Also promotes ``_extra`` metadata stashed on tool-call dicts back to
+    the top level of each tool-call object, and ``_fn_extra`` back into
+    the ``function`` sub-dict.  Gemini's OpenAI-compatible endpoint
+    requires provider-specific fields (e.g. ``thought_signature``) to be
+    present on the tool-call object in subsequent requests — without
+    this, the next API call after a tool result fails.
     """
     out: list[dict[str, Any]] = []
     for msg in messages:
-        if (
-            msg.get("role") == "assistant"
-            and msg.get("content") is None
-            and not msg.get("tool_calls")
-        ):
-            msg = {**msg, "content": ""}
+        if msg.get("role") == "assistant":
+            if msg.get("content") is None and not msg.get("tool_calls"):
+                msg = {**msg, "content": ""}
+            # Promote _extra / _fn_extra fields back to their original locations
+            tc_list = msg.get("tool_calls")
+            if tc_list:
+                new_tcs: list[dict[str, Any]] = []
+                for tc in tc_list:
+                    extra = tc.get("_extra")
+                    if extra:
+                        fn_extra = extra.pop("_fn_extra", None)
+                        # Promote top-level extras, remove _extra key
+                        tc = {k: v for k, v in tc.items() if k != "_extra"}
+                        tc.update(extra)
+                        # Promote function-level extras back into function dict
+                        if fn_extra and isinstance(fn_extra, dict) and "function" in tc:
+                            tc["function"] = {**tc["function"], **fn_extra}
+                    new_tcs.append(tc)
+                msg = {**msg, "tool_calls": new_tcs}
         out.append(msg)
     return out
 

@@ -3583,10 +3583,12 @@ function getCurrentWsId() {
 }
 
 function updateWsActionButtons() {
-  var group = document.getElementById("ws-action-group");
-  if (group) {
-    group.classList.toggle("hidden", !getCurrentWsId());
-  }
+  var hasActiveWs = !!getCurrentWsId();
+  var ids = ["refresh-title-btn", "edit-title-btn", "fork-ws-btn", "delete-ws-btn"];
+  ids.forEach(function (id) {
+    var el = document.getElementById(id);
+    if (el) el.style.display = hasActiveWs ? "" : "none";
+  });
 }
 
 function forkWorkstream() {
@@ -4756,11 +4758,12 @@ function loadInterfaceSettings() {
         if (s.key && s.key.indexOf("interface.") === 0) {
           var lsKey = "turnstone_" + s.key;
           try {
-            // Only write server value if no local value exists — this
-            // preserves the user's theme choice when switching between
-            // nodes via the console proxy (each node may return a
-            // different default).
-            if (!localStorage.getItem(lsKey) && s.source === "storage") {
+            // Server-persisted values (source === "storage") always take
+            // precedence so cross-client theme sync works.  Local-only
+            // defaults are only written when no local value exists.
+            if (s.source === "storage") {
+              localStorage.setItem(lsKey, s.value);
+            } else if (!localStorage.getItem(lsKey)) {
               localStorage.setItem(lsKey, s.value);
             }
           } catch (_) {}

@@ -21,3 +21,7 @@ PROGRESS.md
 .coverage
 tools/skill_audit_analysis/data/
 tools/skill_audit_analysis/output/
+SESSION_HISTORY*.md
+AGENTS.md
+CODE_STYLE.md
+TASKS_TO_DO.md

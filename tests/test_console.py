@@ -1200,6 +1200,43 @@ class TestConsoleProxy:
         )
         assert resp.status_code == 404
 
+    def test_proxy_api_put_unknown_node_returns_404(self, client, mock_collector):
+        """PUT must be accepted by proxy routes (not 405).
+
+        Regression test: upstream #319 changed the theme toggle from POST to
+        PUT but the proxy routes only listed ``["GET", "POST"]``, causing
+        Starlette to return 405 before the handler could run.
+        """
+        mock_collector.get_node_detail.return_value = None
+        resp = client.put(
+            "/node/unknown/api/admin/settings/interface.theme",
+            json={"value": "dark"},
+        )
+        # 404 (unknown node) proves the route matched and the handler ran;
+        # a 405 would mean the route rejected the method.
+        assert resp.status_code == 404
+
+    def test_proxy_api_delete_unknown_node_returns_404(self, client, mock_collector):
+        """DELETE must be accepted by proxy routes (not 405)."""
+        mock_collector.get_node_detail.return_value = None
+        resp = client.delete("/node/unknown/api/workstreams/ws-abc/delete")
+        assert resp.status_code == 404
+
+    def test_proxy_v1_api_put_unknown_node_returns_404(self, client, mock_collector):
+        """PUT via the ``/v1/api/`` proxy path must also be accepted."""
+        mock_collector.get_node_detail.return_value = None
+        resp = client.put(
+            "/node/unknown/v1/api/admin/settings/interface.theme",
+            json={"value": "light"},
+        )
+        assert resp.status_code == 404
+
+    def test_proxy_v1_api_delete_unknown_node_returns_404(self, client, mock_collector):
+        """DELETE via the ``/v1/api/`` proxy path must also be accepted."""
+        mock_collector.get_node_detail.return_value = None
+        resp = client.delete("/node/unknown/v1/api/workstreams/ws-abc/delete")
+        assert resp.status_code == 404
+
 
 # ---------------------------------------------------------------------------
 # Proxy URL rewriting unit tests (no HTTP needed)
