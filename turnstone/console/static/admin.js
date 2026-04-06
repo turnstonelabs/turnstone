@@ -5105,13 +5105,13 @@ function _renderNodeMetadata() {
         html += "<td>";
         if (!isAuto) {
           html +=
-            '<button class="admin-btn-danger" aria-label="Delete ' +
+            '<button class="admin-btn-danger nm-del-btn" aria-label="Delete ' +
             escapeHtml(m.key) +
-            '" onclick="_deleteNodeMeta(\'' +
+            '" data-node="' +
             escapeHtml(nid) +
-            "','" +
+            '" data-key="' +
             escapeHtml(m.key) +
-            "')\">Del</button>";
+            '">Del</button>';
         }
         html += "</td></tr>";
       });
@@ -5132,14 +5132,31 @@ function _renderNodeMetadata() {
       escapeHtml(nid) +
       '" type="text" placeholder="value (JSON or string)" aria-label="Metadata value">';
     html +=
-      '<button class="admin-btn-action" onclick="_addNodeMeta(\'' +
+      '<button class="admin-btn-action nm-add-btn" data-node="' +
       escapeHtml(nid) +
-      '\')" style="white-space:nowrap">Add</button>';
+      '" style="white-space:nowrap">Add</button>';
     html += "</div>";
 
     html += "</div></div>";
   });
   container.innerHTML = html;
+
+  // Bind button handlers (data-* attrs carry node/key context)
+  var delBtns = container.querySelectorAll(".nm-del-btn");
+  for (var d = 0; d < delBtns.length; d++) {
+    delBtns[d].addEventListener("click", function () {
+      _deleteNodeMeta(
+        this.getAttribute("data-node"),
+        this.getAttribute("data-key"),
+      );
+    });
+  }
+  var addBtns = container.querySelectorAll(".nm-add-btn");
+  for (var a = 0; a < addBtns.length; a++) {
+    addBtns[a].addEventListener("click", function () {
+      _addNodeMeta(this.getAttribute("data-node"));
+    });
+  }
 }
 
 function _addNodeMeta(nodeId) {

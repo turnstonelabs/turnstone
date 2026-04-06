@@ -3030,6 +3030,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             await asyncio.to_thread(
                 _dereg_storage.delete_node_metadata_by_source, _svc_node_id, "auto"
             )
+            await asyncio.to_thread(
+                _dereg_storage.delete_node_metadata_by_source, _svc_node_id, "config"
+            )
             log.info("server.service_deregistered", node_id=_svc_node_id)
         except Exception:
             log.exception("server.deregister_failed")

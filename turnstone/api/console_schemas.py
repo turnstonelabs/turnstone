@@ -90,6 +90,12 @@ class ClusterWorkstreamsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class NodeMetadataEntry(BaseModel):
+    key: str
+    value: Any
+    source: str = "user"
+
+
 class NodeDetailResponse(BaseModel):
     node_id: str
     server_url: str = ""
@@ -97,7 +103,7 @@ class NodeDetailResponse(BaseModel):
     workstreams: list[ClusterWorkstreamInfo] = []
     aggregate: dict[str, int] = Field(default_factory=dict)
     reachable: bool = True
-    metadata: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: list[NodeMetadataEntry] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -904,12 +910,6 @@ class RouteCreateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Node metadata
 # ---------------------------------------------------------------------------
-
-
-class NodeMetadataEntry(BaseModel):
-    key: str
-    value: Any
-    source: str = "user"
 
 
 class NodeMetadataResponse(BaseModel):
