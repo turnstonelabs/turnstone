@@ -147,6 +147,9 @@ class ConsoleCreateWsRequest(BaseModel):
     resume_ws: str = Field(
         default="", description="Workstream ID to resume (loads previous conversation)"
     )
+    judge_model: str = Field(
+        default="", description="Override judge model alias for this workstream"
+    )
 
 
 class ConsoleCreateWsResponse(BaseModel):

@@ -30,7 +30,7 @@ Turnstone gives LLMs tools — shell, files, search, web, planning — and orche
 - **Cluster dashboard** — real-time view of all nodes and workstreams with console routing proxy
 - **Intent validation** — LLM judge evaluates every tool call with risk assessments and evidence
 - **Governance** — RBAC, OIDC SSO, tool policies, skills, usage tracking, audit logs
-- **Multi-provider** — OpenAI-compatible APIs (vLLM, llama.cpp, NIM) and Anthropic Messages API
+- **Multi-provider** — OpenAI-compatible APIs (vLLM, llama.cpp, NIM), Anthropic Messages API, and Google Gemini
 - **MCP support** — external tool servers with native deferred loading (Anthropic/OpenAI) or BM25 fallback
 
 <p align="center">
@@ -132,7 +132,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 ## Requirements
 
 - Python 3.11+
-- An OpenAI-compatible API endpoint or Anthropic API key
+- An OpenAI-compatible API endpoint, Anthropic API key, or Google Gemini API key
 - Optional: PostgreSQL (`pip install turnstone[postgres]`), Anthropic (`pip install turnstone[anthropic]`)
 - [Git LFS](https://git-lfs.com/) for cloning (diagram PNGs)
 

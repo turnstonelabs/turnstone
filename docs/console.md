@@ -382,6 +382,9 @@ Triggered by the "+ new" header button. A modal dialog with:
 - **Profile** — optional dropdown listing enabled skills. Applies the skill's model, auto-approve policy, token budget, and other behavioral settings at creation time.
 - **Name** — optional text input. Auto-generated if left empty.
 - **Model** — optional text input for a model alias from the target node's registry.
+- **Judge Model** — optional text input for the judge model alias (overrides the default judge model for this workstream).
+
+Keyboard shortcuts: Ctrl+Shift+R (refresh title), Ctrl+Shift+E (edit title), Ctrl+Shift+F (fork), Ctrl+Shift+X (delete). Press ? for full shortcut help.
 
 On submit, `POST /v1/api/cluster/workstreams/new` dispatches the creation request. A toast confirms success; the SSE stream delivers the `ws_created` event to update the dashboard.
 

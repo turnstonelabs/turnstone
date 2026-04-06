@@ -38,6 +38,7 @@ turnstone/
       _protocol.py    LLMProvider protocol, ModelCapabilities, StreamChunk, CompletionResult
       _openai.py      OpenAIProvider — OpenAI, vLLM, llama.cpp, any compatible API
       _anthropic.py   AnthropicProvider — Anthropic Messages API, native streaming, thinking
+      _google.py      GoogleProvider — Google Gemini via OpenAI-compat endpoint
       __init__.py     create_provider() + create_client() factory functions
     workstream.py     Parallel workstream manager (WorkstreamState, Workstream, WorkstreamManager)
     tools.py          Tool schema loader (JSON -> OpenAI function-calling format)
@@ -593,6 +594,7 @@ LLMProvider (protocol)
     |
     +--- OpenAIProvider  --- OpenAI, vLLM, llama.cpp, any /v1/chat/completions API
     +--- AnthropicProvider --- Anthropic Messages API (native streaming, thinking)
+    +--- GoogleProvider  --- Google Gemini via /v1beta/openai/ (extends OpenAIProvider)
 ```
 
 **Protocol methods:**
@@ -646,6 +648,13 @@ both streaming and non-streaming responses. The `anthropic` SDK is imported
 lazily so it remains an optional dependency (`pip install
 turnstone[anthropic]`).
 
+**GoogleProvider** (`_google.py`): extends `OpenAIChatCompletionsProvider` for
+the Gemini `/v1beta/openai/` endpoint. Uses a single default
+`ModelCapabilities` (2M context window, 65K max output tokens,
+`token_param=max_tokens`) since Google updates models frequently. No static
+per-model capability table. Google's endpoint is wire-compatible with the
+OpenAI SDK, so no extra dependency is needed.
+
 **Factory functions** (`__init__.py`): `create_provider(name)` returns a
 singleton provider instance (thread-safe). `create_client(name, base_url,
 api_key)` creates the appropriate SDK client.
@@ -674,6 +683,10 @@ api_key = "sk-..."
 model = "gpt-5"
 context_window = 400000
 
+[models.gemini]
+provider = "google"
+model = "gemini-2.5-pro"
+
 [model]
 default = "local"
 fallback = ["claude", "openai"]
@@ -681,7 +694,8 @@ agent_model = "claude"
 ```
 
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
-(default: `"openai"`). Supported values: `"openai"` and `"anthropic"`.
+(default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
+and `"openai-compatible"`.
 An optional `[models.*.capabilities]` sub-table overrides per-model
 `ModelCapabilities` flags (useful for local models whose capabilities
 cannot be detected programmatically):

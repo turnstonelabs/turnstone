@@ -25,7 +25,7 @@ package "Entry Points" <<Rectangle>> {
 ' Core engine
 package "turnstone/core/" <<Rectangle>> {
     component [session.py\nChatSession, SessionUI] as session <<core>>
-    component [providers/\nLLMProvider, OpenAI, Anthropic] as providers <<core>>
+    component [providers/\nLLMProvider, OpenAI, Anthropic, Google] as providers <<core>>
     component [workstream.py\nWorkstreamManager] as workstream <<core>>
     component [tools.py\nTool loader] as tools <<core>>
     component [memory.py\nPersistence facade] as memory <<core>>

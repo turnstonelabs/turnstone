@@ -41,6 +41,7 @@ confidence_threshold = 0.7   # reserved for v2 smart approvals (not used in v1)
 max_context_ratio = 0.5       # max % of judge context window for history
 timeout = 60.0                # seconds (generous for local models)
 read_only_tools = true        # judge can use read_file/list_directory
+cancel_on_approval = false    # stop judging remaining tool calls once user decides
 ```
 
 All fields are optional. The judge is enabled by default; use `enabled = false`
@@ -72,6 +73,17 @@ CLI flags override `config.toml` values.
 - **Cross-provider**: When both `model` and `provider` are set, the judge
   creates its own LLM client. You can optionally specify `base_url` and
   `api_key` for non-default endpoints.
+- **Google models**: The judge supports `google` as a provider. Note that
+  read-only tools are disabled for Google models (the Gemini API requires
+  `thought_signature` in tool call round-trips which the judge's normalized
+  format does not preserve).
+
+The judge creates a fresh HTTP client for each evaluation run and closes it
+when done, avoiding stale connection issues across runs.
+
+If the LLM judge fails or returns no verdict, a fallback verdict with tier
+`llm_fallback` is delivered via the callback, ensuring the UI always receives
+a result.
 
 ---
 

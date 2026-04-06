@@ -144,6 +144,34 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
         tags=["Streaming"],
     ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/delete",
+        "POST",
+        "Permanently delete a saved workstream",
+        error_codes=[400, 404, 500],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/open",
+        "POST",
+        "Load a saved workstream into memory",
+        error_codes=[400, 404, 500],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/title",
+        "POST",
+        "Set workstream title manually",
+        error_codes=[400, 409],
+        tags=["Workstreams"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/refresh-title",
+        "POST",
+        "Regenerate workstream title via LLM",
+        error_codes=[404],
+        tags=["Workstreams"],
+    ),
     # --- Saved workstreams ---
     EndpointSpec(
         "/v1/api/workstreams/saved",
@@ -268,6 +296,27 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         ],
         error_codes=[404],
         tags=["Memories"],
+    ),
+    # --- Admin settings ---
+    EndpointSpec(
+        "/v1/api/admin/settings",
+        "GET",
+        "List interface.* settings with values and sources",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/settings/{key}",
+        "PUT",
+        "Update an interface.* setting",
+        error_codes=[400, 503],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
+        "/v1/api/admin/settings/{key}",
+        "POST",
+        "Update an interface.* setting (alias for PUT)",
+        error_codes=[400, 503],
+        tags=["Admin"],
     ),
     # --- Observability ---
     EndpointSpec(

@@ -103,6 +103,18 @@ class "AnthropicProvider" as AnthropicProv {
     core/providers/_anthropic.py
 }
 
+class "GoogleProvider" as GoogleProv {
+    + provider_name: str
+    + get_capabilities(model) -> ModelCapabilities
+    --
+    Extends OpenAIChatCompletionsProvider
+    for Gemini /v1beta/openai/ endpoint.
+    Single default ModelCapabilities
+    (2M context, 65K output).
+    --
+    core/providers/_google.py
+}
+
 ' ModelCapabilities
 class "ModelCapabilities" as ModelCaps <<frozen>> {
     + context_window: int
@@ -360,6 +372,7 @@ SessionUI <|.. NullUI
 
 LLMProvider <|.. OpenAIProv
 LLMProvider <|.. AnthropicProv
+OpenAIProv <|-- GoogleProv
 
 ChatSession --> SessionUI : uses
 ChatSession --> LLMProvider : delegates LLM calls

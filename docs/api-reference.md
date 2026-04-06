@@ -857,6 +857,7 @@ All fields are optional. The body can be empty or an empty JSON object.
 | `auto_approve`   | bool   | false   | Auto-approve all tool calls for this workstream                |
 | `resume_ws`      | string | ""      | Workstream ID to resume atomically during creation (empty = fresh)|
 | `skill`          | string | ""      | Skill name. Applies content (system prompt), model, temperature, reasoning effort, max tokens, auto-approve policy, token budget, and other session config from the skill. Returns 400 if not found or disabled. Ignored when `resume_ws` is set (resumed sessions restore their own skill). |
+| `judge_model`    | string | ""      | Optional model alias for the judge (overrides default judge model for this workstream) |
 
 > **Skill behavior:** When `skill` is specified, the skill's content is injected as a system message and its session config fields (model, temperature, auto-approve, token budget, etc.) override system defaults for the new workstream.
 
@@ -911,6 +912,161 @@ closed.
 ```
 
 Status code: `400`
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/delete`
+
+Permanently delete a saved workstream and all its messages from storage.
+
+**Path parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `ws_id`   | string | Workstream ID        |
+
+**Response (success):** `200`
+
+```json
+{"deleted": "a1b2c3d4"}
+```
+
+**Response (not found):** `404`
+
+```json
+{"error": "Workstream not found"}
+```
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/open`
+
+Load a saved workstream into memory with its original `ws_id`. If the
+workstream is already loaded, returns immediately with `already_loaded: true`.
+
+**Path parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `ws_id`   | string | Workstream ID        |
+
+**Response (success):** `200`
+
+```json
+{"ws_id": "a1b2c3d4", "name": "refactor"}
+```
+
+**Response (already loaded):** `200`
+
+```json
+{"ws_id": "a1b2c3d4", "name": "refactor", "already_loaded": true}
+```
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/title`
+
+Set a workstream title manually. The title is stored as the workstream alias.
+
+**Path parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `ws_id`   | string | Workstream ID        |
+
+**Request body:**
+
+```json
+{"title": "JWT Authentication Refactor"}
+```
+
+| Field   | Type   | Required | Description            |
+|---------|--------|----------|------------------------|
+| `title` | string | yes      | New workstream title   |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok", "title": "JWT Authentication Refactor"}
+```
+
+**Response (conflict):** `409`
+
+```json
+{"error": "That name is already used by another workstream"}
+```
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/refresh-title`
+
+Regenerate the workstream title via LLM based on conversation content.
+
+**Path parameters:**
+
+| Parameter | Type   | Description          |
+|-----------|--------|----------------------|
+| `ws_id`   | string | Workstream ID        |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok"}
+```
+
+---
+
+### `GET /v1/api/admin/settings`
+
+List `interface.*` settings with their current values and sources. Requires
+`read` scope on the server.
+
+**Response:** `200`
+
+```json
+{
+  "settings": [
+    {
+      "key": "interface.close_tab_action",
+      "value": "last_used",
+      "source": "default",
+      "type": "str",
+      "description": "Determines which workstream to switch to after closing a tab."
+    }
+  ]
+}
+```
+
+---
+
+### `POST|PUT /v1/api/admin/settings/{key}`
+
+Update an `interface.*` setting. Only keys in the `interface` section are
+accepted; other keys return `400`.
+
+**Path parameters:**
+
+| Parameter | Type   | Description                         |
+|-----------|--------|-------------------------------------|
+| `key`     | string | Setting key (e.g. `interface.theme`) |
+
+**Request body:**
+
+```json
+{"value": "light"}
+```
+
+| Field   | Type | Required | Description    |
+|---------|------|----------|----------------|
+| `value` | any  | yes      | New value      |
+
+**Response (success):** `200`
+
+```json
+{"status": "ok", "key": "interface.theme", "value": "light"}
+```
+
+**Error:** `400` if the key is not in the `interface` section.
 
 ---
 
