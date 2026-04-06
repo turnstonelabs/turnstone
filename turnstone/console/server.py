@@ -1073,7 +1073,7 @@ async def proxy_api(request: Request) -> Response:
     if request.method == "GET" and path in ("events", "events/global"):
         return await _proxy_sse(request, server_url, path, api_prefix=api_prefix)
 
-    if request.method in ("POST", "PUT"):
+    if request.method in ("POST", "PUT", "DELETE"):
         return await _proxy_post(request, server_url, path, api_prefix=api_prefix)
 
     return await _proxy_get(request, server_url, f"{api_prefix}/{path}")
@@ -1110,7 +1110,7 @@ async def _proxy_get(request: Request, server_url: str, path: str) -> Response:
 async def _proxy_post(
     request: Request, server_url: str, path: str, *, api_prefix: str = "api"
 ) -> Response:
-    """Forward a POST/PUT request to the target server."""
+    """Forward a non-GET request (POST/PUT/DELETE) to the target server."""
     client: httpx.AsyncClient = request.app.state.proxy_client
     body = await request.body()
     content_type = request.headers.get("content-type", "application/json")
@@ -7738,8 +7738,16 @@ def create_app(
             Route("/node/{node_id}/", proxy_index),
             Route("/node/{node_id}/static/{path:path}", proxy_static),
             Route("/node/{node_id}/shared/{path:path}", proxy_shared_static),
-            Route("/node/{node_id}/v1/api/{path:path}", proxy_api, methods=["GET", "POST"]),
-            Route("/node/{node_id}/api/{path:path}", proxy_api, methods=["GET", "POST"]),
+            Route(
+                "/node/{node_id}/v1/api/{path:path}",
+                proxy_api,
+                methods=["GET", "POST", "PUT", "DELETE"],
+            ),
+            Route(
+                "/node/{node_id}/api/{path:path}",
+                proxy_api,
+                methods=["GET", "POST", "PUT", "DELETE"],
+            ),
             Route("/node/{node_id}/{path:path}", proxy_non_api),
         ],
         middleware=_build_console_middleware(cors_origins),

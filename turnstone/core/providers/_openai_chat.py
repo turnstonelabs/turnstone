@@ -46,6 +46,43 @@ class OpenAIChatCompletionsProvider:
     def get_capabilities(self, model: str) -> ModelCapabilities:
         return lookup_openai_capabilities(model)
 
+    # -- message preparation --------------------------------------------------
+
+    def _prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prepare messages for the API request.
+
+        Subclasses (e.g. GoogleProvider) override this to reconstruct
+        provider-specific content from ``_provider_content`` before
+        sending.  The base implementation just calls ``sanitize_messages``.
+        """
+        return sanitize_messages(messages)
+
+    # -- tool-call extraction -------------------------------------------------
+
+    def _extract_tool_calls(
+        self, sdk_tool_calls: list[Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Extract normalised tool-call dicts from SDK objects.
+
+        Returns ``(tool_calls, provider_blocks)``.  The base implementation
+        returns an empty ``provider_blocks`` list.  Subclasses (e.g.
+        ``GoogleProvider``) override this to capture provider-specific
+        fields (like ``thought_signature``) in ``provider_blocks`` for
+        round-trip fidelity.
+        """
+        tool_calls = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            }
+            for tc in sdk_tool_calls
+        ]
+        return tool_calls, []
+
     # -- web search ----------------------------------------------------------
 
     @staticmethod
@@ -88,7 +125,7 @@ class OpenAIChatCompletionsProvider:
         cancel_ref: list[Any] | None = None,
     ) -> Iterator[StreamChunk]:
         caps = self.get_capabilities(model)
-        messages = sanitize_messages(messages)
+        messages = self._prepare_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -215,7 +252,7 @@ class OpenAIChatCompletionsProvider:
         deferred_names: frozenset[str] | None = None,
     ) -> CompletionResult:
         caps = self.get_capabilities(model)
-        messages = sanitize_messages(messages)
+        messages = self._prepare_messages(messages)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -244,18 +281,9 @@ class OpenAIChatCompletionsProvider:
         msg = choice.message
 
         tool_calls = None
+        provider_blocks: list[dict[str, Any]] = []
         if msg.tool_calls:
-            tool_calls = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
+            tool_calls, provider_blocks = self._extract_tool_calls(msg.tool_calls)
 
         # Extract url_citation annotations from web search models
         content = msg.content or ""
@@ -270,6 +298,7 @@ class OpenAIChatCompletionsProvider:
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
+            provider_blocks=provider_blocks,
         )
         log.debug(
             "openai.chat.response",

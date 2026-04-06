@@ -1930,22 +1930,21 @@ async def create_workstream(request: Request) -> JSONResponse:
         resumed = False
         message_count = 0
         if resume_ws_id and ws.session is not None:
-            from turnstone.core.memory import get_workstream_display_name, resolve_workstream
+            from turnstone.core.memory import resolve_workstream
 
             target_id = resolve_workstream(resume_ws_id)
             if target_id and ws.session.resume(target_id, fork=True):
                 resumed = True
                 message_count = len(ws.session.messages)
                 # If the user provided a custom name, set it as the fork's alias
-                # so it takes priority in display.  Otherwise inherit the source name.
+                # so it takes priority in display.  Otherwise keep the
+                # auto-generated name so auto-title can run fresh.
                 user_name = body.get("name", "").strip()
                 if user_name:
                     from turnstone.core.memory import set_workstream_alias
 
                     set_workstream_alias(ws.id, user_name)
                     ws.name = user_name
-                else:
-                    ws.name = get_workstream_display_name(target_id) or ws.name
                 ui = ws.ui
                 if isinstance(ui, WebUI):
                     ui._enqueue({"type": "clear_ui"})

@@ -207,6 +207,14 @@ def _resolve_openai_provider(provider: str, base_url: str) -> str:
     and should use the Chat Completions provider (``"openai-compatible"``).
     """
     if provider == "openai" and base_url and "api.openai.com" not in base_url:
+        try:
+            from urllib.parse import urlparse
+
+            hostname = urlparse(base_url).hostname or ""
+        except Exception:
+            hostname = ""
+        if hostname.endswith(".googleapis.com"):
+            return "google"
         return "openai-compatible"
     return provider
 

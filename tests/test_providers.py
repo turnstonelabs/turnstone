@@ -1140,6 +1140,215 @@ class TestProviderFactory:
 
         assert lookup_model_capabilities("google", "gemini-2.5-pro") is None
 
+    def test_resolve_openai_provider_googleapis(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        assert (
+            _resolve_openai_provider(
+                "openai",
+                "https://generativelanguage.googleapis.com/v1beta/openai/",
+            )
+            == "google"
+        )
+
+    def test_resolve_openai_provider_not_spoofable(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        # evil-googleapis.com must NOT match — requires the dot prefix
+        assert (
+            _resolve_openai_provider("openai", "https://evil-googleapis.com/v1")
+            == "openai-compatible"
+        )
+
+    def test_resolve_openai_provider_api_openai_unchanged(self) -> None:
+        from turnstone.core.model_registry import _resolve_openai_provider
+
+        assert _resolve_openai_provider("openai", "https://api.openai.com/v1") == "openai"
+
+
+# ===========================================================================
+# Google provider fidelity
+# ===========================================================================
+
+
+class TestGoogleProviderFidelity:
+    """Tests for thought_signature round-trip via provider_blocks."""
+
+    def test_prepare_messages_strips_provider_content(self) -> None:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                ],
+                "_provider_content": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                        "thought_signature": "sig123",
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        # _provider_content must be stripped
+        for m in cleaned:
+            assert "_provider_content" not in m
+        # tool_calls must be reconstructed with thought_signature
+        tc = cleaned[0]["tool_calls"][0]
+        assert tc["thought_signature"] == "sig123"
+
+    def test_prepare_messages_passthrough_without_provider_content(self) -> None:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert len(cleaned) == 2
+        assert cleaned[0]["content"] == "hello"
+
+    def test_non_streaming_captures_provider_blocks(self) -> None:
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        # Build a mock response with thought_signature in __pydantic_extra__
+        mock_tc = MagicMock()
+        mock_tc.id = "c1"
+        mock_tc.function.name = "write_file"
+        mock_tc.function.arguments = '{"path":"test.txt"}'
+        mock_tc.model_dump.return_value = {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "write_file", "arguments": '{"path":"test.txt"}'},
+            "thought_signature": "sig_abc",
+        }
+
+        mock_msg = MagicMock()
+        mock_msg.tool_calls = [mock_tc]
+        mock_msg.content = ""
+        mock_msg.annotations = None
+
+        mock_choice = MagicMock()
+        mock_choice.message = mock_msg
+        mock_choice.finish_reason = "tool_calls"
+
+        mock_response = MagicMock()
+        mock_response.choices = [mock_choice]
+        mock_response.usage = None
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = prov.create_completion(
+            client=mock_client,
+            model="gemini-2.5-pro",
+            messages=[{"role": "user", "content": "test"}],
+        )
+
+        # Normalised tool_calls should NOT have thought_signature
+        assert result.tool_calls is not None
+        assert "thought_signature" not in result.tool_calls[0]
+        # provider_blocks should have the raw dict WITH thought_signature
+        assert len(result.provider_blocks) == 1
+        assert result.provider_blocks[0]["thought_signature"] == "sig_abc"
+
+    def test_prepare_messages_base_class_unchanged(self) -> None:
+        """Base class _prepare_messages just calls sanitize_messages."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        prov = OpenAIChatCompletionsProvider()
+        msgs = [
+            {"role": "assistant", "content": None},  # should get content=""
+            {"role": "user", "content": "hi"},
+        ]
+        cleaned = prov._prepare_messages(msgs)
+        assert cleaned[0]["content"] == ""
+
+    def test_streaming_captures_thought_signature(self) -> None:
+        """Streaming _iter_stream taps raw deltas and emits provider_blocks."""
+        from turnstone.core.providers._google import GoogleProvider
+
+        prov = GoogleProvider()
+
+        # Build a minimal mock stream with 2 chunks:
+        # chunk 1: tool call header with thought_signature
+        # chunk 2: finish reason
+        mock_fn = MagicMock()
+        mock_fn.name = "write_file"
+        mock_fn.arguments = '{"path":"test.txt"}'
+
+        mock_tc_delta = MagicMock()
+        mock_tc_delta.index = 0
+        mock_tc_delta.id = "call_abc"
+        mock_tc_delta.function = mock_fn
+        mock_tc_delta.__pydantic_extra__ = {"thought_signature": "sig_stream"}
+
+        mock_delta1 = MagicMock()
+        mock_delta1.content = None
+        mock_delta1.tool_calls = [mock_tc_delta]
+        mock_delta1.annotations = None
+        # reasoning fields
+        mock_delta1.reasoning = None
+        mock_delta1.reasoning_content = None
+
+        mock_choice1 = MagicMock()
+        mock_choice1.finish_reason = None
+        mock_choice1.delta = mock_delta1
+
+        mock_chunk1 = MagicMock()
+        mock_chunk1.choices = [mock_choice1]
+        mock_chunk1.usage = None
+
+        # Finish chunk
+        mock_delta2 = MagicMock()
+        mock_delta2.content = None
+        mock_delta2.tool_calls = None
+        mock_delta2.annotations = None
+        mock_delta2.reasoning = None
+        mock_delta2.reasoning_content = None
+
+        mock_choice2 = MagicMock()
+        mock_choice2.finish_reason = "tool_calls"
+        mock_choice2.delta = mock_delta2
+
+        mock_chunk2 = MagicMock()
+        mock_chunk2.choices = [mock_choice2]
+        mock_chunk2.usage = None
+
+        chunks = list(prov._iter_stream([mock_chunk1, mock_chunk2]))
+
+        # Find the chunk with finish_reason
+        finish_chunks = [c for c in chunks if c.finish_reason]
+        assert len(finish_chunks) == 1
+        fc = finish_chunks[0]
+        assert len(fc.provider_blocks) == 1
+        assert fc.provider_blocks[0]["thought_signature"] == "sig_stream"
+        assert fc.provider_blocks[0]["id"] == "call_abc"
+        assert fc.provider_blocks[0]["function"]["name"] == "write_file"
+
+    def test_base_extract_tool_calls_returns_empty_provider_blocks(self) -> None:
+        """Base class _extract_tool_calls returns empty provider_blocks."""
+        from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+
+        prov = OpenAIChatCompletionsProvider()
+        mock_tc = MagicMock()
+        mock_tc.id = "c1"
+        mock_tc.function.name = "test"
+        mock_tc.function.arguments = "{}"
+        tool_calls, provider_blocks = prov._extract_tool_calls([mock_tc])
+        assert len(tool_calls) == 1
+        assert provider_blocks == []
+
 
 # ===========================================================================
 # TestDataclasses

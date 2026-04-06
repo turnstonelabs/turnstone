@@ -487,6 +487,7 @@ class ChatSession:
             read_only_tools=cs.get("judge.read_only_tools"),
             output_guard=cs.get("judge.output_guard"),
             redact_secrets=cs.get("judge.redact_secrets"),
+            cancel_on_approval=cs.get("judge.cancel_on_approval"),
         )
 
     def _get_web_search_backend(self) -> str:
