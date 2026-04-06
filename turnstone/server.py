@@ -2033,7 +2033,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             def _run_initial() -> None:
                 try:
                     session.send(initial_message)
-                except BaseException:
+                except (Exception, GenerationCancelled):
                     if isinstance(ws.ui, WebUI):
                         ws.ui.on_stream_end()
                         ws.ui.on_state_change("idle")

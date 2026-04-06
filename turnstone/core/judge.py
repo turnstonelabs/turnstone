@@ -1109,7 +1109,7 @@ class IntentJudge:
                 if hasattr(client, "close"):
                     client.close()
             except Exception:
-                pass
+                log.debug("judge.client_close_failed", exc_info=True)
 
     def _deliver_fallbacks(
         self,
