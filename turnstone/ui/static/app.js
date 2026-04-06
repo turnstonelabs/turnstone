@@ -4494,9 +4494,17 @@ document
   });
 
 document.addEventListener("keydown", function (e) {
-  // Defer to modal's own keydown handler when new-ws modal is open
-  var nwsOverlay = document.getElementById("new-ws-overlay");
-  if (nwsOverlay && nwsOverlay.style.display !== "none") return;
+  // Defer to modal's own keydown handler when any modal is open
+  var modalIds = [
+    "new-ws-overlay",
+    "edit-title-overlay",
+    "delete-ws-overlay",
+    "ws-delete-overlay",
+  ];
+  for (var mi = 0; mi < modalIds.length; mi++) {
+    var modal = document.getElementById(modalIds[mi]);
+    if (modal && modal.style.display !== "none") return;
+  }
 
   if (e.key === "Escape" && dashboardVisible) {
     e.preventDefault();
@@ -4541,6 +4549,34 @@ document.addEventListener("keydown", function (e) {
       closePane(focusedPaneId);
     }
     return;
+  }
+  // Workstream action shortcuts — only preventDefault when a workstream
+  // is active, so native browser shortcuts (e.g. Ctrl+Shift+R hard reload)
+  // still work when no workstream is focused.
+  if (e.ctrlKey && e.shiftKey) {
+    var wsActionKey = e.key.toLowerCase();
+    var activeWsId = !dashboardVisible && getCurrentWsId();
+    if (wsActionKey === "r" && activeWsId) {
+      e.preventDefault();
+      refreshWorkstreamTitle();
+      return;
+    }
+    if (wsActionKey === "e" && activeWsId) {
+      e.preventDefault();
+      editWorkstreamTitle();
+      return;
+    }
+    if (wsActionKey === "f" && activeWsId) {
+      e.preventDefault();
+      forkWorkstream();
+      return;
+    }
+    // X not D — D conflicts with Chrome DevTools
+    if (wsActionKey === "x" && activeWsId) {
+      e.preventDefault();
+      confirmDeleteWorkstream();
+      return;
+    }
   }
   // Ctrl+W: close current workstream tab
   if (e.ctrlKey && !e.shiftKey && e.key === "w") {
