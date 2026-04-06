@@ -64,7 +64,7 @@ from turnstone.api.console_schemas import (
     RoleInfo,
     RouteCreateResponse,
     RouteResponse,
-    SetNodeMetadataRequest,
+    SetNodeMetadataValueRequest,
     SettingInfo,
     SettingSchemaInfo,
     SkillDiscoverResponse,
@@ -982,6 +982,12 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
     ),
     # --- Admin: Node metadata ---
     EndpointSpec(
+        "/v1/api/admin/node-metadata",
+        "GET",
+        "Get metadata for all nodes (bulk)",
+        tags=["Admin"],
+    ),
+    EndpointSpec(
         "/v1/api/admin/nodes/{node_id}/metadata",
         "GET",
         "Get all metadata for a node",
@@ -1001,7 +1007,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/admin/nodes/{node_id}/metadata/{key}",
         "PUT",
         "Set a single metadata key for a node",
-        request_model=SetNodeMetadataRequest,
+        request_model=SetNodeMetadataValueRequest,
         error_codes=[400],
         tags=["Admin"],
     ),

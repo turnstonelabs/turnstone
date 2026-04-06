@@ -97,6 +97,7 @@ class NodeDetailResponse(BaseModel):
     workstreams: list[ClusterWorkstreamInfo] = []
     aggregate: dict[str, int] = Field(default_factory=dict)
     reachable: bool = True
+    metadata: list[dict[str, Any]] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -916,7 +917,15 @@ class NodeMetadataResponse(BaseModel):
     metadata: list[NodeMetadataEntry] = Field(default_factory=list)
 
 
+class SetNodeMetadataValueRequest(BaseModel):
+    """Request body for PUT /admin/nodes/{node_id}/metadata/{key}."""
+
+    value: Any
+
+
 class SetNodeMetadataRequest(BaseModel):
+    """Single entry in a bulk metadata set."""
+
     key: str
     value: Any
 

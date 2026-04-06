@@ -2990,6 +2990,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
             _cfg_meta = _load_meta_config("metadata")
             _meta_entries.extend((k, json.dumps(v), "config") for k, v in _cfg_meta.items())
             if _meta_entries:
+                # Clear stale auto/config rows from a prior run before upserting
+                _svc_storage.delete_node_metadata_by_source(_svc_node_id, "auto")
+                _svc_storage.delete_node_metadata_by_source(_svc_node_id, "config")
                 _svc_storage.set_node_metadata_bulk(_svc_node_id, _meta_entries)
                 log.info(
                     "server.node_metadata_stored",

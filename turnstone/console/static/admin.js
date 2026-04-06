@@ -5020,39 +5020,14 @@ function loadAdminNodeMetadata() {
   if (!container) return;
   container.innerHTML = '<div class="dashboard-empty">Loading\u2026</div>';
 
-  // Fetch nodes list first, then metadata for each
-  authFetch("/v1/api/cluster/nodes?limit=1000")
+  // Single bulk fetch for all node metadata
+  authFetch("/v1/api/admin/node-metadata")
     .then(function (r) {
       if (!r.ok) throw new Error("Failed");
       return r.json();
     })
     .then(function (data) {
-      var nodes = data.nodes || [];
-      if (!nodes.length) {
-        container.innerHTML =
-          '<div class="dashboard-empty">No nodes registered</div>';
-        return;
-      }
-      // Fetch metadata for all nodes in parallel
-      var promises = nodes.map(function (n) {
-        return authFetch(
-          "/v1/api/admin/nodes/" + encodeURIComponent(n.node_id) + "/metadata",
-        )
-          .then(function (r) {
-            return r.ok ? r.json() : { node_id: n.node_id, metadata: [] };
-          })
-          .catch(function () {
-            return { node_id: n.node_id, metadata: [] };
-          });
-      });
-      return Promise.all(promises);
-    })
-    .then(function (results) {
-      if (!results) return;
-      _nodeMetaCache = {};
-      results.forEach(function (r) {
-        _nodeMetaCache[r.node_id] = r.metadata || [];
-      });
+      _nodeMetaCache = data.nodes || {};
       _renderNodeMetadata();
     })
     .catch(function () {
