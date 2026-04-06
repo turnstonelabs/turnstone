@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import threading
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
@@ -18,8 +19,10 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 from turnstone.core.auth import AuthResult
+from turnstone.core.session import ChatSession
 from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.server import (
+    create_workstream,
     delete_workstream_endpoint,
     list_interface_settings,
     open_workstream,
@@ -391,3 +394,135 @@ class TestUpdateInterfaceSetting:
             json={"value": "neon-pink"},
         )
         assert r.status_code == 400
+
+
+# ===========================================================================
+# FORK naming — forked workstreams must NOT inherit source title
+# ===========================================================================
+
+
+class TestForkWorkstreamNaming:
+    """Regression test: forking a workstream without a custom name must keep
+    the auto-generated short-ID name (``ws-XXXX``) rather than inheriting the
+    source workstream's display name.
+
+    The bug was an ``else`` branch in ``create_workstream`` that called
+    ``get_workstream_display_name(target_id)`` and overwrote ``ws.name``
+    with the source workstream's title.
+    """
+
+    @pytest.fixture()
+    def fork_app(self, tmp_path):
+        """Minimal Starlette app with the real ``create_workstream`` handler,
+        a real ``WorkstreamManager``, and mocked session factory.
+
+        Returns ``(TestClient, WorkstreamManager, queue.Queue)``.
+        """
+        import turnstone.core.storage._registry as _reg
+        from turnstone.core.workstream import WorkstreamManager
+
+        storage = SQLiteBackend(str(tmp_path / "fork_test.db"))
+
+        old_storage = _reg._storage
+        _reg._storage = storage
+
+        def _session_factory(
+            ui: Any, model_alias: Any = None, ws_id: Any = None, **kwargs: Any
+        ) -> ChatSession:
+            return ChatSession(
+                client=MagicMock(),
+                model=model_alias or "test-model",
+                ui=ui,
+                instructions=None,
+                temperature=0.5,
+                max_tokens=4096,
+                tool_timeout=30,
+                ws_id=ws_id,
+                skill=kwargs.get("skill"),
+            )
+
+        mgr = WorkstreamManager(_session_factory)
+
+        routes = [
+            Mount(
+                "/v1",
+                routes=[
+                    Route(
+                        "/api/workstreams/new",
+                        create_workstream,
+                        methods=["POST"],
+                    ),
+                ],
+            ),
+        ]
+        app = Starlette(
+            routes=routes,
+            middleware=[Middleware(_InjectAuthMiddleware)],
+        )
+        app.state.workstreams = mgr
+        app.state.skip_permissions = True
+        gq: queue.Queue[dict[str, Any]] = queue.Queue()
+        app.state.global_queue = gq
+        app.state.global_listeners = []
+        app.state.global_listeners_lock = threading.Lock()
+
+        client = TestClient(app, raise_server_exceptions=False)
+        yield client, mgr, gq
+        _reg._storage = old_storage
+
+    @patch("turnstone.core.memory.resolve_workstream", return_value="src-ws-id")
+    def test_fork_without_custom_name_keeps_auto_name(self, _mock_resolve, fork_app):
+        """When forking without a custom name, the new workstream must keep
+        its auto-generated ``ws-XXXX`` name, NOT the source workstream's title.
+        """
+        client, mgr, gq = fork_app
+
+        # Mock session.resume so the fork path executes
+        with patch.object(ChatSession, "resume", return_value=True):
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"resume_ws": "src-ws-id"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        ws_id = data["ws_id"]
+        assert data["resumed"] is True
+
+        # The name must be the auto-generated short-ID, not any inherited title
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        assert ws.name == f"ws-{ws_id[:4]}"
+        assert data["name"] == f"ws-{ws_id[:4]}"
+
+        # The ws_rename event on the global queue should also carry the auto name
+        events = []
+        while not gq.empty():
+            events.append(gq.get_nowait())
+        rename_events = [e for e in events if e["type"] == "ws_rename"]
+        assert len(rename_events) == 1
+        assert rename_events[0]["name"] == f"ws-{ws_id[:4]}"
+
+    @patch("turnstone.core.memory.resolve_workstream", return_value="src-ws-id")
+    def test_fork_with_custom_name_uses_provided_name(self, _mock_resolve, fork_app):
+        """When forking with a custom name, the new workstream must use that
+        name (set as an alias).
+        """
+        client, mgr, gq = fork_app
+
+        with patch.object(ChatSession, "resume", return_value=True), patch(
+            "turnstone.core.memory.set_workstream_alias"
+        ) as mock_alias:
+            resp = client.post(
+                "/v1/api/workstreams/new",
+                json={"resume_ws": "src-ws-id", "name": "My Custom Fork"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        ws_id = data["ws_id"]
+        assert data["resumed"] is True
+        assert data["name"] == "My Custom Fork"
+
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        assert ws.name == "My Custom Fork"
+        mock_alias.assert_called_once_with(ws_id, "My Custom Fork")

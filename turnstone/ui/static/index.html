@@ -17,19 +17,16 @@
   <span id="mcp-status" role="status" aria-live="polite"></span>
   <span id="health-indicator" class="health-ok" role="status" aria-live="polite" aria-atomic="true"></span>
   <span class="header-spacer"></span>
+  <button id="refresh-title-btn" class="header-btn ws-action-btn" onclick="refreshWorkstreamTitle()" aria-label="Regenerate title" title="Regenerate title" style="display:none">&#x21bb;</button>
+  <button id="edit-title-btn" class="header-btn ws-action-btn" onclick="editWorkstreamTitle()" aria-label="Edit title" title="Edit title" style="display:none">&#x270E;</button>
+  <button id="fork-ws-btn" class="header-btn ws-action-btn" onclick="forkWorkstream()" aria-label="Fork workstream" title="Fork workstream" style="display:none">&#x2442;</button>
+  <button id="delete-ws-btn" class="header-btn ws-action-btn ws-action-btn-danger" onclick="confirmDeleteWorkstream()" aria-label="Delete workstream" title="Delete workstream" style="display:none">&#x1f5d1;</button>
+  <span class="header-spacer"></span>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme" title="Switch to light theme">&#9790;</button>
 </div>
 
 <div id="tab-bar" role="toolbar" aria-label="Workstreams">
   <div id="tab-list" role="tablist"></div>
-  <div id="ws-action-group" class="ws-action-group hidden">
-    <span class="tab-bar-sep"></span>
-    <button id="refresh-title-btn" class="tab-bar-btn ws-action-btn" onclick="refreshWorkstreamTitle()" aria-label="Regenerate title" title="Regenerate title">&#x21bb;</button>
-    <button id="edit-title-btn" class="tab-bar-btn ws-action-btn" onclick="editWorkstreamTitle()" aria-label="Edit title" title="Edit title">&#x270E;</button>
-    <button id="fork-ws-btn" class="tab-bar-btn ws-action-btn" onclick="forkWorkstream()" aria-label="Fork workstream" title="Fork workstream">&#x2442;</button>
-    <button id="delete-ws-btn" class="tab-bar-btn ws-action-btn ws-action-btn-danger" onclick="confirmDeleteWorkstream()" aria-label="Delete workstream" title="Delete workstream"><span aria-hidden="true">&#x1f5d1;</span></button>
-    <span class="tab-bar-sep"></span>
-  </div>
   <button id="new-tab-btn" onclick="newWorkstream()" title="New workstream (Ctrl+T)" aria-label="New workstream" aria-keyshortcuts="Control+t">+</button>
   <button id="split-btn" onclick="splitFocusedPane()" title="Split pane (Ctrl+\)" aria-label="Split pane" aria-keyshortcuts="Control+Backslash">&#x29C9;</button>
 </div>

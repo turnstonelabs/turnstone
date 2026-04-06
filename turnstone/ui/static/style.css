@@ -196,9 +196,6 @@
 .ws-action-btn:hover { background: var(--bg-highlight); color: var(--fg-bright); border-color: var(--accent); }
 .ws-action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .ws-action-btn-danger:hover { color: var(--red); border-color: var(--red); }
-.ws-action-group { display: flex; align-items: center; flex-shrink: 0; }
-.ws-action-group.hidden { display: none; }
-.tab-bar-sep { width: 1px; height: 16px; background: var(--border-strong); margin: 0 4px; flex-shrink: 0; }
 .header-spacer { flex: 1; }
 
 /* Edit title & delete modals */
