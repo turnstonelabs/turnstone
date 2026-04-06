@@ -33,6 +33,17 @@ from turnstone.core.providers._protocol import (
 log = structlog.get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+# Keys always present on SDK tool-call objects — everything else is
+# provider-specific metadata (e.g. Gemini ``thought_signature``).
+_KNOWN_TC_KEYS = frozenset({"index", "id", "type", "function"})
+_KNOWN_FN_KEYS = frozenset({"name", "arguments"})
+
+
 class OpenAIChatCompletionsProvider:
     """Provider for local OpenAI-compatible servers (vLLM, llama.cpp, SGLang).
 
@@ -118,7 +129,10 @@ class OpenAIChatCompletionsProvider:
             cancel_ref.append(stream)
         return self._iter_stream(stream)
 
-    def _iter_stream(self, stream: Any) -> Iterator[StreamChunk]:
+    def _iter_stream(
+        self,
+        stream: Any,
+    ) -> Iterator[StreamChunk]:
         """Convert OpenAI Chat Completions stream chunks to StreamChunks."""
         first = True
         annotations: list[Any] = []
@@ -168,6 +182,21 @@ class OpenAIChatCompletionsProvider:
                             tcd.name = tc_delta.function.name
                         if tc_delta.function.arguments:
                             tcd.arguments_delta = tc_delta.function.arguments
+                    # Capture provider-specific metadata (e.g. Gemini
+                    # thought_signature) so it survives the round-trip.
+                    # Extras at the tool-call level AND inside the function
+                    # object are both captured — Gemini places
+                    # thought_signature inside function alongside name/args.
+                    if hasattr(tc_delta, "model_dump"):
+                        raw = tc_delta.model_dump(exclude_none=True, exclude_unset=True)
+                        for k, v in raw.items():
+                            if k not in _KNOWN_TC_KEYS:
+                                tcd.extra_fields[k] = v
+                        raw_fn = raw.get("function")
+                        if isinstance(raw_fn, dict):
+                            for k, v in raw_fn.items():
+                                if k not in _KNOWN_FN_KEYS:
+                                    tcd.extra_fields.setdefault("_fn_extra", {})[k] = v
                     sc.tool_call_deltas.append(tcd)
                     tool_call_count += 1
 
@@ -245,8 +274,9 @@ class OpenAIChatCompletionsProvider:
 
         tool_calls = None
         if msg.tool_calls:
-            tool_calls = [
-                {
+            tool_calls = []
+            for tc in msg.tool_calls:
+                tc_dict: dict[str, Any] = {
                     "id": tc.id,
                     "type": "function",
                     "function": {
@@ -254,8 +284,19 @@ class OpenAIChatCompletionsProvider:
                         "arguments": tc.function.arguments,
                     },
                 }
-                for tc in msg.tool_calls
-            ]
+                # Capture provider-specific metadata (e.g. Gemini
+                # thought_signature) for round-trip preservation.
+                if hasattr(tc, "model_dump"):
+                    raw = tc.model_dump(exclude_none=True, exclude_unset=True)
+                    for k, v in raw.items():
+                        if k not in _KNOWN_TC_KEYS:
+                            tc_dict[k] = v
+                    raw_fn = raw.get("function")
+                    if isinstance(raw_fn, dict):
+                        fn_extras = {k: v for k, v in raw_fn.items() if k not in _KNOWN_FN_KEYS}
+                        if fn_extras:
+                            tc_dict["function"] = {**tc_dict["function"], **fn_extras}
+                tool_calls.append(tc_dict)
 
         # Extract url_citation annotations from web search models
         content = msg.content or ""

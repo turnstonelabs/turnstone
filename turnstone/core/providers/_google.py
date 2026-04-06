@@ -31,6 +31,9 @@ _GOOGLE_DEFAULT = ModelCapabilities(
     # Gemini's OpenAI-compat endpoint accepts max_tokens (not
     # max_completion_tokens which is OpenAI Responses-specific).
     token_param="max_tokens",
+    # Gemini requires provider-specific fields (e.g. thought_signature)
+    # to survive the tool-call → tool-result round-trip.
+    preserve_tool_metadata=True,
 )
 
 

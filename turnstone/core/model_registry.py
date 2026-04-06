@@ -205,7 +205,15 @@ def _resolve_openai_provider(provider: str, base_url: str) -> str:
     When ``provider`` is ``"openai"`` but the ``base_url`` does not point to
     ``api.openai.com``, the model is on a local server (vLLM, llama.cpp, etc.)
     and should use the Chat Completions provider (``"openai-compatible"``).
+
+    Google's ``googleapis.com`` endpoint is auto-detected and routed to the
+    ``"google"`` provider so it gets proper capability defaults and avoids
+    local-server-only parameters like ``chat_template_kwargs``.
     """
+    if provider not in ("openai", ""):
+        return provider
+    if base_url and "googleapis.com" in base_url:
+        return "google"
     if provider == "openai" and base_url and "api.openai.com" not in base_url:
         return "openai-compatible"
     return provider

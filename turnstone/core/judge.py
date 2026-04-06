@@ -1222,7 +1222,7 @@ class IntentJudge:
                 deadline = time.monotonic() + per_call_timeout
                 while True:
                     remaining = deadline - time.monotonic()
-                    if cancel_event and cancel_event.is_set():
+                    if cancel_event and cancel_event.is_set() and self._config.cancel_on_approval:
                         future.cancel()
                         return None
                     if remaining <= 0:
