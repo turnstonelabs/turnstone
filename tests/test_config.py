@@ -3,7 +3,10 @@
 import argparse
 
 import turnstone.core.config as config_mod
-from turnstone.core.config import apply_config, load_config, set_config_path
+
+apply_config = config_mod.apply_config
+load_config = config_mod.load_config
+set_config_path = config_mod.set_config_path
 
 
 def _reset_cache():

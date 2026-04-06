@@ -14,6 +14,7 @@ from turnstone.core.auth import (
     check_request,
     create_jwt,
     is_public_path,
+    load_jwt_secret,
     make_clear_cookie,
     make_set_cookie,
     required_scope,
@@ -1420,13 +1421,11 @@ class TestIsSecureRequest:
 
 class TestSecretStrength:
     def test_short_secret_exits(self):
-        import turnstone.core.auth as auth_mod
-
         old = os.environ.get("TURNSTONE_JWT_SECRET", "")
         os.environ["TURNSTONE_JWT_SECRET"] = "short"
         try:
             with pytest.raises(SystemExit):
-                auth_mod.load_jwt_secret()
+                load_jwt_secret()
         finally:
             if old:
                 os.environ["TURNSTONE_JWT_SECRET"] = old
@@ -1434,14 +1433,12 @@ class TestSecretStrength:
                 os.environ.pop("TURNSTONE_JWT_SECRET", None)
 
     def test_missing_secret_exits(self):
-        import turnstone.core.auth as auth_mod
-
         with (
             patch("turnstone.core.config.load_config", return_value={}),
             patch.dict(os.environ, {}, clear=True),
             pytest.raises(SystemExit),
         ):
-            auth_mod.load_jwt_secret()
+            load_jwt_secret()
 
 
 class TestCorsConfigurable:
