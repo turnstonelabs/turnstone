@@ -111,6 +111,7 @@ if TYPE_CHECKING:
         ModelCapabilities,
         StreamChunk,
     )
+    from turnstone.core.tool_advisory import ToolAdvisory
     from turnstone.core.web_search import WebSearchClient
 
 # ---------------------------------------------------------------------------
@@ -2005,11 +2006,18 @@ class ChatSession:
 
                     # Advisory injection: wrap tool output with advisories
                     # (output guard findings, queued user messages, etc.)
+                    advisories = self._collect_advisories(
+                        assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
+                    )
                     if isinstance(output, str):
-                        advisories = self._collect_advisories(
-                            assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
-                        )
                         output = wrap_tool_result(output, advisories)
+                    elif isinstance(output, list) and advisories:
+                        # Structured/image output — append advisories as a
+                        # text part so they aren't silently dropped.
+                        output = [
+                            *output,
+                            {"type": "text", "text": wrap_tool_result("", advisories)},
+                        ]
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
@@ -3015,6 +3023,9 @@ class ChatSession:
         from turnstone.core.tool_advisory import parse_priority
 
         cleaned, priority = parse_priority(text)
+        # Cap individual message length to prevent context bloat
+        if len(cleaned) > 2000:
+            cleaned = cleaned[:2000] + "..."
         msg_id = uuid.uuid4().hex[:12]
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:
@@ -3052,7 +3063,7 @@ class ChatSession:
         assessment: OutputAssessment | None,
         func_name: str,
         is_last_in_batch: bool,
-    ) -> list[Any]:
+    ) -> list[ToolAdvisory]:
         """Gather advisories to attach to a tool result message.
 
         Returns an empty list when no advisories apply (common case).
@@ -3071,7 +3082,7 @@ class ChatSession:
                 self._flush_queued_messages()
             return []
 
-        advisories: list[Any] = []
+        advisories: list[ToolAdvisory] = []
 
         # Output guard advisory
         if assessment is not None:

@@ -92,6 +92,16 @@ class UserInterjection:
 # -- Wrapper ------------------------------------------------------------------
 
 
+def _escape_wrapper_tags(text: str) -> str:
+    """Escape sequences that could break the wrapper tag structure."""
+    return (
+        text.replace("</tool_output>", "&lt;/tool_output&gt;")
+        .replace("<tool_output>", "&lt;tool_output&gt;")
+        .replace("<system-reminder>", "&lt;system-reminder&gt;")
+        .replace("</system-reminder>", "&lt;/system-reminder&gt;")
+    )
+
+
 def wrap_tool_result(
     output: str,
     advisories: list[ToolAdvisory] | None = None,
@@ -99,12 +109,13 @@ def wrap_tool_result(
     """Wrap tool output with advisory blocks when advisories are present.
 
     When *advisories* is empty or ``None`` the raw *output* is returned
-    unchanged — no tags, no overhead.
+    unchanged — no tags, no overhead.  Tool output is escaped to prevent
+    tag injection that could break the wrapper structure.
     """
     if not advisories:
         return output
 
-    parts = [f"<tool_output>\n{output}\n</tool_output>"]
+    parts = [f"<tool_output>\n{_escape_wrapper_tags(output)}\n</tool_output>"]
     for advisory in advisories:
         parts.append(f"\n<system-reminder>\n{advisory.render()}\n</system-reminder>")
     return "\n".join(parts)

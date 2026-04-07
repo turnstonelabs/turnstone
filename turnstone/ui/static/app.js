@@ -704,7 +704,6 @@ Pane.prototype._dequeueMessage = function (el) {
     el.remove();
     return;
   }
-  var self = this;
   authFetch("/v1/api/send", {
     method: "DELETE",
     headers: { "Content-Type": "application/json" },
