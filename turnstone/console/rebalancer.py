@@ -258,9 +258,14 @@ class Rebalancer:
         if not current_rows:
             assignments = _weight_based_assignments(ring_nodes)
             self._storage.seed_ring_buckets(assignments)
-            self._bump_version()
+            new_version = self._bump_version()
+            # Populate router cache directly from computed assignments
+            # to avoid reading 65 536 rows back from DB.
             if self._router is not None:
-                self._router.refresh_cache()
+                from turnstone.console.router import NodeRef
+
+                node_refs = {n.node_id: NodeRef(n.node_id, n.url) for n in ring_nodes}
+                self._router.populate_from_assignments(assignments, node_refs, version=new_version)
             result.seeded = True
             result.noop = False
             result.duration_ms = (time.monotonic() - t0) * 1000
@@ -425,8 +430,10 @@ class Rebalancer:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _bump_version(self) -> None:
+    def _bump_version(self) -> int:
         """Increment the rebalancer_version counter in system_settings.
+
+        Returns the new version number.
 
         The read-then-write is safe because this method is only called while
         the leader lock is held (``_try_acquire_lock`` succeeded).  Concurrent
@@ -438,9 +445,11 @@ class Rebalancer:
         if raw is not None:
             with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
                 version = int(json.loads(raw.get("value", "0")))
+        new_version = version + 1
         self._storage.upsert_system_setting(
-            "rebalancer_version", json.dumps(version + 1), node_id=""
+            "rebalancer_version", json.dumps(new_version), node_id=""
         )
+        return new_version
 
     def _reconcile_bucket_stats(self) -> None:
         """Reconcile bucket_stats against actual workstream table data.

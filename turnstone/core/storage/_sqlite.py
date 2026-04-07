@@ -1540,7 +1540,7 @@ class SQLiteBackend:
     def seed_ring_buckets(self, assignments: list[tuple[int, str]]) -> None:
         from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-        chunk_size = 500
+        chunk_size = 8_000  # 2 params/row × 8k = 16k, within SQLite 3.32+ limit (32 766)
         with self._conn() as conn:
             for i in range(0, len(assignments), chunk_size):
                 chunk = assignments[i : i + chunk_size]

@@ -61,6 +61,28 @@ class TestFirstRunSeed:
         assert node_ids == {"node-0", "node-1"}
 
 
+class TestSeedPopulatesRouter:
+    def test_seed_populates_router_directly(self, storage):
+        """On first seed, the router cache is populated without a DB read-back."""
+        from turnstone.console.router import ConsoleRouter
+
+        _register_nodes(storage, 2)
+        router = ConsoleRouter(storage)
+        assert not router.is_ready()
+
+        rb = Rebalancer(storage=storage, router=router)
+        result = rb.rebalance_once()
+
+        assert result.seeded is True
+        assert router.is_ready()
+        assert router.node_count() == 2
+
+        # Routing should work for any valid ws_id
+        ws_id = "0000" + "a" * 28
+        ref = router.route(ws_id)
+        assert ref.node_id in {"node-0", "node-1"}
+
+
 class TestIdempotent:
     def test_second_run_is_noop(self, storage):
         """Running rebalance twice with same membership produces noop on second pass."""

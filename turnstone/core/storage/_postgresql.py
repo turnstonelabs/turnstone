@@ -1463,7 +1463,7 @@ class PostgreSQLBackend:
     def seed_ring_buckets(self, assignments: list[tuple[int, str]]) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-        chunk_size = 500
+        chunk_size = 16_000  # 2 params/row × 16k = 32k, within psycopg 65 535 limit
         with self._conn() as conn:
             for i in range(0, len(assignments), chunk_size):
                 chunk = assignments[i : i + chunk_size]
