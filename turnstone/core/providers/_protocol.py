@@ -81,6 +81,7 @@ class ModelCapabilities:
     supports_web_search: bool = False
     supports_tool_search: bool = False
     supports_vision: bool = False
+    supports_tool_advisories: bool = True
 
 
 def _lookup_capabilities(

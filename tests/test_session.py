@@ -927,7 +927,9 @@ class TestAgentOutputGuard:
         session = _make_session(judge_config=JudgeConfig(output_guard=True))
         session._provider = OpenAIChatCompletionsProvider()
 
-        with patch.object(session, "_evaluate_output", wraps=lambda cid, o, fn: o) as mock_eval:
+        with patch.object(
+            session, "_evaluate_output", wraps=lambda cid, o, fn: (o, None)
+        ) as mock_eval:
             # Simulate _run_agent getting a tool call response then a text response
             call_count = [0]
 

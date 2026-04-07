@@ -252,8 +252,9 @@ Pane.prototype.disconnectSSE = function () {
 Pane.prototype.setBusy = function (b) {
   this.busy = b;
   this.messagesEl.dataset.busy = b ? "true" : "false";
-  this.sendBtn.disabled = b;
-  this.sendBtn.style.display = b ? "none" : "";
+  // Keep send button enabled during busy — allows queuing messages
+  this.sendBtn.disabled = false;
+  this.sendBtn.style.display = "";
   this.stopBtn.style.display = b ? "" : "none";
   this.stopBtn.disabled = !b;
   this.stopBtn.textContent = "\u25a0 Stop";
@@ -522,6 +523,11 @@ Pane.prototype.handleEvent = function (evt) {
       this.addErrorMessage(evt.message);
       break;
 
+    case "message_queued":
+      // Confirmation from server that a queued message was accepted.
+      // The UI already showed the message optimistically in addQueuedMessage.
+      break;
+
     case "busy_error":
       // Server is still busy — don't transition to send mode.
       // Re-enable the stop button so the user can try cancelling.
@@ -632,6 +638,20 @@ Pane.prototype.addUserMessage = function (text) {
   el.className = "msg msg-user";
   el.textContent = text;
   this._addUserMsgActions(el, text);
+  this.messagesEl.appendChild(el);
+  this.scrollToBottom(true);
+};
+
+Pane.prototype.addQueuedMessage = function (text, priority) {
+  this.removeEmptyState();
+  var el = document.createElement("div");
+  el.className = "msg msg-user msg-queued";
+  if (priority === "important") el.classList.add("msg-queued-important");
+  var badge = document.createElement("span");
+  badge.className = "queued-badge";
+  badge.textContent = priority === "important" ? "queued (!!!) " : "queued ";
+  el.appendChild(badge);
+  el.appendChild(document.createTextNode(text));
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
 };
@@ -1466,9 +1486,10 @@ Pane.prototype.scrollToBottom = function (force) {
 
 Pane.prototype.sendMessage = function () {
   var text = this.inputEl.value.trim();
-  if (!text || this.busy) return;
+  if (!text) return;
 
   if (text.startsWith("/")) {
+    if (this.busy) return; // commands not allowed while busy
     authFetch("/v1/api/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1481,8 +1502,22 @@ Pane.prototype.sendMessage = function () {
   }
 
   var self = this;
-  this.setBusy(true);
-  this.addUserMessage(text);
+  var isBusy = this.busy;
+
+  if (isBusy) {
+    // Queue message for injection at the next tool-result seam.
+    // Strip !!! prefix for display, show priority badge instead.
+    var displayText = text;
+    var priority = "notice";
+    if (text.startsWith("!!!")) {
+      displayText = text.slice(3).trimStart();
+      priority = "important";
+    }
+    this.addQueuedMessage(displayText, priority);
+  } else {
+    this.setBusy(true);
+    this.addUserMessage(text);
+  }
   this.inputEl.value = "";
   this._autoResize();
 
@@ -1490,10 +1525,22 @@ Pane.prototype.sendMessage = function () {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ message: text, ws_id: this.wsId }),
-  }).catch(function (err) {
-    self.addErrorMessage("Connection error: " + err.message);
-    self.setBusy(false);
-  });
+  })
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function (data) {
+      if (data.status === "busy") {
+        self.addErrorMessage("Server is busy. Please wait.");
+        if (!isBusy) self.setBusy(false);
+      } else if (data.status === "queue_full") {
+        self.addErrorMessage("Message queue full. Please wait.");
+      }
+    })
+    .catch(function (err) {
+      self.addErrorMessage("Connection error: " + err.message);
+      if (!isBusy) self.setBusy(false);
+    });
 };
 
 Pane.prototype.cancelGeneration = function () {

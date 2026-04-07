@@ -158,7 +158,7 @@ OPENAI_CAPABILITIES: dict[str, ModelCapabilities] = {
 }
 
 # Default for unknown models (local servers: vLLM, llama.cpp, etc.)
-OPENAI_DEFAULT = ModelCapabilities()
+OPENAI_DEFAULT = ModelCapabilities(supports_tool_advisories=False)
 
 
 def lookup_openai_capabilities(model: str) -> ModelCapabilities:

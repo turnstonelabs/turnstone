@@ -1417,6 +1417,21 @@ async def send_message(request: Request) -> JSONResponse:
                 break
     with ws._lock:
         if ws.worker_thread and ws.worker_thread.is_alive():
+            # Queue the message for injection at the next tool-result seam
+            # instead of rejecting outright.
+            if ws.session is not None:
+                try:
+                    cleaned, priority = ws.session.queue_message(message)
+                except queue.Full:
+                    return JSONResponse({"status": "queue_full"})
+                ui._enqueue(
+                    {
+                        "type": "message_queued",
+                        "message": cleaned,
+                        "priority": priority,
+                    }
+                )
+                return JSONResponse({"status": "queued", "priority": priority})
             ui._enqueue(
                 {
                     "type": "busy_error",

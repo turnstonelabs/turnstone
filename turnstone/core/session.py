@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     from turnstone.core.judge import IntentJudge, JudgeConfig
     from turnstone.core.mcp_client import MCPClientManager
     from turnstone.core.model_registry import ModelConfig, ModelRegistry
+    from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.providers import (
         CompletionResult,
         LLMProvider,
@@ -376,6 +377,8 @@ class ChatSession:
         # Metacognitive nudges: ephemeral prompts for proactive memory use
         self._metacog_state: dict[str, float] = {}
         self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
+        # User message queue: messages sent while model is executing
+        self._queued_messages: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=10)
         # Repeat detection: track recent tool call signatures
         self._recent_tool_sigs: set[str] = set()
         # Tool error tracking: call_id → is_error for message persistence
@@ -1957,12 +1960,18 @@ class ChatSession:
                         self._init_system_messages()
 
                 # Map tool_call_id → tool name for logging
+                from turnstone.core.tool_advisory import wrap_tool_result
+
                 _tc_names = {c["id"]: c.get("function", {}).get("name", "") for c in tool_calls}
-                for tc_id, output in results:
+                _last_idx = len(results) - 1
+                for _ri, (tc_id, output) in enumerate(results):
                     # Output guard: evaluate tool result before it enters context
+                    assessment: OutputAssessment | None = None
                     if self._judge_cfg and self._judge_cfg.output_guard:
                         if isinstance(output, str):
-                            output = self._evaluate_output(tc_id, output, _tc_names.get(tc_id, ""))
+                            output, assessment = self._evaluate_output(
+                                tc_id, output, _tc_names.get(tc_id, "")
+                            )
                         elif isinstance(output, list):
                             # Image/structured output — evaluate each text part
                             # independently so credentials in any part get redacted.
@@ -1972,15 +1981,28 @@ class ChatSession:
                                     and p.get("type") == "text"
                                     and p.get("text")
                                 ):
-                                    p["text"] = self._evaluate_output(
+                                    p["text"], _part_assess = self._evaluate_output(
                                         tc_id, p["text"], _tc_names.get(tc_id, "")
                                     )
+                                    if _part_assess is not None:
+                                        assessment = _part_assess
 
                     # Safety truncation: clamp output to remaining context budget
                     # so a single large result cannot overflow the context window.
                     if isinstance(output, str):
                         budget = self._remaining_token_budget()
                         output = self._truncate_output(output, remaining_budget_tokens=budget)
+
+                    # Capture raw output for DB storage before advisory wrapping
+                    raw_output = output
+
+                    # Advisory injection: wrap tool output with advisories
+                    # (output guard findings, queued user messages, etc.)
+                    if isinstance(output, str):
+                        advisories = self._collect_advisories(
+                            assessment, _tc_names.get(tc_id, ""), _ri == _last_idx
+                        )
+                        output = wrap_tool_result(output, advisories)
 
                     tool_msg: dict[str, Any] = {
                         "role": "tool",
@@ -2005,19 +2027,20 @@ class ChatSession:
                         tok_est = max(1, int(len(output) / self._chars_per_token))
                     self._msg_tokens.append(tok_est)
 
-                    # Log tool result (skip memory tools to avoid noise)
+                    # Log tool result (skip memory tools to avoid noise).
+                    # Use raw_output (pre-advisory-wrap) so DB stores clean
+                    # tool output without ephemeral advisory XML.
                     _tname = _tc_names.get(tc_id, "")
                     if _tname not in (
                         "memory",
                         "recall",
                     ):
-                        # For image content, store text description only
-                        if isinstance(output, list):
+                        if isinstance(raw_output, list):
                             store_text = " ".join(
-                                p.get("text", "") for p in output if p.get("type") == "text"
+                                p.get("text", "") for p in raw_output if p.get("type") == "text"
                             )[:2000]
                         else:
-                            store_text = output[:2000]
+                            store_text = raw_output[:2000]
                         save_message(
                             self._ws_id,
                             "tool",
@@ -2077,6 +2100,9 @@ class ChatSession:
                 # This keeps the conversation valid for both providers while
                 # preserving the full tool call structure in history.
                 self._synthesize_cancelled_results("Cancelled by user.")
+            # Drain any queued user messages so they appear in the
+            # conversation and are visible on the next send().
+            self._flush_queued_messages()
             # No need to clear _cancel_event — it's replaced per-generation
             # in send(), so this generation's event is simply discarded.
             self.ui.on_info("[Generation cancelled]")
@@ -2085,9 +2111,11 @@ class ChatSession:
             # completes cleanly.
         except KeyboardInterrupt:
             self._synthesize_cancelled_results("Interrupted by user.")
+            self._flush_queued_messages()
             self._emit_state("error")
             raise
         except Exception:
+            self._flush_queued_messages()
             self._emit_state("error")
             raise
 
@@ -2927,10 +2955,13 @@ class ChatSession:
 
         return cancel_event
 
-    def _evaluate_output(self, call_id: str, output: str, func_name: str) -> str:
+    def _evaluate_output(
+        self, call_id: str, output: str, func_name: str
+    ) -> tuple[str, OutputAssessment | None]:
         """Run the output guard on tool result text.
 
-        Returns the (possibly sanitized) output.  Surfaces warnings via
+        Returns ``(possibly_sanitized_output, assessment)``.  The assessment
+        is ``None`` when risk_level is ``"none"``.  Surfaces warnings via
         ``ui.on_output_warning`` and logs at debug level.
         """
         from turnstone.core.output_guard import evaluate_output
@@ -2943,7 +2974,7 @@ class ChatSession:
             output, func_name=func_name, call_id=call_id, patterns=og_patterns
         )
         if assessment.risk_level == "none":
-            return output
+            return output, None
 
         log.debug(
             "output_guard.flagged",
@@ -2962,8 +2993,85 @@ class ChatSession:
             log.debug("output_guard.callback_failed", exc_info=True)
 
         if assessment.sanitized is not None and self._judge_cfg and self._judge_cfg.redact_secrets:
-            return assessment.sanitized
-        return output
+            return assessment.sanitized, assessment
+        return output, assessment
+
+    # -- User message queue -----------------------------------------------------
+
+    def queue_message(self, text: str) -> tuple[str, str]:
+        """Queue a user message for injection at the next tool-result seam.
+
+        Thread-safe — called from the HTTP handler while the worker thread
+        is executing.  Returns ``(cleaned_text, priority)``.
+        Raises ``queue.Full`` if the queue is saturated.
+        """
+        from turnstone.core.tool_advisory import parse_priority
+
+        cleaned, priority = parse_priority(text)
+        self._queued_messages.put_nowait((cleaned, priority))
+        return cleaned, priority
+
+    def _flush_queued_messages(self) -> None:
+        """Drain queued messages into a single user message.
+
+        Called after cancellation so queued messages are not silently lost.
+        Concatenates all pending messages to avoid multiple consecutive
+        user messages (out of distribution for most models).
+        """
+        parts: list[str] = []
+        while True:
+            try:
+                msg, priority = self._queued_messages.get_nowait()
+            except queue.Empty:
+                break
+            from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
+            parts.append(f"[IMPORTANT] {msg}" if priority == PRIORITY_IMPORTANT else msg)
+        if not parts:
+            return
+        combined = "\n\n".join(parts)
+        self.messages.append({"role": "user", "content": combined})
+        self._msg_tokens.append(max(1, int(len(combined) / self._chars_per_token)))
+        save_message(self._ws_id, "user", combined)
+
+    def _collect_advisories(
+        self,
+        assessment: OutputAssessment | None,
+        func_name: str,
+        is_last_in_batch: bool,
+    ) -> list[Any]:
+        """Gather advisories to attach to a tool result message.
+
+        Returns an empty list when no advisories apply (common case).
+        """
+        from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
+
+        caps = self._get_capabilities()
+
+        # When the model doesn't support advisory tags, still drain queued
+        # messages so they aren't silently orphaned — flush them as regular
+        # user messages instead.
+        if not caps.supports_tool_advisories:
+            if is_last_in_batch:
+                self._flush_queued_messages()
+            return []
+
+        advisories: list[Any] = []
+
+        # Output guard advisory
+        if assessment is not None:
+            advisories.append(GuardAdvisory(assessment=assessment, func_name=func_name))
+
+        # Drain queued user messages on the last result in the batch
+        if is_last_in_batch:
+            while True:
+                try:
+                    msg, priority = self._queued_messages.get_nowait()
+                except queue.Empty:
+                    break
+                advisories.append(UserInterjection(message=msg, priority=priority))
+
+        return advisories
 
     # -- Two-phase tool execution -----------------------------------------------
     #
@@ -5287,7 +5395,7 @@ class ChatSession:
                 # sees full output (credentials split by truncation would
                 # evade detection).  Agent outputs are always str.
                 if self._judge_cfg and self._judge_cfg.output_guard and isinstance(output, str):
-                    output = self._evaluate_output(tc_dict["id"], output, tool_name)
+                    output, _ = self._evaluate_output(tc_dict["id"], output, tool_name)
 
                 # Truncate large tool outputs to avoid blowing context limits.
                 # Agents operate autonomously; they can refine their queries
