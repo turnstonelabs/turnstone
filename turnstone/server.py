@@ -1390,12 +1390,33 @@ def _make_watch_dispatch(ws: Workstream, session: ChatSession, ui: Any) -> Any:
 
 
 async def send_message(request: Request) -> JSONResponse:
-    """POST /v1/api/send — send a user message to the workstream."""
+    """POST /v1/api/send — send or queue a user message.
+
+    DELETE /v1/api/send — remove a queued message by ``msg_id``.
+    """
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
+
+    # DELETE — remove a queued message
+    if request.method == "DELETE":
+        ws_id = body.get("ws_id")
+        msg_id = body.get("msg_id")
+        if not msg_id:
+            return JSONResponse({"error": "msg_id required"}, status_code=400)
+        mgr = request.app.state.workstreams
+        ws, ui = _get_ws(mgr, ws_id)
+        if not ws or not ui:
+            return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+        session = ws.session
+        if session is None:
+            return JSONResponse({"error": "No session"}, status_code=400)
+        removed = session.dequeue_message(msg_id)
+        return JSONResponse({"status": "removed" if removed else "not_found"})
+
+    # POST — send or queue
     message = body.get("message", "").strip()
     ws_id = body.get("ws_id")
     if not message:
@@ -1421,7 +1442,7 @@ async def send_message(request: Request) -> JSONResponse:
             # instead of rejecting outright.
             if ws.session is not None:
                 try:
-                    cleaned, priority = ws.session.queue_message(message)
+                    cleaned, priority, msg_id = ws.session.queue_message(message)
                 except queue.Full:
                     return JSONResponse({"status": "queue_full"})
                 ui._enqueue(
@@ -1429,9 +1450,10 @@ async def send_message(request: Request) -> JSONResponse:
                         "type": "message_queued",
                         "message": cleaned,
                         "priority": priority,
+                        "msg_id": msg_id,
                     }
                 )
-                return JSONResponse({"status": "queued", "priority": priority})
+                return JSONResponse({"status": "queued", "priority": priority, "msg_id": msg_id})
             ui._enqueue(
                 {
                     "type": "busy_error",
@@ -3149,7 +3171,7 @@ def create_app(
                     Route("/api/workstreams/{ws_id}/title", set_workstream_title, methods=["POST"]),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
-                    Route("/api/send", send_message, methods=["POST"]),
+                    Route("/api/send", send_message, methods=["POST", "DELETE"]),
                     Route("/api/approve", approve, methods=["POST"]),
                     Route("/api/plan", plan_feedback, methods=["POST"]),
                     Route("/api/command", command, methods=["POST"]),

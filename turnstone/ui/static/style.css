@@ -472,6 +472,20 @@
 .msg-queued-important .queued-badge {
   color: var(--yellow);
 }
+.queued-dismiss {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  margin-left: 8px;
+  float: right;
+  line-height: 1;
+}
+.queued-dismiss:hover {
+  color: var(--red);
+}
 .msg-assistant { align-self: flex-start; }
 .msg-info { color: var(--cyan); font-size: 12px; padding: 4px 14px; white-space: pre-wrap; font-family: inherit; }
 .msg-error { color: var(--red); font-size: 12px; padding: 4px 14px; }

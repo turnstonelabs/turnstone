@@ -665,6 +665,7 @@ Pane.prototype.addUserMessage = function (text) {
 
 Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
+  var self = this;
   var el = document.createElement("div");
   el.className = "msg msg-user msg-queued";
   el.setAttribute("role", "status");
@@ -680,9 +681,44 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   badge.textContent = priority === "important" ? "queued (!!!) " : "queued ";
   el.appendChild(badge);
   el.appendChild(document.createTextNode(text));
+  // Dismiss button — remove from queue before injection
+  var dismiss = document.createElement("button");
+  dismiss.className = "queued-dismiss";
+  dismiss.title = "Remove from queue";
+  dismiss.setAttribute("aria-label", "Remove queued message");
+  dismiss.textContent = "\u00d7";
+  dismiss.addEventListener("click", function (e) {
+    e.stopPropagation();
+    self._dequeueMessage(el);
+  });
+  el.appendChild(dismiss);
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
   return el;
+};
+
+Pane.prototype._dequeueMessage = function (el) {
+  var msgId = el.dataset.msgId;
+  if (!msgId) {
+    // ID not yet set from server response — remove optimistically
+    el.remove();
+    return;
+  }
+  var self = this;
+  authFetch("/v1/api/send", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ws_id: this.wsId, msg_id: msgId }),
+  })
+    .then(function (r) {
+      return r.json();
+    })
+    .then(function () {
+      el.remove();
+    })
+    .catch(function () {
+      el.remove();
+    });
 };
 
 Pane.prototype._addUserMsgActions = function (el, text) {
@@ -1560,7 +1596,9 @@ Pane.prototype.sendMessage = function () {
       return r.json();
     })
     .then(function (data) {
-      if (data.status === "busy") {
+      if (data.status === "queued" && data.msg_id && queuedEl) {
+        queuedEl.dataset.msgId = data.msg_id;
+      } else if (data.status === "busy") {
         if (queuedEl) queuedEl.remove();
         self.addErrorMessage("Server is busy. Please wait.");
         if (!isBusy) self.setBusy(false);

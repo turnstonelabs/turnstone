@@ -9,6 +9,7 @@ to receive events and handle approval prompts.
 from __future__ import annotations
 
 import base64
+import collections
 import concurrent.futures
 import contextlib
 import dataclasses
@@ -272,6 +273,8 @@ def _notify_auth_headers() -> dict[str, str]:
 
 
 class ChatSession:
+    _QUEUE_MAX = 10
+
     def __init__(
         self,
         client: Any,
@@ -377,8 +380,12 @@ class ChatSession:
         # Metacognitive nudges: ephemeral prompts for proactive memory use
         self._metacog_state: dict[str, float] = {}
         self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
-        # User message queue: messages sent while model is executing
-        self._queued_messages: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=10)
+        # User message queue: messages sent while model is executing.
+        # OrderedDict preserves FIFO order and supports O(1) removal by ID.
+        self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
+            collections.OrderedDict()
+        )
+        self._queued_lock = threading.Lock()
         # Repeat detection: track recent tool call signatures
         self._recent_tool_sigs: set[str] = set()
         # Tool error tracking: call_id → is_error for message persistence
@@ -2998,18 +3005,27 @@ class ChatSession:
 
     # -- User message queue -----------------------------------------------------
 
-    def queue_message(self, text: str) -> tuple[str, str]:
+    def queue_message(self, text: str) -> tuple[str, str, str]:
         """Queue a user message for injection at the next tool-result seam.
 
         Thread-safe — called from the HTTP handler while the worker thread
-        is executing.  Returns ``(cleaned_text, priority)``.
+        is executing.  Returns ``(cleaned_text, priority, msg_id)``.
         Raises ``queue.Full`` if the queue is saturated.
         """
         from turnstone.core.tool_advisory import parse_priority
 
         cleaned, priority = parse_priority(text)
-        self._queued_messages.put_nowait((cleaned, priority))
-        return cleaned, priority
+        msg_id = uuid.uuid4().hex[:12]
+        with self._queued_lock:
+            if len(self._queued_messages) >= self._QUEUE_MAX:
+                raise queue.Full()
+            self._queued_messages[msg_id] = (cleaned, priority)
+        return cleaned, priority, msg_id
+
+    def dequeue_message(self, msg_id: str) -> bool:
+        """Remove a queued message by ID.  Returns True if removed."""
+        with self._queued_lock:
+            return self._queued_messages.pop(msg_id, None) is not None
 
     def _flush_queued_messages(self) -> None:
         """Drain queued messages into a single user message.
@@ -3018,17 +3034,14 @@ class ChatSession:
         Concatenates all pending messages to avoid multiple consecutive
         user messages (out of distribution for most models).
         """
-        parts: list[str] = []
-        while True:
-            try:
-                msg, priority = self._queued_messages.get_nowait()
-            except queue.Empty:
-                break
-            from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
-            parts.append(f"[IMPORTANT] {msg}" if priority == PRIORITY_IMPORTANT else msg)
-        if not parts:
+        with self._queued_lock:
+            items = list(self._queued_messages.values())
+            self._queued_messages.clear()
+        if not items:
             return
+        parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
         combined = "\n\n".join(parts)
         self.messages.append({"role": "user", "content": combined})
         self._msg_tokens.append(max(1, int(len(combined) / self._chars_per_token)))
@@ -3043,6 +3056,8 @@ class ChatSession:
         """Gather advisories to attach to a tool result message.
 
         Returns an empty list when no advisories apply (common case).
+        Guard advisories attach per-result; user messages drain on the
+        last result in the batch only.
         """
         from turnstone.core.tool_advisory import GuardAdvisory, UserInterjection
 
@@ -3064,11 +3079,10 @@ class ChatSession:
 
         # Drain queued user messages on the last result in the batch
         if is_last_in_batch:
-            while True:
-                try:
-                    msg, priority = self._queued_messages.get_nowait()
-                except queue.Empty:
-                    break
+            with self._queued_lock:
+                items = list(self._queued_messages.values())
+                self._queued_messages.clear()
+            for msg, priority in items:
                 advisories.append(UserInterjection(message=msg, priority=priority))
 
         return advisories
