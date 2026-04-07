@@ -934,6 +934,11 @@ body { position: static; }
 }
 .pane-input-area button:hover { filter: brightness(1.1); }
 .pane-input-area button:disabled { opacity: 0.35; cursor: not-allowed; filter: none; }
+.pane-send.queue-mode {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
 .pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; }
 .pane-stop:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
 [data-theme="light"] .pane-stop { color: #fff; }

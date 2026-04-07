@@ -255,6 +255,27 @@ Pane.prototype.setBusy = function (b) {
   // Keep send button enabled during busy — allows queuing messages
   this.sendBtn.disabled = false;
   this.sendBtn.style.display = "";
+  if (b) {
+    this.sendBtn.textContent = "Queue";
+    this.sendBtn.setAttribute(
+      "aria-label",
+      "Queue message for delivery after current execution",
+    );
+    this.sendBtn.classList.add("queue-mode");
+    this.inputEl.placeholder = "Queue a message\u2026 (!!! for urgent)";
+  } else {
+    this.sendBtn.textContent = "Send";
+    this.sendBtn.setAttribute("aria-label", "Send message");
+    this.sendBtn.classList.remove("queue-mode");
+    this.inputEl.placeholder = "Type a message\u2026";
+    // Promote queued messages to normal appearance on idle
+    var queuedMsgs = this.messagesEl.querySelectorAll(".msg-queued");
+    for (var i = 0; i < queuedMsgs.length; i++) {
+      queuedMsgs[i].classList.remove("msg-queued", "msg-queued-important");
+      var badge = queuedMsgs[i].querySelector(".queued-badge");
+      if (badge) badge.remove();
+    }
+  }
   this.stopBtn.style.display = b ? "" : "none";
   this.stopBtn.disabled = !b;
   this.stopBtn.textContent = "\u25a0 Stop";
@@ -646,14 +667,22 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
   var el = document.createElement("div");
   el.className = "msg msg-user msg-queued";
-  if (priority === "important") el.classList.add("msg-queued-important");
+  el.setAttribute("role", "status");
+  if (priority === "important") {
+    el.classList.add("msg-queued-important");
+    el.setAttribute("aria-label", "Important message queued: " + text);
+  } else {
+    el.setAttribute("aria-label", "Message queued: " + text);
+  }
   var badge = document.createElement("span");
   badge.className = "queued-badge";
+  badge.setAttribute("aria-hidden", "true");
   badge.textContent = priority === "important" ? "queued (!!!) " : "queued ";
   el.appendChild(badge);
   el.appendChild(document.createTextNode(text));
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
+  return el;
 };
 
 Pane.prototype._addUserMsgActions = function (el, text) {
@@ -1503,6 +1532,7 @@ Pane.prototype.sendMessage = function () {
 
   var self = this;
   var isBusy = this.busy;
+  var queuedEl = null;
 
   if (isBusy) {
     // Queue message for injection at the next tool-result seam.
@@ -1513,7 +1543,7 @@ Pane.prototype.sendMessage = function () {
       displayText = text.slice(3).trimStart();
       priority = "important";
     }
-    this.addQueuedMessage(displayText, priority);
+    queuedEl = this.addQueuedMessage(displayText, priority);
   } else {
     this.setBusy(true);
     this.addUserMessage(text);
@@ -1531,13 +1561,16 @@ Pane.prototype.sendMessage = function () {
     })
     .then(function (data) {
       if (data.status === "busy") {
+        if (queuedEl) queuedEl.remove();
         self.addErrorMessage("Server is busy. Please wait.");
         if (!isBusy) self.setBusy(false);
       } else if (data.status === "queue_full") {
+        if (queuedEl) queuedEl.remove();
         self.addErrorMessage("Message queue full. Please wait.");
       }
     })
     .catch(function (err) {
+      if (queuedEl) queuedEl.remove();
       self.addErrorMessage("Connection error: " + err.message);
       if (!isBusy) self.setBusy(false);
     });
