@@ -236,6 +236,60 @@ class TestIsReady:
 
 
 # ---------------------------------------------------------------------------
+# TestPopulateFromAssignments
+# ---------------------------------------------------------------------------
+
+
+class TestPopulateFromAssignments:
+    """Direct cache population without DB round-trip."""
+
+    def test_populate_makes_router_ready(self) -> None:
+        router, _ = _make_router()
+        assignments = [(b, "node-a") for b in range(RING_SIZE)]
+        nodes = {"node-a": NodeRef("node-a", "http://a:8080")}
+        router.populate_from_assignments(assignments, nodes)
+
+        assert router.is_ready()
+        assert router.node_count() == 1
+        assert router.route(_ws_id_for_bucket(0)).node_id == "node-a"
+
+    def test_populate_multi_node(self) -> None:
+        router, _ = _make_router()
+        assignments = [(0, "node-a"), (1, "node-b"), (2, "node-a")]
+        nodes = {
+            "node-a": NodeRef("node-a", "http://a:8080"),
+            "node-b": NodeRef("node-b", "http://b:8080"),
+        }
+        router.populate_from_assignments(assignments, nodes)
+
+        assert router.route(_ws_id_for_bucket(0)).node_id == "node-a"
+        assert router.route(_ws_id_for_bucket(1)).node_id == "node-b"
+        assert router.route(_ws_id_for_bucket(2)).node_id == "node-a"
+
+    def test_populate_loads_overrides_from_db(self) -> None:
+        router, storage = _make_router()
+        ws_id = _ws_id_for_bucket(0)
+        storage.overrides = [{"ws_id": ws_id, "node_id": "node-b"}]
+        nodes = {
+            "node-a": NodeRef("node-a", "http://a:8080"),
+            "node-b": NodeRef("node-b", "http://b:8080"),
+        }
+        router.populate_from_assignments([(0, "node-a")], nodes)
+
+        # Override should route bucket 0 to node-b despite assignment to node-a
+        assert router.route(ws_id) == NodeRef("node-b", "http://b:8080")
+
+    def test_populate_no_overrides_when_table_empty(self) -> None:
+        router, storage = _make_router()
+        # No overrides in storage
+        router.populate_from_assignments(
+            [(0, "node-a")],
+            {"node-a": NodeRef("node-a", "http://a:8080")},
+        )
+        assert len(router._overrides) == 0
+
+
+# ---------------------------------------------------------------------------
 # TestNodeCount
 # ---------------------------------------------------------------------------
 

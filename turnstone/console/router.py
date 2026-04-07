@@ -94,6 +94,34 @@ class ConsoleRouter:
 
         return changed
 
+    def populate_from_assignments(
+        self,
+        assignments: list[tuple[int, str]],
+        nodes: dict[str, NodeRef],
+    ) -> None:
+        """Populate cache directly from computed assignments (no DB round-trip).
+
+        Used during initial seed to avoid a read-back of 65 536 rows.
+        Overrides are loaded from DB since they may exist from a prior run
+        (e.g. table was cleared but overrides survive).
+        """
+        new_cache: list[NodeRef | None] = [None] * RING_SIZE
+        for bucket, node_id in assignments:
+            ref = nodes.get(node_id)
+            if ref is not None:
+                new_cache[bucket] = ref
+
+        overrides = self._storage.list_workstream_overrides()
+        new_overrides: dict[str, NodeRef] = {}
+        for row in overrides:
+            ref = nodes.get(row["node_id"])
+            if ref is not None:
+                new_overrides[row["ws_id"]] = ref
+
+        with self._refresh_lock:
+            self._cache = new_cache
+            self._overrides = new_overrides
+
     def check_version(self) -> bool:
         """Poll the rebalancer version and refresh if it changed.
 

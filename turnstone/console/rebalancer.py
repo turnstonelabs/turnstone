@@ -257,10 +257,15 @@ class Rebalancer:
         # 3. If table is empty — first run, seed all 65536 buckets
         if not current_rows:
             assignments = _weight_based_assignments(ring_nodes)
+            # Populate router cache directly from computed assignments
+            # to avoid reading 65 536 rows back from DB.
+            if self._router is not None:
+                from turnstone.console.router import NodeRef
+
+                node_refs = {n.node_id: NodeRef(n.node_id, n.url) for n in ring_nodes}
+                self._router.populate_from_assignments(assignments, node_refs)
             self._storage.seed_ring_buckets(assignments)
             self._bump_version()
-            if self._router is not None:
-                self._router.refresh_cache()
             result.seeded = True
             result.noop = False
             result.duration_ms = (time.monotonic() - t0) * 1000
