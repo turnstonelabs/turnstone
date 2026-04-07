@@ -98,12 +98,15 @@ class ConsoleRouter:
         self,
         assignments: list[tuple[int, str]],
         nodes: dict[str, NodeRef],
+        *,
+        version: int = 0,
     ) -> None:
         """Populate cache directly from computed assignments (no DB round-trip).
 
         Used during initial seed to avoid a read-back of 65 536 rows.
         Overrides are loaded from DB since they may exist from a prior run
-        (e.g. table was cleared but overrides survive).
+        (e.g. table was cleared but overrides survive).  Setting *version*
+        prevents ``check_version()`` from triggering an immediate refresh.
         """
         new_cache: list[NodeRef | None] = [None] * RING_SIZE
         for bucket, node_id in assignments:
@@ -121,6 +124,7 @@ class ConsoleRouter:
         with self._refresh_lock:
             self._cache = new_cache
             self._overrides = new_overrides
+            self._version = version
 
     def check_version(self) -> bool:
         """Poll the rebalancer version and refresh if it changed.
