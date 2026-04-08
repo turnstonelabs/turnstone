@@ -51,7 +51,7 @@ anthropic = ["anthropic>=0.39"]
 postgres = ["psycopg[binary]>=3.2"]
 ddg = ["ddgs>=9.0"]
 discord = ["discord.py>=2.4"]
-tls = ["lacme>=1.0.4"]
+tls = ["lacme>=1.0.5"]
 sandbox = ["sympy>=1.13", "numpy>=2.0", "scipy>=1.14", "pytest>=9.0"]
 all = ["turnstone[console,anthropic,postgres,discord,ddg,tls,sandbox]"]
 
