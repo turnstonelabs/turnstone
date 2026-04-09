@@ -3368,7 +3368,8 @@ function renderSavedWorkstreams(items) {
       chk.type = "checkbox";
       chk.className = "ws-card-check";
       chk.checked = !!_wsDeleteSelected[sess.ws_id];
-      chk.setAttribute("aria-label", "Select " + label + " for deletion");
+      chk.setAttribute("tabindex", "-1");
+      chk.setAttribute("aria-hidden", "true");
       chk.onclick = function (e) {
         e.stopPropagation();
         if (chk.checked) _wsDeleteSelected[sess.ws_id] = true;
