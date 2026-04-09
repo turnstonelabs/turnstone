@@ -3368,30 +3368,19 @@ function renderSavedWorkstreams(items) {
       chk.type = "checkbox";
       chk.className = "ws-card-check";
       chk.checked = !!_wsDeleteSelected[sess.ws_id];
-      chk.setAttribute("tabindex", "-1");
-      chk.setAttribute("aria-hidden", "true");
+      chk.setAttribute("aria-label", "Select " + label + " for deletion");
       chk.onclick = function (e) {
         e.stopPropagation();
         if (chk.checked) _wsDeleteSelected[sess.ws_id] = true;
         else delete _wsDeleteSelected[sess.ws_id];
         card.classList.toggle("ws-selected", chk.checked);
-        card.setAttribute("aria-checked", chk.checked ? "true" : "false");
         updateWsDeleteBar();
       };
       card.appendChild(chk);
       card.setAttribute("tabindex", "0");
-      card.setAttribute("role", "checkbox");
-      card.setAttribute("aria-checked", chk.checked ? "true" : "false");
       card.onclick = function (e) {
         if (e.target === chk) return;
-        if (chk.checked) {
-          chk.classList.add("ws-check-hint");
-          setTimeout(function () {
-            chk.classList.remove("ws-check-hint");
-          }, 600);
-          return;
-        }
-        chk.checked = true;
+        chk.checked = !chk.checked;
         chk.onclick(e);
       };
       card.onkeydown = function (e) {
