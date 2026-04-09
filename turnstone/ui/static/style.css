@@ -1504,8 +1504,12 @@ audio.media-player {
 .dashboard-card .card-meta { font-size: 11px; color: var(--fg-dim); }
 
 /* Delete mode */
-.dashboard-card.ws-delete-mode { cursor: default; }
-.dashboard-card.ws-delete-mode:hover { border-color: var(--border); background: var(--bg-surface); }
+.dashboard-card.ws-delete-mode { cursor: pointer; }
+.dashboard-card.ws-delete-mode:hover { border-color: var(--red); background: rgba(248, 113, 113, 0.04); }
+.dashboard-card.ws-delete-mode.ws-selected { cursor: default; }
+.dashboard-card.ws-delete-mode.ws-selected:hover { border-color: var(--red); background: rgba(248, 113, 113, 0.08); }
+[data-theme="light"] .dashboard-card.ws-delete-mode:hover { background: rgba(220, 38, 38, 0.04); }
+[data-theme="light"] .dashboard-card.ws-delete-mode.ws-selected:hover { background: rgba(220, 38, 38, 0.08); }
 .ws-card-check {
   position: absolute;
   top: 8px;
@@ -1515,7 +1519,16 @@ audio.media-player {
   accent-color: var(--red);
   cursor: pointer;
   z-index: 1;
+  opacity: 0;
+  animation: ws-check-fadein 0.2s ease-out forwards;
 }
+.ws-card-check.ws-check-hint {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+  animation: ws-check-pulse 0.6s ease-out;
+}
+@keyframes ws-check-fadein { to { opacity: 1; } }
+@keyframes ws-check-pulse { 0% { transform: scale(1.3); } 100% { transform: scale(1); } }
 .dashboard-card.ws-selected {
   border-color: var(--red);
   background: rgba(248, 113, 113, 0.08);
@@ -1533,7 +1546,13 @@ audio.media-player {
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
-.ws-delete-bar.visible { display: flex; }
+.ws-delete-bar.visible { display: flex; animation: ws-bar-slide 0.2s ease-out; }
+@keyframes ws-bar-slide { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
+@media (prefers-reduced-motion: reduce) {
+  .ws-card-check { animation: none; opacity: 1; }
+  .ws-card-check.ws-check-hint { animation: none; }
+  .ws-delete-bar.visible { animation: none; }
+}
 .ws-delete-bar .ws-delete-count-label { font-size: 12px; color: var(--fg-dim); }
 .ws-delete-bar .ws-delete-bar-btn {
   margin-left: auto;
@@ -1560,6 +1579,20 @@ audio.media-player {
 }
 .ws-delete-bar .ws-delete-cancel-btn:hover {
   color: var(--fg-bright);
+  border-color: var(--border-strong);
+  background: var(--bg-highlight);
+}
+.ws-delete-bar .ws-delete-selectall-btn {
+  background: transparent;
+  color: var(--fg-bright);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.ws-delete-bar .ws-delete-selectall-btn:hover {
   border-color: var(--border-strong);
   background: var(--bg-highlight);
 }
@@ -1607,6 +1640,11 @@ audio.media-player {
   background: var(--red);
   color: #fff;
   border-color: var(--red);
+}
+#ws-delete-buttons button.ws-delete-close {
+  background: transparent;
+  color: var(--fg-bright);
+  border-color: var(--border);
 }
 
 /* Server dashboard row — clickable */

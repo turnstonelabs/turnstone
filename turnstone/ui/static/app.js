@@ -3368,18 +3368,37 @@ function renderSavedWorkstreams(items) {
       chk.type = "checkbox";
       chk.className = "ws-card-check";
       chk.checked = !!_wsDeleteSelected[sess.ws_id];
+      chk.setAttribute("aria-label", "Select " + label + " for deletion");
       chk.onclick = function (e) {
         e.stopPropagation();
         if (chk.checked) _wsDeleteSelected[sess.ws_id] = true;
         else delete _wsDeleteSelected[sess.ws_id];
         card.classList.toggle("ws-selected", chk.checked);
+        card.setAttribute("aria-checked", chk.checked ? "true" : "false");
         updateWsDeleteBar();
       };
       card.appendChild(chk);
+      card.setAttribute("tabindex", "0");
+      card.setAttribute("role", "checkbox");
+      card.setAttribute("aria-checked", chk.checked ? "true" : "false");
       card.onclick = function (e) {
         if (e.target === chk) return;
-        chk.checked = !chk.checked;
+        if (chk.checked) {
+          chk.classList.add("ws-check-hint");
+          setTimeout(function () {
+            chk.classList.remove("ws-check-hint");
+          }, 600);
+          return;
+        }
+        chk.checked = true;
         chk.onclick(e);
+      };
+      card.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          chk.checked = !chk.checked;
+          chk.onclick(e);
+        }
       };
     } else {
       card.setAttribute("role", "button");
@@ -3505,6 +3524,7 @@ function confirmWsDeleteSelection() {
   if (delBtn) {
     delBtn.textContent = "Delete";
     delBtn.disabled = false;
+    delBtn.classList.remove("ws-delete-close");
     delBtn.onclick = confirmWsDelete;
   }
   var cancelBtn = document.getElementById("ws-delete-cancel-btn");
@@ -3636,6 +3656,7 @@ function confirmWsDelete() {
     if (delBtn) {
       delBtn.disabled = false;
       delBtn.textContent = "Close";
+      delBtn.classList.add("ws-delete-close");
       delBtn.onclick = function () {
         cancelWsDelete();
         cancelWsDeleteMode();
