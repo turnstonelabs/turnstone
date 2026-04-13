@@ -24,6 +24,7 @@ from turnstone.core.providers._openai_common import (
     format_citations,
     lookup_openai_capabilities,
     resolve_reasoning_effort,
+    sanitize_messages,
 )
 from turnstone.core.providers._protocol import (
     CompletionResult,
@@ -83,6 +84,7 @@ class OpenAIResponsesProvider:
         concatenated system/developer messages (or ``None``) and *input_items*
         is the Responses API ``input`` array.
         """
+        messages = sanitize_messages(messages)
         instructions_parts: list[str] = []
         items: list[dict[str, Any]] = []
 
