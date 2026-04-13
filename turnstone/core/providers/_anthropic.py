@@ -714,8 +714,8 @@ class AnthropicProvider:
             elif event_type == "message_delta":
                 if hasattr(event, "usage") and event.usage:
                     u = event.usage
-                    inp = getattr(u, "input_tokens", 0)
-                    out = getattr(u, "output_tokens", 0)
+                    inp = getattr(u, "input_tokens", 0) or 0
+                    out = getattr(u, "output_tokens", 0) or 0
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
                     # prompt_tokens = total input (non-cached + cached) so
@@ -737,7 +737,7 @@ class AnthropicProvider:
             elif event_type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
                     u = event.message.usage
-                    inp = getattr(u, "input_tokens", 0)
+                    inp = getattr(u, "input_tokens", 0) or 0
                     cc = getattr(u, "cache_creation_input_tokens", 0) or 0
                     cr = getattr(u, "cache_read_input_tokens", 0) or 0
                     total_input = inp + cc + cr
@@ -835,13 +835,15 @@ class AnthropicProvider:
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            inp = getattr(u, "input_tokens", 0) or 0
+            out = getattr(u, "output_tokens", 0) or 0
             cc = getattr(u, "cache_creation_input_tokens", 0) or 0
             cr = getattr(u, "cache_read_input_tokens", 0) or 0
-            total_input = u.input_tokens + cc + cr
+            total_input = inp + cc + cr
             usage = UsageInfo(
                 prompt_tokens=total_input,
-                completion_tokens=u.output_tokens,
-                total_tokens=total_input + u.output_tokens,
+                completion_tokens=out,
+                total_tokens=total_input + out,
                 cache_creation_tokens=cc,
                 cache_read_tokens=cr,
             )

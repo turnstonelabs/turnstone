@@ -928,14 +928,16 @@ class ChatSession:
         ``max_tokens`` is an upper bound, not guaranteed consumption) plus
         a 5% safety margin.  Returns at least 0.
         """
+        used = self._system_tokens + sum(self._msg_tokens)
         if self._last_usage:
             # Provider-reported tokens from the last API call
             base = self._last_usage["prompt_tokens"]
-            # Only estimate tokens for messages added AFTER calibration
-            new_msg_tokens = sum(self._msg_tokens[self._calibrated_msg_count :])
+            # Only estimate tokens for messages added AFTER calibration.
+            # Clamp index to prevent stale _calibrated_msg_count from
+            # over-slicing after compaction or message list mutations.
+            start = min(self._calibrated_msg_count, len(self._msg_tokens))
+            new_msg_tokens = sum(self._msg_tokens[start:])
             used = base + new_msg_tokens
-        else:
-            used = self._system_tokens + sum(self._msg_tokens)
         response_reserve = min(self.max_tokens, self.context_window // 4)
         safety_margin = int(self.context_window * 0.05)
         return max(0, self.context_window - used - response_reserve - safety_margin)
