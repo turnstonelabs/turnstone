@@ -51,6 +51,31 @@ class TestModelConfig:
         cfg = ModelConfig(alias="test", base_url="http://x", api_key="sk-secret-key", model="m")
         assert "sk-secret-key" not in repr(cfg)
 
+    def test_sampling_params_default_none(self) -> None:
+        cfg = ModelConfig(alias="x", base_url="x", api_key="x", model="x")
+        assert cfg.temperature is None
+        assert cfg.max_tokens is None
+        assert cfg.reasoning_effort is None
+
+    def test_sampling_params_set(self) -> None:
+        cfg = ModelConfig(
+            alias="x",
+            base_url="x",
+            api_key="x",
+            model="x",
+            temperature=0.7,
+            max_tokens=8192,
+            reasoning_effort="high",
+        )
+        assert cfg.temperature == 0.7
+        assert cfg.max_tokens == 8192
+        assert cfg.reasoning_effort == "high"
+
+    def test_zero_temperature_distinct_from_none(self) -> None:
+        cfg = ModelConfig(alias="x", base_url="x", api_key="x", model="x", temperature=0.0)
+        assert cfg.temperature == 0.0
+        assert cfg.temperature is not None
+
 
 # ---------------------------------------------------------------------------
 # ModelRegistry
@@ -483,6 +508,58 @@ class TestLoadModelRegistryWithDB:
             reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
         assert reg.get_config("caps-model").capabilities == {"supports_vision": True}
 
+    def test_db_sampling_params_loaded(self) -> None:
+        """Per-model sampling params from DB are carried in ModelConfig."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "hot-model",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    "temperature": 1.5,
+                    "max_tokens": 4096,
+                    "reasoning_effort": "high",
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        cfg = reg.get_config("hot-model")
+        assert cfg.temperature == 1.5
+        assert cfg.max_tokens == 4096
+        assert cfg.reasoning_effort == "high"
+
+    def test_db_sampling_params_null_means_none(self) -> None:
+        """NULL sampling params in DB map to None (use global default)."""
+        storage = _MockStorage(
+            [
+                {
+                    "alias": "null-model",
+                    "model": "m",
+                    "provider": "openai",
+                    "base_url": "",
+                    "api_key": "",
+                    "context_window": 32768,
+                    "capabilities": "{}",
+                    "enabled": True,
+                    "temperature": None,
+                    "max_tokens": None,
+                    "reasoning_effort": None,
+                }
+            ]
+        )
+        with patch("turnstone.core.model_registry.load_config", return_value={}):
+            reg = load_model_registry("http://x/v1", "x", "x", storage=storage)
+        cfg = reg.get_config("null-model")
+        assert cfg.temperature is None
+        assert cfg.max_tokens is None
+        assert cfg.reasoning_effort is None
+
     def test_db_default_alias_not_clobbered(self) -> None:
         """DB model with alias='default' is not overwritten by CLI args."""
         storage = _MockStorage(
@@ -687,6 +764,45 @@ class TestSessionModelCommand:
         assert session.model_alias == "alt"
         assert session.context_window == 64000
         assert "Switched to" in session.ui.infos[-1]
+
+    def test_model_switch_applies_sampling_params(self) -> None:
+        reg = ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "default-model"),
+                "hot": ModelConfig(
+                    "hot",
+                    "y",
+                    "y",
+                    "hot-model",
+                    temperature=1.5,
+                    max_tokens=2048,
+                    reasoning_effort="high",
+                ),
+            },
+            default="default",
+        )
+        session = _make_session(registry=reg, model_alias="default")
+        assert session.temperature == 0.5  # initial global default
+        session.handle_command("/model hot")
+        assert session.temperature == 1.5
+        assert session.max_tokens == 2048
+        assert session.reasoning_effort == "high"
+
+    def test_model_switch_none_params_reverts_to_global(self) -> None:
+        """Switching to a model with no overrides reverts to global defaults."""
+        reg = ModelRegistry(
+            models={
+                "hot": ModelConfig("hot", "x", "x", "hot-model", temperature=1.5),
+                "plain": ModelConfig("plain", "y", "y", "plain-model"),
+            },
+            default="hot",
+        )
+        session = _make_session(registry=reg, model_alias="hot")
+        session.temperature = 1.5  # as set by per-model override
+        # Without a config_store, fallback keeps current value (CLI sessions).
+        # With a config_store, it would revert to the global default.
+        session.handle_command("/model plain")
+        assert session.temperature == 1.5  # no config_store → keeps current
 
     def test_model_switch_unknown_alias(self) -> None:
         reg = ModelRegistry(

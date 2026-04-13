@@ -1551,6 +1551,22 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <input type="password" id="model-api-key" placeholder="sk-..." autocomplete="off">
     <label for="model-ctx-window">Context Window <span style="font-weight:400;text-transform:none">(0 = auto-detect from model)</span></label>
     <input type="number" id="model-ctx-window" value="0" min="0">
+    <div class="modal-section-divider" role="separator">Sampling Defaults</div>
+    <label for="model-temperature">Temperature <span style="font-weight:400;text-transform:none">(empty = use global default)</span></label>
+    <input type="number" id="model-temperature" placeholder="Global default" step="0.1" min="0" max="2">
+    <label for="model-max-tokens">Max Tokens <span style="font-weight:400;text-transform:none">(empty = use global default)</span></label>
+    <input type="number" id="model-max-tokens" placeholder="Global default" min="1">
+    <label for="model-reasoning-effort">Reasoning Effort <span style="font-weight:400;text-transform:none">(empty = use global default)</span></label>
+    <select id="model-reasoning-effort">
+      <option value="">Global default</option>
+      <option value="none">none</option>
+      <option value="minimal">minimal</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+      <option value="xhigh">xhigh</option>
+      <option value="max">max</option>
+    </select>
     <label for="model-capabilities">Capabilities <span style="font-weight:400;text-transform:none">(JSON)</span></label>
     <textarea id="model-capabilities" rows="3" placeholder='{"supports_vision": true}' style="font-family:var(--font-mono);font-size:11px"></textarea>
     <div style="display:flex;gap:20px;margin-top:14px">

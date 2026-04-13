@@ -266,3 +266,21 @@ def warn_migrated_settings() -> None:
                 config_key,
                 key,
             )
+
+    # Warn about removed settings whose config.toml keys are now ignored.
+    # model.name → use model definitions (Models tab); model.context_window
+    # → set per-model in the Models tab (context_window column).
+    removed_settings: dict[str, str] = {
+        "model.name": "Use model definitions in the Models tab instead.",
+        "model.context_window": "Set per-model in the Models tab instead.",
+    }
+    for key, guidance in removed_settings.items():
+        section, config_key = key.split(".", 1)
+        section_data = cfg.get(section, {})
+        if isinstance(section_data, dict) and config_key in section_data:
+            log.warning(
+                "config.toml [%s] %s has been removed and will be ignored. %s",
+                section,
+                config_key,
+                guidance,
+            )

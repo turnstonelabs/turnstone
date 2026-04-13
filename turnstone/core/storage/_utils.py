@@ -106,6 +106,9 @@ MODEL_DEFINITION_MUTABLE = frozenset(
         "context_window",
         "capabilities",
         "enabled",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
     }
 )
 PROMPT_POLICY_MUTABLE = frozenset({"name", "content", "tool_gate", "priority", "enabled"})

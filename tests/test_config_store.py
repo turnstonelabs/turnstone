@@ -87,8 +87,8 @@ class TestSetGetRoundTrip:
         assert store.get("tools.skip_permissions") is False
 
     def test_str(self, store):
-        store.set("model.name", "gpt-5")
-        assert store.get("model.name") == "gpt-5"
+        store.set("model.default_alias", "gpt5-prod")
+        assert store.get("model.default_alias") == "gpt5-prod"
 
 
 # ---------------------------------------------------------------------------
@@ -165,10 +165,10 @@ class TestStoredKeys:
         assert store.stored_keys() == frozenset()
         store.set("tools.timeout", 30)
         assert store.stored_keys() == frozenset({"tools.timeout"})
-        store.set("model.name", "gpt-5")
-        assert store.stored_keys() == frozenset({"tools.timeout", "model.name"})
+        store.set("model.default_alias", "gpt5-prod")
+        assert store.stored_keys() == frozenset({"tools.timeout", "model.default_alias"})
         store.delete("tools.timeout")
-        assert store.stored_keys() == frozenset({"model.name"})
+        assert store.stored_keys() == frozenset({"model.default_alias"})
 
 
 # ---------------------------------------------------------------------------

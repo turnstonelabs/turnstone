@@ -6924,6 +6924,25 @@ class ChatSession:
                 self.context_window = cfg.context_window
                 if not self._manual_tool_truncation:
                     self.tool_truncation = int(cfg.context_window * self._chars_per_token * 0.5)
+                # Apply per-model sampling overrides, falling back to global
+                # defaults — mirrors session_factory() resolution logic so
+                # switching away from a model with overrides doesn't leak them.
+                cs = self._config_store
+                self.temperature = (
+                    cfg.temperature
+                    if cfg.temperature is not None
+                    else (cs.get("model.temperature") if cs else self.temperature)
+                )
+                self.max_tokens = (
+                    cfg.max_tokens
+                    if cfg.max_tokens is not None
+                    else (cs.get("model.max_tokens") if cs else self.max_tokens)
+                )
+                self.reasoning_effort = (
+                    cfg.reasoning_effort
+                    if cfg.reasoning_effort is not None
+                    else (cs.get("model.reasoning_effort") if cs else self.reasoning_effort)
+                )
                 self._init_system_messages()
                 self._save_config()
                 self.ui.on_info(f"Switched to {cyan(arg)}: {model_name}")

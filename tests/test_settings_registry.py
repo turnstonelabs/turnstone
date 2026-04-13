@@ -69,7 +69,7 @@ class TestValidateValueCoercion:
             validate_value("tools.timeout", None)
 
     def test_str(self):
-        assert validate_value("model.name", "gpt-5") == "gpt-5"
+        assert validate_value("model.default_alias", "gpt5-prod") == "gpt5-prod"
         assert validate_value("session.instructions", "be nice") == "be nice"
 
 
@@ -143,10 +143,10 @@ class TestSerializeDeserialize:
 
     def test_str_round_trip(self):
         v = "hello world"
-        assert deserialize_value("model.name", serialize_value(v)) == v
+        assert deserialize_value("model.default_alias", serialize_value(v)) == v
 
     def test_str_round_trip_empty(self):
-        assert deserialize_value("model.name", serialize_value("")) == ""
+        assert deserialize_value("model.default_alias", serialize_value("")) == ""
 
 
 # ---------------------------------------------------------------------------

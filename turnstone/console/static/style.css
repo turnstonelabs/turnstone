@@ -2471,6 +2471,12 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 .model-provider-google{color:var(--green);border-color:rgba(52,211,153,.2)}
 .model-provider-compat{color:var(--fg-dim);border-color:var(--border-strong)}
 
+/* Per-model override hints */
+.model-overrides-hint{font-size:10px;color:var(--fg-dim);font-family:var(--font-mono);letter-spacing:.02em}
+
+/* Modal section divider for field groups */
+.modal-section-divider{font-family:var(--font-display);font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--fg-dim);margin:16px 0 4px;padding-top:12px;border-top:1px solid var(--border)}
+
 /* Model source badge */
 .scope-db{color:var(--blue);border-color:rgba(56,189,248,.2)}
 

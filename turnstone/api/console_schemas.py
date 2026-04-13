@@ -812,6 +812,9 @@ class ModelDefinitionInfo(BaseModel):
     context_window: int = 32768
     capabilities: str = "{}"
     enabled: bool = True
+    temperature: float | None = None
+    max_tokens: int | None = None
+    reasoning_effort: str | None = None
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -827,6 +830,9 @@ class CreateModelDefinitionRequest(BaseModel):
     context_window: int = 32768
     capabilities: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+    temperature: float | None = None
+    max_tokens: int | None = None
+    reasoning_effort: str | None = None
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -838,6 +844,9 @@ class UpdateModelDefinitionRequest(BaseModel):
     context_window: int | None = None
     capabilities: dict[str, Any] | None = None
     enabled: bool | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
+    reasoning_effort: str | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):

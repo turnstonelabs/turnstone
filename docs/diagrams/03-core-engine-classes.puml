@@ -295,7 +295,7 @@ class "ModelRegistry" as ModelReg {
     --
     Thread-safe lazy client + provider
     creation. Loaded by load_model_registry()
-    from CLI args + [models.*] config.
+    from DB + [models.*] config + CLI args.
     --
     core/model_registry.py
 }
@@ -306,6 +306,9 @@ class "ModelConfig" as ModelCfg <<frozen>> {
     + base_url: str
     + model: str
     + context_window: int
+    + temperature: float | None
+    + max_tokens: int | None
+    + reasoning_effort: str | None
 }
 
 ' Circuit breaker state

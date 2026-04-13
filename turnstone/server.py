@@ -2774,6 +2774,9 @@ def internal_model_status(request: Request) -> JSONResponse:
             "source": cfg.source,
             "context_window": cfg.context_window,
             "enabled": True,
+            "temperature": cfg.temperature,
+            "max_tokens": cfg.max_tokens,
+            "reasoning_effort": cfg.reasoning_effort,
         }
     return JSONResponse({"models": models})
 
@@ -3406,9 +3409,8 @@ def main() -> None:
 
     client = create_client(provider_name, base_url=base_url, api_key=api_key)
 
-    cs_model = config_store.get("model.name")
     cli_model = args.model
-    effective_model = cli_model or cs_model or None
+    effective_model = cli_model or None
     if effective_model:
         model = effective_model
         detected_ctx = None
@@ -3422,13 +3424,10 @@ def main() -> None:
             # entry and relies on DB / config.toml models instead.
             model = ""
 
-    # Use detected context window, fall back to ConfigStore override or 32768
-    cfg_ctx = config_store.get("model.context_window")
+    # Use detected context window, fall back to 32768
     if detected_ctx:
         context_window = detected_ctx
         log.info("Context window: %s (detected from backend)", f"{context_window:,}")
-    elif cfg_ctx:  # 0 = auto-detect (no override)
-        context_window = cfg_ctx
     else:
         context_window = 32768
 
@@ -3595,15 +3594,32 @@ def main() -> None:
             except Exception as e:
                 log.warning("Failed to resolve judge_model %r: %s", judge_model, e)
 
+        # Per-model sampling overrides take priority over global defaults
+        eff_temperature = (
+            r_cfg.temperature
+            if r_cfg.temperature is not None
+            else config_store.get("model.temperature")
+        )
+        eff_max_tokens = (
+            r_cfg.max_tokens
+            if r_cfg.max_tokens is not None
+            else config_store.get("model.max_tokens")
+        )
+        eff_reasoning_effort = (
+            r_cfg.reasoning_effort
+            if r_cfg.reasoning_effort is not None
+            else config_store.get("model.reasoning_effort")
+        )
+
         return ChatSession(
             client=r_client,
             model=r_model,
             ui=ui,
             instructions=config_store.get("session.instructions") or None,
-            temperature=config_store.get("model.temperature"),
-            max_tokens=config_store.get("model.max_tokens"),
+            temperature=eff_temperature,
+            max_tokens=eff_max_tokens,
             tool_timeout=config_store.get("tools.timeout"),
-            reasoning_effort=config_store.get("model.reasoning_effort"),
+            reasoning_effort=eff_reasoning_effort,
             context_window=r_cfg.context_window,
             compact_max_tokens=config_store.get("session.compact_max_tokens"),
             auto_compact_pct=config_store.get("session.auto_compact_pct"),

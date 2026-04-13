@@ -161,3 +161,54 @@ class TestModelDefinitionStorage:
         assert m["capabilities"] == "{}"
         assert m["enabled"] is True
         assert m["created_by"] == ""
+        # Per-model sampling params default to None (use global default)
+        assert m["temperature"] is None
+        assert m["max_tokens"] is None
+        assert m["reasoning_effort"] is None
+
+    def test_create_with_sampling_params(self, db: SQLiteBackend) -> None:
+        did = _make_id()
+        db.create_model_definition(
+            definition_id=did,
+            alias="sampling",
+            model="gpt-5",
+            temperature=0.7,
+            max_tokens=8192,
+            reasoning_effort="high",
+        )
+        m = db.get_model_definition(did)
+        assert m is not None
+        assert m["temperature"] == 0.7
+        assert m["max_tokens"] == 8192
+        assert m["reasoning_effort"] == "high"
+
+    def test_create_with_zero_temperature(self, db: SQLiteBackend) -> None:
+        """temperature=0.0 is a valid override, distinct from None."""
+        did = _make_id()
+        db.create_model_definition(
+            definition_id=did, alias="zero-temp", model="o3", temperature=0.0
+        )
+        m = db.get_model_definition(did)
+        assert m is not None
+        assert m["temperature"] == 0.0
+
+    def test_update_sampling_params(self, db: SQLiteBackend) -> None:
+        did = _make_id()
+        db.create_model_definition(definition_id=did, alias="upd-samp", model="gpt-5")
+        db.update_model_definition(did, temperature=1.2, max_tokens=4096, reasoning_effort="low")
+        m = db.get_model_definition(did)
+        assert m is not None
+        assert m["temperature"] == 1.2
+        assert m["max_tokens"] == 4096
+        assert m["reasoning_effort"] == "low"
+
+    def test_clear_sampling_params(self, db: SQLiteBackend) -> None:
+        """Setting sampling params to None clears them back to global default."""
+        did = _make_id()
+        db.create_model_definition(
+            definition_id=did, alias="clear-samp", model="gpt-5", temperature=0.9
+        )
+        db.update_model_definition(did, temperature=None)
+        m = db.get_model_definition(did)
+        assert m is not None
+        assert m["temperature"] is None

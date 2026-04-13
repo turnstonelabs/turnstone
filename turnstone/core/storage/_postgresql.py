@@ -3084,6 +3084,9 @@ class PostgreSQLBackend:
         capabilities: str = "{}",
         enabled: bool = True,
         created_by: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         from sqlalchemy.dialects import postgresql
 
@@ -3101,6 +3104,9 @@ class PostgreSQLBackend:
                     context_window=context_window,
                     capabilities=capabilities,
                     enabled=1 if enabled else 0,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
                     created_by=created_by,
                     created=now,
                     updated=now,

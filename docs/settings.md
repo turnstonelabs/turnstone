@@ -36,6 +36,31 @@ users to the admin Settings API.
 
 ---
 
+## Per-Model Sampling Overrides
+
+The global `model.temperature`, `model.max_tokens`, and `model.reasoning_effort`
+settings serve as cluster-wide defaults. Individual models can override these
+via per-model settings in the `model_definitions` table (admin Models tab).
+
+Resolution order for sampling parameters:
+
+| Priority | Source |
+|----------|--------|
+| 1 (highest) | Per-model override (set in Models tab) |
+| 2 | Global default (set in Settings tab) |
+| 3 | Registry default (code) |
+
+When a per-model override is `NULL` (empty in the UI), the global default is
+used. Switching models via `/model <alias>` re-resolves sampling parameters
+from the new model's overrides or global defaults.
+
+**Removed settings:** `model.name` and `model.context_window` have been removed
+from ConfigStore. Model names and context windows are now configured per-model
+in the Models tab. A startup warning is logged if these keys appear in
+`config.toml`.
+
+---
+
 ## Bootstrap vs ConfigStore
 
 **Bootstrap settings** are required before storage is available (database
@@ -49,12 +74,12 @@ connection, Redis, auth secrets, server bind address). These stay in
 | Auth | `[auth]` | config.toml / env |
 | Console bind | `[console]` | config.toml / env |
 
-**ConfigStore settings** (51 settings) are loaded from the database after
-storage initialization:
+**ConfigStore settings** are loaded from the database after storage
+initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | name, temperature, max_tokens, reasoning_effort, context_window |
+| `model` | default_alias, temperature, max_tokens, reasoning_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |

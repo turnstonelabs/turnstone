@@ -696,6 +696,26 @@ agent_model = "claude"
 Each `[models.*]` entry produces a `ModelConfig` with a `provider` field
 (default: `"openai"`). Supported values: `"openai"`, `"anthropic"`, `"google"`,
 and `"openai-compatible"`.
+
+**Per-model sampling overrides:** Each model can specify `temperature`,
+`max_tokens`, and `reasoning_effort` to override the global defaults from
+ConfigStore. When unset (`NULL`), the global default is used.
+
+```toml
+[models.local]
+base_url = "http://localhost:8000/v1"
+model = "qwen3-32b"
+temperature = 0.7
+max_tokens = 8192
+
+[models.o3]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+model = "o3"
+reasoning_effort = "high"
+# temperature omitted — uses global default
+```
+
 An optional `[models.*.capabilities]` sub-table overrides per-model
 `ModelCapabilities` flags (useful for local models whose capabilities
 cannot be detected programmatically):
@@ -709,9 +729,15 @@ model = "qwen-3.5-vl"
 supports_vision = true
 ```
 
+**Database model definitions:** On server entry points, models can also be
+defined in the `model_definitions` table (admin Models tab). DB models support
+the same per-model sampling overrides. Config.toml models override DB models
+with the same alias in-memory (the DB rows are never modified).
+
 **Lifecycle:**
-1. `load_model_registry()` reads `[models.*]` sections from config.toml and
-   builds a `"default"` entry from CLI `--base-url`/`--model`/`--api-key` args
+1. `load_model_registry()` loads DB model definitions (if storage available),
+   then overlays `[models.*]` from config.toml, then builds a `"default"` entry
+   from CLI `--base-url`/`--model`/`--api-key` args
 2. The registry is passed to the session factory closure in both `cli.py` and
    `server.py`; each workstream resolves its model on creation
 3. `ModelRegistry.get_client()` lazily creates SDK client instances via
@@ -720,7 +746,8 @@ supports_vision = true
 4. `ModelRegistry.get_provider()` lazily creates `LLMProvider` instances via
    `create_provider()` (also cached and thread-safe)
 5. `/model` command shows available models; `/model <alias>` switches the
-   active workstream's client, model, and context window
+   active workstream's client, model, context window, and per-model sampling
+   parameters
 6. `_create_stream_with_retry()` tries the primary model, then each fallback
    alias in order if the primary is unreachable
 7. `_run_agent()` resolves `registry.agent_model` (if set) for plan/task

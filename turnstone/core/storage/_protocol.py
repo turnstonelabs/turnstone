@@ -1070,6 +1070,9 @@ class StorageBackend(Protocol):
         capabilities: str = "{}",
         enabled: bool = True,
         created_by: str = "",
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         """Create a model definition. No-op if definition_id already exists."""
         ...

@@ -36,14 +36,6 @@ def _build_registry() -> dict[str, SettingDef]:
     defs: list[SettingDef] = [
         # -- model ----------------------------------------------------------
         SettingDef(
-            "model.name",
-            "str",
-            "",
-            "Default model name (empty = use provider default)",
-            "model",
-            help="Which AI model to use for conversations. Leave empty to use the provider's default.",
-        ),
-        SettingDef(
             "model.default_alias",
             "str",
             "",
@@ -58,45 +50,38 @@ def _build_registry() -> dict[str, SettingDef]:
             "model.temperature",
             "float",
             0.5,
-            "Sampling temperature (ignored by models that don't support it, e.g. o-series)",
+            "Default sampling temperature (overridden by per-model settings)",
             "model",
             min_value=0.0,
             max_value=2.0,
-            help="Controls randomness in responses. Lower values (0.0\u20130.3) give focused, "
-            "deterministic output; higher values (0.7\u20131.5) make responses more creative and varied.",
+            help="Default sampling temperature for models without a per-model override. "
+            "Controls randomness in responses. Lower values (0.0\u20130.3) give focused, "
+            "deterministic output; higher values (0.7\u20131.5) make responses more creative "
+            "and varied. Per-model overrides can be set in the Models tab.",
             reference_url="https://arxiv.org/abs/1904.09751",
         ),
         SettingDef(
             "model.max_tokens",
             "int",
             32768,
-            "Max output tokens per response",
+            "Default max output tokens (overridden by per-model settings)",
             "model",
             min_value=1,
-            help="Upper limit on how long each response can be. One token is roughly 4 characters "
-            "of English text. Higher values allow longer responses but cost more.",
+            help="Default max output tokens for models without a per-model override. "
+            "Upper limit on how long each response can be. One token is roughly 4 characters "
+            "of English text. Per-model overrides can be set in the Models tab.",
         ),
         SettingDef(
             "model.reasoning_effort",
             "str",
             "medium",
-            "Reasoning effort level (only applies to models with reasoning support)",
+            "Default reasoning effort (overridden by per-model settings)",
             "model",
             choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            help="How much internal \u2018thinking\u2019 the model does before responding. Higher effort "
-            "improves quality on complex tasks but is slower and uses more tokens. Not all models "
-            "support this \u2014 it is silently ignored when unsupported.",
-        ),
-        SettingDef(
-            "model.context_window",
-            "int",
-            0,
-            "Context window size in tokens (0 = auto-detect from model)",
-            "model",
-            min_value=0,
-            help="How much conversation history the model can see at once, measured in tokens "
-            "(~4 characters each). Set to 0 to auto-detect from the model. Only override this "
-            "if auto-detection fails (common with local models).",
+            help="Default reasoning effort for models without a per-model override. "
+            "Controls how much internal \u2018thinking\u2019 the model does before responding. "
+            "Higher effort improves quality on complex tasks but is slower and uses more "
+            "tokens. Per-model overrides can be set in the Models tab.",
         ),
         # -- session --------------------------------------------------------
         SettingDef(

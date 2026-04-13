@@ -5235,6 +5235,9 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
 
 _MODEL_ALIAS_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 _MODEL_PROVIDERS = frozenset({"openai", "anthropic", "openai-compatible", "google"})
+_REASONING_EFFORT_CHOICES = frozenset(
+    {"", "none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
 # Keep in sync with turnstone.core.providers._google.GOOGLE_DEFAULT_BASE_URL
 _PROVIDER_DEFAULT_URLS: dict[str, str] = {
     "openai": "https://api.openai.com/v1",
@@ -5347,12 +5350,18 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         model_name = ""
         provider = "openai"
         context_window = 0
+        cfg_temperature = None
+        cfg_max_tokens = None
+        cfg_reasoning_effort = None
         for node_models in node_statuses.values():
             nm = node_models.get(alias)
             if nm:
                 model_name = nm.get("model", "")
                 provider = nm.get("provider", "openai")
                 context_window = nm.get("context_window", 0)
+                cfg_temperature = nm.get("temperature")
+                cfg_max_tokens = nm.get("max_tokens")
+                cfg_reasoning_effort = nm.get("reasoning_effort")
                 break
         result.append(
             {
@@ -5365,6 +5374,9 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
                 "context_window": context_window,
                 "capabilities": "{}",
                 "enabled": True,
+                "temperature": cfg_temperature,
+                "max_tokens": cfg_max_tokens,
+                "reasoning_effort": cfg_reasoning_effort,
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -5454,6 +5466,36 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
     enabled = bool(body.get("enabled", True))
 
+    # Per-model sampling overrides (None = use global default)
+    temperature: float | None = None
+    if body.get("temperature") is not None:
+        try:
+            temperature = float(body["temperature"])
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "temperature must be a number"}, status_code=400)
+        if not 0.0 <= temperature <= 2.0:
+            return JSONResponse(
+                {"error": "temperature must be between 0.0 and 2.0"}, status_code=400
+            )
+    max_tokens: int | None = None
+    if body.get("max_tokens") is not None:
+        try:
+            max_tokens = int(body["max_tokens"])
+        except (ValueError, TypeError):
+            return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
+        if max_tokens < 1:
+            return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
+    reasoning_effort: str | None = None
+    if body.get("reasoning_effort") is not None:
+        reasoning_effort = str(body["reasoning_effort"]).strip()
+        if reasoning_effort and reasoning_effort not in _REASONING_EFFORT_CHOICES:
+            return JSONResponse(
+                {"error": f"Invalid reasoning_effort: {reasoning_effort!r}"},
+                status_code=400,
+            )
+        if not reasoning_effort:
+            reasoning_effort = None
+
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -5465,6 +5507,9 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         capabilities=capabilities,
         enabled=enabled,
         created_by=audit_uid,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
     )
 
     record_audit(
@@ -5572,6 +5617,50 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
+
+    # Per-model sampling overrides — explicit null clears to "use global default"
+    if "temperature" in body:
+        raw_temp = body["temperature"]
+        if raw_temp is None:
+            updates["temperature"] = None
+        else:
+            try:
+                temp_val = float(raw_temp)
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "temperature must be a number"}, status_code=400)
+            if not 0.0 <= temp_val <= 2.0:
+                return JSONResponse(
+                    {"error": "temperature must be between 0.0 and 2.0"},
+                    status_code=400,
+                )
+            updates["temperature"] = temp_val
+    if "max_tokens" in body:
+        raw_mt = body["max_tokens"]
+        if raw_mt is None:
+            updates["max_tokens"] = None
+        else:
+            try:
+                mt_val = int(raw_mt)
+            except (ValueError, TypeError):
+                return JSONResponse({"error": "max_tokens must be an integer"}, status_code=400)
+            if mt_val < 1:
+                return JSONResponse({"error": "max_tokens must be >= 1"}, status_code=400)
+            updates["max_tokens"] = mt_val
+    if "reasoning_effort" in body:
+        raw_re = body["reasoning_effort"]
+        if raw_re is None:
+            updates["reasoning_effort"] = None
+        else:
+            re_val = str(raw_re).strip()
+            if not re_val:
+                updates["reasoning_effort"] = None
+            elif re_val not in _REASONING_EFFORT_CHOICES:
+                return JSONResponse(
+                    {"error": f"Invalid reasoning_effort: {re_val!r}"},
+                    status_code=400,
+                )
+            else:
+                updates["reasoning_effort"] = re_val
 
     if updates:
         storage.update_model_definition(definition_id, **updates)

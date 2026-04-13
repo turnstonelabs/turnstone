@@ -35,6 +35,10 @@ class ModelConfig:
     provider: str = "openai"
     capabilities: dict[str, Any] = field(default_factory=dict)
     source: str = ""  # "config", "db", or "" (CLI default)
+    # Per-model sampling overrides (None = use global default from ConfigStore)
+    temperature: float | None = None
+    max_tokens: int | None = None
+    reasoning_effort: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +272,10 @@ def load_model_registry(
                 # 0 = auto-detect: inherit CLI-detected context_window,
                 # same fallback chain as config.toml models
                 row_ctx = row.get("context_window", 0) or context_window
+                # Per-model sampling overrides (None = use global default)
+                row_temperature = row.get("temperature")
+                row_max_tokens = row.get("max_tokens")
+                row_reasoning_effort = row.get("reasoning_effort")
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
@@ -277,6 +285,11 @@ def load_model_registry(
                     provider=row_provider,
                     capabilities=caps,
                     source="db",
+                    temperature=float(row_temperature) if row_temperature is not None else None,
+                    max_tokens=int(row_max_tokens) if row_max_tokens is not None else None,
+                    reasoning_effort=row_reasoning_effort
+                    if row_reasoning_effort is not None
+                    else None,
                 )
         except Exception:
             log.warning("Failed to load model definitions from storage", exc_info=True)
@@ -290,6 +303,10 @@ def load_model_registry(
             log.warning("Model entry '%s' has no model name, skipping", alias)
             continue
         entry_base_url = _resolve_env_vars(entry.get("base_url", base_url))
+        # Per-model sampling overrides from config.toml
+        entry_temp = entry.get("temperature")
+        entry_max_tokens = entry.get("max_tokens")
+        entry_effort = entry.get("reasoning_effort")
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
@@ -301,6 +318,9 @@ def load_model_registry(
             if isinstance(entry.get("capabilities"), dict)
             else {},
             source="config",
+            temperature=float(entry_temp) if entry_temp is not None else None,
+            max_tokens=int(entry_max_tokens) if entry_max_tokens is not None else None,
+            reasoning_effort=str(entry_effort) if entry_effort is not None else None,
         )
 
     # 3. Ensure a "default" entry from CLI args (only if not already defined

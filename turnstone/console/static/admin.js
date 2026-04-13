@@ -4447,6 +4447,24 @@ function _renderModels(items) {
       colAlias.appendChild(document.createTextNode(" "));
       colAlias.appendChild(defBadge);
     }
+    // Per-model sampling override indicators
+    var overrides = [];
+    if (m.temperature != null) overrides.push("temp=" + m.temperature);
+    if (m.max_tokens != null) overrides.push("max_tok=" + m.max_tokens);
+    if (m.reasoning_effort != null)
+      overrides.push("effort=" + m.reasoning_effort);
+    if (overrides.length) {
+      var ovrSpan = document.createElement("span");
+      ovrSpan.className = "model-overrides-hint";
+      ovrSpan.textContent = overrides.join(", ");
+      ovrSpan.title = "Per-model overrides (override global defaults)";
+      ovrSpan.setAttribute(
+        "aria-label",
+        "Per-model overrides: " + overrides.join(", "),
+      );
+      colAlias.appendChild(document.createElement("br"));
+      colAlias.appendChild(ovrSpan);
+    }
     row.appendChild(colAlias);
 
     // Model ID
@@ -4593,6 +4611,9 @@ function showCreateModelModal() {
   document.getElementById("model-api-key").value = "";
   document.getElementById("model-api-key").placeholder = "sk-...";
   document.getElementById("model-ctx-window").value = "0";
+  document.getElementById("model-temperature").value = "";
+  document.getElementById("model-max-tokens").value = "";
+  document.getElementById("model-reasoning-effort").value = "";
   document.getElementById("model-capabilities").value = "";
   document.getElementById("model-enabled").checked = true;
   document.getElementById("model-detect-result").style.display = "none";
@@ -4626,6 +4647,12 @@ function showEditModelModal(definitionId) {
         "\u2022\u2022\u2022 (leave blank to keep existing)";
       document.getElementById("model-ctx-window").value =
         m.context_window != null ? m.context_window : 0;
+      document.getElementById("model-temperature").value =
+        m.temperature != null ? m.temperature : "";
+      document.getElementById("model-max-tokens").value =
+        m.max_tokens != null ? m.max_tokens : "";
+      document.getElementById("model-reasoning-effort").value =
+        m.reasoning_effort != null ? m.reasoning_effort : "";
       // Parse capabilities JSON for display
       var caps = m.capabilities || "{}";
       try {
@@ -4688,6 +4715,36 @@ function submitCreateModel() {
     capabilities: caps,
     enabled: document.getElementById("model-enabled").checked,
   };
+
+  // Per-model sampling overrides — null when empty (use global default)
+  var tempVal = document.getElementById("model-temperature").value.trim();
+  if (tempVal !== "") {
+    var t = parseFloat(tempVal);
+    if (isNaN(t) || t < 0 || t > 2) {
+      _showModelError("Temperature must be between 0 and 2");
+      return;
+    }
+    form.temperature = t;
+  } else {
+    form.temperature = null;
+  }
+  var mtVal = document.getElementById("model-max-tokens").value.trim();
+  if (mtVal !== "") {
+    var mt = parseInt(mtVal, 10);
+    if (isNaN(mt) || mt < 1) {
+      _showModelError("Max tokens must be at least 1");
+      return;
+    }
+    form.max_tokens = mt;
+  } else {
+    form.max_tokens = null;
+  }
+  var reVal = document.getElementById("model-reasoning-effort").value;
+  if (reVal !== "") {
+    form.reasoning_effort = reVal;
+  } else {
+    form.reasoning_effort = null;
+  }
 
   var apiKey = document.getElementById("model-api-key").value;
   if (apiKey) form.api_key = apiKey;
