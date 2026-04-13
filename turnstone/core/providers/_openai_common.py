@@ -7,13 +7,18 @@ formatting, and message sanitisation live here so both
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
+
+import structlog
 
 from turnstone.core.providers._protocol import (
     ModelCapabilities,
     UsageInfo,
     _lookup_capabilities,
 )
+
+log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Model capability table
@@ -304,21 +309,132 @@ def format_citations(content: str, annotations: list[Any]) -> str:
 def sanitize_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Ensure assistant messages always have ``content`` or ``tool_calls``.
+    """Sanitize messages for OpenAI-compatible APIs.
 
-    OpenAI-compatible APIs reject assistant messages that have neither.
-    This is a defensive catch-all; the upstream layers should already
-    guarantee well-formed messages.
+    Performs three repairs:
+
+    1. Ensures assistant messages always have ``content`` or ``tool_calls``
+       (APIs reject messages with neither).
+    2. Fills empty tool_call IDs with synthetic ``call_{uuid}`` values
+       (local servers sometimes omit them).
+    3. Detects and repairs orphaned tool_call / tool_result pairs:
+
+       - Synthesizes error tool messages for tool_calls with no matching
+         tool result.
+       - Drops tool messages whose ``tool_call_id`` has no matching
+         tool_call in the preceding assistant message.
+
+    Returns a new list; the original messages are not mutated.
     """
     out: list[dict[str, Any]] = []
-    for msg in messages:
-        if (
-            msg.get("role") == "assistant"
-            and msg.get("content") is None
-            and not msg.get("tool_calls")
-        ):
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        role = msg.get("role", "")
+
+        # (1) Fix empty-content assistant messages
+        if role == "assistant" and msg.get("content") is None and not msg.get("tool_calls"):
             msg = {**msg, "content": ""}
+            out.append(msg)
+            i += 1
+            continue
+
+        # (2+3) Assistant with tool_calls: fix IDs and detect orphans
+        if role == "assistant" and msg.get("tool_calls"):
+            tool_calls = msg["tool_calls"]
+
+            # Back-fill empty IDs and build positional remap for tool results.
+            # Local servers (vLLM, llama.cpp) sometimes omit IDs entirely;
+            # positional pairing is the best heuristic in that case.
+            needs_id_fix = any(not tc.get("id") for tc in tool_calls)
+            id_remap: dict[int, str] = {}  # positional index → new ID
+            if needs_id_fix:
+                new_tcs = []
+                empty_idx = 0
+                for tc in tool_calls:
+                    if not tc.get("id"):
+                        new_id = f"call_{uuid.uuid4().hex}"
+                        id_remap[empty_idx] = new_id
+                        empty_idx += 1
+                        new_tcs.append({**tc, "id": new_id})
+                    else:
+                        new_tcs.append(tc)
+                msg = {**msg, "tool_calls": new_tcs}
+                tool_calls = msg["tool_calls"]
+
+            # Collect IDs from this assistant message
+            tc_ids = [tc["id"] for tc in tool_calls if tc.get("id")]
+            tc_id_set = set(tc_ids)
+
+            out.append(msg)
+            i += 1
+
+            # Copy through existing tool messages, applying ID remap and
+            # filtering out stale results that don't match any tool_call.
+            local_answered: set[str] = set()
+            empty_result_idx = 0
+            while i < len(messages) and messages[i].get("role") == "tool":
+                tool_msg = messages[i]
+                result_tc_id = tool_msg.get("tool_call_id", "")
+                if not result_tc_id and empty_result_idx in id_remap:
+                    # Positional remap: empty result → matching new ID
+                    new_id = id_remap[empty_result_idx]
+                    tool_msg = {**tool_msg, "tool_call_id": new_id}
+                    local_answered.add(new_id)
+                    empty_result_idx += 1
+                    out.append(tool_msg)
+                elif not result_tc_id:
+                    # Empty ID with no remap available — drop it
+                    log.debug("sanitize_messages: dropping tool result with empty ID")
+                    empty_result_idx += 1
+                elif result_tc_id in tc_id_set:
+                    local_answered.add(result_tc_id)
+                    out.append(tool_msg)
+                else:
+                    log.debug(
+                        "sanitize_messages: dropping stale tool result: %s",
+                        result_tc_id,
+                    )
+                i += 1
+
+            # Synthesize error results for tool_calls not answered in
+            # THIS turn (not all of `out`, to avoid false matches from
+            # reused IDs across turns).
+            still_orphaned = [uid for uid in tc_ids if uid not in local_answered]
+            if still_orphaned:
+                log.debug(
+                    "sanitize_messages: synthesizing %d tool result(s) for orphaned tool_calls",
+                    len(still_orphaned),
+                )
+                for uid in still_orphaned:
+                    out.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": uid,
+                            "content": "Tool execution was cancelled.",
+                        }
+                    )
+            continue
+
+        # (3d) Drop orphaned tool results
+        if role == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            # Find the preceding assistant message's tool_call IDs
+            prev_tc_ids: set[str] = set()
+            for k in range(len(out) - 1, -1, -1):
+                if out[k].get("role") == "assistant" and out[k].get("tool_calls"):
+                    prev_tc_ids = {tc.get("id", "") for tc in out[k]["tool_calls"] if tc.get("id")}
+                    break
+            if prev_tc_ids and tc_id and tc_id not in prev_tc_ids:
+                log.debug(
+                    "sanitize_messages: dropping orphaned tool result (no matching tool_call): %s",
+                    tc_id,
+                )
+                i += 1
+                continue
+
         out.append(msg)
+        i += 1
     return out
 
 

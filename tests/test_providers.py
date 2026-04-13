@@ -178,6 +178,217 @@ class TestOpenAIProvider:
         sanitize_messages([original])
         assert original["content"] is None
 
+    # -- sanitize_messages: orphan detection -----------------------------------
+
+    def test_sanitize_orphaned_tool_call_synthesized(self) -> None:
+        """Tool_call with no matching tool result gets a synthetic error result."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "user", "content": "next"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 3
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_1"
+        assert "cancelled" in result[1]["content"]
+        assert result[2]["role"] == "user"
+
+    def test_sanitize_partial_results(self) -> None:
+        """Only the missing tool_call gets a synthetic result."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 3
+        assert result[1]["tool_call_id"] == "call_1"
+        assert result[1]["content"] == "ok"
+        assert result[2]["role"] == "tool"
+        assert result[2]["tool_call_id"] == "call_2"
+        assert "cancelled" in result[2]["content"]
+
+    def test_sanitize_complete_results_unchanged(self) -> None:
+        """All tool_calls paired → no changes."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "thanks"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 3
+        assert result[0]["tool_calls"][0]["id"] == "call_1"
+        assert result[1]["content"] == "ok"
+        assert result[2]["role"] == "user"
+
+    def test_sanitize_trailing_orphan(self) -> None:
+        """Orphaned tool_call at end of conversation (no following messages)."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 2
+        assert result[1]["role"] == "tool"
+        assert result[1]["tool_call_id"] == "call_1"
+
+    def test_sanitize_orphaned_tool_result_dropped(self) -> None:
+        """Tool result with no matching tool_call in preceding assistant → dropped."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_ORPHAN", "content": "stale"},
+        ]
+        result = sanitize_messages(msgs)
+        assert len(result) == 2
+        assert result[1]["tool_call_id"] == "call_1"
+
+    def test_sanitize_empty_tool_call_id_filled(self) -> None:
+        """Empty tool_call IDs get synthetic values; tool results are remapped to match."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "", "content": "ok"},
+        ]
+        result = sanitize_messages(msgs)
+        new_id = result[0]["tool_calls"][0]["id"]
+        assert new_id.startswith("call_")
+        assert len(new_id) > 10
+        # Tool result must have been remapped to match
+        assert result[1]["tool_call_id"] == new_id
+        # No synthetic result needed — the pairing is complete
+        assert len(result) == 2
+
+    def test_sanitize_stale_result_with_orphan(self) -> None:
+        """Stale tool results are dropped even when orphaned calls are present."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "tool", "tool_call_id": "call_STALE", "content": "stale"},
+        ]
+        result = sanitize_messages(msgs)
+        result_tc_ids = [m["tool_call_id"] for m in result if m.get("role") == "tool"]
+        assert "call_STALE" not in result_tc_ids
+        assert "call_1" in result_tc_ids
+        assert "call_2" in result_tc_ids  # synthesized
+
+    def test_sanitize_orphan_no_mutation(self) -> None:
+        """Original messages and dicts are not mutated by orphan detection."""
+        tc = {"id": "", "type": "function", "function": {"name": "a", "arguments": "{}"}}
+        msg = {"role": "assistant", "content": None, "tool_calls": [tc]}
+        sanitize_messages([msg])
+        assert tc["id"] == ""  # original dict untouched
+        assert msg["tool_calls"][0]["id"] == ""
+
+    def test_sanitize_repeated_ids_across_turns(self) -> None:
+        """Reused tool_call IDs across turns are handled per-turn, not globally."""
+        msgs = [
+            # Turn 1: call_1 fully paired
+            {"role": "user", "content": "do A"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            # Turn 2: reuses call_1 but has no result → must be synthesized
+            {"role": "user", "content": "do B"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+        ]
+        result = sanitize_messages(msgs)
+        # Turn 2's orphaned call_1 should get a synthetic result
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2  # one real from turn 1, one synthetic from turn 2
+
     # -- convert_tools --------------------------------------------------------
 
     def test_convert_tools_passthrough(self) -> None:
@@ -3235,11 +3446,14 @@ class TestResponsesMessageConversion:
             },
         ]
         _, items = self.provider._convert_messages(messages)
-        assert len(items) == 1
+        # sanitize_messages synthesizes a missing tool result for the orphaned call
+        assert len(items) == 2
         assert items[0]["type"] == "function_call"
         assert items[0]["call_id"] == "call_1"
         assert items[0]["name"] == "read_file"
         assert items[0]["arguments"] == '{"path": "/tmp"}'
+        assert items[1]["type"] == "function_call_output"
+        assert items[1]["call_id"] == "call_1"
 
     def test_tool_result(self) -> None:
         messages = [
@@ -3290,11 +3504,14 @@ class TestResponsesMessageConversion:
             },
         ]
         _, items = self.provider._convert_messages(messages)
-        assert len(items) == 2
+        # sanitize_messages synthesizes a missing tool result for the orphaned call
+        assert len(items) == 3
         assert items[0]["type"] == "message"
         assert items[0]["content"] == "I'll read that file"
         assert items[1]["type"] == "function_call"
         assert items[1]["name"] == "read_file"
+        assert items[2]["type"] == "function_call_output"
+        assert items[2]["call_id"] == "call_1"
 
 
 class TestResponsesToolConversion:
