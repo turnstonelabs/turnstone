@@ -128,6 +128,8 @@ def _anthropic_event(
         if "usage_input_tokens" in kwargs:
             msg_usage = MagicMock()
             msg_usage.input_tokens = kwargs.get("usage_input_tokens", 0)
+            msg_usage.cache_creation_input_tokens = 0
+            msg_usage.cache_read_input_tokens = 0
             msg.usage = msg_usage
         else:
             msg.usage = None
@@ -637,6 +639,8 @@ class TestAnthropicProvider:
         response.usage = MagicMock()
         response.usage.input_tokens = 10
         response.usage.output_tokens = 5
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
 
         client = MagicMock()
         stream_ctx = MagicMock()
@@ -673,6 +677,8 @@ class TestAnthropicProvider:
         response.usage = MagicMock()
         response.usage.input_tokens = 15
         response.usage.output_tokens = 20
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
 
         client = MagicMock()
         stream_ctx = MagicMock()
@@ -708,6 +714,8 @@ class TestAnthropicProvider:
         response.usage = MagicMock()
         response.usage.input_tokens = 100
         response.usage.output_tokens = 50
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
 
         client = MagicMock()
         stream_ctx = MagicMock()
@@ -1910,6 +1918,8 @@ class TestAnthropicWebSearch:
         response.stop_reason = "end_turn"
         response.usage.input_tokens = 100
         response.usage.output_tokens = 50
+        response.usage.cache_creation_input_tokens = 0
+        response.usage.cache_read_input_tokens = 0
 
         client = MagicMock()
         stream_ctx = MagicMock()
@@ -2876,7 +2886,8 @@ class TestAnthropicPromptCaching:
                 messages=[{"role": "user", "content": "hi"}],
             )
         )
-        start_chunks = [r for r in results if r.usage is not None and r.usage.prompt_tokens == 100]
+        # prompt_tokens = input_tokens (100) + cache_creation (80) + cache_read (0) = 180
+        start_chunks = [r for r in results if r.usage is not None and r.usage.prompt_tokens == 180]
         assert len(start_chunks) == 1
         assert start_chunks[0].usage is not None
         assert start_chunks[0].usage.cache_creation_tokens == 80
