@@ -366,30 +366,29 @@ def sanitize_messages(
             tc_ids = [tc["id"] for tc in tool_calls if tc.get("id")]
             tc_id_set = set(tc_ids)
 
-            # Peek ahead: collect tool_call_ids from consecutive tool messages
-            j = i + 1
-            result_ids: set[str] = set()
-            while j < len(messages) and messages[j].get("role") == "tool":
-                tc_id = messages[j].get("tool_call_id", "")
-                if tc_id:
-                    result_ids.add(tc_id)
-                j += 1
-
             out.append(msg)
             i += 1
 
             # Copy through existing tool messages, applying ID remap and
             # filtering out stale results that don't match any tool_call.
+            local_answered: set[str] = set()
             empty_result_idx = 0
             while i < len(messages) and messages[i].get("role") == "tool":
                 tool_msg = messages[i]
                 result_tc_id = tool_msg.get("tool_call_id", "")
                 if not result_tc_id and empty_result_idx in id_remap:
                     # Positional remap: empty result → matching new ID
-                    tool_msg = {**tool_msg, "tool_call_id": id_remap[empty_result_idx]}
+                    new_id = id_remap[empty_result_idx]
+                    tool_msg = {**tool_msg, "tool_call_id": new_id}
+                    local_answered.add(new_id)
                     empty_result_idx += 1
                     out.append(tool_msg)
-                elif result_tc_id in tc_id_set or not result_tc_id:
+                elif not result_tc_id:
+                    # Empty ID with no remap available — drop it
+                    log.debug("sanitize_messages: dropping tool result with empty ID")
+                    empty_result_idx += 1
+                elif result_tc_id in tc_id_set:
+                    local_answered.add(result_tc_id)
                     out.append(tool_msg)
                 else:
                     log.debug(
@@ -398,10 +397,10 @@ def sanitize_messages(
                     )
                 i += 1
 
-            # Synthesize error results for orphaned tool_calls
-            # (recompute after remap may have resolved some)
-            answered = {m.get("tool_call_id", "") for m in out if m.get("role") == "tool"}
-            still_orphaned = [uid for uid in tc_ids if uid not in answered]
+            # Synthesize error results for tool_calls not answered in
+            # THIS turn (not all of `out`, to avoid false matches from
+            # reused IDs across turns).
+            still_orphaned = [uid for uid in tc_ids if uid not in local_answered]
             if still_orphaned:
                 log.debug(
                     "sanitize_messages: synthesizing %d tool result(s) for orphaned tool_calls",

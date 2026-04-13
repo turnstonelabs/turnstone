@@ -353,6 +353,42 @@ class TestOpenAIProvider:
         assert tc["id"] == ""  # original dict untouched
         assert msg["tool_calls"][0]["id"] == ""
 
+    def test_sanitize_repeated_ids_across_turns(self) -> None:
+        """Reused tool_call IDs across turns are handled per-turn, not globally."""
+        msgs = [
+            # Turn 1: call_1 fully paired
+            {"role": "user", "content": "do A"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            # Turn 2: reuses call_1 but has no result → must be synthesized
+            {"role": "user", "content": "do B"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+        ]
+        result = sanitize_messages(msgs)
+        # Turn 2's orphaned call_1 should get a synthetic result
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 2  # one real from turn 1, one synthetic from turn 2
+
     # -- convert_tools --------------------------------------------------------
 
     def test_convert_tools_passthrough(self) -> None:
