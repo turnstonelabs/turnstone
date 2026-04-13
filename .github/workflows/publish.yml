@@ -49,7 +49,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.tag.outputs.skip == 'false'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
