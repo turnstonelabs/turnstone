@@ -372,6 +372,7 @@ class ChatSession:
         self._applied_skill_version: int = 0
         self._applied_skill_content: str = ""  # inline prompt from applied skill
         self._assistant_pending_tokens = 0
+        self._calibrated_msg_count = 0  # len(messages) at last _update_token_table
         self.creative_mode = False
         self._notify_count = 0
         # Watch support: server-level runner injected via set_watch_runner()
@@ -918,11 +919,25 @@ class ChatSession:
     def _remaining_token_budget(self) -> int:
         """Estimate how many tokens are available for new content.
 
+        When provider-reported usage is available, uses the last API
+        call's ``prompt_tokens`` as ground truth and only estimates the
+        delta (messages added since that call).  Falls back to pure
+        local estimates otherwise.
+
         Reserves a response budget (capped at 25% of context window, since
         ``max_tokens`` is an upper bound, not guaranteed consumption) plus
         a 5% safety margin.  Returns at least 0.
         """
         used = self._system_tokens + sum(self._msg_tokens)
+        if self._last_usage:
+            # Provider-reported tokens from the last API call
+            base = self._last_usage["prompt_tokens"]
+            # Only estimate tokens for messages added AFTER calibration.
+            # Clamp index to prevent stale _calibrated_msg_count from
+            # over-slicing after compaction or message list mutations.
+            start = min(self._calibrated_msg_count, len(self._msg_tokens))
+            new_msg_tokens = sum(self._msg_tokens[start:])
+            used = base + new_msg_tokens
         response_reserve = min(self.max_tokens, self.context_window // 4)
         safety_margin = int(self.context_window * 0.05)
         return max(0, self.context_window - used - response_reserve - safety_margin)
@@ -1090,6 +1105,7 @@ class ChatSession:
         self._read_files.clear()
         self._recent_tool_sigs.clear()
         self._last_usage = None
+        self._calibrated_msg_count = 0
         self._title_generated = True  # don't re-title resumed workstreams
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
@@ -1836,6 +1852,7 @@ class ChatSession:
                     return
 
                 self._update_token_table(assistant_msg)
+                self._print_status_line()  # Report usage for EVERY API call
                 self.messages.append(assistant_msg)
                 self._msg_tokens.append(
                     self._assistant_pending_tokens
@@ -1875,7 +1892,6 @@ class ChatSession:
 
                 tool_calls = assistant_msg.get("tool_calls")
                 if not tool_calls:
-                    self._print_status_line()
                     # Auto-compact when prompt exceeds threshold
                     if (
                         self._last_usage
@@ -2093,6 +2109,18 @@ class ChatSession:
                 if user_feedback:
                     self.messages.append({"role": "user", "content": user_feedback})
                     self._msg_tokens.append(max(1, int(len(user_feedback) / self._chars_per_token)))
+
+                # Mid-turn compaction: prevent context overflow during long
+                # tool chains.  Uses local estimates since _last_usage reflects
+                # the previous API call, not the tool results just appended.
+                estimated_prompt = self._system_tokens + sum(self._msg_tokens)
+                if estimated_prompt > self.context_window * self.auto_compact_pct:
+                    pct_display = int(self.auto_compact_pct * 100)
+                    self.ui.on_info(
+                        f"\n[Auto-compacting mid-turn: estimated prompt "
+                        f"exceeds {pct_display}% of context window]"
+                    )
+                    self._compact_messages(auto=True)
         except GenerationCancelled:
             # If a newer send() has started (force cancel), this thread is
             # orphaned — skip all message mutations and state changes.
@@ -2259,6 +2287,11 @@ class ChatSession:
         Returns the complete assistant message as a dict suitable for
         appending to self.messages.
         """
+        # Reset so this API call captures fresh usage — prevents stale
+        # completion_tokens from a prior tool-chain iteration leaking
+        # through the max() accumulator.
+        self._last_usage = None
+
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_calls_acc: dict[int, dict[str, Any]] = {}
@@ -2598,17 +2631,44 @@ class ChatSession:
 
     # -- Token tracking & status ----------------------------------------------
 
-    def _msg_char_count(self, msg: dict[str, Any]) -> int:
-        """Count characters in a message, including tool call arguments."""
+    # Fixed token count per image (provider-agnostic average).
+    _IMAGE_TOKENS = 1000
+
+    @staticmethod
+    def _msg_text_chars(msg: dict[str, Any]) -> tuple[int, int]:
+        """Return (text_chars, image_count) for a message.
+
+        Counts all textual content plus structural overhead (role,
+        tool_call IDs, tool call names/arguments).  Images are counted
+        separately so the calibration can subtract their fixed token
+        cost from prompt_tokens.
+        """
         content = msg.get("content")
+        n = 0
+        images = 0
         if isinstance(content, list):
-            n = sum(len(p.get("text", "")) for p in content if p.get("type") == "text")
+            n += sum(len(p.get("text", "")) for p in content if p.get("type") == "text")
+            images += sum(1 for p in content if p.get("type") == "image_url")
         else:
-            n = len(content or "")
+            n += len(content or "")
         for tc in msg.get("tool_calls", []):
+            n += len(tc.get("id", ""))
             n += len(tc.get("function", {}).get("name", ""))
             n += len(tc.get("function", {}).get("arguments", ""))
-        return n
+        # Structural overhead: role, tool_call_id
+        n += len(msg.get("role", ""))
+        n += len(msg.get("tool_call_id", ""))
+        return n, images
+
+    def _msg_char_count(self, msg: dict[str, Any]) -> int:
+        """Count characters in a message, including structural overhead.
+
+        Includes role markers, tool_call IDs, and image placeholders so
+        that the chars_per_token calibration matches what providers
+        actually bill.
+        """
+        text_chars, images = self._msg_text_chars(msg)
+        return text_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
 
     def _update_token_table(self, assistant_msg: dict[str, Any]) -> None:
         """Update per-message token estimates using API usage data."""
@@ -2619,12 +2679,28 @@ class ChatSession:
         compl_tok = self._last_usage["completion_tokens"]
 
         # Calibrate chars_per_token ratio from actual usage.
+        # Images get a fixed token budget, so we subtract those from the
+        # provider-reported prompt_tokens and calibrate only the text portion.
         all_msgs = self._full_messages()  # system + self.messages (before append)
         active_tools = self._get_active_tools() or []
         tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
-        total_chars = sum(self._msg_char_count(m) for m in all_msgs) + tool_def_chars
-        if total_chars > 0 and prompt_tok > 0:
-            self._chars_per_token = total_chars / prompt_tok
+        text_chars = 0
+        image_count = 0
+        for m in all_msgs:
+            tc, ic = self._msg_text_chars(m)
+            text_chars += tc
+            image_count += ic
+        text_chars += tool_def_chars
+        image_tokens = image_count * self._IMAGE_TOKENS
+        text_prompt_tok = prompt_tok - image_tokens
+        if text_prompt_tok <= 0:
+            log.debug(
+                "Image token estimate (%d) >= prompt_tokens (%d), skipping calibration",
+                image_tokens,
+                prompt_tok,
+            )
+        elif text_chars > 0:
+            self._chars_per_token = text_chars / text_prompt_tok
 
         # Compute system_tokens (stable after first call)
         sys_chars = sum(self._msg_char_count(m) for m in self.system_messages)
@@ -2637,6 +2713,10 @@ class ChatSession:
 
         # Stash completion_tokens for the assistant message about to be appended
         self._assistant_pending_tokens = compl_tok
+
+        # Record how many messages were in context at calibration time so
+        # _remaining_token_budget() can estimate only the delta.
+        self._calibrated_msg_count = len(self.messages)
 
         # Token budget tracking
         if self._token_budget > 0:
@@ -2849,6 +2929,7 @@ class ChatSession:
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
         sa_tok = max(1, int(self._msg_char_count(summary_asst) / self._chars_per_token))
         self._msg_tokens = [su_tok, sa_tok]
+        self._calibrated_msg_count = len(self.messages)  # anchored to compacted state
         after_tokens = self._system_tokens + sum(self._msg_tokens)
 
         # Update usage estimate so the status bar reflects post-compaction state
@@ -6713,6 +6794,7 @@ class ChatSession:
             self._read_files.clear()
             self._recent_tool_sigs.clear()
             self._last_usage = None
+            self._calibrated_msg_count = 0
             self._msg_tokens = []
             self.ui.on_info("Context cleared (messages preserved in database).")
 
@@ -6723,6 +6805,7 @@ class ChatSession:
             self._read_files.clear()
             self._recent_tool_sigs.clear()
             self._last_usage = None
+            self._calibrated_msg_count = 0
             self._msg_tokens = []
             self._ws_id = uuid.uuid4().hex
             self._title_generated = False

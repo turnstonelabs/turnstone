@@ -714,14 +714,19 @@ class AnthropicProvider:
             elif event_type == "message_delta":
                 if hasattr(event, "usage") and event.usage:
                     u = event.usage
+                    inp = getattr(u, "input_tokens", 0) or 0
+                    out = getattr(u, "output_tokens", 0) or 0
+                    cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                    # prompt_tokens = total input (non-cached + cached) so
+                    # context-window tracking matches OpenAI semantics.
+                    total_input = inp + cc + cr
                     sc.usage = UsageInfo(
-                        prompt_tokens=getattr(u, "input_tokens", 0),
-                        completion_tokens=getattr(u, "output_tokens", 0),
-                        total_tokens=(
-                            getattr(u, "input_tokens", 0) + getattr(u, "output_tokens", 0)
-                        ),
-                        cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-                        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                        prompt_tokens=total_input,
+                        completion_tokens=out,
+                        total_tokens=total_input + out,
+                        cache_creation_tokens=cc,
+                        cache_read_tokens=cr,
                     )
                 if hasattr(event.delta, "stop_reason") and event.delta.stop_reason:
                     sc.finish_reason = _normalize_finish_reason(event.delta.stop_reason)
@@ -732,12 +737,16 @@ class AnthropicProvider:
             elif event_type == "message_start":
                 if hasattr(event.message, "usage") and event.message.usage:
                     u = event.message.usage
+                    inp = getattr(u, "input_tokens", 0) or 0
+                    cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+                    cr = getattr(u, "cache_read_input_tokens", 0) or 0
+                    total_input = inp + cc + cr
                     sc.usage = UsageInfo(
-                        prompt_tokens=getattr(u, "input_tokens", 0),
+                        prompt_tokens=total_input,
                         completion_tokens=0,
-                        total_tokens=getattr(u, "input_tokens", 0),
-                        cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-                        cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                        total_tokens=total_input,
+                        cache_creation_tokens=cc,
+                        cache_read_tokens=cr,
                     )
 
             has_content = sc.content_delta or sc.reasoning_delta or sc.tool_call_deltas
@@ -826,12 +835,17 @@ class AnthropicProvider:
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            inp = getattr(u, "input_tokens", 0) or 0
+            out = getattr(u, "output_tokens", 0) or 0
+            cc = getattr(u, "cache_creation_input_tokens", 0) or 0
+            cr = getattr(u, "cache_read_input_tokens", 0) or 0
+            total_input = inp + cc + cr
             usage = UsageInfo(
-                prompt_tokens=u.input_tokens,
-                completion_tokens=u.output_tokens,
-                total_tokens=u.input_tokens + u.output_tokens,
-                cache_creation_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
-                cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
+                prompt_tokens=total_input,
+                completion_tokens=out,
+                total_tokens=total_input + out,
+                cache_creation_tokens=cc,
+                cache_read_tokens=cr,
             )
 
         return CompletionResult(

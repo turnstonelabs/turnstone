@@ -105,7 +105,8 @@ class TestChatSessionConstruction:
     def test_msg_char_count_content_only(self, tmp_db):
         session = _make_session()
         msg = {"role": "assistant", "content": "hello world"}
-        assert session._msg_char_count(msg) == 11
+        # "hello world" (11) + "assistant" (9) = 20
+        assert session._msg_char_count(msg) == 20
 
     def test_msg_char_count_with_tool_calls(self, tmp_db):
         session = _make_session()
@@ -122,13 +123,14 @@ class TestChatSessionConstruction:
                 }
             ],
         }
-        # "hi" (2) + "bash" (4) + '{"command": "ls"}' (17) = 23
-        assert session._msg_char_count(msg) == 23
+        # "hi" (2) + "tc_1" (4) + "bash" (4) + '{"command": "ls"}' (17) + "assistant" (9) = 36
+        assert session._msg_char_count(msg) == 36
 
     def test_msg_char_count_none_content(self, tmp_db):
         session = _make_session()
         msg = {"role": "assistant", "content": None}
-        assert session._msg_char_count(msg) == 0
+        # len("assistant") = 9
+        assert session._msg_char_count(msg) == 9
 
     def test_reasoning_effort_stored(self, tmp_db):
         session = _make_session(reasoning_effort="high")
