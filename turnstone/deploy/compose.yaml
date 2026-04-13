@@ -9,7 +9,7 @@
 #   Infra only:           docker compose up
 #   Single node:          docker compose --profile production up
 #   Production (PG):      docker compose --profile production up
-#                         (set DB_BACKEND, DATABASE_URL, POSTGRES_PASSWORD in .env)
+#                         (set TURNSTONE_DB_BACKEND, TURNSTONE_DB_URL, POSTGRES_PASSWORD in .env)
 #
 # Set TURNSTONE_IMAGE_TAG in .env to pin the image version (default: latest).
 # =============================================================================
@@ -94,8 +94,8 @@ services:
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
       - MODEL=${MODEL:-}
       - MCP_CONFIG=${MCP_CONFIG:-}
-      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-}
+      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-sqlite}
+      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-}
       - TURNSTONE_NODE_ID=${TURNSTONE_NODE_ID:-}
       - TURNSTONE_ADVERTISE_URL=${TURNSTONE_ADVERTISE_URL:-http://server:8080}
     extra_hosts:
@@ -128,8 +128,8 @@ services:
     environment:
       # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-sqlite}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-}
+      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-sqlite}
+      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-}
       - TURNSTONE_CONSOLE_URL=http://console:8090
     networks:
       - turnstone-net
@@ -161,8 +161,8 @@ services:
       - TURNSTONE_DISCORD_GUILD=${TURNSTONE_DISCORD_GUILD:-0}
       # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
       - TURNSTONE_JWT_SECRET=${TURNSTONE_JWT_SECRET:?Set TURNSTONE_JWT_SECRET in .env}
-      - TURNSTONE_DB_BACKEND=${DB_BACKEND:-postgresql}
-      - TURNSTONE_DB_URL=${DATABASE_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
+      - TURNSTONE_DB_BACKEND=${TURNSTONE_DB_BACKEND:-postgresql}
+      - TURNSTONE_DB_URL=${TURNSTONE_DB_URL:-postgresql+psycopg://${POSTGRES_USER:-turnstone}:${POSTGRES_PASSWORD:-turnstone}@postgres:5432/turnstone}
       - TURNSTONE_CHANNEL_ADVERTISE_URL=http://channel:8091
     networks:
       - turnstone-net

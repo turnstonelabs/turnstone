@@ -53,6 +53,15 @@ pip install turnstone[console]
 turnstone-console --port 8090
 ```
 
+For PostgreSQL (recommended for production):
+
+```bash
+pip install turnstone[postgres]
+export TURNSTONE_DB_BACKEND=postgresql
+export TURNSTONE_DB_URL="postgresql+psycopg://user:pass@localhost:5432/turnstone"
+turnstone-server --port 8080 --base-url http://localhost:8000/v1
+```
+
 ### Docker
 
 ```bash

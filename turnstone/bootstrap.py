@@ -76,8 +76,9 @@ For commercial providers (OpenAI, Anthropic-via-proxy), use the real key.
 - `TAVILY_API_KEY` — Web search API key (optional)
 
 ### Database
-- `DB_BACKEND` — `sqlite` (default) or `postgresql`
-- `DATABASE_URL` — PostgreSQL connection string (production only)
+- `TURNSTONE_DB_BACKEND` — `sqlite` (default) or `postgresql`
+- `TURNSTONE_DB_URL` — PostgreSQL connection URL (production only), \
+e.g. `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`
 - `POSTGRES_USER` — PostgreSQL username (default: turnstone)
 - `POSTGRES_PASSWORD` — PostgreSQL password (required for production)
 
@@ -184,7 +185,7 @@ exact commands to run next (e.g., `docker compose --profile production up -d` th
 - If `compose.yaml` is missing, call `write_compose` before anything else. \
 The compose file uses pre-built images from ghcr.io — no local Docker build is needed.
 - If an existing .env is detected, summarize what's configured and ask what to change.
-- The `DATABASE_URL` for docker compose internal networking uses the hostname `postgres` \
+- The `TURNSTONE_DB_URL` for docker compose internal networking uses the hostname `postgres` \
 (e.g., `postgresql+psycopg://turnstone:<password>@postgres:5432/turnstone`).
 - For local LLM backends (vLLM, llama.cpp, Ollama, etc.), set `OPENAI_API_KEY=dummy` in the \
 .env file — local servers typically don't require authentication. The `LLM_BASE_URL` should \

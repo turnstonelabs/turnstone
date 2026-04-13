@@ -73,7 +73,7 @@ _EXPLICIT_SCRUB: frozenset[str] = frozenset(
         "AZURE_CLIENT_SECRET",
         "GCP_SERVICE_ACCOUNT_KEY",
         "GOOGLE_APPLICATION_CREDENTIALS",
-        "DATABASE_URL",
+        "DATABASE_URL",  # conventional name (Heroku, Railway, etc.) — kept for defence-in-depth
         "TURNSTONE_DB_URL",
     }
 )

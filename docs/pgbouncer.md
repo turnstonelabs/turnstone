@@ -67,7 +67,7 @@ services:
 ```
 
 Then point turnstone services at PgBouncer instead of PostgreSQL
-directly by changing the `DATABASE_URL` (or `TURNSTONE_DB_URL`):
+directly by changing `TURNSTONE_DB_URL`:
 
 ```bash
 # Before (direct)

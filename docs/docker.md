@@ -83,10 +83,14 @@ Auth is always enabled. `TURNSTONE_JWT_SECRET` is required.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TURNSTONE_DB_BACKEND` | `sqlite` | Storage backend: `sqlite` or `postgresql` |
-| `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql://user:pass@db:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
+| `TURNSTONE_DB_URL` | — | Database URL (e.g. `postgresql+psycopg://user:pass@postgres:5432/turnstone`). For SQLite, defaults to `/data/.turnstone.db` |
 | `TURNSTONE_DB_POOL_SIZE` | `2` | PostgreSQL connection pool size per process (default: 2 base + 3 overflow = 5 max) |
+| `POSTGRES_USER` | `turnstone` | PostgreSQL container username (used in default `TURNSTONE_DB_URL` for cluster/channel) |
+| `POSTGRES_PASSWORD` | — | PostgreSQL container password (required for production and cluster profiles) |
 
 The database stores workstream history, user accounts, and API tokens. When using JWT auth, a database backend is required for user storage.
+
+> **Upgrading from <1.3.0a4:** Earlier versions used `DB_BACKEND` and `DATABASE_URL` in `.env`, which `compose.yaml` mapped to the `TURNSTONE_`-prefixed names internally. These short aliases have been removed. Rename `DB_BACKEND` → `TURNSTONE_DB_BACKEND` and `DATABASE_URL` → `TURNSTONE_DB_URL` in your `.env` file.
 
 > **Large clusters:** Each turnstone process maintains a small connection pool (5 max). At hundreds of nodes this adds up — use [PgBouncer](pgbouncer.md) in transaction pooling mode between turnstone and PostgreSQL.
 
