@@ -3720,10 +3720,10 @@ def main() -> None:
     # isn't DNS-resolvable by other containers.  Priority:
     # 1. TURNSTONE_ADVERTISE_URL env var (explicit override)
     # 2. Explicit --host (not a wildcard bind address)
-    # 3. socket.getfqdn() (may work in k8s with proper DNS)
+    # 3. socket.gethostname() (getfqdn does reverse DNS which often truncates)
     _advertise_url = os.environ.get("TURNSTONE_ADVERTISE_URL", "")
     if not _advertise_url:
-        _advertise_host = args.host if args.host not in ("0.0.0.0", "::") else socket.getfqdn()
+        _advertise_host = args.host if args.host not in ("0.0.0.0", "::") else socket.gethostname()
         _advertise_url = f"http://{_advertise_host}:{args.port}"
 
     _skip_perms = config_store.get("tools.skip_permissions")
@@ -3793,8 +3793,11 @@ def main() -> None:
 
             from turnstone.core.tls import TLSClient
 
-            hostname = socket.getfqdn()
+            hostname = socket.gethostname()
+            fqdn = socket.getfqdn()
             hostnames = [hostname, "localhost", "127.0.0.1"]
+            if fqdn != hostname:
+                hostnames.append(fqdn)
             # Only add bind host if it's a concrete address
             if args.host not in ("0.0.0.0", "::", ""):
                 hostnames.append(args.host)

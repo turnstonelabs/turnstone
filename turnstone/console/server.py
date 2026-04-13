@@ -1318,8 +1318,11 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         try:
             if not tls_mgr.ca_initialized:
                 await tls_mgr.init_ca()
-            hostname = socket.getfqdn()
+            hostname = socket.gethostname()
+            fqdn = socket.getfqdn()
             cert_hostnames = [hostname, "localhost", "127.0.0.1"]
+            if fqdn != hostname:
+                cert_hostnames.append(fqdn)
             extra_sans = os.environ.get("TURNSTONE_TLS_SANS", "")
             if extra_sans:
                 cert_hostnames.extend(s.strip() for s in extra_sans.split(",") if s.strip())
@@ -7933,7 +7936,7 @@ def main() -> None:
     else:
         _advertise_host = args.host
         if _advertise_host in ("0.0.0.0", "::", ""):
-            _advertise_host = _socket.getfqdn()
+            _advertise_host = _socket.gethostname()
         console_url = f"http://{_advertise_host}:{args.port}"
     if auth_storage:
         try:
