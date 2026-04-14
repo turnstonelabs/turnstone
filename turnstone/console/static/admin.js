@@ -4681,11 +4681,20 @@ function showEditModelModal(definitionId) {
         /* keep empty */
       }
       var sc = capsObj.server_compat || {};
-      // Thinking mode and param live in capabilities (not server_compat).
-      document.getElementById("model-thinking-mode").value =
-        capsObj.thinking_mode || "";
-      document.getElementById("model-thinking-param").value =
-        capsObj.thinking_param || "";
+      // Only extract thinking_mode into the dropdown when the UI can
+      // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
+      // only) stay in the raw capabilities JSON so they aren't silently
+      // lost on save.
+      var tmVal = capsObj.thinking_mode || "";
+      var tmRepresentable = tmVal === "" || tmVal === "manual";
+      if (tmRepresentable) {
+        document.getElementById("model-thinking-mode").value = tmVal;
+        document.getElementById("model-thinking-param").value =
+          capsObj.thinking_param || "";
+      } else {
+        document.getElementById("model-thinking-mode").value = "";
+        document.getElementById("model-thinking-param").value = "";
+      }
       _toggleThinkingParam();
       // Server compat: server_type and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
@@ -4693,10 +4702,13 @@ function showEditModelModal(definitionId) {
       var ebText = JSON.stringify(eb, null, 2);
       document.getElementById("model-extra-body").value =
         ebText === "{}" ? "" : ebText;
-      // Remove structured fields from capabilities display
+      // Remove structured fields from capabilities display — only delete
+      // thinking_mode/thinking_param when the UI successfully captured them.
       delete capsObj.server_compat;
-      delete capsObj.thinking_mode;
-      delete capsObj.thinking_param;
+      if (tmRepresentable) {
+        delete capsObj.thinking_mode;
+        delete capsObj.thinking_param;
+      }
       var capsText = JSON.stringify(capsObj, null, 2);
       document.getElementById("model-capabilities").value =
         capsText === "{}" ? "" : capsText;
@@ -4746,6 +4758,14 @@ function submitCreateModel() {
       _showModelError("Invalid JSON in capabilities");
       return;
     }
+    if (caps === null || typeof caps !== "object" || Array.isArray(caps)) {
+      capsEl.setAttribute("aria-invalid", "true");
+      capsEl.style.borderColor = "var(--red)";
+      _showModelError(
+        "Capabilities must be a JSON object (not array or primitive)",
+      );
+      return;
+    }
   }
 
   // Thinking mode → capabilities (provider uses this to inject
@@ -4769,11 +4789,19 @@ function submitCreateModel() {
   ebEl.style.borderColor = "";
   if (ebText) {
     try {
-      serverCompat.extra_body = JSON.parse(ebText);
+      var ebParsed = JSON.parse(ebText);
+      if (
+        ebParsed === null ||
+        typeof ebParsed !== "object" ||
+        Array.isArray(ebParsed)
+      ) {
+        throw new Error("not an object");
+      }
+      serverCompat.extra_body = ebParsed;
     } catch (e) {
       ebEl.setAttribute("aria-invalid", "true");
       ebEl.style.borderColor = "var(--red)";
-      _showModelError("Invalid JSON in extra body params");
+      _showModelError("Extra body params must be a JSON object");
       return;
     }
   }

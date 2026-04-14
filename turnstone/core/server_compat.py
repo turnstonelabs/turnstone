@@ -196,8 +196,11 @@ def merge_server_compat(
     if isinstance(compat_eb, dict):
         for key, value in compat_eb.items():
             if key == "chat_template_kwargs":
-                # Prevent accidental override of the assembled ctk —
-                # operator should use capabilities for thinking params.
+                # Deep-merge: operator values in extra_body win over the
+                # base dict (which has reasoning_effort).  This lets
+                # operators intentionally extend chat_template_kwargs.
+                if isinstance(value, dict):
+                    extra["chat_template_kwargs"].update(value)
                 continue
             extra[key] = value
 

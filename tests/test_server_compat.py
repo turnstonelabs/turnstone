@@ -134,18 +134,27 @@ class TestMergeServerCompat:
             "skip_special_tokens": False,
         }
 
-    def test_extra_body_chat_template_kwargs_ignored(self) -> None:
-        """extra_body should not contain chat_template_kwargs — it's skipped."""
+    def test_extra_body_chat_template_kwargs_deep_merged(self) -> None:
+        """chat_template_kwargs in extra_body is deep-merged, operator wins."""
         base = {"reasoning_effort": "medium"}
         compat = {
             "extra_body": {
-                "chat_template_kwargs": {"should_be_ignored": True},
+                "chat_template_kwargs": {"custom_flag": True, "reasoning_effort": "high"},
                 "skip_special_tokens": False,
             },
         }
         result = merge_server_compat(base, compat)
-        assert "should_be_ignored" not in result.get("chat_template_kwargs", {})
+        # Operator values win over base
+        assert result["chat_template_kwargs"]["custom_flag"] is True
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
         assert result["skip_special_tokens"] is False
+
+    def test_extra_body_chat_template_kwargs_non_dict_ignored(self) -> None:
+        """Non-dict chat_template_kwargs in extra_body is safely ignored."""
+        base = {"reasoning_effort": "medium"}
+        compat = {"extra_body": {"chat_template_kwargs": "bad"}}
+        result = merge_server_compat(base, compat)
+        assert result["chat_template_kwargs"] == {"reasoning_effort": "medium"}
 
     def test_base_not_mutated(self) -> None:
         base = {"reasoning_effort": "medium"}
