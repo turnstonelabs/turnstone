@@ -5138,6 +5138,11 @@ function _applyProviderDefaults() {
   if (!def) return;
   document.getElementById("model-base-url").placeholder = def.urlPlaceholder;
   document.getElementById("model-name").placeholder = def.modelPlaceholder;
+  // Server compat section only applies to local model servers
+  var scSection = document.getElementById("model-server-compat-section");
+  if (scSection) {
+    scSection.style.display = provider === "openai-compatible" ? "" : "none";
+  }
 }
 
 /* Populate the model name datalist with known model prefixes for the
