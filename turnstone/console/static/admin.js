@@ -4596,6 +4596,10 @@ function _renderModels(items) {
   });
 }
 
+function _isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
 function _toggleThinkingParam() {
   var mode = document.getElementById("model-thinking-mode").value;
   var row = document.getElementById("model-thinking-param-row");
@@ -4680,21 +4684,11 @@ function showEditModelModal(definitionId) {
       } catch (e) {
         /* keep empty */
       }
-      // Normalize to plain object — defend against null/array/primitive
-      // values that could crash the subsequent property reads.
-      if (
-        capsObj === null ||
-        typeof capsObj !== "object" ||
-        Array.isArray(capsObj)
-      ) {
-        capsObj = {};
-      }
-      var sc =
-        capsObj.server_compat &&
-        typeof capsObj.server_compat === "object" &&
-        !Array.isArray(capsObj.server_compat)
-          ? capsObj.server_compat
-          : {};
+      // Defend against null/array/primitive values in the DB
+      if (!_isPlainObject(capsObj)) capsObj = {};
+      var sc = _isPlainObject(capsObj.server_compat)
+        ? capsObj.server_compat
+        : {};
       // Only extract thinking_mode into the dropdown when the UI can
       // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
       // only) stay in the raw capabilities JSON so they aren't silently
@@ -4772,7 +4766,7 @@ function submitCreateModel() {
       _showModelError("Invalid JSON in capabilities");
       return;
     }
-    if (caps === null || typeof caps !== "object" || Array.isArray(caps)) {
+    if (!_isPlainObject(caps)) {
       capsEl.setAttribute("aria-invalid", "true");
       capsEl.style.borderColor = "var(--red)";
       _showModelError(
@@ -4804,11 +4798,7 @@ function submitCreateModel() {
   if (ebText) {
     try {
       var ebParsed = JSON.parse(ebText);
-      if (
-        ebParsed === null ||
-        typeof ebParsed !== "object" ||
-        Array.isArray(ebParsed)
-      ) {
+      if (!_isPlainObject(ebParsed)) {
         throw new Error("not an object");
       }
       serverCompat.extra_body = ebParsed;
