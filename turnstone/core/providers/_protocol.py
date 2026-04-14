@@ -74,6 +74,11 @@ class ModelCapabilities:
     supports_tools: bool = True
     token_param: str = "max_completion_tokens"
     thinking_mode: str = "none"  # "none" | "manual" | "adaptive"
+    # For openai-compatible servers: the chat_template_kwargs key that
+    # toggles thinking (e.g. "enable_thinking" for Gemma/Qwen,
+    # "thinking" for Granite/DeepSeek).  Ignored when thinking_mode is
+    # "none" or by providers that handle thinking natively (Anthropic).
+    thinking_param: str = "enable_thinking"
     supports_effort: bool = False
     effort_levels: tuple[str, ...] = ()
     reasoning_effort_values: tuple[str, ...] = ()
@@ -127,8 +132,15 @@ class LLMProvider(Protocol):
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
+
+        If *capabilities* is provided the provider uses it instead of
+        calling ``get_capabilities(model)`` internally.  This lets the
+        session pass config-merged capabilities so that overrides from
+        the model registry (e.g. ``thinking_mode``, ``token_param``)
+        are respected.
 
         If *cancel_ref* is provided the provider appends the underlying SDK
         stream object (which has a ``.close()`` method) before yielding the
@@ -149,6 +161,7 @@ class LLMProvider(Protocol):
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> CompletionResult:
         """Create a non-streaming request, returning a normalized result."""
         ...

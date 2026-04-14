@@ -1448,20 +1448,49 @@ class ChatSession:
         self,
         reasoning_effort: str | None = None,
         provider: LLMProvider | None = None,
+        model_alias: str | None = None,
     ) -> dict[str, Any] | None:
         """Build provider-specific extra parameters.
 
         ``chat_template_kwargs`` is only meaningful for local model servers
         (``openai-compatible``).  Commercial OpenAI rejects it as an unknown
         parameter, and handles ``reasoning_effort`` natively.
+
+        Merges server workarounds (``skip_special_tokens``, etc.) from
+        ``ModelConfig.server_compat`` into the request's ``extra_body``.
+        Thinking-mode params (``enable_thinking``) are handled separately
+        by the provider based on ``ModelCapabilities.thinking_mode``.
+
+        *model_alias* controls which model config supplies server compat
+        settings.  When ``None``, defaults to the session's primary alias.
         """
+        from turnstone.core.server_compat import merge_server_compat
+
         prov = provider or self._provider
         if prov.provider_name == "openai-compatible":
-            kwargs = dict(self._chat_template_kwargs_base)
+            ctk_base = dict(self._chat_template_kwargs_base)
             if reasoning_effort:
-                kwargs["reasoning_effort"] = reasoning_effort
-            return {"chat_template_kwargs": kwargs}
+                ctk_base["reasoning_effort"] = reasoning_effort
+            return merge_server_compat(
+                ctk_base,
+                self._get_server_compat(model_alias),
+            )
         return None
+
+    def _get_server_compat(self, model_alias: str | None = None) -> dict[str, Any]:
+        """Get server compatibility settings from a model config.
+
+        *model_alias* selects the config to read.  Falls back to the
+        session's primary alias when ``None``.
+        """
+        alias = model_alias or self._model_alias
+        if self._registry and alias:
+            try:
+                cfg = self._registry.get_config(alias)
+                return dict(cfg.server_compat)
+            except (ValueError, KeyError):
+                pass
+        return {}
 
     def _utility_completion(
         self,
@@ -1488,6 +1517,7 @@ class ChatSession:
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             extra_params=self._provider_extra_params(reasoning_effort=reasoning_effort),
+            capabilities=caps,
         )
 
     # -- tool search helpers --------------------------------------------------
@@ -1622,8 +1652,16 @@ class ChatSession:
         try:
             fb_client, fb_model, _ = self._registry.resolve(alias)
             fb_provider = self._registry.get_provider(alias)
+            fb_caps = self._resolve_capabilities(fb_provider, fb_model, alias)
             self.ui.on_info(f"[Primary model failed, falling back to {alias}]")
-            result = self._try_stream(fb_client, fb_model, msgs, provider=fb_provider)
+            result = self._try_stream(
+                fb_client,
+                fb_model,
+                msgs,
+                provider=fb_provider,
+                capabilities=fb_caps,
+                model_alias=alias,
+            )
             if fb_tracker:
                 fb_tracker.record_success()
             return result
@@ -1639,6 +1677,8 @@ class ChatSession:
         model: str,
         msgs: list[dict[str, Any]],
         provider: LLMProvider | None = None,
+        capabilities: ModelCapabilities | None = None,
+        model_alias: str | None = None,
     ) -> Iterator[StreamChunk]:
         """Attempt a streaming API call with retries on transient errors."""
         prov = provider or self._provider
@@ -1670,9 +1710,12 @@ class ChatSession:
                     max_tokens=self.max_tokens,
                     temperature=self.temperature,
                     reasoning_effort=self.reasoning_effort,
-                    extra_params=self._provider_extra_params(provider=prov),
+                    extra_params=self._provider_extra_params(
+                        provider=prov, model_alias=model_alias
+                    ),
                     deferred_names=self._get_deferred_names(),
                     cancel_ref=self._cancel_ref,
+                    capabilities=capabilities or self._get_capabilities(prov, model),
                 )
             except Exception as e:
                 ename = type(e).__name__
@@ -5381,10 +5424,12 @@ class ChatSession:
         if not agent_caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
 
-        # Build extra params for agent calls
+        # Build extra params for agent calls — resolve server compat from the
+        # agent's own model alias, not the session's primary model.
         agent_extra = self._provider_extra_params(
             reasoning_effort=reasoning_effort,
             provider=agent_provider,
+            model_alias=agent_alias,
         )
 
         def _api_call(
@@ -5403,6 +5448,7 @@ class ChatSession:
                         temperature=self.temperature,
                         reasoning_effort=reasoning_effort or self.reasoning_effort,
                         extra_params=agent_extra,
+                        capabilities=agent_caps,
                     )
                 except Exception as e:
                     ename = type(e).__name__

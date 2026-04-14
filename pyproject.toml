@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turnstone"
-version = "1.4.0a1"
+version = "1.4.0a2"
 description = "Multi-node AI orchestration platform with tool use, agent routing, and cluster simulation."
 readme = "README.md"
 license = "BUSL-1.1"
@@ -80,7 +80,7 @@ include = [
   "turnstone/shared_static/katex-0.16.45/**/*",
   "turnstone/shared_static/hljs-11.11.1/**/*",
   "turnstone/shared_static/mermaid-11.14.0/**/*",
-  "turnstone/shared_static/hls-1.6.15/**/*",
+  "turnstone/shared_static/hls-1.6.16/**/*",
   "turnstone/sdk/py.typed",
   "turnstone/deploy/*.yaml",
 ]

@@ -39,6 +39,9 @@ class ModelConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     reasoning_effort: str | None = None
+    # Server compatibility settings for openai-compatible backends.
+    # Populated from capabilities["server_compat"] during load.
+    server_compat: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +269,10 @@ def load_model_registry(
                             caps = parsed
                     except (_json.JSONDecodeError, TypeError):
                         pass  # falls back to empty capabilities
+                # Extract server_compat from capabilities (namespaced key)
+                row_server_compat = caps.pop("server_compat", {})
+                if not isinstance(row_server_compat, dict):
+                    row_server_compat = {}
                 row_base_url = _resolve_env_vars(row.get("base_url", ""))
                 row_provider = _resolve_openai_provider(row.get("provider", "openai"), row_base_url)
                 row_model = row["model"]
@@ -290,6 +297,7 @@ def load_model_registry(
                     reasoning_effort=row_reasoning_effort
                     if row_reasoning_effort is not None
                     else None,
+                    server_compat=row_server_compat,
                 )
         except Exception:
             log.warning("Failed to load model definitions from storage", exc_info=True)
@@ -333,6 +341,14 @@ def load_model_registry(
         raw_effort = entry.get("reasoning_effort")
         if raw_effort is not None:
             entry_effort = str(raw_effort)
+        entry_caps = (
+            dict(entry.get("capabilities", {}))
+            if isinstance(entry.get("capabilities"), dict)
+            else {}
+        )
+        entry_server_compat = entry_caps.pop("server_compat", {})
+        if not isinstance(entry_server_compat, dict):
+            entry_server_compat = {}
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
@@ -340,13 +356,12 @@ def load_model_registry(
             model=model_name,
             context_window=entry.get("context_window", context_window),
             provider=_resolve_openai_provider(entry.get("provider", "openai"), entry_base_url),
-            capabilities=entry.get("capabilities", {})
-            if isinstance(entry.get("capabilities"), dict)
-            else {},
+            capabilities=entry_caps,
             source="config",
             temperature=entry_temp,
             max_tokens=entry_max_tokens,
             reasoning_effort=entry_effort,
+            server_compat=entry_server_compat,
         )
 
     # 3. Ensure a "default" entry from CLI args (only if not already defined
@@ -642,3 +657,12 @@ def _detect_openai_compat(
         result["server_type"] = "vllm"
     else:
         result["server_type"] = "openai-compatible"
+
+    # Suggest capabilities and server compat based on detected server_type
+    from turnstone.core.server_compat import suggest_profile
+
+    suggested = suggest_profile(result.get("server_type", ""), model_id)
+    if suggested.get("capabilities"):
+        result["suggested_capabilities"] = suggested["capabilities"]
+    if suggested.get("server_compat"):
+        result["suggested_server_compat"] = suggested["server_compat"]

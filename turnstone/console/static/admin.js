@@ -4596,6 +4596,19 @@ function _renderModels(items) {
   });
 }
 
+function _isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function _toggleThinkingParam() {
+  var mode = document.getElementById("model-thinking-mode").value;
+  var row = document.getElementById("model-thinking-param-row");
+  row.style.display = mode ? "" : "none";
+  // Set default when first enabling
+  var paramEl = document.getElementById("model-thinking-param");
+  if (mode && !paramEl.value) paramEl.value = "enable_thinking";
+}
+
 function showCreateModelModal() {
   _modelCreateTrigger = document.activeElement;
   var ov = document.getElementById("model-create-overlay");
@@ -4614,7 +4627,18 @@ function showCreateModelModal() {
   document.getElementById("model-temperature").value = "";
   document.getElementById("model-max-tokens").value = "";
   document.getElementById("model-reasoning-effort").value = "";
+  document.getElementById("model-server-type").value = "";
+  document.getElementById("model-thinking-mode").value = "";
+  document.getElementById("model-thinking-param").value = "";
+  document.getElementById("model-thinking-param-row").style.display = "none";
+  document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
+  // Clear validation error styling from prior submit attempts
+  ["model-extra-body", "model-capabilities"].forEach(function (id) {
+    var el = document.getElementById(id);
+    el.removeAttribute("aria-invalid");
+    el.style.borderColor = "";
+  });
   document.getElementById("model-enabled").checked = true;
   document.getElementById("model-detect-result").style.display = "none";
   document.getElementById("model-detect-btn").disabled = false;
@@ -4653,15 +4677,49 @@ function showEditModelModal(definitionId) {
         m.max_tokens != null ? m.max_tokens : "";
       document.getElementById("model-reasoning-effort").value =
         m.reasoning_effort != null ? m.reasoning_effort : "";
-      // Parse capabilities JSON for display
-      var caps = m.capabilities || "{}";
+      // Parse capabilities JSON and extract server_compat for structured fields
+      var capsObj = {};
       try {
-        caps = JSON.stringify(JSON.parse(caps), null, 2);
+        capsObj = JSON.parse(m.capabilities || "{}");
       } catch (e) {
-        /* keep raw */
+        /* keep empty */
       }
-      if (caps === "{}") caps = "";
-      document.getElementById("model-capabilities").value = caps;
+      // Defend against null/array/primitive values in the DB
+      if (!_isPlainObject(capsObj)) capsObj = {};
+      var sc = _isPlainObject(capsObj.server_compat)
+        ? capsObj.server_compat
+        : {};
+      // Only extract thinking_mode into the dropdown when the UI can
+      // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
+      // only) stay in the raw capabilities JSON so they aren't silently
+      // lost on save.
+      var tmVal = capsObj.thinking_mode || "";
+      var tmRepresentable = tmVal === "" || tmVal === "manual";
+      if (tmRepresentable) {
+        document.getElementById("model-thinking-mode").value = tmVal;
+        document.getElementById("model-thinking-param").value =
+          capsObj.thinking_param || "";
+      } else {
+        document.getElementById("model-thinking-mode").value = "";
+        document.getElementById("model-thinking-param").value = "";
+      }
+      _toggleThinkingParam();
+      // Server compat: server_type and extra_body workarounds
+      document.getElementById("model-server-type").value = sc.server_type || "";
+      var eb = sc.extra_body || {};
+      var ebText = JSON.stringify(eb, null, 2);
+      document.getElementById("model-extra-body").value =
+        ebText === "{}" ? "" : ebText;
+      // Remove structured fields from capabilities display — only delete
+      // thinking_mode/thinking_param when the UI successfully captured them.
+      delete capsObj.server_compat;
+      if (tmRepresentable) {
+        delete capsObj.thinking_mode;
+        delete capsObj.thinking_param;
+      }
+      var capsText = JSON.stringify(capsObj, null, 2);
+      document.getElementById("model-capabilities").value =
+        capsText === "{}" ? "" : capsText;
       document.getElementById("model-enabled").checked = m.enabled !== false;
       _applyProviderDefaults();
     })
@@ -4694,15 +4752,65 @@ function submitCreateModel() {
     return;
   }
 
-  var capsText = document.getElementById("model-capabilities").value.trim();
+  var capsEl = document.getElementById("model-capabilities");
+  var capsText = capsEl.value.trim();
   var caps = {};
+  capsEl.removeAttribute("aria-invalid");
+  capsEl.style.borderColor = "";
   if (capsText) {
     try {
       caps = JSON.parse(capsText);
     } catch (e) {
+      capsEl.setAttribute("aria-invalid", "true");
+      capsEl.style.borderColor = "var(--red)";
       _showModelError("Invalid JSON in capabilities");
       return;
     }
+    if (!_isPlainObject(caps)) {
+      capsEl.setAttribute("aria-invalid", "true");
+      capsEl.style.borderColor = "var(--red)";
+      _showModelError(
+        "Capabilities must be a JSON object (not array or primitive)",
+      );
+      return;
+    }
+  }
+
+  // Thinking mode → capabilities (provider uses this to inject
+  // the correct chat_template_kwargs param automatically).
+  var thinkingMode = document.getElementById("model-thinking-mode").value;
+  if (thinkingMode) {
+    caps.thinking_mode = thinkingMode;
+    // Preserve thinking_param so Granite/DeepSeek "thinking" key
+    // isn't silently reverted to the default "enable_thinking".
+    var savedParam = document.getElementById("model-thinking-param").value;
+    if (savedParam) caps.thinking_param = savedParam;
+  }
+
+  // Build server_compat from structured fields
+  var serverCompat = {};
+  var serverType = document.getElementById("model-server-type").value;
+  if (serverType) serverCompat.server_type = serverType;
+  var ebEl = document.getElementById("model-extra-body");
+  var ebText = ebEl.value.trim();
+  ebEl.removeAttribute("aria-invalid");
+  ebEl.style.borderColor = "";
+  if (ebText) {
+    try {
+      var ebParsed = JSON.parse(ebText);
+      if (!_isPlainObject(ebParsed)) {
+        throw new Error("not an object");
+      }
+      serverCompat.extra_body = ebParsed;
+    } catch (e) {
+      ebEl.setAttribute("aria-invalid", "true");
+      ebEl.style.borderColor = "var(--red)";
+      _showModelError("Extra body params must be a JSON object");
+      return;
+    }
+  }
+  if (Object.keys(serverCompat).length > 0) {
+    caps.server_compat = serverCompat;
   }
 
   var form = {
@@ -4895,6 +5003,52 @@ function detectModel() {
         resultDiv.appendChild(
           _detectResultLine("Server type: " + d.server_type),
         );
+        // Auto-fill server type if not already set and value is a known option
+        var stEl = document.getElementById("model-server-type");
+        var stOpts = Array.from(stEl.options).map(function (o) {
+          return o.value;
+        });
+        if (!stEl.value && stOpts.indexOf(d.server_type) !== -1)
+          stEl.value = d.server_type;
+      }
+      // Auto-fill capabilities from suggested profile
+      if (d.suggested_capabilities) {
+        var sc2 = d.suggested_capabilities;
+        var tmEl = document.getElementById("model-thinking-mode");
+        if (!tmEl.value && sc2.thinking_mode) {
+          tmEl.value = sc2.thinking_mode;
+        }
+        if (sc2.thinking_param) {
+          var tpEl = document.getElementById("model-thinking-param");
+          if (!tpEl.value) tpEl.value = sc2.thinking_param;
+        }
+        _toggleThinkingParam();
+      }
+      // Auto-fill server compat from suggested profile
+      if (d.suggested_server_compat) {
+        var ssc = d.suggested_server_compat;
+        var stEl2 = document.getElementById("model-server-type");
+        var stOpts2 = Array.from(stEl2.options).map(function (o) {
+          return o.value;
+        });
+        if (
+          !stEl2.value &&
+          ssc.server_type &&
+          stOpts2.indexOf(ssc.server_type) !== -1
+        )
+          stEl2.value = ssc.server_type;
+        if (ssc.extra_body) {
+          var ebEl2 = document.getElementById("model-extra-body");
+          if (!ebEl2.value.trim()) {
+            var ebJson = JSON.stringify(ssc.extra_body, null, 2);
+            if (ebJson !== "{}") ebEl2.value = ebJson;
+          }
+        }
+      }
+      if (d.suggested_capabilities || d.suggested_server_compat) {
+        resultDiv.appendChild(
+          _detectResultLine("\u2713 Compatibility profile suggested", "green"),
+        );
       }
       resultDiv.style.borderColor = "var(--green)";
     })
@@ -4988,6 +5142,11 @@ function _applyProviderDefaults() {
   if (!def) return;
   document.getElementById("model-base-url").placeholder = def.urlPlaceholder;
   document.getElementById("model-name").placeholder = def.modelPlaceholder;
+  // Server compat section only applies to local model servers
+  var scSection = document.getElementById("model-server-compat-section");
+  if (scSection) {
+    scSection.style.display = provider === "openai-compatible" ? "" : "none";
+  }
 }
 
 /* Populate the model name datalist with known model prefixes for the

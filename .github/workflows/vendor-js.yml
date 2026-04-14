@@ -48,7 +48,7 @@ jobs:
         id: detect
         run: |
           updates=()
-          for lib in katex hljs mermaid; do
+          for lib in katex hljs mermaid hls; do
             version=$(grep -oE "${lib}-[0-9.]+" pyproject.toml | head -1 | sed "s/${lib}-//")
             [[ -z "$version" ]] && continue
             [[ -d "turnstone/shared_static/${lib}-${version}" ]] && continue
