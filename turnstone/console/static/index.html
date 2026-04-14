@@ -1575,12 +1575,14 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <option value="llama.cpp">llama.cpp</option>
       <option value="openai-compatible">Other OpenAI-compatible</option>
     </select>
-    <input type="hidden" id="model-thinking-param" value="">
     <label for="model-thinking-mode">Thinking Mode <span style="font-weight:400;text-transform:none">(reasoning / chain-of-thought)</span></label>
-    <select id="model-thinking-mode">
+    <select id="model-thinking-mode" onchange="_toggleThinkingParam()">
       <option value="">None</option>
       <option value="manual">Enabled</option>
     </select>
+    <div id="model-thinking-param-row" style="display:none">
+      <label for="model-thinking-param" style="font-size:11px">Template param name <span style="font-weight:400;text-transform:none">(Granite/DeepSeek use "thinking")</span></label>
+      <input type="text" id="model-thinking-param" value="enable_thinking" placeholder="enable_thinking" style="font-family:var(--font-mono);font-size:11px"></div>
     <label for="model-extra-body">Extra body params <span style="font-weight:400;text-transform:none">(JSON, merged into every request)</span></label>
     <textarea id="model-extra-body" rows="2" placeholder='{"skip_special_tokens": false}' style="font-family:var(--font-mono);font-size:11px"></textarea>
     <label for="model-capabilities">Capabilities <span style="font-weight:400;text-transform:none">(JSON)</span></label>

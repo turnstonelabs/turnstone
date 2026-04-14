@@ -134,6 +134,26 @@ class OpenAIChatCompletionsProvider:
         if caps.thinking_param not in ctk:
             ctk[caps.thinking_param] = True
 
+    def _finalize_extra_body(
+        self,
+        extra_params: dict[str, Any] | None,
+        caps: ModelCapabilities,
+    ) -> dict[str, Any] | None:
+        """Build the final ``extra_body``, injecting thinking params if needed.
+
+        Returns ``None`` when the result would be empty (no extra_body needed).
+        Shallow-copies *extra_params* and its ``chat_template_kwargs`` so the
+        caller's dict is never mutated.
+        """
+        eb: dict[str, Any] = {}
+        if extra_params:
+            eb = dict(extra_params)
+            ctk = eb.get("chat_template_kwargs")
+            if isinstance(ctk, dict):
+                eb["chat_template_kwargs"] = dict(ctk)
+        self._apply_thinking_mode(eb, caps)
+        return eb or None
+
     # -- streaming -----------------------------------------------------------
 
     def create_streaming(
@@ -166,13 +186,9 @@ class OpenAIChatCompletionsProvider:
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
-        if extra_params:
-            kwargs["extra_body"] = extra_params
-        else:
-            kwargs["extra_body"] = {}
-        self._apply_thinking_mode(kwargs["extra_body"], caps)
-        if not kwargs["extra_body"]:
-            del kwargs["extra_body"]
+        extra_body = self._finalize_extra_body(extra_params, caps)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         log.debug(
             "openai.chat.request",
@@ -298,13 +314,9 @@ class OpenAIChatCompletionsProvider:
         tools = apply_tool_search(caps, tools, deferred_names)
         if tools:
             kwargs["tools"] = tools
-        if extra_params:
-            kwargs["extra_body"] = extra_params
-        else:
-            kwargs["extra_body"] = {}
-        self._apply_thinking_mode(kwargs["extra_body"], caps)
-        if not kwargs["extra_body"]:
-            del kwargs["extra_body"]
+        extra_body = self._finalize_extra_body(extra_params, caps)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         log.debug(
             "openai.chat.request",

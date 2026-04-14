@@ -4596,6 +4596,15 @@ function _renderModels(items) {
   });
 }
 
+function _toggleThinkingParam() {
+  var mode = document.getElementById("model-thinking-mode").value;
+  var row = document.getElementById("model-thinking-param-row");
+  row.style.display = mode ? "" : "none";
+  // Set default when first enabling
+  var paramEl = document.getElementById("model-thinking-param");
+  if (mode && !paramEl.value) paramEl.value = "enable_thinking";
+}
+
 function showCreateModelModal() {
   _modelCreateTrigger = document.activeElement;
   var ov = document.getElementById("model-create-overlay");
@@ -4617,6 +4626,7 @@ function showCreateModelModal() {
   document.getElementById("model-server-type").value = "";
   document.getElementById("model-thinking-mode").value = "";
   document.getElementById("model-thinking-param").value = "";
+  document.getElementById("model-thinking-param-row").style.display = "none";
   document.getElementById("model-extra-body").value = "";
   document.getElementById("model-capabilities").value = "";
   // Clear validation error styling from prior submit attempts
@@ -4676,6 +4686,7 @@ function showEditModelModal(definitionId) {
         capsObj.thinking_mode || "";
       document.getElementById("model-thinking-param").value =
         capsObj.thinking_param || "";
+      _toggleThinkingParam();
       // Server compat: server_type and extra_body workarounds
       document.getElementById("model-server-type").value = sc.server_type || "";
       var eb = sc.extra_body || {};
@@ -4979,6 +4990,7 @@ function detectModel() {
           var tpEl = document.getElementById("model-thinking-param");
           if (!tpEl.value) tpEl.value = sc2.thinking_param;
         }
+        _toggleThinkingParam();
       }
       // Auto-fill server compat from suggested profile
       if (d.suggested_server_compat) {
