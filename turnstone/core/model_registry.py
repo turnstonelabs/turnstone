@@ -303,10 +303,36 @@ def load_model_registry(
             log.warning("Model entry '%s' has no model name, skipping", alias)
             continue
         entry_base_url = _resolve_env_vars(entry.get("base_url", base_url))
-        # Per-model sampling overrides from config.toml
-        entry_temp = entry.get("temperature")
-        entry_max_tokens = entry.get("max_tokens")
-        entry_effort = entry.get("reasoning_effort")
+        # Per-model sampling overrides from config.toml — invalid values
+        # are logged and treated as None (inherit global default).
+        entry_temp: float | None = None
+        entry_max_tokens: int | None = None
+        entry_effort: str | None = None
+        raw_temp = entry.get("temperature")
+        if raw_temp is not None:
+            try:
+                entry_temp = float(raw_temp)
+                if not 0.0 <= entry_temp <= 2.0:
+                    log.warning(
+                        "Model '%s' temperature %.2f out of range [0, 2], ignoring",
+                        alias,
+                        entry_temp,
+                    )
+                    entry_temp = None
+            except (ValueError, TypeError):
+                log.warning("Model '%s' has invalid temperature %r, ignoring", alias, raw_temp)
+        raw_mt = entry.get("max_tokens")
+        if raw_mt is not None:
+            try:
+                entry_max_tokens = int(raw_mt)
+                if entry_max_tokens < 1:
+                    log.warning("Model '%s' max_tokens %d < 1, ignoring", alias, entry_max_tokens)
+                    entry_max_tokens = None
+            except (ValueError, TypeError):
+                log.warning("Model '%s' has invalid max_tokens %r, ignoring", alias, raw_mt)
+        raw_effort = entry.get("reasoning_effort")
+        if raw_effort is not None:
+            entry_effort = str(raw_effort)
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
@@ -318,9 +344,9 @@ def load_model_registry(
             if isinstance(entry.get("capabilities"), dict)
             else {},
             source="config",
-            temperature=float(entry_temp) if entry_temp is not None else None,
-            max_tokens=int(entry_max_tokens) if entry_max_tokens is not None else None,
-            reasoning_effort=str(entry_effort) if entry_effort is not None else None,
+            temperature=entry_temp,
+            max_tokens=entry_max_tokens,
+            reasoning_effort=entry_effort,
         )
 
     # 3. Ensure a "default" entry from CLI args (only if not already defined
