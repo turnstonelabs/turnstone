@@ -4680,7 +4680,21 @@ function showEditModelModal(definitionId) {
       } catch (e) {
         /* keep empty */
       }
-      var sc = capsObj.server_compat || {};
+      // Normalize to plain object — defend against null/array/primitive
+      // values that could crash the subsequent property reads.
+      if (
+        capsObj === null ||
+        typeof capsObj !== "object" ||
+        Array.isArray(capsObj)
+      ) {
+        capsObj = {};
+      }
+      var sc =
+        capsObj.server_compat &&
+        typeof capsObj.server_compat === "object" &&
+        !Array.isArray(capsObj.server_compat)
+          ? capsObj.server_compat
+          : {};
       // Only extract thinking_mode into the dropdown when the UI can
       // represent it ("manual" or "").  Values like "adaptive" (Anthropic-
       // only) stay in the raw capabilities JSON so they aren't silently
