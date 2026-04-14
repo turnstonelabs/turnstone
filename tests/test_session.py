@@ -1080,3 +1080,85 @@ class TestProviderExtraParams:
         openai_prov = create_provider("openai")
         result = session._provider_extra_params(provider=openai_prov)
         assert result is None
+
+    def test_server_compat_extra_body_merged(self, tmp_db):
+        """server_compat.extra_body workarounds are merged into extra_params."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        cfg = ModelConfig(
+            alias="test",
+            base_url="http://localhost:8000/v1",
+            api_key="none",
+            model="google/gemma-4-31B-it",
+            server_compat={
+                "extra_body": {"skip_special_tokens": False},
+            },
+        )
+        session._registry = ModelRegistry(models={"test": cfg}, default="test")
+        session._model_alias = "test"
+        result = session._provider_extra_params()
+        assert result is not None
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "medium"
+        assert result["skip_special_tokens"] is False
+
+    def test_empty_server_compat_backwards_compatible(self, tmp_db):
+        """Empty server_compat produces same output as before."""
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        result = session._provider_extra_params()
+        assert result == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+
+    def test_server_compat_with_reasoning_effort_override(self, tmp_db):
+        """reasoning_effort override works alongside server_compat."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        cfg = ModelConfig(
+            alias="test",
+            base_url="http://localhost:8000/v1",
+            api_key="none",
+            model="google/gemma-4-31B-it",
+            server_compat={"extra_body": {"skip_special_tokens": False}},
+        )
+        session._registry = ModelRegistry(models={"test": cfg}, default="test")
+        session._model_alias = "test"
+        result = session._provider_extra_params(reasoning_effort="high")
+        assert result is not None
+        assert result["chat_template_kwargs"]["reasoning_effort"] == "high"
+        assert result["skip_special_tokens"] is False
+
+    def test_model_alias_resolves_target_compat(self, tmp_db):
+        """model_alias parameter selects compat from the target, not the primary."""
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        session = self._session_with_provider("openai-compatible", tmp_db)
+        primary = ModelConfig(
+            alias="primary",
+            base_url="http://localhost:8000/v1",
+            api_key="none",
+            model="google/gemma-4-31B-it",
+            server_compat={"extra_body": {"skip_special_tokens": False}},
+        )
+        fallback = ModelConfig(
+            alias="fallback",
+            base_url="http://localhost:9000/v1",
+            api_key="none",
+            model="meta-llama/Llama-3-70B",
+        )
+        reg = ModelRegistry(
+            models={"primary": primary, "fallback": fallback},
+            default="primary",
+            fallback=["fallback"],
+        )
+        session._registry = reg
+        session._model_alias = "primary"
+
+        # Primary alias → gets Gemma workaround
+        result_primary = session._provider_extra_params()
+        assert result_primary is not None
+        assert result_primary["skip_special_tokens"] is False
+
+        # Fallback alias → no compat, just base kwargs
+        result_fallback = session._provider_extra_params(model_alias="fallback")
+        assert result_fallback == {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        assert "skip_special_tokens" not in result_fallback

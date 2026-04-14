@@ -1567,6 +1567,22 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <option value="xhigh">xhigh</option>
       <option value="max">max</option>
     </select>
+    <div class="modal-section-divider" role="separator">Server Compatibility</div>
+    <label for="model-server-type">Server Type <span style="font-weight:400;text-transform:none">(auto-detected or manual)</span></label>
+    <select id="model-server-type">
+      <option value="">Auto / Unknown</option>
+      <option value="vllm">vLLM</option>
+      <option value="llama.cpp">llama.cpp</option>
+      <option value="openai-compatible">Other OpenAI-compatible</option>
+    </select>
+    <input type="hidden" id="model-thinking-param" value="">
+    <label for="model-thinking-mode">Thinking Mode <span style="font-weight:400;text-transform:none">(reasoning / chain-of-thought)</span></label>
+    <select id="model-thinking-mode">
+      <option value="">None</option>
+      <option value="manual">Enabled</option>
+    </select>
+    <label for="model-extra-body">Extra body params <span style="font-weight:400;text-transform:none">(JSON, merged into every request)</span></label>
+    <textarea id="model-extra-body" rows="2" placeholder='{"skip_special_tokens": false}' style="font-family:var(--font-mono);font-size:11px"></textarea>
     <label for="model-capabilities">Capabilities <span style="font-weight:400;text-transform:none">(JSON)</span></label>
     <textarea id="model-capabilities" rows="3" placeholder='{"supports_vision": true}' style="font-family:var(--font-mono);font-size:11px"></textarea>
     <div style="display:flex;gap:20px;margin-top:14px">

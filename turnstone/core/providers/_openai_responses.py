@@ -223,9 +223,10 @@ class OpenAIResponsesProvider:
         temperature: float,
         reasoning_effort: str,
         deferred_names: frozenset[str] | None,
+        capabilities: ModelCapabilities | None = None,
     ) -> dict[str, Any]:
         """Build the kwargs dict for ``client.responses.create/stream``."""
-        caps = self.get_capabilities(model)
+        caps = capabilities or self.get_capabilities(model)
 
         instructions, input_items = self._convert_messages(messages)
         tools = apply_tool_search(caps, tools, deferred_names)
@@ -276,6 +277,7 @@ class OpenAIResponsesProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> Iterator[StreamChunk]:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
@@ -287,6 +289,7 @@ class OpenAIResponsesProvider:
             temperature,
             reasoning_effort,
             deferred_names,
+            capabilities=capabilities,
         )
         kwargs["stream"] = True
 
@@ -455,6 +458,7 @@ class OpenAIResponsesProvider:
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> CompletionResult:
         if extra_params:
             log.debug("openai.responses: extra_params ignored (not supported by Responses API)")
@@ -466,6 +470,7 @@ class OpenAIResponsesProvider:
             temperature,
             reasoning_effort,
             deferred_names,
+            capabilities=capabilities,
         )
 
         log.debug(

@@ -568,9 +568,10 @@ class AnthropicProvider:
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
         cancel_ref: list[Any] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> Iterator[StreamChunk]:
         _ensure_anthropic()
-        caps = self.get_capabilities(model)
+        caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(messages)
         kwargs = self._build_thinking_and_kwargs(
             caps,
@@ -771,9 +772,10 @@ class AnthropicProvider:
         reasoning_effort: str = "medium",
         extra_params: dict[str, Any] | None = None,
         deferred_names: frozenset[str] | None = None,
+        capabilities: ModelCapabilities | None = None,
     ) -> CompletionResult:
         _ensure_anthropic()
-        caps = self.get_capabilities(model)
+        caps = capabilities or self.get_capabilities(model)
         system_prompt, converted_msgs = self._convert_messages(messages)
         kwargs = self._build_thinking_and_kwargs(
             caps,
