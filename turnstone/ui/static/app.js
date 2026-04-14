@@ -4504,7 +4504,7 @@ function _loadHls(callback) {
   if (_hlsState === "loading") return;
   _hlsState = "loading";
   var script = document.createElement("script");
-  script.src = "/shared/hls-1.6.15/hls.min.js";
+  script.src = "/shared/hls-1.6.16/hls.min.js";
   script.onload = function () {
     _hlsState = "ready";
     var q = _hlsQueue;
