@@ -2419,22 +2419,30 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
 # within a single process.  Multi-process deployments would need an
 # additional DB-side check, but turnstone-server runs one process per node.
 #
+# Uses ``threading.Lock`` (not ``asyncio.Lock``) on purpose: Starlette's
+# TestClient — and any framework that runs each request on a fresh
+# anyio task — can leave a cached ``asyncio.Lock`` bound to a stale,
+# closed event loop, and the next acquire deadlocks silently.  A
+# threading.Lock is loop-agnostic, and the critical section here is
+# short (one COUNT, one INSERT) so blocking the event loop briefly is
+# acceptable.
+#
 # Bounded LRU eviction prevents unbounded growth on long-running nodes:
 # when the map exceeds the soft cap we drop the oldest *unlocked* entries
 # (a held lock means an upload is in flight — never evict those).
 _ATTACHMENT_UPLOAD_LOCKS_MAX = 1024
-_attachment_upload_locks: collections.OrderedDict[tuple[str, str], asyncio.Lock] = (
+_attachment_upload_locks: collections.OrderedDict[tuple[str, str], threading.Lock] = (
     collections.OrderedDict()
 )
 _attachment_upload_locks_mx = threading.Lock()
 
 
-def _attachment_upload_lock(ws_id: str, user_id: str) -> asyncio.Lock:
+def _attachment_upload_lock(ws_id: str, user_id: str) -> threading.Lock:
     key = (ws_id, user_id)
     with _attachment_upload_locks_mx:
         lock = _attachment_upload_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = threading.Lock()
             _attachment_upload_locks[key] = lock
         else:
             # Touch for LRU
@@ -2448,7 +2456,10 @@ def _attachment_upload_lock(ws_id: str, user_id: str) -> asyncio.Lock:
                 if stale_key == key:
                     continue  # never evict the lock we're handing out
                 stale = _attachment_upload_locks[stale_key]
-                if not stale.locked():
+                # threading.Lock has no public locked() — use the
+                # non-blocking acquire-and-release probe instead.
+                if stale.acquire(blocking=False):
+                    stale.release()
                     del _attachment_upload_locks[stale_key]
         return lock
 
@@ -2640,9 +2651,12 @@ async def upload_attachment(request: Request) -> JSONResponse:
         mime = mime_or_err[0]
 
     # Serialize count-check + save per (ws, user) so concurrent uploads
-    # can't both pass a check that sees count == cap-1.
+    # can't both pass a check that sees count == cap-1.  Plain
+    # threading.Lock (not asyncio.Lock) — see _attachment_upload_lock
+    # for why.  The critical section is short, so blocking the event
+    # loop briefly is acceptable.
     lock = _attachment_upload_lock(ws_id, user_id)
-    async with lock:
+    with lock:
         if len(list_pending_attachments(ws_id, user_id)) >= MAX_PENDING_ATTACHMENTS_PER_USER_WS:
             return JSONResponse(
                 {
