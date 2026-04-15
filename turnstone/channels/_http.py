@@ -108,7 +108,25 @@ async def _handle_notify(request: Request) -> JSONResponse:
                 status_code=404,
             )
     elif "channel_type" in target and "channel_id" in target:
-        targets.append((target["channel_type"], target["channel_id"]))
+        channel_type = target["channel_type"]
+        channel_id = target["channel_id"]
+
+        if channel_type == "slack":
+            parts = channel_id.split(":", 2)
+            target_user_id = parts[1] if len(parts) >= 2 else ""
+            if ws_id and not target_user_id:
+                return JSONResponse(
+                    {
+                        "error": (
+                            "slack notification targets with ws_id must use "
+                            "channel_id in the form 'channel:user_id' or "
+                            "'channel:user_id:thread_ts'"
+                        )
+                    },
+                    status_code=400,
+                )
+
+        targets.append((channel_type, channel_id))
     else:
         return JSONResponse(
             {"error": "target must have username or channel_type+channel_id"},

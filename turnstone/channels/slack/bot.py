@@ -183,7 +183,11 @@ class TurnstoneSlackBot:
         self._streaming: dict[str, StreamingMessage] = {}
 
         self._pending_approval_ts: dict[str, tuple[str, str]] = {}
+        self._pending_plan_review_ts: dict[str, tuple[str, str]] = {}
         self._notify_ws_map: dict[str, tuple[str, str, str]] = {}
+        # Temporary reply forwarding for notification conversations:
+        # maps ws_id -> canonical Slack route string
+        self._notify_reply_routes: dict[str, str] = {}
         self._channel_sessions: dict[tuple[str, str], tuple[str, str]] = {}
 
         headers: dict[str, str] = {}
@@ -204,6 +208,9 @@ class TurnstoneSlackBot:
         self._app.event("message")(self._on_message)
         self._app.action("ts_approve")(self._on_approve)
         self._app.action("ts_deny")(self._on_deny)
+        self._app.action("ts_plan_approve")(self._on_plan_approve)
+        self._app.action("ts_plan_request_changes")(self._on_plan_request_changes)
+        self._app.view("ts_plan_feedback_modal")(self._on_plan_feedback_modal)
 
     async def start(self) -> None:
         from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -211,7 +218,7 @@ class TurnstoneSlackBot:
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._recover_routes()
         log.info("slack.starting_socket_mode")
-        await self._handler.start_async()  # type: ignore[no-untyped-call]
+        await self._handler.start_async()
 
     async def stop(self) -> None:
         for ws_id in list(self._subscribed_ws):
@@ -219,7 +226,7 @@ class TurnstoneSlackBot:
         await self.router.aclose()
         await self._http_client.aclose()
         if self._handler is not None:
-            await self._handler.close_async()  # type: ignore[no-untyped-call]
+            await self._handler.close_async()
         log.info("slack.stopped")
 
     async def _recover_routes(self) -> None:
@@ -237,9 +244,8 @@ class TurnstoneSlackBot:
 
             await self.subscribe_ws(ws_id, channel_id)
 
-            parts = channel_id.split(":", 2)
-            if len(parts) == 3:
-                slack_channel, user_id, thread_ts = parts
+            slack_channel, user_id, thread_ts = self._parse_route(channel_id)
+            if slack_channel and user_id and thread_ts:
                 key = (slack_channel, user_id)
                 existing = latest_sessions.get(key)
 
@@ -266,10 +272,7 @@ class TurnstoneSlackBot:
         slack_channel = body["channel_id"]
         user_id = body["user_id"]
 
-        if (
-            self.config.allowed_channels
-            and slack_channel not in self.config.allowed_channels
-        ):
+        if self.config.allowed_channels and slack_channel not in self.config.allowed_channels:
             await self._client.chat_postEphemeral(
                 channel=slack_channel,
                 user=user_id,
@@ -377,22 +380,29 @@ class TurnstoneSlackBot:
         if not text or not channel_id or not user_id:
             return
 
+        if thread_ts and thread_ts in self._notify_ws_map:
+            origin_ws_id, notify_channel_id, target_user_id = self._notify_ws_map[thread_ts]
+            if channel_id == notify_channel_id and user_id == target_user_id:
+                try:
+                    reply_thread_ts = thread_ts or event.get("ts", "")
+                    self._notify_reply_routes[origin_ws_id] = self._format_route(
+                        channel_id,
+                        target_user_id,
+                        reply_thread_ts,
+                    )
+                    await self.router.send_message(origin_ws_id, text)
+                    log.info("slack.notification_reply_routed", ws_id=origin_ws_id)
+                except Exception:
+                    self._notify_reply_routes.pop(origin_ws_id, None)
+                    log.exception("slack.notification_reply_failed")
+                return
+
         if channel_id.startswith("D") or channel_type == "im":
             await self._handle_dm(event, say)
             return
 
         if self.config.allowed_channels and channel_id not in self.config.allowed_channels:
             return
-
-        if thread_ts and thread_ts in self._notify_ws_map:
-            origin_ws_id, notify_channel_id, target_user_id = self._notify_ws_map[thread_ts]
-            if channel_id == notify_channel_id and user_id == target_user_id:
-                try:
-                    await self.router.send_message(origin_ws_id, text)
-                    log.info("slack.notification_reply_routed", ws_id=origin_ws_id)
-                except Exception:
-                    log.exception("slack.notification_reply_failed")
-                return
 
         session = self._channel_sessions.get((channel_id, user_id))
         if session is None:
@@ -485,6 +495,97 @@ class TurnstoneSlackBot:
         except Exception:
             log.debug("slack.deny_message_update_failed")
 
+    async def _on_plan_approve(self, ack: Any, body: dict[str, Any]) -> None:
+        await ack()
+        ws_id = body["actions"][0].get("value", "")
+        if not ws_id:
+            return
+
+        await self.router.send_plan_feedback(ws_id, "", "")
+
+        channel = body["container"]["channel_id"]
+        ts = body["container"]["message_ts"]
+
+        self._pending_plan_review_ts.pop(ws_id, None)
+
+        try:
+            await self._client.chat_update(
+                channel=channel,
+                ts=ts,
+                text="Plan approved",
+                blocks=[],
+            )
+        except Exception:
+            log.debug("slack.plan_review_approve_update_failed")
+
+    async def _on_plan_request_changes(self, ack: Any, body: dict[str, Any], client: Any) -> None:
+        await ack()
+        ws_id = body["actions"][0].get("value", "")
+        if not ws_id:
+            return
+
+        trigger_id = body.get("trigger_id", "")
+        if not trigger_id:
+            return
+
+        await client.views_open(
+            trigger_id=trigger_id,
+            view={
+                "type": "modal",
+                "callback_id": "ts_plan_feedback_modal",
+                "private_metadata": ws_id,
+                "title": {"type": "plain_text", "text": "Plan feedback"},
+                "submit": {"type": "plain_text", "text": "Send"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type": "input",
+                        "block_id": "feedback_block",
+                        "label": {"type": "plain_text", "text": "Requested changes"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "feedback_input",
+                            "multiline": True,
+                        },
+                    }
+                ],
+            },
+        )
+
+    async def _on_plan_feedback_modal(self, ack: Any, body: dict[str, Any], view: dict[str, Any]) -> None:
+        await ack()
+
+        ws_id = view.get("private_metadata", "")
+        if not ws_id:
+            return
+
+        feedback = (
+            view.get("state", {})
+            .get("values", {})
+            .get("feedback_block", {})
+            .get("feedback_input", {})
+            .get("value", "")
+            .strip()
+        )
+
+        if not feedback:
+            feedback = "Please revise the plan."
+
+        await self.router.send_plan_feedback(ws_id, "", feedback)
+
+        entry = self._pending_plan_review_ts.pop(ws_id, None)
+        if entry is not None:
+            channel, ts = entry
+            try:
+                await self._client.chat_update(
+                    channel=channel,
+                    ts=ts,
+                    text="Plan changes requested",
+                    blocks=[],
+                )
+            except Exception:
+                log.debug("slack.plan_review_modal_update_failed")
+
     async def subscribe_ws(self, ws_id: str, channel_id: str) -> None:
         if ws_id in self._subscribed_ws:
             return
@@ -507,6 +608,8 @@ class TurnstoneSlackBot:
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pending_approval_ts.pop(ws_id, None)
+        self._pending_plan_review_ts.pop(ws_id, None)
+        self._notify_reply_routes.pop(ws_id, None)
 
         stale = [ts for ts, entry in self._notify_ws_map.items() if entry[0] == ws_id]
         for ts in stale:
@@ -517,10 +620,6 @@ class TurnstoneSlackBot:
     async def _sse_listener(self, ws_id: str, channel_id: str) -> None:
         """Connect to the server SSE endpoint and dispatch events."""
         import httpx_sse
-
-        parts = channel_id.split(":", 2)
-        slack_channel = parts[0]
-        thread_ts = parts[2] if len(parts) == 3 else (parts[1] if len(parts) == 2 else "")
 
         delay = _SSE_RECONNECT_DELAY
         url = ""
@@ -570,6 +669,11 @@ class TurnstoneSlackBot:
 
                             event = ServerEvent.from_dict(data)
                             try:
+                                effective_route = self._notify_reply_routes.get(ws_id, channel_id)
+                                slack_channel, _target_user_id, thread_ts = self._parse_route(
+                                    effective_route
+                                )
+
                                 await self._on_ws_event(
                                     ws_id,
                                     slack_channel,
@@ -606,9 +710,8 @@ class TurnstoneSlackBot:
 
     async def _cleanup_stale_route(self, ws_id: str, channel_id: str) -> None:
         """Remove a channel route whose workstream no longer exists."""
-        parts = channel_id.split(":", 2)
-        if len(parts) == 3:
-            slack_channel, user_id, _ = parts
+        slack_channel, user_id, thread_ts = self._parse_route(channel_id)
+        if slack_channel and user_id and thread_ts:
             self._channel_sessions.pop((slack_channel, user_id), None)
 
         await self.router.delete_route("slack", channel_id)
@@ -616,6 +719,8 @@ class TurnstoneSlackBot:
         self._sse_tasks.pop(ws_id, None)
         self._streaming.pop(ws_id, None)
         self._pending_approval_ts.pop(ws_id, None)
+        self._pending_plan_review_ts.pop(ws_id, None)
+        self._notify_reply_routes.pop(ws_id, None)
 
         stale = [ts for ts, entry in self._notify_ws_map.items() if entry[0] == ws_id]
         for ts in stale:
@@ -636,7 +741,7 @@ class TurnstoneSlackBot:
 
         elif isinstance(event, ContentEvent):
             sm = self._streaming.get(ws_id)
-            if sm is None:
+            if sm is None or sm.channel != slack_channel or sm.thread_ts != thread_ts:
                 sm = StreamingMessage(
                     client=self._client,
                     channel=slack_channel,
@@ -645,6 +750,7 @@ class TurnstoneSlackBot:
                     edit_interval=self.config.streaming_edit_interval,
                 )
                 self._streaming[ws_id] = sm
+
             await sm.append(event.text)
 
         elif isinstance(event, ApproveRequestEvent):
@@ -753,11 +859,44 @@ class TurnstoneSlackBot:
                     log.debug("slack.verdict_message_update_failed", ws_id=ws_id)
 
         elif isinstance(event, PlanReviewEvent):
-            await self._client.chat_postMessage(
+            log.info("slack.plan_review_received", ws_id=ws_id)
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Plan Review*\n```{event.content[:2000]}```",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Approve"},
+                            "style": "primary",
+                            "action_id": "ts_plan_approve",
+                            "value": ws_id,
+                        },
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Request changes"},
+                            "style": "danger",
+                            "action_id": "ts_plan_request_changes",
+                            "value": ws_id,
+                        },
+                    ],
+                },
+            ]
+
+            resp = await self._client.chat_postMessage(
                 channel=slack_channel,
                 thread_ts=thread_ts or None,
-                text=f"*Plan Review*\n```{event.content[:2000]}```",
+                text="Plan review required",
+                blocks=cast("list[dict[str, Any]]", blocks),
             )
+            if resp.get("ok"):
+                self._pending_plan_review_ts[ws_id] = (slack_channel, resp["ts"])
 
         elif isinstance(event, ApprovalResolvedEvent):
             entry = self._pending_approval_ts.pop(ws_id, None)
@@ -776,8 +915,21 @@ class TurnstoneSlackBot:
 
         elif isinstance(event, StreamEndEvent):
             sm = self._streaming.pop(ws_id, None)
+
             if sm is not None:
                 await sm.finalize()
+
+            reply_route = self._notify_reply_routes.get(ws_id)
+            if reply_route is not None and sm is not None and sm._ts:
+                reply_channel, target_user_id, _reply_thread_ts = self._parse_route(reply_route)
+                if reply_channel and target_user_id:
+                    self._track_notification(
+                        sm._ts,
+                        ws_id,
+                        reply_channel,
+                        target_user_id,
+                    )
+
             self._pending_approval_ts.pop(ws_id, None)
 
         elif isinstance(event, ErrorEvent):
@@ -858,6 +1010,27 @@ class TurnstoneSlackBot:
 
         return True
 
+    def _parse_route(self, channel_id: str) -> tuple[str, str, str]:
+        """Parse canonical Slack route as (channel, user_id, thread_ts)."""
+        parts = channel_id.split(":", 2)
+        slack_channel = parts[0]
+        user_id = parts[1] if len(parts) >= 2 else ""
+        thread_ts = parts[2] if len(parts) == 3 else ""
+        return slack_channel, user_id, thread_ts
+
+    def _format_route(
+        self,
+        slack_channel: str,
+        user_id: str = "",
+        thread_ts: str = "",
+    ) -> str:
+        """Format canonical Slack route as channel[:user_id[:thread_ts]]."""
+        if thread_ts:
+            return f"{slack_channel}:{user_id}:{thread_ts}"
+        if user_id:
+            return f"{slack_channel}:{user_id}"
+        return slack_channel
+
     def _track_notification(
         self,
         msg_ts: str,
@@ -870,9 +1043,7 @@ class TurnstoneSlackBot:
         self._notify_ws_map[msg_ts] = (ws_id, slack_channel, target_user_id)
 
     async def send(self, channel_id: str, content: str) -> str:
-        parts = channel_id.split(":", 2)
-        slack_channel = parts[0]
-        thread_ts = parts[2] if len(parts) == 3 else (parts[1] if len(parts) == 2 else "")
+        slack_channel, _user_id, thread_ts = self._parse_route(channel_id)
 
         last_ts = ""
         for chunk in chunk_message(content, self.config.max_message_length):
@@ -889,9 +1060,7 @@ class TurnstoneSlackBot:
     async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
         msg_ts = await self.send(channel_id, content)
         if msg_ts and ws_id:
-            parts = channel_id.split(":", 2)
-            slack_channel = parts[0]
-            target_user_id = parts[1] if len(parts) >= 2 else ""
+            slack_channel, target_user_id, _thread_ts = self._parse_route(channel_id)
             if slack_channel and target_user_id:
                 self._track_notification(
                     msg_ts,

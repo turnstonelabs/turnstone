@@ -213,65 +213,29 @@ def main() -> None:
         sys.exit(1)
 
     # -- Adapter selection ---------------------------------------------------
-    adapters_configured = False
-
-    if args.discord_token:
-        adapters_configured = True
-
-    if args.slack_token:
-        adapters_configured = True
-
-    if not adapters_configured:
+    if not args.discord_token and not args.slack_token:
         print(
             "Error: no channel adapters configured. "
-            "Set --discord-token or $TURNSTONE_DISCORD_TOKEN.",
+            "Set --discord-token / $TURNSTONE_DISCORD_TOKEN "
+            "or --slack-token / $TURNSTONE_SLACK_TOKEN.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     # -- Run -----------------------------------------------------------------
-    if args.slack_token and not args.discord_token:
-        import asyncio
-        import contextlib
+    import asyncio
+    import contextlib
+    from typing import cast
 
-        from turnstone.channels.slack.bot import TurnstoneSlackBot
-        from turnstone.channels.slack.config import SlackConfig
+    from turnstone.channels._http import _get_service_id, create_channel_app
+    from turnstone.channels._protocol import ChannelAdapter
 
-        _storage = get_storage()
-        config = SlackConfig(
-            model=args.model,
-            auto_approve=args.auto_approve,
-            bot_token=args.slack_token,
-            app_token=args.slack_app_token,
-            allowed_channels=[c.strip() for c in args.slack_channels.split(",") if c.strip()],
-            slash_command=args.slack_slash_command,
-        )
-        slack_bot = TurnstoneSlackBot(
-            config,
-            server_url=server_url,
-            storage=_storage,
-            console_url=console_url,
-            console_token_factory=_console_token_factory,
-            server_token_factory=_server_token_factory,
-        )
-
-        async def _run_slack() -> None:
-            try:
-                await slack_bot.start()
-            finally:
-                await slack_bot.stop()
-
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_slack())
-        return
+    storage = get_storage()
+    adapters: dict[str, ChannelAdapter] = {}
 
     if args.discord_token:
-        import asyncio
-
-        from turnstone.channels._http import _get_service_id, create_channel_app
         from turnstone.channels.discord.bot import TurnstoneBot
         from turnstone.channels.discord.config import DiscordConfig
-        from turnstone.core.storage._registry import get_storage
 
         allowed_channels: list[int] = []
         if args.discord_channels:
@@ -287,9 +251,7 @@ def main() -> None:
             guild_id=args.discord_guild,
             allowed_channels=allowed_channels,
         )
-
-        storage = get_storage()
-        bot = TurnstoneBot(
+        discord_bot = TurnstoneBot(
             discord_config,
             server_url,
             storage,
@@ -297,99 +259,120 @@ def main() -> None:
             console_token_factory=_console_token_factory,
             server_token_factory=_server_token_factory,
         )
-        adapters = {"discord": bot}
+        adapters[discord_bot.channel_type] = cast(ChannelAdapter, discord_bot)
 
-        # Create HTTP app for notification delivery
-        channel_app = create_channel_app(
-            adapters,  # type: ignore[arg-type]
-            storage,
-            jwt_secret=jwt_secret,
+    if args.slack_token:
+        from turnstone.channels.slack.bot import TurnstoneSlackBot
+        from turnstone.channels.slack.config import SlackConfig
+
+        slack_config = SlackConfig(
+            model=args.model,
+            auto_approve=args.auto_approve,
+            bot_token=args.slack_token,
+            app_token=args.slack_app_token,
+            allowed_channels=[c.strip() for c in args.slack_channels.split(",") if c.strip()],
+            slash_command=args.slack_slash_command,
         )
-
-        log.info(
-            "channel.starting",
-            adapter="discord",
-            guild_id=discord_config.guild_id,
-            http_port=args.http_port,
+        slack_bot = TurnstoneSlackBot(
+            slack_config,
             server_url=server_url,
+            storage=storage,
+            console_url=console_url,
+            console_token_factory=_console_token_factory,
+            server_token_factory=_server_token_factory,
+        )
+        adapters[slack_bot.channel_type] = cast(ChannelAdapter, slack_bot)
+
+    channel_app = create_channel_app(
+        adapters,
+        storage,
+        jwt_secret=jwt_secret,
+    )
+
+    log.info(
+        "channel.starting",
+        adapters=list(adapters.keys()),
+        http_port=args.http_port,
+        server_url=server_url,
+    )
+
+    async def _run_all() -> None:
+        """Run all adapters + HTTP server + service heartbeat concurrently."""
+        import uvicorn
+
+        service_id = _get_service_id()
+
+        # Resolve advertise URL — env override for Docker/K8s,
+        # otherwise derive from bind address.
+        advertise_url = os.environ.get("TURNSTONE_CHANNEL_ADVERTISE_URL", "").strip()
+        if not advertise_url:
+            if args.http_host in ("0.0.0.0", "::"):
+                advertise_host = socket.gethostname()
+            else:
+                advertise_host = args.http_host
+            scheme = "https" if args.ssl_certfile else "http"
+            advertise_url = f"{scheme}://{advertise_host}:{args.http_port}"
+        service_url = advertise_url
+
+        # Register in service registry
+        storage.register_service("channel", service_id, service_url)
+        log.info(
+            "channel.service_registered",
+            service_id=service_id,
+            url=service_url,
         )
 
-        async def _run_all() -> None:
-            """Run Discord bot + HTTP server + service heartbeat concurrently."""
-            import uvicorn
+        async def _heartbeat_loop() -> None:
+            """Periodically update service heartbeat."""
+            from turnstone.core.storage._registry import StorageUnavailableError
 
-            service_id = _get_service_id()
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
+                except StorageUnavailableError:
+                    pass  # already logged by storage layer
+                except Exception:
+                    log.exception("channel.heartbeat_failed")
 
-            # Resolve advertise URL — env override for Docker/K8s,
-            # otherwise derive from bind address.
-            advertise_url = os.environ.get("TURNSTONE_CHANNEL_ADVERTISE_URL", "").strip()
-            if not advertise_url:
-                if args.http_host in ("0.0.0.0", "::"):
-                    advertise_host = socket.gethostname()
-                else:
-                    advertise_host = args.http_host
-                scheme = "https" if args.ssl_certfile else "http"
-                advertise_url = f"{scheme}://{advertise_host}:{args.http_port}"
-            service_url = advertise_url
-
-            # Register in service registry
-            storage.register_service("channel", service_id, service_url)
-            log.info(
-                "channel.service_registered",
-                service_id=service_id,
-                url=service_url,
+        # TLS: use cert files if available (from bootstrap or TLSClient)
+        ssl_certfile = getattr(args, "ssl_certfile", None)
+        ssl_keyfile = getattr(args, "ssl_keyfile", None)
+        ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
+        if bool(ssl_certfile) != bool(ssl_keyfile):
+            print(
+                "Both --ssl-certfile and --ssl-keyfile are required for TLS",
+                file=sys.stderr,
             )
+            sys.exit(1)
 
-            async def _heartbeat_loop() -> None:
-                """Periodically update service heartbeat."""
-                from turnstone.core.storage._registry import StorageUnavailableError
+        uv_config = uvicorn.Config(
+            channel_app,
+            host=args.http_host,
+            port=args.http_port,
+            log_level="warning",
+            ssl_certfile=ssl_certfile,
+            ssl_keyfile=ssl_keyfile,
+            ssl_ca_certs=ssl_ca_certs,
+        )
+        server = uvicorn.Server(uv_config)
 
-                while True:
-                    await asyncio.sleep(30)
-                    try:
-                        await asyncio.to_thread(storage.heartbeat_service, "channel", service_id)
-                    except StorageUnavailableError:
-                        pass  # already logged by storage layer
-                    except Exception:
-                        log.exception("channel.heartbeat_failed")
-
-            # TLS: use cert files if available (from bootstrap or TLSClient)
-            ssl_certfile = getattr(args, "ssl_certfile", None)
-            ssl_keyfile = getattr(args, "ssl_keyfile", None)
-            ssl_ca_certs = getattr(args, "ssl_ca_certs", None)
-            if bool(ssl_certfile) != bool(ssl_keyfile):
-                print(
-                    "Both --ssl-certfile and --ssl-keyfile are required for TLS",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-
-            uv_config = uvicorn.Config(
-                channel_app,
-                host=args.http_host,
-                port=args.http_port,
-                log_level="warning",
-                ssl_certfile=ssl_certfile,
-                ssl_keyfile=ssl_keyfile,
-                ssl_ca_certs=ssl_ca_certs,
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
+        try:
+            await asyncio.gather(
+                *(adapter.start() for adapter in adapters.values()),
+                server.serve(),
             )
-            server = uvicorn.Server(uv_config)
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat_task
 
-            heartbeat_task = asyncio.create_task(_heartbeat_loop())
-            try:
-                await asyncio.gather(
-                    bot.start(),
-                    server.serve(),
-                )
-            finally:
-                heartbeat_task.cancel()
-                await asyncio.to_thread(storage.deregister_service, "channel", service_id)
-                log.info("channel.service_deregistered", service_id=service_id)
+            await asyncio.to_thread(storage.deregister_service, "channel", service_id)
+            log.info("channel.service_deregistered", service_id=service_id)
 
-        import contextlib
-
-        with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_all())
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_run_all())
 
 
 if __name__ == "__main__":
