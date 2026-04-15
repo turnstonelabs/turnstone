@@ -54,6 +54,28 @@ def main() -> None:
         help="Comma-separated list of allowed Discord channel IDs (default: all)",
     )
 
+    # -- Slack ---------------------------------------------------------------
+    parser.add_argument(
+        "--slack-token",
+        default=os.environ.get("TURNSTONE_SLACK_TOKEN", ""),
+        help="Slack bot token (default: $TURNSTONE_SLACK_TOKEN)",
+    )
+    parser.add_argument(
+        "--slack-app-token",
+        default=os.environ.get("TURNSTONE_SLACK_APP_TOKEN", ""),
+        help="Slack app-level token for Socket Mode (default: $TURNSTONE_SLACK_APP_TOKEN)",
+    )
+    parser.add_argument(
+        "--slack-channels",
+        default=os.environ.get("TURNSTONE_SLACK_CHANNELS", ""),
+        help="Comma-separated list of allowed Slack channel IDs (default: all)",
+    )
+    parser.add_argument(
+        "--slack-slash-command",
+        default=os.environ.get("TURNSTONE_SLACK_SLASH_COMMAND", "/turnstone"),
+        help="Slack slash command name (default: /turnstone)",
+    )
+
     # -- HTTP server ---------------------------------------------------------
     parser.add_argument(
         "--http-host",
@@ -101,7 +123,7 @@ def main() -> None:
     log = get_logger(__name__)
 
     # -- Storage -------------------------------------------------------------
-    from turnstone.core.storage._registry import init_storage
+    from turnstone.core.storage._registry import get_storage, init_storage
 
     db_backend = os.environ.get("TURNSTONE_DB_BACKEND", "sqlite")
     db_url = os.environ.get("TURNSTONE_DB_URL", "")
@@ -196,6 +218,9 @@ def main() -> None:
     if args.discord_token:
         adapters_configured = True
 
+    if args.slack_token:
+        adapters_configured = True
+
     if not adapters_configured:
         print(
             "Error: no channel adapters configured. "
@@ -205,6 +230,40 @@ def main() -> None:
         sys.exit(1)
 
     # -- Run -----------------------------------------------------------------
+    if args.slack_token and not args.discord_token:
+        import asyncio
+        import contextlib
+        from turnstone.channels.slack.bot import TurnstoneSlackBot
+        from turnstone.channels.slack.config import SlackConfig
+
+        _storage = get_storage()
+        config = SlackConfig(
+            model=args.model,
+            auto_approve=args.auto_approve,
+            bot_token=args.slack_token,
+            app_token=args.slack_app_token,
+            allowed_channels=[c.strip() for c in args.slack_channels.split(",") if c.strip()],
+            slash_command=args.slack_slash_command,
+        )
+        slack_bot = TurnstoneSlackBot(
+            config,
+            server_url=server_url,
+            storage=_storage,
+            console_url=console_url,
+            console_token_factory=_console_token_factory,
+            server_token_factory=_server_token_factory,
+        )
+
+        async def _run_slack() -> None:
+            try:
+                await slack_bot.start()
+            finally:
+                await slack_bot.stop()
+
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(_run_slack())
+        return
+
     if args.discord_token:
         import asyncio
 
@@ -219,7 +278,7 @@ def main() -> None:
                 int(c.strip()) for c in args.discord_channels.split(",") if c.strip()
             ]
 
-        config = DiscordConfig(
+        discord_config = DiscordConfig(
             server_url=server_url,
             model=args.model,
             auto_approve=args.auto_approve,
@@ -230,7 +289,7 @@ def main() -> None:
 
         storage = get_storage()
         bot = TurnstoneBot(
-            config,
+            discord_config,
             server_url,
             storage,
             console_url=console_url,
@@ -249,7 +308,7 @@ def main() -> None:
         log.info(
             "channel.starting",
             adapter="discord",
-            guild_id=config.guild_id,
+            guild_id=discord_config.guild_id,
             http_port=args.http_port,
             server_url=server_url,
         )
