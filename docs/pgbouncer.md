@@ -47,6 +47,7 @@ services:
       DB_NAME: ${POSTGRES_DB:-turnstone}
       DB_USER: ${POSTGRES_USER:-turnstone}
       DB_PASSWORD: ${POSTGRES_PASSWORD:?}
+      LISTEN_PORT: "6432"
       AUTH_TYPE: ${POSTGRES_AUTH_TYPE:-scram-sha-256}
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: "40"
@@ -83,7 +84,7 @@ TURNSTONE_DB_URL=postgresql://turnstone:secret@pgbouncer:6432/turnstone
 ## Helm / Kubernetes
 
 Add a PgBouncer deployment or use a Helm chart like
-[bitnami/pgbouncer](https://github.com/bitnami/charts/tree/main/bitnami/pgbouncer).
+[edoburu/pgbouncer](https://github.com/edoburu/docker-pgbouncer/tree/master/examples/kubernetes).
 
 In `values.yaml`, point the database at PgBouncer:
 
@@ -107,7 +108,7 @@ pgbouncer:
   maxClientConn: 5000
   maxDbConnections: 80
 ```
-
+:
 ---
 
 ## Configuration reference
