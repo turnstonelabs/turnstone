@@ -187,6 +187,10 @@ APPROVE_PATHS: frozenset[str] = frozenset(
 )
 ADMIN_PREFIX = "/api/admin/"
 
+# Matches DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}
+# with exactly one path segment for each parameter.
+_ATTACHMENT_DELETE_RE = re.compile(r"^/api/workstreams/[^/]+/attachments/[^/]+$")
+
 
 def _strip_version_prefix(path: str) -> str:
     """Strip ``/v1`` prefix for path classification."""
@@ -434,12 +438,21 @@ def required_scope(method: str, path: str) -> str:
         and normalized.endswith("/cancel")
     ):
         return "write"
-    # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}
+    # Workstream sub-resource mutations: /api/workstreams/{ws_id}/{action}.
+    # The entries here denote write actions OR write-requiring collection
+    # endpoints (e.g. `attachments` is a collection with a POST that
+    # uploads a file — not a verb, but semantically a write).
     if (
         method == "POST"
         and normalized.startswith("/api/workstreams/")
-        and normalized.rsplit("/", 1)[-1] in {"delete", "open", "refresh-title", "title"}
+        and normalized.rsplit("/", 1)[-1]
+        in {"delete", "open", "refresh-title", "title", "attachments"}
     ):
+        return "write"
+    # Attachment deletion: DELETE /api/workstreams/{ws_id}/attachments/{attachment_id}.
+    # Tight regex avoids false positives on unrelated deeper paths under
+    # /attachments/.
+    if method == "DELETE" and _ATTACHMENT_DELETE_RE.match(normalized):
         return "write"
     # Memory delete: /api/memories/{name}
     if method == "DELETE" and normalized.startswith("/api/memories/"):
@@ -459,8 +472,15 @@ def required_scope(method: str, path: str) -> str:
                 "open",
                 "refresh-title",
                 "title",
+                "attachments",
             }:
                 return "write"
+
+    # Proxied attachment deletion: /node/.../api/workstreams/{ws}/attachments/{id}
+    if method == "DELETE" and normalized.startswith("/node/"):
+        proxied = _extract_proxied_path(normalized)
+        if proxied and _ATTACHMENT_DELETE_RE.match(proxied):
+            return "write"
 
     return "read"
 

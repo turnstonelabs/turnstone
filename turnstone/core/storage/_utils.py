@@ -2,13 +2,51 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 from typing import Any
 
+from turnstone.core.attachments import unreadable_placeholder
 from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
+
+
+def _attachment_to_content_part(att: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert a stored attachment row into an OpenAI-style content part.
+
+    Returns ``None`` if the attachment's ``kind`` / ``content`` cannot be
+    turned into a content part (logged but non-fatal so history still renders).
+    """
+    kind = att.get("kind")
+    raw = att.get("content")
+    mime = att.get("mime_type") or "application/octet-stream"
+    if kind == "image" and isinstance(raw, bytes):
+        b64 = base64.b64encode(raw).decode("ascii")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        }
+    if kind == "text" and isinstance(raw, bytes):
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log.warning(
+                "attachment id=%s stored as text but not valid UTF-8",
+                att.get("attachment_id"),
+            )
+            return unreadable_placeholder(att.get("filename") or "")
+        return {
+            "type": "document",
+            "document": {
+                "name": att.get("filename") or "",
+                "media_type": mime,
+                "data": text,
+            },
+        }
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Text sanitization
@@ -197,23 +235,52 @@ def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]
 # ---------------------------------------------------------------------------
 
 
-def reconstruct_messages(rows: list[Any], ws_id: str) -> list[dict[str, Any]]:
+def reconstruct_messages(
+    rows: list[Any],
+    ws_id: str,
+    attachments_by_msg: dict[int, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     """Reconstruct OpenAI message format from stored conversation rows.
 
-    Each *row* is a 6-element tuple of ``(role, content, tool_name,
-    tool_call_id, provider_data, tool_calls_json)`` ordered
-    chronologically by row ID.
+    Each *row* is a 7-tuple ``(id, role, content, tool_name,
+    tool_call_id, provider_data, tool_calls_json)``, ordered
+    chronologically by row id.
 
-    Post-migration 013 the only roles are ``user``, ``assistant``, and
-    ``tool``.  Assistant messages carry their ``tool_calls`` as a JSON
-    column, so no heuristic merging is needed.
+    When ``attachments_by_msg`` is provided, any user row whose id has
+    attachments is rebuilt with multipart list content (text +
+    image_url/document parts).
     """
     messages: list[dict[str, Any]] = []
     for row in rows:
-        role, content, _tool_name, tc_id, provider_data, tool_calls_json = row
+        row_id, role, content, _tool_name, tc_id, provider_data, tool_calls_json = row
 
         if role == "user":
-            messages.append({"role": "user", "content": content or ""})
+            parts: list[dict[str, Any]] = []
+            meta: list[dict[str, Any]] = []
+            if attachments_by_msg and row_id is not None:
+                for att in attachments_by_msg.get(row_id, []):
+                    part = _attachment_to_content_part(att)
+                    if part is not None:
+                        parts.append(part)
+                    # Track display-oriented metadata even when a part
+                    # itself can't be reconstructed — keeps filenames
+                    # available for history replay (e.g. image pills).
+                    meta.append(
+                        {
+                            "kind": str(att.get("kind") or ""),
+                            "filename": str(att.get("filename") or ""),
+                            "mime_type": str(att.get("mime_type") or ""),
+                        }
+                    )
+            if parts:
+                user_content: list[dict[str, Any]] = [{"type": "text", "text": content or ""}]
+                user_content.extend(parts)
+                umsg: dict[str, Any] = {"role": "user", "content": user_content}
+                if meta:
+                    umsg["_attachments_meta"] = meta
+                messages.append(umsg)
+            else:
+                messages.append({"role": "user", "content": content or ""})
 
         elif role == "assistant":
             msg: dict[str, Any] = {"role": "assistant", "content": content or ""}

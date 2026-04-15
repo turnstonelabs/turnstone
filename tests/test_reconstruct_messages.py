@@ -1,8 +1,11 @@
 """Tests for the shared message reconstruction logic."""
 
+import itertools
 import json
 
 from turnstone.core.storage._utils import reconstruct_messages
+
+_row_ids = itertools.count(1)
 
 
 def _row(
@@ -13,8 +16,8 @@ def _row(
     pdata=None,
     tool_calls=None,
 ):
-    """Build a 6-element conversation row tuple (post-migration 027 format)."""
-    return (role, content, tool_name, tc_id, pdata, tool_calls)
+    """Build a 7-element conversation row tuple (id, role, ...)."""
+    return (next(_row_ids), role, content, tool_name, tc_id, pdata, tool_calls)
 
 
 class TestAssistantWithToolCalls:

@@ -667,7 +667,49 @@ def _build_history(
     """
     history = []
     for msg in session.messages:
-        entry = {"role": msg["role"], "content": msg.get("content")}
+        content = msg.get("content")
+        attachments_meta: list[dict[str, Any]] = []
+        # User messages with attachments carry list content (text +
+        # image_url / document parts).  The UI wants a plain-text bubble
+        # plus a derived pill cluster — split the list content here so
+        # the client never has to interpret provider-shaped parts.
+        if msg.get("role") == "user" and isinstance(content, list):
+            text_parts: list[str] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif ptype == "image_url":
+                    attachments_meta.append({"kind": "image", "filename": "", "mime_type": ""})
+                elif ptype == "document":
+                    d = part.get("document", {})
+                    attachments_meta.append(
+                        {
+                            "kind": "text",
+                            "filename": str(d.get("name", "")),
+                            "mime_type": str(d.get("media_type", "")),
+                        }
+                    )
+            content = "\n".join(text_parts)
+        # Prefer the authoritative side-channel (set by
+        # reconstruct_messages on history replay) — it carries image
+        # filenames that the image_url part itself can't express.
+        side_meta = msg.get("_attachments_meta")
+        if isinstance(side_meta, list) and side_meta:
+            attachments_meta = [
+                {
+                    "kind": str(m.get("kind") or ""),
+                    "filename": str(m.get("filename") or ""),
+                    "mime_type": str(m.get("mime_type") or ""),
+                }
+                for m in side_meta
+                if isinstance(m, dict)
+            ]
+        entry = {"role": msg["role"], "content": content}
+        if attachments_meta:
+            entry["attachments"] = attachments_meta
         if msg.get("tool_calls"):
             entry["tool_calls"] = [
                 {
@@ -1425,6 +1467,114 @@ async def send_message(request: Request) -> JSONResponse:
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+
+    # --- Atomic reserve-then-dispatch for attachments ---------------------
+    # Generate a send token up front and reserve attachments BEFORE we
+    # commit to queueing or starting a worker.  The reserved set is the
+    # source of truth — overlapping requests can't select the same row.
+    # Idle path and busy path both reserve, so session.send / dequeue can
+    # consume with defense-in-depth (matching reserved_for_msg_id).
+    from turnstone.core.attachments import Attachment
+    from turnstone.core.memory import (
+        get_attachments as _get_attachments,
+    )
+    from turnstone.core.memory import (
+        get_pending_attachments_with_content as _get_pending_with_content,
+    )
+    from turnstone.core.memory import (
+        reserve_attachments as _reserve,
+    )
+
+    # Actor resolution: service-scoped callers file attachments under the
+    # workstream owner (matches upload/list/delete semantics).  Returns
+    # 404 on missing/foreign workstreams.
+    attach_user_id, err = _require_ws_access(request, ws_id or "")
+    if err:
+        return err
+    # _require_ws_access already 404'd on missing ws_id; the explicit
+    # check keeps the type-checker happy without a bare assert.
+    if not isinstance(ws_id, str):
+        return JSONResponse({"error": "ws_id required"}, status_code=400)
+
+    # Full UUID hex — this token scopes both the attachment reservation
+    # and the eventual consume, so keep the full 128 bits.
+    send_id = uuid.uuid4().hex
+    raw_ids = body.get("attachment_ids")
+    auto_consume_rows: list[dict[str, Any]] = []
+    if raw_ids is None:
+        # Auto-consume: pull the current user's pending (unreserved)
+        # rows in creation order IN ONE QUERY (bytes included) — we'll
+        # reserve them below and skip the second fetch.  The reserve
+        # call is scoped to message_id IS NULL AND reserved_for_msg_id
+        # IS NULL so a concurrent reservation can't double-book.
+        auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
+        requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
+    elif isinstance(raw_ids, list) and raw_ids:
+        requested_ids = [str(x) for x in raw_ids if x]
+    else:
+        requested_ids = []
+
+    reserved_ids: list[str] = (
+        _reserve(requested_ids, send_id, ws_id, attach_user_id) if requested_ids else []
+    )
+    # Preserve request order; reserve returned a set that may be a
+    # strict subset (lost a race, already consumed, etc.).  Silently
+    # drop losers — the user can re-upload if needed and sees the
+    # partial outcome via the UI's chip-clearing on success.
+    reserved_set = set(reserved_ids)
+    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
+
+    resolved_atts: list[Attachment] = []
+    if ordered_reserved:
+        # Prefer the bytes we already fetched on the auto-consume path.
+        # Bytes were pre-reserve-call though, so reserved_for_msg_id
+        # needs refresh from the authoritative row.  Re-fetch if the
+        # auto-fetch is stale or empty.
+        if auto_consume_rows and all(
+            str(r["attachment_id"]) in set(ordered_reserved) for r in auto_consume_rows
+        ):
+            rows_by_id = {str(r["attachment_id"]): r for r in auto_consume_rows}
+            # reserved_for_msg_id was None at pre-fetch; patch in the token
+            # so the belt-and-braces scope check below doesn't reject the
+            # rows we just reserved.
+            for r in rows_by_id.values():
+                r["reserved_for_msg_id"] = send_id
+        else:
+            rows = _get_attachments(ordered_reserved)
+            rows_by_id = {str(r["attachment_id"]): r for r in rows}
+        for aid in ordered_reserved:
+            row = rows_by_id.get(aid)
+            if not row:
+                continue
+            r = row
+            # Scope check — belt and braces on top of the reservation.
+            if (
+                r.get("ws_id") != ws_id
+                or r.get("user_id") != attach_user_id
+                or r.get("message_id") is not None
+                or r.get("reserved_for_msg_id") != send_id
+            ):
+                continue
+            content = r.get("content")
+            if not isinstance(content, bytes):
+                continue
+            resolved_atts.append(
+                Attachment(
+                    attachment_id=str(r["attachment_id"]),
+                    filename=str(r.get("filename") or ""),
+                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
+                    kind=str(r.get("kind") or ""),
+                    content=content,
+                )
+            )
+
+    def _release_reservation_on_fail() -> None:
+        """Unreserve if we bail out before dispatching."""
+        if reserved_ids:
+            from turnstone.core.memory import unreserve_attachments as _unreserve
+
+            _unreserve(send_id, ws_id, attach_user_id)
+
     # Atomically check-and-start to prevent two concurrent workers on the
     # same session (ChatSession.send() is not thread-safe).
     # If cancel was requested, poll briefly for the worker to exit before
@@ -1439,11 +1589,19 @@ async def send_message(request: Request) -> JSONResponse:
     with ws._lock:
         if ws.worker_thread and ws.worker_thread.is_alive():
             # Queue the message for injection at the next tool-result seam
-            # instead of rejecting outright.
+            # instead of rejecting outright.  Attachments were already
+            # reserved above using ``send_id`` as the token — we pass
+            # the same id in as ``queue_msg_id`` so the queue entry, the
+            # reservation, and the eventual consume all share one token.
             if ws.session is not None:
                 try:
-                    cleaned, priority, msg_id = ws.session.queue_message(message)
+                    cleaned, priority, msg_id = ws.session.queue_message(
+                        message,
+                        attachment_ids=list(ordered_reserved),
+                        queue_msg_id=send_id,
+                    )
                 except queue.Full:
+                    _release_reservation_on_fail()
                     return JSONResponse({"status": "queue_full"})
                 ui._enqueue(
                     {
@@ -1453,7 +1611,20 @@ async def send_message(request: Request) -> JSONResponse:
                         "msg_id": msg_id,
                     }
                 )
-                return JSONResponse({"status": "queued", "priority": priority, "msg_id": msg_id})
+                # Report the reservation outcome so the UI can clear
+                # only the chips that actually got attached, leaving
+                # un-reserved ones visible for retry.
+                dropped = [aid for aid in requested_ids if aid not in reserved_set]
+                return JSONResponse(
+                    {
+                        "status": "queued",
+                        "priority": priority,
+                        "msg_id": msg_id,
+                        "attached_ids": list(ordered_reserved),
+                        "dropped_attachment_ids": dropped,
+                    }
+                )
+            _release_reservation_on_fail()
             ui._enqueue(
                 {
                     "type": "busy_error",
@@ -1462,21 +1633,34 @@ async def send_message(request: Request) -> JSONResponse:
             )
             return JSONResponse({"status": "busy"})
         session = ws.session
-        assert session is not None
+        if session is None:
+            _release_reservation_on_fail()
+            return JSONResponse({"error": "No session"}, status_code=500)
 
         def run() -> None:
             assert ui is not None
             me = threading.current_thread()
             try:
-                session.send(message)
+                session.send(
+                    message,
+                    attachments=resolved_atts or None,
+                    send_id=send_id,
+                )
             except GenerationCancelled:
                 # Safety net — send() normally handles this internally.
                 # If this thread was force-abandoned, ws.worker_thread will
                 # have been set to None — don't emit spurious events.
+                _release_reservation_on_fail()
                 if ws.worker_thread is me:
                     ui.on_stream_end()
                     ui.on_state_change("idle")
             except Exception as e:
+                # Release the reservation so the attachments don't stay
+                # soft-locked forever when the worker crashes before
+                # reaching the consume step.  Safe-by-idempotency: once
+                # mark_attachments_consumed has cleared the token, a
+                # follow-up unreserve is a no-op.
+                _release_reservation_on_fail()
                 if ws.worker_thread is me:
                     ui.on_error(f"Error: {e}")
                     ui.on_stream_end()
@@ -1489,7 +1673,14 @@ async def send_message(request: Request) -> JSONResponse:
     with ui._ws_lock:
         ui._ws_messages += 1
         ui._ws_turn_tool_calls = 0
-    return JSONResponse({"status": "ok"})
+    dropped = [aid for aid in requested_ids if aid not in reserved_set]
+    return JSONResponse(
+        {
+            "status": "ok",
+            "attached_ids": list(ordered_reserved),
+            "dropped_attachment_ids": dropped,
+        }
+    )
 
 
 async def approve(request: Request) -> JSONResponse:
@@ -2201,6 +2392,328 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
         ws.session.ui.on_rename(title)
     log.info("ws.title.set_success", ws_id=ws_id[:8], title=title)
     return JSONResponse({"status": "ok", "title": title})
+
+
+# ---------------------------------------------------------------------------
+# Workstream attachments
+# ---------------------------------------------------------------------------
+
+
+# Per-(ws_id, user_id) lock serializing the count-check → insert on
+# upload.  Guards the pending-cap against a concurrent-upload TOCTOU race
+# within a single process.  Multi-process deployments would need an
+# additional DB-side check, but turnstone-server runs one process per node.
+_attachment_upload_locks: dict[tuple[str, str], asyncio.Lock] = {}
+_attachment_upload_locks_mx = threading.Lock()
+
+
+def _attachment_upload_lock(ws_id: str, user_id: str) -> asyncio.Lock:
+    key = (ws_id, user_id)
+    with _attachment_upload_locks_mx:
+        lock = _attachment_upload_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _attachment_upload_locks[key] = lock
+        return lock
+
+
+_TEXT_ATTACHMENT_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".c",
+        ".conf",
+        ".cpp",
+        ".css",
+        ".go",
+        ".h",
+        ".hpp",
+        ".html",
+        ".ini",
+        ".java",
+        ".js",
+        ".json",
+        ".jsx",
+        ".md",
+        ".py",
+        ".rs",
+        ".sh",
+        ".sql",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".txt",
+        ".xml",
+        ".yaml",
+        ".yml",
+    }
+)
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Return a canonical image MIME type by inspecting magic bytes.
+
+    Returns ``None`` if the bytes don't match any supported image
+    format.  Do not trust the client-provided ``Content-Type`` alone.
+    """
+    if len(data) < 12:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _classify_text_attachment(
+    filename: str, claimed_mime: str, data: bytes
+) -> tuple[str | None, str | None]:
+    """Return ``(canonical_mime, error)`` for a candidate text upload.
+
+    Accepts MIMEs starting with ``text/`` or in an application allowlist,
+    OR a filename with a known text-file extension.  The payload must
+    decode as UTF-8.  Returns ``(None, error_message)`` on rejection.
+    """
+    import os
+
+    allowed_app_mimes = {
+        "application/json",
+        "application/xml",
+        "application/x-yaml",
+        "application/yaml",
+        "application/toml",
+    }
+    mime_ok = claimed_mime.startswith("text/") or claimed_mime in allowed_app_mimes
+    ext_ok = os.path.splitext(filename)[1].lower() in _TEXT_ATTACHMENT_EXTENSIONS
+    if not (mime_ok or ext_ok):
+        return None, (
+            f"Unsupported file type: {claimed_mime or 'unknown'} (filename: {filename!r})"
+        )
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "Text attachment is not valid UTF-8"
+    # Normalize MIME — prefer the claimed one if sensible, else text/plain.
+    if mime_ok and claimed_mime:
+        return claimed_mime, None
+    return "text/plain", None
+
+
+def _auth_user_id(request: Request) -> str:
+    """Return the authenticated user's id (empty string when absent)."""
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    return str(getattr(auth, "user_id", "") or "")
+
+
+def _auth_scopes(request: Request) -> set[str]:
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    return set(getattr(auth, "scopes", []) or [])
+
+
+def _require_ws_access(request: Request, ws_id: str) -> tuple[str, JSONResponse | None]:
+    """Resolve ``ws_id`` to its owner after verifying the caller has access.
+
+    Service-scoped tokens (internal callers) bypass ownership checks.
+    Returns ``(owner_user_id, None)`` on success.  The owner id is what
+    attachments should be filed under.
+    """
+    from turnstone.core.memory import get_workstream_owner
+
+    owner = get_workstream_owner(ws_id)
+    if owner is None:
+        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+    caller = _auth_user_id(request)
+    scopes = _auth_scopes(request)
+    if "service" in scopes:
+        # Trust the service caller; file under its own user_id if no owner
+        # is set, otherwise under the existing owner.
+        return owner or caller, None
+    # Authenticated user must own the workstream.  If the workstream was
+    # created before user tracking (owner blank) or by the same user, allow.
+    if owner and owner != caller:
+        # Return 404 (not 403) so non-owners cannot enumerate workstream
+        # existence by response code.
+        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+    return caller, None
+
+
+async def upload_attachment(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/{ws_id}/attachments — upload one file.
+
+    Multipart body with a single ``file`` field.  Validates size + MIME
+    + magic bytes, enforces per-(ws,user) pending cap, then stores.
+    """
+    from turnstone.core.attachments import (
+        IMAGE_SIZE_CAP,
+        MAX_PENDING_ATTACHMENTS_PER_USER_WS,
+        TEXT_DOC_SIZE_CAP,
+    )
+    from turnstone.core.memory import list_pending_attachments, save_attachment
+    from turnstone.core.web_helpers import read_multipart_file_or_400
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id is required"}, status_code=400)
+
+    user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+
+    # Cap at image size (largest permitted type) — per-kind cap enforced below.
+    got = await read_multipart_file_or_400(request, field="file", max_bytes=IMAGE_SIZE_CAP)
+    if isinstance(got, JSONResponse):
+        return got
+    filename, claimed_mime, data = got
+
+    if not data:
+        return JSONResponse({"error": "Empty file"}, status_code=400)
+
+    # Classify: image (magic-byte sniff) vs text (mime/ext + UTF-8 decode)
+    sniffed_image = _sniff_image_mime(data)
+    if sniffed_image is not None:
+        if len(data) > IMAGE_SIZE_CAP:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Image too large ({len(data):,} bytes); cap is {IMAGE_SIZE_CAP:,} bytes."
+                    ),
+                    "code": "too_large",
+                },
+                status_code=413,
+            )
+        kind = "image"
+        mime = sniffed_image
+    else:
+        if len(data) > TEXT_DOC_SIZE_CAP:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Text document too large ({len(data):,} bytes); "
+                        f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
+                    ),
+                    "code": "too_large",
+                },
+                status_code=413,
+            )
+        mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
+        if mime_or_err[0] is None:
+            return JSONResponse({"error": mime_or_err[1], "code": "unsupported"}, status_code=400)
+        kind = "text"
+        mime = mime_or_err[0]
+
+    # Serialize count-check + save per (ws, user) so concurrent uploads
+    # can't both pass a check that sees count == cap-1.
+    lock = _attachment_upload_lock(ws_id, user_id)
+    async with lock:
+        if len(list_pending_attachments(ws_id, user_id)) >= MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Too many pending attachments "
+                        f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
+                    ),
+                    "code": "too_many",
+                },
+                status_code=409,
+            )
+        attachment_id = uuid.uuid4().hex
+        save_attachment(
+            attachment_id,
+            ws_id,
+            user_id,
+            filename,
+            mime,
+            len(data),
+            kind,
+            data,
+        )
+    return JSONResponse(
+        {
+            "attachment_id": attachment_id,
+            "filename": filename,
+            "mime_type": mime,
+            "size_bytes": len(data),
+            "kind": kind,
+        }
+    )
+
+
+async def list_attachments(request: Request) -> JSONResponse:
+    """GET /v1/api/workstreams/{ws_id}/attachments — list current user's
+    pending (unconsumed) attachments for this workstream.
+    """
+    from turnstone.core.memory import list_pending_attachments
+
+    ws_id = request.path_params.get("ws_id", "")
+    if not ws_id:
+        return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+    rows = list_pending_attachments(ws_id, user_id)
+    return JSONResponse({"attachments": rows})
+
+
+async def get_attachment_content(request: Request) -> Response:
+    """GET /v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content —
+    raw bytes of the attachment with its stored ``Content-Type``.
+
+    The caller must own the workstream (or hold service scope).
+    Unknown / cross-workstream ids return 404 to avoid leaking existence.
+    """
+    from turnstone.core.memory import get_attachment
+
+    ws_id = request.path_params.get("ws_id", "")
+    attachment_id = request.path_params.get("attachment_id", "")
+    if not ws_id or not attachment_id:
+        return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
+    _user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+    row = get_attachment(attachment_id)
+    if not row or row.get("ws_id") != ws_id:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    body = row.get("content") or b""
+    kind = row.get("kind") or ""
+    stored_mime = row.get("mime_type") or "application/octet-stream"
+    filename = str(row.get("filename") or "attachment")
+    # Force text/plain for text kinds — avoids same-origin HTML/SVG
+    # rendering if a user uploaded an HTML-ish text file.  Images keep
+    # their sniffed MIME (the allowlist is strict: png/jpeg/gif/webp).
+    response_mime = "text/plain; charset=utf-8" if kind == "text" else stored_mime
+    # Sanitize filename for Content-Disposition (quotes / CRLF only —
+    # browsers tolerate most other characters).  RFC 6266 filename*=
+    # would be more complete but isn't needed for the inline-attachment
+    # use case here.
+    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+        "Content-Disposition": f'inline; filename="{safe_name}"',
+        "Cache-Control": "private, no-store",
+    }
+    return Response(body, media_type=response_mime, headers=headers)
+
+
+async def delete_attachment(request: Request) -> JSONResponse:
+    """DELETE /v1/api/workstreams/{ws_id}/attachments/{attachment_id} —
+    remove a pending attachment.  Consumed attachments return 404.
+    """
+    from turnstone.core.memory import delete_attachment as _delete
+
+    ws_id = request.path_params.get("ws_id", "")
+    attachment_id = request.path_params.get("attachment_id", "")
+    if not ws_id or not attachment_id:
+        return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
+    user_id, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+    deleted = _delete(attachment_id, ws_id, user_id)
+    if not deleted:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse({"status": "deleted"})
 
 
 async def open_workstream(request: Request) -> JSONResponse:
@@ -3172,6 +3685,26 @@ def create_app(
                         methods=["POST"],
                     ),
                     Route("/api/workstreams/{ws_id}/title", set_workstream_title, methods=["POST"]),
+                    Route(
+                        "/api/workstreams/{ws_id}/attachments",
+                        upload_attachment,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/attachments",
+                        list_attachments,
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+                        get_attachment_content,
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/api/workstreams/{ws_id}/attachments/{attachment_id}",
+                        delete_attachment,
+                        methods=["DELETE"],
+                    ),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/models", list_available_models),
                     Route("/api/send", send_message, methods=["POST", "DELETE"]),

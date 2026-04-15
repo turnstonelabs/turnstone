@@ -338,6 +338,7 @@
   min-width: 200px;
   min-height: 150px;
   overflow: hidden;
+  position: relative;
 }
 .pane.focused { outline: 1px solid var(--accent-dim); outline-offset: -1px; }
 .multi-pane .pane.focused .pane-header {
@@ -914,8 +915,14 @@ body { position: static; }
   background: var(--bg-surface);
   border-top: 1px solid var(--border-strong);
   display: flex;
+  flex-direction: column;
   gap: 8px;
   flex-shrink: 0;
+}
+.pane-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
 }
 .pane-input {
   flex: 1;
@@ -956,6 +963,112 @@ body { position: static; }
 .pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; }
 .pane-stop:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
 [data-theme="light"] .pane-stop { color: #fff; }
+
+/* Paperclip button — secondary action, same footprint as send button */
+.pane-attach {
+  background: transparent !important;
+  color: var(--fg-dim, var(--fg)) !important;
+  border: 1px solid var(--border-strong) !important;
+  padding: 9px 12px !important;
+  font-size: 15px !important;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.pane-attach:hover {
+  color: var(--accent) !important;
+  border-color: var(--accent) !important;
+  filter: none !important;
+}
+.pane-attach:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Attachment chips — pill cluster above the textarea */
+.pane-attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.pane-attach-chips:empty { display: none; }
+.pane-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 8px 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 280px;
+}
+.pane-attach-chip-icon { font-size: 12px; opacity: 0.7; }
+.pane-attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.pane-attach-chip-size { color: var(--fg-dim, var(--fg)); opacity: 0.65; font-size: 10px; }
+.pane-attach-chip-remove {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: none;
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.pane-attach-chip-remove:hover { color: var(--red, #c94040); background: var(--bg-surface); }
+.pane-attach-chip-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Drag-and-drop visual state on the pane */
+.pane.pane-drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.pane.pane-drop-target::after {
+  content: "Drop file to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent-dim, rgba(0, 0, 0, 0.1));
+  color: var(--fg-bright, var(--fg));
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* Historical-message attachment pills — beneath the user bubble */
+.msg-user-attach {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.msg-user-attach-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-surface);
+  color: var(--fg-dim, var(--fg));
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+.msg-user-attach-icon { font-size: 11px; opacity: 0.7; }
+.msg-user-attach-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ==========================================================================
    Per-workstream status bar — above input

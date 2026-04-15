@@ -22,6 +22,7 @@ from turnstone.core.providers._openai_common import (
     apply_tool_search,
     extract_usage,
     format_citations,
+    format_document_wrapper,
     lookup_openai_capabilities,
     resolve_reasoning_effort,
     sanitize_messages,
@@ -36,11 +37,13 @@ from turnstone.core.providers._protocol import (
 log = structlog.get_logger(__name__)
 
 
-def _convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
+def convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
     """Convert Chat Completions content parts to Responses API format.
 
-    Handles text and image_url parts.  The Responses API uses
-    ``input_image`` instead of ``image_url``.
+    Handles text, image_url, and internal ``document`` parts.  The
+    Responses API uses ``input_image`` instead of ``image_url``; there
+    is no native document block, so documents are inlined as
+    ``input_text`` with a ``<document>`` wrapper.
     """
     converted: list[dict[str, Any]] = []
     for part in parts:
@@ -53,6 +56,18 @@ def _convert_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
             url_data = part.get("image_url", {})
             url = url_data.get("url", "") if isinstance(url_data, dict) else ""
             converted.append({"type": "input_image", "image_url": url})
+        elif ptype == "document":
+            d = part.get("document", {})
+            converted.append(
+                {
+                    "type": "input_text",
+                    "text": format_document_wrapper(
+                        d.get("name", ""),
+                        d.get("media_type", "text/plain"),
+                        d.get("data", ""),
+                    ),
+                }
+            )
         else:
             converted.append(part)
     return converted
@@ -108,7 +123,7 @@ class OpenAIResponsesProvider:
                     item["content"] = content
                 elif isinstance(content, list):
                     # Vision: content parts (text + image_url)
-                    item["content"] = _convert_content_parts(content)
+                    item["content"] = convert_content_parts(content)
                 else:
                     item["content"] = content or ""
                 items.append(item)

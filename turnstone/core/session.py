@@ -34,6 +34,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from turnstone.core.attachments import (
+    IMAGE_SIZE_CAP as _ATTACH_IMAGE_SIZE_CAP,
+)
+from turnstone.core.attachments import (
+    Attachment,
+    unreadable_placeholder,
+)
 from turnstone.core.config import get_tavily_key
 from turnstone.core.edit import find_occurrences, pick_nearest
 from turnstone.core.log import get_logger
@@ -42,6 +49,7 @@ from turnstone.core.memory import (
     delete_messages_after,
     delete_structured_memory,
     delete_workstream,
+    get_attachments,
     get_skill_by_name,
     get_structured_memory_by_name,
     get_workstream_display_name,
@@ -51,6 +59,7 @@ from turnstone.core.memory import (
     list_workstreams_with_history,
     load_messages,
     load_workstream_config,
+    mark_attachments_consumed,
     normalize_key,
     resolve_workstream,
     save_message,
@@ -61,6 +70,7 @@ from turnstone.core.memory import (
     search_history_recent,
     search_structured_memories,
     set_workstream_alias,
+    unreserve_attachments,
     update_workstream_title,
 )
 from turnstone.core.memory_relevance import (
@@ -160,8 +170,18 @@ _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".ico"}
 )
 
-# 4 MB raw → ~5.3 MB base64, safely under Anthropic's per-block limit
-_IMAGE_SIZE_CAP: int = 4 * 1024 * 1024
+# Alias for back-compat (existing tests import ``_IMAGE_SIZE_CAP``
+# from this module).  Single source of truth lives in
+# turnstone.core.attachments so the server upload cap and the
+# in-session read cap can't drift.
+_IMAGE_SIZE_CAP = _ATTACH_IMAGE_SIZE_CAP
+
+
+def _encode_image_data_uri(raw: bytes, mime: str) -> str:
+    """Wrap raw image bytes as a ``data:{mime};base64,...`` URI."""
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
 
 # Upper bound on total skill content injected into system messages
 _MAX_SKILL_CONTENT: int = 32768
@@ -384,7 +404,15 @@ class ChatSession:
         self._pending_nudge: list[tuple[str, str]] = []  # (type, text)
         # User message queue: messages sent while model is executing.
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
-        self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
+        #
+        # Entry shape: ``(cleaned_text, priority, attachment_ids)``.
+        # Attachment lifecycle:
+        #     pending   — uploaded, not tied to any turn
+        #     reserved  — soft-locked at queue time (reserved_for_msg_id = queue id)
+        #     consumed  — committed to a saved message (message_id = conv row id)
+        # queue_message transitions pending → reserved for its attachments;
+        # _flush_queued_messages (dequeue) transitions reserved → consumed.
+        self._queued_messages: collections.OrderedDict[str, tuple[str, str, tuple[str, ...]]] = (
             collections.OrderedDict()
         )
         self._queued_lock = threading.Lock()
@@ -1791,10 +1819,121 @@ class ChatSession:
         if my_generation and my_generation != self._generation:
             raise GenerationCancelled()
 
+    def _append_user_turn(
+        self,
+        user_input: str,
+        attachments: list[Attachment] | tuple[Attachment, ...],
+        send_id: str | None = None,
+    ) -> int:
+        """Append a user turn (plain or multipart) and persist it.
+
+        When ``attachments`` is non-empty the in-memory message carries
+        list content (text + image_url + document parts); the DB
+        conversations row stores only the text — attachments link back
+        via ``workstream_attachments.message_id``.  Returns the saved
+        conversations row id (0 on save failure, per the storage
+        wrapper's no-raise contract).
+
+        ``send_id`` (when provided) is the reservation token; the
+        consume step adds it to the WHERE clause so a stale send can't
+        steal rows reserved to a different one.
+        """
+        user_content: str | list[dict[str, Any]]
+        if attachments:
+            parts: list[dict[str, Any]] = [{"type": "text", "text": user_input}]
+            for att in attachments:
+                if att.is_image:
+                    parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": _encode_image_data_uri(att.content, att.mime_type),
+                            },
+                        }
+                    )
+                elif att.is_text:
+                    try:
+                        text = att.content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        log.warning(
+                            "attachment id=%s is not valid UTF-8; injecting placeholder",
+                            att.attachment_id,
+                        )
+                        parts.append(unreadable_placeholder(att.filename))
+                        continue
+                    parts.append(
+                        {
+                            "type": "document",
+                            "document": {
+                                "name": att.filename,
+                                "media_type": att.mime_type,
+                                "data": text,
+                            },
+                        }
+                    )
+                else:
+                    log.warning(
+                        "attachment id=%s has unknown kind=%r; injecting placeholder",
+                        att.attachment_id,
+                        att.kind,
+                    )
+                    parts.append(unreadable_placeholder(att.filename))
+            user_content = parts
+        else:
+            user_content = user_input
+
+        user_msg: dict[str, Any] = {"role": "user", "content": user_content}
+        if attachments:
+            # Sibling metadata so live history replay has the same shape
+            # as reloaded-from-DB (filenames are not recoverable from an
+            # image_url data URI).  sanitize_messages strips leading-
+            # underscore keys before the wire call so this is safe.
+            user_msg["_attachments_meta"] = [
+                {
+                    "kind": a.kind,
+                    "filename": a.filename,
+                    "mime_type": a.mime_type,
+                }
+                for a in attachments
+            ]
+        self.messages.append(user_msg)
+        self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
+        # DB row stores the raw text only; attachments are joined back in
+        # from workstream_attachments on load via message_id.  Save →
+        # consume are two separate transactions; a crash between them
+        # leaves pending rows that the UI's chip rehydration can still
+        # surface so the user can clear or resend them.
+        message_id = save_message(self._ws_id, "user", user_input)
+        if attachments and message_id:
+            mark_attachments_consumed(
+                [a.attachment_id for a in attachments],
+                message_id,
+                self._ws_id,
+                self._user_id,
+                reserved_for_msg_id=send_id,
+            )
+        return message_id
+
     # -- Main generation loop ------------------------------------------------
 
-    def send(self, user_input: str) -> None:
-        """Send user input and handle the response loop (including tool calls)."""
+    def send(
+        self,
+        user_input: str,
+        attachments: list[Attachment] | None = None,
+        send_id: str | None = None,
+    ) -> None:
+        """Send user input and handle the response loop (including tool calls).
+
+        When ``attachments`` is provided the in-memory user message carries
+        multipart list content (text + image_url + document parts) while
+        the DB conversations row stores only the text — attachments are
+        linked via ``message_id`` in the workstream_attachments table.
+
+        ``send_id`` is the server-side reservation token for the
+        attachments; on consume, the storage layer matches it against
+        ``reserved_for_msg_id`` so a stale send can't steal rows
+        reserved to a different one.
+        """
         self._refresh_model_from_registry()
         # Token budget approval gate
         if self._budget_exhausted:
@@ -1822,9 +1961,8 @@ class ChatSession:
         # reference so subprocesses from old generations are still killed.
         self._cancel_event = threading.Event()
         self._cancelled_partial_msg = None
-        self.messages.append({"role": "user", "content": user_input})
-        self._msg_tokens.append(max(1, int(len(user_input) / self._chars_per_token)))
-        save_message(self._ws_id, "user", user_input)
+
+        self._append_user_turn(user_input, attachments or (), send_id=send_id)
 
         # Metacognitive nudge: check for correction/completion signals
         nudge = self._check_metacognitive_nudge(user_input)
@@ -2678,20 +2816,35 @@ class ChatSession:
     _IMAGE_TOKENS = 1000
 
     @staticmethod
-    def _msg_text_chars(msg: dict[str, Any]) -> tuple[int, int]:
-        """Return (text_chars, image_count) for a message.
+    def _msg_text_chars(msg: dict[str, Any]) -> tuple[int, int, int]:
+        """Return ``(text_chars, image_count, doc_chars)`` for a message.
 
-        Counts all textual content plus structural overhead (role,
-        tool_call IDs, tool call names/arguments).  Images are counted
-        separately so the calibration can subtract their fixed token
-        cost from prompt_tokens.
+        Counts textual content + structural overhead (role, tool_call
+        IDs, tool call names/arguments).  Images are counted separately
+        so the calibration can subtract their fixed token cost from
+        prompt_tokens.  Document-part content (``data`` + ``name`` +
+        ``media_type``) is counted in a third bucket so it contributes
+        to the token budget without polluting the ``chars_per_token``
+        calibration — provider-native document blocks (Anthropic) and
+        inlined text (OpenAI/Google) tokenize differently, so it's
+        safer to exclude them from the text calibration.
         """
         content = msg.get("content")
         n = 0
         images = 0
+        doc_chars = 0
         if isinstance(content, list):
-            n += sum(len(p.get("text", "")) for p in content if p.get("type") == "text")
-            images += sum(1 for p in content if p.get("type") == "image_url")
+            for p in content:
+                ptype = p.get("type")
+                if ptype == "text":
+                    n += len(p.get("text", ""))
+                elif ptype == "image_url":
+                    images += 1
+                elif ptype == "document":
+                    d = p.get("document", {})
+                    doc_chars += len(d.get("data", ""))
+                    doc_chars += len(d.get("name", ""))
+                    doc_chars += len(d.get("media_type", ""))
         else:
             n += len(content or "")
         for tc in msg.get("tool_calls", []):
@@ -2701,17 +2854,17 @@ class ChatSession:
         # Structural overhead: role, tool_call_id
         n += len(msg.get("role", ""))
         n += len(msg.get("tool_call_id", ""))
-        return n, images
+        return n, images, doc_chars
 
     def _msg_char_count(self, msg: dict[str, Any]) -> int:
         """Count characters in a message, including structural overhead.
 
-        Includes role markers, tool_call IDs, and image placeholders so
-        that the chars_per_token calibration matches what providers
-        actually bill.
+        Includes role markers, tool_call IDs, image placeholders, and
+        document-part characters so that the budget estimate reflects
+        the full payload the provider sees.
         """
-        text_chars, images = self._msg_text_chars(msg)
-        return text_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
+        text_chars, images, doc_chars = self._msg_text_chars(msg)
+        return text_chars + doc_chars + int(images * self._IMAGE_TOKENS * self._chars_per_token)
 
     def _update_token_table(self, assistant_msg: dict[str, Any]) -> None:
         """Update per-message token estimates using API usage data."""
@@ -2722,15 +2875,16 @@ class ChatSession:
         compl_tok = self._last_usage["completion_tokens"]
 
         # Calibrate chars_per_token ratio from actual usage.
-        # Images get a fixed token budget, so we subtract those from the
-        # provider-reported prompt_tokens and calibrate only the text portion.
+        # Images get a fixed token budget (subtracted).  Documents
+        # tokenize non-linearly depending on provider — excluded from
+        # calibration so they don't skew the text ratio.
         all_msgs = self._full_messages()  # system + self.messages (before append)
         active_tools = self._get_active_tools() or []
         tool_def_chars = sum(len(json.dumps(t)) for t in active_tools)
         text_chars = 0
         image_count = 0
         for m in all_msgs:
-            tc, ic = self._msg_text_chars(m)
+            tc, ic, _doc = self._msg_text_chars(m)
             text_chars += tc
             image_count += ic
         text_chars += tool_def_chars
@@ -3140,12 +3294,23 @@ class ChatSession:
 
     # -- User message queue -----------------------------------------------------
 
-    def queue_message(self, text: str) -> tuple[str, str, str]:
+    def queue_message(
+        self,
+        text: str,
+        attachment_ids: list[str] | tuple[str, ...] | None = None,
+        queue_msg_id: str | None = None,
+    ) -> tuple[str, str, str]:
         """Queue a user message for injection at the next tool-result seam.
 
         Thread-safe — called from the HTTP handler while the worker thread
         is executing.  Returns ``(cleaned_text, priority, msg_id)``.
         Raises ``queue.Full`` if the queue is saturated.
+
+        ``attachment_ids`` (ordered) are resolved and consumed at dequeue
+        time so queued multimodal turns don't silently lose their files.
+        ``queue_msg_id`` lets the caller supply the id (so it matches the
+        attachment-reservation token already taken server-side) — when
+        omitted, an id is generated.
         """
         from turnstone.core.tool_advisory import parse_priority
 
@@ -3153,37 +3318,121 @@ class ChatSession:
         # Cap individual message length to prevent context bloat
         if len(cleaned) > 2000:
             cleaned = cleaned[:2000] + "..."
-        msg_id = uuid.uuid4().hex[:12]
+        # Full UUID hex (128 bits) rather than a truncated prefix — this
+        # id doubles as a cross-table reservation token on
+        # workstream_attachments, and a 48-bit truncation narrows the
+        # birthday bound unnecessarily.
+        msg_id = queue_msg_id or uuid.uuid4().hex
+        att_ids = tuple(attachment_ids or ())
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:
                 raise queue.Full()
-            self._queued_messages[msg_id] = (cleaned, priority)
+            self._queued_messages[msg_id] = (cleaned, priority, att_ids)
         return cleaned, priority, msg_id
 
     def dequeue_message(self, msg_id: str) -> bool:
-        """Remove a queued message by ID.  Returns True if removed."""
+        """Remove a queued message by ID.  Returns True if removed.
+
+        Releases any attachment reservation held by the queued message
+        so the user can re-use or delete those files.
+        """
         with self._queued_lock:
-            return self._queued_messages.pop(msg_id, None) is not None
+            popped = self._queued_messages.pop(msg_id, None)
+        if popped is None:
+            return False
+        # popped == (cleaned, priority, attachment_ids_tuple)
+        if popped[2]:
+            unreserve_attachments(msg_id, self._ws_id, self._user_id)
+        return True
+
+    def _resolve_attachment_ids(
+        self,
+        attachment_ids: tuple[str, ...] | list[str],
+        allow_reserved_for: str | None = None,
+    ) -> list[Attachment]:
+        """Fetch+scope-check attachment ids, preserving request order.
+
+        Silently drops ids that don't belong to this session's ws+user,
+        are already consumed, or are reserved for a different queued
+        message.  When ``allow_reserved_for`` is set, attachments whose
+        ``reserved_for_msg_id`` matches are accepted (dequeue path
+        passes the originating queue msg id so its own reservation
+        releases cleanly).
+        """
+        ids = [str(x) for x in attachment_ids if x]
+        if not ids:
+            return []
+        rows = get_attachments(ids)
+        by_id = {str(r["attachment_id"]): r for r in rows}
+        resolved: list[Attachment] = []
+        for aid in ids:
+            r = by_id.get(aid)
+            if (
+                not r
+                or r.get("ws_id") != self._ws_id
+                or r.get("user_id") != self._user_id
+                or r.get("message_id") is not None
+            ):
+                continue
+            reserved = r.get("reserved_for_msg_id")
+            if reserved and reserved != allow_reserved_for:
+                continue
+            content = r.get("content")
+            if not isinstance(content, bytes):
+                continue
+            resolved.append(
+                Attachment(
+                    attachment_id=str(r["attachment_id"]),
+                    filename=str(r.get("filename") or ""),
+                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
+                    kind=str(r.get("kind") or ""),
+                    content=content,
+                )
+            )
+        return resolved
 
     def _flush_queued_messages(self) -> None:
-        """Drain queued messages into a single user message.
+        """Drain queued messages.
 
-        Called after cancellation so queued messages are not silently lost.
-        Concatenates all pending messages to avoid multiple consecutive
-        user messages (out of distribution for most models).
+        Items without attachments are combined into a single user turn
+        to avoid back-to-back user messages that some models handle
+        poorly.  Items with attachments flush as separate multipart user
+        turns (combining text+files across distinct queued sends would
+        misrepresent ordering).
         """
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         with self._queued_lock:
-            items = list(self._queued_messages.values())
+            # .items() so we keep the queue msg id for reservation lookup
+            items = list(self._queued_messages.items())
             self._queued_messages.clear()
         if not items:
             return
-        parts = [f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items]
-        combined = "\n\n".join(parts)
-        self.messages.append({"role": "user", "content": combined})
-        self._msg_tokens.append(max(1, int(len(combined) / self._chars_per_token)))
-        save_message(self._ws_id, "user", combined)
+
+        # Collapse contiguous attachment-free items into one combined text
+        # to preserve the prior behaviour; flush attachment-bearing items
+        # inline as their own multipart turns.
+        text_run: list[tuple[str, str]] = []
+
+        def _flush_text_run() -> None:
+            if not text_run:
+                return
+            parts = [
+                f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in text_run
+            ]
+            combined = "\n\n".join(parts)
+            self._append_user_turn(combined, ())
+            text_run.clear()
+
+        for queue_msg_id, (cleaned, priority, att_ids) in items:
+            if att_ids:
+                _flush_text_run()
+                text = f"[IMPORTANT] {cleaned}" if priority == PRIORITY_IMPORTANT else cleaned
+                resolved = self._resolve_attachment_ids(att_ids, allow_reserved_for=queue_msg_id)
+                self._append_user_turn(text, resolved, send_id=queue_msg_id)
+            else:
+                text_run.append((cleaned, priority))
+        _flush_text_run()
 
     def _collect_advisories(
         self,
@@ -3215,13 +3464,28 @@ class ChatSession:
         if assessment is not None:
             advisories.append(GuardAdvisory(assessment=assessment, func_name=func_name))
 
-        # Drain queued user messages on the last result in the batch
+        # Drain queued user messages on the last result in the batch.
+        # Attachment-bearing items fall back to a full multipart user
+        # turn (advisories are text-only and can't carry image blocks).
         if is_last_in_batch:
             with self._queued_lock:
-                items = list(self._queued_messages.values())
+                items = list(self._queued_messages.items())
                 self._queued_messages.clear()
-            for msg, priority in items:
-                advisories.append(UserInterjection(message=msg, priority=priority))
+            attachment_items: list[tuple[str, str, str, tuple[str, ...]]] = []
+            for queue_msg_id, (msg, priority, att_ids) in items:
+                if att_ids:
+                    attachment_items.append((queue_msg_id, msg, priority, att_ids))
+                else:
+                    advisories.append(UserInterjection(message=msg, priority=priority))
+            if attachment_items:
+                from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
+                for queue_msg_id, msg, priority, att_ids in attachment_items:
+                    text = f"[IMPORTANT] {msg}" if priority == PRIORITY_IMPORTANT else msg
+                    resolved = self._resolve_attachment_ids(
+                        att_ids, allow_reserved_for=queue_msg_id
+                    )
+                    self._append_user_turn(text, resolved, send_id=queue_msg_id)
 
         return advisories
 
@@ -5245,17 +5509,13 @@ class ChatSession:
             return call_id, msg
 
         self._read_files.add(resolved)
-        b64data = base64.b64encode(raw).decode("ascii")
         mime, _ = mimetypes.guess_type(path)
         if not mime:
             mime = "image/png"
 
         content_parts: list[dict[str, Any]] = [
             {"type": "text", "text": f"Image file: {path} ({len(raw):,} bytes)"},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{b64data}"},
-            },
+            {"type": "image_url", "image_url": {"url": _encode_image_data_uri(raw, mime)}},
         ]
 
         self._report_tool_result(call_id, "read_file", f"image ({len(raw):,} bytes)")

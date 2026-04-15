@@ -410,6 +410,46 @@ sa.Index(
 )
 
 # ---------------------------------------------------------------------------
+# Workstream attachments — user-uploaded images and text documents bound to
+# a specific user turn (one-shot, consumed when linked to a conversations row).
+# ---------------------------------------------------------------------------
+
+workstream_attachments = sa.Table(
+    "workstream_attachments",
+    metadata,
+    sa.Column("attachment_id", sa.Text, primary_key=True),
+    sa.Column("ws_id", sa.Text, nullable=False),
+    sa.Column("user_id", sa.Text, nullable=False),
+    sa.Column("filename", sa.Text, nullable=False),
+    sa.Column("mime_type", sa.Text, nullable=False),
+    sa.Column("size_bytes", sa.Integer, nullable=False),
+    sa.Column("kind", sa.Text, nullable=False),  # 'image' | 'text'
+    sa.Column("content", sa.LargeBinary, nullable=False),
+    sa.Column("message_id", sa.Integer, nullable=True),  # conversations.id once consumed
+    # Soft lock tying an attachment to a queued user message.  Lifecycle:
+    #   pending  : message_id IS NULL  AND  reserved_for_msg_id IS NULL
+    #   reserved : message_id IS NULL  AND  reserved_for_msg_id = <queue-msg-id>
+    #   consumed : message_id IS NOT NULL  (reservation cleared on transition)
+    sa.Column("reserved_for_msg_id", sa.Text, nullable=True),
+    sa.Column("created", sa.Text, nullable=False),
+)
+
+sa.Index("idx_ws_attachments_ws_id", workstream_attachments.c.ws_id)
+sa.Index(
+    "idx_ws_attachments_pending",
+    workstream_attachments.c.ws_id,
+    workstream_attachments.c.user_id,
+    workstream_attachments.c.message_id,
+)
+sa.Index("idx_ws_attachments_message", workstream_attachments.c.message_id)
+sa.Index(
+    "idx_ws_attachments_reserved",
+    workstream_attachments.c.ws_id,
+    workstream_attachments.c.user_id,
+    workstream_attachments.c.reserved_for_msg_id,
+)
+
+# ---------------------------------------------------------------------------
 # Skill versions — version history for skills
 # ---------------------------------------------------------------------------
 

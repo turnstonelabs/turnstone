@@ -28,6 +28,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
+    ListAttachmentsResponse,
     ListAvailableModelsResponse,
     ListMemoriesResponse,
     ListSavedWorkstreamsResponse,
@@ -40,6 +41,7 @@ from turnstone.api.server_schemas import (
     SendRequest,
     SendResponse,
     SkillSummary,
+    UploadAttachmentResponse,
 )
 
 SERVER_ENDPOINTS: list[EndpointSpec] = [
@@ -171,6 +173,45 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Regenerate workstream title via LLM",
         error_codes=[404],
         tags=["Workstreams"],
+    ),
+    # --- Workstream attachments ---
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "POST",
+        "Upload a file (multipart/form-data, field 'file') and attach it "
+        "to the caller's next user turn on this workstream.  Validates "
+        "size, MIME, and UTF-8 for text; magic-byte sniff for images.  "
+        "Ownership failures are masked as 404 so non-owners cannot "
+        "enumerate workstream existence; a 403 indicates a scope/auth "
+        "failure from the middleware layer.",
+        response_model=UploadAttachmentResponse,
+        error_codes=[400, 403, 404, 409, 413],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments",
+        "GET",
+        "List the caller's pending (unconsumed) attachments for this "
+        "workstream.  Ownership failures are masked as 404.",
+        response_model=ListAttachmentsResponse,
+        error_codes=[403, 404],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        "GET",
+        "Return raw bytes of an attachment with its stored Content-Type.  "
+        "Ownership failures are masked as 404.",
+        error_codes=[403, 404],
+        tags=["Attachments"],
+    ),
+    EndpointSpec(
+        "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+        "DELETE",
+        "Remove a pending attachment (consumed attachments return 404).  "
+        "Ownership failures are also masked as 404.",
+        error_codes=[403, 404],
+        tags=["Attachments"],
     ),
     # --- Saved workstreams ---
     EndpointSpec(
@@ -348,6 +389,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ListWorkstreamsResponse,
     DashboardResponse,
     ListSavedWorkstreamsResponse,
+    UploadAttachmentResponse,
+    ListAttachmentsResponse,
     HealthResponse,
     SaveMemoryRequest,
     MemoryInfo,

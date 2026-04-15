@@ -24,8 +24,13 @@ class StorageBackend(Protocol):
         tool_call_id: str | None = None,
         provider_data: str | None = None,
         tool_calls: str | None = None,
-    ) -> None:
-        """Log a message to the conversations table."""
+    ) -> int:
+        """Log a message to the conversations table.
+
+        Returns the inserted row's ``id`` (autoincrement PK).  Callers
+        that need to link side tables (e.g. ``workstream_attachments``)
+        use this to associate the row after save.
+        """
         ...
 
     def save_messages_bulk(self, rows: list[dict[str, Any]]) -> None:
@@ -41,6 +46,115 @@ class StorageBackend(Protocol):
 
     def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
         """Load messages for a workstream and reconstruct OpenAI message format."""
+        ...
+
+    # -- Workstream attachments -----------------------------------------------
+
+    def save_attachment(
+        self,
+        attachment_id: str,
+        ws_id: str,
+        user_id: str,
+        filename: str,
+        mime_type: str,
+        size_bytes: int,
+        kind: str,
+        content: bytes,
+    ) -> None:
+        """Persist an uploaded attachment in pending (unconsumed) state."""
+        ...
+
+    def list_pending_attachments(self, ws_id: str, user_id: str) -> list[dict[str, Any]]:
+        """Return un-consumed attachments for ``(ws_id, user_id)``.
+
+        Each dict contains: ``attachment_id``, ``filename``, ``mime_type``,
+        ``size_bytes``, ``kind``, ``created``.  Content bytes are NOT returned.
+        """
+        ...
+
+    def get_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
+        """Bulk fetch attachments by id, including their ``content`` bytes.
+
+        Unknown ids are silently skipped.  Order is unspecified.
+        """
+        ...
+
+    def get_pending_attachments_with_content(
+        self, ws_id: str, user_id: str
+    ) -> list[dict[str, Any]]:
+        """Fetch all pending attachments for ``(ws_id, user_id)`` in a single
+        query, including ``content`` bytes.
+
+        Used by the auto-consume path on send — saves the two-roundtrip
+        list-then-get dance.  Excluded by design from the user-facing
+        listing API (which must never expose bytes).
+        """
+        ...
+
+    def get_attachment(self, attachment_id: str) -> dict[str, Any] | None:
+        """Return a single attachment row (with content bytes) or None."""
+        ...
+
+    def delete_attachment(self, attachment_id: str, ws_id: str, user_id: str) -> bool:
+        """Delete a pending attachment.
+
+        Only succeeds when the row matches ``ws_id``, ``user_id``, AND
+        ``message_id IS NULL`` (i.e. not yet consumed).  Returns True if
+        a row was deleted.
+        """
+        ...
+
+    def mark_attachments_consumed(
+        self,
+        attachment_ids: list[str],
+        message_id: int,
+        ws_id: str,
+        user_id: str,
+        reserved_for_msg_id: str | None = None,
+    ) -> None:
+        """Link a set of attachments to a freshly-saved user message.
+
+        The UPDATE is scoped to ``(ws_id, user_id)`` and
+        ``message_id IS NULL`` as defense-in-depth: even if a caller
+        passes attachment ids that don't belong to them, nothing will be
+        consumed.  When ``reserved_for_msg_id`` is set, also requires
+        the reservation to match — prevents a stale send from consuming
+        rows reserved to a different one.  Clears ``reserved_for_msg_id``
+        on transition.
+        """
+        ...
+
+    def reserve_attachments(
+        self,
+        attachment_ids: list[str],
+        queue_msg_id: str,
+        ws_id: str,
+        user_id: str,
+    ) -> list[str]:
+        """Soft-lock pending attachments to a queued user message.
+
+        Only rows where ``(ws_id, user_id)`` match and both
+        ``message_id`` and ``reserved_for_msg_id`` are NULL are updated.
+        Returns the list of ids that were actually reserved (others
+        silently skipped — caller should not assume completeness).
+        """
+        ...
+
+    def unreserve_attachments(self, queue_msg_id: str, ws_id: str, user_id: str) -> None:
+        """Release any reservation for ``queue_msg_id``.
+
+        Used when a queued message is dequeued (cancelled) before
+        dispatch — the attachments return to ``pending``.
+        """
+        ...
+
+    def load_attachments_for_messages(self, ws_id: str) -> dict[int, list[dict[str, Any]]]:
+        """Return attachments grouped by ``message_id`` for history replay.
+
+        Each attachment dict includes ``attachment_id``, ``filename``,
+        ``mime_type``, ``size_bytes``, ``kind``, and ``content`` (bytes).
+        Pending (un-consumed) rows are excluded.
+        """
         ...
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
@@ -88,6 +202,15 @@ class StorageBackend(Protocol):
 
     def get_workstream_metadata(self, ws_id: str) -> dict[str, Any] | None:
         """Return workstream metadata dict or None if not found."""
+        ...
+
+    def get_workstream_owner(self, ws_id: str) -> str | None:
+        """Return the workstream's owner ``user_id``.
+
+        Returns ``None`` when the workstream doesn't exist, ``""`` when
+        it exists but has no owner recorded.  Used by ownership-gating
+        endpoints (attachments).
+        """
         ...
 
     def update_workstream_title(self, ws_id: str, title: str) -> None:

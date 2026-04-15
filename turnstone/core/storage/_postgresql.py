@@ -48,6 +48,7 @@ from turnstone.core.storage._schema import (
     user_roles,
     users,
     watches,
+    workstream_attachments,
     workstream_config,
     workstream_overrides,
     workstreams,
@@ -166,28 +167,31 @@ class PostgreSQLBackend:
         tool_call_id: str | None = None,
         provider_data: str | None = None,
         tool_calls: str | None = None,
-    ) -> None:
+    ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         content = sanitize_text(content)
         provider_data = sanitize_text(provider_data)
         with self._conn() as conn:
-            conn.execute(
-                sa.insert(conversations),
-                {
-                    "ws_id": ws_id,
-                    "timestamp": now,
-                    "role": role,
-                    "content": content,
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "provider_data": provider_data,
-                    "tool_calls": tool_calls,
-                },
+            result = conn.execute(
+                sa.insert(conversations)
+                .values(
+                    ws_id=ws_id,
+                    timestamp=now,
+                    role=role,
+                    content=content,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    provider_data=provider_data,
+                    tool_calls=tool_calls,
+                )
+                .returning(conversations.c.id)
             )
+            rowid = int(result.scalar_one())
             conn.execute(
                 sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
             )
             conn.commit()
+            return rowid
 
     def save_messages_bulk(self, rows: list[dict[str, Any]]) -> None:
         if not rows:
@@ -222,6 +226,7 @@ class PostgreSQLBackend:
         with self._conn() as conn:
             rows = conn.execute(
                 sa.select(
+                    conversations.c.id,
                     conversations.c.role,
                     conversations.c.content,
                     conversations.c.tool_name,
@@ -232,7 +237,8 @@ class PostgreSQLBackend:
                 .where(conversations.c.ws_id == ws_id)
                 .order_by(conversations.c.id)
             ).fetchall()
-        return _reconstruct_messages(list(rows), ws_id)
+        attachments = self.load_attachments_for_messages(ws_id)
+        return _reconstruct_messages(list(rows), ws_id, attachments or None)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
@@ -246,6 +252,16 @@ class PostgreSQLBackend:
             if cutoff_row is None:
                 return 0
             cutoff_id = cutoff_row[0]
+            # Cascade-delete attachments linked to doomed messages so
+            # rewind/retry flows don't leak orphan BLOBs.
+            conn.execute(
+                sa.delete(workstream_attachments).where(
+                    sa.and_(
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.message_id >= cutoff_id,
+                    )
+                )
+            )
             result = conn.execute(
                 sa.delete(conversations).where(
                     sa.and_(
@@ -406,6 +422,15 @@ class PostgreSQLBackend:
                 return str(value) if value is not None else None
             return None
 
+    def get_workstream_owner(self, ws_id: str) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstreams.c.user_id).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+        if row is None:
+            return None
+        return row[0] or ""
+
     def get_workstream_metadata(self, ws_id: str) -> dict[str, Any] | None:
         with self._conn() as conn:
             row = conn.execute(
@@ -498,6 +523,9 @@ class PostgreSQLBackend:
 
     def delete_workstream(self, ws_id: str) -> bool:
         with self._conn() as conn:
+            conn.execute(
+                sa.delete(workstream_attachments).where(workstream_attachments.c.ws_id == ws_id)
+            )
             conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
             conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
             conn.execute(
@@ -506,6 +534,216 @@ class PostgreSQLBackend:
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0
+
+    # -- Workstream attachments ------------------------------------------------
+
+    def save_attachment(
+        self,
+        attachment_id: str,
+        ws_id: str,
+        user_id: str,
+        filename: str,
+        mime_type: str,
+        size_bytes: int,
+        kind: str,
+        content: bytes,
+    ) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            conn.execute(
+                sa.insert(workstream_attachments),
+                {
+                    "attachment_id": attachment_id,
+                    "ws_id": ws_id,
+                    "user_id": user_id,
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size_bytes": size_bytes,
+                    "kind": kind,
+                    "content": content,
+                    "message_id": None,
+                    "created": now,
+                },
+            )
+            conn.commit()
+
+    def list_pending_attachments(self, ws_id: str, user_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    workstream_attachments.c.attachment_id,
+                    workstream_attachments.c.filename,
+                    workstream_attachments.c.mime_type,
+                    workstream_attachments.c.size_bytes,
+                    workstream_attachments.c.kind,
+                    workstream_attachments.c.created,
+                )
+                .where(
+                    sa.and_(
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.message_id.is_(None),
+                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                    )
+                )
+                .order_by(workstream_attachments.c.created)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_attachments(self, attachment_ids: list[str]) -> list[dict[str, Any]]:
+        if not attachment_ids:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(workstream_attachments).where(
+                    workstream_attachments.c.attachment_id.in_(attachment_ids)
+                )
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_pending_attachments_with_content(
+        self, ws_id: str, user_id: str
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(workstream_attachments)
+                .where(
+                    sa.and_(
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.message_id.is_(None),
+                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                    )
+                )
+                .order_by(workstream_attachments.c.created)
+            ).fetchall()
+            return [dict(r._mapping) for r in rows]
+
+    def get_attachment(self, attachment_id: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(workstream_attachments).where(
+                    workstream_attachments.c.attachment_id == attachment_id
+                )
+            ).fetchone()
+            return dict(row._mapping) if row else None
+
+    def delete_attachment(self, attachment_id: str, ws_id: str, user_id: str) -> bool:
+        with self._conn() as conn:
+            result = conn.execute(
+                sa.delete(workstream_attachments).where(
+                    sa.and_(
+                        workstream_attachments.c.attachment_id == attachment_id,
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.message_id.is_(None),
+                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                    )
+                )
+            )
+            conn.commit()
+            return result.rowcount > 0
+
+    def mark_attachments_consumed(
+        self,
+        attachment_ids: list[str],
+        message_id: int,
+        ws_id: str,
+        user_id: str,
+        reserved_for_msg_id: str | None = None,
+    ) -> None:
+        if not attachment_ids:
+            return
+        predicate = sa.and_(
+            workstream_attachments.c.attachment_id.in_(attachment_ids),
+            workstream_attachments.c.ws_id == ws_id,
+            workstream_attachments.c.user_id == user_id,
+            workstream_attachments.c.message_id.is_(None),
+        )
+        if reserved_for_msg_id is not None:
+            predicate = sa.and_(
+                predicate,
+                workstream_attachments.c.reserved_for_msg_id == reserved_for_msg_id,
+            )
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(workstream_attachments)
+                .where(predicate)
+                .values(message_id=message_id, reserved_for_msg_id=None)
+            )
+            conn.commit()
+
+    def reserve_attachments(
+        self,
+        attachment_ids: list[str],
+        queue_msg_id: str,
+        ws_id: str,
+        user_id: str,
+    ) -> list[str]:
+        if not attachment_ids or not queue_msg_id:
+            return []
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(workstream_attachments)
+                .where(
+                    sa.and_(
+                        workstream_attachments.c.attachment_id.in_(attachment_ids),
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.message_id.is_(None),
+                        workstream_attachments.c.reserved_for_msg_id.is_(None),
+                    )
+                )
+                .values(reserved_for_msg_id=queue_msg_id)
+            )
+            rows = conn.execute(
+                sa.select(workstream_attachments.c.attachment_id).where(
+                    sa.and_(
+                        workstream_attachments.c.attachment_id.in_(attachment_ids),
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.reserved_for_msg_id == queue_msg_id,
+                    )
+                )
+            ).fetchall()
+            conn.commit()
+            return [r[0] for r in rows]
+
+    def unreserve_attachments(self, queue_msg_id: str, ws_id: str, user_id: str) -> None:
+        if not queue_msg_id:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(workstream_attachments)
+                .where(
+                    sa.and_(
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.user_id == user_id,
+                        workstream_attachments.c.reserved_for_msg_id == queue_msg_id,
+                    )
+                )
+                .values(reserved_for_msg_id=None)
+            )
+            conn.commit()
+
+    def load_attachments_for_messages(self, ws_id: str) -> dict[int, list[dict[str, Any]]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(workstream_attachments)
+                .where(
+                    sa.and_(
+                        workstream_attachments.c.ws_id == ws_id,
+                        workstream_attachments.c.message_id.is_not(None),
+                    )
+                )
+                .order_by(workstream_attachments.c.created)
+            ).fetchall()
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for r in rows:
+            row = dict(r._mapping)
+            mid = row["message_id"]
+            grouped.setdefault(mid, []).append(row)
+        return grouped
 
     def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
         with self._conn() as conn:

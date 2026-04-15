@@ -41,10 +41,14 @@ def save_message(
     tool_call_id: str | None = None,
     provider_data: str | None = None,
     tool_calls: str | None = None,
-) -> None:
-    """Log a message to the conversations table."""
+) -> int:
+    """Log a message to the conversations table.
+
+    Returns the inserted row id, or ``0`` on failure (preserving the
+    module's no-raise contract).
+    """
     try:
-        get_storage().save_message(
+        return get_storage().save_message(
             ws_id,
             role,
             content,
@@ -55,6 +59,7 @@ def save_message(
         )
     except Exception:
         log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
+        return 0
 
 
 def save_messages_bulk(rows: list[dict[str, Any]]) -> None:
@@ -72,6 +77,155 @@ def load_messages(ws_id: str) -> list[dict[str, Any]]:
     except Exception:
         log.warning("Failed to load messages for ws=%s", ws_id, exc_info=True)
         return []
+
+
+# -- Workstream attachments ---------------------------------------------------
+
+
+def save_attachment(
+    attachment_id: str,
+    ws_id: str,
+    user_id: str,
+    filename: str,
+    mime_type: str,
+    size_bytes: int,
+    kind: str,
+    content: bytes,
+) -> None:
+    """Persist an uploaded attachment in pending state."""
+    try:
+        get_storage().save_attachment(
+            attachment_id,
+            ws_id,
+            user_id,
+            filename,
+            mime_type,
+            size_bytes,
+            kind,
+            content,
+        )
+    except Exception:
+        log.warning("Failed to save attachment ws=%s", ws_id, exc_info=True)
+
+
+def list_pending_attachments(ws_id: str, user_id: str) -> list[dict[str, Any]]:
+    """List un-consumed attachments for ``(ws_id, user_id)``."""
+    try:
+        return get_storage().list_pending_attachments(ws_id, user_id)
+    except Exception:
+        log.warning("Failed to list pending attachments ws=%s", ws_id, exc_info=True)
+        return []
+
+
+def get_attachments(attachment_ids: list[str]) -> list[dict[str, Any]]:
+    """Bulk fetch attachments by id (includes content bytes)."""
+    if not attachment_ids:
+        return []
+    try:
+        return get_storage().get_attachments(attachment_ids)
+    except Exception:
+        log.warning("Failed to fetch attachments", exc_info=True)
+        return []
+
+
+def get_pending_attachments_with_content(ws_id: str, user_id: str) -> list[dict[str, Any]]:
+    """Single-query fetch of pending attachments + their bytes for the
+    auto-consume path on send.  Never expose this to user-facing listing
+    endpoints — use ``list_pending_attachments`` there instead.
+    """
+    try:
+        return get_storage().get_pending_attachments_with_content(ws_id, user_id)
+    except Exception:
+        log.warning(
+            "Failed to fetch pending attachments with content ws=%s",
+            ws_id,
+            exc_info=True,
+        )
+        return []
+
+
+def get_attachment(attachment_id: str) -> dict[str, Any] | None:
+    """Return a single attachment row (with content) or None."""
+    try:
+        return get_storage().get_attachment(attachment_id)
+    except Exception:
+        log.warning("Failed to fetch attachment id=%s", attachment_id, exc_info=True)
+        return None
+
+
+def delete_attachment(attachment_id: str, ws_id: str, user_id: str) -> bool:
+    """Delete a pending attachment. Returns True if deleted."""
+    try:
+        return get_storage().delete_attachment(attachment_id, ws_id, user_id)
+    except Exception:
+        log.warning("Failed to delete attachment id=%s", attachment_id, exc_info=True)
+        return False
+
+
+def mark_attachments_consumed(
+    attachment_ids: list[str],
+    message_id: int,
+    ws_id: str,
+    user_id: str,
+    reserved_for_msg_id: str | None = None,
+) -> None:
+    """Link attachments to a saved user message (scoped to ws_id+user_id).
+
+    When ``reserved_for_msg_id`` is set, the UPDATE also requires the
+    attachment's reservation token to match — prevents a stale send from
+    consuming rows reserved for a different one.
+    """
+    if not attachment_ids:
+        return
+    try:
+        get_storage().mark_attachments_consumed(
+            attachment_ids,
+            message_id,
+            ws_id,
+            user_id,
+            reserved_for_msg_id=reserved_for_msg_id,
+        )
+    except Exception:
+        log.warning("Failed to mark attachments consumed", exc_info=True)
+
+
+def reserve_attachments(
+    attachment_ids: list[str],
+    queue_msg_id: str,
+    ws_id: str,
+    user_id: str,
+) -> list[str]:
+    """Soft-lock pending attachments to a queued user message.
+
+    Returns the list of ids that were actually reserved for ``queue_msg_id``
+    (others silently skipped — e.g. already consumed or reserved).
+    """
+    if not attachment_ids or not queue_msg_id:
+        return []
+    try:
+        return get_storage().reserve_attachments(attachment_ids, queue_msg_id, ws_id, user_id)
+    except Exception:
+        log.warning("Failed to reserve attachments", exc_info=True)
+        return []
+
+
+def unreserve_attachments(queue_msg_id: str, ws_id: str, user_id: str) -> None:
+    """Release the reservation held by ``queue_msg_id`` on this (ws, user)."""
+    if not queue_msg_id:
+        return
+    try:
+        get_storage().unreserve_attachments(queue_msg_id, ws_id, user_id)
+    except Exception:
+        log.warning("Failed to unreserve attachments", exc_info=True)
+
+
+def load_attachments_for_messages(ws_id: str) -> dict[int, list[dict[str, Any]]]:
+    """Return attachments grouped by ``message_id`` for history replay."""
+    try:
+        return get_storage().load_attachments_for_messages(ws_id)
+    except Exception:
+        log.warning("Failed to load attachments for ws=%s", ws_id, exc_info=True)
+        return {}
 
 
 def delete_messages_after(ws_id: str, keep_count: int) -> int:
@@ -306,6 +460,15 @@ def get_workstream_metadata(ws_id: str) -> dict[str, Any] | None:
         return get_storage().get_workstream_metadata(ws_id)
     except Exception:
         log.warning("Failed to get workstream metadata ws=%s", ws_id, exc_info=True)
+        return None
+
+
+def get_workstream_owner(ws_id: str) -> str | None:
+    """Return the workstream's owner ``user_id`` (or ``""`` when unowned)."""
+    try:
+        return get_storage().get_workstream_owner(ws_id)
+    except Exception:
+        log.warning("Failed to get workstream owner ws=%s", ws_id, exc_info=True)
         return None
 
 

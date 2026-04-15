@@ -456,7 +456,12 @@ class AnthropicProvider:
                 continue
 
             if role == "user":
-                converted.append({"role": "user", "content": msg.get("content", "")})
+                user_content = msg.get("content", "")
+                # Multipart user messages (attachments) carry list content
+                # with image_url / document parts — translate at the boundary.
+                if isinstance(user_content, list):
+                    user_content = self._convert_content_parts(user_content)
+                converted.append({"role": "user", "content": user_content})
                 i += 1
                 continue
 
@@ -471,10 +476,36 @@ class AnthropicProvider:
         """Convert OpenAI-format content parts to Anthropic format.
 
         Transforms ``image_url`` parts (with ``data:`` URIs) to Anthropic's
-        ``image`` source blocks.  Text parts pass through unchanged.
+        ``image`` source blocks and internal ``document`` parts to Anthropic's
+        native ``document`` blocks with a ``text`` source.  Text parts pass
+        through unchanged.
         """
         converted: list[dict[str, Any]] = []
         for part in parts:
+            if part.get("type") == "document":
+                d = part.get("document", {})
+                # Anthropic's text-source documents only accept
+                # ``text/plain``; coerce any other text MIME here and fold
+                # the original type into the human-readable title so the
+                # model still knows it's (e.g.) markdown.
+                original_mime = d.get("media_type", "text/plain")
+                block: dict[str, Any] = {
+                    "type": "document",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/plain",
+                        "data": d.get("data", ""),
+                    },
+                }
+                name = d.get("name")
+                if name and original_mime != "text/plain":
+                    block["title"] = f"{name} ({original_mime})"
+                elif name:
+                    block["title"] = name
+                elif original_mime != "text/plain":
+                    block["title"] = original_mime
+                converted.append(block)
+                continue
             if part.get("type") == "image_url":
                 url = part.get("image_url", {}).get("url", "")
                 if url.startswith("data:") and "," in url:

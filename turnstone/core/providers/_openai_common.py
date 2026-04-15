@@ -306,6 +306,60 @@ def format_citations(content: str, annotations: list[Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _escape_attr(value: str) -> str:
+    """Minimal XML-attribute escape — prevents quote-break injection."""
+    return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+
+
+def format_document_wrapper(name: str, mime: str, data: str) -> str:
+    """Produce the ``<document>...</document>`` wrapper used by non-Anthropic
+    providers that lack a native document block.
+
+    Attribute values are escaped.  A literal ``</document>`` appearing in
+    ``data`` is neutralized so the model can't be tricked into ending the
+    document region early via attacker-controlled payloads.
+    """
+    safe_name = _escape_attr(name or "")
+    safe_mime = _escape_attr(mime or "text/plain")
+    safe_data = (data or "").replace("</document>", "<\\/document>")
+    return f'<document name="{safe_name}" media_type="{safe_mime}">\n{safe_data}\n</document>'
+
+
+def inline_document_parts(parts: list[Any]) -> list[Any]:
+    """Rewrite internal ``document`` content parts as text parts.
+
+    OpenAI Chat Completions and the Google OpenAI-compat endpoint do not
+    accept a native ``document`` block type, so we wrap the text payload
+    in an escaped delimiter and emit it as a plain text part.  Other
+    part types pass through unchanged.
+    """
+    out: list[Any] = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "document":
+            d = part.get("document", {})
+            out.append(
+                {
+                    "type": "text",
+                    "text": format_document_wrapper(
+                        d.get("name", ""),
+                        d.get("media_type", "text/plain"),
+                        d.get("data", ""),
+                    ),
+                }
+            )
+        else:
+            out.append(part)
+    return out
+
+
+def _inline_documents_in_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Return ``msg`` with any list-type content's ``document`` parts inlined."""
+    content = msg.get("content")
+    if isinstance(content, list):
+        return {**msg, "content": inline_document_parts(content)}
+    return msg
+
+
 def sanitize_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -326,6 +380,16 @@ def sanitize_messages(
 
     Returns a new list; the original messages are not mutated.
     """
+    # Drop internal sibling keys (``_provider_content``,
+    # ``_attachments_meta``, etc.) that the OpenAI / Google-compat APIs
+    # don't understand before they reach the wire.
+    messages = [
+        {k: v for k, v in m.items() if not (isinstance(k, str) and k.startswith("_"))}
+        for m in messages
+    ]
+    # Inline any internal ``document`` content parts — OpenAI Chat
+    # Completions does not accept a native document block type.
+    messages = [_inline_documents_in_message(m) for m in messages]
     out: list[dict[str, Any]] = []
     i = 0
     while i < len(messages):

@@ -33,6 +33,11 @@ function Pane(wsId) {
   this._cancelTimeout = null;
   this._forceTimeout = null;
   this._pendingEditSend = null;
+  // Map<attachment_id, {filename, size_bytes, mime_type, kind}>
+  this.pendingAttachments = new Map();
+  this.attachBtn = null;
+  this.attachInput = null;
+  this.attachChipsEl = null;
   this._createDOM();
 }
 
@@ -169,6 +174,48 @@ Pane.prototype._createDOM = function () {
   var inputArea = document.createElement("div");
   inputArea.className = "pane-input-area";
 
+  // Attachment chips row — above the textarea, hidden unless populated
+  this.attachChipsEl = document.createElement("div");
+  this.attachChipsEl.className = "pane-attach-chips";
+  this.attachChipsEl.setAttribute("role", "list");
+  this.attachChipsEl.setAttribute("aria-label", "Pending attachments");
+  inputArea.appendChild(this.attachChipsEl);
+
+  var inputRow = document.createElement("div");
+  inputRow.className = "pane-input-row";
+  inputArea.appendChild(inputRow);
+
+  // Paperclip button — opens the file picker
+  this.attachBtn = document.createElement("button");
+  this.attachBtn.type = "button";
+  this.attachBtn.className = "pane-attach";
+  this.attachBtn.setAttribute("aria-label", "Attach files");
+  this.attachBtn.setAttribute("title", "Attach files");
+  this.attachBtn.textContent = "\ud83d\udcce"; // 📎
+  this.attachBtn.onclick = function () {
+    self.attachInput.click();
+  };
+  inputRow.appendChild(this.attachBtn);
+
+  // Hidden file input
+  this.attachInput = document.createElement("input");
+  this.attachInput.type = "file";
+  this.attachInput.multiple = true;
+  this.attachInput.style.display = "none";
+  this.attachInput.accept =
+    "image/png,image/jpeg,image/gif,image/webp,text/*," +
+    ".md,.py,.js,.ts,.tsx,.jsx,.json,.yaml,.yml,.toml,.html,.css,.sh," +
+    ".rs,.go,.java,.c,.cpp,.h,.hpp,.sql,.xml,.ini,.conf";
+  this.attachInput.addEventListener("change", function (e) {
+    var files = Array.from(e.target.files || []);
+    files.forEach(function (f) {
+      self.uploadAttachment(f);
+    });
+    // Reset so selecting the same file again still fires change
+    self.attachInput.value = "";
+  });
+  inputRow.appendChild(this.attachInput);
+
   this.inputEl = document.createElement("textarea");
   this.inputEl.className = "pane-input";
   this.inputEl.rows = 1;
@@ -190,7 +237,26 @@ Pane.prototype._createDOM = function () {
       self.sendMessage();
     }
   });
-  inputArea.appendChild(this.inputEl);
+  // Paste: pull image blobs out of the clipboard and treat as uploads
+  this.inputEl.addEventListener("paste", function (e) {
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    var uploaded = 0;
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.kind === "file") {
+        var f = it.getAsFile();
+        if (f) {
+          self.uploadAttachment(f);
+          uploaded += 1;
+        }
+      }
+    }
+    if (uploaded > 0) {
+      // Prevent the raw image data from also landing in the textarea
+      e.preventDefault();
+    }
+  });
+  inputRow.appendChild(this.inputEl);
 
   this.sendBtn = document.createElement("button");
   this.sendBtn.className = "pane-send";
@@ -198,7 +264,7 @@ Pane.prototype._createDOM = function () {
   this.sendBtn.onclick = function () {
     self.sendMessage();
   };
-  inputArea.appendChild(this.sendBtn);
+  inputRow.appendChild(this.sendBtn);
 
   this.stopBtn = document.createElement("button");
   this.stopBtn.className = "pane-stop";
@@ -208,9 +274,37 @@ Pane.prototype._createDOM = function () {
   this.stopBtn.onclick = function () {
     self.cancelGeneration();
   };
-  inputArea.appendChild(this.stopBtn);
+  inputRow.appendChild(this.stopBtn);
 
   this.el.appendChild(inputArea);
+
+  // Drag/drop attachments onto the pane.  dragover is required to
+  // opt-into the drop target; without it the browser blocks drop.
+  this.el.addEventListener("dragover", function (e) {
+    if (
+      e.dataTransfer &&
+      Array.from(e.dataTransfer.types || []).indexOf("Files") !== -1
+    ) {
+      e.preventDefault();
+      self.el.classList.add("pane-drop-target");
+    }
+  });
+  this.el.addEventListener("dragleave", function (e) {
+    // Only clear the hover state when leaving the pane itself
+    if (e.target === self.el) {
+      self.el.classList.remove("pane-drop-target");
+    }
+  });
+  this.el.addEventListener("drop", function (e) {
+    self.el.classList.remove("pane-drop-target");
+    var files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+    if (files.length > 0) {
+      e.preventDefault();
+      files.forEach(function (f) {
+        self.uploadAttachment(f);
+      });
+    }
+  });
 };
 
 Pane.prototype.reset = function () {
@@ -222,6 +316,171 @@ Pane.prototype.reset = function () {
   this.approvalBlockEl = null;
   this._pendingEditSend = null;
   this.inputEl.disabled = false;
+  this.clearAttachmentChips();
+};
+
+// ---------------------------------------------------------------------------
+// Attachment handling
+// ---------------------------------------------------------------------------
+
+Pane.prototype.clearAttachmentChips = function () {
+  if (this.pendingAttachments) this.pendingAttachments.clear();
+  if (this.attachChipsEl) this.attachChipsEl.textContent = "";
+};
+
+function _formatAttachSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+Pane.prototype._renderAttachmentChip = function (info) {
+  var self = this;
+  var chip = document.createElement("span");
+  chip.className =
+    "pane-attach-chip pane-attach-chip-" + (info.kind || "other");
+  chip.setAttribute("role", "listitem");
+  chip.dataset.attachmentId = info.attachment_id;
+
+  var icon = document.createElement("span");
+  icon.className = "pane-attach-chip-icon";
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = info.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
+  chip.appendChild(icon);
+
+  var label = document.createElement("span");
+  label.className = "pane-attach-chip-name";
+  label.textContent = info.filename || "(unnamed)";
+  label.title = info.filename || "";
+  chip.appendChild(label);
+
+  var size = document.createElement("span");
+  size.className = "pane-attach-chip-size";
+  size.textContent = _formatAttachSize(info.size_bytes || 0);
+  chip.appendChild(size);
+
+  var remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "pane-attach-chip-remove";
+  remove.setAttribute(
+    "aria-label",
+    "Remove attachment " + (info.filename || ""),
+  );
+  remove.title = "Remove";
+  remove.textContent = "\u00d7";
+  remove.onclick = function () {
+    self.removeAttachment(info.attachment_id);
+  };
+  chip.appendChild(remove);
+
+  this.attachChipsEl.appendChild(chip);
+};
+
+Pane.prototype.uploadAttachment = function (file) {
+  if (!this.wsId || !file) return;
+  var self = this;
+  var wsId = this.wsId;
+  var fd = new FormData();
+  fd.append("file", file, file.name);
+
+  // Placeholder chip with upload-in-flight state
+  var placeholderId = "__uploading_" + Date.now() + "_" + Math.random();
+  this.pendingAttachments.set(placeholderId, {
+    attachment_id: placeholderId,
+    filename: file.name,
+    size_bytes: file.size,
+    mime_type: file.type || "",
+    kind: (file.type || "").indexOf("image/") === 0 ? "image" : "text",
+    uploading: true,
+  });
+  this._renderAttachmentChip(this.pendingAttachments.get(placeholderId));
+
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
+    { method: "POST", body: fd },
+  )
+    .then(function (r) {
+      return r.json().then(function (body) {
+        return { ok: r.ok, status: r.status, body: body };
+      });
+    })
+    .then(function (res) {
+      // Remove placeholder chip
+      var oldChip = self.attachChipsEl.querySelector(
+        '[data-attachment-id="' + placeholderId + '"]',
+      );
+      if (oldChip) oldChip.remove();
+      self.pendingAttachments.delete(placeholderId);
+      if (!res.ok) {
+        showToast((res.body && res.body.error) || "Upload failed");
+        return;
+      }
+      self.pendingAttachments.set(res.body.attachment_id, res.body);
+      self._renderAttachmentChip(res.body);
+    })
+    .catch(function (e) {
+      if ((e && e.message) !== "auth") {
+        var oldChip = self.attachChipsEl.querySelector(
+          '[data-attachment-id="' + placeholderId + '"]',
+        );
+        if (oldChip) oldChip.remove();
+        self.pendingAttachments.delete(placeholderId);
+        showToast("Upload failed");
+      }
+    });
+};
+
+Pane.prototype.removeAttachment = function (attachmentId) {
+  var self = this;
+  var wsId = this.wsId;
+  var info = this.pendingAttachments.get(attachmentId);
+  if (!info) return;
+  var chip = this.attachChipsEl.querySelector(
+    '[data-attachment-id="' + attachmentId + '"]',
+  );
+
+  // Optimistic remove
+  if (chip) chip.remove();
+  this.pendingAttachments.delete(attachmentId);
+
+  // In-flight placeholders have no server-side row yet
+  if (info.uploading) return;
+
+  authFetch(
+    "/v1/api/workstreams/" +
+      encodeURIComponent(wsId) +
+      "/attachments/" +
+      encodeURIComponent(attachmentId),
+    { method: "DELETE" },
+  ).catch(function (e) {
+    if ((e && e.message) !== "auth") {
+      showToast("Failed to remove attachment");
+    }
+  });
+};
+
+Pane.prototype.rehydrateAttachments = function () {
+  if (!this.wsId) return;
+  var self = this;
+  var wsId = this.wsId;
+  authFetch(
+    "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/attachments",
+    { method: "GET" },
+  )
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (body) {
+      // Tab may have switched between fire and response
+      if (!body || self.wsId !== wsId) return;
+      self.clearAttachmentChips();
+      (body.attachments || []).forEach(function (a) {
+        self.pendingAttachments.set(a.attachment_id, a);
+        self._renderAttachmentChip(a);
+      });
+    })
+    .catch(function () {});
 };
 
 Pane.prototype.updateWsName = function () {
@@ -310,7 +569,12 @@ Pane.prototype.removeEmptyState = function () {
 Pane.prototype.connectSSE = function (wsId) {
   var self = this;
   this.disconnectSSE();
+  var wsChanged = this.wsId !== wsId;
   this.wsId = wsId;
+  if (wsChanged) {
+    this.clearAttachmentChips();
+    this.rehydrateAttachments();
+  }
 
   this.evtSource = new EventSource(
     "/v1/api/events?ws_id=" + encodeURIComponent(wsId),
@@ -663,11 +927,35 @@ Pane.prototype.removeThinkingIndicator = function () {
   if (el) el.remove();
 };
 
-Pane.prototype.addUserMessage = function (text) {
+Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
   el.className = "msg msg-user";
-  el.textContent = text;
+  var textEl = document.createElement("div");
+  textEl.className = "msg-user-text";
+  textEl.textContent = text;
+  el.appendChild(textEl);
+  if (Array.isArray(attachments) && attachments.length > 0) {
+    var pills = document.createElement("div");
+    pills.className = "msg-user-attach";
+    attachments.forEach(function (a) {
+      var pill = document.createElement("span");
+      pill.className =
+        "msg-user-attach-pill msg-user-attach-pill-" + (a.kind || "other");
+      var icon = document.createElement("span");
+      icon.className = "msg-user-attach-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = a.kind === "image" ? "\ud83d\uddbc" : "\ud83d\udcc4";
+      pill.appendChild(icon);
+      var nameEl = document.createElement("span");
+      nameEl.className = "msg-user-attach-name";
+      nameEl.textContent =
+        a.filename || (a.kind === "image" ? "image" : "document");
+      pill.appendChild(nameEl);
+      pills.appendChild(pill);
+    });
+    el.appendChild(pills);
+  }
   this._addUserMsgActions(el, text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom(true);
@@ -708,6 +996,7 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
 };
 
 Pane.prototype._dequeueMessage = function (el) {
+  var self = this;
   var msgId = el.dataset.msgId;
   if (!msgId) {
     // ID not yet set — mark for deferred DELETE when send response arrives
@@ -726,6 +1015,10 @@ Pane.prototype._dequeueMessage = function (el) {
     .then(function (data) {
       if (data.status === "removed") {
         el.remove();
+        // The queued message had its attachments reserved; dequeue
+        // releases the reservation server-side, so refresh the chip
+        // strip to show them as available again.
+        self.rehydrateAttachments();
       }
       // "not_found" means already injected — leave the message visible.
       // The promote loop will strip the queued styling on idle.
@@ -943,7 +1236,7 @@ Pane.prototype.replayHistory = function (messages) {
   for (var i = 0; i < messages.length; i++) {
     var msg = messages[i];
     if (msg.role === "user") {
-      this.addUserMessage(msg.content || "");
+      this.addUserMessage(msg.content || "", msg.attachments || null);
       lastToolBlock = null;
     } else if (msg.role === "assistant") {
       if (msg.tool_calls && msg.tool_calls.length) {
@@ -1584,6 +1877,17 @@ Pane.prototype.sendMessage = function () {
   var isBusy = this.busy;
   var queuedEl = null;
 
+  // Snapshot attachments for this turn (stable-ids only — skip in-flight
+  // placeholders, which may not have server-assigned ids yet).
+  var attachmentList = [];
+  var attachmentIds = [];
+  this.pendingAttachments.forEach(function (info, id) {
+    if (info && !info.uploading) {
+      attachmentList.push(info);
+      attachmentIds.push(id);
+    }
+  });
+
   if (isBusy) {
     // Queue message for injection at the next tool-result seam.
     // Strip !!! prefix for display, show priority badge instead.
@@ -1596,7 +1900,7 @@ Pane.prototype.sendMessage = function () {
     queuedEl = this.addQueuedMessage(displayText, priority);
   } else {
     this.setBusy(true);
-    this.addUserMessage(text);
+    this.addUserMessage(text, attachmentList);
   }
   this.inputEl.value = "";
   this._autoResize();
@@ -1604,12 +1908,46 @@ Pane.prototype.sendMessage = function () {
   authFetch("/v1/api/send", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message: text, ws_id: this.wsId }),
+    body: JSON.stringify({
+      message: text,
+      ws_id: this.wsId,
+      attachment_ids: attachmentIds,
+    }),
   })
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
+      // Clear only the chips that were actually reserved/attached on
+      // the server; leftover (dropped) ones stay in the composer so
+      // the user can see what's still pending.
+      var _consumeChips = function () {
+        var attached = Array.isArray(data.attached_ids)
+          ? data.attached_ids
+          : null;
+        if (attached) {
+          attached.forEach(function (id) {
+            var chip = self.attachChipsEl.querySelector(
+              '[data-attachment-id="' + id + '"]',
+            );
+            if (chip) chip.remove();
+            self.pendingAttachments.delete(id);
+          });
+          if (
+            Array.isArray(data.dropped_attachment_ids) &&
+            data.dropped_attachment_ids.length
+          ) {
+            showToast(
+              "Some attachments couldn't be included (" +
+                data.dropped_attachment_ids.length +
+                ") — they're still in your composer.",
+            );
+          }
+        } else {
+          self.clearAttachmentChips();
+        }
+      };
+
       if (data.status === "queued" && data.msg_id && queuedEl) {
         if (queuedEl.dataset.pendingDismiss) {
           // User dismissed before ID arrived — send deferred DELETE
@@ -1621,6 +1959,7 @@ Pane.prototype.sendMessage = function () {
         } else {
           queuedEl.dataset.msgId = data.msg_id;
         }
+        _consumeChips();
       } else if (data.status === "busy") {
         if (queuedEl) queuedEl.remove();
         self.addErrorMessage("Server is busy. Please wait.");
@@ -1628,6 +1967,8 @@ Pane.prototype.sendMessage = function () {
       } else if (data.status === "queue_full") {
         if (queuedEl) queuedEl.remove();
         self.addErrorMessage("Message queue full. Please wait.");
+      } else {
+        _consumeChips();
       }
     })
     .catch(function (err) {

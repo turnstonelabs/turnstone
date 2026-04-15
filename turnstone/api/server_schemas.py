@@ -14,10 +14,37 @@ from pydantic import BaseModel, Field, model_validator
 class SendRequest(BaseModel):
     message: str = Field(description="User message text")
     ws_id: str = Field(description="Target workstream ID")
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description=(
+            "Explicit list of attachment ids to inject into this turn. "
+            "When omitted, any pending attachments for the caller on "
+            "this workstream are auto-consumed. An empty list disables "
+            "auto-consumption for this send."
+        ),
+    )
 
 
 class SendResponse(BaseModel):
     status: str = Field(description="'ok' or 'busy'", examples=["ok", "busy"])
+
+
+class AttachmentInfo(BaseModel):
+    attachment_id: str = Field(description="Opaque id for this attachment")
+    filename: str = Field(description="Original upload filename")
+    mime_type: str = Field(description="Canonicalized MIME type")
+    size_bytes: int = Field(description="Payload size in bytes")
+    kind: str = Field(description="'image' or 'text'", examples=["image", "text"])
+
+
+class UploadAttachmentResponse(AttachmentInfo):
+    """Returned after a successful upload."""
+
+
+class ListAttachmentsResponse(BaseModel):
+    attachments: list[AttachmentInfo] = Field(
+        description="Pending (unconsumed) attachments for caller+workstream"
+    )
 
 
 class ApproveRequest(BaseModel):
