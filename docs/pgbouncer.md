@@ -40,18 +40,20 @@ Add PgBouncer between turnstone services and PostgreSQL:
 ```yaml
 services:
   pgbouncer:
-    image: bitnami/pgbouncer:latest
+    image: edoburu/pgbouncer:latest
     environment:
-      POSTGRESQL_HOST: postgres
-      POSTGRESQL_PORT: "5432"
-      POSTGRESQL_DATABASE: turnstone
-      POSTGRESQL_USERNAME: ${POSTGRES_USER:-turnstone}
-      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:?}
-      PGBOUNCER_POOL_MODE: transaction
-      PGBOUNCER_DEFAULT_POOL_SIZE: "40"
-      PGBOUNCER_MAX_CLIENT_CONN: "5000"
-      PGBOUNCER_MAX_DB_CONNECTIONS: "80"
-      PGBOUNCER_SERVER_IDLE_TIMEOUT: "300"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB:-turnstone}
+      DB_USER: ${POSTGRES_USER:-turnstone}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?}
+      LISTEN_PORT: "6432"
+      AUTH_TYPE: ${POSTGRES_AUTH_TYPE:-scram-sha-256}
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: "40"
+      MAX_CLIENT_CONN: "5000"
+      MAX_DB_CONNECTIONS: "80"
+      SERVER_IDLE_TIMEOUT: "300"
     ports:
       - "6432:6432"
     networks:
@@ -82,7 +84,7 @@ TURNSTONE_DB_URL=postgresql://turnstone:secret@pgbouncer:6432/turnstone
 ## Helm / Kubernetes
 
 Add a PgBouncer deployment or use a Helm chart like
-[bitnami/pgbouncer](https://github.com/bitnami/charts/tree/main/bitnami/pgbouncer).
+[edoburu/pgbouncer](https://github.com/edoburu/docker-pgbouncer/tree/master/examples/kubernetes).
 
 In `values.yaml`, point the database at PgBouncer:
 
@@ -106,7 +108,7 @@ pgbouncer:
   maxClientConn: 5000
   maxDbConnections: 80
 ```
-
+:
 ---
 
 ## Configuration reference
