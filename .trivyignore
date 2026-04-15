@@ -38,3 +38,16 @@ CVE-2026-33671
 CVE-2026-29786
 # https://avd.aquasec.com/nvd/cve-2026-31802
 CVE-2026-31802
+
+# jq out-of-bounds read on non-NUL-terminated buffers — no fix in Debian 13 repos yet.
+# Affects jq + libjq1 (1.7.1-6+deb13u1).  jq is invoked only on trusted
+# CLI/admin paths against process-controlled JSON input, never on untrusted
+# network bytes, so the NUL-terminated invariant holds in our usage.
+# https://avd.aquasec.com/nvd/cve-2026-39979
+CVE-2026-39979
+
+# jq DoS via crafted JSON object causing hash collisions — no fix in Debian 13 repos yet.
+# Affects jq + libjq1 (1.7.1-6+deb13u1).  Same trust boundary as above:
+# jq is not exposed to attacker-controlled JSON in turnstone.
+# https://avd.aquasec.com/nvd/cve-2026-40164
+CVE-2026-40164
