@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import contextlib
 import functools
 import hashlib
@@ -1510,6 +1511,20 @@ async def send_message(request: Request) -> JSONResponse:
         auto_consume_rows = _get_pending_with_content(ws_id, attach_user_id)
         requested_ids = [str(r["attachment_id"]) for r in auto_consume_rows]
     elif isinstance(raw_ids, list) and raw_ids:
+        # Cap inbound id-list length so a hostile client can't blow up
+        # the storage IN (...) clause with millions of bogus ids.
+        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
+
+        if len(raw_ids) > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Too many attachment_ids (max {MAX_PENDING_ATTACHMENTS_PER_USER_WS})"
+                    ),
+                    "code": "too_many",
+                },
+                status_code=400,
+            )
         requested_ids = [str(x) for x in raw_ids if x]
     else:
         requested_ids = []
@@ -2403,7 +2418,14 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
 # upload.  Guards the pending-cap against a concurrent-upload TOCTOU race
 # within a single process.  Multi-process deployments would need an
 # additional DB-side check, but turnstone-server runs one process per node.
-_attachment_upload_locks: dict[tuple[str, str], asyncio.Lock] = {}
+#
+# Bounded LRU eviction prevents unbounded growth on long-running nodes:
+# when the map exceeds the soft cap we drop the oldest *unlocked* entries
+# (a held lock means an upload is in flight — never evict those).
+_ATTACHMENT_UPLOAD_LOCKS_MAX = 1024
+_attachment_upload_locks: collections.OrderedDict[tuple[str, str], asyncio.Lock] = (
+    collections.OrderedDict()
+)
 _attachment_upload_locks_mx = threading.Lock()
 
 
@@ -2414,6 +2436,20 @@ def _attachment_upload_lock(ws_id: str, user_id: str) -> asyncio.Lock:
         if lock is None:
             lock = asyncio.Lock()
             _attachment_upload_locks[key] = lock
+        else:
+            # Touch for LRU
+            _attachment_upload_locks.move_to_end(key)
+        # Opportunistic eviction once we exceed the soft cap.  Skip
+        # held locks (an upload is in flight under that key).
+        if len(_attachment_upload_locks) > _ATTACHMENT_UPLOAD_LOCKS_MAX:
+            for stale_key in list(_attachment_upload_locks):
+                if len(_attachment_upload_locks) <= _ATTACHMENT_UPLOAD_LOCKS_MAX:
+                    break
+                if stale_key == key:
+                    continue  # never evict the lock we're handing out
+                stale = _attachment_upload_locks[stale_key]
+                if not stale.locked():
+                    del _attachment_upload_locks[stale_key]
         return lock
 
 
@@ -2669,11 +2705,14 @@ async def get_attachment_content(request: Request) -> Response:
     attachment_id = request.path_params.get("attachment_id", "")
     if not ws_id or not attachment_id:
         return JSONResponse({"error": "ws_id and attachment_id are required"}, status_code=400)
-    _user_id, err = _require_ws_access(request, ws_id)
+    user_id, err = _require_ws_access(request, ws_id)
     if err:
         return err
     row = get_attachment(attachment_id)
-    if not row or row.get("ws_id") != ws_id:
+    # Scope on user_id too — in an unowned workstream different users
+    # could otherwise fetch each other's blobs via id-guessing.  Mask
+    # cross-user / cross-ws as 404 to avoid leaking existence.
+    if not row or row.get("ws_id") != ws_id or row.get("user_id") != user_id:
         return JSONResponse({"error": "Not found"}, status_code=404)
     body = row.get("content") or b""
     kind = row.get("kind") or ""

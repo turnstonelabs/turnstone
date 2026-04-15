@@ -290,10 +290,18 @@ Pane.prototype._createDOM = function () {
     }
   });
   this.el.addEventListener("dragleave", function (e) {
-    // Only clear the hover state when leaving the pane itself
-    if (e.target === self.el) {
+    // Only clear the hover state when leaving the pane entirely.
+    // e.target fires for every child the cursor crosses (textarea,
+    // buttons), so use relatedTarget — the element being entered —
+    // and clear only when it's outside the pane.
+    var related = e.relatedTarget;
+    if (!related || !self.el.contains(related)) {
       self.el.classList.remove("pane-drop-target");
     }
+  });
+  this.el.addEventListener("dragend", function () {
+    // Fallback: cancelled drags don't always emit dragleave on the pane.
+    self.el.classList.remove("pane-drop-target");
   });
   this.el.addEventListener("drop", function (e) {
     self.el.classList.remove("pane-drop-target");
@@ -405,33 +413,69 @@ Pane.prototype.uploadAttachment = function (file) {
       });
     })
     .then(function (res) {
-      // Remove placeholder chip
-      var oldChip = self.attachChipsEl.querySelector(
-        '[data-attachment-id="' + placeholderId + '"]',
-      );
-      if (oldChip) oldChip.remove();
-      self.pendingAttachments.delete(placeholderId);
       if (!res.ok) {
+        // Drop the placeholder; nothing to swap in.
+        self._removeAttachmentChip(placeholderId);
         showToast((res.body && res.body.error) || "Upload failed");
         return;
       }
-      self.pendingAttachments.set(res.body.attachment_id, res.body);
-      self._renderAttachmentChip(res.body);
+      // Swap placeholder → real id in place so chip and pending-Map
+      // ordering reflect user selection, not upload-completion order.
+      self._swapPlaceholderChip(placeholderId, res.body);
     })
     .catch(function (e) {
+      // Always clean up the placeholder (including auth failures) so
+      // an "uploading…" chip can't get stuck across re-auth.
+      self._removeAttachmentChip(placeholderId);
       if ((e && e.message) !== "auth") {
-        var oldChip = self.attachChipsEl.querySelector(
-          '[data-attachment-id="' + placeholderId + '"]',
-        );
-        if (oldChip) oldChip.remove();
-        self.pendingAttachments.delete(placeholderId);
         showToast("Upload failed");
       }
     });
 };
 
+Pane.prototype._removeAttachmentChip = function (id) {
+  var chip = this.attachChipsEl.querySelector(
+    '[data-attachment-id="' + id + '"]',
+  );
+  if (chip) chip.remove();
+  this.pendingAttachments.delete(id);
+};
+
+Pane.prototype._swapPlaceholderChip = function (placeholderId, info) {
+  // Rebuild pendingAttachments preserving insertion order, swapping
+  // the placeholder key for the real attachment_id.  JS Map iteration
+  // is insertion-ordered, so naïve delete+set would move the entry to
+  // the end and reorder send().
+  var rebuilt = new Map();
+  this.pendingAttachments.forEach(function (val, key) {
+    if (key === placeholderId) {
+      rebuilt.set(info.attachment_id, info);
+    } else {
+      rebuilt.set(key, val);
+    }
+  });
+  this.pendingAttachments = rebuilt;
+
+  // Update the existing chip DOM in place so visual order matches.
+  var chip = this.attachChipsEl.querySelector(
+    '[data-attachment-id="' + placeholderId + '"]',
+  );
+  if (chip) {
+    chip.dataset.attachmentId = info.attachment_id;
+    var name = chip.querySelector(".pane-attach-chip-name");
+    if (name) {
+      name.textContent = info.filename || "(unnamed)";
+      name.title = info.filename || "";
+    }
+    var size = chip.querySelector(".pane-attach-chip-size");
+    if (size) size.textContent = _formatAttachSize(info.size_bytes || 0);
+  } else {
+    // Chip missing (user removed it mid-upload?); render fresh.
+    this._renderAttachmentChip(info);
+  }
+};
+
 Pane.prototype.removeAttachment = function (attachmentId) {
-  var self = this;
   var wsId = this.wsId;
   var info = this.pendingAttachments.get(attachmentId);
   if (!info) return;

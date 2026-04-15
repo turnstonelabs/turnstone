@@ -365,6 +365,30 @@ class TestGetContent:
         # returns 404 to avoid leaking existence.
         assert resp.status_code == 404
 
+    def test_get_content_unowned_ws_user_isolation(self, app_client):
+        # Regression for PR #356 review: in a workstream without an
+        # explicit owner (user_id == ""), one user's attachment must
+        # not be fetchable by another user via id-guessing.
+        client, _ = app_client
+        from turnstone.core.memory import register_workstream
+
+        register_workstream("ws-shared", name="shared")
+        a_aid = _upload(client, "ws-shared", "userA", "secret.md", b"S", "text/markdown")
+        # userB can reach ws-shared (owner blank → no ownership gate)
+        # but must NOT be able to fetch userA's blob.
+        resp = client.get(
+            f"/v1/api/workstreams/ws-shared/attachments/{a_aid}/content",
+            headers=_auth("userB"),
+        )
+        assert resp.status_code == 404
+        # userA still gets their own
+        resp = client.get(
+            f"/v1/api/workstreams/ws-shared/attachments/{a_aid}/content",
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"S"
+
 
 class TestDelete:
     def test_delete_pending(self, app_client):
@@ -515,6 +539,22 @@ class TestSendMessageAttachments:
             time.sleep(0.01)
         atts = captured["attachments"]
         assert [x.attachment_id for x in atts] == [c, a, b]
+
+    def test_send_oversized_attachment_ids_list_rejected(self, app_client):
+        # Hostile / buggy clients should not be able to push an
+        # arbitrarily long IN (...) clause through reservation.
+        client, mgr = app_client
+        self._wire_ws(mgr, "ws-A", "userA")
+        from turnstone.core.attachments import MAX_PENDING_ATTACHMENTS_PER_USER_WS
+
+        too_many = [f"id-{i}" for i in range(MAX_PENDING_ATTACHMENTS_PER_USER_WS + 1)]
+        resp = client.post(
+            "/v1/api/send",
+            json={"message": "x", "ws_id": "ws-A", "attachment_ids": too_many},
+            headers=_auth("userA"),
+        )
+        assert resp.status_code == 400
+        assert resp.json().get("code") == "too_many"
 
     def test_send_forged_id_from_other_user_ignored(self, app_client):
         client, mgr = app_client
