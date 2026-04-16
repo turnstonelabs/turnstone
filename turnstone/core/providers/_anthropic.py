@@ -83,6 +83,19 @@ _ANTHROPIC_DEFAULT = ModelCapabilities(
 )
 
 _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
+    "claude-opus-4-7": ModelCapabilities(
+        context_window=1000000,
+        max_output_tokens=128000,
+        token_param="max_tokens",
+        thinking_mode="adaptive",
+        supports_effort=True,
+        effort_levels=("low", "medium", "high", "xhigh", "max"),
+        supports_web_search=True,
+        supports_tool_search=True,
+        supports_vision=True,
+        supports_temperature=False,
+        thinking_display="summarized",
+    ),
     "claude-opus-4-6": ModelCapabilities(
         context_window=1000000,
         max_output_tokens=128000,
@@ -139,7 +152,7 @@ def _map_reasoning_to_effort(
     valid_levels: tuple[str, ...],
 ) -> str | None:
     """Map turnstone reasoning_effort to Anthropic effort parameter."""
-    mapping = {"low": "low", "medium": "medium", "high": "high", "max": "max"}
+    mapping = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max"}
     effort = mapping.get(reasoning_effort)
     if effort and effort in valid_levels:
         return effort
@@ -226,8 +239,12 @@ class AnthropicProvider:
         """Build the full kwargs dict with thinking mode and effort params."""
         thinking_params: dict[str, Any] = {}
         if caps.thinking_mode == "adaptive":
-            thinking_params = {"thinking": {"type": "adaptive"}}
-            temperature = 1.0  # Required with thinking
+            thinking_dict: dict[str, Any] = {"type": "adaptive"}
+            if caps.thinking_display:
+                thinking_dict["display"] = caps.thinking_display
+            thinking_params = {"thinking": thinking_dict}
+            if caps.supports_temperature:
+                temperature = 1.0  # Required with thinking
         elif caps.thinking_mode == "manual":
             thinking_params = self._reasoning_params(reasoning_effort, extra_params, max_tokens)
             if thinking_params:
@@ -237,12 +254,13 @@ class AnthropicProvider:
             "model": model,
             "messages": converted_msgs,
             caps.token_param: max_tokens,
-            "temperature": temperature,
             # Automatic prompt caching — the API places the cache breakpoint
             # on the last cacheable block and advances it as conversation grows.
             # 90% input cost reduction on cache hits; 1.25x write on first turn.
             "cache_control": {"type": "ephemeral"},
         }
+        if caps.supports_temperature:
+            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
@@ -252,7 +270,7 @@ class AnthropicProvider:
             kwargs["tools"] = anthropic_tools
         kwargs.update(thinking_params)
 
-        # Effort param for models that support it (Opus 4.6, Sonnet 4.6, Opus 4.5)
+        # Effort param for models that support it (Opus 4.7, Opus 4.6, Sonnet 4.6, Opus 4.5)
         if caps.supports_effort and reasoning_effort:
             effort = _map_reasoning_to_effort(reasoning_effort, caps.effort_levels)
             if effort:
