@@ -7,6 +7,10 @@
       "prompt": {
         "type": "string",
         "description": "Complete task description for the sub-agent."
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model alias to run this task agent on. Omit to use the operator-configured task model. (No alternative aliases configured in this session.)"
       }
     },
     "required": ["prompt"]

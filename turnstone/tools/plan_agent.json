@@ -7,6 +7,10 @@
       "goal": {
         "type": "string",
         "description": "The goal and scope of the plan, including any constraints."
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model alias to run this plan agent on. Omit to use the operator-configured plan model. (No alternative aliases configured in this session.)"
       }
     },
     "required": ["goal"]

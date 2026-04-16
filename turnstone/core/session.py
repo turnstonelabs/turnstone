@@ -12,6 +12,7 @@ import base64
 import collections
 import concurrent.futures
 import contextlib
+import copy
 import dataclasses
 import difflib
 import hashlib
@@ -456,6 +457,11 @@ class ChatSession:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
+        # Inject the live alias list into plan_agent / task_agent tool
+        # descriptions so the calling LLM sees its `model` parameter options.
+        # Replaces affected tool dicts with deep copies — module-level
+        # constants are not mutated.
+        self._render_agent_tool_descriptions()
         # Web search backend (pluggable: auto/tavily/ddg/mcp:server:tool)
         self._web_search_backend = web_search_backend
         # Dynamic tool search: defer MCP tools when tool count is high
@@ -780,7 +786,67 @@ class ChatSession:
         self._tools = merge_mcp_tools(TOOLS, mcp_tools)
         self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
         self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
+        self._render_agent_tool_descriptions()
         self._rebuild_tool_search()
+
+    def _render_agent_tool_descriptions(self) -> None:
+        """Inject the live alias list into the ``model`` parameter description
+        on plan_agent / task_agent tools.
+
+        Lets the calling LLM see which aliases are valid right now.
+        Called on session init and on registry reload (via
+        ``refresh_agent_tool_schemas``).  No-op when no registry is
+        configured (CLI single-model case).
+
+        Replaces affected tool dicts with deep copies so the module-level
+        ``TOOLS`` constant stays untouched across sessions.
+
+        plan_agent and task_agent live in ``self._tools`` (the main session's
+        tool set) — not in ``self._agent_tools`` / ``self._task_tools``,
+        which are what *sub-agents* see (sub-agents don't get delegation
+        tools to avoid infinite recursion).
+        """
+        if self._registry is None:
+            return
+        aliases = sorted(self._registry.list_aliases())
+        if not aliases:
+            return
+        aliases_str = ", ".join(f"`{a}`" for a in aliases)
+
+        new_tools: list[dict[str, Any]] = []
+        for tool in self._tools:
+            fn = tool.get("function") or {}
+            name = fn.get("name", "")
+            if name not in ("plan_agent", "task_agent"):
+                new_tools.append(tool)
+                continue
+            kind = "plan model" if name == "plan_agent" else "task model"
+            new_tool = copy.deepcopy(tool)
+            props = new_tool.get("function", {}).get("parameters", {}).get("properties", {})
+            if "model" in props:
+                props["model"]["description"] = (
+                    f"Optional model alias to run this {name} on. "
+                    f"Omit to use the operator-configured {kind}. "
+                    f"Available aliases: {aliases_str}."
+                )
+            new_tools.append(new_tool)
+        self._tools = new_tools
+        # The BM25 tool-search index (when active) holds the OLD plan/task
+        # dicts; rebuild so its description text matches what the LLM sees.
+        # getattr guard: this method also runs from __init__ before
+        # _tool_search is assigned, in which case there's nothing to rebuild.
+        if getattr(self, "_tool_search", None) is not None:
+            self._rebuild_tool_search()
+
+    def refresh_agent_tool_schemas(self) -> None:
+        """Public entry point: re-render plan_agent / task_agent tool
+        descriptions to reflect the current ModelRegistry state.
+
+        Called by the server after a registry reload (sync-to-nodes /
+        admin model edits) so active sessions pick up the new alias
+        list on their next LLM turn.
+        """
+        self._render_agent_tool_descriptions()
 
     def _on_mcp_resources_changed(self) -> None:
         """Callback from MCPClientManager when the resource list changes.
@@ -4476,6 +4542,35 @@ class ChatSession:
         output = self._tool_search.format_search_results(results)
         return item["call_id"], output
 
+    def _validate_agent_model_override(
+        self, call_id: str, func_name: str, args: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Pull and validate the optional `model` arg for plan/task agents.
+
+        Returns (alias, error_item).  When the caller passed a `model` and
+        it isn't in the registry, returns an error_item shaped like the
+        existing _prepare_* error dicts so the LLM gets corrective guidance
+        and retries.  When no override was passed, returns (None, None).
+        """
+        raw = args.get("model")
+        if raw is None or raw == "":
+            return None, None
+        alias = str(raw).strip()
+        if not alias:
+            return None, None
+        if self._registry is None or not self._registry.has_alias(alias):
+            available = sorted(self._registry.list_aliases()) if self._registry is not None else []
+            available_str = ", ".join(available) if available else "(no registry configured)"
+            return None, {
+                "call_id": call_id,
+                "func_name": func_name,
+                "header": f"\u2717 {func_name}: unknown model alias",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: unknown model alias '{alias}'. Available: {available_str}",
+            }
+        return alias, None
+
     def _prepare_task(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a general-purpose sub-agent task for approval."""
         prompt = (args.get("prompt") or "").strip()
@@ -4488,6 +4583,9 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: empty prompt",
             }
+        model_override, err = self._validate_agent_model_override(call_id, "task_agent", args)
+        if err is not None:
+            return err
         preview_text = prompt[:300] + ("..." if len(prompt) > 300 else "")
         return {
             "call_id": call_id,
@@ -4498,6 +4596,7 @@ class ChatSession:
             "approval_label": "task_agent",
             "execute": self._exec_task,
             "prompt": prompt,
+            "model_override": model_override,
         }
 
     def _prepare_plan(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -4512,6 +4611,9 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "Error: empty goal",
             }
+        model_override, err = self._validate_agent_model_override(call_id, "plan_agent", args)
+        if err is not None:
+            return err
         preview_text = goal[:300] + ("..." if len(goal) > 300 else "")
         return {
             "call_id": call_id,
@@ -4522,6 +4624,7 @@ class ChatSession:
             "approval_label": "plan_agent",
             "execute": self._exec_plan,
             "prompt": goal,
+            "model_override": model_override,
         }
 
     def _resolve_scope_id(self, scope: str) -> str:
@@ -5651,6 +5754,7 @@ class ChatSession:
         tools: list[dict[str, Any]] | None = None,
         auto_tools: set[str] | None = None,
         reasoning_effort: str | None = None,
+        agent_alias: str | None = None,
     ) -> str:
         """Run an autonomous agent loop.
 
@@ -5660,6 +5764,11 @@ class ChatSession:
             tools: Tool definitions to send to the API. Defaults to AGENT_TOOLS (read-only).
             auto_tools: Set of tool names the agent may execute. Defaults to AGENT_AUTO_TOOLS.
             reasoning_effort: Override reasoning effort for this agent.
+            agent_alias: Per-call model alias override (the LLM passed
+                ``model="<alias>"`` to plan_agent/task_agent).  Wins over
+                the registry's per-kind resolution when set.  Caller is
+                expected to have validated the alias against the registry;
+                an unknown alias here raises ``ValueError``.
 
         Returns:
             Final content string from the agent.
@@ -5670,10 +5779,14 @@ class ChatSession:
             auto_tools = AGENT_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
 
-        # Resolve agent model: per-kind override (plan_model/task_model) wins
-        # over the legacy single-knob agent_model, which falls back to the
-        # session's primary model when unset.
-        agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
+        # Resolve agent model: explicit per-call override wins, then per-kind
+        # registry override (plan_model/task_model), then the legacy single-
+        # knob agent_model, then the session's primary model.
+        if agent_alias is not None:
+            if self._registry is None or not self._registry.has_alias(agent_alias):
+                raise ValueError(f"Unknown agent_alias '{agent_alias}'")
+        else:
+            agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
         if self._registry and agent_alias:
             agent_client, agent_model, _ = self._registry.resolve(agent_alias)
             agent_provider = self._registry.get_provider(agent_alias)
@@ -5897,6 +6010,7 @@ class ChatSession:
                 label="task",
                 tools=self._task_tools,
                 auto_tools=TASK_AUTO_TOOLS,
+                agent_alias=item.get("model_override"),
             )
         except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(task interrupted by user)"
@@ -6011,10 +6125,12 @@ class ChatSession:
         agent_messages.extend(prior_plan_msgs)
         agent_messages.append({"role": "user", "content": prompt})
 
+        plan_alias = item.get("model_override")
         try:
             content = self._run_agent(
                 agent_messages,
                 label="plan",
+                agent_alias=plan_alias,
             )
         except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(plan interrupted by user)"
@@ -6044,6 +6160,7 @@ class ChatSession:
                 content = self._run_agent(
                     agent_messages,
                     label="plan",
+                    agent_alias=plan_alias,
                 )
             except (KeyboardInterrupt, GenerationCancelled):
                 return call_id, "(plan interrupted by user)"

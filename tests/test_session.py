@@ -367,6 +367,142 @@ class TestPlanExec:
 
 
 # ---------------------------------------------------------------------------
+# Per-call model override on plan_agent / task_agent
+# ---------------------------------------------------------------------------
+
+
+class TestAgentModelOverride:
+    """Tests for the optional `model` arg on plan_agent / task_agent tools."""
+
+    @staticmethod
+    def _registry():
+        from turnstone.core.model_registry import ModelConfig, ModelRegistry
+
+        return ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "m"),
+                "smart": ModelConfig("smart", "x", "x", "m"),
+                "fast": ModelConfig("fast", "x", "x", "m"),
+            },
+            default="default",
+        )
+
+    # ---- _prepare_plan ----
+
+    def test_prepare_plan_extracts_model_override(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": "smart"})
+        assert item["model_override"] == "smart"
+        assert "error" not in item
+
+    def test_prepare_plan_missing_model_arg_means_no_override(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x"})
+        assert item["model_override"] is None
+
+    def test_prepare_plan_empty_string_model_means_no_override(self, tmp_db) -> None:
+        # LLMs sometimes echo "" rather than omit the field; treat as unset.
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": ""})
+        assert item["model_override"] is None
+
+    def test_prepare_plan_unknown_model_returns_error(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_plan("c1", {"goal": "do x", "model": "bogus"})
+        assert item.get("needs_approval") is False
+        assert "error" in item
+        assert "unknown model alias 'bogus'" in item["error"]
+        # The error guidance must list the available aliases so the LLM can retry.
+        for alias in ("default", "smart", "fast"):
+            assert alias in item["error"]
+
+    # ---- _prepare_task ----
+
+    def test_prepare_task_extracts_model_override(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "fast"})
+        assert item["model_override"] == "fast"
+
+    def test_prepare_task_missing_model_arg_means_no_override(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_task("c1", {"prompt": "do x"})
+        assert item["model_override"] is None
+
+    def test_prepare_task_unknown_model_returns_error(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        item = session._prepare_task("c1", {"prompt": "do x", "model": "bogus"})
+        assert item.get("needs_approval") is False
+        assert "error" in item
+        assert "unknown model alias 'bogus'" in item["error"]
+
+    # ---- tool description rendering ----
+
+    @staticmethod
+    def _agent_tool(session, name):
+        """Return the plan_agent / task_agent dict from the main tool set."""
+        for t in session._tools:
+            fn = t.get("function") or {}
+            if fn.get("name") == name:
+                return t
+        return None
+
+    def test_render_injects_alias_list_into_descriptions(self, tmp_db) -> None:
+        session = _make_session(registry=self._registry(), model_alias="default")
+        for name in ("plan_agent", "task_agent"):
+            tool = self._agent_tool(session, name)
+            assert tool is not None, f"{name} missing from session tools"
+            desc = tool["function"]["parameters"]["properties"]["model"]["description"]
+            for alias in ("default", "smart", "fast"):
+                assert f"`{alias}`" in desc, f"alias {alias} missing from {desc!r}"
+
+    def test_render_no_op_without_registry(self, tmp_db) -> None:
+        """No registry → leave the placeholder description untouched."""
+        session = _make_session()  # no registry
+        plan_tool = self._agent_tool(session, "plan_agent")
+        assert plan_tool is not None
+        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "No alternative aliases configured" in desc
+
+    def test_refresh_picks_up_new_aliases(self, tmp_db) -> None:
+        """Adding a new model and calling refresh_agent_tool_schemas updates
+        the description without requiring a fresh session."""
+        from turnstone.core.model_registry import ModelConfig
+
+        reg = self._registry()
+        session = _make_session(registry=reg, model_alias="default")
+
+        # Mutate the registry to add a new alias (simulates admin model add
+        # followed by sync-to-nodes / internal_model_reload).
+        new_models = dict(reg.models)
+        new_models["bigboi"] = ModelConfig("bigboi", "x", "x", "m")
+        reg.reload(new_models, reg.default, reg.fallback, reg.agent_model)
+
+        session.refresh_agent_tool_schemas()
+
+        plan_tool = self._agent_tool(session, "plan_agent")
+        assert plan_tool is not None
+        desc = plan_tool["function"]["parameters"]["properties"]["model"]["description"]
+        assert "`bigboi`" in desc
+
+    def test_module_level_constants_not_mutated(self, tmp_db) -> None:
+        """Rendering must not pollute the module-level TOOLS list shared
+        across all sessions."""
+        from turnstone.core.tools import TOOLS
+
+        # Construct purely for the side effect of rendering on init.
+        _make_session(registry=self._registry(), model_alias="default")
+
+        for t in TOOLS:
+            fn = t.get("function") or {}
+            if fn.get("name") not in ("plan_agent", "task_agent"):
+                continue
+            desc = fn["parameters"]["properties"]["model"]["description"]
+            assert "No alternative aliases configured" in desc, (
+                f"module-level {fn['name']} description was mutated to: {desc!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Plan validation
 # ---------------------------------------------------------------------------
 

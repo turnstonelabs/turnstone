@@ -1170,6 +1170,35 @@ class TestSessionAgentModel:
         )
         assert self._captured_effort(captured) == "minimal"
 
+    # -- per-call agent_alias override (LLM passes model="<alias>") ----------
+
+    def test_run_agent_uses_explicit_alias_override(self) -> None:
+        """agent_alias kwarg routes the agent call to the chosen client/model."""
+        reg = self._three_model_registry()
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "x"}], label="task", agent_alias="fast")
+        assert captured["model"] == "fast-model"
+
+    def test_explicit_alias_overrides_registry_plan_model(self) -> None:
+        """Per-call alias wins over the configured per-kind plan_model."""
+        reg = self._three_model_registry(plan_model="smart")
+        session = _make_session(registry=reg, model_alias="main")
+        # Without override the call would route to "smart"; we ask for "fast".
+        captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "x"}], label="plan", agent_alias="fast")
+        assert captured["model"] == "fast-model"
+
+    def test_invalid_alias_raises_in_run_agent(self) -> None:
+        """Defence-in-depth: _prepare_* validates first, but _run_agent
+        rejects unknown aliases too rather than silently falling back."""
+        reg = self._three_model_registry()
+        session = _make_session(registry=reg, model_alias="main")
+        with pytest.raises(ValueError, match="Unknown agent_alias"):
+            session._run_agent(
+                [{"role": "user", "content": "x"}], label="plan", agent_alias="bogus"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Workstream integration

@@ -3331,6 +3331,31 @@ def _effective_routing(
     return eff_default, eff_plan_model, eff_task_model, eff_plan_effort, eff_task_effort
 
 
+def _broadcast_agent_tool_schema_refresh(app_state: Any) -> None:
+    """Tell every active session on this node to re-render its plan_agent /
+    task_agent tool descriptions.  Best-effort: a session that lacks the
+    method (older code path or test stub) is skipped silently.
+
+    Called after a registry reload that may have added/removed model
+    aliases, so the calling LLMs see an updated `model` parameter
+    description on their next turn.
+    """
+    mgr = getattr(app_state, "workstreams", None)
+    if mgr is None:
+        return
+    try:
+        workstreams = mgr.list_all()
+    except Exception:
+        return
+    for ws in workstreams:
+        session = getattr(ws, "session", None)
+        refresh = getattr(session, "refresh_agent_tool_schemas", None)
+        if refresh is None:
+            continue
+        with contextlib.suppress(Exception):
+            refresh()
+
+
 def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
     """Apply ConfigStore routing overrides to a live *registry* in place.
 
@@ -3445,6 +3470,10 @@ def internal_model_reload(request: Request) -> JSONResponse:
         for alias in registry.list_aliases():
             cfg = registry.get_config(alias)
             health_reg.get_tracker(provider=cfg.provider, base_url=cfg.base_url)
+
+    # Push the new alias list into active sessions so plan_agent/task_agent
+    # `model` parameter descriptions reflect the current registry.
+    _broadcast_agent_tool_schema_refresh(request.app.state)
 
     return JSONResponse({"status": "ok", "aliases": registry.list_aliases()})
 

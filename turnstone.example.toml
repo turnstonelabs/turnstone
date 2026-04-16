@@ -33,6 +33,11 @@
 # task_model = ""              # task_agent override (e.g. "local" for cheap subtasks)
 # plan_effort = ""             # reasoning effort for plan_agent (default: "high")
 # task_effort = ""             # reasoning effort for task_agent (default: inherit session)
+#
+# At call time, the calling LLM may also pass `model="<alias>"` to
+# plan_agent / task_agent to override these per-invocation.  Tool
+# descriptions list available aliases dynamically; bad aliases return
+# an error so the model retries with a valid choice.
 
 # --- Named Models (turnstone, node, eval) ---
 # Define model aliases with per-model overrides. Useful for local model
