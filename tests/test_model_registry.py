@@ -188,6 +188,59 @@ class TestModelRegistry:
         reg = self._make_registry(agent_model="cheap")
         assert reg.agent_model == "cheap"
 
+    def test_plan_task_models_default_none(self) -> None:
+        reg = self._make_registry()
+        assert reg.plan_model is None
+        assert reg.task_model is None
+        assert reg.plan_effort is None
+        assert reg.task_effort is None
+
+    def test_resolve_agent_alias_falls_back_to_agent_model(self) -> None:
+        reg = self._make_registry(agent_model="cheap")
+        assert reg.resolve_agent_alias("plan") == "cheap"
+        assert reg.resolve_agent_alias("task") == "cheap"
+
+    def test_resolve_agent_alias_per_kind_overrides(self) -> None:
+        models = {
+            "default": ModelConfig("default", "http://x/v1", "k", "m"),
+            "smart": ModelConfig("smart", "http://x/v1", "k", "m"),
+            "fast": ModelConfig("fast", "http://x/v1", "k", "m"),
+            "shared": ModelConfig("shared", "http://x/v1", "k", "m"),
+        }
+        reg = ModelRegistry(
+            models=models,
+            default="default",
+            agent_model="shared",
+            plan_model="smart",
+            task_model="fast",
+        )
+        assert reg.resolve_agent_alias("plan") == "smart"
+        assert reg.resolve_agent_alias("task") == "fast"
+
+    def test_resolve_agent_alias_returns_none_when_unconfigured(self) -> None:
+        reg = self._make_registry()
+        assert reg.resolve_agent_alias("plan") is None
+        assert reg.resolve_agent_alias("task") is None
+
+    def test_resolve_agent_effort_plan_back_compat_default(self) -> None:
+        reg = self._make_registry()
+        assert reg.resolve_agent_effort("plan") == ModelRegistry.PLAN_DEFAULT_EFFORT
+        assert reg.resolve_agent_effort("plan") == "high"
+
+    def test_resolve_agent_effort_plan_override(self) -> None:
+        models = {"a": ModelConfig("a", "x", "x", "x")}
+        reg = ModelRegistry(models=models, default="a", plan_effort="max")
+        assert reg.resolve_agent_effort("plan") == "max"
+
+    def test_resolve_agent_effort_task_returns_none_to_inherit(self) -> None:
+        reg = self._make_registry()
+        assert reg.resolve_agent_effort("task") is None
+
+    def test_resolve_agent_effort_task_override(self) -> None:
+        models = {"a": ModelConfig("a", "x", "x", "x")}
+        reg = ModelRegistry(models=models, default="a", task_effort="low")
+        assert reg.resolve_agent_effort("task") == "low"
+
 
 class TestModelRegistryValidation:
     def test_empty_models_raises(self) -> None:
@@ -208,6 +261,16 @@ class TestModelRegistryValidation:
         models = {"a": ModelConfig("a", "x", "x", "x")}
         with pytest.raises(ValueError, match="Agent model 'bad'"):
             ModelRegistry(models=models, default="a", agent_model="bad")
+
+    def test_invalid_plan_model_raises(self) -> None:
+        models = {"a": ModelConfig("a", "x", "x", "x")}
+        with pytest.raises(ValueError, match="Plan model 'bad'"):
+            ModelRegistry(models=models, default="a", plan_model="bad")
+
+    def test_invalid_task_model_raises(self) -> None:
+        models = {"a": ModelConfig("a", "x", "x", "x")}
+        with pytest.raises(ValueError, match="Task model 'bad'"):
+            ModelRegistry(models=models, default="a", task_model="bad")
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +359,52 @@ class TestLoadModelRegistry:
         with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
             reg = load_model_registry("http://x/v1", "x", "x")
         assert reg.agent_model is None
+
+    def test_plan_task_models_from_config(self) -> None:
+        fake_cfg: dict[str, Any] = {
+            "models": {
+                "smart": {"base_url": "http://s/v1", "model": "s"},
+                "fast": {"base_url": "http://f/v1", "model": "f"},
+            },
+            "model": {
+                "plan_model": "smart",
+                "task_model": "fast",
+                "plan_effort": "max",
+                "task_effort": "low",
+            },
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.plan_model == "smart"
+        assert reg.task_model == "fast"
+        assert reg.plan_effort == "max"
+        assert reg.task_effort == "low"
+
+    def test_invalid_plan_task_models_ignored(self) -> None:
+        fake_cfg: dict[str, Any] = {
+            "model": {"plan_model": "nope", "task_model": "alsonope"},
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.plan_model is None
+        assert reg.task_model is None
+
+    def test_invalid_effort_values_dropped_with_warning(self) -> None:
+        """Typos in plan_effort/task_effort shouldn't silently flow to providers."""
+        fake_cfg: dict[str, Any] = {
+            "model": {"plan_effort": "hihg", "task_effort": "extreme"},
+        }
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.plan_effort is None
+        assert reg.task_effort is None
+
+    def test_valid_effort_values_accepted(self) -> None:
+        for level in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            fake_cfg: dict[str, Any] = {"model": {"plan_effort": level}}
+            with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+                reg = load_model_registry("http://x/v1", "x", "x")
+            assert reg.plan_effort == level, f"level={level} not accepted"
 
     def test_invalid_default_falls_back(self) -> None:
         fake_cfg: dict[str, Any] = {
@@ -711,6 +820,7 @@ class _FakeUI:
 def _make_session(
     registry: ModelRegistry | None = None,
     model_alias: str | None = None,
+    reasoning_effort: str = "medium",
 ) -> Any:
     """Create a ChatSession with a mock client and optional registry."""
     from turnstone.core.session import ChatSession
@@ -726,6 +836,7 @@ def _make_session(
         tool_timeout=30,
         registry=registry,
         model_alias=model_alias,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -913,6 +1024,134 @@ class TestSessionAgentModel:
         ]
         session._run_agent(agent_msgs)
         assert captured_model == "agent-model"
+
+    @staticmethod
+    def _capture_on(client: Any) -> dict[str, Any]:
+        """Patch *client* (registry-resolved or session.client) to capture kwargs."""
+        captured: dict[str, Any] = {}
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "done"
+        mock_response.choices[0].message.tool_calls = None
+        mock_response.choices[0].finish_reason = "stop"
+
+        def fake_create(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return mock_response
+
+        client.chat.completions.create = fake_create
+        return captured
+
+    def _capture(self, reg: ModelRegistry, alias: str) -> dict[str, Any]:
+        return self._capture_on(reg.get_client(alias))
+
+    @staticmethod
+    def _captured_effort(captured: dict[str, Any]) -> str | None:
+        """Pull reasoning_effort out of provider-specific shapes.
+
+        openai-compatible servers receive it via extra_body.chat_template_kwargs;
+        commercial providers receive it as a top-level kwarg.
+        """
+        eb = captured.get("extra_body") or {}
+        ctk = eb.get("chat_template_kwargs") or {}
+        return ctk.get("reasoning_effort") or captured.get("reasoning_effort")
+
+    def _three_model_registry(self, **kwargs: Any) -> ModelRegistry:
+        return ModelRegistry(
+            models={
+                "main": ModelConfig(
+                    "main", "http://m/v1", "k", "main-model", provider="openai-compatible"
+                ),
+                "smart": ModelConfig(
+                    "smart", "http://s/v1", "k", "smart-model", provider="openai-compatible"
+                ),
+                "fast": ModelConfig(
+                    "fast", "http://f/v1", "k", "fast-model", provider="openai-compatible"
+                ),
+            },
+            default="main",
+            **kwargs,
+        )
+
+    def test_plan_model_overrides_agent_model(self) -> None:
+        reg = self._three_model_registry(agent_model="fast", plan_model="smart")
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture(reg, "smart")
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert captured["model"] == "smart-model"
+
+    def test_task_model_overrides_agent_model(self) -> None:
+        reg = self._three_model_registry(agent_model="smart", task_model="fast")
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "x"}], label="task")
+        assert captured["model"] == "fast-model"
+
+    def test_plan_falls_back_to_agent_model(self) -> None:
+        reg = self._three_model_registry(agent_model="fast")
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert captured["model"] == "fast-model"
+
+    def test_plan_uses_session_model_when_no_overrides(self) -> None:
+        # No agent_model/plan_model configured — _run_agent falls through to
+        # session.client (the test's MagicMock) and session.model ("test-model").
+        reg = self._three_model_registry()
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture_on(session.client)
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert captured["model"] == "test-model"
+
+    def test_plan_default_reasoning_effort_is_high(self) -> None:
+        """Back-compat: plan_agent always got "high" before; the default must
+        survive the migration even when no plan_effort is configured."""
+        reg = self._three_model_registry()
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture_on(session.client)
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert self._captured_effort(captured) == "high"
+
+    def test_plan_effort_from_registry_overrides_default(self) -> None:
+        reg = self._three_model_registry(plan_effort="max")
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture_on(session.client)
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert self._captured_effort(captured) == "max"
+
+    def test_task_effort_inherits_session_when_unset(self) -> None:
+        # Task with no task_effort override must inherit whatever the SESSION
+        # is configured for — assert against an explicit value rather than
+        # the constructor default so the invariant is unambiguous if someone
+        # changes ChatSession's default later.
+        reg = self._three_model_registry()
+        session = _make_session(registry=reg, model_alias="main", reasoning_effort="low")
+        captured = self._capture_on(session.client)
+        session._run_agent([{"role": "user", "content": "x"}], label="task")
+        assert self._captured_effort(captured) == "low"
+
+    def test_agent_model_routes_both_plan_and_task(self) -> None:
+        """Back-compat invariant via _run_agent: with only the legacy
+        agent_model knob set, both plan and task labels must route through it."""
+        reg = self._three_model_registry(agent_model="fast")
+        session = _make_session(registry=reg, model_alias="main")
+
+        plan_captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "x"}], label="plan")
+        assert plan_captured["model"] == "fast-model"
+
+        task_captured = self._capture(reg, "fast")
+        session._run_agent([{"role": "user", "content": "y"}], label="task")
+        assert task_captured["model"] == "fast-model"
+
+    def test_explicit_effort_wins_over_registry(self) -> None:
+        reg = self._three_model_registry(plan_effort="low")
+        session = _make_session(registry=reg, model_alias="main")
+        captured = self._capture_on(session.client)
+        session._run_agent(
+            [{"role": "user", "content": "x"}], label="plan", reasoning_effort="minimal"
+        )
+        assert self._captured_effort(captured) == "minimal"
 
 
 # ---------------------------------------------------------------------------

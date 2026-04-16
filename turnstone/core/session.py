@@ -5670,16 +5670,32 @@ class ChatSession:
             auto_tools = AGENT_AUTO_TOOLS
         max_tool_turns = self.agent_max_turns
 
-        # Resolve agent model and provider: use registry.agent_model if configured
-        agent_client = self.client
-        agent_model = self.model
-        agent_provider = self._provider
-        if self._registry and self._registry.agent_model:
-            agent_client, agent_model, _ = self._registry.resolve(self._registry.agent_model)
-            agent_provider = self._registry.get_provider(self._registry.agent_model)
+        # Resolve agent model: per-kind override (plan_model/task_model) wins
+        # over the legacy single-knob agent_model, which falls back to the
+        # session's primary model when unset.
+        agent_alias = self._registry.resolve_agent_alias(label) if self._registry else None
+        if self._registry and agent_alias:
+            agent_client, agent_model, _ = self._registry.resolve(agent_alias)
+            agent_provider = self._registry.get_provider(agent_alias)
+        else:
+            agent_client = self.client
+            agent_model = self.model
+            agent_provider = self._provider
+
+        # Per-kind reasoning effort.  Explicit caller arg wins; otherwise
+        # delegate to the registry which knows the per-kind default (plan
+        # gets the back-compat "high", task returns None to inherit the
+        # session).  When no registry exists, apply the plan back-compat
+        # default directly so single-process callers keep prior behaviour.
+        if reasoning_effort is None:
+            if self._registry:
+                reasoning_effort = self._registry.resolve_agent_effort(label)
+            elif label == "plan":
+                from turnstone.core.model_registry import ModelRegistry
+
+                reasoning_effort = ModelRegistry.PLAN_DEFAULT_EFFORT
 
         # Gate web_search: remove when no backend exists for the agent model
-        agent_alias = self._registry.agent_model if self._registry else None
         agent_caps = self._resolve_capabilities(agent_provider, agent_model, agent_alias)
         if not agent_caps.supports_web_search and not self._resolve_search_client():
             tools = _without_tool(tools, "web_search")
@@ -5999,7 +6015,6 @@ class ChatSession:
             content = self._run_agent(
                 agent_messages,
                 label="plan",
-                reasoning_effort="high",
             )
         except (KeyboardInterrupt, GenerationCancelled):
             return call_id, "(plan interrupted by user)"
@@ -6029,7 +6044,6 @@ class ChatSession:
                 content = self._run_agent(
                     agent_messages,
                     label="plan",
-                    reasoning_effort="high",
                 )
             except (KeyboardInterrupt, GenerationCancelled):
                 return call_id, "(plan interrupted by user)"
@@ -6097,7 +6111,6 @@ class ChatSession:
         content = self._run_agent(
             agent_messages,
             label="plan",
-            reasoning_effort="high",
         )
 
         valid, issues = self._validate_plan(content, original_goal)

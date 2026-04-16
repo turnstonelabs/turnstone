@@ -3321,6 +3321,10 @@ def internal_model_reload(request: Request) -> JSONResponse:
             effective_default,
             new_registry.fallback,
             new_registry.agent_model,
+            plan_model=new_registry.plan_model,
+            task_model=new_registry.task_model,
+            plan_effort=new_registry.plan_effort,
+            task_effort=new_registry.task_effort,
         )
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
@@ -4045,7 +4049,16 @@ def main() -> None:
     # Apply runtime default alias override from ConfigStore (if set)
     cs_default_alias = config_store.get("model.default_alias")
     if cs_default_alias and registry.has_alias(cs_default_alias):
-        registry.reload(registry.models, cs_default_alias, registry.fallback, registry.agent_model)
+        registry.reload(
+            registry.models,
+            cs_default_alias,
+            registry.fallback,
+            registry.agent_model,
+            plan_model=registry.plan_model,
+            task_model=registry.task_model,
+            plan_effort=registry.plan_effort,
+            task_effort=registry.task_effort,
+        )
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client
