@@ -71,9 +71,9 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 | | `dashboard()` | `DashboardResponse` |
 | | `create_workstream(*, name, model, auto_approve, skill, initial_message, attachments)` | `CreateWorkstreamResponse` |
 | | `close_workstream(ws_id)` | `StatusResponse` |
-| **Attachments** | `upload_attachment(ws_id, file, filename, mime_type)` | `UploadAttachmentResponse` |
+| **Attachments** | `upload_attachment(ws_id, filename, data, *, mime_type=...)` | `UploadAttachmentResponse` |
 | | `list_attachments(ws_id)` | `ListAttachmentsResponse` |
-| | `download_attachment(ws_id, attachment_id)` | `bytes` |
+| | `get_attachment_content(ws_id, attachment_id)` | `bytes` |
 | | `delete_attachment(ws_id, attachment_id)` | `StatusResponse` |
 | **Chat** | `send(message, ws_id)` | `SendResponse` |
 | | `approve(*, ws_id, approved, feedback, always)` | `StatusResponse` |
@@ -182,8 +182,8 @@ Upload files to a workstream and attach them to the next user turn:
 ```python
 # Upload separately, then send a message — attachments auto-attach
 with open("screenshot.png", "rb") as f:
-    att = client.upload_attachment(ws.ws_id, f.read(),
-                                   filename="screenshot.png",
+    att = client.upload_attachment(ws.ws_id, "screenshot.png",
+                                   f.read(),
                                    mime_type="image/png")
 client.send("What's wrong in this screenshot?", ws.ws_id)
 

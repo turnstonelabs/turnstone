@@ -170,7 +170,7 @@ Every tool defines a `primary_key`. The mapping is:
 | `web_fetch`  | `url`       |
 | `web_search` | `query`     |
 | `task_agent` | `prompt`    |
-| `plan_agent` | `prompt`    |
+| `plan_agent` | `goal`      |
 | `memory`     | `name`      |
 | `recall`     | `query`     |
 | `notify`     | `message`   |
@@ -572,7 +572,7 @@ pre-configure skills at workstream creation.
 | `web_fetch`  | Info       | No           | Yes   | Yes        | `url`       |
 | `web_search` | Info       | No           | Yes   | Yes        | `query`     |
 | `task_agent` | Agent      | No           | No    | No         | `prompt`    |
-| `plan_agent` | Agent      | No           | No    | No         | `prompt`    |
+| `plan_agent` | Agent      | No           | No    | No         | `goal`      |
 | `memory`     | Memory     | Yes          | No    | No         | `name`      |
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |

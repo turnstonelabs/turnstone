@@ -504,7 +504,7 @@ independently, then returns the final content as the tool result.
 - **task_agent**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
 - **plan_agent**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
   to `.plan-<ws_id>.md` — unique per `ChatSession` so concurrent workstreams
-  don't collide. On repeat invocations the prior `plan` tool call and its result
+  don't collide. On repeat invocations the prior `plan_agent` tool call and its result
   are forwarded from `self.messages` so the agent refines the existing plan rather
   than starting over. Planning instructions are injected as a developer message
   prepended to the agent's conversation.
