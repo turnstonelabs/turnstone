@@ -831,22 +831,23 @@ class ChatSession:
                 )
             new_tools.append(new_tool)
         self._tools = new_tools
-        # The BM25 tool-search index (when active) holds the OLD plan/task
-        # dicts; rebuild so its description text matches what the LLM sees.
-        # getattr guard: this method also runs from __init__ before
-        # _tool_search is assigned, in which case there's nothing to rebuild.
-        if getattr(self, "_tool_search", None) is not None:
-            self._rebuild_tool_search()
 
     def refresh_agent_tool_schemas(self) -> None:
         """Public entry point: re-render plan_agent / task_agent tool
-        descriptions to reflect the current ModelRegistry state.
+        descriptions to reflect the current ModelRegistry state, and
+        rebuild the BM25 tool-search index so its text matches.
 
         Called by the server after a registry reload (sync-to-nodes /
         admin model edits) so active sessions pick up the new alias
         list on their next LLM turn.
+
+        ``_on_mcp_tools_changed`` calls ``_render_agent_tool_descriptions``
+        directly (not this) because it already rebuilds the tool-search
+        index right after — calling this wrapper would do that twice.
         """
         self._render_agent_tool_descriptions()
+        if getattr(self, "_tool_search", None) is not None:
+            self._rebuild_tool_search()
 
     def _on_mcp_resources_changed(self) -> None:
         """Callback from MCPClientManager when the resource list changes.

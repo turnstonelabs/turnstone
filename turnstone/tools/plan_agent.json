@@ -10,7 +10,7 @@
       },
       "model": {
         "type": "string",
-        "description": "Optional model alias to run this plan agent on. Omit to use the operator-configured plan model. (No alternative aliases configured in this session.)"
+        "description": "Optional model alias to run this plan agent on. Omit to use the current session model. (No alternative aliases configured in this session.)"
       }
     },
     "required": ["goal"]
