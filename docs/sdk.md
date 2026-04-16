@@ -69,8 +69,12 @@ Both `TurnstoneServer` (sync) and `AsyncTurnstoneServer` (async) expose:
 |----------|--------|---------|
 | **Workstreams** | `list_workstreams()` | `ListWorkstreamsResponse` |
 | | `dashboard()` | `DashboardResponse` |
-| | `create_workstream(*, name, model, auto_approve, skill)` | `CreateWorkstreamResponse` |
+| | `create_workstream(*, name, model, auto_approve, skill, initial_message, attachments)` | `CreateWorkstreamResponse` |
 | | `close_workstream(ws_id)` | `StatusResponse` |
+| **Attachments** | `upload_attachment(ws_id, file, filename, mime_type)` | `UploadAttachmentResponse` |
+| | `list_attachments(ws_id)` | `ListAttachmentsResponse` |
+| | `download_attachment(ws_id, attachment_id)` | `bytes` |
+| | `delete_attachment(ws_id, attachment_id)` | `StatusResponse` |
 | **Chat** | `send(message, ws_id)` | `SendResponse` |
 | | `approve(*, ws_id, approved, feedback, always)` | `StatusResponse` |
 | | `plan_feedback(*, ws_id, feedback)` | `StatusResponse` |
@@ -170,6 +174,36 @@ result.errors       # Any error messages
 result.ok           # True if no errors and not timed out
 result.timed_out    # True if timeout expired
 ```
+
+### Attachments
+
+Upload files to a workstream and attach them to the next user turn:
+
+```python
+# Upload separately, then send a message — attachments auto-attach
+with open("screenshot.png", "rb") as f:
+    att = client.upload_attachment(ws.ws_id, f.read(),
+                                   filename="screenshot.png",
+                                   mime_type="image/png")
+client.send("What's wrong in this screenshot?", ws.ws_id)
+
+# Or attach at workstream-creation time (multipart upload)
+from turnstone.sdk import AttachmentUpload
+
+with open("notes.txt", "rb") as f:
+    ws = client.create_workstream(
+        name="triage",
+        initial_message="Summarize the notes",
+        attachments=[AttachmentUpload(data=f.read(),
+                                      filename="notes.txt",
+                                      mime_type="text/plain")],
+    )
+```
+
+Limits: images ≤ 4 MiB (png/jpeg/gif/webp), text ≤ 512 KiB (UTF-8),
+10 pending per (workstream, user). The SDK auto-generates `ws_id` on the
+client so cluster-routed callers bind attachments to the owning node
+before the request lands.
 
 ### Error Handling
 
@@ -284,7 +318,7 @@ turnstone/sdk/               Python SDK (sub-package)
   _base.py                   Shared httpx async client, auth, error handling
   _sync.py                   Background event loop for sync wrappers
   _types.py                  TurnResult + TurnstoneAPIError
-  events.py                  27 SSE event dataclasses with type registry
+  events.py                  38 SSE event dataclasses with type registry
   server.py                  AsyncTurnstoneServer + TurnstoneServer
   console.py                 AsyncTurnstoneConsole + TurnstoneConsole
 

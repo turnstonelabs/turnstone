@@ -8,7 +8,8 @@
 This document describes a consistent hash ring algorithm evaluated during
 the design of the direct HTTP transport routing system. The current
 implementation uses weight-proportional bucket assignment with a
-donor/recipient rebalancing algorithm (see `direct-http-transport.md`).
+donor/recipient rebalancing algorithm (see the routing section of
+[../architecture.md](../architecture.md)).
 The consistent hash ring is documented here as a reference for future
 scalability work — if the cluster grows beyond the point where the
 weight-proportional approach is sufficient, the ring provides a

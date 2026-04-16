@@ -842,6 +842,15 @@ button automatically.
 
 Creates a new workstream. The server supports up to 10 concurrent workstreams.
 
+The endpoint accepts **either** `application/json` (legacy shape) **or**
+`multipart/form-data` when you want to upload attachments at creation
+time.  Multipart requests carry one `meta` field containing the JSON body
+shown below plus zero-or-more `file` parts; each file is validated and
+reserved onto the new workstream's first turn before the dispatch worker
+runs, so queued multimodal turns cannot lose files to racing sends.  If
+validation fails the fresh workstream is rolled back so no orphan rows
+leak.
+
 **Request body:**
 
 ```json
@@ -912,6 +921,100 @@ closed.
 ```
 
 Status code: `400`
+
+---
+
+### `POST /v1/api/workstreams/{ws_id}/attachments`
+
+Upload an image or text document and attach it to the caller's next user
+turn on this workstream.
+
+- Images (png/jpeg/gif/webp) are capped at **4 MiB** and validated via
+  magic-byte sniff on upload.
+- Text documents (any `text/*` MIME, allow-listed application MIMEs, or
+  known text extensions) are capped at **512 KiB** and must be UTF-8.
+- Per-(workstream, user) pending cap is **10** attachments.
+
+The attachment moves through three states: `pending → reserved →
+consumed`.  Reservation tokens are threaded through
+`POST /v1/api/send` so a queued multimodal turn cannot lose its file to
+an overlapping send.
+
+Ownership failures are masked as `404` so non-owners cannot enumerate
+workstream existence.
+
+**Content-Type:** `multipart/form-data` with a single `file` field.
+
+**Response (success):** `200`
+
+```json
+{
+  "attachment_id": "att_abc123",
+  "kind": "image",
+  "mime_type": "image/png",
+  "size_bytes": 73240,
+  "filename": "screenshot.png",
+  "state": "pending"
+}
+```
+
+**Errors:**
+
+| Code | Meaning                                                 |
+|------|---------------------------------------------------------|
+| 400  | Missing/invalid form, unsupported MIME, not UTF-8, etc. |
+| 403  | Auth/scope failure                                      |
+| 404  | Workstream not found / not owned by caller              |
+| 409  | Pending-cap reached                                     |
+| 413  | Payload exceeds size cap                                |
+
+---
+
+### `GET /v1/api/workstreams/{ws_id}/attachments`
+
+List the caller's **pending** (unconsumed) attachments for this
+workstream.  Ownership failures are masked as `404`.
+
+**Response:** `200`
+
+```json
+{
+  "attachments": [
+    {
+      "attachment_id": "att_abc123",
+      "kind": "image",
+      "mime_type": "image/png",
+      "size_bytes": 73240,
+      "filename": "screenshot.png",
+      "state": "pending"
+    }
+  ]
+}
+```
+
+---
+
+### `GET /v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content`
+
+Returns the raw bytes of an attachment with its stored `Content-Type`.
+Useful for previewing an image or replaying a document.  Ownership
+failures are masked as `404`.
+
+**Response:** `200` — binary body, original `Content-Type`.
+
+---
+
+### `DELETE /v1/api/workstreams/{ws_id}/attachments/{attachment_id}`
+
+Remove a pending attachment.  Consumed attachments return `404` (they
+are part of a committed conversation turn).  Ownership failures are also
+masked as `404`.
+
+**Response:** `200`
+
+```json
+{"deleted": "att_abc123"}
+```
 
 ---
 

@@ -7,24 +7,29 @@ platform-native events (messages, button clicks, slash commands) into
 turnstone API calls, and renders workstream output back into the
 platform's UI.
 
-Discord ships as the first adapter. The adapter protocol is designed for
-future Slack and Teams integrations.
+Discord and Slack adapters ship today. The adapter protocol is designed
+so new platforms can be added with only a new package under
+`turnstone/channels/<platform>/`.
 
 ---
 
 ## Architecture
 
 ```
-Discord Gateway
-      |
-      v
-turnstone-channel  (Discord adapter)
-      |
-      v
-turnstone-server   (direct HTTP)
-      or
-turnstone-console  (routing proxy, multi-node)
+Discord Gateway        Slack (Socket Mode WebSocket)
+       \                  /
+        v                v
+       turnstone-channel  (one or more adapters)
+              |
+              v
+       turnstone-server   (direct HTTP)
+              or
+       turnstone-console  (routing proxy, multi-node)
 ```
+
+A single `turnstone-channel` process can run multiple adapters
+simultaneously (e.g. Discord + Slack) — pass the tokens for each
+platform you want to enable.
 
 Key components:
 
@@ -120,6 +125,68 @@ An admin can also force-link or unlink users via the console admin panel
 
 ---
 
+## Slack Setup
+
+Slack uses **Socket Mode**, so no public URL or API Gateway is required — Slack
+connects outbound to the bot via a WebSocket. Install with:
+
+```bash
+pip install 'turnstone[slack]'
+```
+
+### 1. Create a Slack App
+
+1. Go to https://api.slack.com/apps and click **Create New App**
+2. Under **Settings > Socket Mode**, enable Socket Mode. This generates an
+   **App-Level Token** (prefix `xapp-`) — copy it.
+3. Under **OAuth & Permissions**, add these **Bot Token Scopes**:
+   `chat:write`, `chat:write.public`, `channels:history`, `im:history`,
+   `groups:history`, `mpim:history`, `reactions:write`, `commands`
+4. Under **Event Subscriptions** (Socket Mode delivers events), subscribe
+   to bot events: `message.channels`, `message.im`, `message.groups`
+5. Under **Slash Commands**, create a command (default `/turnstone`)
+6. Install the app to your workspace to generate the **Bot User OAuth
+   Token** (prefix `xoxb-`).
+
+### 2. Configure Turnstone
+
+**Environment variables** (recommended for Docker):
+
+```bash
+TURNSTONE_SLACK_TOKEN=xoxb-...        # Bot User OAuth Token
+TURNSTONE_SLACK_APP_TOKEN=xapp-...    # App-Level Token (Socket Mode)
+TURNSTONE_SLACK_CHANNELS=             # optional, comma-separated channel IDs
+TURNSTONE_SLACK_SLASH_COMMAND=/turnstone
+```
+
+**CLI flags** (bare-metal):
+
+```bash
+turnstone-channel \
+  --slack-token "xoxb-..." \
+  --slack-app-token "xapp-..." \
+  --slack-slash-command /turnstone \
+  --server-url http://localhost:8080
+```
+
+The Slack and Discord adapters can be enabled together — pass tokens for
+both and the gateway hosts both adapters in one process.
+
+### 3. Usage
+
+- **DM the bot**: messages sent directly to the bot create a workstream
+  scoped to that DM; the slash command is not required.
+- **Slash command**: `/turnstone <message>` in any channel the bot can
+  see starts a per-user channel session.
+- Tool approvals render as Slack **Block Kit** buttons; only the user
+  who owns the workstream can approve/reject.
+- Plan reviews render as a modal with approve / request-changes actions.
+- Notifications and reply routing work identically to Discord.
+- Session recovery: persisted channel routes are re-subscribed when the
+  bot restarts, so existing Slack conversations keep flowing.
+
+---
+
 ## Usage
 
 ### Conversations
@@ -184,9 +251,13 @@ Plan review requests are displayed as a blue embed with:
 
 | CLI Flag | Env Var | Default | Description |
 |----------|---------|---------|-------------|
-| `--discord-token` | `TURNSTONE_DISCORD_TOKEN` | — | Bot token (required to enable Discord) |
+| `--discord-token` | `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord) |
 | `--discord-guild` | — | `0` (all guilds) | Restrict to a single Discord guild |
-| `--discord-channels` | — | empty (all) | Comma-separated channel IDs to allow |
+| `--discord-channels` | — | empty (all) | Comma-separated Discord channel IDs to allow |
+| `--slack-token` | `TURNSTONE_SLACK_TOKEN` | — | Slack Bot User OAuth token (`xoxb-…`, required to enable Slack) |
+| `--slack-app-token` | `TURNSTONE_SLACK_APP_TOKEN` | — | Slack App-Level token (`xapp-…`, required with `--slack-token`) |
+| `--slack-channels` | `TURNSTONE_SLACK_CHANNELS` | empty (all) | Comma-separated Slack channel IDs to allow |
+| `--slack-slash-command` | `TURNSTONE_SLACK_SLASH_COMMAND` | `/turnstone` | Slash command name registered in the Slack app |
 | `--server-url` | `TURNSTONE_SERVER_URL` | `http://localhost:8080` | Server URL (single-node) |
 | `--console-url` | `TURNSTONE_CONSOLE_URL` | — | Console URL (multi-node routing proxy) |
 | `--model` | — | server default | Default model for new workstreams |
@@ -195,6 +266,9 @@ Plan review requests are displayed as a blue embed with:
 | `--http-port` | `TURNSTONE_CHANNEL_PORT` | `8091` | HTTP server port |
 | `--log-level` | `TURNSTONE_LOG_LEVEL` | `INFO` | Log level |
 | `--log-format` | `TURNSTONE_LOG_FORMAT` | `auto` | Log format (`auto`/`json`/`text`) |
+
+At least one of `--discord-token` or `--slack-token` must be supplied.
+Passing both starts both adapters in the same process.
 
 ---
 
@@ -249,8 +323,8 @@ waiting for them to check in.
 Two modes:
 
 - **Username** — provide a turnstone `username`. The gateway resolves
-  it via the `channel_users` table and sends to all linked channels
-  (e.g. Discord + future Slack).
+  it via the `channel_users` table and sends to every linked platform
+  the user has (e.g. Discord + Slack).
 - **Direct** — provide `channel_type` + `channel_id` to target a
   specific platform channel or user DM.
 

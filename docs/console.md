@@ -396,10 +396,19 @@ The browser maintains a local `clusterState` object that mirrors the cluster sna
 
 Accessed via the "admin" button in the header (visible when authenticated
 with `approve` scope). Provides user, API token, channel link, MCP server,
-and skill management with 13 tabs (see also
-[Governance](governance.md) for
-the Roles, Policies, Skills, Usage, and Audit tabs, and
-[Settings](settings.md) for the database-backed configuration editor):
+and skill management with 18 tabs (Users, API Tokens, Channels, Schedules,
+Watches, Roles, Policies, Prompts, Judge, Skills, MCP Servers, Usage,
+Audit, Memories, Models, Nodes, Settings, TLS).  See also
+[Governance](governance.md) for the Roles, Policies, Skills, Usage, and
+Audit tabs, and [Settings](settings.md) for the database-backed
+configuration editor.
+
+The **Channels** tab links users to either a Discord or Slack account
+via a per-row channel-type selector.  The **Models** tab is a CRUD
+editor for `model_definitions`, the **Nodes** tab edits per-node
+metadata, and the **TLS** tab manages CA and leaf certificates for the
+internal mTLS fabric.  The **Settings** tab edits ConfigStore values
+live; edits apply without restart.
 
 **Users tab:**
 
