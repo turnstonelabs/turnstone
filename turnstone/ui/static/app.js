@@ -1067,13 +1067,14 @@ Pane.prototype._dequeueMessage = function (el) {
     .then(function (data) {
       if (data.status === "removed") {
         el.remove();
-        // The queued message had its attachments reserved; dequeue
-        // releases the reservation server-side, so refresh the chip
-        // strip to show them as available again.
-        self.rehydrateAttachments();
       }
-      // "not_found" means already injected — leave the message visible.
-      // The promote loop will strip the queued styling on idle.
+      // Either path warrants a chip-strip refresh: a successful remove
+      // unreserves the attachments server-side, and a "not_found" means
+      // dispatch raced us so the actual pending state may differ from
+      // what the UI last saw.  Re-fetch to stay in sync.  (Leave the
+      // message bubble visible on not_found — the promote loop strips
+      // the queued styling on idle.)
+      self.rehydrateAttachments();
     })
     .catch(function () {
       // Network error — don't remove, message may have been injected
