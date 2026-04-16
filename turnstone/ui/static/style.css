@@ -1625,11 +1625,35 @@ audio.media-player {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
 }
+.dashboard-composer {
+  position: relative;
+}
 .dashboard-composer-drop {
   border-style: dashed;
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-glow-strong);
   background: var(--accent-glow);
+}
+/* Drag-over affordance — make the action explicit so users know what
+   dropping does.  Pseudo-element so the markup stays clean; the inner
+   composer controls remain interactive. */
+.dashboard-composer-drop::before {
+  content: "Drop to attach";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  background: var(--bg-surface);
+  opacity: 0.92;
+  border-radius: var(--radius);
+  pointer-events: none;
+  z-index: 1;
 }
 .dashboard-input {
   background: transparent;
@@ -1667,6 +1691,27 @@ audio.media-player {
 .dashboard-options-btn[aria-expanded="true"] .dashboard-options-caret {
   transform: rotate(180deg);
   display: inline-block;
+}
+/* Inline summary of non-default options so users see at a glance which
+   defaults they've overridden, without having to expand the panel.
+   Hidden via [hidden] when everything is default. */
+.dashboard-options-summary {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 2px 6px;
+  border-left: 1px solid var(--border-strong);
+  margin-left: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 280px;
+}
+.dashboard-options-summary[hidden] { display: none; }
+@media (max-width: 600px) {
+  /* On phones the action row stacks; the summary hides to keep the
+     row compact — power users on mobile can expand the panel itself. */
+  .dashboard-options-summary { display: none; }
 }
 .dashboard-composer-row {
   display: flex;

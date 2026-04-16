@@ -3721,6 +3721,8 @@ function showDashboard() {
   document.getElementById("split-root").inert = true;
   loadDashboard();
   _loadDashboardOptionsLists();
+  _restoreDashboardOptionsState();
+  _refreshDashboardOptionsSummary();
   _refreshDashboardSubmitLabel();
   setTimeout(function () {
     document.getElementById("dashboard-input").focus();
@@ -4667,18 +4669,69 @@ function _loadDashboardOptionsLists() {
   }
 }
 
-function _toggleDashboardOptions() {
+// localStorage key for the dashboard composer's Options-panel disclosure
+// state — power users who set non-default model/skill repeatedly want the
+// panel to stay open across reloads instead of clicking it every time.
+var _DASH_OPTIONS_LS_KEY = "turnstone.dashboard.options_open";
+
+function _setDashboardOptionsOpen(open) {
   var panel = document.getElementById("dashboard-options");
   var btn = document.getElementById("dashboard-options-btn");
   if (!panel || !btn) return;
-  var open = !panel.hasAttribute("hidden");
   if (open) {
-    panel.setAttribute("hidden", "");
-    btn.setAttribute("aria-expanded", "false");
-  } else {
     panel.removeAttribute("hidden");
     btn.setAttribute("aria-expanded", "true");
+  } else {
+    panel.setAttribute("hidden", "");
+    btn.setAttribute("aria-expanded", "false");
   }
+}
+
+function _toggleDashboardOptions() {
+  var panel = document.getElementById("dashboard-options");
+  if (!panel) return;
+  var nextOpen = panel.hasAttribute("hidden");
+  _setDashboardOptionsOpen(nextOpen);
+  try {
+    localStorage.setItem(_DASH_OPTIONS_LS_KEY, nextOpen ? "1" : "0");
+  } catch (_) {
+    /* localStorage may be unavailable (private mode, quota) — fall back to
+       per-session state, which is what we already have. */
+  }
+}
+
+function _restoreDashboardOptionsState() {
+  // Default closed when never set; non-power users get the cleaner first view.
+  var saved = null;
+  try {
+    saved = localStorage.getItem(_DASH_OPTIONS_LS_KEY);
+  } catch (_) {
+    /* unavailable */
+  }
+  _setDashboardOptionsOpen(saved === "1");
+}
+
+// Update the inline summary chip beside the Options button when any of
+// model / judge_model / skill is non-default.  Helps users see at a
+// glance that they've overridden defaults — without having to expand
+// the panel.  Hidden when everything is default.
+function _refreshDashboardOptionsSummary() {
+  var summary = document.getElementById("dashboard-options-summary");
+  if (!summary) return;
+  var bits = [];
+  var modelSel = document.getElementById("dashboard-model");
+  var judgeSel = document.getElementById("dashboard-judge-model");
+  var skillSel = document.getElementById("dashboard-skill");
+  if (modelSel && modelSel.value) bits.push(modelSel.value);
+  if (judgeSel && judgeSel.value) bits.push("judge: " + judgeSel.value);
+  if (skillSel && skillSel.value) bits.push(skillSel.value);
+  if (bits.length === 0) {
+    summary.textContent = "";
+    summary.setAttribute("hidden", "");
+    return;
+  }
+  summary.textContent = bits.join(" · ");
+  summary.removeAttribute("hidden");
 }
 
 // Unified dashboard submit. Replaces the old "click button → modal" +
@@ -5655,6 +5708,13 @@ document
   }
   if (optionsBtn) {
     optionsBtn.addEventListener("click", _toggleDashboardOptions);
+  }
+  // Keep the inline summary chip in sync with whichever non-default
+  // model / judge / skill is selected.  Listening on the options panel
+  // catches all three selects with one handler.
+  var optionsPanel = document.getElementById("dashboard-options");
+  if (optionsPanel) {
+    optionsPanel.addEventListener("change", _refreshDashboardOptionsSummary);
   }
   if (composer) {
     composer.addEventListener("dragover", function (e) {
