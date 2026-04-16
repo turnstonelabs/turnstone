@@ -77,9 +77,14 @@ def _make_bot() -> tuple[object, MagicMock, MagicMock]:
     client.conversations_history = AsyncMock(return_value={"ok": True, "messages": []})
     client.views_open = AsyncMock(return_value={"ok": True})
 
+    # Patch httpx.AsyncClient so each test doesn't open a real client that
+    # leaks an unclosed-warning at GC time.  The bot's _http_client is only
+    # used by the SDK router (which we replace with a MagicMock below), so
+    # an AsyncMock standin is enough for every test that uses this factory.
     with (
         patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
         patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
+        patch("turnstone.channels.slack.bot.httpx.AsyncClient", return_value=AsyncMock()),
     ):
         bot = TurnstoneSlackBot(
             config,
@@ -193,10 +198,27 @@ class TestPreviewSanitization:
         text = "<@U123>`abc`" + ("x" * 2000)
         out = _sanitize_slack_preview(text, max_length=50)
 
+        # Mention markup is escaped so it can't render as a real ping
         assert "&lt;@U123&gt;" in out
-        assert "`abc`" not in out
-        assert "\\`abc\\`" in out
+        # Single backticks survive — code-quoted snippets stay readable
+        assert "`abc`" in out
         assert len(out) <= 50
+
+    def test_sanitize_slack_preview_neutralizes_triple_backtick(self) -> None:
+        """Triple backticks would close the surrounding mrkdwn fence — splice
+        a zero-width space inside so Slack no longer recognizes it as a
+        delimiter."""
+        from turnstone.channels.slack.bot import _sanitize_slack_preview
+
+        out = _sanitize_slack_preview("inner ``` text", max_length=200)
+        assert "```" not in out
+        assert "``\u200b`" in out
+
+    def test_sanitize_slack_preview_keeps_short_input(self) -> None:
+        from turnstone.channels.slack.bot import _sanitize_slack_preview
+
+        out = _sanitize_slack_preview("short and clean", max_length=200)
+        assert out == "short and clean"
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +568,10 @@ class TestWsEventDispatch:
         with (
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
+            patch(
+                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                return_value=AsyncMock(),
+            ),
         ):
             bot = TurnstoneSlackBot(
                 config,
@@ -622,13 +648,19 @@ class TestWsEventDispatch:
         with (
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient", return_value=client),
+            patch(
+                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                return_value=AsyncMock(),
+            ),
         ):
             bot = TurnstoneSlackBot(config, server_url="http://localhost:8080", storage=storage)
         bot.router = router  # type: ignore[attr-defined]
         bot._client = client  # type: ignore[attr-defined]
         bot.storage = None  # type: ignore[attr-defined]
 
-        event = ApproveRequestEvent(ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}])
+        event = ApproveRequestEvent(
+            ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}]
+        )
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
         _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
 
@@ -640,7 +672,9 @@ class TestWsEventDispatch:
 
         bot, client = self._make_ws_bot()
 
-        event = ApproveRequestEvent(ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}])
+        event = ApproveRequestEvent(
+            ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}]
+        )
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
         _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
 
@@ -732,11 +766,7 @@ class TestWsEventDispatch:
         view = {
             "private_metadata": "ws-1",
             "state": {
-                "values": {
-                    "feedback_block": {
-                        "feedback_input": {"value": "please revise step 2"}
-                    }
-                }
+                "values": {"feedback_block": {"feedback_input": {"value": "please revise step 2"}}}
             },
         }
 
@@ -768,6 +798,10 @@ class TestNotificationTracking:
         with (
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
+            patch(
+                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                return_value=AsyncMock(),
+            ),
         ):
             bot = TurnstoneSlackBot(config, server_url="http://localhost:8080", storage=storage)
 
@@ -785,6 +819,10 @@ class TestNotificationTracking:
         with (
             patch("turnstone.channels.slack.bot.AsyncApp", MagicMock()),
             patch("turnstone.channels.slack.bot.AsyncWebClient"),
+            patch(
+                "turnstone.channels.slack.bot.httpx.AsyncClient",
+                return_value=AsyncMock(),
+            ),
         ):
             bot = TurnstoneSlackBot(config, server_url="http://localhost:8080", storage=storage)
 
@@ -843,9 +881,7 @@ class TestNotificationTracking:
 class TestDmContinuity:
     def test_dm_messages_reuse_same_workstream(self) -> None:
         bot, router, _client = _make_bot()
-        router.get_or_create_workstream = AsyncMock(
-            side_effect=[("ws-dm", True), ("ws-dm", False)]
-        )
+        router.get_or_create_workstream = AsyncMock(side_effect=[("ws-dm", True), ("ws-dm", False)])
 
         event1 = _make_slack_event(
             channel="D12345",
@@ -900,7 +936,13 @@ class TestChannelCLI:
             patch.object(
                 sys,
                 "argv",
-                ["turnstone-channel", "--slack-token", "xoxb-test", "--server-url", "http://localhost:8080"],
+                [
+                    "turnstone-channel",
+                    "--slack-token",
+                    "xoxb-test",
+                    "--server-url",
+                    "http://localhost:8080",
+                ],
             ),
             patch.dict("os.environ", {}, clear=True),
             pytest.raises(SystemExit) as exc_info,
@@ -942,6 +984,7 @@ class TestChannelCLI:
             for aw in aws:
                 await aw
             return []
+
         storage = MagicMock()
         storage.register_service = MagicMock()
         storage.deregister_service = MagicMock()
@@ -962,7 +1005,9 @@ class TestChannelCLI:
             ),
             patch("turnstone.core.storage._registry.init_storage"),
             patch("turnstone.core.storage._registry.get_storage", return_value=storage),
-            patch("turnstone.channels._http.create_channel_app", side_effect=_fake_create_channel_app),
+            patch(
+                "turnstone.channels._http.create_channel_app", side_effect=_fake_create_channel_app
+            ),
             patch("turnstone.channels._http._get_service_id", return_value="channel-test"),
             patch("asyncio.gather", side_effect=_fake_gather),
             patch("uvicorn.Config", return_value=MagicMock()),
@@ -1037,7 +1082,9 @@ class TestChannelCLI:
             ),
             patch("turnstone.core.storage._registry.init_storage"),
             patch("turnstone.core.storage._registry.get_storage", return_value=storage),
-            patch("turnstone.channels._http.create_channel_app", side_effect=_fake_create_channel_app),
+            patch(
+                "turnstone.channels._http.create_channel_app", side_effect=_fake_create_channel_app
+            ),
             patch("turnstone.channels._http._get_service_id", return_value="channel-test"),
             patch("asyncio.gather", side_effect=_fake_gather),
             patch("uvicorn.Config", return_value=MagicMock()),
