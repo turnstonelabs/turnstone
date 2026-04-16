@@ -1619,14 +1619,13 @@ audio.media-player {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   padding: 10px;
+  /* position context for the .dashboard-composer-drop::before overlay */
+  position: relative;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 .dashboard-composer:focus-within {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-dim);
-}
-.dashboard-composer {
-  position: relative;
 }
 .dashboard-composer-drop {
   border-style: dashed;
