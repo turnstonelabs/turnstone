@@ -3192,10 +3192,62 @@ function _newWsRenderChips() {
   }
 }
 
-function _formatAttachSize(n) {
-  if (n < 1024) return n + " B";
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
-  return (n / (1024 * 1024)).toFixed(1) + " MB";
+// Mirrors turnstone/server.py classifier — magic-byte image allowlist plus
+// text/* MIMEs, allowlisted application/* MIMEs, and known text extensions.
+// Surfaces unsupported types client-side so the user sees a clear error
+// instead of a generic create failure after the server rejects.
+var _ATTACH_IMAGE_MIMES = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+];
+var _ATTACH_TEXT_APP_MIMES = [
+  "application/json",
+  "application/xml",
+  "application/x-yaml",
+  "application/yaml",
+  "application/toml",
+];
+var _ATTACH_TEXT_EXTENSIONS = [
+  ".c",
+  ".conf",
+  ".cpp",
+  ".css",
+  ".go",
+  ".h",
+  ".hpp",
+  ".html",
+  ".ini",
+  ".java",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".py",
+  ".rs",
+  ".sh",
+  ".sql",
+  ".toml",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".xml",
+  ".yaml",
+  ".yml",
+];
+
+function _isAttachmentAllowed(file) {
+  var mime = (file.type || "").toLowerCase();
+  if (_ATTACH_IMAGE_MIMES.indexOf(mime) !== -1) return true;
+  if (mime.indexOf("text/") === 0) return true;
+  if (_ATTACH_TEXT_APP_MIMES.indexOf(mime) !== -1) return true;
+  var name = (file.name || "").toLowerCase();
+  var dot = name.lastIndexOf(".");
+  if (dot >= 0 && _ATTACH_TEXT_EXTENSIONS.indexOf(name.substr(dot)) !== -1) {
+    return true;
+  }
+  return false;
 }
 
 function _newWsAddFiles(files) {
@@ -3205,6 +3257,14 @@ function _newWsAddFiles(files) {
     if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
       errEl.textContent =
         "At most " + _NEW_WS_MAX_FILES + " attachments per workstream";
+      errEl.style.display = "block";
+      return;
+    }
+    if (!_isAttachmentAllowed(f)) {
+      errEl.textContent =
+        "Unsupported file type: " +
+        f.name +
+        " (allowed: png/jpeg/gif/webp images, text)";
       errEl.style.display = "block";
       return;
     }
@@ -4499,6 +4559,16 @@ function _addDashboardFiles(files) {
       );
       return;
     }
+    // Drag-drop bypasses the <input accept="..."> filter, so re-check
+    // against the server's allowlist before the upload roundtrip.
+    if (!_isAttachmentAllowed(f)) {
+      _dashboardError(
+        "Unsupported file type: " +
+          f.name +
+          " (allowed: png/jpeg/gif/webp images, text)",
+      );
+      return;
+    }
     var isImage = (f.type || "").indexOf("image/") === 0;
     var cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
     if (f.size > cap) {
@@ -4675,7 +4745,13 @@ function dashboardSubmit() {
     .catch(function (err) {
       input.disabled = false;
       btn.disabled = false;
-      _dashboardError("Connection error: " + (err && err.message));
+      // authFetch throws Error("auth") when the user is signed out and the
+      // login modal has already been surfaced; suppress the redundant
+      // error toast in that case.  Otherwise fall back to a generic
+      // string so we never render "Connection error: undefined".
+      if (err && err.message === "auth") return;
+      var detail = (err && err.message) || "Unable to reach the server";
+      _dashboardError("Connection error: " + detail);
     });
 }
 

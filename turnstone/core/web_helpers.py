@@ -54,8 +54,9 @@ async def read_multipart_create_or_400(
     ``JSONResponse`` (400/413) on failure.
 
     Enforces a cheap ``Content-Length`` pre-check against *max_total_bytes*
-    when the header is sensible.  Per-file size is not enforced here — the
-    caller classifies each file and applies the kind-specific cap.
+    when the header is sensible, and (when ``max_per_file_bytes`` is set) a
+    generic per-file cap as a defense-in-depth gate.  The caller still
+    classifies each file and applies any kind-specific cap on top.
     """
     from starlette.datastructures import UploadFile
     from starlette.responses import JSONResponse as _JSONResponse

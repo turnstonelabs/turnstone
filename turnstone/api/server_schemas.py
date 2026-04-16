@@ -26,7 +26,35 @@ class SendRequest(BaseModel):
 
 
 class SendResponse(BaseModel):
-    status: str = Field(description="'ok' or 'busy'", examples=["ok", "busy"])
+    status: str = Field(
+        description="'ok', 'busy', 'queued', or 'queue_full'",
+        examples=["ok", "busy", "queued", "queue_full"],
+    )
+    attached_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids actually reserved onto this turn. Subset of "
+            "the request's `attachment_ids` (or the auto-consumed pending "
+            "set). Empty when the send carries no attachments."
+        ),
+    )
+    dropped_attachment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Attachment ids the caller requested that the server could "
+            "not reserve (lost a race, already consumed, or cross-scope). "
+            "The request still proceeds with whatever was reserved; the "
+            "client can retry uploads or surface a partial-attach warning."
+        ),
+    )
+    priority: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: relative priority of the queued message.",
+    )
+    msg_id: str | None = Field(
+        default=None,
+        description="Set on `queued` responses: id used to dequeue the message.",
+    )
 
 
 class AttachmentInfo(BaseModel):

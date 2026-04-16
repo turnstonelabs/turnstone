@@ -254,19 +254,19 @@ class _FakeUI:
 @pytest.fixture
 def app_client(tmp_path, monkeypatch):
     """End-to-end app with a fake session factory + WorkstreamManager."""
-    import turnstone.server as srv_mod
     from turnstone.core.metrics import MetricsCollector
     from turnstone.core.storage import init_storage, reset_storage
     from turnstone.core.workstream import WorkstreamManager
+    from turnstone.server import create_app
 
     reset_storage()
     init_storage("sqlite", path=str(tmp_path / "t.db"), run_migrations=False)
 
-    srv_mod._metrics = MetricsCollector()
-    srv_mod._metrics.model = "test-model"
-
+    metrics = MetricsCollector()
+    metrics.model = "test-model"
+    monkeypatch.setattr("turnstone.server._metrics", metrics)
     # Replace WebUI with our fake so the create handler's isinstance check passes.
-    monkeypatch.setattr(srv_mod, "WebUI", _FakeUI)
+    monkeypatch.setattr("turnstone.server.WebUI", _FakeUI)
 
     fake_sessions: list[_FakeSession] = []
 
@@ -281,7 +281,7 @@ def app_client(tmp_path, monkeypatch):
     mgr = WorkstreamManager(_factory, max_workstreams=10, node_id="node-test")
 
     gq: queue.Queue[dict] = queue.Queue()
-    app = srv_mod.create_app(
+    app = create_app(
         workstreams=mgr,
         global_queue=gq,
         global_listeners=[],

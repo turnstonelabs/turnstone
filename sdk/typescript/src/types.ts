@@ -59,9 +59,23 @@ export interface SendRequest {
 }
 
 export interface SendResponse {
+  /** "ok" | "busy" | "queued" | "queue_full". */
   status: string;
+  /**
+   * Attachment ids actually reserved onto this turn. Subset of the
+   * request's `attachment_ids` (or the auto-consumed pending set).
+   */
   attached_ids?: string[];
+  /**
+   * Attachment ids the caller requested that the server could not
+   * reserve (lost a race, already consumed, or cross-scope). The
+   * request still proceeds with whatever was reserved.
+   */
   dropped_attachment_ids?: string[];
+  /** Set on "queued" responses: relative priority of the queued message. */
+  priority?: string | null;
+  /** Set on "queued" responses: id used to dequeue the message. */
+  msg_id?: string | null;
 }
 
 // ---------------------------------------------------------------------------
