@@ -39,7 +39,7 @@
 # supports_web_search = false
 #
 # [models.claude]
-# name = "claude-opus-4-6"
+# name = "claude-opus-4-7"
 # provider = "anthropic"
 
 # --- Database (turnstone, node, console) ---

@@ -1246,6 +1246,31 @@ class TestAnthropicHelpers:
         assert caps.token_param == "max_tokens"
         assert caps.thinking_mode == "adaptive"
 
+    def test_capabilities_opus_4_7(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-7")
+        assert caps.context_window == 1000000
+        assert caps.max_output_tokens == 128000
+        assert caps.thinking_mode == "adaptive"
+        assert caps.supports_effort is True
+        assert "xhigh" in caps.effort_levels
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+        assert caps.supports_web_search is True
+        assert caps.supports_tool_search is True
+        assert caps.supports_vision is True
+
+    def test_capabilities_opus_4_7_dated(self) -> None:
+        from turnstone.core.providers._anthropic import AnthropicProvider
+
+        provider = AnthropicProvider()
+        caps = provider.get_capabilities("claude-opus-4-7-20260416")
+        assert caps.context_window == 1000000
+        assert caps.supports_temperature is False
+        assert caps.thinking_display == "summarized"
+
     def test_capabilities_lookup_unknown(self) -> None:
         from turnstone.core.providers._anthropic import AnthropicProvider
 
@@ -1955,6 +1980,18 @@ class TestAnthropicReasoningNone:
         result = self.provider._reasoning_params("low", None, max_tokens=4096)
         assert "thinking" in result
         assert result["thinking"]["budget_tokens"] == 1024
+
+    def test_map_xhigh_effort(self) -> None:
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "xhigh", "max"))
+        assert result == "xhigh"
+
+    def test_map_xhigh_rejected_by_model_without_it(self) -> None:
+        from turnstone.core.providers._anthropic import _map_reasoning_to_effort
+
+        result = _map_reasoning_to_effort("xhigh", ("low", "medium", "high", "max"))
+        assert result is None
 
 
 # ===========================================================================
@@ -3113,6 +3150,103 @@ class TestAnthropicPromptCaching:
         )
         assert "cache_control" in kwargs
         assert kwargs["cache_control"] == {"type": "ephemeral"}
+
+    def test_opus_4_7_no_temperature_in_kwargs(self) -> None:
+        """Opus 4.7 rejects temperature — must not appear in kwargs."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert "temperature" not in kwargs
+
+    def test_opus_4_6_still_has_temperature(self) -> None:
+        """Opus 4.6 must still send temperature (regression guard)."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-6",
+            tools=None,
+        )
+        assert "temperature" in kwargs
+        assert kwargs["temperature"] == 1.0  # forced for adaptive thinking
+
+    def test_opus_4_7_thinking_display_summarized(self) -> None:
+        """Opus 4.7 must opt in to thinking display with 'summarized'."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+    def test_opus_4_6_thinking_no_display(self) -> None:
+        """Opus 4.6 adaptive thinking should not include display key."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="high",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-6",
+            tools=None,
+        )
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    def test_opus_4_7_xhigh_effort(self) -> None:
+        """Opus 4.7 xhigh effort passes through to output_config."""
+        caps = self.provider.get_capabilities("claude-opus-4-7")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="xhigh",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-7",
+            tools=None,
+        )
+        assert kwargs["output_config"] == {"effort": "xhigh"}
+
+    def test_xhigh_effort_not_applied_to_opus_4_6(self) -> None:
+        """xhigh is not a valid effort level for Opus 4.6 — should be ignored."""
+        caps = self.provider.get_capabilities("claude-opus-4-6")
+        kwargs = self.provider._build_thinking_and_kwargs(
+            caps=caps,
+            reasoning_effort="xhigh",
+            extra_params=None,
+            max_tokens=8192,
+            temperature=0.5,
+            converted_msgs=[{"role": "user", "content": "hi"}],
+            system_prompt="",
+            model="claude-opus-4-6",
+            tools=None,
+        )
+        assert "output_config" not in kwargs
 
     @patch("turnstone.core.providers._anthropic._ensure_anthropic")
     def test_streaming_message_start_cache_metrics(self, mock_ensure: MagicMock) -> None:
