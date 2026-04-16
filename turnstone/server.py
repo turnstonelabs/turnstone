@@ -76,11 +76,13 @@ _VALID_WS_ID = re.compile(r"^[0-9a-f]{32}$")
 
 _MAX_TURN_CONTENT_CHARS = 256 * 1024  # cap piggybacked content on idle events
 
-# Orphan-attachment-reservation sweep cadence.  Threshold is comfortably
-# longer than any realistic single send so we don't race a long-running
-# dispatch and unreserve rows the worker is still about to consume.
+# Orphan-attachment-reservation sweep cadence.  Threshold is measured
+# against the storage layer's `reserved_at` column (time the row last
+# transitioned into reserved state, NOT upload time), so a 1-hour cap
+# is safely longer than any realistic single send without risking the
+# unreservation of attachments uploaded long ago but reserved fresh.
 _ORPHAN_SWEEP_INTERVAL_S = 30 * 60
-_ORPHAN_SWEEP_THRESHOLD_S = 4 * 3600
+_ORPHAN_SWEEP_THRESHOLD_S = 1 * 3600
 
 
 class WebUI:

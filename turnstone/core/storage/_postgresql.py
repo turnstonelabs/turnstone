@@ -669,7 +669,11 @@ class PostgreSQLBackend:
             conn.execute(
                 sa.update(workstream_attachments)
                 .where(predicate)
-                .values(message_id=message_id, reserved_for_msg_id=None)
+                .values(
+                    message_id=message_id,
+                    reserved_for_msg_id=None,
+                    reserved_at=None,
+                )
             )
             conn.commit()
 
@@ -682,6 +686,7 @@ class PostgreSQLBackend:
     ) -> list[str]:
         if not attachment_ids or not queue_msg_id:
             return []
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
             conn.execute(
                 sa.update(workstream_attachments)
@@ -694,7 +699,7 @@ class PostgreSQLBackend:
                         workstream_attachments.c.reserved_for_msg_id.is_(None),
                     )
                 )
-                .values(reserved_for_msg_id=queue_msg_id)
+                .values(reserved_for_msg_id=queue_msg_id, reserved_at=now)
             )
             rows = conn.execute(
                 sa.select(workstream_attachments.c.attachment_id).where(
@@ -722,7 +727,7 @@ class PostgreSQLBackend:
                         workstream_attachments.c.reserved_for_msg_id == queue_msg_id,
                     )
                 )
-                .values(reserved_for_msg_id=None)
+                .values(reserved_for_msg_id=None, reserved_at=None)
             )
             conn.commit()
 
@@ -739,10 +744,11 @@ class PostgreSQLBackend:
                     sa.and_(
                         workstream_attachments.c.reserved_for_msg_id.is_not(None),
                         workstream_attachments.c.message_id.is_(None),
-                        workstream_attachments.c.created < cutoff,
+                        workstream_attachments.c.reserved_at.is_not(None),
+                        workstream_attachments.c.reserved_at < cutoff,
                     )
                 )
-                .values(reserved_for_msg_id=None)
+                .values(reserved_for_msg_id=None, reserved_at=None)
             )
             conn.commit()
             return int(result.rowcount or 0)

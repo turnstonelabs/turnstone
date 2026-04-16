@@ -152,15 +152,15 @@ class StorageBackend(Protocol):
         """Clear ``reserved_for_msg_id`` on stale reservations.
 
         Targets rows with ``reserved_for_msg_id IS NOT NULL`` AND
-        ``message_id IS NULL`` AND ``created`` older than the cutoff.
+        ``message_id IS NULL`` AND ``reserved_at`` older than the cutoff.
         Self-heals reservations leaked by process crashes between
         ``reserve_attachments`` and ``mark_attachments_consumed`` /
         ``unreserve_attachments``.
 
-        ``created`` is used as the staleness proxy because we don't
-        track a separate ``reserved_at`` timestamp; pick a threshold
-        comfortably longer than any expected send duration to avoid
-        racing a long-running dispatch.  Returns the row count swept.
+        Uses ``reserved_at`` (set on reserve, cleared on consume /
+        unreserve) rather than ``created`` (upload time) so an attachment
+        that sat pending for hours before being reserved is not
+        mistakenly unreserved mid-send.  Returns the row count swept.
         """
         ...
 

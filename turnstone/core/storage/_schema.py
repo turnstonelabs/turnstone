@@ -431,6 +431,11 @@ workstream_attachments = sa.Table(
     #   reserved : message_id IS NULL  AND  reserved_for_msg_id = <queue-msg-id>
     #   consumed : message_id IS NOT NULL  (reservation cleared on transition)
     sa.Column("reserved_for_msg_id", sa.Text, nullable=True),
+    # When the row last transitioned into reserved state.  Cleared on
+    # consume / unreserve.  Set independently of `created` (upload time)
+    # so the orphan-reservation sweep can target only reservations that
+    # have actually been held longer than the threshold.
+    sa.Column("reserved_at", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
 )
 
@@ -447,6 +452,14 @@ sa.Index(
     workstream_attachments.c.ws_id,
     workstream_attachments.c.user_id,
     workstream_attachments.c.reserved_for_msg_id,
+)
+# Partial index — only reserved rows participate, so the sweep scan
+# stays cheap as the consumed-history grows.
+sa.Index(
+    "idx_ws_attachments_reserved_at",
+    workstream_attachments.c.reserved_at,
+    sqlite_where=workstream_attachments.c.reserved_at.is_not(None),
+    postgresql_where=workstream_attachments.c.reserved_at.is_not(None),
 )
 
 # ---------------------------------------------------------------------------
