@@ -92,6 +92,11 @@ export interface PlanReviewEvent {
   content: string;
 }
 
+export interface PlanResolvedEvent {
+  type: "plan_resolved";
+  feedback: string;
+}
+
 export interface InfoEvent {
   type: "info";
   message: string;
@@ -165,6 +170,7 @@ export type ServerEvent =
   | ToolOutputChunkEvent
   | StatusEvent
   | PlanReviewEvent
+  | PlanResolvedEvent
   | InfoEvent
   | ErrorEvent
   | BusyErrorEvent
@@ -281,6 +287,10 @@ export function isApprovalResolvedEvent(
 
 export function isPlanReviewEvent(e: ServerEvent): e is PlanReviewEvent {
   return e.type === "plan_review";
+}
+
+export function isPlanResolvedEvent(e: ServerEvent): e is PlanResolvedEvent {
+  return e.type === "plan_resolved";
 }
 
 export function isCancelledEvent(e: ServerEvent): e is CancelledEvent {

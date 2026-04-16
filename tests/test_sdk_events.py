@@ -17,6 +17,7 @@ from turnstone.sdk.events import (
     InfoEvent,
     NodeJoinedEvent,
     NodeLostEvent,
+    PlanResolvedEvent,
     PlanReviewEvent,
     ReasoningEvent,
     ServerEvent,
@@ -141,6 +142,12 @@ def test_plan_review_event():
     e = ServerEvent.from_dict({"type": "plan_review", "content": "## Plan\n1. Do X"})
     assert isinstance(e, PlanReviewEvent)
     assert "Plan" in e.content
+
+
+def test_plan_resolved_event():
+    e = ServerEvent.from_dict({"type": "plan_resolved", "feedback": "approved"})
+    assert isinstance(e, PlanResolvedEvent)
+    assert e.feedback == "approved"
 
 
 def test_info_event():

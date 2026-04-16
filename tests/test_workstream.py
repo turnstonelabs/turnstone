@@ -751,6 +751,53 @@ class TestWebUI:
         ui.resolve_plan("ok")
         assert ui._pending_plan_review is None
 
+    def test_resolve_plan_broadcasts_plan_resolved(self):
+        """resolve_plan emits a plan_resolved SSE so other clients dismiss.
+
+        Also verifies _pending_plan_review is cleared BEFORE the event is
+        enqueued, so a reconnecting client cannot get both the replayed
+        plan_review and the live plan_resolved.
+        """
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test")
+        ui._pending_plan_review = {"type": "plan_review", "content": "x"}
+        listener = ui._register_listener()
+        try:
+            ui.resolve_plan("approved")
+            events = []
+            while not listener.empty():
+                events.append(listener.get_nowait())
+        finally:
+            ui._unregister_listener(listener)
+
+        resolved = [e for e in events if e.get("type") == "plan_resolved"]
+        assert len(resolved) == 1
+        assert resolved[0]["feedback"] == "approved"
+        # Critical ordering invariant: pending cleared before broadcast.
+        assert ui._pending_plan_review is None
+
+    def test_resolve_plan_skips_broadcast_when_no_plan_pending(self):
+        """cancel_generation calls resolve_plan unconditionally — don't
+        emit a stray plan_resolved frame when no modal was ever shown."""
+        from turnstone.server import WebUI
+
+        ui = WebUI(ws_id="test")
+        assert ui._pending_plan_review is None
+        listener = ui._register_listener()
+        try:
+            ui.resolve_plan("reject")  # cancel path with no pending plan
+            events = []
+            while not listener.empty():
+                events.append(listener.get_nowait())
+        finally:
+            ui._unregister_listener(listener)
+
+        assert not [e for e in events if e.get("type") == "plan_resolved"]
+        # Wait must still unblock so the worker thread can return.
+        assert ui._plan_event.is_set()
+        assert ui._plan_result == "reject"
+
 
 # ---------------------------------------------------------------------------
 # WebUI SSE fan-out
