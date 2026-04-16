@@ -3721,6 +3721,8 @@ function showDashboard() {
   document.getElementById("split-root").inert = true;
   loadDashboard();
   _loadDashboardOptionsLists();
+  _restoreDashboardOptionsState();
+  _refreshDashboardOptionsSummary();
   _refreshDashboardSubmitLabel();
   setTimeout(function () {
     document.getElementById("dashboard-input").focus();
@@ -4667,18 +4669,86 @@ function _loadDashboardOptionsLists() {
   }
 }
 
-function _toggleDashboardOptions() {
+// localStorage key for the dashboard composer's Options-panel disclosure
+// state — power users who set non-default model/skill repeatedly want the
+// panel to stay open across reloads instead of clicking it every time.
+var _DASH_OPTIONS_LS_KEY = "turnstone.dashboard.options_open";
+// In-memory fallback for environments where localStorage throws (private
+// mode, storage quota, embedded WebViews).  null means "no preference
+// recorded this session yet — use the closed default".
+var _dashOptionsOpenSession = null;
+
+function _setDashboardOptionsOpen(open) {
   var panel = document.getElementById("dashboard-options");
   var btn = document.getElementById("dashboard-options-btn");
   if (!panel || !btn) return;
-  var open = !panel.hasAttribute("hidden");
   if (open) {
-    panel.setAttribute("hidden", "");
-    btn.setAttribute("aria-expanded", "false");
-  } else {
     panel.removeAttribute("hidden");
     btn.setAttribute("aria-expanded", "true");
+  } else {
+    panel.setAttribute("hidden", "");
+    btn.setAttribute("aria-expanded", "false");
   }
+}
+
+function _toggleDashboardOptions() {
+  var panel = document.getElementById("dashboard-options");
+  if (!panel) return;
+  var nextOpen = panel.hasAttribute("hidden");
+  _setDashboardOptionsOpen(nextOpen);
+  _dashOptionsOpenSession = nextOpen;
+  try {
+    localStorage.setItem(_DASH_OPTIONS_LS_KEY, nextOpen ? "1" : "0");
+  } catch (_) {
+    /* localStorage unavailable — _dashOptionsOpenSession above keeps the
+       state for this session so a hide/show cycle preserves the choice. */
+  }
+}
+
+function _restoreDashboardOptionsState() {
+  // Read order: localStorage (cross-session) → in-memory session value
+  // → closed default.  Only override based on a genuinely-successful
+  // localStorage read; on throw, fall back to the session value so the
+  // panel stays where the user last put it within the same tab.
+  var saved = null;
+  var lsAvailable = true;
+  try {
+    saved = localStorage.getItem(_DASH_OPTIONS_LS_KEY);
+  } catch (_) {
+    lsAvailable = false;
+  }
+  var open;
+  if (lsAvailable && saved !== null) {
+    open = saved === "1";
+  } else if (_dashOptionsOpenSession !== null) {
+    open = _dashOptionsOpenSession;
+  } else {
+    open = false;
+  }
+  _setDashboardOptionsOpen(open);
+}
+
+// Update the inline summary chip beside the Options button when any of
+// model / judge_model / skill is non-default.  Helps users see at a
+// glance that they've overridden defaults — without having to expand
+// the panel.  Hidden when everything is default.
+function _refreshDashboardOptionsSummary() {
+  var summary = document.getElementById("dashboard-options-summary");
+  if (!summary) return;
+  var bits = [];
+  var modelSel = document.getElementById("dashboard-model");
+  var judgeSel = document.getElementById("dashboard-judge-model");
+  var skillSel = document.getElementById("dashboard-skill");
+  if (modelSel && modelSel.value) bits.push(modelSel.value);
+  if (judgeSel && judgeSel.value) bits.push("judge: " + judgeSel.value);
+  if (skillSel && skillSel.value) bits.push(skillSel.value);
+  if (bits.length === 0) {
+    summary.textContent = "";
+    summary.setAttribute("hidden", "");
+    return;
+  }
+  summary.textContent = bits.join(" · ");
+  summary.removeAttribute("hidden");
 }
 
 // Unified dashboard submit. Replaces the old "click button → modal" +
@@ -5655,6 +5725,13 @@ document
   }
   if (optionsBtn) {
     optionsBtn.addEventListener("click", _toggleDashboardOptions);
+  }
+  // Keep the inline summary chip in sync with whichever non-default
+  // model / judge / skill is selected.  Listening on the options panel
+  // catches all three selects with one handler.
+  var optionsPanel = document.getElementById("dashboard-options");
+  if (optionsPanel) {
+    optionsPanel.addEventListener("change", _refreshDashboardOptionsSummary);
   }
   if (composer) {
     composer.addEventListener("dragover", function (e) {
