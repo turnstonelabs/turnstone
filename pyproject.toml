@@ -182,10 +182,6 @@ disallow_untyped_decorators = false
 warn_unused_ignores = false
 
 [[tool.mypy.overrides]]
-module = "tests.*"
-disallow_untyped_defs = false
-
-[[tool.mypy.overrides]]
 module = ["slack_bolt", "slack_bolt.*", "slack_sdk", "slack_sdk.*"]
 ignore_missing_imports = true
 disallow_untyped_calls = false

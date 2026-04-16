@@ -224,17 +224,17 @@ def main() -> None:
 
     # Slack config validation (fail fast)
     if bool(args.slack_token) != bool(args.slack_app_token):
-        raise SystemExit(
-            "--slack-token and --slack-app-token must be provided together"
-        )
+        raise SystemExit("--slack-token and --slack-app-token must be provided together")
 
     # -- Run -----------------------------------------------------------------
     import asyncio
     import contextlib
-    from typing import cast
+    from typing import TYPE_CHECKING, cast
 
     from turnstone.channels._http import _get_service_id, create_channel_app
-    from turnstone.channels._protocol import ChannelAdapter
+
+    if TYPE_CHECKING:
+        from turnstone.channels._protocol import ChannelAdapter
 
     storage = get_storage()
     adapters: dict[str, ChannelAdapter] = {}
@@ -265,7 +265,7 @@ def main() -> None:
             console_token_factory=_console_token_factory,
             server_token_factory=_server_token_factory,
         )
-        adapters[discord_bot.channel_type] = cast(ChannelAdapter, discord_bot)
+        adapters[discord_bot.channel_type] = cast("ChannelAdapter", discord_bot)
 
     if args.slack_token:
         from turnstone.channels.slack.bot import TurnstoneSlackBot
@@ -287,7 +287,7 @@ def main() -> None:
             console_token_factory=_console_token_factory,
             server_token_factory=_server_token_factory,
         )
-        adapters[slack_bot.channel_type] = cast(ChannelAdapter, slack_bot)
+        adapters[slack_bot.channel_type] = cast("ChannelAdapter", slack_bot)
 
     channel_app = create_channel_app(
         adapters,

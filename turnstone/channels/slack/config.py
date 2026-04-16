@@ -29,8 +29,8 @@ class SlackConfig(ChannelConfig):
     5. Install the app to your workspace to get the bot_token
     """
 
-    bot_token: str = ""           # xoxb-...  (Bot User OAuth Token)
-    app_token: str = ""           # xapp-...  (App-Level Token for Socket Mode)
+    bot_token: str = ""  # xoxb-...  (Bot User OAuth Token)
+    app_token: str = ""  # xapp-...  (App-Level Token for Socket Mode)
     allowed_channels: list[str] = field(default_factory=list)  # empty = all
     max_message_length: int = 3000
     streaming_edit_interval: float = 1.5  # seconds between message edits

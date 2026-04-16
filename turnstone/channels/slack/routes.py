@@ -10,7 +10,7 @@ class SlackRoute:
     thread_ts: str | None = None
 
     @classmethod
-    def parse(cls, channel_id: str) -> "SlackRoute":
+    def parse(cls, channel_id: str) -> SlackRoute:
         parts = channel_id.split(":", 2)
         channel = parts[0] if parts else ""
         user_id = parts[1] if len(parts) >= 2 and parts[1] else None
