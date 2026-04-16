@@ -242,7 +242,7 @@ class TurnstoneSlackBot:
         self._handler = AsyncSocketModeHandler(self._app, self._app_token)
         await self._recover_routes()
         log.info("slack.starting_socket_mode")
-        await self._handler.start_async()
+        await self._handler.start_async()  # type: ignore[no-untyped-call]
 
     async def stop(self) -> None:
         for ws_id in list(self._subscribed_ws):
@@ -250,7 +250,7 @@ class TurnstoneSlackBot:
         await self.router.aclose()
         await self._http_client.aclose()
         if self._handler is not None:
-            await self._handler.close_async()
+            await self._handler.close_async()  # type: ignore[no-untyped-call]
         log.info("slack.stopped")
 
     async def _recover_routes(self) -> None:
