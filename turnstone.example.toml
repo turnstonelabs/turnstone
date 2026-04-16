@@ -20,7 +20,7 @@
 [model]
 # name = ""                    # Model ID; empty = provider default (gpt-5 / claude-sonnet-4)
 # temperature = 0.0            # 0 = provider default
-# reasoning_effort = ""        # "low", "medium", "high", "xhigh", "max"
+# reasoning_effort = ""        # "none", "minimal", "low", "medium", "high", "xhigh", "max"
 # context_window = 0           # 0 = auto-detect from provider capabilities
 # max_tokens = 0               # 0 = provider default
 #

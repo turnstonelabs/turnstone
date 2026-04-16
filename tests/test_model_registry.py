@@ -406,6 +406,23 @@ class TestLoadModelRegistry:
                 reg = load_model_registry("http://x/v1", "x", "x")
             assert reg.plan_effort == level, f"level={level} not accepted"
 
+    def test_empty_or_whitespace_effort_treated_as_unset(self) -> None:
+        """Operators write `plan_effort = ""` to make "unset" explicit;
+        warning on benign empty values would be noise."""
+        for value in ("", "  ", "\t"):
+            fake_cfg: dict[str, Any] = {"model": {"plan_effort": value, "task_effort": value}}
+            with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+                reg = load_model_registry("http://x/v1", "x", "x")
+            assert reg.plan_effort is None, f"empty value {value!r} not treated as unset"
+            assert reg.task_effort is None
+
+    def test_effort_normalised_to_lowercase(self) -> None:
+        fake_cfg: dict[str, Any] = {"model": {"plan_effort": "HIGH", "task_effort": " Low "}}
+        with patch("turnstone.core.model_registry.load_config", return_value=fake_cfg):
+            reg = load_model_registry("http://x/v1", "x", "x")
+        assert reg.plan_effort == "high"
+        assert reg.task_effort == "low"
+
     def test_invalid_default_falls_back(self) -> None:
         fake_cfg: dict[str, Any] = {
             "model": {"default": "nonexistent"},

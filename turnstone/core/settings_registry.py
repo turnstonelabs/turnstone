@@ -83,6 +83,54 @@ def _build_registry() -> dict[str, SettingDef]:
             "Higher effort improves quality on complex tasks but is slower and uses more "
             "tokens. Per-model overrides can be set in the Models tab.",
         ),
+        SettingDef(
+            "model.plan_alias",
+            "str",
+            "",
+            "Model alias for plan_agent (empty = inherit from config / session)",
+            "model",
+            help="Which model the plan_agent sub-agent uses. When empty, falls back to "
+            "[model].plan_model in config.toml, then [model].agent_model, then the session "
+            "model. Plan_agent runs rarely but benefits from a stronger model for "
+            "high-quality plans \u2014 point this at your strongest reasoner.",
+        ),
+        SettingDef(
+            "model.task_alias",
+            "str",
+            "",
+            "Model alias for task_agent (empty = inherit from config / session)",
+            "model",
+            help="Which model the task_agent sub-agent uses. When empty, falls back to "
+            "[model].task_model in config.toml, then [model].agent_model, then the session "
+            "model. Task_agent fires frequently for autonomous subtasks \u2014 point this "
+            "at a cheaper/faster model than your plan_agent.",
+        ),
+        SettingDef(
+            "model.plan_effort",
+            "str",
+            "",
+            "Reasoning effort for plan_agent (empty = inherit from config; default \u2018high\u2019)",
+            "model",
+            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="Reasoning effort for plan_agent specifically. When empty, falls back to "
+            "[model].plan_effort in config.toml, then to the built-in default \u2018high\u2019. "
+            "Use \u2018xhigh\u2019 or \u2018max\u2019 with models that support deeper reasoning "
+            "for higher-quality plans. (Empty here means \u201cinherit\u201d \u2014 use "
+            "\u2018none\u2019 to actually disable reasoning.)",
+        ),
+        SettingDef(
+            "model.task_effort",
+            "str",
+            "",
+            "Reasoning effort for task_agent (empty = inherit from config / session)",
+            "model",
+            choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="Reasoning effort for task_agent specifically. When empty, falls back to "
+            "[model].task_effort in config.toml, then inherits the session\u2019s effort. "
+            "Set to \u2018low\u2019 or \u2018minimal\u2019 if your task_agent runs many "
+            "fast subtasks where deep reasoning is wasteful. (Empty here means \u201cinherit\u201d "
+            "\u2014 use \u2018none\u2019 to actually disable reasoning.)",
+        ),
         # -- session --------------------------------------------------------
         SettingDef(
             "session.instructions",

@@ -122,6 +122,26 @@ class TestValidateValueChoices:
         for ch in ("", "none", "low", "medium", "high", "max"):
             assert validate_value("model.reasoning_effort", ch) == ch
 
+    def test_plan_task_alias_accept_any_string(self):
+        # plan/task aliases are validated dynamically against live registry
+        # at apply time; here we just confirm the static validator accepts
+        # arbitrary strings (including "" for "use server default").
+        assert validate_value("model.plan_alias", "") == ""
+        assert validate_value("model.task_alias", "") == ""
+        assert validate_value("model.plan_alias", "smart") == "smart"
+        assert validate_value("model.task_alias", "fast") == "fast"
+
+    def test_plan_task_effort_choices(self):
+        for ch in ("", "none", "minimal", "low", "medium", "high", "xhigh", "max"):
+            assert validate_value("model.plan_effort", ch) == ch
+            assert validate_value("model.task_effort", ch) == ch
+
+    def test_plan_task_effort_invalid(self):
+        with pytest.raises(ValueError, match="not in"):
+            validate_value("model.plan_effort", "extreme")
+        with pytest.raises(ValueError, match="not in"):
+            validate_value("model.task_effort", "supercharged")
+
 
 # ---------------------------------------------------------------------------
 # serialize / deserialize round-trip
@@ -147,6 +167,16 @@ class TestSerializeDeserialize:
 
     def test_str_round_trip_empty(self):
         assert deserialize_value("model.default_alias", serialize_value("")) == ""
+
+    def test_plan_task_round_trip(self):
+        for k in (
+            "model.plan_alias",
+            "model.task_alias",
+            "model.plan_effort",
+            "model.task_effort",
+        ):
+            assert deserialize_value(k, serialize_value("")) == ""
+            assert deserialize_value(k, serialize_value("high")) == "high"
 
 
 # ---------------------------------------------------------------------------

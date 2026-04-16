@@ -501,7 +501,12 @@ def load_model_registry(
     def _validate_effort(value: Any, key: str) -> str | None:
         if value is None:
             return None
-        coerced = str(value)
+        # Treat empty / whitespace as unset.  Operators commonly write
+        # `plan_effort = ""` to make "leave it default" explicit; warning
+        # on that benign case would just be noise.
+        coerced = str(value).strip().lower()
+        if not coerced:
+            return None
         if coerced not in valid_efforts:
             log.warning(
                 "Configured %s '%s' is not a recognised effort level "

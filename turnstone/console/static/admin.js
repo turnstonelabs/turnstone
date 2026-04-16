@@ -15,6 +15,21 @@ var _confirmCallbackFn = null;
 var _confirmTriggerEl = null;
 var _mobileSidebarOpen = false;
 
+// Settings whose choices are populated dynamically from the live model
+// alias list, and whose empty-string option renders as "(server default)".
+var ALIAS_SETTING_KEYS = [
+  "model.default_alias",
+  "model.plan_alias",
+  "model.task_alias",
+  "channels.default_model_alias",
+];
+
+// Settings whose empty option means "inherit from a fallback chain", as
+// opposed to "no value" — distinct from the literal "none" choice (e.g.
+// reasoning_effort="none" actually disables reasoning, very different
+// from leaving it unset).
+var INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
+
 // ---------------------------------------------------------------------------
 // View switching (called from app.js showOverview/drillDown pattern)
 // ---------------------------------------------------------------------------
@@ -2577,11 +2592,9 @@ function loadSettings() {
         if (modelDefs[m].enabled) enabledAliases.push(modelDefs[m].alias);
       }
       if (enabledAliases.length > 1) {
-        if (merged["model.default_alias"]) {
-          merged["model.default_alias"].choices = enabledAliases;
-        }
-        if (merged["channels.default_model_alias"]) {
-          merged["channels.default_model_alias"].choices = enabledAliases;
+        for (var ak = 0; ak < ALIAS_SETTING_KEYS.length; ak++) {
+          var aliasKey = ALIAS_SETTING_KEYS[ak];
+          if (merged[aliasKey]) merged[aliasKey].choices = enabledAliases;
         }
       }
 
@@ -2757,11 +2770,10 @@ function _renderSettingRow(item) {
       var label;
       if (item.choices[c] !== "") {
         label = escapeHtml(item.choices[c]);
-      } else if (
-        item.key === "model.default_alias" ||
-        item.key === "channels.default_model_alias"
-      ) {
+      } else if (ALIAS_SETTING_KEYS.indexOf(item.key) !== -1) {
         label = "(server default)";
+      } else if (INHERIT_EMPTY_LABEL_KEYS.indexOf(item.key) !== -1) {
+        label = "(inherit)";
       } else {
         label = "(none)";
       }

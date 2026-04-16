@@ -90,6 +90,18 @@ class TestSetGetRoundTrip:
         store.set("model.default_alias", "gpt5-prod")
         assert store.get("model.default_alias") == "gpt5-prod"
 
+    def test_plan_task_alias(self, store):
+        store.set("model.plan_alias", "smart")
+        store.set("model.task_alias", "fast")
+        assert store.get("model.plan_alias") == "smart"
+        assert store.get("model.task_alias") == "fast"
+
+    def test_plan_task_effort(self, store):
+        store.set("model.plan_effort", "max")
+        store.set("model.task_effort", "low")
+        assert store.get("model.plan_effort") == "max"
+        assert store.get("model.task_effort") == "low"
+
 
 # ---------------------------------------------------------------------------
 # delete()

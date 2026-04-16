@@ -3301,8 +3301,14 @@ def internal_model_reload(request: Request) -> JSONResponse:
         provider=cli_args["provider"],
         storage=get_storage(),
     )
-    # Allow runtime override of the default alias via ConfigStore
+    # Allow runtime override of routing fields via ConfigStore.  Per-kind
+    # values (plan/task) override the legacy single-knob agent_model when
+    # set; effort values override the per-kind defaults from config.toml.
     effective_default = new_registry.default
+    effective_plan_model = new_registry.plan_model
+    effective_task_model = new_registry.task_model
+    effective_plan_effort = new_registry.plan_effort
+    effective_task_effort = new_registry.task_effort
     cs = getattr(request.app.state, "config_store", None)
     if cs:
         cs.reload()  # Ensure latest settings from DB
@@ -3314,6 +3320,21 @@ def internal_model_reload(request: Request) -> JSONResponse:
                 effective_default,
                 new_registry.default,
             )
+        # Aliases are validated against the live registry here (must exist);
+        # effort values were validated against the SettingDef choices on
+        # write, so a truthiness check is sufficient at apply time.
+        cs_plan_alias = cs.get("model.plan_alias")
+        if cs_plan_alias and cs_plan_alias in new_registry.models:
+            effective_plan_model = cs_plan_alias
+        cs_task_alias = cs.get("model.task_alias")
+        if cs_task_alias and cs_task_alias in new_registry.models:
+            effective_task_model = cs_task_alias
+        cs_plan_effort = cs.get("model.plan_effort")
+        if cs_plan_effort:
+            effective_plan_effort = cs_plan_effort
+        cs_task_effort = cs.get("model.task_effort")
+        if cs_task_effort:
+            effective_task_effort = cs_task_effort
 
     try:
         registry.reload(
@@ -3321,10 +3342,10 @@ def internal_model_reload(request: Request) -> JSONResponse:
             effective_default,
             new_registry.fallback,
             new_registry.agent_model,
-            plan_model=new_registry.plan_model,
-            task_model=new_registry.task_model,
-            plan_effort=new_registry.plan_effort,
-            task_effort=new_registry.task_effort,
+            plan_model=effective_plan_model,
+            task_model=effective_task_model,
+            plan_effort=effective_plan_effort,
+            task_effort=effective_task_effort,
         )
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
@@ -4046,18 +4067,52 @@ def main() -> None:
         storage=_get_storage(),
     )
 
-    # Apply runtime default alias override from ConfigStore (if set)
+    # Apply runtime overrides from ConfigStore for default alias plus the
+    # per-kind sub-agent routing.  Only triggers a reload when at least one
+    # ConfigStore value differs from what the registry loaded from disk.
+    # ConfigStore returns the SettingDef default ("" for these keys) when
+    # unset — distinct from the registry's None for unconfigured fields.
+    config_store.reload()  # symmetry with internal_model_reload's cs.reload()
     cs_default_alias = config_store.get("model.default_alias")
-    if cs_default_alias and registry.has_alias(cs_default_alias):
+    cs_plan_alias = config_store.get("model.plan_alias")
+    cs_task_alias = config_store.get("model.task_alias")
+    cs_plan_effort = config_store.get("model.plan_effort")
+    cs_task_effort = config_store.get("model.task_effort")
+
+    eff_default = (
+        cs_default_alias
+        if cs_default_alias and registry.has_alias(cs_default_alias)
+        else registry.default
+    )
+    eff_plan_model = (
+        cs_plan_alias
+        if cs_plan_alias and registry.has_alias(cs_plan_alias)
+        else registry.plan_model
+    )
+    eff_task_model = (
+        cs_task_alias
+        if cs_task_alias and registry.has_alias(cs_task_alias)
+        else registry.task_model
+    )
+    eff_plan_effort = cs_plan_effort or registry.plan_effort
+    eff_task_effort = cs_task_effort or registry.task_effort
+
+    if (
+        eff_default != registry.default
+        or eff_plan_model != registry.plan_model
+        or eff_task_model != registry.task_model
+        or eff_plan_effort != registry.plan_effort
+        or eff_task_effort != registry.task_effort
+    ):
         registry.reload(
             registry.models,
-            cs_default_alias,
+            eff_default,
             registry.fallback,
             registry.agent_model,
-            plan_model=registry.plan_model,
-            task_model=registry.task_model,
-            plan_effort=registry.plan_effort,
-            task_effort=registry.task_effort,
+            plan_model=eff_plan_model,
+            task_model=eff_task_model,
+            plan_effort=eff_plan_effort,
+            task_effort=eff_task_effort,
         )
 
     # Initialize MCP client (connects to configured MCP servers, if any)
