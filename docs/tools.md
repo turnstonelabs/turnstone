@@ -169,8 +169,8 @@ Every tool defines a `primary_key`. The mapping is:
 | `man`        | `page`      |
 | `web_fetch`  | `url`       |
 | `web_search` | `query`     |
-| `task`       | `prompt`    |
-| `plan`       | `prompt`    |
+| `task_agent` | `prompt`    |
+| `plan_agent` | `prompt`    |
 | `memory`     | `name`      |
 | `recall`     | `query`     |
 | `notify`     | `message`   |
@@ -357,7 +357,10 @@ Search the web using a text query.
 
 ## Agent
 
-### task
+Tool names use the `_agent` suffix — bare `plan` / `task` collide with
+chat-template channel names on some local models.
+
+### task_agent
 
 Delegate a general-purpose task to an autonomous sub-agent.
 
@@ -371,7 +374,7 @@ Delegate a general-purpose task to an autonomous sub-agent.
 
 ---
 
-### plan
+### plan_agent
 
 Plan before implementing -- an autonomous agent explores the codebase and writes a structured plan.
 
@@ -568,8 +571,8 @@ pre-configure skills at workstream creation.
 | `man`        | Info       | Yes          | Yes   | Yes        | `page`      |
 | `web_fetch`  | Info       | No           | Yes   | Yes        | `url`       |
 | `web_search` | Info       | No           | Yes   | Yes        | `query`     |
-| `task`       | Agent      | No           | No    | No         | `prompt`    |
-| `plan`       | Agent      | No           | No    | No         | `prompt`    |
+| `task_agent` | Agent      | No           | No    | No         | `prompt`    |
+| `plan_agent` | Agent      | No           | No    | No         | `prompt`    |
 | `memory`     | Memory     | Yes          | No    | No         | `name`      |
 | `recall`     | Memory     | Yes          | No    | No         | `query`     |
 | `notify`     | Notify     | Yes          | Yes   | Yes        | `message`   |

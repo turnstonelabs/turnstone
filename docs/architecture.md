@@ -21,7 +21,8 @@ plugs in.
 | `turnstone-console` | `turnstone.console.server` | ClusterCollector | Cluster dashboard (aggregates all nodes) |
 | `turnstone-eval` | `turnstone.eval` | `NullUI` | Headless evaluation and prompt optimization |
 | `turnstone-channel` | `turnstone.channels.cli` | ChannelAdapter | Channel gateway (Discord, Slack, etc.) |
-| `turnstone-admin` | `turnstone.core.admin_cli` | — | Offline user and API token management |
+| `turnstone-admin` | `turnstone.admin` | — | Offline user and API token management |
+| `turnstone-bootstrap` | `turnstone.bootstrap` | — | LLM-guided setup wizard |
 
 ---
 
@@ -36,7 +37,10 @@ turnstone/
     session.py        ChatSession engine, SessionUI protocol, tool dispatch
     providers/        LLM provider adapters (pluggable backend layer)
       _protocol.py    LLMProvider protocol, ModelCapabilities, StreamChunk, CompletionResult
-      _openai.py      OpenAIProvider — OpenAI, vLLM, llama.cpp, any compatible API
+      _openai.py      OpenAIProvider facade (re-exports Chat/Responses providers)
+      _openai_chat.py       OpenAIChatCompletionsProvider — vLLM, llama.cpp, local compatible APIs
+      _openai_responses.py  OpenAIResponsesProvider — commercial OpenAI Responses API
+      _openai_common.py     Shared ModelCapabilities table + helpers
       _anthropic.py   AnthropicProvider — Anthropic Messages API, native streaming, thinking
       _google.py      GoogleProvider — Google Gemini via OpenAI-compat endpoint
       __init__.py     create_provider() + create_client() factory functions
@@ -85,6 +89,7 @@ turnstone/
     _routing.py       ChannelRouter — channel/thread ↔ workstream mapping via HTTP
     _config.py        Base ChannelConfig dataclass
     discord/          Discord adapter (bot, cog, views, streaming, config)
+    slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
     katex-0.16.45/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
   ui/
@@ -97,7 +102,7 @@ turnstone/
       renderer.js     Markdown + LaTeX renderer (tables, nested lists, blockquotes, KaTeX math)
       app.js          Split-pane UI (Pane class, binary layout tree, SSE, tool approval)
   tools/
-    *.json            15 tool schemas (OpenAI function-calling format + turnstone metadata)
+    *.json            19 tool schemas (OpenAI function-calling format + turnstone metadata)
 ```
 
 Both UIs share a common design system extracted into `turnstone/shared_static/`: design tokens, login overlay, toast notifications, theme toggle, keyboard shortcuts, and utility functions. Each UI imports `base.css` and the shared JS modules at `/shared/`, then adds only page-specific code at `/static/`.
@@ -443,13 +448,15 @@ from each schema and builds:
 - `PRIMARY_KEY_MAP` -- `{name: primary_key}` for JSON fallback recovery
 - `merge_mcp_tools(builtin, mcp_tools)` -- merges built-in + MCP tools at session init
 
-### 13 Tools by Category
+### 19 Tools by Category
 
 **Read-only (auto-approve)**:
 - `read_file` -- read file contents with optional offset/limit
+- `diff_file` -- show diff between two files / versions
 - `search` -- ripgrep-based codebase search
 - `man` -- read man pages
 - `recall` -- search conversation history
+- `read_resource` -- read an MCP resource by URI
 
 **Write (requires approval)**:
 - `bash` -- execute shell commands (with safety checks via `turnstone.core.safety`)
@@ -458,13 +465,20 @@ from each schema and builds:
 - `math` -- execute Python in sandboxed subprocess (via `turnstone.core.sandbox`)
 - `web_fetch` -- fetch a URL (with SSRF protection via `turnstone.core.web`)
 - `web_search` -- search the web (provider-native for Anthropic/OpenAI, Tavily fallback for local models)
+- `notify` -- send a user-facing notification (Discord/Slack, optional reply routing)
+- `watch` -- schedule a recurring poll with condition DSL
 
 **Agent (delegated sub-sessions)**:
-- `task` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
-- `plan` -- explore codebase and write a structured plan (`AGENT_TOOLS`)
+- `task_agent` -- delegate to a sub-agent with full tool access (`TASK_AGENT_TOOLS`)
+- `plan_agent` -- explore codebase and write a structured plan (`AGENT_TOOLS`)
 
-**Memory (structured persistent store)**:
+**Memory / skills / prompts**:
 - `memory` -- save, search, delete, or list memories (typed and scoped)
+- `skill` -- invoke a skill (governed, versioned procedure)
+- `use_prompt` -- fetch and apply a prompt template
+
+Tool names are `plan_agent` / `task_agent` (not `plan` / `task`); bare words
+collide with chat-template channels on some local models.
 
 ### Prepare / Execute Pattern
 
@@ -483,12 +497,12 @@ separation allows the UI to show previews before any side effects occur.
 
 ### Agent Tools
 
-`task` and `plan` invoke `_run_agent()`, which runs a multi-turn loop with
-a subset of tools and its own system prompt. The sub-agent runs
+`task_agent` and `plan_agent` invoke `_run_agent()`, which runs a multi-turn
+loop with a subset of tools and its own system prompt. The sub-agent runs
 independently, then returns the final content as the tool result.
 
-- **task**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
-- **plan**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
+- **task_agent**: uses `self._task_tools` (`TASK_AGENT_TOOLS` + MCP tools)
+- **plan_agent**: uses `self._agent_tools` (`AGENT_TOOLS` + MCP tools). Writes output
   to `.plan-<ws_id>.md` — unique per `ChatSession` so concurrent workstreams
   don't collide. On repeat invocations the prior `plan` tool call and its result
   are forwarded from `self.messages` so the agent refines the existing plan rather
@@ -1111,8 +1125,9 @@ Three hierarchical scopes control endpoint access:
 - **Console** is the auth management hub — it hosts the admin endpoints for
   creating users, issuing API tokens, and managing channel mappings. User
   records and token hashes live in the shared storage backend. The console
-  dashboard includes an **admin panel** (14 tabs) for managing
-  credentials, governance, MCP servers, and runtime settings through the browser.
+  dashboard includes an **admin panel** (18 tabs) for managing
+  credentials, governance, MCP servers, models, node metadata, and runtime
+  settings through the browser.
 - **Server** is a JWT validator only — it validates tokens on each request but
   never creates users or tokens. Both processes share the same `jwt_secret`
   (via `TURNSTONE_JWT_SECRET` env var or `[auth].jwt_secret` config).
@@ -1347,9 +1362,10 @@ setup, auth headers, `_request()` (REST) and `_stream_sse()` (SSE). Sync
 clients delegate through `_SyncRunner` which maintains a persistent background
 event loop on a daemon thread.
 
-**Event types**: 27 standalone dataclasses in `events.py` with a type-registry
-pattern matching `OutboundEvent.from_json()` from `mq/protocol.py`. Events are
-decoupled from server internals.
+**Event types**: 38 standalone dataclasses in `events.py` with a type-registry
+dispatch (`from_json()` on each event). Events are decoupled from server
+internals — the SDK parses SSE frames directly from the `/v1/api/events`
+streams.
 
 **TypeScript SDK**: `sdk/typescript/` — separate npm package with the same API
 surface. Zero browser dependencies, SSE via `fetch` + `ReadableStream` parsing.
@@ -1371,7 +1387,8 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
 > See also: [Channel Integrations guide](channels.md)
 
 The `turnstone-channel` gateway connects external messaging platforms
-(Discord, Slack, Teams) to the turnstone cluster via HTTP. Each
+(Discord and Slack today, with an adapter protocol for future platforms) to
+the turnstone cluster via HTTP. Each
 platform adapter implements the `ChannelAdapter` protocol and translates
 between platform-native events and turnstone server API calls.
 
@@ -1384,7 +1401,7 @@ workstream is reactivated, the router uses atomic resume via the
 the old workstream's conversation during creation in a single HTTP
 request, eliminating ordering fragility.
 
-Discord ships as the first adapter. See [channels.md](channels.md) for
+Discord and Slack adapters ship today. See [channels.md](channels.md) for
 setup instructions, configuration reference, and the adapter development
 guide.
 
@@ -1405,11 +1422,11 @@ retries up to 3 times with backoff, re-querying the service registry on
 each attempt. See [Notification Flow diagram](diagrams/png/17-notify-flow.png).
 
 **Bidirectional replies:** When a user replies to a notification DM, the
-Discord bot looks up the originating `ws_id` from the tracked message ID,
-verifies the replying user matches the notification recipient, and routes
-the reply to the workstream via `router.send_message()`. The workstream's
-response is forwarded back to the DM via a temporary entry in
-`_notify_reply_channels`. On `TurnCompleteEvent`, the response message is
+channel adapter (Discord or Slack) looks up the originating `ws_id` from the
+tracked message ID, verifies the replying user matches the notification
+recipient, and routes the reply to the workstream via `router.send_message()`.
+The workstream's response is forwarded back to the DM via a temporary entry
+in `_notify_reply_channels`. On `TurnCompleteEvent`, the response message is
 itself tracked for further replies, enabling multi-turn DM conversations
 without requiring the user to open the web UI. Tracking entries are capped
 at 100 (FIFO eviction) and cleaned up on workstream close.
@@ -1442,11 +1459,10 @@ and workstreams record which skill and version spawned them. Token budget
 enforcement tracks consumption in `session.send()` with 80% warning and
 100% approval gate via the `__budget_override__` synthetic tool name.
 
-The console admin panel adds 5 governance tabs (Roles, Policies, Skills,
-Usage, Audit), a Memories tab, a Settings tab (form-based editor for all
-ConfigStore settings), and an MCP Servers tab (database-backed server
-definitions with live connection status and cluster-wide reload) for a
-total of 13 tabs, all permission-gated.
+The console admin panel exposes these capabilities as 18 permission-gated
+tabs: Users, API Tokens, Channels, Schedules, Watches, Roles, Policies,
+Prompts, Judge, Skills, MCP Servers, Usage, Audit, Memories, Models, Nodes,
+Settings, and TLS.
 Both Python and TypeScript SDKs expose governance methods on the console
 client.
 

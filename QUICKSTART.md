@@ -55,7 +55,7 @@ The wizard supports two deployment modes:
 ```
 $ turnstone-bootstrap
 
- Turnstone Bootstrap Wizard  v0.5.4
+ Turnstone Bootstrap Wizard  v1.5.0
  ────────────────────────────────────────────────
 
  Which provider for this wizard?
@@ -87,6 +87,6 @@ $ turnstone-bootstrap
 
 ## See Also
 
-- [Docker Deployment](docker.md) — manual compose setup and profiles
-- [Security](security.md) — auth architecture and token types
-- [Governance](governance.md) — roles, policies, and templates
+- [Docker Deployment](docs/docker.md) — manual compose setup and profiles
+- [Security](docs/security.md) — auth architecture and token types
+- [Governance](docs/governance.md) — roles, policies, and templates

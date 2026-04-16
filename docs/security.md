@@ -1,8 +1,10 @@
 # Security and Authentication
 
-Turnstone uses a layered authentication system with three token types,
-hierarchical scopes, and a split architecture where the console manages
-credentials while individual server nodes validate JWTs locally.
+Turnstone uses a layered authentication system with two token types
+(database-backed API tokens + HMAC-SHA256 JWTs), hierarchical scopes,
+and a split architecture where the console manages credentials while
+individual server nodes validate JWTs locally.  Inter-service traffic
+uses short-lived service JWTs minted by `ServiceTokenManager`.
 
 ---
 
@@ -37,7 +39,7 @@ Claims:
 |-------|-------------|
 | `sub` | User ID |
 | `scopes` | Comma-separated scope list (`read,write,approve`) |
-| `src` | Token source (`password`, `api_token`, `config`, `oidc`) |
+| `src` | Token source (`password`, `api_token`, `oidc`, or a service origin like `console` / `cli`) |
 | `iss` | Issuer — always `turnstone` |
 | `aud` | Audience — `turnstone-server` or `turnstone-console` |
 | `iat` | Issued-at timestamp |

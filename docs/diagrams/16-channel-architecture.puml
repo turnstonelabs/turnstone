@@ -20,11 +20,14 @@ class "Discord" as Discord <<platform>> {
     asyncio event loop
 }
 
-class "Slack (future)" as Slack <<platform>> {
-    Socket Mode / Events API
+class "Slack" as Slack <<platform>> {
+    Socket Mode WebSocket
     Block Kit messages
+    Slash command (default /turnstone)
+    DM + channel events
     --
-    Planned integration
+    slack-bolt (Python)
+    asyncio event loop
 }
 
 class "Teams (future)" as Teams <<platform>> {
@@ -38,13 +41,26 @@ class "Teams (future)" as Teams <<platform>> {
 class "turnstone-channel" as ChannelService <<service>> {
     entry point: turnstone-channel
     --
-    One process per platform
+    One process — hosts one or more adapters
     asyncio event loop
     Structured logging (structlog)
     --log-level, --log-format
     --
     POST /v1/api/notify (HTTP)
     GET  /health
+}
+
+class "SlackBot" as SlackBot <<service>> {
+    +on_message(event)
+    +on_action(action)  (Block Kit buttons)
+    +send(channel_id, content)
+    +send_notification(channel_id, content, ws_id)
+    +run(bot_token, app_token)
+    --
+    slack-bolt AsyncApp
+    Socket Mode client
+    Per-user channel sessions via slash command
+    DM routing without slash command
 }
 
 class "DiscordBot" as Bot <<service>> {
@@ -138,10 +154,15 @@ Server --> Bot : SSE event stream
 
 Bot --> Discord : reply / embed\nbutton callback
 
-Slack .[hidden]. Discord
+Slack --> SlackBot : socket-mode\nevents
+SlackBot --> Router : on_message / on_action
+SlackBot --> Server : POST /v1/api/send\nGET /v1/api/events?ws_id=
+SlackBot --> Slack : post / update\nBlock Kit button callbacks
+
 Teams .[hidden]. Slack
 
 ChannelService --> Bot : creates + runs
+ChannelService --> SlackBot : creates + runs
 ChannelService --> Router : creates
 ChannelService --> SVC : register / heartbeat /\nderegister
 

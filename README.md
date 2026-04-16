@@ -84,7 +84,7 @@ with TurnstoneServer("http://localhost:8080", token="tok_xxx") as client:
 
 ## Tools
 
-Built-in tools for shell, files, search, web, memory, notifications, and autonomous sub-agents — plus external tools via [MCP](https://modelcontextprotocol.io/) with native deferred loading. See [docs/tools.md](docs/tools.md) for the full reference and [docs/mcp.md](docs/mcp.md) for MCP configuration.
+Built-in tools for shell, files, search, web, memory, notifications, and autonomous sub-agents — plus external tools via [MCP](https://modelcontextprotocol.io/) with native deferred loading. See [docs/tools.md](docs/tools.md) for the full reference and [docs/mcp-registry.md](docs/mcp-registry.md) for MCP configuration.
 
 ## Architecture
 
@@ -97,7 +97,7 @@ Built-in tools for shell, files, search, web, memory, notifications, and autonom
 | `turnstone` | Terminal CLI (REPL) |
 | `turnstone-server` | Web UI + REST API + SSE events |
 | `turnstone-console` | Cluster dashboard + routing proxy + admin panel |
-| `turnstone-channel` | Channel gateway (Discord, with adapters for Slack/Teams planned) |
+| `turnstone-channel` | Channel gateway (Discord and Slack adapters) |
 | `turnstone-admin` | User/token management CLI |
 | `turnstone-eval` | Eval harness for prompt/tool optimization |
 | `turnstone-bootstrap` | LLM-guided setup wizard |
@@ -117,7 +117,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | [Console Data Flow](docs/diagrams/png/11-console-data-flow.png) | Dashboard data collection |
 | [Deployment](docs/diagrams/png/12-deployment.png) | Docker Compose topology |
 | [Auth](docs/diagrams/png/15-auth-architecture.png) | JWT, scopes, login flows |
-| [Channels](docs/diagrams/png/16-channel-architecture.png) | Discord adapter + routing |
+| [Channels](docs/diagrams/png/16-channel-architecture.png) | Discord / Slack adapters + routing |
 | [Judge](docs/diagrams/png/22-judge-architecture.png) | Intent validation pipeline |
 | [OIDC](docs/diagrams/png/25-oidc-architecture.png) | SSO authorization code flow |
 
@@ -136,7 +136,7 @@ UML diagrams in [`docs/diagrams/`](docs/diagrams/):
 | Console dashboard | [docs/console.md](docs/console.md) |
 | Eval harness | [docs/eval.md](docs/eval.md) |
 | Tools reference | [docs/tools.md](docs/tools.md) |
-| MCP integration | [docs/mcp.md](docs/mcp.md) |
+| MCP integration | [docs/mcp-registry.md](docs/mcp-registry.md) |
 
 ## Requirements
 

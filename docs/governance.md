@@ -62,14 +62,14 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
 - **Default skills**: All `is_default=true` skills auto-apply to new
   workstreams, concatenated in alphabetical order by name. Use name prefixes
   (e.g. `01-safety`, `02-style`) to control ordering.
-- **Explicit selection**: `--template <name>` CLI flag, `template` field on
+- **Explicit selection**: `--skill <name>` CLI flag, `skill` field on
   `POST /v1/api/workstreams/new`, console creation modal dropdown, scheduled task
   config, and channel adapter config. An explicit skill *replaces* defaults.
 - **Variables**: Three built-in placeholders resolved at load time:
   `{{model}}` (active model name), `{{ws_id}}` (workstream ID),
   `{{node_id}}` (server node ID). Unrecognized placeholders are kept as-is.
-- **Runtime switching**: `/template <name>` to switch, `/template clear` to revert
-  to defaults, `/template` to show current. Persisted across resume.
+- **Runtime switching**: `/skill <name>` to switch, `/skill clear` to revert
+  to defaults, `/skill` to show current. Persisted across resume.
 - **Model-driven loading**: The `skill` built-in tool lets the model
   discover and activate skills mid-conversation. `search` action finds skills
   by query (auto-approved); `load` action activates by name (requires user
@@ -186,15 +186,21 @@ Full OpenAPI spec at `/openapi.json` and Swagger UI at `/docs`.
 
 ## Admin Console UI
 
-6 new tabs added to the admin panel (11 total):
+Governance-related tabs within the 18-tab admin panel:
 
 - **Roles** — CRUD roles, permission checkbox grid, user role assignment modal
 - **Policies** — CRUD tool policies with colored action badges (green/red/amber)
-- **Skills** — CRUD skills with wide modal, textarea editor
+- **Prompts** — Prompt-policy editor (heuristics for admin guardrails)
+- **Skills** — CRUD skills with wide modal, textarea editor; Discover pill for
+  installing from skills.sh / GitHub; per-row scan badges (safe/low/med/high/critical)
+- **Judge** — Intent validation configuration and verdict history
 - **Usage** — Summary readouts + CSS bar chart, time range + group-by selectors
 - **Audit** — Filterable log with relative timestamps, load-more pagination
 
 Tabs are permission-gated: hidden if the user lacks the required permission.
+See [docs/console.md](console.md) for the full tab list and
+[docs/settings.md](settings.md) for the Settings tab that edits live
+ConfigStore values.
 
 ## SDK
 

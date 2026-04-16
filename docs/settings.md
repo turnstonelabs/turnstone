@@ -59,6 +59,22 @@ from ConfigStore. Model names and context windows are now configured per-model
 in the Models tab. A startup warning is logged if these keys appear in
 `config.toml`.
 
+### Plan / task agent overrides
+
+`plan_agent` and `task_agent` sub-sessions resolve independently from the
+conversation model so operators can pick a cheaper/faster model for
+autonomous loops:
+
+| Setting | Purpose |
+|---------|---------|
+| `model.plan_model` | Alias used for `plan_agent` sub-sessions. Falls back to `[model].plan_model` in config.toml, then `[model].agent_model`, then the session's active model. |
+| `model.task_model` | Alias used for `task_agent` sub-sessions. Same fallback chain as `plan_model`. |
+| `model.plan_effort` | Reasoning effort for `plan_agent` (`none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`). Defaults to `high`. |
+| `model.task_effort` | Reasoning effort for `task_agent`. Empty string means "inherit from the session". |
+
+All four are live-editable from the Settings tab and take effect on the
+next sub-agent invocation — no restart required.
+
 ---
 
 ## Bootstrap vs ConfigStore
@@ -79,7 +95,7 @@ initialization:
 
 | Section | Settings |
 |---------|----------|
-| `model` | default_alias, temperature, max_tokens, reasoning_effort |
+| `model` | default_alias, temperature, max_tokens, reasoning_effort, plan_model, task_model, plan_effort, task_effort |
 | `session` | instructions, retention_days, compact_max_tokens, auto_compact_pct |
 | `tools` | timeout, truncation, agent_max_turns, skip_permissions, search, search_threshold, search_max_results |
 | `server` | workstream_idle_timeout, max_workstreams |

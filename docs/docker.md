@@ -22,7 +22,7 @@ Console dashboard: http://localhost:8090
 |---------|------|---------|-------------|
 | `server` | 8080 | default | Web UI + chat workstreams + LLM |
 | `console` | 8090 | default | Cluster dashboard |
-| `channel` | — | production | Channel gateway (Discord, Slack, etc.) |
+| `channel` | — | production | Channel gateway (Discord and/or Slack adapters) |
 | `server-1`…`server-10` | — | cluster | 10-node server fleet (PostgreSQL required) |
 
 ## Profiles
@@ -108,8 +108,16 @@ The database stores workstream history, user accounts, and API tokens. When usin
 |----------|---------|-------------|
 | `TURNSTONE_DISCORD_TOKEN` | — | Discord bot token (required to enable Discord adapter) |
 | `TURNSTONE_DISCORD_GUILD` | `0` | Restrict to a single Discord guild (0 = all guilds) |
+| `TURNSTONE_SLACK_TOKEN` | — | Slack Bot User OAuth token `xoxb-…` (required to enable Slack adapter) |
+| `TURNSTONE_SLACK_APP_TOKEN` | — | Slack App-Level token `xapp-…` (required with `TURNSTONE_SLACK_TOKEN`) |
+| `TURNSTONE_SLACK_CHANNELS` | — | Comma-separated Slack channel IDs to allow (empty = all) |
+| `TURNSTONE_SLACK_SLASH_COMMAND` | `/turnstone` | Slash command registered in the Slack app |
 
-The channel service runs in the `production` profile. When `TURNSTONE_DISCORD_TOKEN` is set, the Discord adapter connects to the Discord Gateway and routes messages to the server via HTTP. See [Channel Integrations](channels.md) for full setup instructions including Discord application creation and user account linking.
+The channel service runs in the `production` profile. When
+`TURNSTONE_DISCORD_TOKEN` or the Slack pair is set the gateway starts the
+corresponding adapter; both can run in one process. See
+[Channel Integrations](channels.md) for platform app setup and user
+account linking.
 
 ## Scaling
 
@@ -141,7 +149,9 @@ docker compose build
 docker compose build --no-cache
 ```
 
-All entry points are installed in a single image: `turnstone-server`, `turnstone-console`, `turnstone-channel`, `turnstone-admin`, `turnstone-eval`.
+All entry points are installed in a single image: `turnstone`,
+`turnstone-server`, `turnstone-console`, `turnstone-channel`,
+`turnstone-admin`, `turnstone-eval`, and `turnstone-bootstrap`.
 
 ## Cleanup
 

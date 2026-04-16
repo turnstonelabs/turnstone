@@ -26,7 +26,15 @@ transferring ownership.
 ```
 python -m venv .venv
 source .venv/bin/activate
-pip install -e ".[test]"
+pip install -e ".[test,dev]"
+```
+
+The `dev` extra installs `ruff` and `mypy`. Before pushing, run:
+
+```
+ruff check turnstone tests
+mypy turnstone
+pytest
 ```
 
 ## Guidelines

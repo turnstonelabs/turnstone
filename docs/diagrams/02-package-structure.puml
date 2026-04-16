@@ -19,7 +19,8 @@ package "Entry Points" <<Rectangle>> {
     component [cli.py\nturnstone] as cli <<entry>>
     component [server.py\nturnstone-server] as server <<entry>>
     component [eval.py\nturnstone-eval] as eval <<entry>>
-    component [chat.py\n(re-exports)] as chat <<entry>>
+    component [admin.py\nturnstone-admin] as admin <<entry>>
+    component [bootstrap.py\nturnstone-bootstrap] as bootstrap <<entry>>
 }
 
 ' Core engine
@@ -48,7 +49,8 @@ package "turnstone/core/" <<Rectangle>> {
 package "turnstone/channels/" <<Rectangle>> {
     component [_routing.py\nChannelRouter] as router <<channel>>
     component [discord/bot.py\nDiscordBot] as discordbot <<channel>>
-    component [gateway.py\nturnstone-channel] as gateway <<channel>>
+    component [slack/bot.py\nSlackBot (Socket Mode)] as slackbot <<channel>>
+    component [cli.py\nturnstone-channel] as gateway <<channel>>
 }
 
 ' Console
@@ -112,7 +114,8 @@ eval --> memory
 eval --> config
 eval --> tools
 
-chat --> session
+admin --> auth
+bootstrap --> providers
 
 ' Core internal deps
 session --> providers
@@ -135,8 +138,10 @@ tools --> schemas
 
 ' Channel dependencies
 gateway --> discordbot
+gateway --> slackbot
 gateway --> router
 discordbot --> sdkserver : HTTP + SSE
+slackbot --> sdkserver : HTTP + SSE
 router --> storage : channel_routes
 
 ' Console dependencies
