@@ -219,6 +219,22 @@ def unreserve_attachments(queue_msg_id: str, ws_id: str, user_id: str) -> None:
         log.warning("Failed to unreserve attachments", exc_info=True)
 
 
+def sweep_orphan_reservations(older_than_seconds: int) -> int:
+    """Clear ``reserved_for_msg_id`` on stale attachment rows.
+
+    Defensive cleanup for reservations leaked by process crashes between
+    ``reserve_attachments`` and ``mark_attachments_consumed`` /
+    ``unreserve_attachments``.  Returns count of rows swept.
+    """
+    if older_than_seconds <= 0:
+        return 0
+    try:
+        return get_storage().sweep_orphan_reservations(older_than_seconds)
+    except Exception:
+        log.warning("Failed to sweep orphan reservations", exc_info=True)
+        return 0
+
+
 def load_attachments_for_messages(ws_id: str) -> dict[int, list[dict[str, Any]]]:
     """Return attachments grouped by ``message_id`` for history replay."""
     try:
