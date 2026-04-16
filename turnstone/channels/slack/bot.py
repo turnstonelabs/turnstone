@@ -66,19 +66,37 @@ _GREETING = "Hey! Let me know what I can help with."
 _SSE_RECONNECT_DELAY: float = 2.0
 _SSE_MAX_RECONNECT_DELAY: float = 30.0
 
+# Slack section.text caps at 3000 chars.  Reserve headroom for the heading
+# and the "+N more" suffix; cap each preview individually so a single huge
+# tool can't crowd out the rest of a multi-tool batch.
+_APPROVAL_TEXT_BUDGET: int = 2700
+_APPROVAL_PER_ITEM_PREVIEW: int = 600
+
+
 def _sanitize_slack_preview(text: str, max_length: int = 1200) -> str:
-    """Escape Slack mrkdwn-sensitive content for safe fenced display."""
-    text = text.replace("`", "\\`")
+    """Escape Slack mrkdwn-sensitive content for safe fenced display.
+
+    Targets the *closing-fence* injection vector: any literal ```\
+    inside the content would terminate the surrounding mrkdwn fence and
+    let the rest of the preview render as live markup (mentions, links,
+    etc.).  We splice a zero-width space inside the triple sequence so
+    Slack no longer recognizes it as a fence delimiter, and escape
+    ``&<>`` for good measure.  Single backticks are kept intact so code
+    snippets in plans / tool previews remain readable.
+    """
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("```", "``\u200b`")
     if len(text) > max_length:
         return text[: max_length - 3] + "..."
     return text
+
 
 def _parse_ts(ts: str) -> tuple[int, int]:
     parts = ts.split(".", 1)
     seconds = int(parts[0])
     micros = int(parts[1]) if len(parts) > 1 else 0
     return (seconds, micros)
+
 
 @dataclass(frozen=True)
 class PendingApproval:
@@ -120,7 +138,7 @@ class StreamingMessage:
                     text=chunks[0],
                 )
             except Exception:
-                log.debug("slack.streaming_message.finalize_edit_failed")
+                log.debug("slack.streaming_message.finalize_edit_failed", exc_info=True)
 
             for chunk in chunks[1:]:
                 await self.client.chat_postMessage(
@@ -160,7 +178,7 @@ class StreamingMessage:
                     text=display,
                 )
         except Exception:
-            log.debug("slack.streaming_message.flush_failed")
+            log.debug("slack.streaming_message.flush_failed", exc_info=True)
 
         self._last_edit = time.monotonic()
 
@@ -340,6 +358,7 @@ class TurnstoneSlackBot:
             channel_type="slack",
             channel_id=route.to_channel_id(),
             name=f"slack-{slack_channel[:8]}",
+            client_type="chat",
         )
         await self.subscribe_ws(ws_id, route.to_channel_id())
         self._channel_sessions[(slack_channel, user_id)] = (ws_id, opener_ts)
@@ -367,7 +386,7 @@ class TurnstoneSlackBot:
                 text="_This session has been archived. A new one has started._",
             )
         except Exception:
-            log.debug("slack.archive_session.notify_failed", ws_id=ws_id)
+            log.debug("slack.archive_session.notify_failed", ws_id=ws_id, exc_info=True)
 
         route = SlackRoute(
             channel=slack_channel,
@@ -451,7 +470,10 @@ class TurnstoneSlackBot:
                                 ),
                             )
                         except Exception:
-                            log.debug("slack.notification_reply_dead_ws_notice_failed")
+                            log.debug(
+                                "slack.notification_reply_dead_ws_notice_failed",
+                                exc_info=True,
+                            )
                     else:
                         log.exception("slack.notification_reply_failed")
                 except Exception:
@@ -503,6 +525,7 @@ class TurnstoneSlackBot:
                 channel_type="slack",
                 channel_id=route.to_channel_id(),
                 name=f"slack-dm-{user_id[:8]}",
+                client_type="chat",
             )
             if is_new:
                 await self.subscribe_ws(ws_id, route.to_channel_id())
@@ -565,7 +588,7 @@ class TurnstoneSlackBot:
                 blocks=[],
             )
         except Exception:
-            log.debug("slack.approve_message_update_failed")
+            log.debug("slack.approve_message_update_failed", exc_info=True)
 
     async def _on_deny(self, ack: Any, body: dict[str, Any]) -> None:
         await ack()
@@ -619,7 +642,7 @@ class TurnstoneSlackBot:
                 blocks=[],
             )
         except Exception:
-            log.debug("slack.deny_message_update_failed")
+            log.debug("slack.deny_message_update_failed", exc_info=True)
 
     async def _on_plan_approve(self, ack: Any, body: dict[str, Any]) -> None:
         await ack()
@@ -645,7 +668,7 @@ class TurnstoneSlackBot:
                 blocks=[],
             )
         except Exception:
-            log.debug("slack.plan_review_approve_update_failed")
+            log.debug("slack.plan_review_approve_update_failed", exc_info=True)
 
     async def _on_plan_request_changes(self, ack: Any, body: dict[str, Any], client: Any) -> None:
         await ack()
@@ -681,7 +704,9 @@ class TurnstoneSlackBot:
             },
         )
 
-    async def _on_plan_feedback_modal(self, ack: Any, body: dict[str, Any], view: dict[str, Any]) -> None:
+    async def _on_plan_feedback_modal(
+        self, ack: Any, body: dict[str, Any], view: dict[str, Any]
+    ) -> None:
         await ack()
 
         ws_id = view.get("private_metadata", "")
@@ -717,7 +742,7 @@ class TurnstoneSlackBot:
                     blocks=[],
                 )
             except Exception:
-                log.debug("slack.plan_review_modal_update_failed")
+                log.debug("slack.plan_review_modal_update_failed", exc_info=True)
 
     async def subscribe_ws(self, ws_id: str, channel_id: str) -> None:
         if ws_id in self._subscribed_ws:
@@ -793,7 +818,7 @@ class TurnstoneSlackBot:
                             try:
                                 data = json.loads(sse.data)
                             except json.JSONDecodeError:
-                                log.debug("slack.sse_invalid_json", ws_id=ws_id)
+                                log.debug("slack.sse_invalid_json", ws_id=ws_id, exc_info=True)
                                 continue
 
                             event = ServerEvent.from_dict(data)
@@ -884,9 +909,7 @@ class TurnstoneSlackBot:
                     _tool_names = [
                         it.get("approval_label", "") or it.get("func_name", "")
                         for it in event.items
-                        if it.get("needs_approval")
-                        and it.get("func_name")
-                        and not it.get("error")
+                        if it.get("needs_approval") and it.get("func_name") and not it.get("error")
                     ]
                     _tool_names = [n for n in _tool_names if n]
                     if _tool_names:
@@ -980,16 +1003,17 @@ class TurnstoneSlackBot:
                         text="Tool approval required",
                     )
                 except Exception:
-                    log.debug("slack.verdict_message_update_failed", ws_id=ws_id)
+                    log.debug("slack.verdict_message_update_failed", ws_id=ws_id, exc_info=True)
 
         elif isinstance(event, PlanReviewEvent):
             log.info("slack.plan_review_received", ws_id=ws_id)
+            plan_preview = _sanitize_slack_preview(event.content, max_length=2000)
             blocks = [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Plan Review*\n```{event.content[:2000]}```",
+                        "text": f"*Plan Review*\n```{plan_preview}```",
                     },
                 },
                 {
@@ -1036,7 +1060,7 @@ class TurnstoneSlackBot:
                         blocks=cast("list[dict[str, Any]]", []),
                     )
                 except Exception:
-                    log.debug("slack.approval_resolved_edit_failed", ws_id=ws_id)
+                    log.debug("slack.approval_resolved_edit_failed", ws_id=ws_id, exc_info=True)
 
         elif isinstance(event, StreamEndEvent):
             sm = self._streaming.pop(ws_id, None)
@@ -1044,10 +1068,19 @@ class TurnstoneSlackBot:
             if sm is not None:
                 await sm.finalize()
 
-            reply_route = self._notify_reply_routes.get(ws_id)
-            if reply_route is not None and sm is not None and sm._ts:
-                if reply_route.channel and reply_route.user_id:
-                    self._track_notification(sm._ts, ws_id, reply_route)
+            # Pop the notification-reply override so subsequent turns on
+            # this ws default back to the session route.  Without the pop,
+            # one notification reply pins all future responses to the
+            # notification thread until the bot restarts.
+            reply_route = self._notify_reply_routes.pop(ws_id, None)
+            if (
+                reply_route is not None
+                and sm is not None
+                and sm._ts
+                and reply_route.channel
+                and reply_route.user_id
+            ):
+                self._track_notification(sm._ts, ws_id, reply_route)
 
             self._pending_approval.pop(ws_id, None)
 
@@ -1068,17 +1101,30 @@ class TurnstoneSlackBot:
         thread_ts: str,
         owner_user_id: str | None,
     ) -> None:
-        tool_lines = []
+        tool_lines: list[str] = []
+        body_len = 0
+        truncated_items = 0
         for item in items:
             raw_name = item.get("approval_label") or item.get("func_name") or "tool"
             name = raw_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
             raw_preview = item.get("preview", "")
-            preview = _sanitize_slack_preview(raw_preview) if raw_preview else ""
-
-            tool_lines.append(
-                f"• *{name}*\n```{preview}```" if preview else f"• *{name}*"
+            preview = (
+                _sanitize_slack_preview(raw_preview, max_length=_APPROVAL_PER_ITEM_PREVIEW)
+                if raw_preview
+                else ""
             )
+
+            line = f"• *{name}*\n```{preview}```" if preview else f"• *{name}*"
+            # +1 for the join newline
+            if body_len + len(line) + 1 > _APPROVAL_TEXT_BUDGET:
+                truncated_items = len(items) - len(tool_lines)
+                break
+            tool_lines.append(line)
+            body_len += len(line) + 1
+
+        if truncated_items > 0:
+            tool_lines.append(f"_…and {truncated_items} more (preview truncated)_")
 
         blocks = [
             {
