@@ -62,6 +62,28 @@ describe("TurnstoneConsole", () => {
     expect(url).toContain("page=2");
   });
 
+  it("routeCreateWorkstream rejects attachments + target_node", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      new Response("{}", {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    const client = new TurnstoneConsole({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    const data = new TextEncoder().encode("hi");
+    await expect(
+      client.routeCreateWorkstream({
+        name: "x",
+        target_node: "n1",
+        attachments: [{ filename: "a.txt", data }],
+      }),
+    ).rejects.toThrow(/target_node/);
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
   it("health returns parsed response", async () => {
     const fetchFn = mockFetch({
       status: "ok",

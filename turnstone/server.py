@@ -2081,14 +2081,196 @@ def _deliver_notification(
             time.sleep(1.0 if attempt == 0 else 3.0)
 
 
-async def create_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/new — create a new workstream."""
-    from turnstone.core.memory import get_workstream_display_name
-    from turnstone.core.web_helpers import read_json_or_400
+def _reserve_and_resolve_attachments(
+    requested_ids: list[str],
+    send_id: str,
+    ws_id: str,
+    user_id: str,
+) -> tuple[list[Any], list[str], list[str]]:
+    """Reserve attachment ids for ``send_id`` and resolve to Attachment objects.
 
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
+    Returns ``(resolved, ordered_reserved, dropped)``. ``dropped`` is the
+    subset of *requested_ids* that could not be reserved (already consumed,
+    lost a race, or cross-scope).  Used by the create-with-attachments
+    path; ``send_message`` has its own inlined variant with an
+    auto-consume fast path that reuses bytes fetched during selection.
+    """
+    from turnstone.core.attachments import Attachment
+    from turnstone.core.memory import get_attachments as _get_attachments
+    from turnstone.core.memory import reserve_attachments as _reserve
+
+    if not requested_ids:
+        return [], [], []
+
+    reserved_ids: list[str] = _reserve(requested_ids, send_id, ws_id, user_id)
+    reserved_set = set(reserved_ids)
+    ordered_reserved: list[str] = [aid for aid in requested_ids if aid in reserved_set]
+    dropped: list[str] = [aid for aid in requested_ids if aid not in reserved_set]
+
+    resolved: list[Any] = []
+    if ordered_reserved:
+        rows = _get_attachments(ordered_reserved)
+        rows_by_id = {str(r["attachment_id"]): r for r in rows}
+        for aid in ordered_reserved:
+            r = rows_by_id.get(aid)
+            if not r:
+                continue
+            if (
+                r.get("ws_id") != ws_id
+                or r.get("user_id") != user_id
+                or r.get("message_id") is not None
+                or r.get("reserved_for_msg_id") != send_id
+            ):
+                continue
+            content = r.get("content")
+            if not isinstance(content, bytes):
+                continue
+            resolved.append(
+                Attachment(
+                    attachment_id=str(r["attachment_id"]),
+                    filename=str(r.get("filename") or ""),
+                    mime_type=str(r.get("mime_type") or "application/octet-stream"),
+                    kind=str(r.get("kind") or ""),
+                    content=content,
+                )
+            )
+    return resolved, ordered_reserved, dropped
+
+
+def _validate_and_save_uploaded_files(
+    files: list[tuple[str, str, bytes]],
+    ws_id: str,
+    user_id: str,
+) -> tuple[list[str], JSONResponse | None]:
+    """Classify + save a list of ``(filename, claimed_mime, data)`` tuples.
+
+    Applies the same validation rules as ``upload_attachment`` (magic-byte
+    image sniffing, UTF-8 text decode, per-kind size cap, per-(ws,user)
+    pending cap) under the shared ``_attachment_upload_lock``.
+
+    Returns ``(attachment_ids, None)`` on success or ``(ids_saved_so_far,
+    JSONResponse)`` on the first failure so the caller can roll back any
+    partial state.
+    """
+    from turnstone.core.attachments import (
+        IMAGE_SIZE_CAP,
+        MAX_PENDING_ATTACHMENTS_PER_USER_WS,
+        TEXT_DOC_SIZE_CAP,
+    )
+    from turnstone.core.memory import list_pending_attachments, save_attachment
+
+    saved_ids: list[str] = []
+    if not files:
+        return saved_ids, None
+
+    lock = _attachment_upload_lock(ws_id, user_id)
+    with lock:
+        pending_count = len(list_pending_attachments(ws_id, user_id))
+        for filename, claimed_mime, data in files:
+            if not data:
+                return saved_ids, JSONResponse({"error": "Empty file"}, status_code=400)
+            sniffed_image = _sniff_image_mime(data)
+            if sniffed_image is not None:
+                if len(data) > IMAGE_SIZE_CAP:
+                    return saved_ids, JSONResponse(
+                        {
+                            "error": (
+                                f"Image too large ({len(data):,} bytes); "
+                                f"cap is {IMAGE_SIZE_CAP:,} bytes."
+                            ),
+                            "code": "too_large",
+                        },
+                        status_code=413,
+                    )
+                kind = "image"
+                mime = sniffed_image
+            else:
+                if len(data) > TEXT_DOC_SIZE_CAP:
+                    return saved_ids, JSONResponse(
+                        {
+                            "error": (
+                                f"Text document too large ({len(data):,} bytes); "
+                                f"cap is {TEXT_DOC_SIZE_CAP:,} bytes."
+                            ),
+                            "code": "too_large",
+                        },
+                        status_code=413,
+                    )
+                mime_or_err = _classify_text_attachment(filename, claimed_mime, data)
+                if mime_or_err[0] is None:
+                    return saved_ids, JSONResponse(
+                        {"error": mime_or_err[1], "code": "unsupported"},
+                        status_code=400,
+                    )
+                kind = "text"
+                mime = mime_or_err[0]
+
+            if pending_count + 1 > MAX_PENDING_ATTACHMENTS_PER_USER_WS:
+                return saved_ids, JSONResponse(
+                    {
+                        "error": (
+                            f"Too many pending attachments "
+                            f"(max {MAX_PENDING_ATTACHMENTS_PER_USER_WS} pending per workstream)"
+                        ),
+                        "code": "too_many",
+                    },
+                    status_code=409,
+                )
+            attachment_id = uuid.uuid4().hex
+            save_attachment(
+                attachment_id,
+                ws_id,
+                user_id,
+                filename,
+                mime,
+                len(data),
+                kind,
+                data,
+            )
+            saved_ids.append(attachment_id)
+            pending_count += 1
+    return saved_ids, None
+
+
+async def create_workstream(request: Request) -> JSONResponse:
+    """POST /v1/api/workstreams/new — create a new workstream.
+
+    Accepts two content types:
+
+    - ``application/json`` (default): body is a :class:`CreateWorkstreamRequest`.
+    - ``multipart/form-data``: one ``meta`` field (JSON object, same shape
+      as the JSON body) plus zero-or-more ``file`` parts. Files are saved
+      as attachments under the new workstream and reserved onto the first
+      ``initial_message`` turn (if provided) before the worker dispatches.
+    """
+    from turnstone.core.attachments import IMAGE_SIZE_CAP
+    from turnstone.core.memory import get_workstream_display_name
+    from turnstone.core.web_helpers import (
+        read_json_or_400,
+        read_multipart_create_or_400,
+    )
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    uploaded_files: list[tuple[str, str, bytes]] = []
+    body: dict[str, Any]
+    if content_type.startswith("multipart/form-data"):
+        # Multipart cap: up to MAX_PENDING × image cap, plus slack for
+        # JSON meta + multipart framing.  Per-file size is enforced in
+        # _validate_and_save_uploaded_files against the kind-specific cap.
+        parsed = await read_multipart_create_or_400(
+            request,
+            max_files=10,
+            max_per_file_bytes=IMAGE_SIZE_CAP,
+            max_total_bytes=10 * IMAGE_SIZE_CAP,
+        )
+        if isinstance(parsed, JSONResponse):
+            return parsed
+        body, uploaded_files = parsed
+    else:
+        json_body = await read_json_or_400(request)
+        if isinstance(json_body, JSONResponse):
+            return json_body
+        body = json_body
     mgr: WorkstreamManager = request.app.state.workstreams
     skip: bool = request.app.state.skip_permissions
     auth = getattr(getattr(request, "state", None), "auth_result", None)
@@ -2134,6 +2316,16 @@ async def create_workstream(request: Request) -> JSONResponse:
         requested_ws_id = ""
     if requested_ws_id and not _VALID_WS_ID.match(requested_ws_id):
         return JSONResponse({"error": "invalid ws_id format"}, status_code=400)
+    # Disallow attachments + resume_ws in the same request — semantics
+    # are unclear (resume forks an existing ws, but attachments are for
+    # the *fresh* turn).  Caller should resume first, then upload via
+    # the standard endpoint.  Checked before mgr.create() so we don't
+    # waste work on a request we'll reject.
+    if uploaded_files and resume_ws_id:
+        return JSONResponse(
+            {"error": "attachments cannot be combined with resume_ws"},
+            status_code=400,
+        )
     try:
         ws = mgr.create(
             name=body.get("name", ""),
@@ -2156,9 +2348,29 @@ async def create_workstream(request: Request) -> JSONResponse:
             ws.session.set_watch_runner(
                 runner, dispatch_fn=_make_watch_dispatch(ws, ws.session, ws.ui)
             )
-        # Emit creation event on global queue for SSE consumers (console)
-        display_name = get_workstream_display_name(ws.id) or ws.name
         gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
+
+        # Save attachments BEFORE the ws_created broadcast so failed
+        # validation doesn't make SSE consumers flash a workstream that
+        # never really existed.  Validate + save happens early; rollback
+        # is silent (no ws_created → no ws_closed needed).
+        attachment_ids: list[str] = []
+        if uploaded_files:
+            saved_ids, save_err = _validate_and_save_uploaded_files(uploaded_files, ws.id, uid)
+            if save_err is not None:
+                from turnstone.core.memory import delete_workstream as _delete_ws
+
+                with contextlib.suppress(Exception):
+                    mgr.close(ws.id)
+                with contextlib.suppress(Exception):
+                    _delete_ws(ws.id)
+                return save_err
+            attachment_ids = saved_ids
+
+        # Emit creation event on global queue for SSE consumers (console).
+        # Deferred until past attachment validation so a rejected create
+        # doesn't surface a phantom create→close pair.
+        display_name = get_workstream_display_name(ws.id) or ws.name
         with contextlib.suppress(queue.Full):
             gq.put_nowait(
                 {
@@ -2284,11 +2496,33 @@ async def create_workstream(request: Request) -> JSONResponse:
         initial_message = body.get("initial_message", "").strip()
         if initial_message and ws.session is not None:
             session = ws.session
+            # Reserve any attachments uploaded in this request before the
+            # worker dispatches.  Mirrors the /send endpoint pattern: the
+            # send_id token scopes both the reservation and the eventual
+            # consume.  Unreserve on worker failure so the rows don't stay
+            # soft-locked forever.
+            send_id = uuid.uuid4().hex
+            resolved_atts: list[Any] = []
+            if attachment_ids:
+                resolved_atts, _ord, _drop = _reserve_and_resolve_attachments(
+                    attachment_ids, send_id, ws.id, uid
+                )
 
             def _run_initial() -> None:
                 try:
-                    session.send(initial_message)
+                    session.send(
+                        initial_message,
+                        attachments=resolved_atts or None,
+                        send_id=send_id if resolved_atts else None,
+                    )
                 except (Exception, GenerationCancelled):
+                    if attachment_ids:
+                        from turnstone.core.memory import (
+                            unreserve_attachments as _unreserve,
+                        )
+
+                        with contextlib.suppress(Exception):
+                            _unreserve(send_id, ws.id, uid)
                     if isinstance(ws.ui, WebUI):
                         ws.ui.on_stream_end()
                         ws.ui.on_state_change("idle")
@@ -2309,6 +2543,7 @@ async def create_workstream(request: Request) -> JSONResponse:
                 "name": ws.name,
                 "resumed": resumed,
                 "message_count": message_count,
+                "attachment_ids": attachment_ids,
             }
         )
     except RuntimeError as e:

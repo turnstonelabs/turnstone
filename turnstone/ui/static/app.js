@@ -3147,6 +3147,81 @@ function switchTab(wsId) {
 var _newWsTrapHandler = null;
 var _forkFromWsId = "";
 
+// Staged files for the new-workstream modal.  Distinct from the pane's
+// chip strip: there's no ws_id yet, so we hold File objects in memory
+// and ship them all in one multipart create request on submit.
+var _newWsStagedFiles = [];
+
+// Per-kind size caps (mirrored from turnstone/core/attachments.py so the
+// browser can fail fast before uploading).  Keep in sync.
+var _NEW_WS_IMAGE_CAP = 4 * 1024 * 1024;
+var _NEW_WS_TEXT_CAP = 512 * 1024;
+var _NEW_WS_MAX_FILES = 10;
+
+function _newWsRenderChips() {
+  var chipsEl = document.getElementById("new-ws-attach-chips");
+  if (!chipsEl) return;
+  chipsEl.textContent = "";
+  for (var i = 0; i < _newWsStagedFiles.length; i++) {
+    (function (idx) {
+      var f = _newWsStagedFiles[idx];
+      var chip = document.createElement("span");
+      chip.className = "new-ws-attach-chip";
+      chip.setAttribute("role", "listitem");
+      var label = document.createElement("span");
+      label.className = "new-ws-attach-chip-name";
+      label.textContent = f.name;
+      label.title = f.name + " (" + f.size + " bytes)";
+      chip.appendChild(label);
+      var size = document.createElement("span");
+      size.className = "new-ws-attach-chip-size";
+      size.textContent = _formatAttachSize(f.size);
+      chip.appendChild(size);
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "new-ws-attach-chip-remove";
+      rm.setAttribute("aria-label", "Remove " + f.name);
+      rm.textContent = "\u00d7";
+      rm.onclick = function () {
+        _newWsStagedFiles.splice(idx, 1);
+        _newWsRenderChips();
+      };
+      chip.appendChild(rm);
+      chipsEl.appendChild(chip);
+    })(i);
+  }
+}
+
+function _formatAttachSize(n) {
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function _newWsAddFiles(files) {
+  var errEl = document.getElementById("new-ws-error");
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
+      errEl.textContent =
+        "At most " + _NEW_WS_MAX_FILES + " attachments per workstream";
+      errEl.style.display = "block";
+      return;
+    }
+    var isImage = (f.type || "").indexOf("image/") === 0;
+    var cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
+    if (f.size > cap) {
+      errEl.textContent =
+        f.name + " exceeds the " + _formatAttachSize(cap) + " cap";
+      errEl.style.display = "block";
+      return;
+    }
+    _newWsStagedFiles.push(f);
+  }
+  errEl.style.display = "none";
+  _newWsRenderChips();
+}
+
 function newWorkstream() {
   showNewWsModal();
 }
@@ -3244,12 +3319,36 @@ function showNewWsModal(forkFromWsId) {
     });
 
   document.getElementById("new-ws-name").value = "";
+  var initEl = document.getElementById("new-ws-initial-message");
+  if (initEl) initEl.value = "";
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
   errEl.textContent = "";
   var submitBtn = document.getElementById("new-ws-submit");
   submitBtn.disabled = false;
   submitBtn.textContent = _forkFromWsId ? "Fork" : "Create";
+
+  // Reset attachment staging.  Forks don't carry attachments —
+  // disable the attach UI in that case (the fork inherits its
+  // parent's history; new attachments go on the next manual send).
+  _newWsStagedFiles = [];
+  var attachRow = document.getElementById("new-ws-attach-row");
+  var attachInput = document.getElementById("new-ws-attach-input");
+  var attachBtn = document.getElementById("new-ws-attach-btn");
+  if (attachRow) attachRow.style.display = _forkFromWsId ? "none" : "";
+  if (attachInput) attachInput.value = "";
+  _newWsRenderChips();
+  if (attachBtn && attachInput) {
+    attachBtn.onclick = function () {
+      attachInput.click();
+    };
+    attachInput.onchange = function () {
+      if (attachInput.files && attachInput.files.length) {
+        _newWsAddFiles(attachInput.files);
+      }
+      attachInput.value = "";
+    };
+  }
 
   document.getElementById("new-ws-cancel").onclick = hideNewWsModal;
   submitBtn.onclick = submitNewWs;
@@ -3317,20 +3416,37 @@ function submitNewWs() {
   var model = document.getElementById("new-ws-model").value.trim();
   var judge_model = document.getElementById("new-ws-judge-model").value.trim();
   var skill = document.getElementById("new-ws-skill").value;
+  var initEl = document.getElementById("new-ws-initial-message");
+  var initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
   if (model) body.model = model;
   if (judge_model) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
+  if (initial_message) body.initial_message = initial_message;
 
   var errEl = document.getElementById("new-ws-error");
   errEl.style.display = "none";
 
-  authFetch("/v1/api/workstreams/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  })
+  var fetchOpts;
+  var staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
+  if (staged.length > 0) {
+    var form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (var i = 0; i < staged.length; i++) {
+      form.append("file", staged[i], staged[i].name);
+    }
+    // Don't set Content-Type — the browser adds the correct boundary.
+    fetchOpts = { method: "POST", body: form };
+  } else {
+    fetchOpts = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    };
+  }
+
+  authFetch("/v1/api/workstreams/new", fetchOpts)
     .then(function (r) {
       return r.json();
     })
@@ -3344,6 +3460,7 @@ function submitNewWs() {
       }
       if (data.ws_id) {
         workstreams[data.ws_id] = { name: data.name, state: "idle" };
+        _newWsStagedFiles = [];
         hideNewWsModal();
         switchTab(data.ws_id);
       }
@@ -3542,6 +3659,8 @@ function showDashboard() {
   document.getElementById("tab-bar").inert = true;
   document.getElementById("split-root").inert = true;
   loadDashboard();
+  _loadDashboardOptionsLists();
+  _refreshDashboardSubmitLabel();
   setTimeout(function () {
     document.getElementById("dashboard-input").focus();
   }, 50);
@@ -3554,6 +3673,9 @@ function hideDashboard() {
   document.getElementById("tab-bar").inert = false;
   document.getElementById("split-root").inert = false;
   document.getElementById("dashboard-input").value = "";
+  _dashboardStagedFiles = [];
+  _renderDashboardChips();
+  _refreshDashboardSubmitLabel();
   var pane = getFocusedPane();
   if (pane) pane.inputEl.focus();
 }
@@ -4323,57 +4445,237 @@ function dashboardResumeSession(wsId) {
     });
 }
 
-function dashboardNewChat() {
-  hideDashboard();
-  newWorkstream();
+// Staged files for the dashboard composer. Reuses the same file-list pattern
+// as the new-workstream modal but lives independently so the two flows don't
+// stomp on each other's state.
+var _dashboardStagedFiles = [];
+
+// Per-kind size caps mirrored from turnstone/core/attachments.py — keep in sync.
+var _DASH_IMAGE_CAP = 4 * 1024 * 1024;
+var _DASH_TEXT_CAP = 512 * 1024;
+var _DASH_MAX_FILES = 10;
+
+function _renderDashboardChips() {
+  var chipsEl = document.getElementById("dashboard-attach-chips");
+  if (!chipsEl) return;
+  chipsEl.textContent = "";
+  for (var i = 0; i < _dashboardStagedFiles.length; i++) {
+    (function (idx) {
+      var f = _dashboardStagedFiles[idx];
+      var chip = document.createElement("span");
+      chip.className = "new-ws-attach-chip";
+      chip.setAttribute("role", "listitem");
+      var label = document.createElement("span");
+      label.className = "new-ws-attach-chip-name";
+      label.textContent = f.name;
+      label.title = f.name + " (" + f.size + " bytes)";
+      chip.appendChild(label);
+      var size = document.createElement("span");
+      size.className = "new-ws-attach-chip-size";
+      size.textContent = _formatAttachSize(f.size);
+      chip.appendChild(size);
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "new-ws-attach-chip-remove";
+      rm.setAttribute("aria-label", "Remove " + f.name);
+      rm.textContent = "\u00d7";
+      rm.onclick = function () {
+        _dashboardStagedFiles.splice(idx, 1);
+        _renderDashboardChips();
+        _refreshDashboardSubmitLabel();
+      };
+      chip.appendChild(rm);
+      chipsEl.appendChild(chip);
+    })(i);
+  }
 }
 
-function dashboardSendMessage() {
+function _addDashboardFiles(files) {
+  for (var i = 0; i < files.length; i++) {
+    var f = files[i];
+    if (_dashboardStagedFiles.length >= _DASH_MAX_FILES) {
+      _dashboardError(
+        "At most " + _DASH_MAX_FILES + " attachments per workstream",
+      );
+      return;
+    }
+    var isImage = (f.type || "").indexOf("image/") === 0;
+    var cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
+    if (f.size > cap) {
+      _dashboardError(
+        f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
+      );
+      return;
+    }
+    _dashboardStagedFiles.push(f);
+  }
+  _renderDashboardChips();
+  _refreshDashboardSubmitLabel();
+}
+
+var _dashboardErrorTimer = null;
+
+function _dashboardError(msg) {
+  // Live-region message + outline.  title= alone is invisible to screen
+  // readers and on touch devices, so we surface the message visibly
+  // beneath the textarea via aria-live="polite".
   var input = document.getElementById("dashboard-input");
+  var errEl = document.getElementById("dashboard-error");
+  if (errEl) {
+    errEl.textContent = msg;
+  }
+  if (input) {
+    input.classList.add("dashboard-input-error");
+  }
+  if (_dashboardErrorTimer) clearTimeout(_dashboardErrorTimer);
+  _dashboardErrorTimer = setTimeout(function () {
+    if (input) input.classList.remove("dashboard-input-error");
+    if (errEl) errEl.textContent = "";
+    _dashboardErrorTimer = null;
+  }, 5000);
+}
+
+function _refreshDashboardSubmitLabel() {
+  var btn = document.getElementById("dashboard-submit-btn");
+  if (!btn) return;
+  var input = document.getElementById("dashboard-input");
+  var hasText = input && input.value.trim().length > 0;
+  var hasFiles = _dashboardStagedFiles.length > 0;
+  btn.textContent = hasText || hasFiles ? "Send" : "Create";
+}
+
+function _loadDashboardOptionsLists() {
+  // Models
+  var modelSel = document.getElementById("dashboard-model");
+  var judgeSel = document.getElementById("dashboard-judge-model");
+  if (modelSel && modelSel.options.length <= 1) {
+    authFetch("/v1/api/models")
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (data) {
+        (data.models || []).forEach(function (m) {
+          var opt = document.createElement("option");
+          opt.value = m.alias;
+          opt.textContent =
+            m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
+          modelSel.appendChild(opt);
+          if (judgeSel) {
+            var jOpt = document.createElement("option");
+            jOpt.value = m.alias;
+            jOpt.textContent = opt.textContent;
+            judgeSel.appendChild(jOpt);
+          }
+        });
+      })
+      .catch(function () {
+        /* default model still works */
+      });
+  }
+  // Skills
+  var skillSel = document.getElementById("dashboard-skill");
+  if (skillSel && skillSel.options.length <= 1) {
+    authFetch("/v1/api/skills")
+      .then(function (r) {
+        return r.json();
+      })
+      .then(function (data) {
+        (data.skills || []).forEach(function (t) {
+          var opt = document.createElement("option");
+          opt.value = t.name;
+          var label = t.name;
+          if (t.is_default) label += " (default)";
+          if (t.origin === "mcp") label += " [MCP]";
+          opt.textContent = label;
+          skillSel.appendChild(opt);
+        });
+      })
+      .catch(function () {
+        /* ignore */
+      });
+  }
+}
+
+function _toggleDashboardOptions() {
+  var panel = document.getElementById("dashboard-options");
+  var btn = document.getElementById("dashboard-options-btn");
+  if (!panel || !btn) return;
+  var open = !panel.hasAttribute("hidden");
+  if (open) {
+    panel.setAttribute("hidden", "");
+    btn.setAttribute("aria-expanded", "false");
+  } else {
+    panel.removeAttribute("hidden");
+    btn.setAttribute("aria-expanded", "true");
+  }
+}
+
+// Unified dashboard submit. Replaces the old "click button → modal" +
+// "press Enter → quick-send-empty-config" split. One path: build the
+// create payload from text + attachments + options, send it, switch.
+function dashboardSubmit() {
+  var input = document.getElementById("dashboard-input");
+  var btn = document.getElementById("dashboard-submit-btn");
   var text = input.value.trim();
-  if (!text) return;
+  var staged = _dashboardStagedFiles.slice();
+
+  var body = {};
+  var model = document.getElementById("dashboard-model").value.trim();
+  var judge = document.getElementById("dashboard-judge-model").value.trim();
+  var skill = document.getElementById("dashboard-skill").value;
+  if (model) body.model = model;
+  if (judge) body.judge_model = judge;
+  if (skill) body.skill = skill;
+  if (text) body.initial_message = text;
+
   input.disabled = true;
-  var btn = document.querySelector(".dashboard-new-btn");
   btn.disabled = true;
-  authFetch("/v1/api/workstreams/new", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: "{}",
-  })
+
+  var fetchOpts;
+  if (staged.length > 0) {
+    var form = new FormData();
+    form.append("meta", JSON.stringify(body));
+    for (var i = 0; i < staged.length; i++) {
+      form.append("file", staged[i], staged[i].name);
+    }
+    fetchOpts = { method: "POST", body: form };
+  } else {
+    fetchOpts = {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    };
+  }
+
+  authFetch("/v1/api/workstreams/new", fetchOpts)
     .then(function (r) {
       return r.json();
     })
     .then(function (data) {
-      if (!data.ws_id) {
-        input.disabled = false;
-        btn.disabled = false;
+      input.disabled = false;
+      btn.disabled = false;
+      if (data.error || !data.ws_id) {
+        _dashboardError(data.error || "Failed to create workstream");
         return;
       }
       workstreams[data.ws_id] = { name: data.name, state: "idle" };
       switchTab(data.ws_id);
       hideDashboard();
-      input.disabled = false;
-      btn.disabled = false;
-      var pane = getFocusedPane();
-      if (pane) {
-        pane.setBusy(true);
-        pane.addUserMessage(text);
-      }
-      authFetch("/v1/api/send", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, ws_id: data.ws_id }),
-      }).catch(function (err) {
-        var p = getFocusedPane();
-        if (p) {
-          p.addErrorMessage("Connection error: " + err.message);
-          p.setBusy(false);
+      // If we sent an initial_message, the server's worker thread already
+      // dispatched it. Echo into the pane so the user sees their own text
+      // immediately rather than waiting for SSE to backfill.
+      if (text) {
+        var pane = getFocusedPane();
+        if (pane) {
+          pane.setBusy(true);
+          pane.addUserMessage(text);
         }
-      });
+      }
     })
-    .catch(function () {
+    .catch(function (err) {
       input.disabled = false;
       btn.disabled = false;
+      _dashboardError("Connection error: " + (err && err.message));
     });
 }
 
@@ -5229,14 +5531,81 @@ document
   .getElementById("plan-feedback")
   .addEventListener("input", _updatePlanRejectBtn);
 
-document
-  .getElementById("dashboard-input")
-  .addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) {
+// Dashboard composer wiring — Enter (no shift) submits, input refreshes the
+// button label, paperclip + drag-drop + paste-image stage files, options
+// toggle expands the dropdown panel.
+(function () {
+  var input = document.getElementById("dashboard-input");
+  var attachBtn = document.getElementById("dashboard-attach-btn");
+  var attachInput = document.getElementById("dashboard-attach-input");
+  var optionsBtn = document.getElementById("dashboard-options-btn");
+  var composer = document.getElementById("dashboard-composer");
+  if (!input) return;
+
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey) {
       e.preventDefault();
-      dashboardSendMessage();
+      dashboardSubmit();
     }
   });
+  input.addEventListener("input", _refreshDashboardSubmitLabel);
+  input.addEventListener("paste", function (e) {
+    if (!e.clipboardData) return;
+    var items = e.clipboardData.items || [];
+    var pasted = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind === "file") {
+        var f = items[i].getAsFile();
+        if (f) pasted.push(f);
+      }
+    }
+    if (pasted.length) {
+      e.preventDefault();
+      _addDashboardFiles(pasted);
+    }
+  });
+
+  if (attachBtn && attachInput) {
+    attachBtn.addEventListener("click", function () {
+      attachInput.click();
+    });
+    attachInput.addEventListener("change", function () {
+      if (attachInput.files && attachInput.files.length) {
+        _addDashboardFiles(attachInput.files);
+      }
+      attachInput.value = "";
+    });
+  }
+  if (optionsBtn) {
+    optionsBtn.addEventListener("click", _toggleDashboardOptions);
+  }
+  if (composer) {
+    composer.addEventListener("dragover", function (e) {
+      if (
+        e.dataTransfer &&
+        Array.from(e.dataTransfer.types || []).includes("Files")
+      ) {
+        e.preventDefault();
+        composer.classList.add("dashboard-composer-drop");
+      }
+    });
+    composer.addEventListener("dragleave", function (e) {
+      if (e.target === composer)
+        composer.classList.remove("dashboard-composer-drop");
+    });
+    composer.addEventListener("drop", function (e) {
+      composer.classList.remove("dashboard-composer-drop");
+      if (
+        e.dataTransfer &&
+        e.dataTransfer.files &&
+        e.dataTransfer.files.length
+      ) {
+        e.preventDefault();
+        _addDashboardFiles(e.dataTransfer.files);
+      }
+    });
+  }
+})();
 
 document.addEventListener("keydown", function (e) {
   // Defer to modal's own keydown handler when any modal is open

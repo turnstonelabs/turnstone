@@ -11,6 +11,7 @@ Usage::
 
 from __future__ import annotations
 
+import secrets
 from typing import TYPE_CHECKING, Any
 
 from turnstone.api.console_schemas import (
@@ -57,6 +58,10 @@ from turnstone.api.schemas import (
     ScheduleInfo,
     StatusResponse,
 )
+from turnstone.api.server_schemas import (
+    ListAttachmentsResponse,
+    UploadAttachmentResponse,
+)
 from turnstone.sdk._base import _BaseClient
 from turnstone.sdk._sync import _SyncRunner
 from turnstone.sdk.events import ClusterEvent
@@ -67,6 +72,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator
 
     import httpx
+
+    from turnstone.sdk._types import AttachmentUpload
 
 
 class AsyncTurnstoneConsole(_BaseClient):
@@ -209,11 +216,16 @@ class AsyncTurnstoneConsole(_BaseClient):
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        ws_id: str = "",
+        attachments: list[AttachmentUpload] | None = None,
     ) -> dict[str, Any]:
         """Create a workstream via the console's routing proxy.
 
-        Posts to /v1/api/route/workstreams/new. Returns the full response
-        dict including node_url and node_id.
+        Posts to /v1/api/route/workstreams/new.  When *attachments* is
+        non-empty, the request is sent as multipart and the console
+        routes via ``?ws_id=<hex>`` (auto-generated when not supplied)
+        so the body lands on the owning node directly.  Returns the
+        full response dict including ``node_url`` and ``node_id``.
         """
         body: dict[str, Any] = {}
         if name:
@@ -236,7 +248,87 @@ class AsyncTurnstoneConsole(_BaseClient):
             body["user_id"] = user_id
         if client_type:
             body["client_type"] = client_type
+
+        if attachments:
+            # The console's multipart route_create routes by `?ws_id=` only —
+            # it does not parse the body to honor `target_node`.  Refuse the
+            # combination at the SDK boundary so callers don't silently get
+            # routed to the wrong node.
+            if target_node:
+                raise ValueError(
+                    "target_node is not supported with attachments; "
+                    "use ws_id (caller-generated to hash to the desired node) instead"
+                )
+            if not ws_id:
+                ws_id = secrets.token_hex(16)
+            body["ws_id"] = ws_id
+            import json as _json
+
+            files: list[tuple[str, tuple[str, bytes, str]]] = [
+                (
+                    "file",
+                    (
+                        att.filename,
+                        att.data,
+                        att.mime_type or "application/octet-stream",
+                    ),
+                )
+                for att in attachments
+            ]
+            return await self._request(
+                "POST",
+                "/v1/api/route/workstreams/new",
+                files=files,
+                data={"meta": _json.dumps(body)},
+                params={"ws_id": ws_id},
+            )
+
+        if ws_id:
+            body["ws_id"] = ws_id
         return await self._request("POST", "/v1/api/route/workstreams/new", json_body=body)
+
+    # -- routing proxy: attachments -----------------------------------------
+
+    async def route_upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        files: list[tuple[str, tuple[str, bytes, str]]] = [
+            (
+                "file",
+                (filename, data, mime_type or "application/octet-stream"),
+            )
+        ]
+        return await self._request(
+            "POST",
+            f"/v1/api/route/workstreams/{ws_id}/attachments",
+            files=files,
+            response_model=UploadAttachmentResponse,
+        )
+
+    async def route_list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        return await self._request(
+            "GET",
+            f"/v1/api/route/workstreams/{ws_id}/attachments",
+            response_model=ListAttachmentsResponse,
+        )
+
+    async def route_get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        return await self._request_bytes(
+            "GET",
+            f"/v1/api/route/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        )
+
+    async def route_delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        return await self._request(
+            "DELETE",
+            f"/v1/api/route/workstreams/{ws_id}/attachments/{attachment_id}",
+            response_model=StatusResponse,
+        )
 
     async def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
         """Send a message via the routing proxy."""
@@ -1079,6 +1171,8 @@ class TurnstoneConsole:
         target_node: str = "",
         user_id: str = "",
         client_type: str = "",
+        ws_id: str = "",
+        attachments: list[AttachmentUpload] | None = None,
     ) -> dict[str, Any]:
         return self._runner.run(
             self._async.route_create_workstream(
@@ -1092,11 +1186,36 @@ class TurnstoneConsole:
                 target_node=target_node,
                 user_id=user_id,
                 client_type=client_type,
+                ws_id=ws_id,
+                attachments=attachments,
             )
         )
 
     def route_send(self, message: str, ws_id: str) -> dict[str, Any]:
         return self._runner.run(self._async.route_send(message, ws_id))
+
+    # -- routing proxy: attachments -----------------------------------------
+
+    def route_upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        return self._runner.run(
+            self._async.route_upload_attachment(ws_id, filename, data, mime_type=mime_type)
+        )
+
+    def route_list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        return self._runner.run(self._async.route_list_attachments(ws_id))
+
+    def route_get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        return self._runner.run(self._async.route_get_attachment_content(ws_id, attachment_id))
+
+    def route_delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        return self._runner.run(self._async.route_delete_attachment(ws_id, attachment_id))
 
     def route_approve(
         self,

@@ -1025,6 +1025,78 @@ body { position: static; }
 .pane-attach-chip-remove:hover { color: var(--red, #c94040); background: var(--bg-surface); }
 .pane-attach-chip-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
+/* New-workstream modal: attachment row + chips */
+#new-ws-attach-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+#new-ws-attach-btn {
+  align-self: flex-start;
+  padding: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  cursor: pointer;
+}
+#new-ws-attach-btn:hover { background: var(--bg-surface); }
+#new-ws-attach-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#new-ws-attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#new-ws-attach-chips:empty { display: none; }
+.new-ws-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 8px 3px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 280px;
+}
+.new-ws-attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 180px;
+}
+.new-ws-attach-chip-size { color: var(--fg-dim, var(--fg)); opacity: 0.65; font-size: 10px; }
+.new-ws-attach-chip-remove {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: none;
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.new-ws-attach-chip-remove:hover { color: var(--red, #c94040); background: var(--bg-surface); }
+.new-ws-attach-chip-remove:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#new-ws-initial-message {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  resize: vertical;
+  min-height: 60px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 6px 8px;
+  box-sizing: border-box;
+}
+
 /* Drag-and-drop visual state on the pane */
 .pane.pane-drop-target {
   outline: 2px dashed var(--accent);
@@ -1538,21 +1610,132 @@ audio.media-player {
 .dashboard-overlay { display: none; position: fixed; inset: 0; background: var(--bg); z-index: 50; overflow-y: auto; }
 .dashboard-overlay.active { display: flex; justify-content: center; align-items: flex-start; }
 .dashboard-content { width: 100%; max-width: 960px; padding: 32px 20px 24px; }
-.dashboard-input-row { display: flex; gap: 8px; margin-bottom: 24px; }
-.dashboard-input {
-  flex: 1;
+.dashboard-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 24px;
   background: var(--bg-surface);
-  color: var(--fg);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
-  padding: 12px 16px;
+  padding: 10px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.dashboard-composer:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+.dashboard-composer-drop {
+  border-style: dashed;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow-strong);
+  background: var(--accent-glow);
+}
+.dashboard-input {
+  background: transparent;
+  color: var(--fg);
+  border: none;
+  /* Hairline below the textarea so it reads as an input even before focus */
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  padding: 6px 8px;
   font: inherit;
   font-size: 14px;
   outline: none;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  resize: vertical;
+  min-height: 60px;
+  font-family: var(--font-mono);
 }
-.dashboard-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
 .dashboard-input::placeholder { color: var(--fg-dim); }
+.dashboard-input.dashboard-input-error {
+  outline: 2px solid var(--red);
+  outline-offset: -1px;
+}
+.dashboard-error {
+  color: var(--red);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  min-height: 14px;
+  padding: 0 4px;
+}
+.dashboard-error:empty { display: none; }
+.dashboard-options-caret {
+  font-size: 9px;
+  opacity: 0.7;
+  transition: transform 0.15s;
+}
+.dashboard-options-btn[aria-expanded="true"] .dashboard-options-caret {
+  transform: rotate(180deg);
+  display: inline-block;
+}
+.dashboard-composer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 4px;
+}
+.dashboard-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dashboard-icon-btn {
+  background: transparent;
+  color: var(--fg-dim, var(--fg));
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  /* Larger comfortable hit target without growing the visible chrome */
+  min-height: 28px;
+}
+.dashboard-icon-btn:hover { color: var(--fg); background: var(--bg); }
+.dashboard-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dashboard-options-btn[aria-expanded="true"] {
+  color: var(--fg);
+  background: var(--bg);
+}
+#dashboard-attach-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 4px;
+}
+#dashboard-attach-chips:empty { display: none; }
+.dashboard-options {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  align-items: center;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.dashboard-options[hidden] { display: none; }
+.dashboard-options label {
+  color: var(--fg-dim, var(--fg));
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+.dashboard-options select {
+  background: var(--bg-surface);
+  color: var(--fg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
 .dashboard-new-btn {
   background: var(--accent);
   color: var(--bg);
@@ -1779,8 +1962,15 @@ audio.media-player {
   .dash-row-sub { padding-left: 76px; }
 }
 @media (max-width: 600px) {
-  .dashboard-input-row { flex-direction: column; }
-  .dashboard-new-btn { width: 100%; }
+  /* Drop the row constraint and let composer children flow vertically so
+     Send can naturally come after chips + options instead of breaking the
+     reading order with a giant button mid-card. */
+  .dashboard-composer-row { display: contents; }
+  .dashboard-composer-actions { order: 2; justify-content: flex-start; }
+  .dashboard-composer #dashboard-error { order: 3; }
+  .dashboard-composer #dashboard-attach-chips { order: 4; }
+  .dashboard-composer .dashboard-options { order: 5; }
+  .dashboard-composer .dashboard-new-btn { order: 6; width: 100%; }
 }
 @media (max-width: 480px) {
   .dashboard-content { padding: 24px 12px 16px; }

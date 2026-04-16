@@ -50,10 +50,53 @@ export interface AuthSetupResponse {
 export interface SendRequest {
   message: string;
   ws_id: string;
+  /**
+   * Explicit list of pending attachment ids to inject into this turn.
+   * When omitted, any pending attachments for the caller on the
+   * workstream are auto-consumed; an empty list disables auto-consume.
+   */
+  attachment_ids?: string[];
 }
 
 export interface SendResponse {
   status: string;
+  attached_ids?: string[];
+  dropped_attachment_ids?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Server API — Attachments
+// ---------------------------------------------------------------------------
+
+/** A file to upload as an attachment. */
+export interface AttachmentUpload {
+  filename: string;
+  /** Raw file bytes; use a `Blob` in browsers and a `Uint8Array` in Node. */
+  data: Blob | Uint8Array;
+  /** Optional advisory MIME type; the server applies its own validation. */
+  mimeType?: string;
+}
+
+export interface AttachmentInfo {
+  attachment_id: string;
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  /** "image" or "text". */
+  kind: string;
+}
+
+export type UploadAttachmentResponse = AttachmentInfo;
+
+export interface ListAttachmentsResponse {
+  attachments: AttachmentInfo[];
+}
+
+/** Raw bytes returned from the attachment `/content` endpoint. */
+export interface AttachmentContent {
+  bytes: Uint8Array;
+  contentType: string;
+  filename: string;
 }
 
 export interface ApproveRequest {
@@ -79,6 +122,20 @@ export interface CreateWorkstreamRequest {
   auto_approve?: boolean;
   resume_ws?: string;
   skill?: string;
+  /** First user message dispatched in a background worker after creation. */
+  initial_message?: string;
+  /**
+   * Caller-supplied workstream id (32-hex). Auto-generated when omitted.
+   * Required for cluster-routed multipart creates so the console can
+   * hash to the owning node before the body lands.
+   */
+  ws_id?: string;
+  /**
+   * Files to attach to the first turn. When non-empty the request is
+   * sent as multipart/form-data and (with `initial_message`) reserved
+   * onto that turn before the worker dispatches.
+   */
+  attachments?: AttachmentUpload[];
 }
 
 export interface CreateWorkstreamResponse {
@@ -86,6 +143,8 @@ export interface CreateWorkstreamResponse {
   name: string;
   resumed?: boolean;
   message_count?: number;
+  /** Ids of attachments saved by this request (multipart variant only). */
+  attachment_ids?: string[];
 }
 
 export interface CloseWorkstreamRequest {

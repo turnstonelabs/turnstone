@@ -83,6 +83,8 @@ class _BaseClient:
         *,
         json_body: dict[str, Any] | None = ...,
         params: dict[str, Any] | None = ...,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
+        data: dict[str, Any] | None = ...,
         response_model: type[T],
     ) -> T: ...
 
@@ -94,6 +96,8 @@ class _BaseClient:
         *,
         json_body: dict[str, Any] | None = ...,
         params: dict[str, Any] | None = ...,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = ...,
+        data: dict[str, Any] | None = ...,
         response_model: None = ...,
     ) -> dict[str, Any]: ...
 
@@ -104,22 +108,40 @@ class _BaseClient:
         *,
         json_body: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+        data: dict[str, Any] | None = None,
         response_model: type[Any] | None = None,
     ) -> Any:
         """Execute an HTTP request and return parsed response data.
 
-        Raises :class:`TurnstoneAPIError` on non-2xx responses.
+        When *files* is provided, the request is sent as
+        ``multipart/form-data`` with the named file parts (and any
+        *data* fields as plain form fields).  Mutually exclusive with
+        *json_body*.  Raises :class:`TurnstoneAPIError` on non-2xx
+        responses.
         """
         headers: dict[str, str] | None = None
         if self._token_factory is not None:
             headers = {"Authorization": f"Bearer {self._token_factory()}"}
-        resp = await self._client.request(
-            method,
-            path,
-            json=json_body,
-            params=params,
-            headers=headers,
-        )
+        if files is not None:
+            # httpx infers multipart from the files= kwarg and sets the
+            # Content-Type + boundary itself; do not pass json= alongside.
+            resp = await self._client.request(
+                method,
+                path,
+                files=files,
+                data=data,
+                params=params,
+                headers=headers,
+            )
+        else:
+            resp = await self._client.request(
+                method,
+                path,
+                json=json_body,
+                params=params,
+                headers=headers,
+            )
         if resp.status_code >= 400:
             # Try to extract error message from JSON body
             msg = ""
@@ -129,10 +151,37 @@ class _BaseClient:
             if not msg:
                 msg = resp.text[:200]
             raise TurnstoneAPIError(resp.status_code, msg)
-        data: dict[str, Any] = resp.json()
+        body_data: dict[str, Any] = resp.json()
         if response_model is not None:
-            return response_model.model_validate(data)
-        return data
+            return response_model.model_validate(body_data)
+        return body_data
+
+    async def _request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        """Execute a request and return the raw response bytes.
+
+        Used for endpoints like the attachment ``/content`` route that
+        return arbitrary binary or text payloads with their own
+        ``Content-Type``.  Raises :class:`TurnstoneAPIError` on non-2xx.
+        """
+        headers: dict[str, str] | None = None
+        if self._token_factory is not None:
+            headers = {"Authorization": f"Bearer {self._token_factory()}"}
+        resp = await self._client.request(method, path, params=params, headers=headers)
+        if resp.status_code >= 400:
+            msg = ""
+            with contextlib.suppress(Exception):
+                body = resp.json()
+                msg = body.get("error", body.get("detail", ""))
+            if not msg:
+                msg = resp.text[:200]
+            raise TurnstoneAPIError(resp.status_code, msg)
+        return resp.content
 
     async def _stream_sse(
         self,

@@ -468,6 +468,27 @@ async def test_route_create_workstream():
 
 
 @pytest.mark.anyio
+async def test_route_create_workstream_rejects_attachments_with_target_node():
+    """Regression: target_node has no effect on multipart route_create
+    (which routes by ?ws_id=) — refuse the combination at the SDK boundary
+    instead of silently routing to the wrong node.
+    """
+    from turnstone.sdk._types import AttachmentUpload
+
+    transport = httpx.MockTransport(
+        lambda req: _json_response({"error": "should not be called"}, status=500)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneConsole(httpx_client=hc)
+        with pytest.raises(ValueError, match="target_node"):
+            await client.route_create_workstream(
+                name="x",
+                target_node="n1",
+                attachments=[AttachmentUpload(filename="a.txt", data=b"hi")],
+            )
+
+
+@pytest.mark.anyio
 async def test_route_create_workstream_omits_defaults():
     captured_body: dict = {}
 

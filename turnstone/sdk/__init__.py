@@ -12,7 +12,7 @@ Quick start::
 
 from __future__ import annotations
 
-from turnstone.sdk._types import TurnResult, TurnstoneAPIError
+from turnstone.sdk._types import AttachmentUpload, TurnResult, TurnstoneAPIError
 from turnstone.sdk.console import AsyncTurnstoneConsole, TurnstoneConsole
 from turnstone.sdk.events import (
     ApproveRequestEvent,
@@ -54,6 +54,7 @@ __all__ = [
     "AsyncTurnstoneConsole",
     "TurnstoneConsole",
     # Result types
+    "AttachmentUpload",
     "TurnResult",
     "TurnstoneAPIError",
     # Server events

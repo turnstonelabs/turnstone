@@ -625,7 +625,13 @@ def _record_route(
 
 
 async def route_create(request: Request) -> Response:
-    """POST /v1/api/route/workstreams/new — create via hash-ring routing."""
+    """POST /v1/api/route/workstreams/new — create via hash-ring routing.
+
+    Accepts both `application/json` and `multipart/form-data`. Multipart
+    callers must include ``?ws_id=<hex>`` in the URL query string so the
+    console can hash to the owning node before the multipart body lands —
+    we do not parse the body just to peek at the metadata.
+    """
     t0 = time.monotonic()
     router: ConsoleRouter | None = request.app.state.router
     ring_ready = router is not None and router.is_ready()
@@ -649,88 +655,102 @@ async def route_create(request: Request) -> Response:
             )
     assert router is not None
 
-    try:
-        body = await request.json()
-    except Exception:
-        return _record_route(
-            request,
-            "create",
-            400,
-            t0,
-            JSONResponse(
-                {"error": "Invalid JSON body"},
-                status_code=400,
-            ),
-        )
-
+    raw_content_type = request.headers.get("content-type") or ""
+    is_multipart = raw_content_type.lower().startswith("multipart/form-data")
     client: httpx.AsyncClient = request.app.state.proxy_client
     headers = _proxy_auth_headers(request)
     pin = False
+    body: dict[str, Any] = {}
+    raw_body: bytes = b""
 
-    try:
-        if body.get("resume_ws"):
-            ref = router.route(body["resume_ws"])
-        elif body.get("target_node"):
-            ws_id = router.generate_ws_id_for_node(body["target_node"])
-            body["ws_id"] = ws_id
-            ref = router.route(ws_id)
-            pin = True
-        else:
-            ws_id = secrets.token_hex(16)
-            body["ws_id"] = ws_id
-            ref = router.route(ws_id)
-    except NoAvailableNodeError:
-        return _record_route(
-            request,
-            "create",
-            503,
-            t0,
-            JSONResponse(
-                {"error": "No available node for routing"},
-                status_code=503,
-            ),
-        )
-
-    try:
-        resp = await client.post(f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers)
-    except httpx.HTTPError:
-        return _record_route(
-            request,
-            "create",
-            502,
-            t0,
-            JSONResponse(
-                {"error": f"upstream node {ref.node_id} unreachable"},
-                status_code=502,
-            ),
-        )
-
-    # 503 retry with a new ws_id that hashes to a different node
-    if resp.status_code == 503 and not pin and not body.get("resume_ws"):
-        failed_node = ref.node_id
-        found_alt = False
-        for _ in range(10):
-            ws_id = secrets.token_hex(16)
-            try:
-                ref = router.route(ws_id)
-            except NoAvailableNodeError:
-                break
-            if ref.node_id != failed_node:
-                found_alt = True
-                break
-        if not found_alt:
+    if is_multipart:
+        # Multipart: caller must pass ws_id as a query param so we can
+        # route without parsing the body.  Stream the raw bytes through
+        # to the upstream so we don't lose the multipart framing.
+        ws_id = request.query_params.get("ws_id", "").strip()
+        if not ws_id:
             return _record_route(
                 request,
                 "create",
-                resp.status_code,
+                400,
                 t0,
-                Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    headers=dict(resp.headers),
+                JSONResponse(
+                    {"error": "ws_id query parameter required for multipart create"},
+                    status_code=400,
                 ),
             )
-        body["ws_id"] = ws_id
+        try:
+            ref = router.route(ws_id)
+        except NoAvailableNodeError:
+            return _record_route(
+                request,
+                "create",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "No available node for routing"},
+                    status_code=503,
+                ),
+            )
+        raw_body = await request.body()
+        # Forward the raw header verbatim — the multipart `boundary=` parameter
+        # is case-sensitive and must match the bytes in the body exactly.
+        upstream_headers = {**headers, "Content-Type": raw_content_type}
+        try:
+            resp = await client.post(
+                f"{ref.url}/v1/api/workstreams/new",
+                content=raw_body,
+                headers=upstream_headers,
+            )
+        except httpx.HTTPError:
+            return _record_route(
+                request,
+                "create",
+                502,
+                t0,
+                JSONResponse(
+                    {"error": f"upstream node {ref.node_id} unreachable"},
+                    status_code=502,
+                ),
+            )
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "Invalid JSON body"},
+                    status_code=400,
+                ),
+            )
+        try:
+            if body.get("resume_ws"):
+                ref = router.route(body["resume_ws"])
+            elif body.get("target_node"):
+                ws_id = router.generate_ws_id_for_node(body["target_node"])
+                body["ws_id"] = ws_id
+                ref = router.route(ws_id)
+                pin = True
+            else:
+                ws_id = secrets.token_hex(16)
+                body["ws_id"] = ws_id
+                ref = router.route(ws_id)
+        except NoAvailableNodeError:
+            return _record_route(
+                request,
+                "create",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "No available node for routing"},
+                    status_code=503,
+                ),
+            )
+
         try:
             resp = await client.post(
                 f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
@@ -747,6 +767,50 @@ async def route_create(request: Request) -> Response:
                 ),
             )
 
+        # 503 retry with a new ws_id that hashes to a different node.
+        # Multipart variant skips this branch — the body is bound to the
+        # ws_id the caller chose, so re-routing would mean re-uploading.
+        if resp.status_code == 503 and not pin and not body.get("resume_ws"):
+            failed_node = ref.node_id
+            found_alt = False
+            for _ in range(10):
+                ws_id = secrets.token_hex(16)
+                try:
+                    ref = router.route(ws_id)
+                except NoAvailableNodeError:
+                    break
+                if ref.node_id != failed_node:
+                    found_alt = True
+                    break
+            if not found_alt:
+                return _record_route(
+                    request,
+                    "create",
+                    resp.status_code,
+                    t0,
+                    Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        headers=dict(resp.headers),
+                    ),
+                )
+            body["ws_id"] = ws_id
+            try:
+                resp = await client.post(
+                    f"{ref.url}/v1/api/workstreams/new", json=body, headers=headers
+                )
+            except httpx.HTTPError:
+                return _record_route(
+                    request,
+                    "create",
+                    502,
+                    t0,
+                    JSONResponse(
+                        {"error": f"upstream node {ref.node_id} unreachable"},
+                        status_code=502,
+                    ),
+                )
+
     if resp.status_code == 200:
         data = resp.json()
         data["node_url"] = ref.url
@@ -761,6 +825,132 @@ async def route_create(request: Request) -> Response:
             content=resp.content,
             status_code=resp.status_code,
             headers=dict(resp.headers),
+        ),
+    )
+
+
+async def route_attachment_proxy(request: Request) -> Response:
+    """Proxy ws-id-keyed attachment endpoints through the hash-ring router.
+
+    Handles all four shapes mounted under
+    ``/v1/api/route/workstreams/{ws_id}/attachments[/...]``:
+
+    - ``POST .../attachments`` — multipart upload (raw-body forward)
+    - ``GET  .../attachments`` — list pending (JSON pass-through)
+    - ``GET  .../attachments/{attachment_id}/content`` — raw bytes
+    - ``DELETE .../attachments/{attachment_id}`` — JSON pass-through
+
+    All variants forward ``Content-Type`` + auth headers so multipart
+    framing survives, and propagate upstream response headers so the
+    ``Content-Disposition`` / ``X-Content-Type-Options`` set by
+    ``get_attachment_content`` reach the original caller intact.
+    """
+    method = "attach"
+    t0 = time.monotonic()
+    router: ConsoleRouter | None = request.app.state.router
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                method,
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
+
+    ws_id = request.path_params.get("ws_id", "").strip()
+    if not ws_id:
+        return _record_route(
+            request,
+            method,
+            400,
+            t0,
+            JSONResponse({"error": "ws_id required"}, status_code=400),
+        )
+    try:
+        ref = router.route(ws_id)
+    except (NoAvailableNodeError, ValueError):
+        return _record_route(
+            request,
+            method,
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+
+    upstream_path = request.url.path.replace("/api/route/", "/api/", 1)
+    if request.url.query:
+        upstream_path += f"?{request.url.query}"
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    upstream_headers: dict[str, str] = dict(headers)
+    if request.method in ("POST", "PUT", "DELETE"):
+        upstream_headers["Content-Type"] = request.headers.get(
+            "content-type", "application/octet-stream"
+        )
+        body = await request.body()
+        try:
+            resp = await client.request(
+                request.method,
+                f"{ref.url}{upstream_path}",
+                content=body,
+                headers=upstream_headers,
+            )
+        except httpx.HTTPError:
+            return _record_route(
+                request,
+                method,
+                502,
+                t0,
+                JSONResponse(
+                    {"error": f"upstream node {ref.node_id} unreachable"},
+                    status_code=502,
+                ),
+            )
+    else:
+        try:
+            resp = await client.get(f"{ref.url}{upstream_path}", headers=upstream_headers)
+        except httpx.HTTPError:
+            return _record_route(
+                request,
+                method,
+                502,
+                t0,
+                JSONResponse(
+                    {"error": f"upstream node {ref.node_id} unreachable"},
+                    status_code=502,
+                ),
+            )
+
+    # Preserve upstream headers — Content-Disposition + CSP set by the
+    # /content handler must reach the original caller, and the upstream
+    # already produced the correct Content-Type for both JSON and binary
+    # payloads.  Drop hop-by-hop headers that the underlying transport
+    # will manage itself.
+    response_headers = {
+        k: v
+        for k, v in resp.headers.items()
+        if k.lower()
+        not in {"transfer-encoding", "content-encoding", "connection", "content-length"}
+    }
+    return _record_route(
+        request,
+        method,
+        resp.status_code,
+        t0,
+        Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=response_headers,
         ),
     )
 
@@ -7453,6 +7643,21 @@ def create_app(
                     Route("/api/route/command", route_proxy, methods=["POST"]),
                     Route("/api/route/plan", route_proxy, methods=["POST"]),
                     Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/attachments",
+                        route_attachment_proxy,
+                        methods=["POST", "GET"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/attachments/{attachment_id}",
+                        route_attachment_proxy,
+                        methods=["DELETE"],
+                    ),
+                    Route(
+                        "/api/route/workstreams/{ws_id}/attachments/{attachment_id}/content",
+                        route_attachment_proxy,
+                        methods=["GET"],
+                    ),
                     Route("/api/route", route_lookup, methods=["GET"]),
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),

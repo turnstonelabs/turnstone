@@ -28,10 +28,38 @@
 
 <div id="dashboard" class="dashboard-overlay" role="dialog" aria-modal="true" aria-label="Dashboard">
   <div class="dashboard-content">
-    <div class="dashboard-input-row">
-      <input type="text" id="dashboard-input" class="dashboard-input"
-             placeholder="What are you working on?" aria-label="Start a new conversation">
-      <button class="dashboard-new-btn" onclick="dashboardNewChat()" aria-label="New empty chat">New Chat</button>
+    <div class="dashboard-composer" id="dashboard-composer">
+      <textarea id="dashboard-input" class="dashboard-input" rows="3"
+                placeholder="What are you working on?"
+                aria-label="Start a new conversation"></textarea>
+      <div class="dashboard-composer-row">
+        <div class="dashboard-composer-actions">
+          <button id="dashboard-attach-btn" class="dashboard-icon-btn" type="button"
+                  title="Attach files" aria-label="Attach files">
+            <span aria-hidden="true">&#128206;</span>
+          </button>
+          <input id="dashboard-attach-input" type="file" multiple style="display:none"
+                 accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf">
+          <button id="dashboard-options-btn" class="dashboard-icon-btn dashboard-options-btn" type="button"
+                  title="Options" aria-label="Toggle options" aria-expanded="false"
+                  aria-controls="dashboard-options">
+            Options <span aria-hidden="true" class="dashboard-options-caret">&#9662;</span>
+          </button>
+        </div>
+        <button id="dashboard-submit-btn" class="dashboard-new-btn" type="button"
+                onclick="dashboardSubmit()" aria-label="Create workstream">Create</button>
+      </div>
+      <div id="dashboard-error" class="dashboard-error" role="status" aria-live="polite"></div>
+      <div id="dashboard-attach-chips" role="list" aria-label="Pending attachments" aria-live="polite"></div>
+      <div id="dashboard-options" class="dashboard-options"
+           role="region" aria-labelledby="dashboard-options-btn" hidden>
+        <label for="dashboard-model">Model</label>
+        <select id="dashboard-model"><option value="">Default model</option></select>
+        <label for="dashboard-judge-model">Judge Model</label>
+        <select id="dashboard-judge-model"><option value="">Default (agent model)</option></select>
+        <label for="dashboard-skill">Skill</label>
+        <select id="dashboard-skill"><option value="">Use defaults</option></select>
+      </div>
     </div>
     <div class="dash-header">
       <span class="dash-header-title">WORKSTREAMS</span>
@@ -82,6 +110,15 @@
     <select id="new-ws-judge-model"><option value="">Default (agent model)</option></select>
     <label for="new-ws-skill">Skill <span class="nws-hint">optional</span></label>
     <select id="new-ws-skill"><option value="">Use defaults</option></select>
+    <label for="new-ws-initial-message">First message <span class="nws-hint">optional</span></label>
+    <textarea id="new-ws-initial-message" rows="3" placeholder="Sent as the first turn after the workstream is created"></textarea>
+    <div id="new-ws-attach-row">
+      <button id="new-ws-attach-btn" type="button" title="Attach files to the first turn" aria-label="Attach files">
+        <span aria-hidden="true">&#128206;</span> Attach
+      </button>
+      <input id="new-ws-attach-input" type="file" multiple style="display:none" accept="image/png,image/jpeg,image/gif,image/webp,text/*,.md,.txt,.json,.yaml,.yml,.toml,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.sql,.ini,.conf">
+      <div id="new-ws-attach-chips" role="list" aria-label="Pending attachments"></div>
+    </div>
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" type="button">Cancel</button>
       <button id="new-ws-submit" type="button">Create</button>

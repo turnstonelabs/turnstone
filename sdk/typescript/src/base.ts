@@ -29,6 +29,12 @@ export interface ClientOptions {
 export interface RequestOptions {
   json?: object;
   params?: Record<string, string | number>;
+  /**
+   * When set, send as multipart form-data with this body. The runtime's
+   * fetch sets the Content-Type + boundary itself, so we deliberately do
+   * not include a Content-Type header in this case.
+   */
+  form?: FormData;
 }
 
 export class BaseClient {
@@ -47,36 +53,34 @@ export class BaseClient {
     path: string,
     options?: RequestOptions,
   ): Promise<T> {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
+    const headers: Record<string, string> = {};
+    if (!options?.form) {
+      headers["Content-Type"] = "application/json";
+    }
     if (this.token) {
       headers["Authorization"] = `Bearer ${this.token}`;
     }
 
-    let url = `${this.baseUrl}${path}`;
-    if (options?.params) {
-      const searchParams = new URLSearchParams();
-      for (const [key, value] of Object.entries(options.params)) {
-        if (value !== undefined && value !== "") {
-          searchParams.set(key, String(value));
-        }
-      }
-      const qs = searchParams.toString();
-      if (qs) url += `?${qs}`;
+    const url = this._buildUrl(path, options?.params);
+
+    let body: BodyInit | undefined;
+    if (options?.form) {
+      body = options.form;
+    } else if (options?.json) {
+      body = JSON.stringify(options.json);
     }
 
     const resp = await this.fetchFn(url, {
       method,
       headers,
-      body: options?.json ? JSON.stringify(options.json) : undefined,
+      body,
     });
 
     if (!resp.ok) {
       let msg = "";
       try {
-        const body = (await resp.json()) as Record<string, unknown>;
-        msg = (body.error as string) ?? (body.detail as string) ?? "";
+        const errBody = (await resp.json()) as Record<string, unknown>;
+        msg = (errBody.error as string) ?? (errBody.detail as string) ?? "";
       } catch {
         msg = await resp.text().catch(() => "");
       }
@@ -84,6 +88,55 @@ export class BaseClient {
     }
 
     return (await resp.json()) as T;
+  }
+
+  protected async requestBytes(
+    method: string,
+    path: string,
+    options?: { params?: Record<string, string | number> },
+  ): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
+    const headers: Record<string, string> = {};
+    if (this.token) {
+      headers["Authorization"] = `Bearer ${this.token}`;
+    }
+
+    const url = this._buildUrl(path, options?.params);
+    const resp = await this.fetchFn(url, { method, headers });
+    if (!resp.ok) {
+      let msg = "";
+      try {
+        const errBody = (await resp.json()) as Record<string, unknown>;
+        msg = (errBody.error as string) ?? (errBody.detail as string) ?? "";
+      } catch {
+        msg = await resp.text().catch(() => "");
+      }
+      throw new TurnstoneAPIError(resp.status, msg || `HTTP ${resp.status}`);
+    }
+    const contentType =
+      resp.headers.get("content-type") ?? "application/octet-stream";
+    const disposition = resp.headers.get("content-disposition") ?? "";
+    const match = /filename="?([^";]+)"?/.exec(disposition);
+    const filename = match ? match[1] : "";
+    const buf = await resp.arrayBuffer();
+    return { bytes: new Uint8Array(buf), contentType, filename };
+  }
+
+  private _buildUrl(
+    path: string,
+    params?: Record<string, string | number>,
+  ): string {
+    let url = `${this.baseUrl}${path}`;
+    if (params) {
+      const searchParams = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== "") {
+          searchParams.set(key, String(value));
+        }
+      }
+      const qs = searchParams.toString();
+      if (qs) url += `?${qs}`;
+    }
+    return url;
   }
 
   protected async *streamSSE<T = Record<string, unknown>>(

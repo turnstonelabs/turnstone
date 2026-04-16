@@ -1,6 +1,8 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ServerEvent } from "./events.js";
 import type {
+  AttachmentContent,
+  AttachmentUpload,
   AuthLoginResponse,
   AuthSetupResponse,
   AuthStatusResponse,
@@ -9,19 +11,45 @@ import type {
   DashboardResponse,
   DeleteMemoryOptions,
   HealthResponse,
+  ListAttachmentsResponse,
   ListMemoriesOptions,
   ListMemoriesResponse,
   ListSavedWorkstreamsResponse,
-  SkillSummary,
   ListWorkstreamsResponse,
   MemoryInfo,
   SaveMemoryRequest,
   SearchMemoriesRequest,
   SendAndWaitOptions,
   SendResponse,
+  SkillSummary,
   StatusResponse,
   TurnResult,
+  UploadAttachmentResponse,
 } from "./types.js";
+
+function generateWsId(): string {
+  // 16 bytes => 32 hex chars; matches `secrets.token_hex(16)` server-side.
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function attachmentToBlob(att: AttachmentUpload): Blob {
+  if (att.data instanceof Blob) {
+    return att.mimeType
+      ? new Blob([att.data], { type: att.mimeType })
+      : att.data;
+  }
+  // Copy bytes into a fresh ArrayBuffer-backed Uint8Array. The Blob
+  // BlobPart type rejects ArrayBufferLike views (could be backed by
+  // SharedArrayBuffer); a freshly allocated buffer is plainly ArrayBuffer.
+  const src = att.data;
+  const fresh = new Uint8Array(new ArrayBuffer(src.byteLength));
+  fresh.set(src);
+  return new Blob([fresh], {
+    type: att.mimeType ?? "application/octet-stream",
+  });
+}
 
 /** Async client for the turnstone server API. */
 export class TurnstoneServer extends BaseClient {
@@ -42,7 +70,27 @@ export class TurnstoneServer extends BaseClient {
   async createWorkstream(
     opts?: CreateWorkstreamRequest,
   ): Promise<CreateWorkstreamResponse> {
-    return this.request("POST", "/v1/api/workstreams/new", { json: opts });
+    const attachments = opts?.attachments;
+    if (attachments && attachments.length > 0) {
+      // Multipart variant: pre-generate ws_id so cluster routers can
+      // hash to the owning node before this body lands. Server accepts
+      // either a server-generated id (when meta.ws_id is empty) or the
+      // caller-supplied one.
+      const meta: Record<string, unknown> = { ...opts };
+      delete (meta as { attachments?: unknown }).attachments;
+      if (!meta.ws_id) {
+        meta.ws_id = generateWsId();
+      }
+      const form = new FormData();
+      form.append("meta", JSON.stringify(meta));
+      for (const att of attachments) {
+        form.append("file", attachmentToBlob(att), att.filename);
+      }
+      return this.request("POST", "/v1/api/workstreams/new", { form });
+    }
+    return this.request("POST", "/v1/api/workstreams/new", {
+      json: opts ?? {},
+    });
   }
 
   async closeWorkstream(wsId: string): Promise<StatusResponse> {
@@ -53,10 +101,53 @@ export class TurnstoneServer extends BaseClient {
 
   // -- Chat interaction -----------------------------------------------------
 
-  async send(message: string, wsId: string): Promise<SendResponse> {
-    return this.request("POST", "/v1/api/send", {
-      json: { message, ws_id: wsId },
+  async send(
+    message: string,
+    wsId: string,
+    opts?: { attachmentIds?: string[] },
+  ): Promise<SendResponse> {
+    const body: Record<string, unknown> = { message, ws_id: wsId };
+    if (opts?.attachmentIds !== undefined) {
+      body.attachment_ids = opts.attachmentIds;
+    }
+    return this.request("POST", "/v1/api/send", { json: body });
+  }
+
+  // -- Attachments ----------------------------------------------------------
+
+  async uploadAttachment(
+    wsId: string,
+    file: AttachmentUpload,
+  ): Promise<UploadAttachmentResponse> {
+    const form = new FormData();
+    form.append("file", attachmentToBlob(file), file.filename);
+    return this.request("POST", `/v1/api/workstreams/${wsId}/attachments`, {
+      form,
     });
+  }
+
+  async listAttachments(wsId: string): Promise<ListAttachmentsResponse> {
+    return this.request("GET", `/v1/api/workstreams/${wsId}/attachments`);
+  }
+
+  async getAttachmentContent(
+    wsId: string,
+    attachmentId: string,
+  ): Promise<AttachmentContent> {
+    return this.requestBytes(
+      "GET",
+      `/v1/api/workstreams/${wsId}/attachments/${attachmentId}/content`,
+    );
+  }
+
+  async deleteAttachment(
+    wsId: string,
+    attachmentId: string,
+  ): Promise<StatusResponse> {
+    return this.request(
+      "DELETE",
+      `/v1/api/workstreams/${wsId}/attachments/${attachmentId}`,
+    );
   }
 
   async approve(opts: {

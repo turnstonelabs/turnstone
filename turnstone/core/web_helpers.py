@@ -37,6 +37,119 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
         return _JSONResponse({"error": "Failed to read request body"}, status_code=500)
 
 
+async def read_multipart_create_or_400(
+    request: Request,
+    *,
+    meta_field: str = "meta",
+    file_field: str = "file",
+    max_files: int = 10,
+    max_per_file_bytes: int | None = None,
+    max_total_bytes: int | None = None,
+) -> tuple[dict[str, Any], list[tuple[str, str, bytes]]] | JSONResponse:
+    """Parse a multipart create-with-attachments body.
+
+    Expects one ``meta`` field (JSON-encoded object with create metadata)
+    and zero-or-more ``file`` parts (standard UploadFile objects).  Returns
+    ``(meta_dict, [(filename, content_type, bytes), ...])`` on success or a
+    ``JSONResponse`` (400/413) on failure.
+
+    Enforces a cheap ``Content-Length`` pre-check against *max_total_bytes*
+    when the header is sensible.  Per-file size is not enforced here — the
+    caller classifies each file and applies the kind-specific cap.
+    """
+    from starlette.datastructures import UploadFile
+    from starlette.responses import JSONResponse as _JSONResponse
+
+    if max_total_bytes is not None:
+        cl_raw = request.headers.get("content-length")
+        if cl_raw:
+            try:
+                cl = int(cl_raw)
+            except ValueError:
+                cl = -1
+            if cl > int(max_total_bytes * 1.1):
+                return _JSONResponse(
+                    {
+                        "error": (
+                            f"Request body too large ({cl:,} bytes by Content-Length); "
+                            f"cap is {max_total_bytes:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+
+    try:
+        form = await request.form()
+    except Exception:
+        import structlog
+
+        structlog.get_logger(__name__).warning(
+            "read_multipart_create_or_400.parse_failed", exc_info=True
+        )
+        return _JSONResponse({"error": "Invalid multipart body"}, status_code=400)
+
+    meta_raw = form.get(meta_field)
+    if not isinstance(meta_raw, str):
+        return _JSONResponse({"error": f"Missing '{meta_field}' JSON field"}, status_code=400)
+    try:
+        meta: dict[str, Any] = json.loads(meta_raw)
+    except (ValueError, json.JSONDecodeError):
+        return _JSONResponse({"error": f"'{meta_field}' field must be valid JSON"}, status_code=400)
+    if not isinstance(meta, dict):
+        return _JSONResponse({"error": f"'{meta_field}' must be a JSON object"}, status_code=400)
+
+    uploads = [v for v in form.getlist(file_field) if isinstance(v, UploadFile)]
+    if len(uploads) > max_files:
+        return _JSONResponse(
+            {
+                "error": (f"Too many files ({len(uploads)}); max {max_files} per request"),
+                "code": "too_many",
+            },
+            status_code=400,
+        )
+
+    files: list[tuple[str, str, bytes]] = []
+    running_total = 0
+    try:
+        for upload in uploads:
+            filename = upload.filename or ""
+            content_type = upload.content_type or "application/octet-stream"
+            try:
+                data = await upload.read()
+            except Exception:
+                return _JSONResponse({"error": "Failed to read upload"}, status_code=400)
+            if max_per_file_bytes is not None and len(data) > max_per_file_bytes:
+                return _JSONResponse(
+                    {
+                        "error": (
+                            f"File too large ({len(data):,} bytes); "
+                            f"cap is {max_per_file_bytes:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            running_total += len(data)
+            if max_total_bytes is not None and running_total > max_total_bytes:
+                return _JSONResponse(
+                    {
+                        "error": (
+                            f"Request body too large ({running_total:,} bytes total); "
+                            f"cap is {max_total_bytes:,} bytes."
+                        ),
+                        "code": "too_large",
+                    },
+                    status_code=413,
+                )
+            files.append((filename, content_type, data))
+    finally:
+        for upload in uploads:
+            await upload.close()
+
+    return meta, files
+
+
 async def read_multipart_file_or_400(
     request: Request,
     field: str = "file",

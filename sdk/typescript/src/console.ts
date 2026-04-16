@@ -4,6 +4,8 @@ import type {
   AdminListMemoriesOptions,
   AdminMemoryInfo,
   AdminSearchMemoriesOptions,
+  AttachmentContent,
+  AttachmentUpload,
   AuditQueryOptions,
   AuditResponse,
   AuthLoginResponse,
@@ -16,6 +18,9 @@ import type {
   ConsoleCreateWsRequest,
   ConsoleCreateWsResponse,
   ConsoleHealthResponse,
+  CreateWorkstreamRequest,
+  CreateWorkstreamResponse,
+  ListAttachmentsResponse,
   CreateMcpServerRequest,
   CreatePolicyOptions,
   CreateRoleOptions,
@@ -55,11 +60,36 @@ import type {
   UpdateScheduleRequest,
   UpdateSettingOptions,
   UpdateSkillRequest,
+  UploadAttachmentResponse,
   UsageQueryOptions,
   UsageResponse,
   UserRoleInfo,
   WorkstreamsOptions,
 } from "./types.js";
+
+function generateConsoleWsId(): string {
+  // 16 bytes => 32 hex chars; matches `secrets.token_hex(16)` server-side.
+  const buf = new Uint8Array(16);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function consoleAttachmentToBlob(att: AttachmentUpload): Blob {
+  if (att.data instanceof Blob) {
+    return att.mimeType
+      ? new Blob([att.data], { type: att.mimeType })
+      : att.data;
+  }
+  // Copy bytes into a fresh ArrayBuffer-backed Uint8Array. The Blob
+  // BlobPart type rejects ArrayBufferLike views (could be backed by
+  // SharedArrayBuffer); a freshly allocated buffer is plainly ArrayBuffer.
+  const src = att.data;
+  const fresh = new Uint8Array(new ArrayBuffer(src.byteLength));
+  fresh.set(src);
+  return new Blob([fresh], {
+    type: att.mimeType ?? "application/octet-stream",
+  });
+}
 
 /** Async client for the turnstone console API. */
 export class TurnstoneConsole extends BaseClient {
@@ -111,6 +141,92 @@ export class TurnstoneConsole extends BaseClient {
     return this.request("POST", "/v1/api/cluster/workstreams/new", {
       json: opts,
     });
+  }
+
+  // -- Routing proxy --------------------------------------------------------
+
+  /**
+   * Create a workstream via the console hash-ring router.
+   *
+   * When `attachments` is non-empty the request is sent as
+   * multipart/form-data and the console routes via `?ws_id=<hex>`
+   * (auto-generated when not supplied) so the body lands on the
+   * owning node directly.
+   */
+  async routeCreateWorkstream(
+    opts?: CreateWorkstreamRequest & { target_node?: string },
+  ): Promise<
+    CreateWorkstreamResponse & { node_url?: string; node_id?: string }
+  > {
+    const attachments = opts?.attachments;
+    if (attachments && attachments.length > 0) {
+      // The console's multipart route_create routes by `?ws_id=` only —
+      // it does not parse the body to honor `target_node`. Refuse the
+      // combination at the SDK boundary so callers don't silently get
+      // routed to the wrong node.
+      if (opts?.target_node) {
+        throw new Error(
+          "target_node is not supported with attachments; " +
+            "use ws_id (caller-generated to hash to the desired node) instead",
+        );
+      }
+      const meta: Record<string, unknown> = { ...opts };
+      delete (meta as { attachments?: unknown }).attachments;
+      let wsId = (meta.ws_id as string | undefined) ?? "";
+      if (!wsId) {
+        wsId = generateConsoleWsId();
+        meta.ws_id = wsId;
+      }
+      const form = new FormData();
+      form.append("meta", JSON.stringify(meta));
+      for (const att of attachments) {
+        form.append("file", consoleAttachmentToBlob(att), att.filename);
+      }
+      return this.request("POST", "/v1/api/route/workstreams/new", {
+        form,
+        params: { ws_id: wsId },
+      });
+    }
+    return this.request("POST", "/v1/api/route/workstreams/new", {
+      json: opts ?? {},
+    });
+  }
+
+  async routeUploadAttachment(
+    wsId: string,
+    file: AttachmentUpload,
+  ): Promise<UploadAttachmentResponse> {
+    const form = new FormData();
+    form.append("file", consoleAttachmentToBlob(file), file.filename);
+    return this.request(
+      "POST",
+      `/v1/api/route/workstreams/${wsId}/attachments`,
+      { form },
+    );
+  }
+
+  async routeListAttachments(wsId: string): Promise<ListAttachmentsResponse> {
+    return this.request("GET", `/v1/api/route/workstreams/${wsId}/attachments`);
+  }
+
+  async routeGetAttachmentContent(
+    wsId: string,
+    attachmentId: string,
+  ): Promise<AttachmentContent> {
+    return this.requestBytes(
+      "GET",
+      `/v1/api/route/workstreams/${wsId}/attachments/${attachmentId}/content`,
+    );
+  }
+
+  async routeDeleteAttachment(
+    wsId: string,
+    attachmentId: string,
+  ): Promise<StatusResponse> {
+    return this.request(
+      "DELETE",
+      `/v1/api/route/workstreams/${wsId}/attachments/${attachmentId}`,
+    );
   }
 
   // -- Streaming ------------------------------------------------------------

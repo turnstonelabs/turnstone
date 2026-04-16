@@ -6,6 +6,21 @@ from dataclasses import dataclass, field
 
 
 @dataclass
+class AttachmentUpload:
+    """A file to upload as an attachment.
+
+    Used by ``upload_attachment`` and by ``create_workstream(attachments=...)``.
+    ``mime_type`` is advisory — the server applies its own magic-byte
+    sniffing for images and UTF-8 validation for text documents and
+    rejects anything that doesn't match its allowlist.
+    """
+
+    filename: str
+    data: bytes
+    mime_type: str | None = None
+
+
+@dataclass
 class TurnResult:
     """Aggregated result of a send_and_wait call.
 

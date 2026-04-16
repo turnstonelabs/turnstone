@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 from typing import TYPE_CHECKING, Any
 
 from turnstone.api.schemas import (
@@ -26,6 +27,7 @@ from turnstone.api.server_schemas import (
     CreateWorkstreamResponse,
     DashboardResponse,
     HealthResponse,
+    ListAttachmentsResponse,
     ListAvailableModelsResponse,
     ListMemoriesResponse,
     ListSavedWorkstreamsResponse,
@@ -33,10 +35,11 @@ from turnstone.api.server_schemas import (
     ListWorkstreamsResponse,
     MemoryInfo,
     SendResponse,
+    UploadAttachmentResponse,
 )
 from turnstone.sdk._base import _BaseClient
 from turnstone.sdk._sync import _SyncRunner
-from turnstone.sdk._types import TurnResult
+from turnstone.sdk._types import AttachmentUpload, TurnResult
 from turnstone.sdk.events import (
     ClusterEvent,
     ContentEvent,
@@ -108,7 +111,19 @@ class AsyncTurnstoneServer(_BaseClient):
         ws_id: str = "",
         client_type: str = "",
         notify_targets: str = "",
+        attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
+        """Create a new workstream.
+
+        When *attachments* is non-empty the request is sent as
+        ``multipart/form-data`` with the metadata in a ``meta`` JSON
+        field and one ``file`` part per attachment.  A ws_id is
+        auto-generated client-side when not supplied so cluster-routed
+        callers can bind the body to the owning node up front.  When
+        *initial_message* is also set, the server reserves the
+        attachments onto that turn before its background worker
+        dispatches.
+        """
         body: dict[str, Any] = {}
         if name:
             body["name"] = name
@@ -126,12 +141,38 @@ class AsyncTurnstoneServer(_BaseClient):
             body["auto_approve_tools"] = auto_approve_tools
         if user_id:
             body["user_id"] = user_id
-        if ws_id:
-            body["ws_id"] = ws_id
         if client_type:
             body["client_type"] = client_type
         if notify_targets and notify_targets != "[]":
             body["notify_targets"] = notify_targets
+
+        if attachments:
+            if not ws_id:
+                ws_id = secrets.token_hex(16)
+            body["ws_id"] = ws_id
+            import json as _json
+
+            files: list[tuple[str, tuple[str, bytes, str]]] = [
+                (
+                    "file",
+                    (
+                        att.filename,
+                        att.data,
+                        att.mime_type or "application/octet-stream",
+                    ),
+                )
+                for att in attachments
+            ]
+            return await self._request(
+                "POST",
+                "/v1/api/workstreams/new",
+                files=files,
+                data={"meta": _json.dumps(body)},
+                response_model=CreateWorkstreamResponse,
+            )
+
+        if ws_id:
+            body["ws_id"] = ws_id
         return await self._request(
             "POST",
             "/v1/api/workstreams/new",
@@ -149,12 +190,74 @@ class AsyncTurnstoneServer(_BaseClient):
 
     # -- chat interaction ----------------------------------------------------
 
-    async def send(self, message: str, ws_id: str) -> SendResponse:
+    async def send(
+        self,
+        message: str,
+        ws_id: str,
+        *,
+        attachment_ids: list[str] | None = None,
+    ) -> SendResponse:
+        body: dict[str, Any] = {"message": message, "ws_id": ws_id}
+        if attachment_ids is not None:
+            body["attachment_ids"] = list(attachment_ids)
         return await self._request(
             "POST",
             "/v1/api/send",
-            json_body={"message": message, "ws_id": ws_id},
+            json_body=body,
             response_model=SendResponse,
+        )
+
+    # -- attachments ---------------------------------------------------------
+
+    async def upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        """Upload one file as a pending attachment for this workstream.
+
+        The server validates size + MIME (magic-byte sniff for images,
+        UTF-8 decode for text) and rejects with 400/413 on any mismatch.
+        Returns the persisted ``AttachmentInfo`` so the caller can pass
+        the id into a subsequent ``send(attachment_ids=...)``.
+        """
+        files: list[tuple[str, tuple[str, bytes, str]]] = [
+            (
+                "file",
+                (filename, data, mime_type or "application/octet-stream"),
+            )
+        ]
+        return await self._request(
+            "POST",
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            files=files,
+            response_model=UploadAttachmentResponse,
+        )
+
+    async def list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        """List the caller's pending (unconsumed) attachments for *ws_id*."""
+        return await self._request(
+            "GET",
+            f"/v1/api/workstreams/{ws_id}/attachments",
+            response_model=ListAttachmentsResponse,
+        )
+
+    async def get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        """Return the raw bytes of an attachment."""
+        return await self._request_bytes(
+            "GET",
+            f"/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content",
+        )
+
+    async def delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        """Remove a pending attachment.  Consumed attachments return 404."""
+        return await self._request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/attachments/{attachment_id}",
+            response_model=StatusResponse,
         )
 
     async def approve(
@@ -494,6 +597,7 @@ class TurnstoneServer:
         ws_id: str = "",
         client_type: str = "",
         notify_targets: str = "",
+        attachments: list[AttachmentUpload] | None = None,
     ) -> CreateWorkstreamResponse:
         return self._runner.run(
             self._async.create_workstream(
@@ -508,6 +612,7 @@ class TurnstoneServer:
                 ws_id=ws_id,
                 client_type=client_type,
                 notify_targets=notify_targets,
+                attachments=attachments,
             )
         )
 
@@ -516,8 +621,37 @@ class TurnstoneServer:
 
     # -- chat interaction ----------------------------------------------------
 
-    def send(self, message: str, ws_id: str) -> SendResponse:
-        return self._runner.run(self._async.send(message, ws_id))
+    def send(
+        self,
+        message: str,
+        ws_id: str,
+        *,
+        attachment_ids: list[str] | None = None,
+    ) -> SendResponse:
+        return self._runner.run(self._async.send(message, ws_id, attachment_ids=attachment_ids))
+
+    # -- attachments ---------------------------------------------------------
+
+    def upload_attachment(
+        self,
+        ws_id: str,
+        filename: str,
+        data: bytes,
+        *,
+        mime_type: str | None = None,
+    ) -> UploadAttachmentResponse:
+        return self._runner.run(
+            self._async.upload_attachment(ws_id, filename, data, mime_type=mime_type)
+        )
+
+    def list_attachments(self, ws_id: str) -> ListAttachmentsResponse:
+        return self._runner.run(self._async.list_attachments(ws_id))
+
+    def get_attachment_content(self, ws_id: str, attachment_id: str) -> bytes:
+        return self._runner.run(self._async.get_attachment_content(ws_id, attachment_id))
+
+    def delete_attachment(self, ws_id: str, attachment_id: str) -> StatusResponse:
+        return self._runner.run(self._async.delete_attachment(ws_id, attachment_id))
 
     def approve(
         self,

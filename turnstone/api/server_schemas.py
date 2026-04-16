@@ -95,6 +95,23 @@ class CreateWorkstreamRequest(BaseModel):
         default="",
         description="Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
     )
+    initial_message: str = Field(
+        default="",
+        description=(
+            "Optional first user message dispatched as a background turn after "
+            "the workstream is created. When attachments are also provided "
+            "(via the multipart variant), they are reserved onto this turn."
+        ),
+    )
+    ws_id: str = Field(
+        default="",
+        description=(
+            "Optional caller-supplied workstream id (32-hex). Required when "
+            "creating with attachments via the cluster routing layer so the "
+            "console can hash to the owning node before the multipart body "
+            "lands. Auto-generated when omitted."
+        ),
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):
@@ -103,6 +120,14 @@ class CreateWorkstreamResponse(BaseModel):
     resumed: bool = Field(default=False, description="Whether a previous workstream was resumed")
     message_count: int = Field(
         default=0, description="Number of messages in the resumed workstream"
+    )
+    attachment_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of attachments saved by this request (multipart variant only). "
+            "Already reserved onto the initial_message turn when one was provided; "
+            "otherwise left pending for a follow-up POST /v1/api/send."
+        ),
     )
 
 

@@ -64,9 +64,19 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/new",
         "POST",
         "Create a new workstream",
+        description=(
+            "Accepts two content types. Default is `application/json` with a "
+            "`CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` "
+            "with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) "
+            "plus zero-or-more `file` parts saves each file as an attachment "
+            "under the new workstream. When `initial_message` is also set, "
+            "attachments are reserved onto that turn before the worker thread "
+            "dispatches; otherwise they remain pending for a follow-up "
+            "`POST /v1/api/send`."
+        ),
         request_model=CreateWorkstreamRequest,
         response_model=CreateWorkstreamResponse,
-        error_codes=[400],
+        error_codes=[400, 409, 413],
         tags=["Workstreams"],
     ),
     EndpointSpec(

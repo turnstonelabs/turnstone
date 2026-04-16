@@ -183,6 +183,12 @@ export type {
   SkillInstallRequest,
   SkillInstallResponse,
   SkillInstallSkipped,
+  // Attachment types
+  AttachmentUpload,
+  AttachmentInfo,
+  UploadAttachmentResponse,
+  ListAttachmentsResponse,
+  AttachmentContent,
 } from "./types.js";
 
 // SSE parser (for advanced usage)
