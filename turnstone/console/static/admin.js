@@ -859,9 +859,20 @@ function _renderChannels(channels) {
   var html = "";
   for (var i = 0; i < channels.length; i++) {
     var c = channels[i];
+    // Per-platform badge class (scope-discord / scope-slack) so different
+    // adapters render with their own color.  Falls back to the generic
+    // scope-channel for unknown platforms; the per-platform class wins
+    // by being the only class set, not by source order.
+    var ctSlug = (c.channel_type || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    var ctClass =
+      ctSlug && (ctSlug === "discord" || ctSlug === "slack")
+        ? "scope-badge scope-" + ctSlug
+        : "scope-badge scope-channel";
     html +=
       '<div class="admin-row" role="listitem">' +
-      '<span class="admin-col admin-col-chtype"><span class="scope-badge scope-channel">' +
+      '<span class="admin-col admin-col-chtype"><span class="' +
+      ctClass +
+      '">' +
       escapeHtml(c.channel_type) +
       "</span></span>" +
       '<span class="admin-col admin-col-chuid"><code>' +
@@ -1133,13 +1144,50 @@ function _populateScheduleSelect(selectId, url, labelKey, valueKey, opts) {
     });
 }
 
-function _addNotifyRow(prefix, targetType, targetId) {
+// Channel platforms shown in admin notify-target rows.  Mirror server-side
+// channel adapters; expand here when a new adapter ships (Discord / Slack
+// today, MS Teams / etc. later).
+var _NOTIFY_CHANNEL_TYPES = [
+  {
+    value: "discord",
+    label: "Discord",
+    id_hint: "Discord ID (e.g. 123456789012345678)",
+  },
+  {
+    value: "slack",
+    label: "Slack",
+    id_hint: "Slack ID (e.g. C01234567 or U01234567)",
+  },
+];
+
+function _notifyIdPlaceholder(channelType) {
+  for (var i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
+    if (_NOTIFY_CHANNEL_TYPES[i].value === channelType) {
+      return _NOTIFY_CHANNEL_TYPES[i].id_hint;
+    }
+  }
+  return "ID";
+}
+
+function _addNotifyRow(prefix, targetType, targetId, channelType) {
   var container = document.getElementById(prefix + "-notify-rows");
   var row = document.createElement("div");
   row.className = "notify-row";
 
+  var ctSel = document.createElement("select");
+  ctSel.setAttribute("aria-label", "Channel platform");
+  ctSel.className = "notify-row-ct";
+  for (var i = 0; i < _NOTIFY_CHANNEL_TYPES.length; i++) {
+    var ctOpt = document.createElement("option");
+    ctOpt.value = _NOTIFY_CHANNEL_TYPES[i].value;
+    ctOpt.textContent = _NOTIFY_CHANNEL_TYPES[i].label;
+    ctSel.appendChild(ctOpt);
+  }
+  ctSel.value = channelType || "discord";
+
   var typeSel = document.createElement("select");
   typeSel.setAttribute("aria-label", "Target type");
+  typeSel.className = "notify-row-target";
   var optCh = document.createElement("option");
   optCh.value = "channel_id";
   optCh.textContent = "Channel";
@@ -1152,10 +1200,17 @@ function _addNotifyRow(prefix, targetType, targetId) {
 
   var idInput = document.createElement("input");
   idInput.type = "text";
-  idInput.placeholder = "Discord ID";
-  idInput.setAttribute("aria-label", "Discord ID");
+  idInput.className = "notify-row-id";
+  idInput.placeholder = _notifyIdPlaceholder(ctSel.value);
+  idInput.setAttribute("aria-label", "Channel/user ID");
   idInput.spellcheck = false;
   if (targetId) idInput.value = targetId;
+
+  // Re-hint the ID input when the platform changes — e.g. Discord
+  // snowflakes vs Slack C…/U… ids.
+  ctSel.addEventListener("change", function () {
+    idInput.placeholder = _notifyIdPlaceholder(ctSel.value);
+  });
 
   var removeBtn = document.createElement("button");
   removeBtn.type = "button";
@@ -1166,6 +1221,7 @@ function _addNotifyRow(prefix, targetType, targetId) {
     row.remove();
   };
 
+  row.appendChild(ctSel);
   row.appendChild(typeSel);
   row.appendChild(idInput);
   row.appendChild(removeBtn);
@@ -1179,10 +1235,13 @@ function _collectNotifyTargets(prefix) {
     .querySelectorAll(".notify-row");
   var targets = [];
   for (var i = 0; i < rows.length; i++) {
-    var type = rows[i].querySelector("select").value;
-    var id = (rows[i].querySelector("input").value || "").trim();
+    var ct = (rows[i].querySelector(".notify-row-ct") || {}).value || "discord";
+    var type =
+      (rows[i].querySelector(".notify-row-target") || {}).value || "channel_id";
+    var idEl = rows[i].querySelector(".notify-row-id");
+    var id = ((idEl && idEl.value) || "").trim();
     if (!id) continue;
-    var t = { channel_type: "discord" };
+    var t = { channel_type: ct };
     t[type] = id;
     targets.push(t);
   }
@@ -1196,7 +1255,7 @@ function _populateNotifyRows(prefix, targets) {
   targets.forEach(function (t) {
     var targetType = "channel_id" in t ? "channel_id" : "user_id";
     var targetId = t[targetType] || "";
-    _addNotifyRow(prefix, targetType, targetId);
+    _addNotifyRow(prefix, targetType, targetId, t.channel_type || "discord");
   });
 }
 
@@ -1783,13 +1842,19 @@ function showCreateChannelModal() {
   var overlay = document.getElementById("create-channel-overlay");
   overlay.style.display = "flex";
   document.getElementById("create-channel-error").style.display = "none";
-  document.getElementById("cc-type").value = "discord";
-  document.getElementById("cc-uid").value = "";
+  var ctSel = document.getElementById("cc-type");
+  var uidInput = document.getElementById("cc-uid");
+  ctSel.value = "discord";
+  uidInput.value = "";
+  uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
+  ctSel.onchange = function () {
+    uidInput.placeholder = _notifyIdPlaceholder(ctSel.value);
+  };
   document.getElementById("cc-submit").disabled = false;
   document.getElementById("cc-submit").textContent = "Link";
   _ccTrapHandler = _installTrap("create-channel-overlay", "create-channel-box");
   setTimeout(function () {
-    document.getElementById("cc-uid").focus();
+    uidInput.focus();
   }, 50);
 }
 

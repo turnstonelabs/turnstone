@@ -31,6 +31,12 @@
   --blue: #38bdf8;
   --on-color: var(--bg);
 
+  /* Channel-platform accents — kept distinct from --magenta (generic
+     channel) and from each other so per-platform badges read at a glance.
+     Light-theme variants live in [data-theme="light"] below. */
+  --discord: #818cf8;
+  --slack: #f472b6;
+
   /* Glow variants for LED effects */
   --green-glow: rgba(52, 211, 153, 0.25);
   --red-glow: rgba(248, 113, 113, 0.25);
@@ -39,6 +45,8 @@
   --cyan-glow: rgba(103, 232, 249, 0.2);
   --magenta-glow: rgba(192, 132, 252, 0.25);
   --blue-glow: rgba(56, 189, 248, 0.25);
+  --discord-glow: rgba(129, 140, 248, 0.3);
+  --slack-glow: rgba(244, 114, 182, 0.3);
 
   /* Structure */
   --border: rgba(255, 255, 255, 0.06);
@@ -71,6 +79,8 @@
   --cyan: #0e7490;
   --magenta: #7c3aed;
   --blue: #0369a1;
+  --discord: #4f46e5;       /* darker indigo on white surface — passes WCAG AA */
+  --slack: #be185d;         /* darker rose */
   --on-color: #ffffff;
   --green-glow: rgba(4, 120, 87, 0.25);
   --red-glow: rgba(220, 38, 38, 0.25);
@@ -79,6 +89,8 @@
   --cyan-glow: rgba(14, 116, 144, 0.2);
   --magenta-glow: rgba(124, 58, 237, 0.2);
   --blue-glow: rgba(3, 105, 161, 0.2);
+  --discord-glow: rgba(79, 70, 229, 0.2);
+  --slack-glow: rgba(190, 24, 93, 0.2);
   --border: rgba(0, 0, 0, 0.08);
   --border-strong: rgba(0, 0, 0, 0.12);
   --code-bg: #f0f1f5;

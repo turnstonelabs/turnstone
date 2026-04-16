@@ -988,7 +988,13 @@
 }
 .scope-write { color: var(--cyan); border-color: rgba(103, 232, 249, 0.2); }
 .scope-approve { color: var(--accent); border-color: var(--accent-dim); }
-.scope-channel { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
+/* Per-platform channel badges first — a row uses scope-discord OR
+   scope-slack OR (for unknown platforms) the generic scope-channel
+   fallback below.  Source order matters less now that the per-platform
+   classes are exclusive of scope-channel; keeping it tidy regardless. */
+.scope-discord { color: var(--discord); border-color: var(--discord-glow); }
+.scope-slack { color: var(--slack); border-color: var(--slack-glow); }
+.scope-channel { color: var(--magenta); border-color: var(--magenta-glow); }
 .scope-mcp { color: var(--magenta); border-color: rgba(192, 132, 252, 0.25); }
 .scope-deny { color: var(--red); border-color: rgba(255, 80, 80, 0.25); }
 .scope-scan-safe { color: var(--green); border-color: var(--green-glow); }
@@ -1227,20 +1233,32 @@
 .admin-inline-add:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .notify-row {
   display: flex; gap: 6px; margin-bottom: 4px; align-items: center;
+  flex-wrap: wrap;
 }
 .notify-row select, .notify-row input {
   padding: 7px 8px;
   background: var(--bg); border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm); color: var(--fg); font: inherit; font-size: 12px;
 }
-.notify-row select { width: 90px; flex-shrink: 0; }
-.notify-row input { flex: 1; min-width: 0; }
+/* Tighter platform select — labels are short ("Discord"/"Slack") */
+.notify-row-ct { width: 76px; flex-shrink: 0; }
+.notify-row-target { width: 90px; flex-shrink: 0; }
+.notify-row-id { flex: 1 1 140px; min-width: 0; }
+/* Older rows that didn't get the per-element classes still need to size */
+.notify-row select:not([class*="notify-row-"]) { width: 90px; flex-shrink: 0; }
+.notify-row input:not([class*="notify-row-"]) { flex: 1; min-width: 0; }
 .notify-row-remove {
   background: none; border: none; color: var(--fg-dim); cursor: pointer;
   font-size: 16px; padding: 0 4px; line-height: 1; flex-shrink: 0;
 }
 .notify-row-remove:hover { color: var(--red); }
 .notify-row-remove:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+/* Narrow viewports — drop the ID input to its own line so snowflakes
+   and Slack ids aren't truncated to ~80px on phones. */
+@media (max-width: 700px) {
+  .notify-row-id { flex-basis: 100%; order: 3; }
+  .notify-row-remove { order: 2; margin-left: auto; }
+}
 
 .admin-details { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; padding: 0 12px; }
 .admin-details[open] { padding-bottom: 12px; }

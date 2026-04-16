@@ -914,9 +914,10 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <label for="cc-type">Channel type</label>
     <select id="cc-type">
       <option value="discord">Discord</option>
+      <option value="slack">Slack</option>
     </select>
     <label for="cc-uid">External user ID <span class="label-hint">the user's ID on the platform</span></label>
-    <input id="cc-uid" type="text" placeholder="e.g. 123456789012345678" autocomplete="off" spellcheck="false">
+    <input id="cc-uid" type="text" autocomplete="off" spellcheck="false">
     <div class="modal-buttons">
       <button class="modal-cancel" onclick="hideCreateChannelModal()">Cancel</button>
       <button id="cc-submit" class="modal-submit" onclick="submitCreateChannel()">Link</button>
@@ -1292,7 +1293,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <label for="csk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="csk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
       <label for="csk-notify-on-complete">Notify on completion <span class="label-hint">optional</span></label>
-      <textarea id="csk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."}]' spellcheck="false" aria-describedby="csk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
+      <textarea id="csk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."},{"channel_type":"slack","channel_id":"C0..."}]' spellcheck="false" aria-describedby="csk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
       <span id="csk-notify-hint" class="label-hint" style="display:block;margin-top:3px">JSON array. Each: channel_type + channel_id or user_id</span>
       <label class="admin-checkbox"><input id="csk-enabled" type="checkbox" checked> Enabled</label>
     </details>
@@ -1413,7 +1414,7 @@ window.TURNSTONE_KB_SHORTCUTS = [
       <label for="esk-allowed-tools">Allowed Tools <span class="label-hint">comma-separated tool names for auto-approve</span></label>
       <input id="esk-allowed-tools" type="text" placeholder="bash, read_file, write_file">
       <label for="esk-notify-on-complete">Notify on completion <span class="label-hint">optional</span></label>
-      <textarea id="esk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."}]' spellcheck="false" aria-describedby="esk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
+      <textarea id="esk-notify-on-complete" rows="2" placeholder='[{"channel_type":"discord","channel_id":"123..."},{"channel_type":"slack","channel_id":"C0..."}]' spellcheck="false" aria-describedby="esk-notify-hint" style="font-family:var(--font-mono);font-size:12px"></textarea>
       <span id="esk-notify-hint" class="label-hint" style="display:block;margin-top:3px">JSON array. Each: channel_type + channel_id or user_id</span>
       <label class="admin-checkbox"><input id="esk-enabled" type="checkbox" checked> Enabled</label>
     </details>
