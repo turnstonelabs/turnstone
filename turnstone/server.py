@@ -3238,6 +3238,12 @@ def config_reload(request: Request) -> JSONResponse:
     if not cs:
         return JSONResponse({"status": "noop"})
     cs.reload()
+    # Apply routing overrides to the live registry — admin settings updates
+    # fan out via this endpoint and would otherwise not affect plan/task
+    # routing until a model-reload or restart.
+    registry = getattr(request.app.state, "registry", None)
+    if registry is not None:
+        _apply_routing_overrides(registry, cs)
     # Broadcast settings_changed event to all connected clients
     if gq is not None:
         with contextlib.suppress(queue.Full):
@@ -3283,6 +3289,85 @@ def internal_mcp_status(request: Request) -> JSONResponse:
 # -- internal model management -----------------------------------------------
 
 
+def _effective_routing(
+    cs: Any,
+    base_models: dict[str, Any],
+    base_default: str,
+    base_plan_model: str | None,
+    base_task_model: str | None,
+    base_plan_effort: str | None,
+    base_task_effort: str | None,
+) -> tuple[str, str | None, str | None, str | None, str | None]:
+    """Compute (default, plan_model, task_model, plan_effort, task_effort)
+    after layering ConfigStore overrides on top of the supplied base values.
+
+    Aliases require existence in *base_models* (silently dropped otherwise);
+    effort values were validated against SettingDef choices on write, so a
+    truthiness check is sufficient at apply time.
+
+    Returns the base values unchanged when *cs* is None.
+    """
+    eff_default = base_default
+    eff_plan_model = base_plan_model
+    eff_task_model = base_task_model
+    eff_plan_effort = base_plan_effort
+    eff_task_effort = base_task_effort
+    if cs is not None:
+        cs_default = cs.get("model.default_alias")
+        if cs_default and cs_default in base_models:
+            eff_default = cs_default
+        cs_plan_alias = cs.get("model.plan_alias")
+        if cs_plan_alias and cs_plan_alias in base_models:
+            eff_plan_model = cs_plan_alias
+        cs_task_alias = cs.get("model.task_alias")
+        if cs_task_alias and cs_task_alias in base_models:
+            eff_task_model = cs_task_alias
+        cs_plan_effort = cs.get("model.plan_effort")
+        if cs_plan_effort:
+            eff_plan_effort = cs_plan_effort
+        cs_task_effort = cs.get("model.task_effort")
+        if cs_task_effort:
+            eff_task_effort = cs_task_effort
+    return eff_default, eff_plan_model, eff_task_model, eff_plan_effort, eff_task_effort
+
+
+def _apply_routing_overrides(registry: Any, cs: Any) -> bool:
+    """Apply ConfigStore routing overrides to a live *registry* in place.
+
+    Used by the startup path and by ``config_reload`` (admin settings
+    update fan-out) — both keep the existing model definitions and only
+    rewrite routing fields.  Returns True when a reload happened.
+    """
+    eff = _effective_routing(
+        cs,
+        registry.models,
+        registry.default,
+        registry.plan_model,
+        registry.task_model,
+        registry.plan_effort,
+        registry.task_effort,
+    )
+    if (
+        eff[0] != registry.default
+        or eff[1] != registry.plan_model
+        or eff[2] != registry.task_model
+        or eff[3] != registry.plan_effort
+        or eff[4] != registry.task_effort
+    ):
+        registry.reload(
+            registry.models,
+            eff[0],
+            registry.fallback,
+            registry.agent_model,
+            plan_model=eff[1],
+            task_model=eff[2],
+            plan_effort=eff[3],
+            task_effort=eff[4],
+        )
+        return True
+    return False
+
+
 def internal_model_reload(request: Request) -> JSONResponse:
     """POST /v1/api/_internal/model-reload — rebuild registry from DB + config."""
     from turnstone.core.model_registry import load_model_registry
@@ -3301,51 +3386,53 @@ def internal_model_reload(request: Request) -> JSONResponse:
         provider=cli_args["provider"],
         storage=get_storage(),
     )
-    # Allow runtime override of routing fields via ConfigStore.  Per-kind
-    # values (plan/task) override the legacy single-knob agent_model when
-    # set; effort values override the per-kind defaults from config.toml.
-    effective_default = new_registry.default
-    effective_plan_model = new_registry.plan_model
-    effective_task_model = new_registry.task_model
-    effective_plan_effort = new_registry.plan_effort
-    effective_task_effort = new_registry.task_effort
     cs = getattr(request.app.state, "config_store", None)
-    if cs:
+    if cs is not None:
         cs.reload()  # Ensure latest settings from DB
-        cs_alias = cs.get("model.default_alias")
-        if cs_alias and cs_alias in new_registry.models:
-            effective_default = cs_alias
-            log.info(
-                "ConfigStore override: using '%s' as default model (registry had '%s')",
-                effective_default,
-                new_registry.default,
-            )
-        # Aliases are validated against the live registry here (must exist);
-        # effort values were validated against the SettingDef choices on
-        # write, so a truthiness check is sufficient at apply time.
-        cs_plan_alias = cs.get("model.plan_alias")
-        if cs_plan_alias and cs_plan_alias in new_registry.models:
-            effective_plan_model = cs_plan_alias
-        cs_task_alias = cs.get("model.task_alias")
-        if cs_task_alias and cs_task_alias in new_registry.models:
-            effective_task_model = cs_task_alias
-        cs_plan_effort = cs.get("model.plan_effort")
-        if cs_plan_effort:
-            effective_plan_effort = cs_plan_effort
-        cs_task_effort = cs.get("model.task_effort")
-        if cs_task_effort:
-            effective_task_effort = cs_task_effort
+    eff_default, eff_plan_model, eff_task_model, eff_plan_effort, eff_task_effort = (
+        _effective_routing(
+            cs,
+            new_registry.models,
+            new_registry.default,
+            new_registry.plan_model,
+            new_registry.task_model,
+            new_registry.plan_effort,
+            new_registry.task_effort,
+        )
+    )
+    if eff_default != new_registry.default:
+        log.info(
+            "ConfigStore override: using '%s' as default model (registry had '%s')",
+            eff_default,
+            new_registry.default,
+        )
+
+    # No-op fast path: skip reload when nothing changed (avoids client churn
+    # on broadcast model-reloads where this node has no pending changes).
+    unchanged = (
+        new_registry.models == registry.models
+        and new_registry.fallback == registry.fallback
+        and new_registry.agent_model == registry.agent_model
+        and eff_default == registry.default
+        and eff_plan_model == registry.plan_model
+        and eff_task_model == registry.task_model
+        and eff_plan_effort == registry.plan_effort
+        and eff_task_effort == registry.task_effort
+    )
+    if unchanged:
+        new_registry.shutdown()
+        return JSONResponse({"status": "ok", "aliases": registry.list_aliases(), "noop": True})
 
     try:
         registry.reload(
             new_registry.models,
-            effective_default,
+            eff_default,
             new_registry.fallback,
             new_registry.agent_model,
-            plan_model=effective_plan_model,
-            task_model=effective_task_model,
-            plan_effort=effective_plan_effort,
-            task_effort=effective_task_effort,
+            plan_model=eff_plan_model,
+            task_model=eff_task_model,
+            plan_effort=eff_plan_effort,
+            task_effort=eff_task_effort,
         )
     except ValueError as exc:
         return JSONResponse({"status": "error", "reason": str(exc)}, status_code=422)
@@ -4073,47 +4160,7 @@ def main() -> None:
     # ConfigStore returns the SettingDef default ("" for these keys) when
     # unset — distinct from the registry's None for unconfigured fields.
     config_store.reload()  # symmetry with internal_model_reload's cs.reload()
-    cs_default_alias = config_store.get("model.default_alias")
-    cs_plan_alias = config_store.get("model.plan_alias")
-    cs_task_alias = config_store.get("model.task_alias")
-    cs_plan_effort = config_store.get("model.plan_effort")
-    cs_task_effort = config_store.get("model.task_effort")
-
-    eff_default = (
-        cs_default_alias
-        if cs_default_alias and registry.has_alias(cs_default_alias)
-        else registry.default
-    )
-    eff_plan_model = (
-        cs_plan_alias
-        if cs_plan_alias and registry.has_alias(cs_plan_alias)
-        else registry.plan_model
-    )
-    eff_task_model = (
-        cs_task_alias
-        if cs_task_alias and registry.has_alias(cs_task_alias)
-        else registry.task_model
-    )
-    eff_plan_effort = cs_plan_effort or registry.plan_effort
-    eff_task_effort = cs_task_effort or registry.task_effort
-
-    if (
-        eff_default != registry.default
-        or eff_plan_model != registry.plan_model
-        or eff_task_model != registry.task_model
-        or eff_plan_effort != registry.plan_effort
-        or eff_task_effort != registry.task_effort
-    ):
-        registry.reload(
-            registry.models,
-            eff_default,
-            registry.fallback,
-            registry.agent_model,
-            plan_model=eff_plan_model,
-            task_model=eff_task_model,
-            plan_effort=eff_plan_effort,
-            task_effort=eff_task_effort,
-        )
+    _apply_routing_overrides(registry, config_store)
 
     # Initialize MCP client (connects to configured MCP servers, if any)
     from turnstone.core.mcp_client import create_mcp_client

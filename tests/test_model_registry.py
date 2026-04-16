@@ -1434,3 +1434,127 @@ class TestLoadModelRegistryDBOnly:
         with patch("turnstone.core.model_registry.load_config", return_value={}):
             reg = load_model_registry(model="", storage=storage)
         assert not reg.has_alias("default")
+
+
+# ---------------------------------------------------------------------------
+# server._effective_routing / _apply_routing_overrides
+# ---------------------------------------------------------------------------
+
+
+class _FakeCS:
+    """Minimal ConfigStore stand-in: dict-backed get()."""
+
+    def __init__(self, **values: str) -> None:
+        self._values = values
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._values.get(key, default if default is not None else "")
+
+
+class TestEffectiveRouting:
+    """Pure-function helper that overlays ConfigStore values on a base."""
+
+    def _models(self) -> dict[str, ModelConfig]:
+        return {
+            "default": ModelConfig("default", "x", "x", "m"),
+            "smart": ModelConfig("smart", "x", "x", "m"),
+            "fast": ModelConfig("fast", "x", "x", "m"),
+        }
+
+    def test_returns_base_when_cs_is_none(self) -> None:
+        from turnstone.server import _effective_routing
+
+        result = _effective_routing(None, self._models(), "default", "smart", "fast", "high", "low")
+        assert result == ("default", "smart", "fast", "high", "low")
+
+    def test_cs_alias_overrides_base(self) -> None:
+        from turnstone.server import _effective_routing
+
+        cs = _FakeCS(**{"model.plan_alias": "fast", "model.task_alias": "smart"})
+        result = _effective_routing(cs, self._models(), "default", "smart", "fast", "high", "low")
+        assert result == ("default", "fast", "smart", "high", "low")
+
+    def test_cs_alias_silently_dropped_when_unknown(self) -> None:
+        from turnstone.server import _effective_routing
+
+        cs = _FakeCS(**{"model.plan_alias": "nonexistent"})
+        result = _effective_routing(cs, self._models(), "default", "smart", None, None, None)
+        assert result == ("default", "smart", None, None, None)  # falls back to base
+
+    def test_cs_empty_string_treated_as_unset(self) -> None:
+        from turnstone.server import _effective_routing
+
+        cs = _FakeCS(
+            **{
+                "model.default_alias": "",
+                "model.plan_alias": "",
+                "model.task_alias": "",
+                "model.plan_effort": "",
+                "model.task_effort": "",
+            }
+        )
+        result = _effective_routing(cs, self._models(), "default", "smart", "fast", "high", "low")
+        assert result == ("default", "smart", "fast", "high", "low")
+
+    def test_cs_effort_overrides_base(self) -> None:
+        from turnstone.server import _effective_routing
+
+        cs = _FakeCS(**{"model.plan_effort": "max", "model.task_effort": "minimal"})
+        result = _effective_routing(cs, self._models(), "default", None, None, "high", None)
+        assert result == ("default", None, None, "max", "minimal")
+
+
+class TestApplyRoutingOverrides:
+    """Decides whether to call registry.reload based on effective vs current."""
+
+    def _registry(self, **kwargs: Any) -> ModelRegistry:
+        return ModelRegistry(
+            models={
+                "default": ModelConfig("default", "x", "x", "m"),
+                "smart": ModelConfig("smart", "x", "x", "m"),
+                "fast": ModelConfig("fast", "x", "x", "m"),
+            },
+            default="default",
+            **kwargs,
+        )
+
+    def test_no_reload_when_cs_matches_registry(self) -> None:
+        from turnstone.server import _apply_routing_overrides
+
+        reg = self._registry(plan_model="smart", task_model="fast")
+        cs = _FakeCS(**{"model.plan_alias": "smart", "model.task_alias": "fast"})
+        # Patch reload to detect calls
+        called = {"count": 0}
+        original_reload = reg.reload
+        reg.reload = lambda *a, **kw: (
+            called.update(count=called["count"] + 1)
+            or original_reload(  # type: ignore[method-assign]
+                *a, **kw
+            )
+        )
+
+        assert _apply_routing_overrides(reg, cs) is False
+        assert called["count"] == 0
+
+    def test_reload_when_cs_differs(self) -> None:
+        from turnstone.server import _apply_routing_overrides
+
+        reg = self._registry()  # plan_model=None
+        cs = _FakeCS(**{"model.plan_alias": "smart"})
+        assert _apply_routing_overrides(reg, cs) is True
+        assert reg.plan_model == "smart"
+
+    def test_no_reload_when_cs_is_none(self) -> None:
+        from turnstone.server import _apply_routing_overrides
+
+        reg = self._registry()
+        assert _apply_routing_overrides(reg, None) is False
+
+    def test_unknown_alias_does_not_trigger_reload(self) -> None:
+        """Invalid CS aliases are silently dropped — no spurious reload."""
+        from turnstone.server import _apply_routing_overrides
+
+        reg = self._registry()
+        cs = _FakeCS(**{"model.plan_alias": "nonexistent"})
+        assert _apply_routing_overrides(reg, cs) is False
+        assert reg.plan_model is None  # unchanged
