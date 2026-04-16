@@ -39,7 +39,7 @@ Claims:
 |-------|-------------|
 | `sub` | User ID |
 | `scopes` | Comma-separated scope list (`read,write,approve`) |
-| `src` | Token source (`password`, `api_token`, `oidc`, or a service origin like `console` / `cli`) |
+| `src` | Token source (`password`, `database`, `oidc`, or a service origin like `console`, `cli`, or `channel`) |
 | `iss` | Issuer — always `turnstone` |
 | `aud` | Audience — `turnstone-server` or `turnstone-console` |
 | `iat` | Issued-at timestamp |
