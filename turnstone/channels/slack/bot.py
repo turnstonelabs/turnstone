@@ -35,6 +35,7 @@ from slack_sdk.web.async_client import AsyncWebClient
 
 from turnstone.channels._formatter import chunk_message
 from turnstone.channels._routing import ChannelRouter
+from turnstone.channels.slack.routes import SlackRoute
 from turnstone.core.log import get_logger
 from turnstone.sdk._types import TurnstoneAPIError
 from turnstone.sdk.events import (
@@ -58,14 +59,20 @@ if TYPE_CHECKING:
     from turnstone.channels.slack.config import SlackConfig
     from turnstone.core.storage._protocol import StorageBackend
 
-from turnstone.channels.slack.routes import SlackRoute
-
 log = get_logger(__name__)
 
 _GREETING = "Hey! Let me know what I can help with."
 
 _SSE_RECONNECT_DELAY: float = 2.0
 _SSE_MAX_RECONNECT_DELAY: float = 30.0
+
+
+@dataclass(frozen=True)
+class PendingApproval:
+    channel: str
+    message_ts: str
+    owner_user_id: str | None = None
+
 
 @dataclass
 class StreamingMessage:
@@ -185,7 +192,7 @@ class TurnstoneSlackBot:
         self._sse_tasks: dict[str, asyncio.Task[None]] = {}
         self._streaming: dict[str, StreamingMessage] = {}
 
-        self._pending_approval_ts: dict[str, tuple[str, str]] = {}
+        self._pending_approval: dict[str, PendingApproval] = {}
         self._pending_plan_review_ts: dict[str, tuple[str, str]] = {}
         self._notify_ws_map: dict[str, tuple[str, SlackRoute]] = {}
         # Per-workstream override used to route the next streamed assistant
@@ -422,9 +429,9 @@ class TurnstoneSlackBot:
                         )
                         try:
                             slash_cmd = self.config.slash_command or "/turnstone"
-                            await self._client.chat_postMessage(
+                            await self._client.chat_postEphemeral(
                                 channel=channel_id,
-                                thread_ts=thread_ts or None,
+                                user=user_id,
                                 text=(
                                     "This notification is no longer linked to an active session. "
                                     f"Please start a new one with `{slash_cmd}`."
@@ -501,8 +508,19 @@ class TurnstoneSlackBot:
             return
 
         ws_id, correlation_id = parts
-        await self.router.send_approval(ws_id, correlation_id, approved=True)
+        entry = self._pending_approval.get(ws_id)
+        actor_user_id = body.get("user", {}).get("id", "")
         channel = body["container"]["channel_id"]
+
+        if entry and entry.owner_user_id and actor_user_id != entry.owner_user_id:
+            await self._client.chat_postEphemeral(
+                channel=channel,
+                user=actor_user_id,
+                text="Only the session owner can approve this tool call.",
+            )
+            return
+
+        await self.router.send_approval(ws_id, correlation_id, approved=True)
         ts = body["container"]["message_ts"]
 
         try:
@@ -523,8 +541,19 @@ class TurnstoneSlackBot:
             return
 
         ws_id, correlation_id = parts
-        await self.router.send_approval(ws_id, correlation_id, approved=False)
+        entry = self._pending_approval.get(ws_id)
+        actor_user_id = body.get("user", {}).get("id", "")
         channel = body["container"]["channel_id"]
+
+        if entry and entry.owner_user_id and actor_user_id != entry.owner_user_id:
+            await self._client.chat_postEphemeral(
+                channel=channel,
+                user=actor_user_id,
+                text="Only the session owner can deny this tool call.",
+            )
+            return
+
+        await self.router.send_approval(ws_id, correlation_id, approved=False)
         ts = body["container"]["message_ts"]
 
         try:
@@ -656,7 +685,7 @@ class TurnstoneSlackBot:
 
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
-        self._pending_approval_ts.pop(ws_id, None)
+        self._pending_approval.pop(ws_id, None)
         self._pending_plan_review_ts.pop(ws_id, None)
         self._clear_notification_tracking_for_ws(ws_id)
 
@@ -718,12 +747,7 @@ class TurnstoneSlackBot:
                                     ws_id,
                                     SlackRoute.parse(channel_id),
                                 )
-                                await self._on_ws_event(
-                                    ws_id,
-                                    effective_route.channel,
-                                    effective_route.thread_ts or "",
-                                    event,
-                                )
+                                await self._on_ws_event(ws_id, effective_route, event)
                             except Exception:
                                 log.warning(
                                     "slack.event_dispatch_failed",
@@ -762,7 +786,7 @@ class TurnstoneSlackBot:
         self._subscribed_ws.discard(ws_id)
         self._sse_tasks.pop(ws_id, None)
         self._streaming.pop(ws_id, None)
-        self._pending_approval_ts.pop(ws_id, None)
+        self._pending_approval.pop(ws_id, None)
         self._pending_plan_review_ts.pop(ws_id, None)
         self._clear_notification_tracking_for_ws(ws_id)
 
@@ -771,11 +795,14 @@ class TurnstoneSlackBot:
     async def _on_ws_event(
         self,
         ws_id: str,
-        slack_channel: str,
-        thread_ts: str,
+        route: SlackRoute,
         event: ServerEvent,
     ) -> None:
         """Handle a typed server event for a subscribed workstream."""
+        slack_channel = route.channel
+        thread_ts = route.thread_ts or ""
+        owner_user_id = route.user_id
+
         if isinstance(event, (ThinkingStartEvent, ThinkingStopEvent)):
             pass
 
@@ -858,12 +885,14 @@ class TurnstoneSlackBot:
                     event.items,
                     slack_channel,
                     thread_ts,
+                    owner_user_id,
                 )
 
         elif isinstance(event, IntentVerdictEvent):
-            entry = self._pending_approval_ts.get(ws_id)
+            entry = self._pending_approval.get(ws_id)
             if entry is not None:
-                pending_channel, pending_ts = entry
+                pending_channel = entry.channel
+                pending_ts = entry.message_ts
                 risk = (event.risk_level or "medium").upper()
                 verdict_text = (
                     f"*Judge Verdict: {event.func_name or 'tool'}*\n"
@@ -939,9 +968,10 @@ class TurnstoneSlackBot:
                 self._pending_plan_review_ts[ws_id] = (slack_channel, resp["ts"])
 
         elif isinstance(event, ApprovalResolvedEvent):
-            entry = self._pending_approval_ts.pop(ws_id, None)
+            entry = self._pending_approval.pop(ws_id, None)
             if entry is not None:
-                pending_channel, pending_ts = entry
+                pending_channel = entry.channel
+                pending_ts = entry.message_ts
                 label = "Approved" if event.approved else "Denied"
                 try:
                     await self._client.chat_update(
@@ -964,7 +994,7 @@ class TurnstoneSlackBot:
                 if reply_route.channel and reply_route.user_id:
                     self._track_notification(sm._ts, ws_id, reply_route)
 
-            self._pending_approval_ts.pop(ws_id, None)
+            self._pending_approval.pop(ws_id, None)
 
         elif isinstance(event, ErrorEvent):
             safe_msg = event.message[:500] if event.message else "An error occurred"
@@ -981,6 +1011,7 @@ class TurnstoneSlackBot:
         items: list[dict[str, Any]],
         channel: str,
         thread_ts: str,
+        owner_user_id: str | None,
     ) -> None:
         tool_lines = []
         for item in items:
@@ -1026,7 +1057,11 @@ class TurnstoneSlackBot:
             blocks=cast("list[dict[str, Any]]", blocks),
         )
         if resp.get("ok"):
-            self._pending_approval_ts[ws_id] = (channel, resp["ts"])
+            self._pending_approval[ws_id] = PendingApproval(
+                channel=channel,
+                message_ts=resp["ts"],
+                owner_user_id=owner_user_id,
+            )
 
     def _should_auto_approve(self, event: ApproveRequestEvent) -> bool:
         allowed = self.config.auto_approve_tools
