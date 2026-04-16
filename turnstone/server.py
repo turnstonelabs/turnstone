@@ -642,8 +642,20 @@ class WebUI:
 
     def resolve_plan(self, feedback: str) -> None:
         """Called by the HTTP handler when the user responds to a plan."""
-        self._pending_plan_review = None
         self._plan_result = feedback
+        if self._pending_plan_review is None:
+            # cancel_generation calls us unconditionally to unblock any wait.
+            # No plan pending — just signal and skip the broadcast frame.
+            self._plan_event.set()
+            return
+        # Clear pending BEFORE broadcasting so a client reconnecting in the
+        # window between enqueue and clear cannot receive both the replayed
+        # plan_review (SSE re-injection at the connect handler) AND the live
+        # plan_resolved.  Broadcast lets other clients (e.g. desktop while
+        # phone approved) dismiss their plan modals in sync — mirrors the
+        # approval_resolved pattern used by resolve_approval().
+        self._pending_plan_review = None
+        self._enqueue({"type": "plan_resolved", "feedback": feedback})
         self._plan_event.set()
 
 

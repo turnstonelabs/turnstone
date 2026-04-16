@@ -851,6 +851,14 @@ Pane.prototype.handleEvent = function (evt) {
       showPlanDialog(evt.content);
       break;
 
+    case "plan_resolved":
+      // Plan was resolved on another client (or by server-initiated cancel).
+      // Only act if our modal is for this pane's workstream.
+      if (_planWsId === this.wsId) {
+        dismissPlanDialog(evt.feedback);
+      }
+      break;
+
     case "info":
       this.addInfoMessage(evt.message);
       break;
@@ -5056,6 +5064,8 @@ function _updatePlanRejectBtn() {
 function resolvePlan(defaultFeedback) {
   var feedback = document.getElementById("plan-feedback").value.trim();
   if (!feedback && defaultFeedback) feedback = defaultFeedback;
+  // Removing 'active' synchronously is what lets dismissPlanDialog's
+  // early-return guard treat the server's echoed plan_resolved as a no-op.
   document.getElementById("plan-overlay").classList.remove("active");
 
   var pane = panes[_planPaneId];
@@ -5095,7 +5105,70 @@ function resolvePlan(defaultFeedback) {
   }
 }
 
-function _addInlinePlan(content, action, feedback) {
+function dismissPlanDialog(feedback) {
+  // Sync-dismiss: another client (or the server) already resolved the plan.
+  // Do NOT call /v1/api/plan — the server has already moved on.  The early
+  // return also handles self-receipt: the client that called resolvePlan()
+  // already removed the active class, so this is a no-op for that client.
+  var overlay = document.getElementById("plan-overlay");
+  if (!overlay.classList.contains("active")) return;
+  overlay.classList.remove("active");
+
+  var pane = panes[_planPaneId];
+  if (pane) {
+    pane.inputEl.disabled = false;
+    pane.sendBtn.disabled = false;
+    // Restore keyboard context — but skip on touch so we don't surprise the
+    // mobile user with a soft-keyboard pop after a remote approval.
+    if (!matchMedia("(pointer: coarse)").matches) pane.inputEl.focus();
+  }
+
+  var fb = feedback || "";
+  var isReject = fb === "reject";
+  var isAmend = fb && !isReject;
+  var action = isReject ? "rejected" : isAmend ? "amending" : "approved";
+
+  // Race fallback: if plan_resolved arrives before plan_review (e.g. SSE
+  // reconnect ordering), _planContent is empty and _addInlinePlan early-
+  // returns silently.  Surface a one-line info message so the user sees
+  // what happened.
+  if (_planContent) {
+    try {
+      _addInlinePlan(_planContent, action, fb, "remote");
+    } catch (err) {
+      console.error("Failed to render inline plan:", err);
+      if (pane) pane.addInfoMessage("Plan " + action + " on another device");
+    }
+  } else if (pane) {
+    pane.addInfoMessage("Plan " + action + " on another device");
+  }
+
+  // SR announcement (visible toast styling deferred — #toast already has
+  // aria-live="polite" in markup, this just gives screen-reader parity).
+  _announce("Plan " + action + " on another device");
+
+  if (pane) {
+    pane.setBusy(true);
+    pane.addThinkingIndicator();
+  }
+
+  _planContent = "";
+  _planPaneId = null;
+  _planWsId = null;
+}
+
+function _announce(text) {
+  var el = document.getElementById("toast");
+  if (!el) return;
+  // Re-set textContent in two ticks so screen readers re-announce even
+  // when the message is identical to the previous one.
+  el.textContent = "";
+  setTimeout(function () {
+    el.textContent = text;
+  }, 50);
+}
+
+function _addInlinePlan(content, action, feedback, origin) {
   if (!content) return;
   var pane = panes[_planPaneId];
   if (!pane) return;
@@ -5111,8 +5184,13 @@ function _addInlinePlan(content, action, feedback) {
       : action === "amending"
         ? "Plan \u2014 amending"
         : "Plan approved";
-  header.innerHTML =
-    '<span class="plan-inline-label plan-' + action + '">' + label + "</span>";
+  // Disambiguate remote dismissal — otherwise the desktop user sees "Plan
+  // approved" with no attribution and may wonder if the agent self-approved.
+  if (origin === "remote") label += " (synced)";
+  var labelEl = document.createElement("span");
+  labelEl.className = "plan-inline-label plan-" + action;
+  labelEl.textContent = label;
+  header.appendChild(labelEl);
   wrapper.appendChild(header);
 
   var body = document.createElement("div");

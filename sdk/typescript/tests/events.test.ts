@@ -8,6 +8,7 @@ import {
   isApproveRequestEvent,
   isApprovalResolvedEvent,
   isPlanReviewEvent,
+  isPlanResolvedEvent,
   isReasoningEvent,
 } from "../src/events.js";
 import type { ServerEvent } from "../src/events.js";
@@ -75,5 +76,10 @@ describe("event type guards", () => {
   it("isPlanReviewEvent", () => {
     const e: ServerEvent = { type: "plan_review", content: "## Plan" };
     expect(isPlanReviewEvent(e)).toBe(true);
+  });
+
+  it("isPlanResolvedEvent", () => {
+    const e: ServerEvent = { type: "plan_resolved", feedback: "approved" };
+    expect(isPlanResolvedEvent(e)).toBe(true);
   });
 });

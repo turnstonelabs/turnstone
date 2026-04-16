@@ -138,6 +138,12 @@ class PlanReviewEvent(ServerEvent):
 
 
 @dataclass
+class PlanResolvedEvent(ServerEvent):
+    type: str = "plan_resolved"
+    feedback: str = ""
+
+
+@dataclass
 class InfoEvent(ServerEvent):
     type: str = "info"
     message: str = ""
@@ -360,6 +366,7 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
         ToolOutputChunkEvent,
         StatusEvent,
         PlanReviewEvent,
+        PlanResolvedEvent,
         InfoEvent,
         ErrorEvent,
         BusyErrorEvent,
