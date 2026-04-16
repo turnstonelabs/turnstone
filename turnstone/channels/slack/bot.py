@@ -512,7 +512,28 @@ class TurnstoneSlackBot:
         actor_user_id = body.get("user", {}).get("id", "")
         channel = body["container"]["channel_id"]
 
-        if entry and entry.owner_user_id and actor_user_id != entry.owner_user_id:
+        log.info(
+            "slack.approval_actor_check",
+            ws_id=ws_id,
+            actor_user_id=actor_user_id,
+            owner_user_id=entry.owner_user_id if entry else None,
+            has_entry=entry is not None,
+        )
+
+        if entry is None or not entry.owner_user_id:
+            log.warning(
+                "slack.approval_missing_owner",
+                ws_id=ws_id,
+                actor_user_id=actor_user_id,
+            )
+            await self._client.chat_postEphemeral(
+                channel=channel,
+                user=actor_user_id,
+                text="This approval can no longer be verified. Please retry from the active session.",
+            )
+            return
+
+        if actor_user_id != entry.owner_user_id:
             await self._client.chat_postEphemeral(
                 channel=channel,
                 user=actor_user_id,
@@ -545,7 +566,28 @@ class TurnstoneSlackBot:
         actor_user_id = body.get("user", {}).get("id", "")
         channel = body["container"]["channel_id"]
 
-        if entry and entry.owner_user_id and actor_user_id != entry.owner_user_id:
+        log.info(
+            "slack.approval_actor_check",
+            ws_id=ws_id,
+            actor_user_id=actor_user_id,
+            owner_user_id=entry.owner_user_id if entry else None,
+            has_entry=entry is not None,
+        )
+
+        if entry is None or not entry.owner_user_id:
+            log.warning(
+                "slack.approval_missing_owner",
+                ws_id=ws_id,
+                actor_user_id=actor_user_id,
+            )
+            await self._client.chat_postEphemeral(
+                channel=channel,
+                user=actor_user_id,
+                text="This approval can no longer be verified. Please retry from the active session.",
+            )
+            return
+
+        if actor_user_id != entry.owner_user_id:
             await self._client.chat_postEphemeral(
                 channel=channel,
                 user=actor_user_id,
@@ -1060,6 +1102,13 @@ class TurnstoneSlackBot:
             self._pending_approval[ws_id] = PendingApproval(
                 channel=channel,
                 message_ts=resp["ts"],
+                owner_user_id=owner_user_id,
+            )
+            log.info(
+                "slack.pending_approval_stored",
+                ws_id=ws_id,
+                channel=channel,
+                thread_ts=thread_ts,
                 owner_user_id=owner_user_id,
             )
 
