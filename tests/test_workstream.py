@@ -161,6 +161,21 @@ class TestManagerCreation:
         ws = mgr.create(ui_factory=FakeUI)
         assert ws.name.startswith("ws-")
 
+    def test_create_persists_user_id_on_dataclass(self):
+        """Regression: ``mgr.create(user_id=X)`` must surface X on the
+        ``Workstream`` dataclass.  The server-side handler used to omit
+        ``user_id=uid`` in the call, leaving interactive workstreams
+        unowned and weakening ownership-based access controls.
+        """
+        mgr = WorkstreamManager(_fake_factory)
+        ws = mgr.create(ui_factory=FakeUI, user_id="user-abc")
+        assert ws.user_id == "user-abc"
+
+    def test_create_defaults_user_id_to_empty(self):
+        mgr = WorkstreamManager(_fake_factory)
+        ws = mgr.create(ui_factory=FakeUI)
+        assert ws.user_id == ""
+
     def test_create_max_workstreams_all_active(self):
         mgr = WorkstreamManager(_fake_factory, max_workstreams=3)
         ws1 = mgr.create(ui_factory=FakeUI)

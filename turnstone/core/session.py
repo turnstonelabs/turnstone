@@ -3781,19 +3781,29 @@ class ChatSession:
             args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
             args = None
-            # Fallback 1: regex-extract a known key from malformed JSON
+            # Fallback 1: regex-extract a known key from malformed JSON.
+            # Keep this list focused on primary/identifying keys — the
+            # model will see the salvaged minimal-args result and
+            # resubmit with correct JSON on the next turn.  Coordinator
+            # keys (ws_id, message, initial_message, parent_ws_id) are
+            # included so malformed coordinator tool calls aren't a
+            # dead-end.
             for key in (
                 "command",
                 "code",
                 "content",
+                "initial_message",
+                "message",
                 "name",
                 "page",
+                "parent_ws_id",
                 "path",
                 "pattern",
                 "prompt",
                 "query",
                 "uri",
                 "url",
+                "ws_id",
             ):
                 m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_args)
                 if m:

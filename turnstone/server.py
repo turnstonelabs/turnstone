@@ -2358,6 +2358,7 @@ async def create_workstream(request: Request) -> JSONResponse:
             ws_id=requested_ws_id,
             client_type=body.get("client_type", "") or "",
             judge_model=body.get("judge_model", "") or None,
+            user_id=uid,
             kind=body_kind,
             parent_ws_id=body_parent,
         )
@@ -3087,10 +3088,16 @@ async def open_workstream(request: Request) -> JSONResponse:
     uid: str = getattr(auth, "user_id", "") or ""
 
     try:
+        # Prefer the persisted owner (this workstream may have been created
+        # by a trusted-service forwarder) and only fall back to the
+        # authenticated caller if the stored row has no owner recorded.
+        stored_owner = (ws_row.get("user_id") or "").strip()
+        owner_uid = stored_owner or uid
         ws = mgr.create(
             name=ws_row.get("name", ""),
-            ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
+            ui_factory=lambda wid: WebUI(ws_id=wid, user_id=owner_uid),
             ws_id=resolved_id,
+            user_id=owner_uid,
         )
     except Exception as e:
         log.warning("ws.open.create_failed", ws_id=resolved_id[:8], error=str(e))
