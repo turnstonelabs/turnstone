@@ -235,7 +235,9 @@ def test_inspect_exec_dispatches_to_client(coord_session):
     }
     item = sess._prepare_tool(_tc("inspect_workstream", {"ws_id": "child-x"}))
     _call_id, output = sess._exec_inspect_workstream(item)
-    coord.inspect.assert_called_once_with("child-x", message_limit=20)
+    coord.inspect.assert_called_once_with(
+        "child-x", message_limit=20, include_provider_content=False
+    )
     assert "child-x" in output
 
 
@@ -476,7 +478,12 @@ def test_list_nodes_exec_dispatches_to_client(coord_session):
     parsed = json.loads(output)
     assert parsed["nodes"][0]["node_id"] == "n1"
     assert parsed["truncated"] is False
-    coord.list_nodes.assert_called_once_with(filters={"arch": "x86_64"}, limit=100)
+    coord.list_nodes.assert_called_once_with(
+        filters={"arch": "x86_64"},
+        limit=100,
+        include_network_detail=False,
+        include_inactive=False,
+    )
 
 
 def test_list_nodes_exec_surfaces_truncated_sentinel(coord_session):
@@ -769,3 +776,78 @@ def test_task_list_exec_remove_success_dispatches(coord_session):
     _, output = sess._exec_task_list(item)
     parsed = json.loads(output)
     assert parsed.get("ok") is True
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test regressions — empty-arg tool calls, metadata stripping,
+# provider-content trimming
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_tool_empty_arguments_string_parses_as_object(coord_session):
+    """Some providers emit an empty string when a tool is invoked with
+    no arguments (all params optional).  The empty string must be
+    treated as ``{}`` rather than dropped into the malformed-JSON
+    error branch — otherwise zero-arg coordinator tool calls fail."""
+    sess, coord, _ui = coord_session
+    coord.list_nodes.return_value = {"nodes": [], "truncated": False}
+    tc = {
+        "id": "call-empty",
+        "type": "function",
+        "function": {"name": "list_nodes", "arguments": ""},
+    }
+    item = sess._prepare_tool(tc)
+    # No error field, prepared for list_nodes exec.
+    assert "error" not in item
+    assert item["func_name"] == "list_nodes"
+
+
+def test_list_nodes_strips_interfaces_by_default(coord_session):
+    """Default ``list_nodes`` output omits the auto-populated
+    ``interfaces`` key — it leaks internal RFC 1918 addresses and the
+    model never uses it for routing decisions."""
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_nodes", {}))
+    coord.list_nodes.assert_not_called()  # prepare doesn't fire the client yet
+    assert item["include_network_detail"] is False
+    sess._exec_list_nodes(item)
+    coord.list_nodes.assert_called_once()
+    kwargs = coord.list_nodes.call_args.kwargs
+    assert kwargs.get("include_network_detail") is False
+
+
+def test_list_nodes_include_network_detail_opt_in(coord_session):
+    """Opt-in flag flips include_network_detail=True through to the client."""
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_nodes", {"include_network_detail": True}))
+    assert item["include_network_detail"] is True
+    sess._exec_list_nodes(item)
+    kwargs = coord.list_nodes.call_args.kwargs
+    assert kwargs.get("include_network_detail") is True
+
+
+def test_inspect_workstream_default_trims_provider_content(coord_session):
+    """Default ``inspect_workstream`` threads
+    ``include_provider_content=False`` through to the client so the
+    ``_provider_content`` / ``provider_blocks`` duplicates don't bloat
+    the response."""
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("inspect_workstream", {"ws_id": "abc123"}))
+    assert item["include_provider_content"] is False
+    sess._exec_inspect_workstream(item)
+    kwargs = coord.inspect.call_args.kwargs
+    assert kwargs.get("include_provider_content") is False
+
+
+def test_inspect_workstream_include_provider_content_opt_in(coord_session):
+    sess, coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "inspect_workstream",
+            {"ws_id": "abc123", "include_provider_content": True},
+        )
+    )
+    assert item["include_provider_content"] is True
+    sess._exec_inspect_workstream(item)
+    kwargs = coord.inspect.call_args.kwargs
+    assert kwargs.get("include_provider_content") is True

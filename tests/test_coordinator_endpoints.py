@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -21,8 +22,10 @@ from starlette.testclient import TestClient
 from turnstone.console.coordinator import CoordinatorManager
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
+    cluster_ws_detail,
     coordinator_approve,
     coordinator_cancel,
+    coordinator_children,
     coordinator_close,
     coordinator_create,
     coordinator_detail,
@@ -30,6 +33,7 @@ from turnstone.console.server import (
     coordinator_list,
     coordinator_open,
     coordinator_send,
+    coordinator_tasks,
 )
 from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
@@ -142,8 +146,23 @@ def _make_client(
                 methods=["POST"],
             ),
             Route(
+                "/v1/api/coordinator/{ws_id}/children",
+                coordinator_children,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/coordinator/{ws_id}/tasks",
+                coordinator_tasks,
+                methods=["GET"],
+            ),
+            Route(
                 "/v1/api/coordinator/{ws_id}",
                 coordinator_detail,
+                methods=["GET"],
+            ),
+            Route(
+                "/v1/api/cluster/ws/{ws_id}/detail",
+                cluster_ws_detail,
                 methods=["GET"],
             ),
         ],
@@ -199,7 +218,10 @@ def test_missing_coord_mgr_returns_503(storage):
     assert "not initialized" in body["error"]
 
 
-def test_missing_model_alias_returns_503(storage):
+def test_missing_model_alias_falls_back_to_registry_default(storage):
+    """``coordinator.model_alias`` unset → resolve through the
+    registry's default alias rather than 503-ing.  Operators get a
+    working coordinator out of the box once any model is configured."""
     mgr = _build_mgr(storage)
     client = _make_client(storage, coord_mgr=mgr, alias="", registry=_fake_registry())
     resp = client.post(
@@ -207,8 +229,28 @@ def test_missing_model_alias_returns_503(storage):
         json={},
         headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
     )
+    # The fake registry resolves any alias (including None → default)
+    # so the create call succeeds past the gate.  We only assert that
+    # the 503 remediation stack is NOT fired — any success or further
+    # downstream failure is unrelated to this regression.
+    assert resp.status_code != 503, resp.json()
+
+
+def test_missing_alias_and_no_default_returns_503(storage):
+    """When neither ``coordinator.model_alias`` nor the registry
+    default resolves, 503 with remediation still fires so operators
+    know they haven't configured any model at all."""
+    mgr = _build_mgr(storage)
+    broken_registry = MagicMock()
+    broken_registry.resolve.side_effect = KeyError("no-default")
+    client = _make_client(storage, coord_mgr=mgr, alias="", registry=broken_registry)
+    resp = client.post(
+        "/v1/api/coordinator/new",
+        json={},
+        headers={"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"},
+    )
     assert resp.status_code == 503
-    assert "model_alias" in resp.json()["error"]
+    assert "does not resolve" in resp.json()["error"]
 
 
 def test_unresolvable_alias_returns_503(storage):
@@ -536,3 +578,481 @@ def test_open_503_when_open_raises_value_error(storage, monkeypatch):
     resp = client.post("/v1/api/coordinator/bad-ws/open", headers=_COORD_HEADERS)
     assert resp.status_code == 503
     assert "registry missing" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/coordinator/{ws_id}/children — phase 3 tree view backend
+# ---------------------------------------------------------------------------
+
+
+def _seed_child(storage, parent_ws_id: str, ws_id: str, *, state: str = "idle") -> None:
+    storage.register_workstream(
+        ws_id,
+        node_id="node-a",
+        user_id="user-1",
+        name=f"child-{ws_id[:4]}",
+        kind="interactive",
+        parent_ws_id=parent_ws_id,
+    )
+    if state != "idle":
+        storage.update_workstream_state(ws_id, state)
+
+
+def test_children_empty_for_new_coordinator(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/coordinator/{ws.id}/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"items": [], "truncated": False}
+
+
+def test_children_returns_interactive_children(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    _seed_child(storage, ws.id, "c" * 32)
+    _seed_child(storage, ws.id, "d" * 32, state="running")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/coordinator/{ws.id}/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["items"]) == 2
+    states = {r["state"] for r in body["items"]}
+    assert states == {"idle", "running"}
+    kinds = {r["kind"] for r in body["items"]}
+    assert kinds == {"interactive"}
+
+
+def test_children_ownership_404(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/coordinator/{ws.id}/children",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+def test_children_admin_bypass(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    _seed_child(storage, ws.id, "a" * 32)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/coordinator/{ws.id}/children",
+        headers={
+            "X-Test-User": "admin-1",
+            "X-Test-Perms": "admin.coordinator,admin.users",
+        },
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["items"]) == 1
+
+
+def test_children_invalid_ws_id_400(storage):
+    mgr = _build_mgr(storage)
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get("/v1/api/coordinator/INVALID-WS-SHOUT/children", headers=_COORD_HEADERS)
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/coordinator/{ws_id}/tasks — phase 3 task pane backend
+# ---------------------------------------------------------------------------
+
+
+def test_tasks_empty_envelope_for_new_coordinator(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == {"version": 1, "tasks": []}
+
+
+def test_tasks_round_trips_stored_envelope(storage):
+    import json
+
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    envelope = {
+        "version": 1,
+        "tasks": [
+            {
+                "id": "tsk_abc",
+                "title": "Spawn analyzer",
+                "status": "in_progress",
+                "child_ws_id": "",
+                "created": "2026-04-17T00:00:00+00:00",
+                "updated": "2026-04-17T00:01:00+00:00",
+            }
+        ],
+    }
+    storage.save_workstream_config(ws.id, {"tasks": json.dumps(envelope)})
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == envelope
+
+
+def test_tasks_corrupt_envelope_returns_empty(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    storage.save_workstream_config(ws.id, {"tasks": "NOT-JSON"})
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/coordinator/{ws.id}/tasks", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json() == {"version": 1, "tasks": []}
+
+
+def test_tasks_ownership_404(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/coordinator/{ws.id}/tasks",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/api/cluster/ws/{ws_id}/detail — cluster-wide live inspect
+# ---------------------------------------------------------------------------
+
+
+_CLUSTER_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.cluster.inspect"}
+
+
+def test_cluster_inspect_requires_permission(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get(
+        "/v1/api/cluster/ws/" + ("a" * 32) + "/detail",
+        headers={"X-Test-User": "u", "X-Test-Perms": "read"},
+    )
+    assert resp.status_code == 403
+
+
+def test_cluster_inspect_unknown_ws_id_404(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get("/v1/api/cluster/ws/" + ("a" * 32) + "/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_cluster_inspect_invalid_ws_id_400(storage):
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
+    resp = client.get("/v1/api/cluster/ws/NOT-HEX/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 400
+
+
+def test_cluster_inspect_ownership_404(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.cluster.inspect"},
+    )
+    assert resp.status_code == 404
+
+
+def test_cluster_inspect_coordinator_self_path(storage):
+    """A coordinator row returns live from the in-process manager."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/cluster/ws/{ws.id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["persisted"]["ws_id"] == ws.id
+    assert body["persisted"]["kind"] == "coordinator"
+    # Live is populated from the manager snapshot (pending_approval key signals
+    # we went through the coordinator branch, not the node-fetch branch).
+    assert body["live"] is not None
+    assert "pending_approval" in body["live"]
+    # Freshly created coordinator has no pending approval — the previous
+    # implementation read `not _approval_event.is_set()` which fires True
+    # on any unset event, making this flag spuriously True on every new
+    # coordinator.  Regression guard.
+    assert body["live"]["pending_approval"] is False
+    assert body["live"]["activity_state"] == ""
+    assert isinstance(body["messages"], list)
+
+
+def test_cluster_inspect_unloaded_coordinator_live_null(storage):
+    """A persisted-but-not-loaded coordinator returns live: null, 200."""
+    mgr = _build_mgr(storage)
+    # Persist a coordinator row directly without loading into the manager.
+    storage.register_workstream(
+        "f" * 32,
+        node_id="console",
+        user_id="user-1",
+        name="offline-coord",
+        kind="coordinator",
+        parent_ws_id=None,
+    )
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(f"/v1/api/cluster/ws/{'f' * 32}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["live"] is None
+    assert body["persisted"]["kind"] == "coordinator"
+
+
+def _install_proxy_client(client: TestClient, transport: httpx.MockTransport) -> None:
+    """Attach an httpx.AsyncClient backed by a MockTransport to the app state.
+
+    cluster_ws_detail's node-backed branch reads
+    ``request.app.state.proxy_client`` + ``request.app.state.collector``
+    to fetch a node's dashboard.  Both are normally wired in the lifespan;
+    tests short-circuit by injecting a proxy client here and stubbing
+    the collector's node lookup with a MagicMock.
+    """
+    client.app.state.proxy_client = httpx.AsyncClient(transport=transport)
+
+
+def _install_collector_with_node(client: TestClient, node_id: str, server_url: str) -> None:
+    """Stub app.state.collector so _get_server_url returns server_url."""
+    collector = MagicMock()
+    collector.get_node_detail.return_value = {
+        "node_id": node_id,
+        "server_url": server_url,
+    }
+    client.app.state.collector = collector
+
+
+def _seed_node_workstream(storage, *, ws_id: str, node_id: str, user_id: str = "user-1") -> None:
+    storage.register_workstream(
+        ws_id,
+        node_id=node_id,
+        user_id=user_id,
+        name=f"child-{ws_id[:4]}",
+        kind="interactive",
+        parent_ws_id=None,
+    )
+
+
+def test_cluster_inspect_node_backed_success(storage):
+    """Node returns a matching workstream entry in /dashboard — cluster_ws_detail
+    merges its live fields into the `live` block."""
+    mgr = _build_mgr(storage)
+    ws_id = "ab" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {
+                "id": ws_id,
+                "state": "running",
+                "tokens": 512,
+                "context_ratio": 0.25,
+                "activity": "tool: bash",
+                "activity_state": "tool",
+                "tool_calls": 3,
+                "model": "gpt-5",
+                "model_alias": "default",
+                "title": "hello",
+                "name": "child",
+            }
+        ]
+    }
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        assert req.url.path == "/v1/api/dashboard"
+        return httpx.Response(200, json=payload)
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(_handler))
+
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    live = body["live"]
+    assert live is not None
+    assert live["state"] == "running"
+    assert live["tokens"] == 512
+    assert live["tool_calls"] == 3
+    # pending_approval synthesized from activity_state != "approval"
+    assert live["pending_approval"] is False
+
+
+def test_cluster_inspect_node_backed_pending_approval_synthesized(storage):
+    """activity_state=='approval' from the node synthesizes pending_approval=True."""
+    mgr = _build_mgr(storage)
+    ws_id = "cd" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {
+                "id": ws_id,
+                "state": "attention",
+                "activity_state": "approval",
+                "activity": "awaiting approval",
+                "tokens": 100,
+            }
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"]["pending_approval"] is True
+
+
+def test_cluster_inspect_node_unreachable_live_null(storage):
+    """httpx connect/timeout error → live: null, status 200."""
+    mgr = _build_mgr(storage)
+    ws_id = "de" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+
+    def _handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("node down")
+
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(_handler))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_node_5xx_live_null(storage):
+    """Non-2xx from the node → live: null, status 200."""
+    mgr = _build_mgr(storage)
+    ws_id = "ef" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(503, text="down")))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_node_missing_entry_live_null(storage):
+    """Node returned 200 but the target ws_id is not in its workstream list."""
+    mgr = _build_mgr(storage)
+    ws_id = "1a" * 16
+    _seed_node_workstream(storage, ws_id=ws_id, node_id="node-a")
+    payload = {
+        "workstreams": [
+            {"id": "different-" + "x" * 24, "state": "idle"},
+        ]
+    }
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    _install_collector_with_node(client, "node-a", "http://node-a")
+    _install_proxy_client(client, httpx.MockTransport(lambda r: httpx.Response(200, json=payload)))
+    resp = client.get(f"/v1/api/cluster/ws/{ws_id}/detail", headers=_CLUSTER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.json()["live"] is None
+
+
+def test_cluster_inspect_message_limit_clamped(storage):
+    """Seed enough messages that the 200-row clamp must actually
+    execute, and assert the tail slice is correct — prior version
+    only checked `<= 200` on a fresh coordinator (0 messages), which
+    passed even if the clamp were stripped."""
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    # 250 messages — last 200 must come back, in chronological order.
+    for i in range(250):
+        storage.save_message(ws.id, role="user", content=f"msg-{i:04d}")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=9999",
+        headers=_CLUSTER_HEADERS,
+    )
+    assert resp.status_code == 200
+    messages = resp.json()["messages"]
+    # Clamp took effect: exactly 200 rows back.
+    assert len(messages) == 200
+    # Chronological order preserved: oldest of the tail-200 first,
+    # newest last.  The tail of 250 inserts is messages 50..249.
+    contents = [m.get("content") for m in messages]
+    assert contents[0] == "msg-0050"
+    assert contents[-1] == "msg-0249"
+
+
+def test_cluster_inspect_zero_message_limit_returns_empty(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1")
+    for i in range(10):
+        storage.save_message(ws.id, role="user", content=f"msg-{i}")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.get(
+        f"/v1/api/cluster/ws/{ws.id}/detail?message_limit=0",
+        headers=_CLUSTER_HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["messages"] == []
+
+
+# ---------------------------------------------------------------------------
+# _coordinator_rows tenant filter — regression for the cross-tenant leak
+# ultrareview flagged in the cluster dashboard path
+# ---------------------------------------------------------------------------
+
+
+def test_coordinator_rows_filters_by_caller_identity(storage):
+    """Non-admin callers get only their own coordinators.  `list_all` must
+    never be reached for them — mirrors list_for_user's docstring
+    invariant, which the phase-3 dashboard merge originally bypassed."""
+    from unittest.mock import MagicMock
+
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.auth import AuthResult
+
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="alice", name="alice-coord")
+    mgr.create(user_id="bob", name="bob-coord")
+
+    def _request_for(user_id: str, perms: frozenset[str]) -> MagicMock:
+        request = MagicMock()
+        request.app.state.coord_mgr = mgr
+        request.state.auth_result = AuthResult(
+            user_id=user_id,
+            scopes=frozenset({"read"}),
+            token_source="test",
+            permissions=perms,
+        )
+        return request
+
+    alice_rows = _coordinator_rows(
+        _request_for("alice", frozenset({"read"})),
+    )
+    names = {r["name"] for r in alice_rows}
+    assert names == {"alice-coord"}, "non-admin alice must NOT see bob's coordinator"
+
+    bob_rows = _coordinator_rows(_request_for("bob", frozenset({"read"})))
+    assert {r["name"] for r in bob_rows} == {"bob-coord"}
+
+    admin_rows = _coordinator_rows(
+        _request_for("admin-1", frozenset({"read", "admin.users"})),
+    )
+    assert {r["name"] for r in admin_rows} == {"alice-coord", "bob-coord"}
+
+
+def test_coordinator_rows_empty_user_id_returns_empty(storage):
+    """Defense-in-depth: a request with no user_id (shouldn't reach this
+    path through the auth middleware, but defensive) gets zero rows,
+    not a list_all leak."""
+    from unittest.mock import MagicMock
+
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.auth import AuthResult
+
+    mgr = _build_mgr(storage)
+    mgr.create(user_id="alice", name="alice-coord")
+
+    request = MagicMock()
+    request.app.state.coord_mgr = mgr
+    request.state.auth_result = AuthResult(
+        user_id="",
+        scopes=frozenset({"read"}),
+        token_source="test",
+        permissions=frozenset({"read"}),
+    )
+    assert _coordinator_rows(request) == []

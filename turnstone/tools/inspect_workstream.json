@@ -1,6 +1,6 @@
 {
   "name": "inspect_workstream",
-  "description": "Read the persisted state of a workstream you previously spawned: state, title, skill, timestamps, and the last N messages. Auto-approved — safe, read-only. Live per-node counters (current token usage, active tools) are NOT returned yet; rely on the 'state' field ('idle' vs 'running' vs 'attention') for completion checks.",
+  "description": "Read the persisted state of a workstream you previously spawned: state, title, skill, timestamps, and the last N messages. Auto-approved — safe, read-only. A `live` block from the owning node is merged when available (current tokens, activity, pending_approval). Provider-native content blocks are stripped by default to keep the response compact; pass include_provider_content=true if you need the full fidelity payload for replay tooling.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,6 +11,10 @@
       "message_limit": {
         "type": "integer",
         "description": "Max messages to return (most recent first, reversed into chronological order). Default 20."
+      },
+      "include_provider_content": {
+        "type": "boolean",
+        "description": "When true, include provider-native content blocks (duplicates the plain `content` string for replay fidelity). Default false — trimmed shape keeps regular inspect calls half the size."
       }
     },
     "required": ["ws_id"]

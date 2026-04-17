@@ -3782,6 +3782,14 @@ class ChatSession:
         func_name = tc["function"]["name"].strip()
         raw_args = tc["function"]["arguments"]
 
+        # Some providers emit an empty string when the model invokes a
+        # tool with no arguments (all params optional → no JSON object
+        # produced).  Treat that as ``{}`` rather than feeding the
+        # empty string to json.loads which raises and drops the call
+        # into the malformed-args error branch.
+        if raw_args == "" or raw_args is None:
+            raw_args = "{}"
+
         try:
             args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
@@ -4943,6 +4951,7 @@ class ChatSession:
         except (TypeError, ValueError):
             message_limit = 20
         message_limit = max(1, min(message_limit, 200))
+        include_provider_content = bool(args.get("include_provider_content"))
         return {
             "call_id": call_id,
             "func_name": "inspect_workstream",
@@ -4952,13 +4961,18 @@ class ChatSession:
             "execute": self._exec_inspect_workstream,
             "ws_id": ws_id,
             "message_limit": message_limit,
+            "include_provider_content": include_provider_content,
         }
 
     def _exec_inspect_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
         ws_id = item["ws_id"]
         try:
-            result = self._coord_client.inspect(ws_id, message_limit=item["message_limit"])
+            result = self._coord_client.inspect(
+                ws_id,
+                message_limit=item["message_limit"],
+                include_provider_content=item.get("include_provider_content", False),
+            )
         except Exception as e:
             msg = f"Error: inspect_workstream failed: {e}"
             self._report_tool_result(call_id, "inspect_workstream", msg, is_error=True)
@@ -5127,11 +5141,14 @@ class ChatSession:
         except (TypeError, ValueError):
             limit = 100
         limit = max(1, min(limit, 500))
+        include_closed = bool(args.get("include_closed"))
         header_bits = [f"\u2699 list_workstreams: parent={parent_ws_id}"]
         if state:
             header_bits.append(f"state={state}")
         if skill:
             header_bits.append(f"skill={skill}")
+        if include_closed:
+            header_bits.append("include_closed")
         header = " ".join(header_bits)
         return {
             "call_id": call_id,
@@ -5144,6 +5161,7 @@ class ChatSession:
             "state": state,
             "skill": skill,
             "limit": limit,
+            "include_closed": include_closed,
         }
 
     def _exec_list_workstreams(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -5154,6 +5172,7 @@ class ChatSession:
                 state=item["state"],
                 skill=item["skill"],
                 limit=item["limit"],
+                include_closed=item.get("include_closed", False),
             )
         except Exception as e:
             msg = f"Error: list_workstreams failed: {e}"
@@ -5195,11 +5214,17 @@ class ChatSession:
         except (TypeError, ValueError):
             limit = 100
         limit = max(1, min(limit, 500))
+        include_network_detail = bool(args.get("include_network_detail"))
+        include_inactive = bool(args.get("include_inactive"))
         header_bits = ["\u2699 list_nodes"]
         if filters:
             header_bits.append(
                 "filters=" + ",".join(f"{k}={v}" for k, v in sorted(filters.items()))
             )
+        if include_network_detail:
+            header_bits.append("network=detail")
+        if include_inactive:
+            header_bits.append("include_inactive")
         return {
             "call_id": call_id,
             "func_name": "list_nodes",
@@ -5209,6 +5234,8 @@ class ChatSession:
             "execute": self._exec_list_nodes,
             "filters": filters,
             "limit": limit,
+            "include_network_detail": include_network_detail,
+            "include_inactive": include_inactive,
         }
 
     def _exec_list_nodes(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -5217,6 +5244,8 @@ class ChatSession:
             result = self._coord_client.list_nodes(
                 filters=item["filters"] or None,
                 limit=item["limit"],
+                include_network_detail=item.get("include_network_detail", False),
+                include_inactive=item.get("include_inactive", False),
             )
         except Exception as e:
             msg = f"Error: list_nodes failed: {e}"

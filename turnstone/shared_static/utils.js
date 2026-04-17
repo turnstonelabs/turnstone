@@ -34,3 +34,19 @@ function formatCount(n) {
   if (n >= 1000) return (n / 1000).toFixed(1) + "k";
   return String(n);
 }
+
+// Safe CSS attribute-selector escape.  CSS.escape is universally
+// supported in modern browsers, but we keep a minimal polyfill so
+// selector-construction never throws on an older browser or a
+// sandboxed runtime where CSS is undefined.  Unlike CSS.escape
+// (which is spec-exact), this fallback handles the characters that
+// actually appear in our id formats — hex ws_ids, alphanumeric
+// node_ids — and escapes the characters a CSS attribute selector
+// treats specially.
+function cssEscape(s) {
+  var str = String(s == null ? "" : s);
+  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+    return CSS.escape(str);
+  }
+  return str.replace(/["\\]/g, "\\$&");
+}

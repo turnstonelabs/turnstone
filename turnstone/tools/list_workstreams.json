@@ -1,6 +1,6 @@
 {
   "name": "list_workstreams",
-  "description": "List child workstreams. Auto-approved — safe, read-only. By default returns your own children (workstreams you spawned). Explicitly pass parent_ws_id to list another parent's children. Coordinator-kind workstreams are excluded from the results.",
+  "description": "List ACTIVE child workstreams. Auto-approved — safe, read-only. By default returns your own children (workstreams you spawned) that are NOT closed or deleted — this matches the common \"what's still running?\" query. Explicitly pass parent_ws_id to list another parent's children. Pass include_closed=true to also return soft-closed and deleted rows (useful for audit / history views). An explicit state filter (e.g. state=\"closed\") overrides the default and returns matching terminal rows regardless of include_closed. Coordinator-kind workstreams are excluded from the results.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "state": {
         "type": "string",
-        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed'. Matched exactly."
+        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed', 'deleted'. Matched exactly. An explicit state filter OVERRIDES the default-exclude-terminal behavior, so state=\"closed\" still returns closed rows."
       },
       "skill": {
         "type": "string",
@@ -19,6 +19,10 @@
       "limit": {
         "type": "integer",
         "description": "Max rows to return. Default 100."
+      },
+      "include_closed": {
+        "type": "boolean",
+        "description": "When true, include soft-closed and deleted children in the default (no-state-filter) listing. Default false — \"what's still running?\" is the common coordinator query. Ignored when an explicit state filter is set."
       }
     }
   },

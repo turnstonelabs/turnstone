@@ -1,6 +1,6 @@
 {
   "name": "task_list",
-  "description": "Lightweight, ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to track work decomposition, mark progress, and link tasks to spawned children (child_ws_id field). Five actions: add (append a task, needs approval), update (mutate title/status/child_ws_id by id, needs approval), remove (delete by id, needs approval), reorder (rearrange by id list, needs approval), list (read, auto-approved). Status enum: pending / in_progress / done / blocked.",
+  "description": "Lightweight, ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to track work decomposition, mark progress, and link tasks to spawned children (child_ws_id field). Five actions: add (append a task, needs approval), update (mutate title/status/child_ws_id by id, needs approval), remove (delete by id, needs approval), reorder (rearrange by id list, needs approval), list (read, auto-approved). Status enum: pending / in_progress / done / blocked. Titles over 200 chars are REJECTED (error response) rather than silently truncated — shorten before retry. child_ws_id is a free-form label: NOT validated against the workstreams table, so you can set it before spawn_workstream returns or keep it pointing at a closed child; consumers that care should cross-reference list_workstreams. Parallel tool dispatch does NOT serialize reads after writes in the same batch: if you update and list in one parallel batch, the list response may reflect the pre-update state. Dispatch mutate and list SERIALLY (one tool_use turn each) when the list must observe the mutation.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,7 +11,7 @@
       },
       "title": {
         "type": "string",
-        "description": "For 'add' and 'update': task title (max 200 chars)."
+        "description": "For 'add' and 'update': task title. Max 200 chars; longer titles are REJECTED (not truncated)."
       },
       "task_id": {
         "type": "string",
@@ -24,7 +24,7 @@
       },
       "child_ws_id": {
         "type": "string",
-        "description": "For 'add' and 'update': optional ws_id of the child workstream this task represents."
+        "description": "For 'add' and 'update': optional free-form ws_id label. NOT validated against the workstreams table — the coordinator owns the linkage semantics (pre-spawn placeholders and post-close references are both legal)."
       },
       "task_ids": {
         "type": "array",

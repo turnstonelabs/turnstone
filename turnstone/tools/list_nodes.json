@@ -1,6 +1,6 @@
 {
   "name": "list_nodes",
-  "description": "List server nodes in the cluster with their metadata. Auto-approved — safe, read-only. Each node carries two metadata sources: (a) AUTO-populated on every node startup — keys arch, cpu_count, fqdn, hostname, os, os_release, python (always present); (b) USER-supplied via the console Nodes admin tab — keys like capability, region, tenant, role (deployment-specific). Pass arbitrary key=value filters to narrow the result; ALL filters must match (AND semantics). Pair with target_node on spawn_workstream to pin a child workstream to a node that matches your capability requirements.",
+  "description": "List ACTIVE server nodes in the cluster with their metadata. Auto-approved — safe, read-only. By default only nodes with a fresh service-registry heartbeat (within the last 120s) are returned — stale registrations (decommissioned containers, migrated hosts) are filtered out so `target_node` suggestions from this call actually route. Each node carries two metadata sources: (a) AUTO-populated on every node startup — keys arch, cpu_count, fqdn, hostname, os, os_release, python (always present); (b) USER-supplied via the console Nodes admin tab — keys like capability, region, tenant, role (deployment-specific). Pass arbitrary key=value filters to narrow the result; ALL filters must match (AND semantics). Pair with target_node on spawn_workstream to pin a child workstream to a node that matches your capability requirements. Internal network detail (the `interfaces` key — container IPs and interface names) is stripped by default because routing decisions should use capability/region/role tags, not IPs; set include_network_detail=true only if you specifically need it for debugging. Set include_inactive=true to surface stale registrations for troubleshooting — those nodes will reject `target_node` pinning.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,6 +14,14 @@
       "limit": {
         "type": "integer",
         "description": "Max rows to return. Default 100, max 500."
+      },
+      "include_network_detail": {
+        "type": "boolean",
+        "description": "When true, include the auto-populated `interfaces` key (container IPs, interface names). Default false — routing decisions should use capability tags, not IPs, and including internal network detail trips the private-IP output guard."
+      },
+      "include_inactive": {
+        "type": "boolean",
+        "description": "When true, also return nodes whose service-registry heartbeat is stale (>120s old). Default false. Use only for debugging stale registrations; inactive nodes will reject `target_node` pinning and should not be used for `spawn_workstream` routing."
       }
     }
   },

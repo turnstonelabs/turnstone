@@ -96,15 +96,17 @@ def build_console_session_factory(
             )
 
         # Resolve coordinator.model_alias from settings if caller didn't
-        # override.  Empty string → raise so the caller (CoordinatorManager)
-        # surfaces a 503 remediation message rather than constructing a
-        # session that explodes on first LLM call.
-        effective_alias = model_alias or config_store.get("coordinator.model_alias") or ""
-        if not effective_alias:
-            raise ValueError(
-                "coordinator.model_alias is not configured — set it in the "
-                "admin Settings tab before creating coordinator sessions."
-            )
+        # override.  Unset ``coordinator.model_alias`` falls back to the
+        # model registry's default alias — operators get a working
+        # coordinator on a freshly-provisioned console without an extra
+        # manual setting.  Resolve to the CONCRETE alias name
+        # (``registry.default``) rather than passing None downstream:
+        # ``ChatSession.__init__`` reads ``registry.get_provider(alias)``
+        # to pick the right provider class, and passing None makes it
+        # fall through to a generic OpenAI-compat provider — which
+        # mismatches when the default is Anthropic/Google-backed.
+        explicit_alias = model_alias or (config_store.get("coordinator.model_alias") or "").strip()
+        effective_alias = explicit_alias or registry.default
 
         r_client, r_model, r_cfg = registry.resolve(effective_alias)
 

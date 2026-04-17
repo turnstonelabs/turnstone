@@ -27,8 +27,9 @@ import json
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import httpx
 
@@ -40,11 +41,57 @@ _TASK_STATUSES = frozenset({"pending", "in_progress", "done", "blocked"})
 # on every mutation, so unbounded growth is both a storage and a tool-output-size
 # hazard.  Hitting the cap is an explicit signal to prune done/blocked rows.
 _TASK_LIST_MAX = 500
+# Max task title length.  Exceeded titles return an error rather than
+# silently truncating — mutating the coordinator's planning state
+# under its nose masks real planning bugs (the model may rely on the
+# title it SENT, not the stored one).
+_TASK_TITLE_MAX = 200
+# Short TTL on the per-ws_id live-inspect cache.  Back-to-back inspect()
+# calls in a model's tool loop hit this hot-path; 2s is short enough
+# that cached data stays meaningful to a human watching output and long
+# enough to bound one stall per child per turn regardless of how many
+# inspect calls the model fires.
+_LIVE_CACHE_TTL_SECONDS = 2.0
 
 
 def _utc_now_iso() -> str:
     """ISO-8601 UTC timestamp with seconds precision — used for task timestamps."""
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def load_task_envelope(storage: Any, ws_id: str) -> tuple[dict[str, Any], bool]:
+    """Decode the persisted task envelope for ``ws_id``.
+
+    Shared between :class:`CoordinatorClient` (the model-tool write path)
+    and the coordinator UI's read endpoints so both agree on the schema
+    and corruption-tolerant semantics.  Returns ``(envelope, corrupt)``:
+
+    - ``corrupt=False, envelope={"version": 1, "tasks": []}`` — row absent
+      or empty.
+    - ``corrupt=False, envelope=stored_dict`` — parseable and shape-checks.
+    - ``corrupt=True, envelope={"version": 1, "tasks": []}`` — a non-empty
+      stored value failed decode / shape check.  Callers that mutate the
+      list refuse to overwrite a corrupt blob (preserve for operator
+      inspection); the UI read path treats it as an empty envelope.
+    """
+    empty: dict[str, Any] = {"version": 1, "tasks": []}
+    try:
+        raw = storage.load_workstream_config(ws_id) or {}
+    except Exception:
+        log.debug("load_task_envelope.storage_failed ws=%s", ws_id, exc_info=True)
+        return empty, False
+    payload = raw.get("tasks")
+    if not payload:
+        return empty, False
+    try:
+        data = json.loads(payload)
+    except (TypeError, ValueError):
+        log.warning("task_list.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
+        return empty, True
+    if not (isinstance(data, dict) and isinstance(data.get("tasks"), list)):
+        log.warning("task_list.corrupt_envelope ws=%s (wrong shape)", ws_id)
+        return empty, True
+    return data, False
 
 
 if TYPE_CHECKING:
@@ -175,6 +222,20 @@ class CoordinatorClient:
         # CoordinatorClient instance).
         self._task_lock_cache: dict[str, threading.Lock] = {}
         self._task_lock_cache_lock = threading.Lock()
+        # Per-ws_id short-TTL cache for the cluster-inspect live block.
+        # Back-to-back inspect() calls against the same child (common
+        # when a model is iterating over its children) would otherwise
+        # each fire an HTTP round-trip at the 1s timeout and stall the
+        # session thread.  2s is short enough that cached data stays
+        # meaningful for a human reading model output.
+        # OrderedDict + size cap turns the cache into an LRU — long-
+        # running coordinators that walk many spawned-and-closed
+        # children no longer accumulate dict entries for every ws_id
+        # ever inspected.  256 entries is comfortably larger than any
+        # realistic fan-out batch while bounding memory at ~O(256 *
+        # tuple-size + dict-overhead) per coordinator.
+        self._live_cache: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
+        self._live_cache_lock = threading.Lock()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -286,10 +347,16 @@ class CoordinatorClient:
         state: str | None = None,
         skill: str | None = None,
         limit: int = 100,
+        include_closed: bool = False,
     ) -> dict[str, Any]:
         """Return children of ``parent_ws_id`` excluding other coordinators.
 
         ``skill`` matches on ``skill_id`` (template id) when provided.
+        ``include_closed`` controls whether soft-closed and deleted
+        children appear; default False so the common "what's active?"
+        query doesn't have to filter them out post-hoc.  Explicit
+        ``state="closed"`` / ``state="deleted"`` filters still work
+        regardless (they override the default).
 
         Returns a dict ``{"children": [...], "truncated": bool}``.  The
         ``truncated`` flag is ``True`` when the SQL fetch returned a full
@@ -310,6 +377,7 @@ class CoordinatorClient:
             parent_ws_id=parent_ws_id,
             kind="interactive",
         )
+        _terminal_states = {"closed", "deleted"}
         children: list[dict[str, Any]] = []
         for row in raw:
             # Dict access via ``._mapping`` is resilient to SELECT
@@ -333,6 +401,12 @@ class CoordinatorClient:
                     "skill_version": row[9] if len(row) > 9 else None,
                 }
             if state is not None and m["state"] != state:
+                continue
+            # Default-exclude terminal states.  An explicit state
+            # filter takes precedence (caller asking for state="closed"
+            # clearly wants them); only drop terminal rows when the
+            # caller didn't specify a state at all.
+            if state is None and not include_closed and m["state"] in _terminal_states:
                 continue
             child: dict[str, Any] = {
                 "ws_id": m["ws_id"],
@@ -359,21 +433,43 @@ class CoordinatorClient:
         truncated = len(raw) >= limit
         return {"children": children, "truncated": truncated}
 
+    # Auto-metadata keys that expose internal network topology (RFC 1918
+    # addresses, interface maps) without contributing to any routing
+    # decision a coordinator makes.  Stripped from the default response
+    # so the output guard's private_ip_disclosure check doesn't fire on
+    # every ``list_nodes`` call.  Operators who need this for
+    # debugging can opt back in via ``include_network_detail=True``.
+    _NODES_NETWORK_KEYS: ClassVar[frozenset[str]] = frozenset({"interfaces"})
+
+    # A node counts as "routable" for coordinator spawn targeting when
+    # its service-registry heartbeat is within this window.  Matches
+    # the default max_age_seconds on storage.list_services and the
+    # ClusterCollector's own discovery freshness.
+    _NODES_HEARTBEAT_WINDOW_S: ClassVar[int] = 120
+
     def list_nodes(
         self,
         *,
         filters: dict[str, Any] | None = None,
         limit: int = 100,
+        include_network_detail: bool = False,
+        include_inactive: bool = False,
     ) -> dict[str, Any]:
         """Return ``{"nodes": [...], "truncated": bool}``.
 
-        Each row carries the node's full metadata dict — both auto-populated
+        Each row carries the node's metadata dict — both auto-populated
         keys (``arch``, ``cpu_count``, ``fqdn``, ``hostname``, ``os``,
         ``os_release``, ``python``; always present, ``source="auto"``) and
         operator-supplied user keys (deployment-specific, ``source="user"``).
         ``filters`` matches all key=value pairs (AND semantics) and is
         pushed into SQL via ``filter_nodes_by_metadata`` — no per-row
         lookups.
+
+        Internal network metadata (``interfaces`` — container IPs and
+        interface names) is stripped by default; pass
+        ``include_network_detail=True`` to include it.  The model never
+        needs this for routing decisions (routing is by capability/region
+        tags) and it trips the private-IP output guard.
 
         Storage stores metadata values as JSON-encoded strings (the write
         path in ``server.py`` / ``admin.py`` / ``console/server.py`` all
@@ -383,6 +479,25 @@ class CoordinatorClient:
         ``'"x86_64"'``, ``4`` not ``"4"``).
         """
         page_size = max(1, min(int(limit), 500))
+        # Liveness filter: node_metadata rows persist across node
+        # restarts and never get deleted automatically, so
+        # ``get_all_node_metadata`` returns every node that ever
+        # registered — including long-dead container ids.  Intersect
+        # against the service registry (last_heartbeat within
+        # _NODES_HEARTBEAT_WINDOW_S) so target_node suggestions actually
+        # route.  Operators debugging stale registrations can pass
+        # include_inactive=True.
+        active_ids: set[str] | None = None
+        if not include_inactive:
+            try:
+                services = self._storage.list_services(
+                    "server", max_age_seconds=self._NODES_HEARTBEAT_WINDOW_S
+                )
+                active_ids = {s["service_id"] for s in services if s.get("service_id")}
+            except Exception:
+                log.debug("coord_client.list_services_failed", exc_info=True)
+                active_ids = None  # fail-open: return metadata as-is
+
         if filters:
             # Filtered case: narrow to the matching ids first, then pull
             # metadata only for the ``page_size``-bounded slice.  Avoids
@@ -391,6 +506,8 @@ class CoordinatorClient:
             # are bounded at 500 by the limit clamp.
             encoded_filters = {str(k): json.dumps(v) for k, v in filters.items()}
             matching = self._storage.filter_nodes_by_metadata(encoded_filters)
+            if active_ids is not None:
+                matching = {nid for nid in matching if nid in active_ids}
             node_ids = sorted(matching)
             truncated = len(node_ids) > page_size
             node_ids = node_ids[:page_size]
@@ -402,7 +519,10 @@ class CoordinatorClient:
             # through the whole cluster and needs metadata for every
             # node anyway — per-node lookups would be a true N+1.
             all_meta = self._storage.get_all_node_metadata()
-            node_ids = sorted(all_meta.keys())
+            meta_node_ids = set(all_meta.keys())
+            if active_ids is not None:
+                meta_node_ids &= active_ids
+            node_ids = sorted(meta_node_ids)
             truncated = len(node_ids) > page_size
             node_ids = node_ids[:page_size]
             meta_rows_by_node = {nid: all_meta.get(nid, []) for nid in node_ids}
@@ -413,12 +533,15 @@ class CoordinatorClient:
                 key = r.get("key")
                 if not key:
                     continue
+                key_str = str(key)
+                if not include_network_detail and key_str in self._NODES_NETWORK_KEYS:
+                    continue
                 raw_value = r.get("value", "")
                 try:
                     decoded = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
                 except (TypeError, ValueError):
                     decoded = raw_value
-                meta[str(key)] = {
+                meta[key_str] = {
                     "value": decoded,
                     "source": str(r.get("source", "")),
                 }
@@ -492,23 +615,17 @@ class CoordinatorClient:
 
     def _load_task_envelope(self, ws_id: str) -> tuple[dict[str, Any], bool]:
         """Return ``(envelope, corrupt)``; ``corrupt=True`` iff the stored
-        payload is non-empty and unparseable as the expected shape."""
+        payload is non-empty and unparseable as the expected shape.
+
+        Enforces the coordinator's cross-tenant guard (untrusted LLM input
+        cannot be used to peek at another coordinator's task list), then
+        delegates to :func:`load_task_envelope` so the HTTP read endpoint
+        and this method share the same decoder + corruption semantics.
+        """
         empty: dict[str, Any] = {"version": 1, "tasks": []}
         if ws_id != self._coord_ws_id:
             return empty, False
-        raw = self._storage.load_workstream_config(ws_id) or {}
-        payload = raw.get("tasks")
-        if not payload:
-            return empty, False
-        try:
-            data = json.loads(payload)
-        except (TypeError, ValueError):
-            log.warning("task_list.corrupt_envelope ws=%s (unparseable JSON)", ws_id)
-            return empty, True
-        if not (isinstance(data, dict) and isinstance(data.get("tasks"), list)):
-            log.warning("task_list.corrupt_envelope ws=%s (wrong shape)", ws_id)
-            return empty, True
-        return data, False
+        return load_task_envelope(self._storage, ws_id)
 
     def _save_task_list(self, ws_id: str, envelope: dict[str, Any]) -> None:
         # Save only the ``tasks`` key so concurrent writers to other
@@ -543,9 +660,21 @@ class CoordinatorClient:
     ) -> dict[str, Any]:
         if ws_id != self._coord_ws_id:
             return {"error": f"task_list scope violation: {ws_id}"}
-        clean_title = (title or "").strip()[:200]
+        clean_title = (title or "").strip()
         if not clean_title:
             return {"error": "title is required"}
+        # Reject overlong titles rather than silently truncating —
+        # mutating the coordinator's planning state under its nose
+        # masks real planning bugs (the model may rely on the title it
+        # SENT, not the stored one).  Callers that want a long title
+        # must shorten it themselves.
+        if len(clean_title) > _TASK_TITLE_MAX:
+            return {
+                "error": (
+                    f"title too long ({len(clean_title)} chars, max "
+                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
+                )
+            }
         if status not in _TASK_STATUSES:
             return {"error": f"invalid status: {status}"}
         with self._task_lock(ws_id):
@@ -598,9 +727,16 @@ class CoordinatorClient:
             for t in envelope["tasks"]:
                 if t.get("id") == task_id:
                     if title is not None:
-                        clean = title.strip()[:200]
+                        clean = title.strip()
                         if not clean:
                             return {"error": "title cannot be empty"}
+                        if len(clean) > _TASK_TITLE_MAX:
+                            return {
+                                "error": (
+                                    f"title too long ({len(clean)} chars, max "
+                                    f"{_TASK_TITLE_MAX}).  Shorten and retry."
+                                )
+                            }
                         t["title"] = clean
                     if status is not None:
                         t["status"] = status
@@ -657,7 +793,13 @@ class CoordinatorClient:
             self._save_task_list(ws_id, envelope)
             return {"ok": True, "order": task_ids}
 
-    def inspect(self, ws_id: str, *, message_limit: int = 20) -> dict[str, Any]:
+    def inspect(
+        self,
+        ws_id: str,
+        *,
+        message_limit: int = 20,
+        include_provider_content: bool = False,
+    ) -> dict[str, Any]:
         """Return persisted workstream state + tail-N messages + recent verdicts.
 
         Cross-tenant guard: the coordinator's LLM input is untrusted, so
@@ -666,6 +808,13 @@ class CoordinatorClient:
         (i.e. one of its own children).  Any other ws_id returns the
         same not-found shape used for genuine misses, avoiding an
         existence oracle.
+
+        ``include_provider_content`` defaults to False.  Provider-native
+        content blocks (``_provider_content`` / ``provider_blocks``)
+        duplicate the plain ``content`` string and roughly double the
+        response size on longer conversations.  The model only needs
+        them for provider-fidelity replay tooling; regular inspect
+        calls get the trimmed shape.
         """
         full = self._storage.get_workstream(ws_id)
         miss = {"error": f"workstream not found: {ws_id}", "ws_id": ws_id}
@@ -694,11 +843,89 @@ class CoordinatorClient:
             verdicts = self._storage.list_intent_verdicts(ws_id=ws_id, limit=10)
         except Exception:
             log.debug("coord_client.list_verdicts.failed ws=%s", ws_id, exc_info=True)
-        return {
+        result: dict[str, Any] = {
             **full,
-            "messages": _serialize_messages(messages),
+            "messages": _serialize_messages(
+                messages, include_provider_content=include_provider_content
+            ),
             "verdicts": _serialize_verdicts(verdicts),
         }
+        live = self._fetch_cluster_live(ws_id)
+        if live is not None:
+            result["live"] = live
+        return result
+
+    def _fetch_cluster_live(self, ws_id: str) -> dict[str, Any] | None:
+        """Optionally merge live state from the cluster-inspect endpoint.
+
+        Best-effort: an error / non-2xx / missing ``live`` key all fall
+        back to ``None`` so a node outage never breaks ``inspect``.  The
+        model-facing tool schema is unchanged — the returned dict just
+        gains an optional ``live`` key when available.
+
+        Permission inheritance: the coordinator's per-session JWT carries
+        the creator's scopes and permissions (see
+        :class:`CoordinatorTokenManager`).  The cluster-inspect endpoint
+        is gated on ``admin.cluster.inspect`` — creators without that
+        permission get a 403 here and ``inspect`` silently degrades to
+        storage-only.  This is correct behavior (the coordinator cannot
+        exceed its creator's privilege), not a bug.  Operators who want
+        live state in coordinator outputs must explicitly grant
+        ``admin.cluster.inspect`` to those users.
+        """
+        # Short-TTL cache: repeated inspect() against the same child
+        # (e.g. a model walking its children in a loop) amortizes to
+        # one HTTP call per 2s instead of one per inspect.
+        now = time.time()
+        with self._live_cache_lock:
+            cached = self._live_cache.get(ws_id)
+            if cached is not None and now - cached[0] < _LIVE_CACHE_TTL_SECONDS:
+                # LRU touch — move the fresh entry to the most-recent
+                # position so it's not the next eviction candidate.
+                self._live_cache.move_to_end(ws_id)
+                return cached[1]
+        try:
+            url = f"{self._base_url}/v1/api/cluster/ws/{ws_id}/detail"
+            # 1s timeout is ample for a same-host console call.  The
+            # previous 2s was conservatively generous and stalled the
+            # session thread visibly when a node was unhealthy.
+            resp = self._http.get(url, headers=self._headers(), timeout=1.0)
+        except httpx.HTTPError:
+            log.debug("coord_client.cluster_inspect.http_error ws=%s", ws_id, exc_info=True)
+            self._store_live_cache(ws_id, now, None)
+            return None
+        if resp.status_code < 200 or resp.status_code >= 300:
+            self._store_live_cache(ws_id, now, None)
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            self._store_live_cache(ws_id, now, None)
+            return None
+        if not isinstance(payload, dict):
+            self._store_live_cache(ws_id, now, None)
+            return None
+        live = payload.get("live")
+        result: dict[str, Any] | None = live if isinstance(live, dict) else None
+        self._store_live_cache(ws_id, now, result)
+        return result
+
+    _LIVE_CACHE_MAX = 256
+
+    def _store_live_cache(self, ws_id: str, ts: float, value: dict[str, Any] | None) -> None:
+        """Write an entry and evict the oldest if over the cap.
+
+        Thread-safe: all mutation + eviction happens under
+        ``_live_cache_lock``.  Eviction is LRU — ``OrderedDict`` orders
+        by insertion order, ``move_to_end`` on read turns it into the
+        LRU touch, and ``popitem(last=False)`` drops the least-recent.
+        """
+        with self._live_cache_lock:
+            if ws_id in self._live_cache:
+                self._live_cache.move_to_end(ws_id)
+            self._live_cache[ws_id] = (ts, value)
+            while len(self._live_cache) > self._LIVE_CACHE_MAX:
+                self._live_cache.popitem(last=False)
 
 
 # ---------------------------------------------------------------------------
@@ -706,17 +933,31 @@ class CoordinatorClient:
 # ---------------------------------------------------------------------------
 
 
-def _serialize_messages(rows: list[Any]) -> list[dict[str, Any]]:
+_PROVIDER_FIDELITY_KEYS: frozenset[str] = frozenset({"_provider_content", "provider_blocks"})
+
+
+def _serialize_messages(
+    rows: list[Any], *, include_provider_content: bool = False
+) -> list[dict[str, Any]]:
     """Normalize load_messages rows to JSON-friendly dicts.
 
     ``load_messages`` historically returns provider-specific message dicts
-    (``role``/``content``/``tool_name``/...). Keep the passthrough but
+    (``role``/``content``/``tool_name``/...).  Keep the passthrough but
     ensure the list is serializable.
+
+    When ``include_provider_content=False`` (default), strip
+    provider-native content blocks — they duplicate the plain
+    ``content`` string and roughly double response size on longer
+    conversations.  Callers that need the full provider-fidelity
+    payload (replay tooling, round-trip tests) pass True to restore.
     """
     out: list[dict[str, Any]] = []
     for r in rows:
         if isinstance(r, dict):
-            out.append(r)
+            if include_provider_content:
+                out.append(r)
+            else:
+                out.append({k: v for k, v in r.items() if k not in _PROVIDER_FIDELITY_KEYS})
         else:
             # Fall back to a string repr so at least something lands.
             out.append({"raw": str(r)})

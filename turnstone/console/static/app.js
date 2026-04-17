@@ -1095,128 +1095,331 @@ function renderPagination(container, page, pages) {
 }
 
 // --- Workstream table renderer (shared) ---
+//
+// Phase 3: group rows by parent_ws_id so coordinator workstreams render
+// with their spawned children nested beneath (tree grouping).  A
+// coordinator row gets an expand/collapse caret; its children render as
+// indented sub-rows when expanded.  Orphaned children (parent missing
+// from the pool) fall through to the top level with an "orphan" badge.
+//
+// Expansion state persists in localStorage keyed by coordinator ws_id so
+// the browser remembers the operator's preferred layout across reloads.
+var _DASH_EXPAND_KEY_PREFIX = "coord-dashboard-expanded-";
+
+function _isExpanded(coordWsId) {
+  if (!coordWsId) return false;
+  try {
+    var v = localStorage.getItem(_DASH_EXPAND_KEY_PREFIX + coordWsId);
+    return v === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function _setExpanded(coordWsId, expanded) {
+  if (!coordWsId) return;
+  try {
+    localStorage.setItem(
+      _DASH_EXPAND_KEY_PREFIX + coordWsId,
+      expanded ? "1" : "0",
+    );
+  } catch (_) {
+    /* storage quota / private mode — silently drop */
+  }
+}
+
+function _bucketByParent(wsList) {
+  var byId = {};
+  wsList.forEach(function (ws) {
+    if (ws.id) byId[ws.id] = ws;
+  });
+  var childrenMap = {};
+  var roots = [];
+  var orphans = [];
+  wsList.forEach(function (ws) {
+    var parent = ws.parent_ws_id || null;
+    if (parent && byId[parent]) {
+      (childrenMap[parent] = childrenMap[parent] || []).push(ws);
+    } else if (parent) {
+      orphans.push(ws);
+    } else {
+      roots.push(ws);
+    }
+  });
+  return { roots: roots, childrenMap: childrenMap, orphans: orphans };
+}
+
 function renderWsTable(container, wsList) {
-  container.innerHTML = "";
+  container.replaceChildren();
   if (!wsList.length) {
-    container.innerHTML = '<div class="dashboard-empty">No workstreams</div>';
+    var empty = document.createElement("div");
+    empty.className = "dashboard-empty";
+    empty.textContent = "No workstreams";
+    container.appendChild(empty);
     return;
   }
-  wsList.forEach(function (ws) {
-    var state = ws.state || "idle";
-    var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+  var groups = _bucketByParent(wsList);
 
-    var row = document.createElement("div");
-    row.className = "dash-row";
-    row.dataset.wsId = ws.id || "";
-    row.dataset.state = state;
-    row.setAttribute("tabindex", "0");
-    row.setAttribute("role", "button");
-    var ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
-    if (ws.model_alias || ws.model)
-      ariaLabel += ", model: " + (ws.model_alias || ws.model);
-    if (ws.node) ariaLabel += " on " + ws.node;
-    if (ws.title) ariaLabel += ", task: " + ws.title;
-    if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
-    if (ws.context_ratio > 0)
-      ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
-    row.setAttribute("aria-label", ariaLabel);
-
-    var main = document.createElement("div");
-    main.className = "dash-row-main";
-
-    // STATE
-    var stateCell = document.createElement("span");
-    stateCell.className = "dash-cell-state";
-    stateCell.innerHTML =
-      '<span class="dash-state-dot" data-state="' +
-      escapeHtml(state) +
-      '" aria-hidden="true"></span>' +
-      '<span class="dash-state-label" data-state="' +
-      escapeHtml(state) +
-      '">' +
-      sd.symbol +
-      " " +
-      sd.label +
-      "</span>";
-    main.appendChild(stateCell);
-
-    // NAME
-    var nameCell = document.createElement("span");
-    nameCell.className = "dash-cell-name";
-    nameCell.textContent = ws.name || ws.title || ws.id || "";
-    main.appendChild(nameCell);
-
-    // MODEL
-    var modelCell = document.createElement("span");
-    modelCell.className = "dash-cell-model";
-    modelCell.textContent = ws.model_alias || ws.model || "";
-    if (ws.model) modelCell.title = ws.model;
-    main.appendChild(modelCell);
-
-    // NODE (clickable)
-    var nodeCell = document.createElement("span");
-    nodeCell.className = "dash-cell-node";
-    nodeCell.textContent = ws.node || "";
-    nodeCell.onclick = function (e) {
-      e.stopPropagation();
-      if (ws.node) drillDownByNode(ws.node);
-    };
-    main.appendChild(nodeCell);
-
-    // TASK
-    var taskCell = document.createElement("span");
-    taskCell.className = "dash-cell-task";
-    taskCell.textContent = ws.title || "";
-    main.appendChild(taskCell);
-
-    // TOKENS
-    var tokensCell = document.createElement("span");
-    tokensCell.className = "dash-cell-tokens";
-    tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
-    main.appendChild(tokensCell);
-
-    // CTX
-    var ctxCell = document.createElement("span");
-    ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio || 0);
-    ctxCell.textContent =
-      ws.context_ratio > 0 ? Math.round(ws.context_ratio * 100) + "%" : "";
-    main.appendChild(ctxCell);
-
-    row.appendChild(main);
-
-    // Sub-line
-    var sub = document.createElement("div");
-    sub.className = "dash-row-sub";
-    if (ws.activity_state === "approval") sub.classList.add("sub-attention");
-    sub.textContent = ws.activity || "";
-    row.appendChild(sub);
-
-    // Deep link: click opens proxied server UI at this workstream
-    var wsNodeId = ws.node;
-    if (wsNodeId) {
-      row.classList.add("has-link");
-      (function (nodeId, wsId) {
-        row.onclick = function () {
-          window.location.href =
-            "/node/" +
-            encodeURIComponent(nodeId) +
-            "/?ws_id=" +
-            encodeURIComponent(wsId);
-        };
-        row.onkeydown = function (e) {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            row.onclick();
-          }
-        };
-      })(wsNodeId, ws.id);
-    } else {
-      row.removeAttribute("role");
-      row.removeAttribute("tabindex");
-    }
-
+  function appendRow(ws, opts) {
+    opts = opts || {};
+    var row = _renderWsRow(ws, opts, container);
     container.appendChild(row);
+    // Render children ALWAYS — expand/collapse is a CSS display toggle
+    // on the child rows.  This lets the caret swap a class instead of
+    // rebuilding the table, which preserves focus, avoids SR re-
+    // announcement, and stays cheap regardless of row count.
+    if (opts.childCount != null) {
+      var kids = groups.childrenMap[ws.id] || [];
+      kids.forEach(function (child) {
+        var childRow = _renderWsRow(
+          child,
+          { isChild: true, parentWsId: ws.id, collapsed: !opts.expanded },
+          container,
+        );
+        container.appendChild(childRow);
+      });
+    }
+  }
+
+  groups.roots.forEach(function (ws) {
+    var kids = groups.childrenMap[ws.id] || [];
+    var isCoord = ws.kind === "coordinator" || kids.length > 0;
+    if (isCoord) {
+      appendRow(ws, {
+        isCoordinator: true,
+        childCount: kids.length,
+        expanded: _isExpanded(ws.id),
+      });
+    } else {
+      appendRow(ws, {});
+    }
   });
+  groups.orphans.forEach(function (ws) {
+    appendRow(ws, { isOrphan: true });
+  });
+}
+
+function _renderWsRow(ws, opts, container) {
+  opts = opts || {};
+  var state = ws.state || "idle";
+  var sd = STATE_DISPLAY[state] || STATE_DISPLAY.idle;
+
+  var row = document.createElement("div");
+  row.className = "dash-row";
+  if (opts.isCoordinator) row.classList.add("dash-row--coordinator");
+  if (opts.isChild) {
+    row.classList.add("dash-row--child");
+    if (opts.parentWsId) row.dataset.parentWsId = opts.parentWsId;
+    // Child rows render in the collapsed state by default when the
+    // parent coordinator was last left collapsed.  Caret toggle
+    // flips this class in place — no table rebuild.
+    if (opts.collapsed) row.classList.add("dash-row--collapsed");
+  }
+  if (opts.isOrphan) row.classList.add("dash-row--orphan");
+  row.dataset.wsId = ws.id || "";
+  row.dataset.state = state;
+  row.setAttribute("tabindex", "0");
+  row.setAttribute("role", "button");
+  var ariaLabel = sd.label + ": " + (ws.name || ws.id || "unnamed");
+  if (ws.model_alias || ws.model)
+    ariaLabel += ", model: " + (ws.model_alias || ws.model);
+  if (ws.node) ariaLabel += " on " + ws.node;
+  if (ws.title) ariaLabel += ", task: " + ws.title;
+  if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
+  if (ws.context_ratio > 0)
+    ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
+  if (opts.isCoordinator && opts.childCount != null)
+    ariaLabel += ", " + opts.childCount + " children";
+  if (opts.isOrphan) ariaLabel += ", orphan";
+  row.setAttribute("aria-label", ariaLabel);
+
+  var main = document.createElement("div");
+  main.className = "dash-row-main";
+
+  // Expand / collapse caret — coordinator rows only.  The caret is a
+  // button so it's keyboard-reachable; clicking it toggles without
+  // bubbling to the row-level deep link handler.
+  if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
+    var caret = document.createElement("button");
+    caret.type = "button";
+    caret.className = "dash-caret";
+    caret.setAttribute("aria-expanded", opts.expanded ? "true" : "false");
+    // aria-controls intentionally omitted — children render as sibling
+    // rows in the same flat list, not a nested container, so there's
+    // no stable id to target.  aria-expanded alone is a valid SR
+    // affordance per WAI-ARIA 1.1 when the controlled relationship
+    // isn't strict (mirrors the admin sidebar carets elsewhere here).
+    caret.setAttribute(
+      "aria-label",
+      (opts.expanded ? "Collapse" : "Expand") + " children",
+    );
+    caret.textContent = opts.expanded ? "\u25BE" : "\u25B8"; // ▾ / ▸
+    caret.onclick = function (e) {
+      e.stopPropagation();
+      var coordWsId = ws.id;
+      var nowExpanded = caret.getAttribute("aria-expanded") !== "true";
+      _setExpanded(coordWsId, nowExpanded);
+      // Toggle CSS class on child rows — no table rebuild, so focus
+      // stays on the caret and screen readers don't re-announce the
+      // list.  See .dash-row--collapsed in style.css for the hide
+      // rule.
+      caret.setAttribute("aria-expanded", nowExpanded ? "true" : "false");
+      caret.setAttribute(
+        "aria-label",
+        (nowExpanded ? "Collapse" : "Expand") + " children",
+      );
+      caret.textContent = nowExpanded ? "\u25BE" : "\u25B8";
+      row.dataset.expanded = nowExpanded ? "true" : "false";
+      if (container) {
+        var selector =
+          '.dash-row--child[data-parent-ws-id="' + cssEscape(coordWsId) + '"]';
+        var kids = container.querySelectorAll(selector);
+        kids.forEach(function (k) {
+          k.classList.toggle("dash-row--collapsed", !nowExpanded);
+        });
+      }
+    };
+    // Tag the parent row so CSS can key off expansion state
+    // (e.g. hide the "(N children)" summary when expanded).
+    row.dataset.expanded = opts.expanded ? "true" : "false";
+    main.appendChild(caret);
+  } else if (opts.isChild) {
+    // Indentation placeholder so child rows align visually with their
+    // parent's post-caret content.  Not a caret — nested coordinators
+    // aren't supported in v1.
+    var indent = document.createElement("span");
+    indent.className = "dash-caret-placeholder";
+    indent.setAttribute("aria-hidden", "true");
+    main.appendChild(indent);
+  }
+
+  // STATE
+  var stateCell = document.createElement("span");
+  stateCell.className = "dash-cell-state";
+  var dot = document.createElement("span");
+  dot.className = "dash-state-dot";
+  dot.dataset.state = state;
+  dot.setAttribute("aria-hidden", "true");
+  stateCell.appendChild(dot);
+  var stateLabel = document.createElement("span");
+  stateLabel.className = "dash-state-label";
+  stateLabel.dataset.state = state;
+  stateLabel.textContent = sd.symbol + " " + sd.label;
+  stateCell.appendChild(stateLabel);
+  main.appendChild(stateCell);
+
+  // NAME (with optional child-count summary for collapsed coordinators)
+  var nameCell = document.createElement("span");
+  nameCell.className = "dash-cell-name";
+  var nameText = ws.name || ws.title || ws.id || "";
+  nameCell.textContent = nameText;
+  if (opts.isCoordinator && opts.childCount != null) {
+    // Always render the "(N children)" summary; CSS hides it when
+    // the row is expanded (see [data-expanded="true"] .dash-child-count
+    // in style.css).  Keeping it in the DOM means the caret toggle
+    // doesn't need to mutate this text on every click.
+    var summary = document.createElement("span");
+    summary.className = "dash-child-count";
+    summary.textContent =
+      " (" +
+      opts.childCount +
+      (opts.childCount === 1 ? " child)" : " children)");
+    nameCell.appendChild(summary);
+  }
+  if (opts.isOrphan) {
+    var orphanBadge = document.createElement("span");
+    orphanBadge.className = "dash-orphan-badge";
+    orphanBadge.textContent = " orphan";
+    nameCell.appendChild(orphanBadge);
+  }
+  main.appendChild(nameCell);
+
+  // MODEL
+  var modelCell = document.createElement("span");
+  modelCell.className = "dash-cell-model";
+  modelCell.textContent = ws.model_alias || ws.model || "";
+  if (ws.model) modelCell.title = ws.model;
+  main.appendChild(modelCell);
+
+  // NODE (clickable)
+  var nodeCell = document.createElement("span");
+  nodeCell.className = "dash-cell-node";
+  nodeCell.textContent = ws.node || "";
+  nodeCell.onclick = function (e) {
+    e.stopPropagation();
+    if (ws.node) drillDownByNode(ws.node);
+  };
+  main.appendChild(nodeCell);
+
+  // TASK
+  var taskCell = document.createElement("span");
+  taskCell.className = "dash-cell-task";
+  taskCell.textContent = ws.title || "";
+  main.appendChild(taskCell);
+
+  // TOKENS
+  var tokensCell = document.createElement("span");
+  tokensCell.className = "dash-cell-tokens";
+  tokensCell.textContent = ws.tokens ? formatTokens(ws.tokens) : "";
+  main.appendChild(tokensCell);
+
+  // CTX
+  var ctxCell = document.createElement("span");
+  ctxCell.className = "dash-cell-ctx " + ctxClass(ws.context_ratio || 0);
+  ctxCell.textContent =
+    ws.context_ratio > 0 ? Math.round(ws.context_ratio * 100) + "%" : "";
+  main.appendChild(ctxCell);
+
+  row.appendChild(main);
+
+  // Sub-line
+  var sub = document.createElement("div");
+  sub.className = "dash-row-sub";
+  if (ws.activity_state === "approval") sub.classList.add("sub-attention");
+  sub.textContent = ws.activity || "";
+  row.appendChild(sub);
+
+  // Deep link: click opens proxied server UI at this workstream.
+  // Coordinator rows route to /coordinator/{ws_id}; node-backed
+  // workstreams route to the proxied /node/{node_id}/?ws_id=X UI.
+  var wsNodeId = ws.node;
+  if (opts.isCoordinator || ws.kind === "coordinator") {
+    row.classList.add("has-link");
+    (function (wsId) {
+      row.onclick = function () {
+        if (wsId)
+          window.location.href = "/coordinator/" + encodeURIComponent(wsId);
+      };
+      row.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.onclick();
+        }
+      };
+    })(ws.id);
+  } else if (wsNodeId) {
+    row.classList.add("has-link");
+    (function (nodeId, wsId) {
+      row.onclick = function () {
+        window.location.href =
+          "/node/" +
+          encodeURIComponent(nodeId) +
+          "/?ws_id=" +
+          encodeURIComponent(wsId);
+      };
+      row.onkeydown = function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          row.onclick();
+        }
+      };
+    })(wsNodeId, ws.id);
+  } else {
+    row.removeAttribute("role");
+    row.removeAttribute("tabindex");
+  }
+
+  return row;
 }
 
 // --- Navigation ---
@@ -1526,7 +1729,9 @@ function showNewCoordModal() {
   var sel = document.getElementById("new-coord-skill");
   sel.innerHTML = '<option value="">Use defaults</option>';
   authFetch("/v1/api/skills")
-    .then(function (r) { return r.json(); })
+    .then(function (r) {
+      return r.json();
+    })
     .then(function (data) {
       (data.skills || []).forEach(function (t) {
         var opt = document.createElement("option");
@@ -1535,7 +1740,9 @@ function showNewCoordModal() {
         sel.appendChild(opt);
       });
     })
-    .catch(function () { /* defaults still work */ });
+    .catch(function () {
+      /* defaults still work */
+    });
 
   setTimeout(function () {
     document.getElementById("new-coord-task").focus();
@@ -1577,12 +1784,14 @@ function submitNewCoord() {
       btn.disabled = false;
       btn.textContent = "Create";
       if (!res.ok || !res.data || !res.data.ws_id) {
-        errEl.textContent = (res.data && res.data.error) || "HTTP " + res.status;
+        errEl.textContent =
+          (res.data && res.data.error) || "HTTP " + res.status;
         errEl.style.display = "block";
         return;
       }
       hideNewCoordModal();
-      window.location.href = "/coordinator/" + encodeURIComponent(res.data.ws_id);
+      window.location.href =
+        "/coordinator/" + encodeURIComponent(res.data.ws_id);
     })
     .catch(function () {
       btn.disabled = false;

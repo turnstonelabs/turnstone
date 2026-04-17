@@ -570,3 +570,356 @@ def test_list_for_user_excludes_empty_owner_rows(built_mgr):
     assert empty_owner.id not in ids, (
         "list_for_user must not expose empty-owner coordinators to other callers"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — child-event fan-out
+# ---------------------------------------------------------------------------
+
+
+def _seed_child_row(storage, *, parent_ws_id: str, ws_id: str, state: str = "idle") -> None:
+    storage.register_workstream(
+        ws_id,
+        node_id="node-a",
+        user_id="user-1",
+        name=f"c-{ws_id[:4]}",
+        kind="interactive",
+        parent_ws_id=parent_ws_id,
+    )
+    if state != "idle":
+        storage.update_workstream_state(ws_id, state)
+
+
+def _drain(listener, *, wait: float = 0.5):
+    """Drain a ConsoleCoordinatorUI listener queue with a short timeout."""
+    import queue as _q
+
+    items = []
+    try:
+        while True:
+            items.append(listener.get(timeout=wait))
+    except _q.Empty:
+        return items
+
+
+def test_children_registry_bootstrapped_from_storage_on_create(built_mgr):
+    mgr, _calls, storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    # The registry starts empty — no children yet.
+    assert mgr._children.get(ws.id, set()) == set()
+
+
+def test_children_registry_bootstrapped_from_storage_on_open(built_mgr):
+    mgr, _calls, storage = built_mgr
+    # Seed a persisted coordinator row + two children directly in storage
+    # so open() rehydrates them without create() being called.
+    coord_id = "a" * 32
+    storage.register_workstream(
+        coord_id,
+        node_id="console",
+        user_id="user-1",
+        name="persisted",
+        kind="coordinator",
+        parent_ws_id=None,
+    )
+    _seed_child_row(storage, parent_ws_id=coord_id, ws_id="b" * 32)
+    _seed_child_row(storage, parent_ws_id=coord_id, ws_id="c" * 32)
+    ws = mgr.open(coord_id, "user-1")
+    assert ws is not None
+    assert mgr._children[coord_id] == {"b" * 32, "c" * 32}
+
+
+def test_dispatch_ws_created_fans_out_to_parent(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    listener = ws.ui._register_listener()
+    mgr._dispatch_child_event(
+        {
+            "type": "ws_created",
+            "ws_id": "d" * 32,
+            "parent_ws_id": ws.id,
+            "node_id": "node-a",
+            "name": "new-child",
+            "title": "",
+            "user_id": "user-1",
+        }
+    )
+    events = _drain(listener)
+    child_created = [e for e in events if e.get("type") == "child_ws_created"]
+    assert len(child_created) == 1
+    assert child_created[0]["child_ws_id"] == "d" * 32
+    assert child_created[0]["parent_ws_id"] == ws.id
+    assert "d" * 32 in mgr._children[ws.id]
+
+
+def test_dispatch_ws_created_ignores_unrelated_parent(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    listener = ws.ui._register_listener()
+    # A ws_created for a parent this coordinator doesn't own.
+    mgr._dispatch_child_event(
+        {
+            "type": "ws_created",
+            "ws_id": "e" * 32,
+            "parent_ws_id": "f" * 32,
+            "node_id": "node-a",
+            "name": "stranger-child",
+            "title": "",
+            "user_id": "user-1",
+        }
+    )
+    events = _drain(listener, wait=0.1)
+    assert not any(e.get("type") == "child_ws_created" for e in events)
+
+
+def test_dispatch_ws_created_cross_tenant_dropped(built_mgr):
+    """A ws_created event whose user_id does not match the coordinator's
+    owner must NOT reach the coordinator's SSE stream — prevents the
+    cross-tenant info-leak via spoofed parent_ws_id (sec-1)."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="alice")
+    listener = ws.ui._register_listener()
+    # A mallory-owned workstream claiming alice's coordinator as parent.
+    mgr._dispatch_child_event(
+        {
+            "type": "ws_created",
+            "ws_id": "d" * 32,
+            "parent_ws_id": ws.id,
+            "node_id": "node-a",
+            "name": "spoofed-child",
+            "title": "",
+            "user_id": "mallory",
+        }
+    )
+    events = _drain(listener, wait=0.1)
+    assert not any(e.get("type") == "child_ws_created" for e in events)
+    # Registry must not have gained mallory's ws_id either.
+    assert "d" * 32 not in mgr._children.get(ws.id, set())
+
+
+def test_dispatch_ws_created_empty_user_id_dropped(built_mgr):
+    """An event with empty/missing user_id fails closed — we can't
+    prove tenancy, so we refuse to route it."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="alice")
+    listener = ws.ui._register_listener()
+    mgr._dispatch_child_event(
+        {
+            "type": "ws_created",
+            "ws_id": "d" * 32,
+            "parent_ws_id": ws.id,
+            "node_id": "node-a",
+            "name": "no-owner-child",
+            "title": "",
+            # user_id intentionally absent
+        }
+    )
+    events = _drain(listener, wait=0.1)
+    assert not any(e.get("type") == "child_ws_created" for e in events)
+    assert "d" * 32 not in mgr._children.get(ws.id, set())
+
+
+def test_dispatch_cluster_state_fans_out_when_child_tracked(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    child_id = "a" * 32
+    mgr._add_child(ws.id, child_id)
+    listener = ws.ui._register_listener()
+    mgr._dispatch_child_event(
+        {
+            "type": "cluster_state",
+            "ws_id": child_id,
+            "state": "running",
+            "tokens": 42,
+            "node_id": "node-a",
+        }
+    )
+    events = _drain(listener)
+    state_events = [e for e in events if e.get("type") == "child_ws_state"]
+    assert len(state_events) == 1
+    assert state_events[0]["child_ws_id"] == child_id
+    assert state_events[0]["state"] == "running"
+    assert state_events[0]["tokens"] == 42
+
+
+def test_dispatch_ws_closed_fans_out(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    child_id = "a" * 32
+    mgr._add_child(ws.id, child_id)
+    listener = ws.ui._register_listener()
+    mgr._dispatch_child_event({"type": "ws_closed", "ws_id": child_id, "reason": "closed"})
+    events = _drain(listener)
+    close_events = [e for e in events if e.get("type") == "child_ws_closed"]
+    assert len(close_events) == 1
+    assert close_events[0]["child_ws_id"] == child_id
+    assert close_events[0]["reason"] == "closed"
+
+
+def test_dispatch_unrelated_state_ignored(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    listener = ws.ui._register_listener()
+    # No _add_child called — ws_id is not in anyone's registry.
+    mgr._dispatch_child_event({"type": "cluster_state", "ws_id": "a" * 32, "state": "running"})
+    events = _drain(listener, wait=0.1)
+    assert not any(e.get("type", "").startswith("child_ws_") for e in events)
+
+
+def test_shutdown_is_idempotent(built_mgr):
+    mgr, _calls, _storage = built_mgr
+    # No fanout started — shutdown must not raise.
+    mgr.shutdown()
+    mgr.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — review-pass-2 regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_rebuild_registry_unions_with_concurrent_adds(built_mgr):
+    """A ws_created event that arrives during open() must survive the
+    subsequent _rebuild_children_registry call — the rebuild must UNION
+    its storage read with whatever the fan-out thread already added."""
+    mgr, _calls, storage = built_mgr
+    coord_id = "a" * 32
+    # Seed a persisted coordinator row — open() will rehydrate it.
+    storage.register_workstream(
+        coord_id,
+        node_id="console",
+        user_id="user-1",
+        name="persisted",
+        kind="coordinator",
+        parent_ws_id=None,
+    )
+    # Persist one child (will show up in rebuild's storage query).
+    _seed_child_row(storage, parent_ws_id=coord_id, ws_id="b" * 32)
+    # Simulate the fan-out thread pre-adding a different child_ws_id
+    # between the placeholder install and the rebuild call.  Calling
+    # open() in this test runs synchronously, so we emulate the race
+    # by pre-populating the registry for the coord before open.
+    mgr._add_child(coord_id, "c" * 32)
+    ws = mgr.open(coord_id, "user-1")
+    assert ws is not None
+    # Both the persisted child (from rebuild) AND the pre-added one
+    # (from the simulated fan-out race) should be present.
+    assert "b" * 32 in mgr._children[coord_id]
+    assert "c" * 32 in mgr._children[coord_id]
+
+
+def test_dispatch_ws_created_atomic_against_close(built_mgr):
+    """Concurrent close() during a ws_created dispatch must not leave
+    the evicted coordinator's registry entry behind."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    # Close the coordinator — _children[ws.id] gets popped.
+    assert mgr.close(ws.id)
+    # A ws_created event still arriving for the now-closed parent
+    # must NOT resurrect the registry entry via setdefault.
+    mgr._dispatch_child_event(
+        {
+            "type": "ws_created",
+            "ws_id": "d" * 32,
+            "parent_ws_id": ws.id,
+            "node_id": "node-a",
+        }
+    )
+    # No stale entry left behind.
+    assert ws.id not in mgr._children
+
+
+def test_open_impl_eviction_clears_children_registry(built_mgr):
+    """When _open_impl evicts an idle coordinator to make room, the
+    evicted coordinator's _children entry must be popped — matching
+    the create() eviction path."""
+    mgr, _calls, storage = built_mgr
+    # Fill the manager to capacity (max_active=3) with owned coords,
+    # then pre-seed a 4th as persisted-only so open() triggers eviction.
+    for i in range(3):
+        mgr.create(user_id=f"u{i}")
+    # Record which coord is idlest (oldest create) — it's the eviction
+    # candidate.
+    victim_id = mgr._order[0]
+    # Pre-seed the victim's _children to prove the pop works.
+    mgr._add_child(victim_id, "z" * 32)
+    assert victim_id in mgr._children
+    # Persist a 4th coord row so open() will rehydrate + evict.
+    fourth_id = "f" * 32
+    storage.register_workstream(
+        fourth_id,
+        node_id="console",
+        user_id="u3",
+        name="fourth",
+        kind="coordinator",
+        parent_ws_id=None,
+    )
+    # Force open() — it must evict the idle victim and clear its
+    # registry entry in the process.
+    result = mgr.open_admin(fourth_id)
+    assert result is not None
+    assert victim_id not in mgr._workstreams, "victim should have been evicted to make room"
+    assert victim_id not in mgr._children, (
+        "_open_impl must pop the evicted coordinator's _children entry "
+        "(mirrors create() eviction path)"
+    )
+
+
+def test_child_to_coord_reverse_index_maintained(built_mgr):
+    """_coord_for_child uses the reverse index for O(1) lookup.  The
+    index must stay in sync with the forward set across add/close
+    paths — this test pokes each maintenance point."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    # _add_child path — populates both sides.
+    assert mgr._add_child(ws.id, "child-1")
+    assert mgr._coord_for_child("child-1") == ws.id
+    assert mgr._child_to_coord["child-1"] == ws.id
+
+    # close() path — pops both sides.
+    mgr.close(ws.id)
+    assert mgr._coord_for_child("child-1") is None
+    assert "child-1" not in mgr._child_to_coord
+
+
+def test_prime_children_from_snapshot(built_mgr):
+    """start_child_event_fanout uses the collector snapshot to prime
+    the child registry so a just-opened coordinator sees already-live
+    children without waiting for the next ws_state event.  Simulate
+    by calling the helper directly."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    snapshot = {
+        "nodes": [
+            {
+                "node_id": "node-a",
+                "workstreams": [
+                    {"id": "child-1", "parent_ws_id": ws.id, "state": "running"},
+                    {"id": "child-2", "parent_ws_id": ws.id, "state": "idle"},
+                    # Unrelated — parent isn't a tracked coordinator.
+                    {
+                        "id": "foreign-1",
+                        "parent_ws_id": "some-other-coord",
+                        "state": "idle",
+                    },
+                ],
+            }
+        ]
+    }
+    mgr._prime_children_from_snapshot(snapshot)
+    assert mgr._children[ws.id] == {"child-1", "child-2"}
+    assert mgr._coord_for_child("child-1") == ws.id
+    assert mgr._coord_for_child("child-2") == ws.id
+    # Foreign children with parents we don't track stay out of the
+    # registry — we only care about live coordinators.
+    assert mgr._coord_for_child("foreign-1") is None
+
+
+def test_prime_children_from_empty_snapshot_noop(built_mgr):
+    """No nodes → no state changes.  Defensive: snapshot shape can
+    legitimately be missing the ``nodes`` key right after startup."""
+    mgr, _calls, _storage = built_mgr
+    ws = mgr.create(user_id="user-1")
+    mgr._prime_children_from_snapshot({})
+    mgr._prime_children_from_snapshot({"nodes": []})
+    assert mgr._children[ws.id] == set()

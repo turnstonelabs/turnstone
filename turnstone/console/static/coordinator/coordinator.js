@@ -39,6 +39,12 @@
   const approvalBar = document.getElementById("coord-approval-bar");
   const approvalTools = document.getElementById("coord-approval-tools");
   const cancelBtn = document.getElementById("coord-cancel-btn");
+  const childrenTreeEl = document.getElementById("coord-children-tree");
+  const childrenCountEl = document.getElementById("coord-children-count");
+  const childrenRefreshBtn = document.getElementById("coord-children-refresh");
+  const tasksEl = document.getElementById("coord-tasks");
+  const tasksCountEl = document.getElementById("coord-tasks-count");
+  const tasksRefreshBtn = document.getElementById("coord-tasks-refresh");
 
   let pendingApprovalCallId = null;
   let evtSource = null;
@@ -438,11 +444,23 @@
       }
     }
     setSseStatus("connecting…", "");
+    // Snapshot whether this is a reconnect BEFORE resetting
+    // reconnectAttempts in onopen — child_ws_* events dispatched while
+    // we were disconnected aren't replayed by coordinator_events, so
+    // the client has to pull authoritative state after any gap.
+    const wasReconnecting = reconnectAttempts > 0;
     const url = "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/events";
     evtSource = new EventSource(url, { withCredentials: true });
     evtSource.onopen = function () {
       reconnectAttempts = 0;
       setSseStatus("live", "ok");
+      if (wasReconnecting) {
+        // Replace-mode refresh: the server is authoritative after a
+        // gap; any SSE-only rows the client accumulated before
+        // disconnect are stale.
+        loadChildren({ replace: true });
+        loadTasks();
+      }
     };
     evtSource.onerror = function () {
       setSseStatus("disconnected", "err");
@@ -493,6 +511,13 @@
           ev.output || "",
           !!ev.is_error,
         );
+        // task_list mutations change persisted state the sidebar reads
+        // from GET /tasks — re-fetch so the operator sees
+        // add/update/remove/reorder without clicking the refresh icon.
+        // list is a read-only action; skip to avoid redundant fetches.
+        if (ev.name === "task_list" && !ev.is_error) {
+          loadTasks();
+        }
         break;
       case "approve_request":
         showApproval(ev.items);
@@ -505,7 +530,7 @@
           if (
             it.call_id &&
             document.querySelector(
-              '.coord-msg[data-call-id="' + CSS.escape(it.call_id) + '"]',
+              '.coord-msg[data-call-id="' + cssEscape(it.call_id) + '"]',
             )
           ) {
             return; // already rendered in this pane — skip
@@ -557,10 +582,552 @@
       case "tools_auto_approved":
         (ev.items || []).forEach((it) => appendToolCall(it));
         break;
+      // Phase 3 — child-workstream fan-out routed through the coordinator's
+      // own SSE stream.  CoordinatorManager filters the cluster event bus
+      // by known child ws_ids so we never see unrelated noise here.
+      case "child_ws_created":
+        handleChildCreated(ev);
+        break;
+      case "child_ws_state":
+        handleChildState(ev);
+        break;
+      case "child_ws_closed":
+        handleChildClosed(ev);
+        break;
+      case "child_ws_rename":
+        handleChildRename(ev);
+        break;
       default:
         // Unknown event type — ignore silently.
         break;
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Children tree + task list — phase 3 sidebar
+  // ------------------------------------------------------------------
+
+  // ws_id -> child row snapshot.  Updated on initial /children load +
+  // SSE child_ws_* events so the tree can be re-rendered cheaply.
+  const childrenState = new Map();
+  // ws_id -> {live: <dict>, fetched: <ms>} for the 5s TTL live-badge cache.
+  const liveBadgeCache = new Map();
+  // ws_id -> timeout id, for 250ms debounce on live-inspect fetches.
+  const liveBadgeDebounce = new Map();
+  // ws_ids currently visible in the viewport — only these trigger
+  // live-fetch on SSE state changes.  Populated by an
+  // IntersectionObserver attached to each rendered .ch-row so a
+  // coordinator with hundreds of off-screen children doesn't burn
+  // HTTP round-trips for rows nobody can see.
+  const visibleChildIds = new Set();
+  // ws_id -> monotonic timestamp of last update (childrenState Map value
+  // + SSE event).  Used by the periodic pruner to drop terminal-state
+  // rows that have sat idle past the grace window so long-lived
+  // operator tabs don't accumulate unbounded map entries.
+  const childrenLastSeen = new Map();
+  const TERMINAL_CHILD_STATES = new Set(["closed", "deleted"]);
+  const LIVE_BADGE_TTL_MS = 5000;
+  const LIVE_BADGE_DEBOUNCE_MS = 250;
+  // Sweep every 60s; drop terminal-state entries older than 10min so
+  // an operator who scrolls past them later still sees them briefly
+  // (they won't vanish mid-read) but we cap the long-tail growth.
+  const CHILDREN_PRUNE_INTERVAL_MS = 60 * 1000;
+  const CHILDREN_TERMINAL_GRACE_MS = 10 * 60 * 1000;
+  const CHILDREN_HARD_CAP = 2000;
+
+  let tasksState = { version: 1, tasks: [] };
+
+  function stateGlyph(state) {
+    switch (state) {
+      case "running":
+        return { glyph: "\u25CF", cls: "glyph-running" };
+      case "thinking":
+        return { glyph: "\u25D0", cls: "glyph-thinking" };
+      case "attention":
+        return { glyph: "\u26A0", cls: "glyph-attention" };
+      case "error":
+        return { glyph: "\u2717", cls: "glyph-error" };
+      case "closed":
+      case "deleted":
+        return { glyph: "\u25CB", cls: "" };
+      case "idle":
+      default:
+        return { glyph: "\u25CB", cls: "" };
+    }
+  }
+
+  function safeAttr(value, re) {
+    return value && re.test(value) ? value : null;
+  }
+
+  // Build child rows using DOM methods only (no innerHTML) — keeps the
+  // XSS surface to zero even for attacker-controlled name strings.
+  function renderChildRow(child) {
+    const state = child.state || "idle";
+    const g = stateGlyph(state);
+    const safeWs = safeAttr(child.ws_id, WS_ID_RE);
+    const safeNode = safeAttr(child.node_id, NODE_ID_RE);
+    const row = document.createElement("div");
+    row.className = "ch-row";
+    row.setAttribute("role", "listitem");
+    if (state === "closed" || state === "deleted") row.classList.add("closed");
+    if (child.ws_id) row.dataset.wsId = child.ws_id;
+
+    const a = document.createElement("a");
+    a.className = "ws-link";
+    if (safeWs && safeNode) {
+      a.href =
+        "/node/" +
+        encodeURIComponent(safeNode) +
+        "/?ws_id=" +
+        encodeURIComponent(safeWs);
+      a.target = "_blank";
+      a.rel = "noopener";
+    } else {
+      a.href = "#";
+    }
+    const glyphSpan = document.createElement("span");
+    glyphSpan.className = "glyph " + g.cls;
+    glyphSpan.textContent = g.glyph;
+    a.appendChild(glyphSpan);
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "name";
+    nameSpan.textContent = child.name || child.ws_id || "?";
+    a.appendChild(nameSpan);
+    row.appendChild(a);
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    if (child.node_id) {
+      const s = document.createElement("span");
+      s.textContent = "node=" + child.node_id;
+      meta.appendChild(s);
+    }
+    if (state) {
+      const s = document.createElement("span");
+      s.textContent = "state=" + state;
+      meta.appendChild(s);
+    }
+    const cached = liveBadgeCache.get(child.ws_id);
+    if (cached && cached.live) {
+      if (typeof cached.live.tokens === "number" && cached.live.tokens > 0) {
+        const s = document.createElement("span");
+        s.textContent = "tokens=" + cached.live.tokens;
+        meta.appendChild(s);
+      }
+      if (cached.live.pending_approval) {
+        const s = document.createElement("span");
+        s.className = "badge-attention";
+        s.textContent = "\u2691 approval";
+        meta.appendChild(s);
+      }
+    }
+    row.appendChild(meta);
+    return row;
+  }
+
+  // Coalesce repeated renderChildren() calls within a single frame so
+  // SSE bursts (N child_ws_state events in quick succession) don't
+  // trigger N full tree rebuilds.  rAF fires at most once per display
+  // refresh, dropping ~60Hz of intra-frame churn to one render.
+  let _renderChildrenScheduled = false;
+  function renderChildren() {
+    if (_renderChildrenScheduled) return;
+    _renderChildrenScheduled = true;
+    const raf =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (cb) => setTimeout(cb, 16);
+    raf(() => {
+      _renderChildrenScheduled = false;
+      _renderChildrenNow();
+    });
+  }
+
+  // IntersectionObserver singleton — tracks which .ch-row elements are
+  // currently in the scroll viewport so scheduleLiveFetch skips
+  // off-screen rows.  Lazy init: created on first render since the
+  // observer api isn't guaranteed on ancient browsers and the tree
+  // degrades to "all rows always considered visible" as a fallback.
+  let _childObserver = null;
+  function _getChildObserver() {
+    if (_childObserver !== null) return _childObserver;
+    if (typeof IntersectionObserver !== "function") {
+      _childObserver = false; // sentinel: no-obs mode, treat all visible
+      return _childObserver;
+    }
+    _childObserver = new IntersectionObserver(
+      (entries) => {
+        let anyNew = false;
+        entries.forEach((ent) => {
+          const el = ent.target;
+          const wsKey = el && el.dataset ? el.dataset.wsId : "";
+          if (!wsKey) return;
+          if (ent.isIntersecting) {
+            if (!visibleChildIds.has(wsKey)) {
+              visibleChildIds.add(wsKey);
+              anyNew = true;
+            }
+          } else {
+            visibleChildIds.delete(wsKey);
+          }
+        });
+        // Rows that just entered the viewport get their live-fetch
+        // scheduled immediately — the observer-fire is the moment
+        // scheduling became legal.
+        if (anyNew) {
+          visibleChildIds.forEach((wsKey) => scheduleLiveFetch(wsKey));
+        }
+      },
+      { root: childrenTreeEl, threshold: 0.1 },
+    );
+    return _childObserver;
+  }
+
+  function _renderChildrenNow() {
+    childrenTreeEl.setAttribute("aria-busy", "false");
+    const rows = Array.from(childrenState.values());
+    // Sort: non-terminal states first, then by name.
+    const terminal = { closed: 1, deleted: 1 };
+    rows.sort((a, b) => {
+      const ta = terminal[a.state] ? 1 : 0;
+      const tb = terminal[b.state] ? 1 : 0;
+      if (ta !== tb) return ta - tb;
+      return (a.name || "").localeCompare(b.name || "");
+    });
+    // Disconnect + reset visibility set — each render rebuilds the
+    // observed element set.  Observer retains its configuration.
+    const obs = _getChildObserver();
+    if (obs) {
+      obs.disconnect();
+      visibleChildIds.clear();
+    }
+    childrenTreeEl.replaceChildren();
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "sidebar-empty";
+      empty.textContent = "no children spawned yet";
+      childrenTreeEl.appendChild(empty);
+    } else {
+      rows.forEach((r) => {
+        const rowEl = renderChildRow(r);
+        childrenTreeEl.appendChild(rowEl);
+        if (obs) obs.observe(rowEl);
+        else visibleChildIds.add(r.ws_id); // fallback: treat all visible
+      });
+    }
+    childrenCountEl.textContent = rows.length ? "(" + rows.length + ")" : "";
+  }
+
+  function renderTaskRow(task) {
+    const row = document.createElement("div");
+    row.className = "task-row";
+    row.setAttribute("role", "listitem");
+    const status = task.status || "pending";
+    const statusSpan = document.createElement("span");
+    statusSpan.className = "status status-" + status;
+    statusSpan.textContent = status;
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = task.title || "";
+    const head = document.createElement("div");
+    head.appendChild(statusSpan);
+    head.appendChild(title);
+    row.appendChild(head);
+    if (task.child_ws_id && WS_ID_RE.test(task.child_ws_id)) {
+      const link = document.createElement("div");
+      link.className = "meta";
+      const a = document.createElement("a");
+      a.href = "#child-" + encodeURIComponent(task.child_ws_id);
+      a.textContent = "\u2192 child " + task.child_ws_id.slice(0, 8);
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const target = document.querySelector(
+          '.ch-row[data-ws-id="' + cssEscape(task.child_ws_id) + '"]',
+        );
+        if (target && target.scrollIntoView) {
+          target.scrollIntoView({ behavior: "smooth", block: "nearest" });
+          target.classList.add("highlight");
+          setTimeout(() => target.classList.remove("highlight"), 1200);
+        }
+      });
+      link.appendChild(a);
+      row.appendChild(link);
+    }
+    return row;
+  }
+
+  function renderTasks() {
+    tasksEl.replaceChildren();
+    const tasks = (tasksState && tasksState.tasks) || [];
+    if (tasks.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "sidebar-empty";
+      empty.textContent = "no tasks yet";
+      tasksEl.appendChild(empty);
+    } else {
+      tasks.forEach((t) => tasksEl.appendChild(renderTaskRow(t)));
+    }
+    tasksCountEl.textContent = tasks.length ? "(" + tasks.length + ")" : "";
+  }
+
+  async function loadChildren({ replace = false } = {}) {
+    childrenTreeEl.setAttribute("aria-busy", "true");
+    try {
+      const body = await getJSON(
+        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/children",
+      );
+      // Default (initial page load): merge rather than clear.  SSE
+      // events may have arrived during the in-flight fetch and
+      // `clear()` would wipe them before the merge.
+      //
+      // replace=true (operator hits Refresh): take the server snapshot
+      // as authoritative — stale SSE-only rows disappear on demand.
+      const fresh = new Map();
+      (body.items || []).forEach((c) => {
+        if (c && c.ws_id) fresh.set(c.ws_id, { ...c });
+      });
+      if (replace) {
+        childrenState.clear();
+        childrenLastSeen.clear();
+      }
+      const now = Date.now();
+      fresh.forEach((v, k) => {
+        childrenState.set(k, v);
+        childrenLastSeen.set(k, now);
+      });
+    } catch (e) {
+      console.warn("loadChildren failed", e);
+    } finally {
+      renderChildren();
+      childrenState.forEach((_, ws) => scheduleLiveFetch(ws));
+    }
+  }
+
+  async function loadTasks() {
+    try {
+      const body = await getJSON(
+        "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/tasks",
+      );
+      tasksState = body || { version: 1, tasks: [] };
+    } catch (e) {
+      console.warn("loadTasks failed", e);
+    } finally {
+      renderTasks();
+    }
+  }
+
+  function scheduleLiveFetch(childWsId) {
+    if (!childWsId) return;
+    // Skip terminal-state children entirely — their live block will
+    // never change again; fetching just burns a round-trip and caches
+    // a stale value.  Renderer already styles closed/deleted rows.
+    const entry = childrenState.get(childWsId);
+    if (entry && TERMINAL_CHILD_STATES.has(entry.state)) return;
+    // Skip rows that aren't in the viewport.  The IntersectionObserver
+    // calls scheduleLiveFetch when a row scrolls into view, so
+    // off-screen rows sit idle until the operator scrolls to them —
+    // a coordinator with 100+ children only fires ~visible-count
+    // concurrent fetches on initial load instead of N.
+    if (!visibleChildIds.has(childWsId)) return;
+    const cached = liveBadgeCache.get(childWsId);
+    if (cached) {
+      // "permanent" cache entries (403/404 — the caller lacks the
+      // admin.cluster.inspect permission, or the ws_id is unknown
+      // cluster-wide) never re-fire.  Without this, every SSE state
+      // change on any child triggers a fresh fetch → retry storm for
+      // users who'll never have permission mid-session.
+      if (cached.permanent) return;
+      if (Date.now() - cached.fetched < LIVE_BADGE_TTL_MS) return;
+    }
+    if (liveBadgeDebounce.has(childWsId)) return;
+    const tid = setTimeout(() => {
+      liveBadgeDebounce.delete(childWsId);
+      fetchLiveBadge(childWsId);
+    }, LIVE_BADGE_DEBOUNCE_MS);
+    liveBadgeDebounce.set(childWsId, tid);
+  }
+
+  async function fetchLiveBadge(childWsId) {
+    if (!WS_ID_RE.test(childWsId)) return;
+    try {
+      const body = await getJSON(
+        "/v1/api/cluster/ws/" + encodeURIComponent(childWsId) + "/detail",
+      );
+      liveBadgeCache.set(childWsId, {
+        live: body && body.live ? body.live : null,
+        fetched: Date.now(),
+      });
+      const row = childrenTreeEl.querySelector(
+        '.ch-row[data-ws-id="' + cssEscape(childWsId) + '"]',
+      );
+      if (row) {
+        const entry = childrenState.get(childWsId);
+        if (entry) {
+          const replacement = renderChildRow(entry);
+          row.replaceWith(replacement);
+        }
+      }
+    } catch (e) {
+      // Cache failures too — otherwise 403 / 404 paths burn one HTTP
+      // round-trip per SSE child_ws_state event.  403/404 are marked
+      // permanent (permission/identity won't change mid-session); 5xx
+      // + network errors take the normal 5s TTL so transient blips
+      // recover on the next schedule.
+      const isTerminal = e && /HTTP 40[34]/.test(e.message || "");
+      liveBadgeCache.set(childWsId, {
+        live: null,
+        fetched: Date.now(),
+        permanent: isTerminal,
+      });
+      if (!isTerminal) {
+        console.warn("fetchLiveBadge failed", e);
+      }
+    }
+  }
+
+  function invalidateLiveBadge(childWsId) {
+    liveBadgeCache.delete(childWsId);
+  }
+
+  // --- SSE handlers for child_ws_* events ----------------------------
+
+  function _touchChild(childId) {
+    childrenLastSeen.set(childId, Date.now());
+  }
+
+  function handleChildCreated(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    childrenState.set(childId, {
+      ws_id: childId,
+      node_id: ev.node_id || "",
+      name: ev.name || ev.title || childId.slice(0, 8),
+      state: "idle",
+      kind: "interactive",
+    });
+    _touchChild(childId);
+    renderChildren();
+    invalidateLiveBadge(childId);
+    scheduleLiveFetch(childId);
+  }
+
+  function handleChildState(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const existing = childrenState.get(childId) || {
+      ws_id: childId,
+      name: "",
+    };
+    existing.state = ev.state || existing.state;
+    if (ev.node_id) existing.node_id = ev.node_id;
+    childrenState.set(childId, existing);
+    _touchChild(childId);
+    renderChildren();
+    // Do NOT invalidateLiveBadge on routine state ticks — that defeats
+    // the 5s TTL cache and devolves rate-limiting to the 250ms
+    // debouncer, hitting cluster_ws_detail ~4 req/s per chatty child.
+    // The TTL check in scheduleLiveFetch will refresh the badge on its
+    // own schedule; identity-changing events (created/rename/closed)
+    // still invalidate below.
+    scheduleLiveFetch(childId);
+  }
+
+  function handleChildClosed(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const existing = childrenState.get(childId);
+    if (!existing) return;
+    existing.state = ev.reason === "deleted" ? "deleted" : "closed";
+    childrenState.set(childId, existing);
+    _touchChild(childId);
+    renderChildren();
+  }
+
+  function handleChildRename(ev) {
+    const childId = ev.child_ws_id || ev.ws_id;
+    if (!childId) return;
+    const existing = childrenState.get(childId);
+    if (!existing) return;
+    if (ev.name) existing.name = ev.name;
+    childrenState.set(childId, existing);
+    _touchChild(childId);
+    renderChildren();
+  }
+
+  // Periodic sweep of stale terminal rows.  Operator tabs left open all
+  // day would otherwise accumulate entries for every child the
+  // coordinator ever spawned — rows the user can still see (state !=
+  // terminal, or touched within the grace window) are kept; everything
+  // else gets dropped along with its liveBadgeCache entry.  Also
+  // enforces a hard cap as a belt-and-braces fallback.
+  function _pruneChildren() {
+    const now = Date.now();
+    let removed = 0;
+    for (const [id, entry] of childrenState) {
+      const terminal = TERMINAL_CHILD_STATES.has(entry.state);
+      const lastSeen = childrenLastSeen.get(id) || 0;
+      if (terminal && now - lastSeen > CHILDREN_TERMINAL_GRACE_MS) {
+        childrenState.delete(id);
+        childrenLastSeen.delete(id);
+        liveBadgeCache.delete(id);
+        visibleChildIds.delete(id);
+        removed += 1;
+      }
+    }
+    // Hard cap — drop oldest-touched until under the limit.  Should
+    // rarely fire in practice; defends against pathological churn.
+    if (childrenState.size > CHILDREN_HARD_CAP) {
+      const byAge = Array.from(childrenLastSeen.entries()).sort(
+        (a, b) => a[1] - b[1],
+      );
+      const excess = childrenState.size - CHILDREN_HARD_CAP;
+      for (let i = 0; i < excess && i < byAge.length; i += 1) {
+        const id = byAge[i][0];
+        childrenState.delete(id);
+        childrenLastSeen.delete(id);
+        liveBadgeCache.delete(id);
+        visibleChildIds.delete(id);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      renderChildren();
+    }
+  }
+  setInterval(_pruneChildren, CHILDREN_PRUNE_INTERVAL_MS);
+
+  if (childrenRefreshBtn) {
+    childrenRefreshBtn.addEventListener("click", () => {
+      liveBadgeCache.clear();
+      // Explicit refresh wipes SSE-discovered rows the server no
+      // longer knows about — the operator asked for a clean snapshot.
+      loadChildren({ replace: true });
+    });
+  }
+  if (tasksRefreshBtn) {
+    tasksRefreshBtn.addEventListener("click", () => {
+      loadTasks();
+    });
+  }
+
+  // Mobile-only sidebar toggle — wires the accordion collapse below 700px.
+  // On desktop the button is display:none so the handler is a no-op.
+  const sidebarEl = document.getElementById("coord-sidebar");
+  const sidebarToggle = document.getElementById("coord-sidebar-toggle");
+  const sidebarToggleGlyph = document.getElementById(
+    "coord-sidebar-toggle-glyph",
+  );
+  if (sidebarEl && sidebarToggle) {
+    sidebarToggle.addEventListener("click", () => {
+      const expanded = sidebarEl.getAttribute("aria-expanded") !== "false";
+      const next = !expanded;
+      sidebarEl.setAttribute("aria-expanded", next ? "true" : "false");
+      sidebarToggle.setAttribute("aria-expanded", next ? "true" : "false");
+      if (sidebarToggleGlyph) {
+        sidebarToggleGlyph.textContent = next ? "\u25BE" : "\u25B8"; // ▾ / ▸
+      }
+    });
   }
 
   // ------------------------------------------------------------------
@@ -603,6 +1170,9 @@
     } catch (e) {
       console.warn("history load failed", e);
     }
+    // Load children + tasks in parallel — neither blocks SSE connection.
+    loadChildren();
+    loadTasks();
     connectSSE();
   }
 

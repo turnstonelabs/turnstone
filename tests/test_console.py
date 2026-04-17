@@ -777,6 +777,7 @@ class TestConsoleHTTPEndpoints:
             sort_by="state",
             page=1,
             per_page=25,
+            extra_rows=[],
         )
 
     def test_get_workstreams_per_page_capped(self, client, mock_collector):

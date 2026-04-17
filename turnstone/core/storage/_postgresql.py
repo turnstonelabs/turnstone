@@ -222,22 +222,46 @@ class PostgreSQLBackend:
                 )
             conn.commit()
 
-    def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
+    def load_messages(self, ws_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         with self._conn() as conn:
-            rows = conn.execute(
-                sa.select(
-                    conversations.c.id,
-                    conversations.c.role,
-                    conversations.c.content,
-                    conversations.c.tool_name,
-                    conversations.c.tool_call_id,
-                    conversations.c.provider_data,
-                    conversations.c.tool_calls,
-                )
-                .where(conversations.c.ws_id == ws_id)
-                .order_by(conversations.c.id)
-            ).fetchall()
-        attachments = self.load_attachments_for_messages(ws_id)
+            if limit is not None and limit > 0:
+                rows = conn.execute(
+                    sa.select(
+                        conversations.c.id,
+                        conversations.c.role,
+                        conversations.c.content,
+                        conversations.c.tool_name,
+                        conversations.c.tool_call_id,
+                        conversations.c.provider_data,
+                        conversations.c.tool_calls,
+                    )
+                    .where(conversations.c.ws_id == ws_id)
+                    .order_by(conversations.c.id.desc())
+                    .limit(limit)
+                ).fetchall()
+                rows = list(reversed(rows))
+            else:
+                rows = conn.execute(
+                    sa.select(
+                        conversations.c.id,
+                        conversations.c.role,
+                        conversations.c.content,
+                        conversations.c.tool_name,
+                        conversations.c.tool_call_id,
+                        conversations.c.provider_data,
+                        conversations.c.tool_calls,
+                    )
+                    .where(conversations.c.ws_id == ws_id)
+                    .order_by(conversations.c.id)
+                ).fetchall()
+        # Bound the attachment scan to the fetched message ids when
+        # tail-N was requested — otherwise the attachments query
+        # still scans every row for the workstream and partially
+        # defeats the conversations-table LIMIT.
+        message_ids: list[int] | None = None
+        if limit is not None and limit > 0:
+            message_ids = [r[0] for r in rows]
+        attachments = self.load_attachments_for_messages(ws_id, message_ids=message_ids)
         return _reconstruct_messages(list(rows), ws_id, attachments or None)
 
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
@@ -798,16 +822,24 @@ class PostgreSQLBackend:
             conn.commit()
             return int(result.rowcount or 0)
 
-    def load_attachments_for_messages(self, ws_id: str) -> dict[int, list[dict[str, Any]]]:
+    def load_attachments_for_messages(
+        self,
+        ws_id: str,
+        *,
+        message_ids: list[int] | None = None,
+    ) -> dict[int, list[dict[str, Any]]]:
         with self._conn() as conn:
+            where_clauses = [
+                workstream_attachments.c.ws_id == ws_id,
+                workstream_attachments.c.message_id.is_not(None),
+            ]
+            if message_ids is not None:
+                if not message_ids:
+                    return {}
+                where_clauses.append(workstream_attachments.c.message_id.in_(message_ids))
             rows = conn.execute(
                 sa.select(workstream_attachments)
-                .where(
-                    sa.and_(
-                        workstream_attachments.c.ws_id == ws_id,
-                        workstream_attachments.c.message_id.is_not(None),
-                    )
-                )
+                .where(sa.and_(*where_clauses))
                 .order_by(workstream_attachments.c.created)
             ).fetchall()
         grouped: dict[int, list[dict[str, Any]]] = {}
@@ -838,6 +870,7 @@ class PostgreSQLBackend:
                     workstreams.c.parent_ws_id,
                     workstreams.c.skill_id,
                     workstreams.c.skill_version,
+                    workstreams.c.user_id,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)

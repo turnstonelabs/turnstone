@@ -96,6 +96,153 @@ class TestSaveAndLoadMessages:
         assert backend.load_messages("nonexistent") == []
 
 
+class TestLoadMessagesLimit:
+    """Phase 3 added ``limit=N`` so cluster-inspect can avoid reading
+    thousands of rows to return a tail-20 preview.  The contract: fetch
+    the last N conversation rows (DESC + LIMIT at the SQL layer), then
+    reverse into chronological order for reconstruction.  Approximate
+    tail-N — a tool-call group straddling the cut produces an
+    incomplete turn that the existing repair step strips."""
+
+    def test_limit_none_fetches_all(self, backend):
+        backend.register_workstream("s1")
+        for i in range(10):
+            backend.save_message("s1", "user", f"msg-{i}")
+        msgs = backend.load_messages("s1", limit=None)
+        assert len(msgs) == 10
+
+    def test_limit_fetches_tail_in_chronological_order(self, backend):
+        backend.register_workstream("s1")
+        for i in range(10):
+            backend.save_message("s1", "user", f"msg-{i:02d}")
+        msgs = backend.load_messages("s1", limit=3)
+        assert len(msgs) == 3
+        # Chronological order preserved even though SQL fetched DESC.
+        assert msgs[0]["content"] == "msg-07"
+        assert msgs[1]["content"] == "msg-08"
+        assert msgs[2]["content"] == "msg-09"
+
+    def test_limit_exceeds_total_returns_all(self, backend):
+        backend.register_workstream("s1")
+        for i in range(5):
+            backend.save_message("s1", "user", f"msg-{i}")
+        msgs = backend.load_messages("s1", limit=100)
+        assert len(msgs) == 5
+
+    def test_limit_zero_fetches_all(self, backend):
+        """limit<=0 matches the ``None`` branch — the SQL LIMIT is
+        skipped, full history returned.  Belt-and-suspenders against
+        callers that pass the clamped ``max(0, limit)`` result."""
+        backend.register_workstream("s1")
+        for i in range(5):
+            backend.save_message("s1", "user", f"msg-{i}")
+        assert len(backend.load_messages("s1", limit=0)) == 5
+
+    def test_limit_boundary_straddles_tool_call_group(self, backend):
+        """Document the approximate-tail-N semantics the ``load_messages``
+        docstring warns about: when the tail slice opens mid-tool-call-
+        group, the orphaned ``role=tool`` row is returned verbatim
+        (the incomplete-turn repair at ``_reconstruct_messages`` only
+        strips incomplete *assistant-with-tool_calls* groups, not
+        orphaned tool-response rows).
+
+        Callers that need strict tail-N semantics (e.g. re-hydrating a
+        session to resume generation) must either request more than
+        they need and post-filter, or do a full load.  The cluster-
+        inspect preview path tolerates orphan tool rows because the
+        UI renders them as standalone tool-output blocks.
+
+        Seed: [user, assistant w/ 1 tool_call, tool result, assistant].
+        Fetch tail=2 → [tool result, assistant].  Orphan tool row
+        survives; this is expected behavior, not a bug."""
+        import json
+
+        backend.register_workstream("s1")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"cmd":"ls"}'},
+                }
+            ]
+        )
+        backend.save_message("s1", "user", "do it")
+        backend.save_message("s1", "assistant", None, tool_calls=tc_json)
+        backend.save_message("s1", "tool", "output", tool_call_id="c1")
+        backend.save_message("s1", "assistant", "done")
+
+        # Full load: 4 messages (complete turn, assistant reply).
+        assert len(backend.load_messages("s1")) == 4
+
+        # Tail=2: orphan tool row + final assistant reply.
+        tail = backend.load_messages("s1", limit=2)
+        assert len(tail) == 2
+        assert tail[0]["role"] == "tool"
+        assert tail[0]["content"] == "output"
+        assert tail[1]["role"] == "assistant"
+        assert tail[1]["content"] == "done"
+
+    def test_limit_keeps_complete_tool_call_group_when_fully_contained(self, backend):
+        """Tool-call groups entirely inside the tail slice survive intact."""
+        import json
+
+        backend.register_workstream("s1")
+        tc_json = json.dumps(
+            [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": '{"p":"a"}'},
+                }
+            ]
+        )
+        backend.save_message("s1", "user", "older message")
+        backend.save_message("s1", "assistant", None, tool_calls=tc_json)
+        backend.save_message("s1", "tool", "contents", tool_call_id="c1")
+        backend.save_message("s1", "assistant", "summarized")
+
+        # Tail=3 captures the full group + assistant reply (drops
+        # only the oldest user message).
+        tail = backend.load_messages("s1", limit=3)
+        assert len(tail) == 3
+        assert tail[0]["role"] == "assistant"
+        assert len(tail[0]["tool_calls"]) == 1
+        assert tail[1]["role"] == "tool"
+        assert tail[1]["content"] == "contents"
+        assert tail[2]["content"] == "summarized"
+
+    def test_limit_bounds_attachment_scan(self, backend):
+        """When ``limit=N`` is set, ``load_attachments_for_messages``
+        receives only the fetched message ids — the attachment query
+        must not fall back to a full-workstream scan.  Otherwise the
+        tail-N optimization on conversations is partly undone for
+        workstreams with many attachments."""
+        from unittest.mock import patch
+
+        backend.register_workstream("s1")
+        for i in range(20):
+            backend.save_message("s1", "user", f"msg-{i:02d}")
+
+        captured: dict[str, list[int] | None] = {}
+        orig = backend.load_attachments_for_messages
+
+        def _spy(ws_id, *, message_ids=None):
+            captured["message_ids"] = list(message_ids) if message_ids is not None else None
+            return orig(ws_id, message_ids=message_ids)
+
+        with patch.object(backend, "load_attachments_for_messages", side_effect=_spy):
+            backend.load_messages("s1", limit=5)
+        # Tail-N request passed a bounded list of exactly 5 ids.
+        assert captured["message_ids"] is not None
+        assert len(captured["message_ids"]) == 5
+
+        with patch.object(backend, "load_attachments_for_messages", side_effect=_spy):
+            backend.load_messages("s1")
+        # Full-load request passes None → backend scans all attachments.
+        assert captured["message_ids"] is None
+
+
 class TestSaveMessagesBulk:
     def test_bulk_roundtrip(self, backend):
         backend.register_workstream("s1")

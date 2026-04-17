@@ -210,7 +210,15 @@ class WorkstreamManager:
         ws.kind = kind
         ws.parent_ws_id = parent_ws_id if parent_ws_id else None
         if ui_factory:
-            ws.ui = ui_factory(ws.id)
+            # Thread lineage metadata to the UI so broadcast events
+            # can embed kind / parent_ws_id without a manager-lock
+            # round-trip per event.  Factory lambdas that only accept
+            # ws_id will KeyError on **kwargs; tolerate them via a
+            # TypeError fallback so older call sites keep working.
+            try:
+                ws.ui = ui_factory(ws.id, kind=kind, parent_ws_id=ws.parent_ws_id)
+            except TypeError:
+                ws.ui = ui_factory(ws.id)
         factory_kwargs: dict[str, Any] = {
             "skill": skill,
             "kind": kind,

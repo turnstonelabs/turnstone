@@ -397,6 +397,8 @@ class ClusterCollector:
                     "name": ws.get("title", "") or ws.get("name", ""),
                     "title": ws.get("title", ""),
                     "node_id": node_id,
+                    "kind": ws.get("kind", "interactive"),
+                    "parent_ws_id": ws.get("parent_ws_id"),
                 }
             )
         # Removals
@@ -417,6 +419,8 @@ class ClusterCollector:
                         "node_id": node_id,
                         "tokens": new_w.get("tokens", 0),
                         "content": new_w.get("content", ""),
+                        "kind": new_w.get("kind", "interactive"),
+                        "parent_ws_id": new_w.get("parent_ws_id"),
                     }
                 )
             old_name = old_ws.get("title", "") or old_ws.get("name", "")
@@ -465,6 +469,14 @@ class ClusterCollector:
                     ws["context_ratio"] = data.get("context_ratio", ws.get("context_ratio", 0))
                     ws["activity"] = data.get("activity", ws.get("activity", ""))
                     ws["activity_state"] = data.get("activity_state", ws.get("activity_state", ""))
+                    # kind/parent_ws_id: defensive update from ws_state event.
+                    # These rarely change but the event carries them so the
+                    # collector's entry stays authoritative even if a delta
+                    # lands before the originating ws_created (e.g. on reconnect).
+                    if "kind" in data:
+                        ws["kind"] = data["kind"]
+                    if "parent_ws_id" in data:
+                        ws["parent_ws_id"] = data["parent_ws_id"]
                     pending_events.append(
                         {
                             "type": "cluster_state",
@@ -473,6 +485,8 @@ class ClusterCollector:
                             "node_id": node_id,
                             "tokens": data.get("tokens", 0),
                             "content": data.get("content", ""),
+                            "kind": ws.get("kind", "interactive"),
+                            "parent_ws_id": ws.get("parent_ws_id"),
                         }
                     )
 
@@ -486,6 +500,14 @@ class ClusterCollector:
 
             elif etype == "ws_created":
                 ws_id = data.get("ws_id", "")
+                ws_kind = data.get("kind", "interactive")
+                ws_parent = data.get("parent_ws_id")
+                # user_id travels on the event so console-side fan-out
+                # can enforce tenant isolation — a coordinator must
+                # never receive child_ws_* events for workstreams it
+                # doesn't own.  Empty string when the emitter didn't
+                # populate it (older nodes).
+                ws_user = data.get("user_id", "") or ""
                 if ws_id and ws_id not in node.workstreams:
                     node.workstreams[ws_id] = {
                         "id": ws_id,
@@ -501,6 +523,9 @@ class ClusterCollector:
                         "activity_state": "",
                         "tool_calls": 0,
                         "title": "",
+                        "kind": ws_kind,
+                        "parent_ws_id": ws_parent,
+                        "user_id": ws_user,
                     }
                 pending_events.append(
                     {
@@ -509,6 +534,9 @@ class ClusterCollector:
                         "name": data.get("title", "") or data.get("name", ""),
                         "title": data.get("title", ""),
                         "node_id": node_id,
+                        "kind": ws_kind,
+                        "parent_ws_id": ws_parent,
+                        "user_id": ws_user,
                     }
                 )
 
@@ -686,13 +714,22 @@ class ClusterCollector:
         sort_by: str = "state",
         page: int = 1,
         per_page: int = 50,
+        extra_rows: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Return filtered, sorted, paginated workstreams + total count."""
+        """Return filtered, sorted, paginated workstreams + total count.
+
+        ``extra_rows`` are merged into the unpaginated pool before
+        filter / sort / paginate — used by callers that contribute
+        console-local rows (e.g. coordinator workstreams) that aren't
+        tracked on any node's SSE stream.
+        """
         with self._lock:
             all_ws = []
             for n in self._nodes.values():
                 for ws in n.workstreams.values():
                     all_ws.append(dict(ws))
+            if extra_rows:
+                all_ws.extend(dict(r) for r in extra_rows)
 
         # Filter
         if state:

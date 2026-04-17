@@ -9,7 +9,7 @@ storage-call path.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -379,6 +379,33 @@ def test_inspect_missing_ws_returns_error(populated_storage):
     assert "error" in result
 
 
+def test_list_children_excludes_closed_by_default(tmp_path):
+    """Default ``list_children`` filters out closed / deleted rows —
+    the common "what's still running?" query shouldn't have to
+    post-hoc filter them.  An explicit state filter still wins."""
+    st = SQLiteBackend(str(tmp_path / "closed.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.register_workstream("child-active", kind="interactive", parent_ws_id="coord-1", state="idle")
+    st.register_workstream(
+        "child-closed", kind="interactive", parent_ws_id="coord-1", state="closed"
+    )
+    st.register_workstream(
+        "child-deleted", kind="interactive", parent_ws_id="coord-1", state="deleted"
+    )
+    client = _make_read_client(st)
+    result = client.list_children("coord-1")
+    ids = {c["ws_id"] for c in result["children"]}
+    assert ids == {"child-active"}
+    # Opt-in surfaces everything.
+    with_closed = client.list_children("coord-1", include_closed=True)
+    all_ids = {c["ws_id"] for c in with_closed["children"]}
+    assert all_ids == {"child-active", "child-closed", "child-deleted"}
+    # Explicit state=closed overrides the default-exclude.
+    closed_only = client.list_children("coord-1", state="closed")
+    closed_ids = {c["ws_id"] for c in closed_only["children"]}
+    assert closed_ids == {"child-closed"}
+
+
 def test_inspect_returns_persisted_fields(populated_storage):
     client = _make_read_client(populated_storage)
     result = client.inspect("child-a")
@@ -398,6 +425,76 @@ def test_inspect_refuses_workstreams_outside_coordinator_subtree(populated_stora
     result = client.inspect("unrelated")
     assert "error" in result
     assert "messages" not in result
+
+
+def _make_client_with_cluster_response(
+    storage: SQLiteBackend, status: int, body: dict[str, Any] | None = None
+) -> CoordinatorClient:
+    """Build a CoordinatorClient whose mocked HTTP transport returns
+    ``status`` + ``body`` for any ``/cluster/ws/.../detail`` GET."""
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if "/v1/api/cluster/ws/" in request.url.path and request.method == "GET":
+            return httpx.Response(status, json=body or {})
+        return httpx.Response(200, json={})
+
+    http = httpx.Client(transport=httpx.MockTransport(_handler))
+    return CoordinatorClient(
+        console_base_url="http://x",
+        storage=storage,
+        token_factory=lambda: "t",
+        coord_ws_id="coord-1",
+        user_id="user-1",
+        http_client=http,
+    )
+
+
+def test_inspect_merges_live_block_when_cluster_endpoint_returns_200(populated_storage):
+    """Creator has admin.cluster.inspect → cluster endpoint returns
+    live state → inspect() merges `live` onto the storage snapshot."""
+    live_payload = {
+        "persisted": {"ws_id": "child-a"},
+        "live": {
+            "state": "running",
+            "tokens": 42,
+            "activity": "bash ls",
+            "activity_state": "tool",
+            "pending_approval": False,
+        },
+        "messages": [],
+    }
+    client = _make_client_with_cluster_response(populated_storage, status=200, body=live_payload)
+    result = client.inspect("child-a")
+    assert "live" in result
+    assert result["live"]["state"] == "running"
+    assert result["live"]["tokens"] == 42
+
+
+def test_inspect_degrades_to_storage_only_on_cluster_endpoint_403(populated_storage):
+    """Creator lacks admin.cluster.inspect → cluster endpoint returns
+    403 → inspect() falls back to storage-only with no `live` key.
+
+    This documents the permission-inheritance contract: the coordinator
+    cannot see more than its creator, so a 403 at the live endpoint is
+    expected behavior for users without the opt-in permission."""
+    client = _make_client_with_cluster_response(
+        populated_storage, status=403, body={"error": "forbidden"}
+    )
+    result = client.inspect("child-a")
+    assert "live" not in result
+    # Storage fields still present.
+    assert result["ws_id"] == "child-a"
+
+
+def test_inspect_degrades_to_storage_only_on_cluster_endpoint_503(populated_storage):
+    """Live-state endpoint can transiently fail (node unreachable,
+    timeout, 5xx) — same degrade path."""
+    client = _make_client_with_cluster_response(
+        populated_storage, status=503, body={"error": "node unreachable"}
+    )
+    result = client.inspect("child-a")
+    assert "live" not in result
+    assert result["ws_id"] == "child-a"
 
 
 def test_list_children_refuses_arbitrary_parent_ws_id(populated_storage):
@@ -448,6 +545,12 @@ def _set_meta(storage, node_id, entries):
     )
 
 
+def _register_service(storage, node_id: str, url: str = "http://x:8080") -> None:
+    """Register a node in the services table so list_nodes' liveness
+    filter treats it as active (recent heartbeat)."""
+    storage.register_service("server", node_id, url)
+
+
 @pytest.fixture
 def storage_with_nodes(tmp_path):
     st = SQLiteBackend(str(tmp_path / "nodes.db"))
@@ -460,6 +563,7 @@ def storage_with_nodes(tmp_path):
             ("region", "us-east", "user"),
         ],
     )
+    _register_service(st, "node-a")
     _set_meta(
         st,
         "node-b",
@@ -470,11 +574,13 @@ def storage_with_nodes(tmp_path):
             ("capability", "gpu", "user"),
         ],
     )
+    _register_service(st, "node-b")
     _set_meta(
         st,
         "node-c",
         [("arch", "arm64", "auto"), ("cpu_count", 8, "auto")],
     )
+    _register_service(st, "node-c")
     return st
 
 
@@ -491,6 +597,69 @@ def test_list_nodes_no_filters_returns_all_rows_decoded(storage_with_nodes):
     assert node_b["metadata"]["arch"] == {"value": "x86_64", "source": "auto"}
     assert node_b["metadata"]["cpu_count"] == {"value": 16, "source": "auto"}
     assert node_b["metadata"]["capability"] == {"value": "gpu", "source": "user"}
+
+
+def test_list_nodes_strips_interfaces_by_default(tmp_path):
+    """The auto-populated ``interfaces`` key carries internal RFC 1918
+    addresses which trip the private_ip_disclosure output guard and
+    aren't used for routing decisions.  Default response omits it."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            ("interfaces", {"eth0": ["172.18.0.4"]}, "auto"),
+            ("region", "us-east", "user"),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    node = result["nodes"][0]
+    assert "interfaces" not in node["metadata"]
+    # Other auto keys still land.
+    assert "arch" in node["metadata"]
+    assert "region" in node["metadata"]
+
+
+def test_list_nodes_include_network_detail_opt_in(tmp_path):
+    """Operators who need the IP map for debugging opt back in."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-x",
+        [
+            ("arch", "x86_64", "auto"),
+            ("interfaces", {"eth0": ["172.18.0.4"]}, "auto"),
+        ],
+    )
+    _register_service(st, "node-x")
+    client = _make_read_client(st)
+    result = client.list_nodes(include_network_detail=True)
+    node = result["nodes"][0]
+    assert "interfaces" in node["metadata"]
+    assert node["metadata"]["interfaces"]["value"] == {"eth0": ["172.18.0.4"]}
+
+
+def test_list_nodes_filters_stale_registrations_by_default(tmp_path):
+    """node_metadata rows persist across restarts but the services
+    table heartbeats expire — list_nodes should intersect against
+    active services so the model doesn't suggest a dead node for
+    target_node pinning.  Regression for the stale-registration bug."""
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(st, "node-live", [("arch", "x86_64", "auto")])
+    _set_meta(st, "node-dead", [("arch", "x86_64", "auto")])
+    # Only node-live has a fresh heartbeat; node-dead is metadata-only.
+    _register_service(st, "node-live")
+    client = _make_read_client(st)
+    result = client.list_nodes()
+    ids = {n["node_id"] for n in result["nodes"]}
+    assert ids == {"node-live"}
+    # Opt-in surfaces the stale registration for troubleshooting.
+    full = client.list_nodes(include_inactive=True)
+    full_ids = {n["node_id"] for n in full["nodes"]}
+    assert full_ids == {"node-live", "node-dead"}
 
 
 def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
@@ -690,11 +859,30 @@ def test_task_list_add_rejects_invalid_status(tmp_path):
     assert "error" in result
 
 
-def test_task_list_add_clamps_title_to_200(tmp_path):
+def test_task_list_add_rejects_title_over_200(tmp_path):
+    """Silent truncation is a data-integrity footgun: the model may
+    rely on the title it sent, not the one stored.  Reject instead."""
     client = _task_client(tmp_path)
-    long_title = "a" * 500
-    task = client.task_list_add("coord-1", title=long_title)
+    long_title = "a" * 201
+    result = client.task_list_add("coord-1", title=long_title)
+    assert "error" in result
+    assert "too long" in result["error"]
+    # Exactly 200 chars is the boundary and still accepted.
+    boundary = "a" * 200
+    task = client.task_list_add("coord-1", title=boundary)
+    assert "error" not in task
     assert len(task["title"]) == 200
+
+
+def test_task_list_update_rejects_title_over_200(tmp_path):
+    client = _task_client(tmp_path)
+    added = client.task_list_add("coord-1", title="original")
+    result = client.task_list_update("coord-1", task_id=added["id"], title="b" * 201)
+    assert "error" in result
+    assert "too long" in result["error"]
+    # Original title untouched when update rejected.
+    env = client.task_list_get("coord-1")
+    assert env["tasks"][0]["title"] == "original"
 
 
 def test_task_list_update_by_id(tmp_path):
@@ -814,3 +1002,45 @@ def test_task_list_save_preserves_other_workstream_config_keys(tmp_path):
     config = st.load_workstream_config("coord-1")
     assert config.get("reasoning_effort") == "high"
     assert config.get("tasks")  # task_list wrote its key too
+
+
+def test_live_cache_lru_eviction_caps_memory(tmp_path):
+    """_live_cache must evict the oldest entry when inserting past the
+    cap — long-running coordinators that walk many children otherwise
+    grow the cache monotonically."""
+    st = SQLiteBackend(str(tmp_path / "cache.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    # Use the internal store helper directly — the HTTP-driven path is
+    # exercised elsewhere; here we just verify the eviction semantics.
+    cap = client._LIVE_CACHE_MAX
+    for i in range(cap + 10):
+        client._store_live_cache(f"ws-{i:04x}", 0.0, None)
+    assert len(client._live_cache) == cap
+    # The oldest 10 entries should have been evicted.
+    for i in range(10):
+        assert f"ws-{i:04x}" not in client._live_cache
+    # The newest entries survived.
+    for i in range(cap, cap + 10):
+        assert f"ws-{i:04x}" in client._live_cache
+
+
+def test_live_cache_touch_on_hit_moves_to_end(tmp_path):
+    """A cache hit must reset the entry's LRU position so it's not
+    evicted just because it was old by insertion order."""
+    st = SQLiteBackend(str(tmp_path / "cache.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    client = _make_read_client(st)
+    cap = client._LIVE_CACHE_MAX
+    for i in range(cap):
+        client._store_live_cache(f"ws-{i:04x}", 0.0, None)
+    # "Touch" the oldest entry by reading it — use an HTTP stub that
+    # would normally 200 but we want the cache path to intercept.
+    # Simulate by directly calling the touch pathway.
+    with client._live_cache_lock:
+        client._live_cache.move_to_end("ws-0000")
+    # Now insert one more — the SECOND-oldest should be evicted, not
+    # the touched ws-0000.
+    client._store_live_cache("ws-new", 0.0, None)
+    assert "ws-0000" in client._live_cache
+    assert "ws-0001" not in client._live_cache

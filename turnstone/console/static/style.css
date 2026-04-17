@@ -467,6 +467,54 @@
 }
 .dash-cell-node:hover { text-decoration: underline; color: var(--fg-bright); }
 
+/* Phase 3 — coordinator / child / orphan tree grouping ------------------ */
+.dash-caret,
+.dash-caret-placeholder {
+  display: inline-block;
+  width: 1.25rem;
+  flex-shrink: 0;
+  text-align: center;
+  font-size: 0.75rem;
+  color: var(--fg-dim);
+  line-height: 1;
+}
+.dash-caret {
+  background: transparent;
+  border: none;
+  padding: 0 0.15rem;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.dash-caret:hover { background: var(--bg-elevated); color: var(--fg); }
+.dash-caret:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.dash-caret-placeholder { visibility: hidden; }
+.dash-row--coordinator .dash-cell-name { font-weight: 600; }
+.dash-row--child { padding-left: 1.75rem; opacity: 0.95; }
+.dash-row--child .dash-row-main { border-left: 2px solid var(--border); padding-left: 0.5rem; }
+/* Caret-driven collapse: child rows render in the DOM always; the
+   caret toggles this class on the matching [data-parent-ws-id].  No
+   table rebuild, so focus and screen-reader position survive. */
+.dash-row--child.dash-row--collapsed { display: none; }
+.dash-child-count { color: var(--fg-dim); font-weight: 400; font-size: 0.85em; }
+/* Hide the "(N children)" summary when the caret is expanded — the
+   indented child rows make the count self-evident. */
+.dash-row--coordinator[data-expanded="true"] .dash-child-count { display: none; }
+.dash-orphan-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.02rem 0.35rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  background: var(--bg-elevated);
+  border-radius: 2px;
+}
+
 /* ==========================================================================
    MCP summary in node detail
    ========================================================================== */

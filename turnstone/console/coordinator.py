@@ -31,7 +31,7 @@ import queue
 import secrets
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import (
@@ -41,8 +41,9 @@ from turnstone.core.workstream import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
+    from turnstone.console.collector import ClusterCollector
     from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
     from turnstone.core.session import ChatSession
     from turnstone.core.storage._protocol import StorageBackend
@@ -86,6 +87,42 @@ class CoordinatorManager:
         # the lock would let a fresh arrival allocate a different lock
         # for the same ws_id, breaking serialization on the failure path.
         self._open_locks: dict[str, tuple[threading.Lock, int]] = {}
+        # Per-coordinator known-child ws_id set.  Populated lazily on
+        # create/open from storage and updated live as the cluster fan-out
+        # thread sees ws_created events with matching parent_ws_id.
+        # Closed / deleted children stay in the registry so the tree UI
+        # can keep rendering them grayed out; the authoritative render
+        # path reads storage for state.  Bounded by eventual coordinator
+        # close/eviction; for long-running coordinators with high child
+        # churn the set grows monotonically — an LRU cap is a future
+        # tech-debt item.
+        self._children: dict[str, set[str]] = {}
+        # Reverse index for O(1) child → coord lookup on every cluster
+        # event.  Without this, every cluster event incurs a linear
+        # scan over every coordinator's child set while holding the
+        # fan-out lock — a hot-path tax that scales with both active
+        # coordinators and their retained-history depth.
+        self._child_to_coord: dict[str, str] = {}
+        self._children_lock = threading.Lock()
+        # Cluster-event fan-out: subscribes to the ClusterCollector's
+        # listener channel, filters by known child ws_ids, and re-emits
+        # child_ws_* events on the matching coordinator's UI.  Configured
+        # lazily via ``start_child_event_fanout(collector)`` from the
+        # console lifespan once both the manager and collector exist.
+        self._collector: ClusterCollector | None = None
+        self._collector_queue: queue.Queue[dict[str, Any]] | None = None
+        self._fanout_thread: threading.Thread | None = None
+        self._fanout_stop = threading.Event()
+        # Lock-free presence cache for the fan-out dispatch path:
+        # coord_ws_id -> (user_id, ui).  The dict is swapped by
+        # reference (copy-on-write) under self._lock on every install
+        # / remove so dispatch can read it without acquiring the
+        # manager lock.  An in-flight dispatch that observes a stale
+        # snapshot either sees the coordinator or doesn't — both are
+        # safe outcomes.  Without this, every ws_created event in the
+        # cluster serialized behind self._lock, contending against
+        # every user-driven open/close/create.
+        self._active_coords: dict[str, tuple[str, Any]] = {}
 
     @property
     def max_active(self) -> int:
@@ -125,6 +162,8 @@ class CoordinatorManager:
 
         if evicted is not None:
             self._cleanup(evicted)
+            with self._children_lock:
+                self._pop_coord_registry_locked(evicted.id)
 
         # Persist before constructing the session so lazy rehydration on
         # restart can find the row even if the ChatSession build fails.
@@ -181,6 +220,14 @@ class CoordinatorManager:
 
         if initial_message:
             self._spawn_worker(ws, initial_message)
+
+        # Seed the known-children registry with an empty set so the
+        # fan-out filter recognises this coordinator immediately when a
+        # child's ws_created arrives.  Cheap in-memory write, no storage
+        # round-trip — freshly created coordinators have no persisted
+        # children to rebuild from.
+        with self._children_lock:
+            self._children.setdefault(ws_id, set())
 
         return ws
 
@@ -264,6 +311,13 @@ class CoordinatorManager:
 
                 if evicted is not None:
                     self._cleanup(evicted)
+                    # Mirror the create() eviction path exactly — clears
+                    # both the forward _children set AND the reverse
+                    # _child_to_coord index.  A plain _children.pop
+                    # would leak every evicted coordinator's reverse-
+                    # index entries forever.
+                    with self._children_lock:
+                        self._pop_coord_registry_locked(evicted.id)
 
                 try:
                     ws.session = self._session_factory(
@@ -289,6 +343,10 @@ class CoordinatorManager:
                             ws_id[:8],
                             exc_info=True,
                         )
+                # Rebuild the known-children registry from storage so the
+                # cluster fan-out filter sees the coordinator's subtree
+                # immediately after rehydration.
+                self._rebuild_children_registry(ws_id)
                 return ws
         finally:
             with self._lock:
@@ -361,8 +419,34 @@ class CoordinatorManager:
         def _run() -> None:
             try:
                 session.send(message)
-            except Exception:
+            except Exception as exc:
                 log.exception("coord_mgr.worker_failed ws=%s", ws.id[:8])
+                # Surface the failure to the coordinator's SSE stream so
+                # the operator sees what broke instead of a bare "error"
+                # badge — most common cause is a model-alias
+                # misconfiguration (wrong provider for the model) which
+                # the raw traceback narrows down quickly.
+                ui = ws.ui
+                if ui is not None and hasattr(ui, "on_error"):
+                    try:
+                        ui.on_error(f"{type(exc).__name__}: {exc}")
+                    except Exception:
+                        log.debug(
+                            "coord_mgr.on_error_dispatch_failed ws=%s",
+                            ws.id[:8],
+                            exc_info=True,
+                        )
+                # Also mark the workstream state=error so the cluster
+                # fan-out + dashboard reflect the failure.
+                if ui is not None and hasattr(ui, "on_state_change"):
+                    try:
+                        ui.on_state_change(WorkstreamState.ERROR.value)
+                    except Exception:
+                        log.debug(
+                            "coord_mgr.error_state_update_failed ws=%s",
+                            ws.id[:8],
+                            exc_info=True,
+                        )
 
         t = threading.Thread(
             target=_run,
@@ -404,6 +488,16 @@ class CoordinatorManager:
                 return False
             if ws_id in self._order:
                 self._order.remove(ws_id)
+            # Drop from the lock-free dispatch presence cache so
+            # post-close ws_created events for this (now-gone)
+            # coordinator don't keep reaching its orphaned UI.
+            self._refresh_active_coords_locked(drop={ws_id})
+        with self._children_lock:
+            # Free the known-children registry so long-running consoles
+            # don't accumulate stale entries as coordinators churn.  The
+            # child event fan-out filter scans this map on every cluster
+            # event; unbounded growth turns into a hot-loop tax.
+            self._pop_coord_registry_locked(ws_id)
         self._cleanup(ws)
         try:
             self._storage.update_workstream_state(ws_id, "closed")
@@ -493,6 +587,13 @@ class CoordinatorManager:
         ws.ui = self._ui_factory(ws_id, user_id)
         self._workstreams[ws_id] = ws
         self._order.append(ws_id)
+        # Track the evicted coordinator's id for the active-coords
+        # snapshot update below — callers must hold _lock across both
+        # install and evict.
+        self._refresh_active_coords_locked(
+            add={ws_id: (user_id, ws.ui)},
+            drop=({evicted.id} if evicted is not None else None),
+        )
         return ws, evicted
 
     def _remove_locked(self, ws_id: str) -> None:
@@ -503,6 +604,36 @@ class CoordinatorManager:
         self._workstreams.pop(ws_id, None)
         if ws_id in self._order:
             self._order.remove(ws_id)
+        self._refresh_active_coords_locked(drop={ws_id})
+
+    def _refresh_active_coords_locked(
+        self,
+        *,
+        add: dict[str, tuple[str, Any]] | None = None,
+        drop: set[str] | None = None,
+    ) -> None:
+        """Copy-on-write swap of the lock-free active-coords snapshot.
+
+        Caller MUST hold ``self._lock``.  The dispatch fan-out path
+        reads ``self._active_coords`` without any lock — correctness
+        depends on the reference itself being swapped atomically (a
+        plain attribute assignment is atomic in CPython) rather than
+        mutated in place.
+        """
+        current = self._active_coords
+        changed = False
+        new = dict(current)
+        if drop:
+            for wid in drop:
+                if new.pop(wid, None) is not None:
+                    changed = True
+        if add:
+            for wid, meta in add.items():
+                if new.get(wid) != meta:
+                    new[wid] = meta
+                    changed = True
+        if changed:
+            self._active_coords = new
 
     def _cleanup(self, ws: Workstream) -> None:
         """Unblock events + cancel session.  Matches WorkstreamManager._cleanup_ui."""
@@ -517,3 +648,354 @@ class CoordinatorManager:
         ws = self.get(ws_id)
         if ws is not None:
             ws.last_active = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Child-event fan-out
+    # ------------------------------------------------------------------
+
+    def _merge_child_ids_locked(self, coord_ws_id: str, child_ids: Iterable[str]) -> None:
+        """Merge ``child_ids`` into ``coord_ws_id``'s forward + reverse maps.
+
+        Caller MUST hold ``self._children_lock``.  Idempotent — re-
+        adding an existing child is a no-op (the reverse-index pointer
+        is already correct).  Empty / falsy entries in ``child_ids``
+        are skipped.
+
+        Sole write-path for bulk registry updates so
+        ``_rebuild_children_registry`` (storage-seeded) and
+        ``_prime_children_from_snapshot`` (collector-seeded) agree on
+        ordering and reverse-index invariants.
+        """
+        existing = self._children.setdefault(coord_ws_id, set())
+        for cid in child_ids:
+            if cid and cid not in existing:
+                existing.add(cid)
+                self._child_to_coord[cid] = coord_ws_id
+
+    def _rebuild_children_registry(self, coord_ws_id: str) -> None:
+        """Populate ``self._children[coord_ws_id]`` from storage.
+
+        Called on ``open`` / rehydrate — ``create`` seeds an empty set
+        directly (a freshly-created coordinator has no persisted
+        children) and the extra storage query would just pay unnecessary
+        latency on the hot create-path.  Closed / deleted children are
+        intentionally kept in the registry so the tree UI can render
+        them grayed out — state is authoritative in storage, not here.
+
+        UNIONs with any entries the fan-out thread already added during
+        the storage query window (the coordinator is installed in
+        ``self._workstreams`` before we get here, so a ``ws_created``
+        event for one of its children can fire in parallel and call
+        ``_add_child`` on a fresh or pre-existing set).  Overwriting
+        would drop that child.
+        """
+        # Tenant filter: only accept persisted children whose owning
+        # user_id matches the coordinator's.  A forged parent_ws_id
+        # that slipped past the server-side create gate (migration-era
+        # data, downgrade path) would otherwise keep re-leaking into
+        # the fan-out set on every console restart.
+        with self._lock:
+            coord_ws = self._workstreams.get(coord_ws_id)
+        coord_user_id = coord_ws.user_id if coord_ws is not None else ""
+        try:
+            rows = self._storage.list_workstreams(
+                limit=1000,
+                parent_ws_id=coord_ws_id,
+                kind=None,
+            )
+        except Exception:
+            log.debug(
+                "coord_mgr.rebuild_children_failed ws=%s",
+                coord_ws_id[:8],
+                exc_info=True,
+            )
+            rows = []
+        child_ids: list[str] = []
+        for r in rows:
+            try:
+                m = r._mapping
+                child_id = m["ws_id"]
+                row_user = m.get("user_id", "") or ""
+            except (AttributeError, KeyError):
+                child_id = r[0] if r else ""
+                row_user = ""
+            if not child_id:
+                continue
+            # Fail-closed: empty coord owner or mismatch → skip.  If
+            # coord_user_id was unavailable (coordinator evicted
+            # mid-rebuild) we'd rather lose the registry seed than
+            # leak cross-tenant.
+            if not coord_user_id or row_user != coord_user_id:
+                log.debug(
+                    "coord_mgr.rebuild_skipped_cross_tenant coord=%s child=%s",
+                    coord_ws_id[:8],
+                    str(child_id)[:8],
+                )
+                continue
+            child_ids.append(child_id)
+        with self._children_lock:
+            self._merge_child_ids_locked(coord_ws_id, child_ids)
+
+    def _coord_for_child(self, child_ws_id: str) -> str | None:
+        """Reverse-lookup: which coordinator owns this child ws_id?
+
+        O(1) via the ``_child_to_coord`` reverse index.  Cluster events
+        fire on every token tick across the cluster; a linear scan
+        here turned into a hot-path tax as the retained-history set
+        grew.
+        """
+        with self._children_lock:
+            return self._child_to_coord.get(child_ws_id)
+
+    def _pop_coord_registry_locked(self, coord_ws_id: str) -> None:
+        """Remove a coordinator's forward set + reverse-index entries.
+
+        Caller MUST hold ``self._children_lock``.  Used by close /
+        eviction paths so stale coordinators don't leak registry
+        entries.  No-op if the coordinator is unknown.
+        """
+        child_set = self._children.pop(coord_ws_id, None)
+        if child_set is None:
+            return
+        for cid in child_set:
+            # Defensive: only clear the reverse entry if it still
+            # points at THIS coordinator.  If a child has since been
+            # reassigned (unusual but possible on schema changes), we
+            # don't want to orphan the new owner's entry.
+            if self._child_to_coord.get(cid) == coord_ws_id:
+                self._child_to_coord.pop(cid, None)
+
+    def _add_child(self, coord_ws_id: str, child_ws_id: str) -> bool:
+        """Record a new child_ws_id for ``coord_ws_id``.
+
+        Returns True when the child is newly added (first observation),
+        False when it was already tracked.  Caller uses the return to
+        decide whether to re-emit a ``child_ws_created`` event.
+        """
+        with self._children_lock:
+            existing = self._children.setdefault(coord_ws_id, set())
+            if child_ws_id in existing:
+                return False
+            existing.add(child_ws_id)
+            self._child_to_coord[child_ws_id] = coord_ws_id
+            return True
+
+    def start_child_event_fanout(self, collector: ClusterCollector) -> None:
+        """Subscribe to cluster events and start the filter + re-emit thread.
+
+        Idempotent — calling twice is a no-op (already-started fan-out
+        thread stays).  Called once from the console lifespan after both
+        the collector and the coordinator manager are constructed.
+        """
+        if self._fanout_thread is not None and self._fanout_thread.is_alive():
+            return
+        self._collector = collector
+        self._collector_queue = queue.Queue(maxsize=1000)
+        # Register with the collector — use the existing listener channel
+        # the browser SSE fan-out uses; the collector treats our queue as
+        # just another subscriber.
+        snapshot = collector.get_snapshot_and_register(self._collector_queue)
+        # Prime the child registry from the snapshot so a coordinator
+        # that opens right after a console restart sees already-live
+        # children without waiting for the next ``ws_state`` tick to
+        # discover them via the fan-out path.
+        self._prime_children_from_snapshot(snapshot)
+        self._fanout_stop.clear()
+        t = threading.Thread(
+            target=self._fanout_loop,
+            name="coord-mgr-child-fanout",
+            daemon=True,
+        )
+        self._fanout_thread = t
+        t.start()
+
+    def _prime_children_from_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Populate ``_children`` + ``_child_to_coord`` from a collector
+        snapshot.
+
+        The snapshot's per-node workstreams carry ``parent_ws_id`` (phase
+        3 propagated it end-to-end).  For every workstream whose parent
+        is an in-memory coordinator, record the child so the fan-out
+        filter sees it immediately.  Running under both locks keeps the
+        registry write consistent with concurrent close / eviction.
+        """
+        nodes = snapshot.get("nodes", []) if isinstance(snapshot, dict) else []
+        if not nodes:
+            return
+        # Bucket children by parent so each coordinator's forward set +
+        # reverse index gets one helper call instead of one per child.
+        by_parent: dict[str, list[str]] = {}
+        with self._lock:
+            known = set(self._workstreams)
+        for node in nodes:
+            for entry in node.get("workstreams", []) or []:
+                parent = entry.get("parent_ws_id") or ""
+                child_id = entry.get("id") or ""
+                if not parent or not child_id or parent not in known:
+                    continue
+                by_parent.setdefault(parent, []).append(child_id)
+        if not by_parent:
+            return
+        with self._children_lock:
+            for parent, kids in by_parent.items():
+                self._merge_child_ids_locked(parent, kids)
+
+    def shutdown(self) -> None:
+        """Stop the fan-out thread and unregister from the collector.
+
+        Safe to call multiple times; idempotent.  Invoked from the
+        console lifespan teardown so SSE listener queues don't leak.
+        """
+        self._fanout_stop.set()
+        t = self._fanout_thread
+        q = self._collector_queue
+        coll = self._collector
+        self._fanout_thread = None
+        self._collector_queue = None
+        self._collector = None
+        if coll is not None and q is not None:
+            try:
+                coll.unregister_listener(q)
+            except Exception:
+                log.debug("coord_mgr.unregister_listener_failed", exc_info=True)
+        if t is not None:
+            t.join(timeout=2.0)
+
+    def _fanout_loop(self) -> None:
+        """Drain collector events, filter by known children, dispatch."""
+        q = self._collector_queue
+        if q is None:
+            return
+        while not self._fanout_stop.is_set():
+            try:
+                event = q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._dispatch_child_event(event)
+            except Exception:
+                log.debug("coord_mgr.fanout.dispatch_failed", exc_info=True)
+
+    def _dispatch_child_event(self, event: dict[str, Any]) -> None:
+        """Match a cluster event to a coordinator and re-emit on its UI.
+
+        Events of interest:
+
+        - ``ws_created`` with ``parent_ws_id`` matching an in-memory
+          coordinator → add to registry + re-emit as
+          ``child_ws_created``.
+        - ``cluster_state`` / ``ws_closed`` / ``ws_rename`` whose
+          ``ws_id`` is in any coordinator's known-children registry →
+          re-emit as ``child_ws_state`` / ``child_ws_closed`` /
+          ``child_ws_rename``.
+
+        Events for ws_ids we don't own silently drop — the filter lives
+        on the server so each coordinator's SSE stream stays small.
+        """
+        etype = event.get("type") or ""
+        ws_id = event.get("ws_id") or ""
+        if not etype or not ws_id:
+            return
+
+        if etype == "ws_created":
+            parent = event.get("parent_ws_id") or ""
+            if not parent:
+                return
+            # Lock-free presence + tenant check via the atomically-
+            # swapped _active_coords snapshot.  The manager updates
+            # this dict by reference under _lock on every install /
+            # remove, so an in-flight dispatch that reads a stale
+            # snapshot either sees the coord or doesn't — both
+            # outcomes are safe (a coord that just evicted gets one
+            # last fan-out; a coord that just installed gets one
+            # missed event — the next state change picks it up).
+            active = self._active_coords
+            meta = active.get(parent)
+            if meta is None:
+                return
+            coord_user_id, coord_ui = meta
+            # Tenant-isolation gate: cross-tenant fan-out is the
+            # vuln the server-side create endpoint also gates
+            # against.  Defense-in-depth here means a spoofed
+            # parent_ws_id from any path (bypassed server check,
+            # migration-era data) still can't route a child's
+            # real-time events into a foreign coordinator's SSE
+            # stream.  Empty user_id on either side fails closed.
+            event_user = event.get("user_id") or ""
+            if not event_user or event_user != coord_user_id:
+                return
+            # Only _children_lock is needed for the registry write
+            # now — the hot path no longer contends self._lock.
+            newly_added = False
+            with self._children_lock:
+                existing = self._children.setdefault(parent, set())
+                if ws_id not in existing:
+                    existing.add(ws_id)
+                    self._child_to_coord[ws_id] = parent
+                    newly_added = True
+            if not newly_added:
+                return
+            if coord_ui is None:
+                return
+            payload = {
+                "type": "child_ws_created",
+                "ws_id": ws_id,
+                "child_ws_id": ws_id,
+                "parent_ws_id": parent,
+                "node_id": event.get("node_id", ""),
+                "name": event.get("name", ""),
+                "title": event.get("title", ""),
+            }
+            _enqueue_on_ui(coord_ui, parent, payload)
+            return
+
+        if etype in ("cluster_state", "ws_closed", "ws_rename"):
+            coord_id = self._coord_for_child(ws_id)
+            if coord_id is None:
+                return
+            owning_ws = self.get(coord_id)
+            if owning_ws is None or owning_ws.ui is None:
+                return
+            if etype == "cluster_state":
+                child_event = {
+                    "type": "child_ws_state",
+                    "child_ws_id": ws_id,
+                    "parent_ws_id": coord_id,
+                    "state": event.get("state", ""),
+                    "tokens": event.get("tokens", 0),
+                    "node_id": event.get("node_id", ""),
+                }
+            elif etype == "ws_closed":
+                child_event = {
+                    "type": "child_ws_closed",
+                    "child_ws_id": ws_id,
+                    "parent_ws_id": coord_id,
+                    "reason": event.get("reason", ""),
+                }
+            else:  # ws_rename
+                child_event = {
+                    "type": "child_ws_rename",
+                    "child_ws_id": ws_id,
+                    "parent_ws_id": coord_id,
+                    "name": event.get("name", ""),
+                }
+            _enqueue_on_ui(owning_ws.ui, coord_id, child_event)
+
+
+def _enqueue_on_ui(ui: Any, coord_ws_id: str, payload: dict[str, Any]) -> None:
+    """Dispatch ``payload`` onto the coordinator UI's listener fan-out.
+
+    ``ConsoleCoordinatorUI`` auto-stamps ``ws_id`` on enqueue, but the
+    child-fanout payloads already carry ``child_ws_id`` + ``parent_ws_id``.
+    Stamp the coordinator's own ws_id too so the browser event handler
+    can discriminate child_* events from its own-session events purely
+    from the payload.
+    """
+    enqueue = getattr(ui, "_enqueue", None)
+    if enqueue is None:
+        return
+    body = {**payload, "ws_id": coord_ws_id}
+    try:
+        enqueue(body)
+    except Exception:
+        log.debug("coord_mgr.enqueue_failed ws=%s", coord_ws_id[:8], exc_info=True)

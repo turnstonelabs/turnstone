@@ -97,9 +97,21 @@ class WebUI:
     _global_queue: queue.Queue[dict[str, Any]] | None = None  # bounded in main()
     _workstream_mgr: WorkstreamManager | None = None
 
-    def __init__(self, ws_id: str = "", user_id: str = "") -> None:
+    def __init__(
+        self,
+        ws_id: str = "",
+        user_id: str = "",
+        *,
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
+    ) -> None:
         self.ws_id = ws_id
         self._user_id = user_id
+        # Cached for broadcast event payloads — both are immutable for
+        # the lifetime of the workstream, so locking the manager on
+        # every state/activity tick to re-read them burns lock budget.
+        self._kind = kind
+        self._parent_ws_id = parent_ws_id
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._approval_event = threading.Event()
@@ -158,6 +170,16 @@ class WebUI:
         with self._listeners_lock, contextlib.suppress(ValueError):
             self._listeners.remove(client_queue)
 
+    def _ws_kind_and_parent(self) -> tuple[str, str | None]:
+        """Return cached (kind, parent_ws_id) for broadcast event payloads.
+
+        Stored on the UI at construction time — both fields are
+        immutable for the lifetime of the workstream, so re-reading
+        them from the manager under lock on every broadcast was a
+        process-wide serialization tax on every activity tick.
+        """
+        return self._kind, self._parent_ws_id
+
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel."""
         if WebUI._global_queue is not None:
@@ -166,6 +188,7 @@ class WebUI:
                 ctx = self._ws_context_ratio
                 activity = self._ws_current_activity
                 activity_state = self._ws_activity_state
+            kind, parent_ws_id = self._ws_kind_and_parent()
             event: dict[str, Any] = {
                 "type": "ws_state",
                 "ws_id": self.ws_id,
@@ -174,6 +197,8 @@ class WebUI:
                 "context_ratio": ctx,
                 "activity": activity,
                 "activity_state": activity_state,
+                "kind": kind,
+                "parent_ws_id": parent_ws_id,
             }
             if state == "idle":
                 event["content"] = "".join(self._ws_turn_content)
@@ -193,6 +218,7 @@ class WebUI:
             with self._ws_lock:
                 activity = self._ws_current_activity
                 activity_state = self._ws_activity_state
+            kind, parent_ws_id = self._ws_kind_and_parent()
             with contextlib.suppress(queue.Full):
                 WebUI._global_queue.put_nowait(
                     {
@@ -200,6 +226,8 @@ class WebUI:
                         "ws_id": self.ws_id,
                         "activity": activity,
                         "activity_state": activity_state,
+                        "kind": kind,
+                        "parent_ws_id": parent_ws_id,
                     }
                 )
 
@@ -1068,6 +1096,9 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "tool_calls": tc,
                 "model": ws.session.model if ws.session else "",
                 "model_alias": ws.session.model_alias if ws.session else "",
+                "kind": ws.kind,
+                "parent_ws_id": ws.parent_ws_id,
+                "user_id": ws.user_id,
             }
         )
     return {
@@ -1202,6 +1233,9 @@ async def dashboard(request: Request) -> JSONResponse:
                 "node": "local",
                 "model": ws.session.model if ws.session else "",
                 "model_alias": ws.session.model_alias if ws.session else "",
+                "kind": ws.kind,
+                "parent_ws_id": ws.parent_ws_id,
+                "user_id": ws.user_id,
             }
         )
     uptime_sec = round(time.monotonic() - _metrics.start_time)
@@ -2347,10 +2381,35 @@ async def create_workstream(request: Request) -> JSONResponse:
             status_code=400,
         )
     body_parent = body.get("parent_ws_id") or None
+    if body_parent is not None:
+        # Ownership gate: parent_ws_id is client-supplied in the request
+        # body, so a malicious caller could previously point a new
+        # interactive workstream at another tenant's coordinator — the
+        # coordinator's SSE fan-out would then route child_ws_* events
+        # (carrying the attacker's name/state/tokens) to that victim.
+        # Validate against storage: the parent must exist, be a
+        # coordinator, and belong to the same user.  Coordinator-spawned
+        # children satisfy this by construction (the coordinator's JWT
+        # `sub` claim is the owning user and parent_ws_id is the coord's
+        # own ws_id); external clients that fabricate the field get 403.
+        from turnstone.core.storage._registry import get_storage as _get_storage_for_parent
+
+        _pstorage = _get_storage_for_parent()
+        parent_row = _pstorage.get_workstream(body_parent) if _pstorage else None
+        if parent_row is None:
+            return JSONResponse(
+                {"error": "parent_ws_id does not reference a known workstream"},
+                status_code=400,
+            )
+        if parent_row.get("kind") != "coordinator" or (parent_row.get("user_id") or "") != uid:
+            return JSONResponse(
+                {"error": "parent_ws_id must reference a coordinator you own"},
+                status_code=403,
+            )
     try:
         ws = mgr.create(
             name=body.get("name", ""),
-            ui_factory=lambda wid: WebUI(ws_id=wid, user_id=uid),
+            ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=uid, **kw),
             model=resolved_model,
             skill=resolved_skill,
             skill_id=skill_data["template_id"] if skill_data else "",
@@ -2403,6 +2462,13 @@ async def create_workstream(request: Request) -> JSONResponse:
                     "name": display_name,
                     "model": ws.session.model if ws.session else "",
                     "model_alias": ws.session.model_alias if ws.session else "",
+                    "kind": ws.kind,
+                    "parent_ws_id": ws.parent_ws_id,
+                    # Owner id is propagated through the cluster event
+                    # stream so console-side fan-out can enforce tenant
+                    # isolation — a coordinator must never receive
+                    # child_ws_* events for workstreams it doesn't own.
+                    "user_id": ws.user_id,
                 }
             )
         # Emit eviction event if a workstream was evicted to make room
@@ -3095,7 +3161,7 @@ async def open_workstream(request: Request) -> JSONResponse:
         owner_uid = stored_owner or uid
         ws = mgr.create(
             name=ws_row.get("name", ""),
-            ui_factory=lambda wid: WebUI(ws_id=wid, user_id=owner_uid),
+            ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=owner_uid, **kw),
             ws_id=resolved_id,
             user_id=owner_uid,
             kind=ws_row.get("kind") or "interactive",
@@ -3126,6 +3192,9 @@ async def open_workstream(request: Request) -> JSONResponse:
                 "name": ws.name,
                 "model": ws.session.model if ws.session else "",
                 "model_alias": ws.session.model_alias if ws.session else "",
+                "kind": ws.kind,
+                "parent_ws_id": ws.parent_ws_id,
+                "user_id": ws.user_id,
             }
         )
 
@@ -4725,7 +4794,7 @@ def main() -> None:
         """
         try:
             ws = manager.create(
-                ui_factory=lambda wid: WebUI(ws_id=wid),
+                ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
             )
             # Restored workstreams run unattended — auto-approve tool calls
             # to avoid blocking forever on approval with no connected user.
@@ -4748,7 +4817,7 @@ def main() -> None:
     )
     ws = manager.create(
         name="default",
-        ui_factory=lambda wid: WebUI(ws_id=wid),
+        ui_factory=lambda wid, **kw: WebUI(ws_id=wid, **kw),
     )
     if not isinstance(ws.ui, WebUI):
         raise TypeError(f"Expected WebUI, got {type(ws.ui).__name__}")

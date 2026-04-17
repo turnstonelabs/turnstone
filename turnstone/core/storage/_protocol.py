@@ -44,8 +44,17 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def load_messages(self, ws_id: str) -> list[dict[str, Any]]:
-        """Load messages for a workstream and reconstruct OpenAI message format."""
+    def load_messages(self, ws_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
+        """Load messages for a workstream and reconstruct OpenAI message format.
+
+        ``limit`` caps the number of underlying conversation rows fetched
+        (from the tail, then reversed), bounding memory for callers that
+        only need a recent slice — e.g. the cluster-inspect endpoint.  The
+        returned message list may have slightly fewer *reconstructed*
+        entries than ``limit`` when a tool-call group splits across the
+        boundary; callers that need strict tail-N semantics must slice
+        again client-side.  Default ``None`` fetches the full history.
+        """
         ...
 
     # -- Workstream attachments -----------------------------------------------
@@ -164,12 +173,23 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def load_attachments_for_messages(self, ws_id: str) -> dict[int, list[dict[str, Any]]]:
+    def load_attachments_for_messages(
+        self,
+        ws_id: str,
+        *,
+        message_ids: list[int] | None = None,
+    ) -> dict[int, list[dict[str, Any]]]:
         """Return attachments grouped by ``message_id`` for history replay.
 
         Each attachment dict includes ``attachment_id``, ``filename``,
         ``mime_type``, ``size_bytes``, ``kind``, and ``content`` (bytes).
         Pending (un-consumed) rows are excluded.
+
+        ``message_ids`` narrows the scan to attachments tied to the
+        given message rows — used by the tail-N path in
+        :func:`load_messages` so the attachment read doesn't defeat
+        the conversations-table LIMIT.  Default ``None`` returns every
+        attachment for the workstream.
         """
         ...
 
