@@ -3098,6 +3098,8 @@ async def open_workstream(request: Request) -> JSONResponse:
             ui_factory=lambda wid: WebUI(ws_id=wid, user_id=owner_uid),
             ws_id=resolved_id,
             user_id=owner_uid,
+            kind=ws_row.get("kind") or "interactive",
+            parent_ws_id=ws_row.get("parent_ws_id"),
         )
     except Exception as e:
         log.warning("ws.open.create_failed", ws_id=resolved_id[:8], error=str(e))

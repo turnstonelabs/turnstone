@@ -1661,6 +1661,12 @@ async def coordinator_send(request: Request) -> JSONResponse:
         # 403) to avoid leaking existence.
         return JSONResponse({"error": "coordinator not found"}, status_code=404)
     if not coord_mgr.send(ws_id, message):
+        # Distinguish "worker busy + queue full" from "ws not loaded".
+        # If ws is loaded and session exists, the worker queue is full —
+        # tell the client to back off rather than retry blindly.
+        ws_now = coord_mgr.get(ws_id)
+        if ws_now is not None and ws_now.session is not None:
+            return JSONResponse({"error": "worker queue full; retry shortly"}, status_code=429)
         return JSONResponse({"error": "send failed"}, status_code=500)
     return JSONResponse({"status": "ok"})
 
@@ -1846,7 +1852,11 @@ async def coordinator_history(request: Request) -> JSONResponse:
         row = storage.get_workstream(ws_id)
         if row is None or row.get("kind") != "coordinator":
             return JSONResponse({"error": "coordinator not found"}, status_code=404)
-        if row.get("user_id") and row.get("user_id") != user_id and not _is_admin(request):
+        # Strict equality (not short-circuit on empty user_id) — empty-
+        # owner rows would otherwise leak the full persisted message
+        # history of an orphan/system-owned coordinator to anyone
+        # holding admin.coordinator.
+        if (row.get("user_id") or "") != user_id and not _is_admin(request):
             return JSONResponse({"error": "coordinator not found"}, status_code=404)
         messages = storage.load_messages(ws_id)
         return JSONResponse({"ws_id": ws_id, "messages": messages})

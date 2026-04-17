@@ -139,12 +139,19 @@ class ConsoleCoordinatorUI:
                 self._enqueue({"type": "tools_auto_approved", "items": serialized})
             return True, None
 
-        # Coordinator default honors auto_approve (set e.g. during
-        # scripted restart-rehydration) — matches WebUI semantics.
-        if self.auto_approve and all(
-            it.get("func_name") in self.auto_approve_tools or not self.auto_approve_tools
-            for it in pending
-        ):
+        # Per-tool auto-approve: 'Always approve this tool' adds the
+        # tool name to ``auto_approve_tools``.  This must short-circuit
+        # independently of the blanket ``auto_approve`` flag — matches
+        # the WebUI two-tier contract (turnstone/server.py).
+        if self.auto_approve_tools:
+            pending_names = {it.get("func_name", "") for it in pending if it.get("func_name")}
+            if pending_names and pending_names.issubset(self.auto_approve_tools):
+                self._enqueue({"type": "tools_auto_approved", "items": serialized})
+                return True, None
+
+        # Blanket auto-approve (set e.g. during scripted
+        # restart-rehydration) — also matches WebUI semantics.
+        if self.auto_approve:
             self._enqueue({"type": "tools_auto_approved", "items": serialized})
             return True, None
 

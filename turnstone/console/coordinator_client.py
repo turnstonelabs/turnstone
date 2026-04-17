@@ -272,12 +272,18 @@ class CoordinatorClient:
 
         Returns a dict ``{"children": [...], "truncated": bool}``.  The
         ``truncated`` flag is ``True`` when the SQL fetch returned a full
-        ``limit``-sized page *and* the final result is shorter than ``limit``
-        after post-filtering (state / skill) — the model can signal to the
-        user there may be more rows and request pagination.  ``kind`` is
-        pushed into the SQL query so coordinator-siblings never burn the
-        row budget here.
+        ``limit``-sized page — the model can signal to the user there may
+        be more rows and request pagination.  ``kind`` is pushed into the
+        SQL query so coordinator-siblings never burn the row budget here.
+
+        Cross-tenant guard: the coordinator's LLM input is untrusted
+        (prompt injection is a first-class threat), so ``parent_ws_id``
+        is constrained to the coordinator's own ws_id.  A model that
+        emits some other ws_id gets an empty result rather than a peek
+        into another tenant's subtree.
         """
+        if parent_ws_id != self._coord_ws_id:
+            return {"children": [], "truncated": False}
         raw = self._storage.list_workstreams(
             limit=limit,
             parent_ws_id=parent_ws_id,
@@ -325,17 +331,31 @@ class CoordinatorClient:
                 child["skill_id"] = m["skill_id"]
                 child["skill_version"] = m["skill_version"]
             children.append(child)
-        # truncated is True when the DB returned a full page *and* post-
-        # filtering dropped at least one row — the model should know more
-        # children may be available via pagination.
-        truncated = len(raw) >= limit and len(children) < len(raw)
+        # The DB filled a full page → more matching rows may exist behind
+        # the cap; tell the model so it can re-query with a narrower filter
+        # or larger limit.  Python-side post-filtering is unrelated to
+        # whether the DB has more pages.
+        truncated = len(raw) >= limit
         return {"children": children, "truncated": truncated}
 
     def inspect(self, ws_id: str, *, message_limit: int = 20) -> dict[str, Any]:
-        """Return persisted workstream state + tail-N messages + recent verdicts."""
+        """Return persisted workstream state + tail-N messages + recent verdicts.
+
+        Cross-tenant guard: the coordinator's LLM input is untrusted, so
+        the inspectable scope is restricted to (a) the coordinator
+        itself or (b) a row whose ``parent_ws_id`` is this coordinator
+        (i.e. one of its own children).  Any other ws_id returns the
+        same not-found shape used for genuine misses, avoiding an
+        existence oracle.
+        """
         full = self._storage.get_workstream(ws_id)
+        miss = {"error": f"workstream not found: {ws_id}", "ws_id": ws_id}
         if full is None:
-            return {"error": f"workstream not found: {ws_id}", "ws_id": ws_id}
+            return miss
+        is_self = ws_id == self._coord_ws_id
+        is_own_child = full.get("parent_ws_id") == self._coord_ws_id
+        if not (is_self or is_own_child):
+            return miss
         # load_messages returns the full history in chronological order
         # (no limit param in the Protocol) — slice the tail here.  Defensive
         # try/except: storage errors should not break inspect.

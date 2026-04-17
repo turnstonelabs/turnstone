@@ -995,6 +995,11 @@ class ChatSession:
             self._mcp_prompt_cb = None
         if self._watch_runner:
             self._watch_runner.remove_dispatch_fn(self._ws_id)
+        if self._coord_client is not None and hasattr(self._coord_client, "close"):
+            try:
+                self._coord_client.close()
+            except Exception:
+                log.debug("chat_session.coord_client_close_failed", exc_info=True)
         self._cleanup_skill_resources()
 
     def _handle_mcp_refresh(self, arg: str) -> None:

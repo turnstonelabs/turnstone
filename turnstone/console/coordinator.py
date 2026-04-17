@@ -27,6 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
+import queue
 import secrets
 import threading
 import time
@@ -80,9 +81,11 @@ class CoordinatorManager:
         # but-not-loaded ws_id both miss the fast path, both call the
         # session factory, and the second clobbers the first — orphaning
         # a worker thread and leaking SSE listeners.  The dict is guarded
-        # by ``self._lock``; individual entries are popped once the open
-        # completes (success or failure).
-        self._open_locks: dict[str, threading.Lock] = {}
+        # by ``self._lock``; entries are refcounted so we only pop when
+        # the last waiter releases — popping while a waiter still holds
+        # the lock would let a fresh arrival allocate a different lock
+        # for the same ws_id, breaking serialization on the failure path.
+        self._open_locks: dict[str, tuple[threading.Lock, int]] = {}
 
     @property
     def max_active(self) -> int:
@@ -205,13 +208,19 @@ class CoordinatorManager:
         same persisted-but-unloaded ws_id must not each construct a
         session.  A per-ws_id lock ensures the second arrival sees the
         first thread's installed workstream and returns it instead of
-        spinning up a duplicate.  Per-ws locks are popped from
-        ``self._open_locks`` once the winning thread exits; later
-        arrivals allocate a fresh lock but will fast-path through
-        ``self._workstreams`` under ``self._lock``.
+        spinning up a duplicate.  The lock entry is refcounted so it
+        survives until the last waiter releases — only then is it
+        popped.  Popping earlier would let a third arrival allocate a
+        fresh lock for the same ws_id, defeating the serialization.
         """
         with self._lock:
-            open_lock = self._open_locks.setdefault(ws_id, threading.Lock())
+            entry = self._open_locks.get(ws_id)
+            if entry is None:
+                open_lock = threading.Lock()
+                self._open_locks[ws_id] = (open_lock, 1)
+            else:
+                open_lock, refs = entry
+                self._open_locks[ws_id] = (open_lock, refs + 1)
         try:
             with open_lock:
                 # Fast-path: someone else installed the session while we
@@ -224,8 +233,19 @@ class CoordinatorManager:
                 row = self._storage.get_workstream(ws_id)
                 if row is None or row.get("kind") != "coordinator":
                     return None
+                # close()/delete() only soft-mark the row — refuse to
+                # resurrect those sessions on any subsequent GET, or the
+                # Close button becomes silently reversible on URL revisit
+                # and burns max_active capacity.
+                if row.get("state") in {"closed", "deleted"}:
+                    return None
                 row_owner = row.get("user_id") or ""
-                if not admin and row_owner and row_owner != user_id:
+                # Strict equality (not short-circuit on empty row_owner)
+                # — empty-owner rows must not allow non-admin callers to
+                # rehydrate orphan / system-owned coordinators (would
+                # consume a max_active slot + evict another tenant's
+                # IDLE coordinator).
+                if not admin and row_owner != user_id:
                     return None
 
                 # Reserve the slot + install placeholder under the lock
@@ -272,7 +292,13 @@ class CoordinatorManager:
                 return ws
         finally:
             with self._lock:
-                self._open_locks.pop(ws_id, None)
+                entry = self._open_locks.get(ws_id)
+                if entry is not None:
+                    lk, refs = entry
+                    if refs <= 1:
+                        self._open_locks.pop(ws_id, None)
+                    else:
+                        self._open_locks[ws_id] = (lk, refs - 1)
 
     # ------------------------------------------------------------------
     # Worker thread dispatch
@@ -281,21 +307,29 @@ class CoordinatorManager:
     def send(self, ws_id: str, message: str) -> bool:
         """Queue a message onto a coordinator session's ChatSession.
 
-        Returns False if the coordinator isn't loaded in the manager.
-        Priority is parsed from the message prefix (``/high``,
-        ``/urgent``, etc.) by :meth:`ChatSession.queue_message`.
+        Returns False if the coordinator isn't loaded in the manager or
+        if the worker's pending-message queue is full (caller should
+        surface 429 / backpressure).  Priority is parsed from the
+        message prefix (``/high``, ``/urgent``, etc.) by
+        :meth:`ChatSession.queue_message`.
         """
         ws = self.get(ws_id)
         if ws is None or ws.session is None:
             return False
-        self._spawn_worker(ws, message)
-        return True
+        return self._spawn_worker(ws, message)
 
-    def _spawn_worker(self, ws: Workstream, message: str) -> None:
-        """Start (or reuse) a worker thread that drives session.send."""
+    def _spawn_worker(self, ws: Workstream, message: str) -> bool:
+        """Start (or reuse) a worker thread that drives session.send.
+
+        Returns True on successful enqueue (existing worker) or thread
+        spawn (no live worker).  Returns False when an existing worker's
+        queue is full — must NOT spawn a second concurrent worker on
+        the same ChatSession (mutates messages, queued_messages,
+        streaming state, LLM client cursors, approvals).
+        """
         session = ws.session
         if session is None:
-            return
+            return False
         # If a worker is already running for this ws, enqueue instead of
         # spawning a duplicate — ChatSession.queue_message handles FIFO.
         if (
@@ -305,13 +339,24 @@ class CoordinatorManager:
         ):
             try:
                 session.queue_message(message)
-                return
+                return True
+            except queue.Full:
+                # Queue is at capacity AND a worker is still running.
+                # Spawning a second thread on the same ChatSession would
+                # corrupt history / cursors / approvals — return False so
+                # the caller can surface backpressure (HTTP 429).
+                log.warning(
+                    "coord_mgr.queue_full ws=%s — message dropped (worker still busy)",
+                    ws.id[:8],
+                )
+                return False
             except Exception:
-                log.debug(
+                log.warning(
                     "coord_mgr.queue_message_failed ws=%s",
                     ws.id[:8],
                     exc_info=True,
                 )
+                return False
 
         def _run() -> None:
             try:
@@ -326,6 +371,7 @@ class CoordinatorManager:
         )
         ws.worker_thread = t
         t.start()
+        return True
 
     # ------------------------------------------------------------------
     # Inspect / list / close

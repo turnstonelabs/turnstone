@@ -162,6 +162,46 @@ def test_send_returns_false_when_not_loaded(built_mgr):
     assert mgr.send("nonexistent", "hello") is False
 
 
+def test_send_returns_false_on_queue_full_without_spawning_duplicate(storage):
+    """If queue_message raises queue.Full, _spawn_worker must NOT fall
+    through and start a second concurrent worker on the same ChatSession
+    — that would corrupt history / cursors / approvals.  Instead, send()
+    returns False so the endpoint can surface 429."""
+    import queue
+    import threading
+
+    entered = threading.Event()
+    block = threading.Event()
+
+    def _slow_send(msg):
+        entered.set()
+        block.wait(timeout=5.0)
+
+    def _session_factory(ui, model_alias=None, ws_id=None, **kwargs):
+        sess = MagicMock()
+        sess.send.side_effect = _slow_send
+        sess.queue_message.side_effect = queue.Full()
+        return sess
+
+    mgr = CoordinatorManager(
+        session_factory=_session_factory,
+        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
+        storage=storage,
+        max_active=3,
+    )
+    ws = mgr.create(user_id="u1", initial_message="first")
+    try:
+        assert entered.wait(timeout=2.0), "worker didn't start"
+        original_thread = ws.worker_thread
+        assert mgr.send(ws.id, "second") is False
+        # Must NOT have replaced worker_thread with a fresh second worker.
+        assert ws.worker_thread is original_thread
+    finally:
+        block.set()
+        if ws.worker_thread:
+            ws.worker_thread.join(timeout=2.0)
+
+
 def test_send_enqueues_on_live_worker(storage):
     """When a worker thread is already processing, send() routes through
     queue_message instead of spawning a duplicate worker."""
@@ -346,6 +386,32 @@ def test_open_admin_ignores_ownership(built_mgr):
     storage.register_workstream("coord-x", kind="coordinator", user_id="owner")
     ws = mgr.open_admin("coord-x")
     assert ws is not None
+
+
+def test_open_refuses_closed_coordinator(built_mgr):
+    """A coordinator that was closed (state=closed in storage) must not
+    silently resurrect on the next GET.  Otherwise the Close button is
+    reversible on URL revisit and burns max_active capacity."""
+    mgr, _calls, storage = built_mgr
+    ws = mgr.create(user_id="u1")
+    mgr.close(ws.id)
+    # Direct GET via open() must NOT rehydrate the closed row.
+    reopened = mgr.open(ws.id, "u1")
+    assert reopened is None
+    # Admin path must also refuse to resurrect — closed means closed.
+    assert mgr.open_admin(ws.id) is None
+
+
+def test_open_refuses_empty_owner_for_non_admin(built_mgr):
+    """Empty-owner rows (orphan / pre-002 migrated) must not be
+    rehydrated by non-admin callers — would consume a max_active slot
+    and let any user evict another tenant's IDLE coordinator."""
+    mgr, _calls, storage = built_mgr
+    storage.register_workstream("coord-orphan", kind="coordinator", user_id=None)
+    # Non-admin caller — empty owner must NOT short-circuit the gate.
+    assert mgr.open("coord-orphan", "any-user") is None
+    # Admin path can still rehydrate (e.g. cleanup tooling).
+    assert mgr.open_admin("coord-orphan") is not None
 
 
 def test_open_returns_existing_when_loaded(built_mgr):

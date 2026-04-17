@@ -388,3 +388,42 @@ def test_inspect_returns_persisted_fields(populated_storage):
     assert result["parent_ws_id"] == "coord-1"
     assert isinstance(result["messages"], list)
     assert isinstance(result["verdicts"], list)
+
+
+def test_inspect_refuses_workstreams_outside_coordinator_subtree(populated_storage):
+    """Prompt-injection guard — coordinator must not be able to inspect
+    arbitrary ws_ids (e.g. another tenant's workstream)."""
+    client = _make_read_client(populated_storage)
+    # 'unrelated' has no parent_ws_id and is not coord-1 itself.
+    result = client.inspect("unrelated")
+    assert "error" in result
+    assert "messages" not in result
+
+
+def test_list_children_refuses_arbitrary_parent_ws_id(populated_storage):
+    """Prompt-injection guard — coordinator must not be able to enumerate
+    children of some other coordinator."""
+    # Add a sibling coordinator with its own children.
+    populated_storage.register_workstream(
+        "coord-other",
+        kind="coordinator",
+        user_id="user-2",
+    )
+    populated_storage.register_workstream(
+        "child-other",
+        kind="interactive",
+        parent_ws_id="coord-other",
+    )
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-other")
+    assert result == {"children": [], "truncated": False}
+
+
+def test_list_children_truncated_signals_db_page_full(populated_storage):
+    """truncated=True whenever the SQL fetch hit the limit, regardless
+    of post-filtering."""
+    client = _make_read_client(populated_storage)
+    # populated_storage has child-a + child-b under coord-1; limit=1
+    # always fills the page so truncated must fire.
+    result = client.list_children("coord-1", limit=1)
+    assert result["truncated"] is True
