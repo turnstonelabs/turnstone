@@ -944,3 +944,14 @@ class SetNodeMetadataRequest(BaseModel):
 
 class BulkSetNodeMetadataRequest(BaseModel):
     entries: list[SetNodeMetadataRequest] = Field(default_factory=list)
+
+
+class CoordinatorOpenResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/{ws_id}/open."""
+
+    ws_id: str
+    name: str
+    already_loaded: bool | None = Field(
+        default=None,
+        description="True when the coordinator was already in memory; absent after a fresh rehydrate.",
+    )

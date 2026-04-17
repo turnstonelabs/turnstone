@@ -917,6 +917,27 @@ class StorageBackend(Protocol):
         """Return prompt templates filtered by activation value, ordered by priority then name."""
         ...
 
+    def list_skills_filtered(
+        self,
+        *,
+        category: str | None = None,
+        tag: str | None = None,
+        scan_status: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return prompt templates filtered by optional category/tag/scan_status,
+        ordered by priority then name.
+
+        Filters are pushed into SQL — no per-row Python filter loops.  The
+        ``tag`` filter matches if the tag string appears in the JSON-array
+        ``tags`` column (quote-bracketed substring against the JSON text:
+        ``%"<tag>"%``).  Cheap and correct for tag values without quote
+        characters; upgrade to true JSON-array containment if the
+        convention ever needs to expand.
+        """
+        ...
+
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
         """Lookup skill (prompt template) by name. Returns dict or None."""
         ...

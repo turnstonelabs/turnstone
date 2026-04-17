@@ -3882,6 +3882,8 @@ class ChatSession:
             "close_workstream": self._prepare_close_workstream,
             "delete_workstream": self._prepare_delete_workstream,
             "list_workstreams": self._prepare_list_workstreams,
+            "list_nodes": self._prepare_list_nodes,
+            "list_skills": self._prepare_list_skills,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -4813,6 +4815,41 @@ class ChatSession:
             "error": f"Error: {msg}",
         }
 
+    @staticmethod
+    def _coord_str_arg(args: dict[str, Any], key: str, default: str = "") -> str:
+        """Return ``args[key]`` if it's a string, else ``default``.
+
+        Coordinator tool args come from an LLM and may be ill-typed
+        (int / list / dict in a string slot).  A naive
+        ``(args.get(key) or "").strip()`` raises ``AttributeError`` on
+        such inputs and kills the whole tool call; this guard lets the
+        prepare layer fall through to its own "required" validation and
+        produce a clean error item instead.
+        """
+        val = args.get(key)
+        return val if isinstance(val, str) else default
+
+    @staticmethod
+    def _coord_bool_arg(args: dict[str, Any], key: str, default: bool = False) -> bool:
+        """Return ``args[key]`` as a bool with robust string coercion.
+
+        Plain ``bool(x)`` treats ``"false"`` as truthy (non-empty string).
+        Accept actual bools verbatim; parse common string forms; return
+        ``default`` for anything else.
+        """
+        val = args.get(key)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            normalized = val.strip().lower()
+            if normalized in ("true", "1", "yes", "on"):
+                return True
+            if normalized in ("false", "0", "no", "off", ""):
+                return False
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            return bool(val)
+        return default
+
     def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         if self._coord_client is None:
             return self._coord_tool_error(
@@ -5134,6 +5171,125 @@ class ChatSession:
                 " (truncated — more may exist; re-run with a narrower filter or larger limit)"
             )
         self._report_tool_result(call_id, "list_workstreams", summary)
+        return call_id, self._truncate_output(output)
+
+    def _prepare_list_nodes(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(call_id, "list_nodes", "coordinator client unavailable")
+        raw_filters = args.get("filters")
+        # Metadata values are JSON-encoded at rest; the client handles the
+        # encode/decode so preserve the model's natural types (``4`` stays
+        # an int, ``"gpu"`` stays a string) rather than stringifying here.
+        filters: dict[str, Any] = {}
+        if isinstance(raw_filters, dict):
+            for k, v in raw_filters.items():
+                if isinstance(k, str) and k and isinstance(v, (str, int, float, bool)):
+                    filters[k] = v
+        try:
+            limit = int(args.get("limit") or 100)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        header_bits = ["\u2699 list_nodes"]
+        if filters:
+            header_bits.append(
+                "filters=" + ",".join(f"{k}={v}" for k, v in sorted(filters.items()))
+            )
+        return {
+            "call_id": call_id,
+            "func_name": "list_nodes",
+            "header": " ".join(header_bits),
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_list_nodes,
+            "filters": filters,
+            "limit": limit,
+        }
+
+    def _exec_list_nodes(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.list_nodes(
+                filters=item["filters"] or None,
+                limit=item["limit"],
+            )
+        except Exception as e:
+            msg = f"Error: list_nodes failed: {e}"
+            self._report_tool_result(call_id, "list_nodes", msg, is_error=True)
+            return call_id, msg
+        nodes = result.get("nodes", [])
+        truncated = bool(result.get("truncated"))
+        output = json.dumps(
+            {"nodes": nodes, "truncated": truncated},
+            separators=(",", ":"),
+            default=str,
+        )
+        summary = f"{len(nodes)} nodes"
+        if truncated:
+            summary += " (truncated — narrow filters or raise limit)"
+        self._report_tool_result(call_id, "list_nodes", summary)
+        return call_id, self._truncate_output(output)
+
+    def _prepare_list_skills(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(call_id, "list_skills", "coordinator client unavailable")
+        category = self._coord_str_arg(args, "category").strip() or None
+        tag = self._coord_str_arg(args, "tag").strip() or None
+        scan_status = self._coord_str_arg(args, "scan_status").strip() or None
+        enabled_only = self._coord_bool_arg(args, "enabled_only")
+        try:
+            limit = int(args.get("limit") or 100)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        header_bits = ["\u2699 list_skills"]
+        if category:
+            header_bits.append(f"category={category}")
+        if tag:
+            header_bits.append(f"tag={tag}")
+        if scan_status:
+            header_bits.append(f"scan_status={scan_status}")
+        if enabled_only:
+            header_bits.append("enabled_only=true")
+        return {
+            "call_id": call_id,
+            "func_name": "list_skills",
+            "header": " ".join(header_bits),
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_list_skills,
+            "category": category,
+            "tag": tag,
+            "scan_status": scan_status,
+            "enabled_only": enabled_only,
+            "limit": limit,
+        }
+
+    def _exec_list_skills(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.list_skills(
+                category=item["category"],
+                tag=item["tag"],
+                scan_status=item["scan_status"],
+                enabled_only=item["enabled_only"],
+                limit=item["limit"],
+            )
+        except Exception as e:
+            msg = f"Error: list_skills failed: {e}"
+            self._report_tool_result(call_id, "list_skills", msg, is_error=True)
+            return call_id, msg
+        skills = result.get("skills", [])
+        truncated = bool(result.get("truncated"))
+        output = json.dumps(
+            {"skills": skills, "truncated": truncated},
+            separators=(",", ":"),
+            default=str,
+        )
+        summary = f"{len(skills)} skills"
+        if truncated:
+            summary += " (truncated — narrow filters or raise limit)"
+        self._report_tool_result(call_id, "list_skills", summary)
         return call_id, self._truncate_output(output)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:

@@ -427,3 +427,225 @@ def test_list_children_truncated_signals_db_page_full(populated_storage):
     # always fills the page so truncated must fire.
     result = client.list_children("coord-1", limit=1)
     assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+
+def _set_meta(storage, node_id, entries):
+    """Write node metadata the way production writers do — JSON-encoded values.
+
+    ``server.py``, ``admin.py``, and ``console/server.py`` all call
+    ``set_node_metadata[_bulk]`` with ``json.dumps(value)``.  Tests have
+    to use the same encoding so coordinator filter semantics are
+    validated against realistic data.
+    """
+    storage.set_node_metadata_bulk(
+        node_id,
+        [(k, json.dumps(v), src) for (k, v, src) in entries],
+    )
+
+
+@pytest.fixture
+def storage_with_nodes(tmp_path):
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-a",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 4, "auto"),
+            ("region", "us-east", "user"),
+        ],
+    )
+    _set_meta(
+        st,
+        "node-b",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 16, "auto"),
+            ("region", "us-west", "user"),
+            ("capability", "gpu", "user"),
+        ],
+    )
+    _set_meta(
+        st,
+        "node-c",
+        [("arch", "arm64", "auto"), ("cpu_count", 8, "auto")],
+    )
+    return st
+
+
+def test_list_nodes_no_filters_returns_all_rows_decoded(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes()
+    assert set(result.keys()) == {"nodes", "truncated"}
+    node_ids = {n["node_id"] for n in result["nodes"]}
+    assert node_ids == {"node-a", "node-b", "node-c"}
+    assert result["truncated"] is False
+    # Values round-trip through json.loads — model sees natural types,
+    # not the raw stored JSON text.
+    node_b = next(n for n in result["nodes"] if n["node_id"] == "node-b")
+    assert node_b["metadata"]["arch"] == {"value": "x86_64", "source": "auto"}
+    assert node_b["metadata"]["cpu_count"] == {"value": 16, "source": "auto"}
+    assert node_b["metadata"]["capability"] == {"value": "gpu", "source": "user"}
+
+
+def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
+    """Model passes ``{"capability": "gpu"}`` — client re-encodes to
+    ``'"gpu"'`` before filter_nodes_by_metadata so the stored text
+    matches.  Also asserts the filtered path fetches metadata only for
+    the paginated slice (bounded at page_size) rather than the whole
+    cluster — no wide ``get_all_node_metadata`` scan on a narrow filter.
+    """
+    per_node_calls: list[str] = []
+    real = storage_with_nodes.get_node_metadata
+
+    def _spy(nid):  # type: ignore[no-untyped-def]
+        per_node_calls.append(nid)
+        return real(nid)
+
+    all_meta_calls: list[int] = []
+    real_all = storage_with_nodes.get_all_node_metadata
+
+    def _spy_all():  # type: ignore[no-untyped-def]
+        all_meta_calls.append(1)
+        return real_all()
+
+    monkeypatch.setattr(storage_with_nodes, "get_node_metadata", _spy)
+    monkeypatch.setattr(storage_with_nodes, "get_all_node_metadata", _spy_all)
+
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"capability": "gpu"})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-b"}
+    # Filtered path: no wide scan; per-node lookups bounded to the
+    # matching page (1 row matched the filter).
+    assert all_meta_calls == []
+    assert per_node_calls == ["node-b"]
+
+
+def test_list_nodes_filter_accepts_int_and_encodes_correctly(storage_with_nodes):
+    """Model passes ``{"cpu_count": 4}`` — int encoded to ``"4"``; match."""
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"cpu_count": 4})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-a"}
+
+
+def test_list_nodes_int_and_string_filters_are_distinct(storage_with_nodes):
+    """The JSON schema for ``filters`` accepts primitives (string, integer,
+    number, boolean); stringified ints compare as strings, not as ints.
+    The tool description documents this as ``JSON-equal compare``.
+    """
+    client = _make_read_client(storage_with_nodes)
+    # Int filter against int-stored value matches.
+    assert {n["node_id"] for n in client.list_nodes(filters={"cpu_count": 4})["nodes"]} == {
+        "node-a"
+    }
+    # String filter against int-stored value is a distinct comparison and
+    # returns zero rows — ``"4"`` JSON-encodes to ``'"4"'`` but the stored
+    # row is ``'4'``.  Documented in the tool description.
+    assert client.list_nodes(filters={"cpu_count": "4"})["nodes"] == []
+
+
+def test_list_nodes_truncation_signal(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(limit=2)
+    assert len(result["nodes"]) == 2
+    assert result["truncated"] is True
+
+
+def test_list_nodes_empty_on_no_matching_filters(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"region": "nowhere"})
+    assert result["nodes"] == []
+    assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# list_skills
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def storage_with_skills(tmp_path):
+    st = SQLiteBackend(str(tmp_path / "skills.db"))
+    st.create_prompt_template(
+        template_id="s1",
+        name="alpha",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags='["gpu", "fast"]',
+    )
+    st.create_prompt_template(
+        template_id="s2",
+        name="beta",
+        category="engineering",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags='["slow"]',
+    )
+    st.create_prompt_template(
+        template_id="s3",
+        name="gamma",
+        category="engineering",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        enabled=False,
+    )
+    return st
+
+
+def test_list_skills_returns_shape(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills()
+    assert set(result.keys()) == {"skills", "truncated"}
+    names = {s["name"] for s in result["skills"]}
+    assert names == {"alpha", "beta", "gamma"}
+    # Tags decoded to a list, not a string.
+    alpha = next(s for s in result["skills"] if s["name"] == "alpha")
+    assert alpha["tags"] == ["gpu", "fast"]
+    # Discovery projection only — not full row.
+    assert "content" not in alpha
+
+
+def test_list_skills_pushes_filters_to_storage_no_per_row_lookups(storage_with_skills, monkeypatch):
+    called = []
+    real_get = storage_with_skills.get_prompt_template
+
+    def _spy(tid):  # type: ignore[no-untyped-def]
+        called.append(tid)
+        return real_get(tid)
+
+    monkeypatch.setattr(storage_with_skills, "get_prompt_template", _spy)
+
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(tag="gpu")
+    assert {s["name"] for s in result["skills"]} == {"alpha"}
+    assert called == []  # no N+1
+
+
+def test_list_skills_enabled_only(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(enabled_only=True)
+    names = {s["name"] for s in result["skills"]}
+    assert names == {"alpha", "beta"}  # gamma is disabled
+
+
+def test_list_skills_truncation_signal(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(limit=2)
+    assert len(result["skills"]) == 2
+    assert result["truncated"] is True

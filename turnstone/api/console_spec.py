@@ -21,6 +21,7 @@ from turnstone.api.console_schemas import (
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    CoordinatorOpenResponse,
     CreateChannelUserRequest,
     CreateMcpServerRequest,
     CreateModelDefinitionRequest,
@@ -1106,6 +1107,15 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         error_codes=[400, 503],
         tags=["Routing"],
     ),
+    # --- Coordinator workstream API ---
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/open",
+        "POST",
+        "Open (rehydrate) a coordinator workstream by ws_id",
+        response_model=CoordinatorOpenResponse,
+        error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
     # --- Observability ---
     EndpointSpec(
         "/health",
@@ -1142,6 +1152,7 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    CoordinatorOpenResponse,
     CreateScheduleRequest,
     UpdateScheduleRequest,
     ScheduleInfo,

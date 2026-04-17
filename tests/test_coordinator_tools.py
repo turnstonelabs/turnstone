@@ -124,6 +124,8 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         "close_workstream",
         "delete_workstream",
         "list_workstreams",
+        "list_nodes",
+        "list_skills",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []
@@ -408,6 +410,173 @@ def test_prepare_fails_cleanly_when_coord_client_missing(monkeypatch):
         ("close_workstream", {"ws_id": "x"}),
         ("delete_workstream", {"ws_id": "x"}),
         ("list_workstreams", {}),
+        ("list_nodes", {}),
+        ("list_skills", {}),
     ):
         item = sess._prepare_tool(_tc(tool, args))
         assert "error" in item, f"{tool} did not error on missing coord_client"
+
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+
+def test_list_nodes_prepare_is_auto_approved(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_nodes", {}))
+    assert item["needs_approval"] is False
+    assert item["filters"] == {}
+    assert item["limit"] == 100
+
+
+def test_list_nodes_prepare_accepts_filters(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("list_nodes", {"filters": {"arch": "x86_64", "capability": "gpu"}})
+    )
+    assert item["filters"] == {"arch": "x86_64", "capability": "gpu"}
+
+
+def test_list_nodes_prepare_drops_invalid_filter_types(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_nodes",
+            {"filters": {"arch": "x86_64", "bad": {"nested": "dict"}, "": "empty-key"}},
+        )
+    )
+    # Nested dict values + empty keys are filtered out; string + primitive kept.
+    assert item["filters"] == {"arch": "x86_64"}
+
+
+def test_list_nodes_prepare_clamps_limit(coord_session):
+    sess, _coord, _ui = coord_session
+    over = sess._prepare_tool(_tc("list_nodes", {"limit": 9999}))
+    assert over["limit"] == 500
+    # limit == 0 falls back to the default (100), not 1 — consistent with
+    # the other coordinator list tools' ``int(args.get("limit") or 100)``.
+    zero = sess._prepare_tool(_tc("list_nodes", {"limit": 0}))
+    assert zero["limit"] == 100
+    neg = sess._prepare_tool(_tc("list_nodes", {"limit": -5}))
+    assert neg["limit"] == 1  # negative values clamp to 1
+
+
+def test_list_nodes_exec_dispatches_to_client(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_nodes.return_value = {
+        "nodes": [{"node_id": "n1", "metadata": {"arch": {"value": "x86_64", "source": "auto"}}}],
+        "truncated": False,
+    }
+    item = sess._prepare_tool(_tc("list_nodes", {"filters": {"arch": "x86_64"}}))
+    call_id, output = sess._exec_list_nodes(item)
+    assert call_id == "call-1"
+    parsed = json.loads(output)
+    assert parsed["nodes"][0]["node_id"] == "n1"
+    assert parsed["truncated"] is False
+    coord.list_nodes.assert_called_once_with(filters={"arch": "x86_64"}, limit=100)
+
+
+def test_list_nodes_exec_surfaces_truncated_sentinel(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_nodes.return_value = {"nodes": [], "truncated": True}
+    item = sess._prepare_tool(_tc("list_nodes", {}))
+    _, _ = sess._exec_list_nodes(item)
+    # Summary reported to UI carries the "truncated" hint.
+    assert any("truncated" in r[2] for r in ui.tool_results)
+
+
+# ---------------------------------------------------------------------------
+# list_skills
+# ---------------------------------------------------------------------------
+
+
+def test_list_skills_prepare_is_auto_approved(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_skills", {}))
+    assert item["needs_approval"] is False
+    assert item["category"] is None
+    assert item["tag"] is None
+    assert item["scan_status"] is None
+    assert item["enabled_only"] is False
+    assert item["limit"] == 100
+
+
+def test_list_skills_prepare_accepts_filters(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_skills",
+            {"category": "ops", "tag": "gpu", "scan_status": "clean", "enabled_only": True},
+        )
+    )
+    assert item["category"] == "ops"
+    assert item["tag"] == "gpu"
+    assert item["scan_status"] == "clean"
+    assert item["enabled_only"] is True
+
+
+def test_list_skills_prepare_tolerates_non_string_filters(coord_session):
+    """A malformed model call with non-string filter values must NOT
+    raise AttributeError during ``.strip()`` — the prepare path should
+    coerce non-strings to ``None`` and proceed."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_skills",
+            {"category": 42, "tag": ["not", "a", "string"], "scan_status": {"bad": 1}},
+        )
+    )
+    assert "error" not in item
+    assert item["category"] is None
+    assert item["tag"] is None
+    assert item["scan_status"] is None
+
+
+def test_list_skills_prepare_parses_enabled_only_string_forms(coord_session):
+    """``bool("false")`` is True (non-empty string).  The prepare path
+    must interpret common string forms the way the model would expect."""
+    sess, _coord, _ui = coord_session
+    for raw, expected in (
+        ("true", True),
+        ("True", True),
+        ("1", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("", False),
+        (True, True),
+        (False, False),
+    ):
+        item = sess._prepare_tool(_tc("list_skills", {"enabled_only": raw}))
+        assert item.get("enabled_only") is expected, (
+            f"enabled_only={raw!r} → {item.get('enabled_only')!r}, expected {expected!r}"
+        )
+
+
+def test_list_skills_exec_dispatches_to_client(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_skills.return_value = {
+        "skills": [{"name": "alpha", "tags": ["gpu"]}],
+        "truncated": False,
+    }
+    item = sess._prepare_tool(_tc("list_skills", {"category": "ops", "tag": "gpu"}))
+    call_id, output = sess._exec_list_skills(item)
+    assert call_id == "call-1"
+    parsed = json.loads(output)
+    assert parsed["skills"][0]["name"] == "alpha"
+    coord.list_skills.assert_called_once_with(
+        category="ops",
+        tag="gpu",
+        scan_status=None,
+        enabled_only=False,
+        limit=100,
+    )
+
+
+def test_list_skills_exec_surfaces_truncated_sentinel(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_skills.return_value = {"skills": [], "truncated": True}
+    item = sess._prepare_tool(_tc("list_skills", {}))
+    _, _ = sess._exec_list_skills(item)
+    assert any("truncated" in r[2] for r in ui.tool_results)

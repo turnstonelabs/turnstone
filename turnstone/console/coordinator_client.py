@@ -23,6 +23,7 @@ JWTs carrying the real user's identity + scopes.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -337,6 +338,122 @@ class CoordinatorClient:
         # whether the DB has more pages.
         truncated = len(raw) >= limit
         return {"children": children, "truncated": truncated}
+
+    def list_nodes(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return ``{"nodes": [...], "truncated": bool}``.
+
+        Each row carries the node's full metadata dict — both auto-populated
+        keys (``arch``, ``cpu_count``, ``fqdn``, ``hostname``, ``os``,
+        ``os_release``, ``python``; always present, ``source="auto"``) and
+        operator-supplied user keys (deployment-specific, ``source="user"``).
+        ``filters`` matches all key=value pairs (AND semantics) and is
+        pushed into SQL via ``filter_nodes_by_metadata`` — no per-row
+        lookups.
+
+        Storage stores metadata values as JSON-encoded strings (the write
+        path in ``server.py`` / ``admin.py`` / ``console/server.py`` all
+        go through ``json.dumps``).  Filter values get re-encoded so the
+        stored-text comparison succeeds, and read values get decoded so
+        the model sees the natural Python form (``"x86_64"`` not
+        ``'"x86_64"'``, ``4`` not ``"4"``).
+        """
+        page_size = max(1, min(int(limit), 500))
+        if filters:
+            # Filtered case: narrow to the matching ids first, then pull
+            # metadata only for the ``page_size``-bounded slice.  Avoids
+            # the full-cluster ``get_all_node_metadata`` scan when the
+            # model is asking for a handful of nodes.  Per-node lookups
+            # are bounded at 500 by the limit clamp.
+            encoded_filters = {str(k): json.dumps(v) for k, v in filters.items()}
+            matching = self._storage.filter_nodes_by_metadata(encoded_filters)
+            node_ids = sorted(matching)
+            truncated = len(node_ids) > page_size
+            node_ids = node_ids[:page_size]
+            meta_rows_by_node: dict[str, list[dict[str, Any]]] = {
+                nid: self._storage.get_node_metadata(nid) for nid in node_ids
+            }
+        else:
+            # Unfiltered case: one wide query.  The caller is paging
+            # through the whole cluster and needs metadata for every
+            # node anyway — per-node lookups would be a true N+1.
+            all_meta = self._storage.get_all_node_metadata()
+            node_ids = sorted(all_meta.keys())
+            truncated = len(node_ids) > page_size
+            node_ids = node_ids[:page_size]
+            meta_rows_by_node = {nid: all_meta.get(nid, []) for nid in node_ids}
+        nodes: list[dict[str, Any]] = []
+        for nid in node_ids:
+            meta: dict[str, dict[str, Any]] = {}
+            for r in meta_rows_by_node.get(nid, []):
+                key = r.get("key")
+                if not key:
+                    continue
+                raw_value = r.get("value", "")
+                try:
+                    decoded = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+                except (TypeError, ValueError):
+                    decoded = raw_value
+                meta[str(key)] = {
+                    "value": decoded,
+                    "source": str(r.get("source", "")),
+                }
+            nodes.append({"node_id": nid, "metadata": meta})
+        return {"nodes": nodes, "truncated": truncated}
+
+    def list_skills(
+        self,
+        *,
+        category: str | None = None,
+        tag: str | None = None,
+        scan_status: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return ``{"skills": [...], "truncated": bool}``.
+
+        Filters pushed into SQL via ``list_skills_filtered`` — no per-row
+        lookups.  ``tag`` matches when the value appears in the
+        JSON-array ``tags`` column (quote-bracketed substring).
+        ``tags`` is decoded from JSON at the edge so the model sees a
+        list, not the escaped string.  Projection is intentionally narrow
+        — discovery metadata only, not full row.
+        """
+        page_size = max(1, min(int(limit), 500))
+        rows = self._storage.list_skills_filtered(
+            category=category,
+            tag=tag,
+            scan_status=scan_status,
+            enabled_only=enabled_only,
+            limit=page_size + 1,  # +1 to detect truncation
+        )
+        truncated = len(rows) > page_size
+        rows = rows[:page_size]
+        skills: list[dict[str, Any]] = []
+        for r in rows:
+            tags_raw = r.get("tags") or "[]"
+            try:
+                tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
+            except (TypeError, ValueError):
+                tags = []
+            skills.append(
+                {
+                    "name": r.get("name") or "",
+                    "category": r.get("category") or "",
+                    "tags": tags,
+                    "version": r.get("version") or "",
+                    "description": r.get("description") or "",
+                    "model": r.get("model") or "",
+                    "enabled": bool(r.get("enabled")),
+                    "scan_status": r.get("scan_status") or "",
+                    "activation": r.get("activation") or "",
+                }
+            )
+        return {"skills": skills, "truncated": truncated}
 
     def inspect(self, ws_id: str, *, message_limit: int = 20) -> dict[str, Any]:
         """Return persisted workstream state + tail-N messages + recent verdicts.

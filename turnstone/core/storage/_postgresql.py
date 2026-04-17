@@ -2423,6 +2423,41 @@ class PostgreSQLBackend:
                 _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
             ]
 
+    def list_skills_filtered(
+        self,
+        *,
+        category: str | None = None,
+        tag: str | None = None,
+        scan_status: str | None = None,
+        enabled_only: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            q = sa.select(prompt_templates).order_by(
+                prompt_templates.c.priority, prompt_templates.c.name
+            )
+            if category:
+                q = q.where(prompt_templates.c.category == category)
+            if scan_status:
+                q = q.where(prompt_templates.c.scan_status == scan_status)
+            if enabled_only:
+                q = q.where(prompt_templates.c.enabled == 1)
+            if tag:
+                # Quote-bracketed substring match against the JSON-array text:
+                # `["foo"]` matches `tag="foo"` but not `["foobar"]`.
+                # Escape ILIKE metacharacters (``%`` / ``_``) so a literal
+                # tag like ``a%b`` doesn't over-match.  ``ilike`` is
+                # case-insensitive natively on PostgreSQL — matches the
+                # SQLite backend's normalised behaviour.
+                pattern = f'%"{_escape_ilike(tag)}"%'
+                q = q.where(prompt_templates.c.tags.ilike(pattern, escape="\\"))
+            if limit > 0:
+                q = q.limit(limit)
+            rows = conn.execute(q).fetchall()
+            return [
+                _row_to_dict(r, "is_default", "readonly", "auto_approve", "enabled") for r in rows
+            ]
+
     def get_skill_by_name(self, name: str) -> dict[str, Any] | None:
         return self.get_prompt_template_by_name(name)
 
