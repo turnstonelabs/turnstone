@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import functools
 import html
 import json
@@ -174,19 +175,36 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
     so the upstream server records correct audit attribution and enforces
     scope narrowing.  Falls back to the ServiceTokenManager when no user
     context is available.
+
+    When the inbound request authenticated with a coordinator-minted JWT
+    (``auth_result.token_source == "coordinator"``), the re-mint
+    preserves that source AND the ``coord_ws_id`` custom claim so
+    upstream audit rows retain coordinator-origin visibility.  For all
+    other inbound sources the re-mint uses ``"console-proxy"`` as before.
     """
     auth_result = getattr(getattr(request, "state", None), "auth_result", None)
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
 
     if auth_result is not None and auth_result.user_id and jwt_secret:
+        # Preserve coordinator-origin source on re-mint — otherwise
+        # every upstream call from a coordinator session would be
+        # indistinguishable from a human-originated console proxy call.
+        is_coord = auth_result.token_source == "coordinator"
+        source = "coordinator" if is_coord else "console-proxy"
+        extra: dict[str, Any] = {}
+        if is_coord:
+            coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
+            if coord_ws_id:
+                extra["coord_ws_id"] = coord_ws_id
         token = create_jwt(
             user_id=auth_result.user_id,
             scopes=auth_result.scopes,
-            source="console-proxy",
+            source=source,
             secret=jwt_secret,
             audience=JWT_AUD_SERVER,
             permissions=auth_result.permissions,
             expiry_seconds=_PROXY_JWT_EXPIRY_SECONDS,
+            extra_claims=extra or None,
         )
         return {"Authorization": f"Bearer {token}"}
 
@@ -1090,6 +1108,96 @@ async def route_proxy(request: Request) -> Response:
     )
 
 
+async def route_workstream_delete(request: Request) -> Response:
+    """POST /v1/api/route/workstreams/delete — proxy to the upstream delete endpoint.
+
+    The upstream server exposes delete at ``POST /v1/api/workstreams/{ws_id}/delete``
+    (path parameter), so ``route_proxy``'s ``/api/route/... → /api/...``
+    rewrite doesn't apply.  This dedicated handler reads ``ws_id`` from the
+    request body, routes to the owning node, and forwards to the path-parameter
+    form.  Used by the coordinator's ``delete_workstream`` tool.
+    """
+    t0 = time.monotonic()
+    router: ConsoleRouter | None = request.app.state.router
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                "delete",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _record_route(
+            request,
+            "delete",
+            400,
+            t0,
+            JSONResponse({"error": "Invalid JSON body"}, status_code=400),
+        )
+
+    ws_id = body.get("ws_id", "")
+    if not ws_id:
+        return _record_route(
+            request,
+            "delete",
+            400,
+            t0,
+            JSONResponse({"error": "ws_id required"}, status_code=400),
+        )
+    try:
+        ref = router.route(ws_id)
+    except (NoAvailableNodeError, ValueError):
+        return _record_route(
+            request,
+            "delete",
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+    upstream_url = f"{ref.url}/v1/api/workstreams/{ws_id}/delete"
+    try:
+        resp = await client.post(upstream_url, json=body, headers=headers)
+    except httpx.HTTPError:
+        return _record_route(
+            request,
+            "delete",
+            502,
+            t0,
+            JSONResponse(
+                {"error": f"upstream node {ref.node_id} unreachable"},
+                status_code=502,
+            ),
+        )
+
+    return _record_route(
+        request,
+        "delete",
+        resp.status_code,
+        t0,
+        Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        ),
+    )
+
+
 async def route_lookup(request: Request) -> JSONResponse:
     """GET /v1/api/route — look up which node owns a workstream."""
     t0 = time.monotonic()
@@ -1376,6 +1484,495 @@ async def _proxy_sse(
 
 
 # ---------------------------------------------------------------------------
+# Coordinator workstream endpoints — POST /v1/api/coordinator/*
+# ---------------------------------------------------------------------------
+
+
+def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
+    """Resolve the coordinator manager or return a 503 with remediation.
+
+    Returns ``(coord_mgr, None)`` on success, ``(None, JSONResponse)``
+    when the coordinator subsystem isn't configured.
+    """
+    coord_mgr = getattr(request.app.state, "coord_mgr", None)
+    config_store = getattr(request.app.state, "config_store", None)
+    if coord_mgr is None:
+        registry_err = getattr(request.app.state, "coord_registry_error", "") or ""
+        msg = "Coordinator subsystem not initialized. " + (
+            registry_err or "Check coordinator.model_alias and Models tab configuration."
+        )
+        return None, JSONResponse({"error": msg}, status_code=503)
+    if config_store is None:
+        return None, JSONResponse({"error": "ConfigStore unavailable"}, status_code=503)
+    alias = (config_store.get("coordinator.model_alias") or "").strip()
+    if not alias:
+        return None, JSONResponse(
+            {
+                "error": (
+                    "coordinator.model_alias is not configured. Set it in "
+                    "the admin Settings tab (coordinator section) before "
+                    "creating coordinator sessions."
+                )
+            },
+            status_code=503,
+        )
+    # Registry must be present for alias resolution.  Defensive — when
+    # coord_mgr is built the lifespan also sets coord_registry, so this
+    # branch catches partial-init states rather than intentional misuse.
+    registry = getattr(request.app.state, "coord_registry", None)
+    if registry is None:
+        return None, JSONResponse(
+            {
+                "error": (
+                    "ModelRegistry unavailable for coordinator sessions. "
+                    "Restart the console after adding a model definition."
+                )
+            },
+            status_code=503,
+        )
+    try:
+        registry.resolve(alias)
+    except Exception as exc:
+        return None, JSONResponse(
+            {
+                "error": (
+                    f"coordinator.model_alias '{alias}' does not resolve: "
+                    f"{exc}. Fix the alias in the admin Settings tab."
+                )
+            },
+            status_code=503,
+        )
+    return coord_mgr, None
+
+
+def _require_admin_coordinator(request: Request) -> JSONResponse | None:
+    """Gate a coordinator endpoint on the ``admin.coordinator`` permission."""
+    from turnstone.core.auth import require_permission
+
+    return require_permission(request, "admin.coordinator")
+
+
+def _auth_user_id(request: Request) -> str:
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    return getattr(auth, "user_id", "") or ""
+
+
+def _is_admin(request: Request) -> bool:
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    perms: frozenset[str] = getattr(auth, "permissions", frozenset())
+    return "admin.users" in perms or "admin.roles" in perms
+
+
+async def coordinator_create(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/new — create a new coordinator session."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    user_id = _auth_user_id(request)
+    if not user_id:
+        return JSONResponse({"error": "authentication required"}, status_code=401)
+    name = (body.get("name") or "").strip()
+    skill = (body.get("skill") or "").strip() or None
+    initial_message = (body.get("initial_message") or "").strip()
+    try:
+        ws = coord_mgr.create(
+            user_id=user_id,
+            name=name,
+            skill=skill,
+            initial_message=initial_message,
+        )
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=429)
+    except ValueError as exc:
+        # Session factory raises ValueError on misconfigured alias —
+        # surface as 503 with the factory's remediation text.
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception:
+        # Don't echo the exception text to the caller — it can leak
+        # internals (stack frame names, file paths, etc.).  Log with a
+        # short correlation id and return that to the client so support
+        # can match a user report to the log line.
+        correlation_id = secrets.token_hex(4)
+        log.warning(
+            "coordinator_create.failed correlation_id=%s",
+            correlation_id,
+            exc_info=True,
+        )
+        return JSONResponse(
+            {
+                "error": (
+                    "failed to create coordinator (internal error). "
+                    f"correlation_id={correlation_id}"
+                )
+            },
+            status_code=500,
+        )
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is not None:
+        try:
+            record_audit(
+                storage,
+                user_id,
+                "coordinator.create",
+                "workstream",
+                ws.id,
+                {"coord_ws_id": ws.id, "src": "coordinator", "name": ws.name},
+                request.client.host if request.client else "",
+            )
+        except Exception:
+            log.debug("coordinator_create.audit_failed", exc_info=True)
+    return JSONResponse({"ws_id": ws.id, "name": ws.name}, status_code=201)
+
+
+async def coordinator_send(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/send — queue a user message."""
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    message = (body.get("message") or "").strip()
+    if not message:
+        return JSONResponse({"error": "message is required"}, status_code=400)
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality (not short-circuit on empty ws.user_id) —
+        # empty-owner rows would otherwise leak ws_id/state/history
+        # across tenants to anyone with admin.coordinator.  404 (not
+        # 403) to avoid leaking existence.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if not coord_mgr.send(ws_id, message):
+        return JSONResponse({"error": "send failed"}, status_code=500)
+    return JSONResponse({"status": "ok"})
+
+
+async def coordinator_approve(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/approve — unblock pending approval."""
+    from turnstone.core.web_helpers import read_json_or_400
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    approved = bool(body.get("approved", False))
+    feedback = body.get("feedback")
+    always = bool(body.get("always", False))
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    ui = ws.ui
+    if ui is None or not hasattr(ui, "resolve_approval"):
+        return JSONResponse(
+            {"error": "coordinator UI does not support approval"},
+            status_code=409,
+        )
+    if always and approved and getattr(ui, "_pending_approval", None):
+        tool_names = {
+            it.get("approval_label", "") or it.get("func_name", "")
+            for it in ui._pending_approval.get("items", [])
+            if it.get("needs_approval") and it.get("func_name") and not it.get("error")
+        }
+        tool_names.discard("")
+        ui.auto_approve_tools.update(tool_names)
+    ui.resolve_approval(approved, feedback)
+    return JSONResponse({"status": "ok"})
+
+
+async def coordinator_cancel(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/cancel — cancel in-flight generation."""
+    from turnstone.core.audit import record_audit
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    coord_mgr.cancel(ws_id)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is not None:
+        try:
+            record_audit(
+                storage,
+                user_id,
+                "coordinator.cancel",
+                "workstream",
+                ws_id,
+                {"coord_ws_id": ws_id, "src": "coordinator"},
+                request.client.host if request.client else "",
+            )
+        except Exception:
+            log.debug("coordinator_cancel.audit_failed", exc_info=True)
+    return JSONResponse({"status": "ok"})
+
+
+async def coordinator_close(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/close — unload the session."""
+    from turnstone.core.audit import record_audit
+
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if not coord_mgr.close(ws_id):
+        return JSONResponse({"error": "close failed"}, status_code=500)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is not None:
+        try:
+            record_audit(
+                storage,
+                user_id,
+                "coordinator.close",
+                "workstream",
+                ws_id,
+                {"coord_ws_id": ws_id, "src": "coordinator"},
+                request.client.host if request.client else "",
+            )
+        except Exception:
+            log.debug("coordinator_close.audit_failed", exc_info=True)
+    return JSONResponse({"status": "ok"})
+
+
+async def coordinator_events(request: Request) -> Response:
+    """GET /v1/api/coordinator/{ws_id}/events — SSE event stream."""
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    ui = ws.ui
+    if ui is None or not hasattr(ui, "_register_listener"):
+        return JSONResponse({"error": "coordinator has no UI"}, status_code=409)
+
+    client_queue = ui._register_listener()
+    # Replay any pending approval so a reconnecting tab sees the prompt.
+    pending = getattr(ui, "_pending_approval", None)
+    if pending is not None:
+        with contextlib.suppress(queue.Full):
+            client_queue.put_nowait(pending)
+    pending_plan = getattr(ui, "_pending_plan_review", None)
+    if pending_plan is not None:
+        with contextlib.suppress(queue.Full):
+            client_queue.put_nowait(pending_plan)
+
+    async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.to_thread(client_queue.get, True, 1.0)
+                    yield {"data": json.dumps(event)}
+                except queue.Empty:
+                    pass  # ping keeps the connection alive
+        finally:
+            ui._unregister_listener(client_queue)
+
+    return EventSourceResponse(event_generator(), ping=5)
+
+
+async def coordinator_history(request: Request) -> JSONResponse:
+    """GET /v1/api/coordinator/{ws_id}/history — message history for page load."""
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    storage = getattr(request.app.state, "auth_storage", None)
+    if ws is None:
+        # Fall through to storage — maybe the user needs to lazy-rehydrate.
+        if storage is None:
+            return JSONResponse({"error": "coordinator not found"}, status_code=404)
+        row = storage.get_workstream(ws_id)
+        if row is None or row.get("kind") != "coordinator":
+            return JSONResponse({"error": "coordinator not found"}, status_code=404)
+        if row.get("user_id") and row.get("user_id") != user_id and not _is_admin(request):
+            return JSONResponse({"error": "coordinator not found"}, status_code=404)
+        messages = storage.load_messages(ws_id)
+        return JSONResponse({"ws_id": ws_id, "messages": messages})
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    messages = []
+    if storage is not None:
+        try:
+            messages = storage.load_messages(ws_id)
+        except Exception:
+            log.debug("coordinator_history.load_failed ws=%s", ws_id[:8], exc_info=True)
+    return JSONResponse({"ws_id": ws_id, "messages": messages})
+
+
+async def coordinator_list(request: Request) -> JSONResponse:
+    """GET /v1/api/coordinator — list active coordinator sessions for the caller."""
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    user_id = _auth_user_id(request)
+    rows = coord_mgr.list_all() if _is_admin(request) else coord_mgr.list_for_user(user_id)
+    return JSONResponse(
+        {
+            "coordinators": [
+                {
+                    "ws_id": r.id,
+                    "name": r.name,
+                    "state": r.state.value,
+                    "user_id": r.user_id,
+                }
+                for r in rows
+            ]
+        }
+    )
+
+
+_VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+
+
+async def coordinator_page(request: Request) -> Response:
+    """GET /coordinator/{ws_id} — serve the one-pane coordinator HTML.
+
+    The handler injects ``data-ws-id`` on the <html> tag so
+    ``coordinator.js`` can read it without a separate API round-trip.
+    Auth gating happens on the API endpoints the page calls — this
+    handler simply serves the static template (same model as /static).
+    """
+    ws_id = request.path_params.get("ws_id", "")
+    if not _VALID_WS_ID_RE.match(ws_id):
+        return JSONResponse({"error": "invalid ws_id"}, status_code=400)
+    template_path = _STATIC_DIR / "coordinator" / "index.html"
+    if not template_path.is_file():
+        return JSONResponse({"error": "coordinator UI template missing"}, status_code=500)
+    try:
+        body = template_path.read_text(encoding="utf-8")
+    except OSError:
+        return JSONResponse({"error": "failed to read coordinator UI template"}, status_code=500)
+    # Inject the ws_id as an HTML attribute.  ws_id passed the
+    # ``_VALID_WS_ID_RE`` gate above (hex only) so there's nothing
+    # to HTML-escape; leave the replacement simple.
+    body = body.replace("{{WS_ID}}", ws_id)
+    return Response(body, media_type="text/html; charset=utf-8")
+
+
+async def coordinator_detail(request: Request) -> JSONResponse:
+    """GET /v1/api/coordinator/{ws_id} — detail + lazy rehydrate on miss."""
+    err = _require_admin_coordinator(request)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    ws_id = request.path_params.get("ws_id", "")
+    user_id = _auth_user_id(request)
+    ws = coord_mgr.get(ws_id)
+    if ws is None:
+        # Lazy rehydration goes through the session factory, which can
+        # raise the same exceptions coordinator_create handles — match
+        # the correlation-id mask so stack traces don't leak through
+        # the detail endpoint either.
+        try:
+            ws = (
+                coord_mgr.open_admin(ws_id)
+                if _is_admin(request)
+                else coord_mgr.open(ws_id, user_id)
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=503)
+        except Exception:
+            correlation_id = secrets.token_hex(4)
+            log.warning(
+                "coordinator_detail.rehydrate_failed correlation_id=%s ws_id=%s",
+                correlation_id,
+                ws_id[:8],
+                exc_info=True,
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "failed to rehydrate coordinator (internal error). "
+                        f"correlation_id={correlation_id}"
+                    )
+                },
+                status_code=500,
+            )
+        if ws is None:
+            return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    if ws.user_id != user_id and not _is_admin(request):
+        # Strict equality — empty-owner rows must not leak across tenants.
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    return JSONResponse(
+        {
+            "ws_id": ws.id,
+            "name": ws.name,
+            "state": ws.state.value,
+            "user_id": ws.user_id,
+            "kind": ws.kind,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -1545,6 +2142,85 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 log.info("tls.proxy_clients.upgraded")
         except Exception:
             log.warning("TLS initialization failed — continuing without TLS", exc_info=True)
+
+    # Coordinator workstream plumbing.  Lazy — failure here is non-fatal;
+    # the coordinator endpoints return 503 with a remediation message
+    # when coord_mgr is None, so the rest of the console still works.
+    app.state.coord_mgr = None
+    app.state.coord_registry = None
+    app.state.coord_registry_error = ""
+    if storage and config_store:
+        try:
+            from turnstone.core.model_registry import load_model_registry
+
+            try:
+                coord_registry = load_model_registry(storage=storage)
+                app.state.coord_registry = coord_registry
+            except ValueError as exc:
+                # No model rows configured.  Endpoint returns 503 with
+                # the error text so admin sees remediation in the UI.
+                app.state.coord_registry_error = str(exc)
+                coord_registry = None
+
+            if coord_registry is not None:
+                from turnstone.console.coordinator import CoordinatorManager
+                from turnstone.console.coordinator_client import (
+                    CoordinatorClient,
+                    CoordinatorTokenManager,
+                )
+                from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
+                from turnstone.console.session_factory import (
+                    build_console_session_factory,
+                )
+
+                jwt_secret: str = getattr(app.state, "jwt_secret", "")
+                console_bind_url: str = getattr(app.state, "console_url", "") or (
+                    "http://127.0.0.1:8001"
+                )
+
+                def _ui_factory(ws_id: str, user_id: str) -> ConsoleCoordinatorUI:
+                    return ConsoleCoordinatorUI(ws_id=ws_id, user_id=user_id)
+
+                def _coord_client_factory(ws_id: str, user_id: str) -> CoordinatorClient:
+                    ttl = int(config_store.get("coordinator.session_jwt_ttl_seconds"))
+                    tm = CoordinatorTokenManager(
+                        user_id=user_id or "system",
+                        scopes=frozenset({"read", "write", "approve"}),
+                        permissions=frozenset({"admin.coordinator"}),
+                        secret=jwt_secret,
+                        coord_ws_id=ws_id,
+                        ttl_seconds=ttl,
+                    )
+
+                    def _token_factory() -> str:
+                        return tm.token
+
+                    return CoordinatorClient(
+                        console_base_url=console_bind_url,
+                        storage=storage,
+                        token_factory=_token_factory,
+                        coord_ws_id=ws_id,
+                        user_id=user_id,
+                    )
+
+                coord_factory = build_console_session_factory(
+                    registry=coord_registry,
+                    config_store=config_store,
+                    node_id="console",
+                    coord_client_factory=_coord_client_factory,
+                )
+                app.state.coord_mgr = CoordinatorManager(
+                    session_factory=coord_factory,
+                    ui_factory=_ui_factory,
+                    storage=storage,
+                    max_active=int(config_store.get("coordinator.max_active")),
+                )
+                log.info(
+                    "console.coordinator_mgr_ready max_active=%s",
+                    config_store.get("coordinator.max_active"),
+                )
+        except Exception:
+            log.warning("console.coordinator_init_failed", exc_info=True)
 
     yield
     # Shutdown
@@ -2491,6 +3167,10 @@ _VALID_PERMISSIONS = frozenset(
         "admin.settings",
         "admin.mcp",
         "admin.models",
+        # Coordinator workstream kind — granted per-user, NOT part of any
+        # builtin role.  Operators opt in to let specific users run
+        # console-hosted coordinator sessions.
+        "admin.coordinator",
         "tools.approve",
         "workstreams.create",
         "workstreams.close",
@@ -7643,6 +8323,13 @@ def create_app(
                     Route("/api/route/command", route_proxy, methods=["POST"]),
                     Route("/api/route/plan", route_proxy, methods=["POST"]),
                     Route("/api/route/workstreams/close", route_proxy, methods=["POST"]),
+                    # Coordinator-only hard delete — forwards to the server's
+                    # path-parameter form at /v1/api/workstreams/{ws_id}/delete.
+                    Route(
+                        "/api/route/workstreams/delete",
+                        route_workstream_delete,
+                        methods=["POST"],
+                    ),
                     Route(
                         "/api/route/workstreams/{ws_id}/attachments",
                         route_attachment_proxy,
@@ -7659,6 +8346,49 @@ def create_app(
                         methods=["GET"],
                     ),
                     Route("/api/route", route_lookup, methods=["GET"]),
+                    # Coordinator workstream API — console-hosted sessions.
+                    # All require admin.coordinator permission.
+                    Route(
+                        "/api/coordinator/new",
+                        coordinator_create,
+                        methods=["POST"],
+                    ),
+                    Route("/api/coordinator", coordinator_list, methods=["GET"]),
+                    Route(
+                        "/api/coordinator/{ws_id}/send",
+                        coordinator_send,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/approve",
+                        coordinator_approve,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/cancel",
+                        coordinator_cancel,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/close",
+                        coordinator_close,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/events",
+                        coordinator_events,
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/history",
+                        coordinator_history,
+                        methods=["GET"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}",
+                        coordinator_detail,
+                        methods=["GET"],
+                    ),
                     Route("/api/models", list_available_models),
                     Route("/api/skills", list_skills_summary),
                     Route("/api/auth/login", auth_login, methods=["POST"]),
@@ -8031,6 +8761,10 @@ def create_app(
             Route("/docs", _docs_handler),
             Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
             Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
+            # Coordinator one-pane UI — the route serves a single
+            # index.html template with the ws_id injected via data-ws-id
+            # so coordinator.js can pull it without an extra round-trip.
+            Route("/coordinator/{ws_id}", coordinator_page),
             # Proxy routes — serve server UI through console port
             Route("/node/{node_id}/", proxy_index),
             Route("/node/{node_id}/static/{path:path}", proxy_static),

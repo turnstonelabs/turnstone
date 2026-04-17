@@ -54,6 +54,13 @@ workstreams = sa.Table(
     sa.Column("state", sa.Text, nullable=False, server_default="idle"),
     sa.Column("skill_id", sa.Text, nullable=False, server_default=""),
     sa.Column("skill_version", sa.Integer, nullable=False, server_default="0"),
+    # kind: "interactive" (default) | "coordinator" | future kinds.
+    # Added in migration 039.  Coordinator entries live only on the console.
+    sa.Column("kind", sa.Text, nullable=False, server_default="interactive"),
+    # parent_ws_id: non-NULL for children spawned by a coordinator.  NULL for
+    # top-level workstreams (including the coordinators themselves).  See
+    # migration 039.
+    sa.Column("parent_ws_id", sa.Text, nullable=True),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),
 )
@@ -62,6 +69,8 @@ sa.Index("idx_workstreams_node_id", workstreams.c.node_id)
 sa.Index("idx_workstreams_state", workstreams.c.state)
 sa.Index("idx_workstreams_user_id", workstreams.c.user_id)
 sa.Index("idx_workstreams_alias", workstreams.c.alias)
+sa.Index("idx_workstreams_kind", workstreams.c.kind)
+sa.Index("idx_workstreams_parent", workstreams.c.parent_ws_id)
 
 workstream_config = sa.Table(
     "workstream_config",

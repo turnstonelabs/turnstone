@@ -1,0 +1,16 @@
+{
+  "name": "delete_workstream",
+  "description": "Hard-delete a child workstream — removes the row AND cascades its conversation history, config, and attachments. Use for throwaway exploratory workstreams you no longer need. Irreversible. Prefer close_workstream when you might want to revisit later.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "ws_id": {
+        "type": "string",
+        "description": "Workstream id to hard-delete."
+      }
+    },
+    "required": ["ws_id"]
+  },
+  "coordinator": true,
+  "primary_key": "ws_id"
+}

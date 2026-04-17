@@ -1467,6 +1467,7 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
 #github-import-overlay,
 #model-create-overlay,
+#new-coord-overlay,
 #create-hr-overlay, #edit-hr-overlay, #create-ogp-overlay, #edit-ogp-overlay {
   position: fixed;
   inset: 0;

@@ -220,6 +220,16 @@ class StorageBackend(Protocol):
         """Return workstream metadata dict or None if not found."""
         ...
 
+    def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
+        """Return the full ``workstreams`` row as a dict, or ``None``.
+
+        Richer than :meth:`get_workstream_metadata` — includes ``state``,
+        ``user_id``, ``kind``, ``parent_ws_id``, and timestamps.  Used by
+        coordinator ``inspect_workstream`` and any caller that needs the
+        authoritative row.
+        """
+        ...
+
     def get_workstream_owner(self, ws_id: str) -> str | None:
         """Return the workstream's owner ``user_id``.
 
@@ -321,8 +331,15 @@ class StorageBackend(Protocol):
         title: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
     ) -> None:
-        """Create a workstreams row (no-op if already exists)."""
+        """Create a workstreams row (no-op if already exists).
+
+        ``kind`` is ``"interactive"`` (default) or ``"coordinator"``.
+        ``parent_ws_id`` is non-NULL for children spawned by a coordinator;
+        the storage edge normalizes the empty string to ``None``.
+        """
         ...
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
@@ -337,8 +354,26 @@ class StorageBackend(Protocol):
         """Delete a workstream and all its conversations + config."""
         ...
 
-    def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
-        """List workstreams, optionally filtered by node_id."""
+    def list_workstreams(
+        self,
+        node_id: str | None = None,
+        limit: int = 100,
+        *,
+        parent_ws_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Any]:
+        """List workstreams, optionally filtered.
+
+        Filters are additive.  When ``parent_ws_id`` / ``kind`` are ``None``
+        (default) they are not applied — behavior is identical to the
+        pre-1.5 two-arg call shape.
+
+        Returns a list of SQLAlchemy ``Row`` objects.  **Prefer dict access
+        via ``row._mapping[<col>]``**; positional indexing is brittle against
+        future SELECT reorders.  The current column order is ``ws_id,
+        node_id, name, state, created, updated, kind, parent_ws_id`` but
+        new code should not rely on that.
+        """
         ...
 
     # -- Conversation search ---------------------------------------------------

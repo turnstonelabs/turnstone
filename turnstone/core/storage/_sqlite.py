@@ -553,6 +553,44 @@ class SQLiteBackend:
                 }
             return None
 
+    def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
+        """Return the full workstreams row as a dict, or None if missing."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.node_id,
+                    workstreams.c.user_id,
+                    workstreams.c.alias,
+                    workstreams.c.title,
+                    workstreams.c.name,
+                    workstreams.c.state,
+                    workstreams.c.skill_id,
+                    workstreams.c.skill_version,
+                    workstreams.c.kind,
+                    workstreams.c.parent_ws_id,
+                    workstreams.c.created,
+                    workstreams.c.updated,
+                ).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ws_id": row[0],
+            "node_id": row[1],
+            "user_id": row[2],
+            "alias": row[3],
+            "title": row[4],
+            "name": row[5],
+            "state": row[6],
+            "skill_id": row[7],
+            "skill_version": row[8],
+            "kind": row[9],
+            "parent_ws_id": row[10],
+            "created": row[11],
+            "updated": row[12],
+        }
+
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -573,8 +611,13 @@ class SQLiteBackend:
         title: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # Normalize empty-string parent to NULL so WHERE parent_ws_id IS NULL
+        # filters remain correct.
+        norm_parent = parent_ws_id if parent_ws_id else None
         with self._conn() as conn:
             conn.execute(
                 sa.insert(workstreams).prefix_with("OR IGNORE"),
@@ -588,6 +631,8 @@ class SQLiteBackend:
                     "state": state,
                     "skill_id": skill_id,
                     "skill_version": skill_version,
+                    "kind": kind,
+                    "parent_ws_id": norm_parent,
                     "created": now,
                     "updated": now,
                 },
@@ -869,7 +914,14 @@ class SQLiteBackend:
             grouped.setdefault(mid, []).append(row)
         return grouped
 
-    def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
+    def list_workstreams(
+        self,
+        node_id: str | None = None,
+        limit: int = 100,
+        *,
+        parent_ws_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Any]:
         with self._conn() as conn:
             q = (
                 sa.select(
@@ -879,12 +931,18 @@ class SQLiteBackend:
                     workstreams.c.state,
                     workstreams.c.created,
                     workstreams.c.updated,
+                    workstreams.c.kind,
+                    workstreams.c.parent_ws_id,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)
             )
             if node_id is not None:
                 q = q.where(workstreams.c.node_id == node_id)
+            if parent_ws_id is not None:
+                q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
+            if kind is not None:
+                q = q.where(workstreams.c.kind == kind)
             return list(conn.execute(q).fetchall())
 
     # -- Conversation search ---------------------------------------------------

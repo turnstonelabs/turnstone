@@ -1,0 +1,27 @@
+{
+  "name": "list_workstreams",
+  "description": "List child workstreams. Auto-approved — safe, read-only. By default returns your own children (workstreams you spawned). Explicitly pass parent_ws_id to list another parent's children. Coordinator-kind workstreams are excluded from the results.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "parent_ws_id": {
+        "type": "string",
+        "description": "Parent workstream id. Omit to list the caller coordinator's own children; pass a value to list that parent's children."
+      },
+      "state": {
+        "type": "string",
+        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed'. Matched exactly."
+      },
+      "skill": {
+        "type": "string",
+        "description": "Optional skill_id filter (template id, NOT skill name). Workstreams inherit skill_id at creation time."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max rows to return. Default 100."
+      }
+    }
+  },
+  "coordinator": true,
+  "auto_approve": true
+}

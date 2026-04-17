@@ -29,6 +29,8 @@ if TYPE_CHECKING:
             *,
             skill: str | None = ...,
             client_type: str = ...,
+            kind: str = ...,
+            parent_ws_id: str | None = ...,
         ) -> ChatSession: ...
 
 
@@ -64,6 +66,14 @@ class Workstream:
     error_message: str = ""
     last_active: float = field(default_factory=time.monotonic, repr=False)
     notify_targets: str = "[]"
+    # Owning user_id.  Populated by the console's CoordinatorManager so
+    # attribution survives across restarts / lazy rehydration.
+    user_id: str = ""
+    # "interactive" (default) or "coordinator".  Reused by both
+    # WorkstreamManager and CoordinatorManager — no parallel type hierarchy.
+    kind: str = "interactive"
+    # Non-None for children spawned by a coordinator.
+    parent_ws_id: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
@@ -140,6 +150,9 @@ class WorkstreamManager:
         ws_id: str = "",
         client_type: str = "",
         judge_model: str | None = None,
+        user_id: str = "",
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
     ) -> Workstream:
         """Create a new workstream.  Returns the new ws.
 
@@ -155,7 +168,21 @@ class WorkstreamManager:
             skill_version: Version of the skill at creation time.
             ws_id: Optional workstream ID.  If non-empty, used as-is instead of
                 generating a new UUID.
+            user_id: Owning user id, persisted on the dataclass + storage row.
+            kind: Workstream kind — must be ``"interactive"``.  Coordinator
+                workstreams live on the console process and are created
+                via ``CoordinatorManager``; routing one through
+                ``WorkstreamManager`` silently builds a coordinator-kind
+                session with ``coord_client=None``, so this guard refuses
+                at the boundary rather than failing deep inside tool
+                execution.
+            parent_ws_id: Optional parent workstream id (coordinator children).
         """
+        if kind != "interactive":
+            raise ValueError(
+                f"WorkstreamManager only hosts interactive workstreams; refusing kind={kind!r}",
+            )
+
         # Fast-fail capacity check (avoids expensive ChatSession creation when full).
         first_evicted: Workstream | None = None
         with self._lock:
@@ -179,9 +206,16 @@ class WorkstreamManager:
         # Create workstream and ChatSession outside the lock (construction is
         # expensive — involves LLM client setup and DB writes).
         ws = Workstream(id=ws_id, name=name) if ws_id else Workstream(name=name)
+        ws.user_id = user_id
+        ws.kind = kind
+        ws.parent_ws_id = parent_ws_id if parent_ws_id else None
         if ui_factory:
             ws.ui = ui_factory(ws.id)
-        factory_kwargs: dict[str, Any] = {"skill": skill}
+        factory_kwargs: dict[str, Any] = {
+            "skill": skill,
+            "kind": kind,
+            "parent_ws_id": ws.parent_ws_id,
+        }
         if client_type:
             factory_kwargs["client_type"] = client_type
         if judge_model:
@@ -210,6 +244,9 @@ class WorkstreamManager:
             name=ws.name,
             skill_id=skill_id,
             skill_version=skill_version,
+            user_id=user_id or None,
+            kind=kind,
+            parent_ws_id=ws.parent_ws_id,
         )
         increment_bucket_count(ws.id)
 

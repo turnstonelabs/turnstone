@@ -682,6 +682,57 @@ def _build_registry() -> dict[str, SettingDef]:
             "roughly twice as many bucket assignments (and therefore workstreams) as a "
             "node with weight 1.",
         ),
+        # -- coordinator --------------------------------------------------------
+        SettingDef(
+            "coordinator.model_alias",
+            "str",
+            "",
+            "Model alias used for coordinator workstreams",
+            "coordinator",
+            help="Which model alias the console-hosted coordinator sessions run on. "
+            "Must match an entry in the Models tab. Coordinator sessions create and "
+            "drive child workstreams on your server nodes; point this at a capable "
+            "model so the orchestration reasoning is solid. When empty, "
+            "POST /v1/api/coordinator/new returns 503 with a remediation message.",
+        ),
+        SettingDef(
+            "coordinator.reasoning_effort",
+            "str",
+            "medium",
+            "Reasoning effort for coordinator sessions",
+            "coordinator",
+            choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            help="Reasoning effort for coordinator sessions. Coordinators benefit from "
+            "medium-or-higher effort when juggling multiple child workstreams. Use "
+            "'low' only when your coordinator handles simple, one-off dispatch "
+            "workflows.",
+        ),
+        SettingDef(
+            "coordinator.max_active",
+            "int",
+            5,
+            "Maximum concurrent coordinator sessions",
+            "coordinator",
+            min_value=1,
+            max_value=100,
+            help="Cap on how many coordinator workstreams can run at once on this "
+            "console. When the limit is reached, POST /v1/api/coordinator/new either "
+            "evicts the oldest idle coordinator (matching WorkstreamManager.close_idle "
+            "semantics) or returns 429 if every slot is non-idle.",
+        ),
+        SettingDef(
+            "coordinator.session_jwt_ttl_seconds",
+            "int",
+            300,
+            "TTL (seconds) of the per-session coordinator JWT",
+            "coordinator",
+            min_value=30,
+            max_value=3600,
+            help="Lifetime of the JWT the console mints for each coordinator session's "
+            "outbound tool calls. The token is refreshed lazily before expiry. Keep "
+            "this short (5 minutes default) to limit blast radius if the process "
+            "is compromised; longer values reduce JWT re-mint frequency at minor risk.",
+        ),
     ]
     return {d.key: d for d in defs}
 

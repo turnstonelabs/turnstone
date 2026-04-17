@@ -16,6 +16,7 @@
   <span id="cluster-summary" aria-live="polite"></span>
   <span id="status-bar" role="status" aria-live="polite"></span>
   <button id="new-ws-btn" class="header-btn header-btn-accent" onclick="showNewWsModal()" title="Create workstream">+ new</button>
+  <button id="new-coord-btn" class="header-btn" style="display:none" onclick="showNewCoordModal()" title="Create coordinator workstream (requires admin.coordinator)">+ coordinator</button>
   <button id="admin-btn" class="header-btn" onclick="showAdmin()" title="User &amp; token administration" aria-expanded="false" aria-controls="view-admin">admin</button>
   <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
@@ -815,6 +816,26 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- New coordinator modal — gated by admin.coordinator permission -->
+<div id="new-coord-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-coord-title">
+  <div id="new-coord-box" class="admin-modal">
+    <h2 id="new-coord-title">New Coordinator</h2>
+    <div id="new-coord-error" role="alert" aria-live="assertive"></div>
+    <label for="new-coord-task">Initial task <span class="label-hint">optional &mdash; dispatched as the first message</span></label>
+    <textarea id="new-coord-task" rows="4" placeholder="What should this coordinator orchestrate?"></textarea>
+    <label for="new-coord-name">Name <span class="label-hint">optional</span></label>
+    <input id="new-coord-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
+    <label for="new-coord-skill">Skill <span class="label-hint">optional</span></label>
+    <select id="new-coord-skill">
+      <option value="">Use defaults</option>
+    </select>
+    <div id="new-coord-buttons">
+      <button id="new-coord-cancel" onclick="hideNewCoordModal()">Cancel</button>
+      <button id="new-coord-submit" onclick="submitNewCoord()">Create</button>
     </div>
   </div>
 </div>

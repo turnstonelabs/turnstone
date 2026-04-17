@@ -1,0 +1,20 @@
+{
+  "name": "close_workstream",
+  "description": "Soft-close a child workstream — preserves the conversation in the database but removes it from the active pool so it no longer consumes a slot. Use when a sub-task is done. Opposite of delete_workstream (which is hard).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "ws_id": {
+        "type": "string",
+        "description": "Workstream id to soft-close."
+      },
+      "reason": {
+        "type": "string",
+        "description": "Optional human-readable reason for closing. Recorded in the message stream for audit."
+      }
+    },
+    "required": ["ws_id"]
+  },
+  "coordinator": true,
+  "primary_key": "ws_id"
+}

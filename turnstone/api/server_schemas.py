@@ -140,6 +140,23 @@ class CreateWorkstreamRequest(BaseModel):
             "lands. Auto-generated when omitted."
         ),
     )
+    kind: str = Field(
+        default="interactive",
+        description=(
+            "Workstream kind — 'interactive' (default) or 'coordinator'. "
+            "Coordinator workstreams are created by the console's own "
+            "/v1/api/coordinator/new endpoint; clients hitting "
+            "/v1/api/workstreams/new should leave this at the default."
+        ),
+    )
+    parent_ws_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional parent workstream id. Populated on children spawned "
+            "by a coordinator so the parent/child relationship survives "
+            "restart and appears in audit / list views."
+        ),
+    )
 
 
 class CreateWorkstreamResponse(BaseModel):

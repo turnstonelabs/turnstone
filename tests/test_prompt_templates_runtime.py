@@ -449,7 +449,7 @@ class TestSkillFactoryPassthrough:
 
         captured_skill = None
 
-        def factory(ui, model_alias=None, ws_id=None, *, skill=None):
+        def factory(ui, model_alias=None, ws_id=None, *, skill=None, **_kwargs):
             nonlocal captured_skill
             captured_skill = skill
             return _make_session(skill=captured_skill)
@@ -465,7 +465,7 @@ class TestSkillFactoryPassthrough:
         """WorkstreamManager.create() without skill passes None."""
         captured_skill = "sentinel"
 
-        def factory(ui, model_alias=None, ws_id=None, *, skill=None):
+        def factory(ui, model_alias=None, ws_id=None, *, skill=None, **_kwargs):
             nonlocal captured_skill
             captured_skill = skill
             return _make_session(skill=skill)

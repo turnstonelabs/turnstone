@@ -456,6 +456,44 @@ class PostgreSQLBackend:
                 }
             return None
 
+    def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
+        """Return the full workstreams row as a dict, or None if missing."""
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.node_id,
+                    workstreams.c.user_id,
+                    workstreams.c.alias,
+                    workstreams.c.title,
+                    workstreams.c.name,
+                    workstreams.c.state,
+                    workstreams.c.skill_id,
+                    workstreams.c.skill_version,
+                    workstreams.c.kind,
+                    workstreams.c.parent_ws_id,
+                    workstreams.c.created,
+                    workstreams.c.updated,
+                ).where(workstreams.c.ws_id == ws_id)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ws_id": row[0],
+            "node_id": row[1],
+            "user_id": row[2],
+            "alias": row[3],
+            "title": row[4],
+            "name": row[5],
+            "state": row[6],
+            "skill_id": row[7],
+            "skill_version": row[8],
+            "kind": row[9],
+            "parent_ws_id": row[10],
+            "created": row[11],
+            "updated": row[12],
+        }
+
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._conn() as conn:
             conn.execute(
@@ -476,29 +514,36 @@ class PostgreSQLBackend:
         title: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
     ) -> None:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        # Normalize empty-string parent to NULL so WHERE parent_ws_id IS NULL
+        # filters remain correct.
+        norm_parent = parent_ws_id if parent_ws_id else None
+        # Use ON CONFLICT DO NOTHING to match SQLite's OR IGNORE semantics
+        # and close the SELECT-then-INSERT TOCTOU window under concurrent
+        # register_workstream calls for the same ws_id.
+        stmt = pg_insert(workstreams).values(
+            ws_id=ws_id,
+            node_id=node_id,
+            user_id=user_id,
+            name=name,
+            state=state,
+            alias=alias,
+            title=title,
+            skill_id=skill_id,
+            skill_version=skill_version,
+            kind=kind,
+            parent_ws_id=norm_parent,
+            created=now,
+            updated=now,
+        )
+        stmt = stmt.on_conflict_do_nothing(index_elements=["ws_id"])
         with self._conn() as conn:
-            existing = conn.execute(
-                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
-            ).fetchone()
-            if not existing:
-                conn.execute(
-                    sa.insert(workstreams),
-                    {
-                        "ws_id": ws_id,
-                        "node_id": node_id,
-                        "user_id": user_id,
-                        "name": name,
-                        "state": state,
-                        "alias": alias,
-                        "title": title,
-                        "skill_id": skill_id,
-                        "skill_version": skill_version,
-                        "created": now,
-                        "updated": now,
-                    },
-                )
+            conn.execute(stmt)
             conn.commit()
 
     def update_workstream_state(self, ws_id: str, state: str) -> None:
@@ -772,7 +817,14 @@ class PostgreSQLBackend:
             grouped.setdefault(mid, []).append(row)
         return grouped
 
-    def list_workstreams(self, node_id: str | None = None, limit: int = 100) -> list[Any]:
+    def list_workstreams(
+        self,
+        node_id: str | None = None,
+        limit: int = 100,
+        *,
+        parent_ws_id: str | None = None,
+        kind: str | None = None,
+    ) -> list[Any]:
         with self._conn() as conn:
             q = (
                 sa.select(
@@ -782,12 +834,18 @@ class PostgreSQLBackend:
                     workstreams.c.state,
                     workstreams.c.created,
                     workstreams.c.updated,
+                    workstreams.c.kind,
+                    workstreams.c.parent_ws_id,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)
             )
             if node_id is not None:
                 q = q.where(workstreams.c.node_id == node_id)
+            if parent_ws_id is not None:
+                q = q.where(workstreams.c.parent_ws_id == parent_ws_id)
+            if kind is not None:
+                q = q.where(workstreams.c.kind == kind)
             return list(conn.execute(q).fetchall())
 
     # -- Conversation search ---------------------------------------------------

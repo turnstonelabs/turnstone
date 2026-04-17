@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -213,6 +213,10 @@ class AuthResult:
     token_source: str  # "jwt", "database", "password", or service origin (e.g. "console", "cli")
     permissions: frozenset[str] = frozenset()
     token_version: str = ""  # JWT ``ver`` claim (major.minor), empty for pre-upgrade tokens
+    # Non-reserved JWT claims carried through from ``validate_jwt``.  Used
+    # by the console's coordinator plumbing to preserve ``coord_ws_id``
+    # across the proxy re-mint and surface it on audit rows.
+    extra_claims: dict[str, Any] = field(default_factory=dict)
 
     def has_scope(self, scope: str) -> bool:
         """Return True if this result includes *scope*."""
@@ -329,8 +333,17 @@ def create_jwt(
     permissions: frozenset[str] = frozenset(),
     expiry_seconds: int | None = None,
     version: str | None = None,
+    extra_claims: dict[str, Any] | None = None,
 ) -> str:
-    """Create a signed JWT with user identity, scopes, and permissions."""
+    """Create a signed JWT with user identity, scopes, and permissions.
+
+    ``extra_claims`` is merged after the standard claims so callers can
+    embed custom fields (e.g., ``coord_ws_id`` for coordinator-minted
+    tokens).  Reserved standard names (``sub``, ``scopes``, ``src``,
+    ``iss``, ``iat``, ``exp``, ``aud``, ``permissions``, ``ver``) take
+    precedence and cannot be overridden — attempting to do so is a
+    silent no-op to prevent accidental claim spoofing.
+    """
     import jwt
 
     if expiry_seconds is not None and expiry_seconds <= 0:
@@ -351,6 +364,27 @@ def create_jwt(
         payload["permissions"] = ",".join(sorted(permissions))
     if version:
         payload["ver"] = version
+    if extra_claims:
+        # Matches the reserved set used by validate_jwt when extracting
+        # extra_claims — keep symmetric so a future caller of create_jwt
+        # can't inject nbf/jti and have them survive a validate-then-remint
+        # round trip.
+        reserved = {
+            "sub",
+            "scopes",
+            "src",
+            "iss",
+            "iat",
+            "exp",
+            "aud",
+            "permissions",
+            "ver",
+            "nbf",
+            "jti",
+        }
+        for k, v in extra_claims.items():
+            if k not in reserved:
+                payload[k] = v
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
@@ -389,12 +423,31 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
 
     perms = frozenset(p for p in perms_str.split(",") if p) if perms_str else frozenset()
 
+    # Extra claims: everything the JWT standard and our own mint function
+    # don't reserve.  Used by the coordinator plumbing to pull
+    # ``coord_ws_id`` across the console proxy re-mint.
+    reserved = {
+        "sub",
+        "scopes",
+        "src",
+        "iss",
+        "iat",
+        "exp",
+        "aud",
+        "permissions",
+        "ver",
+        "nbf",
+        "jti",
+    }
+    extra = {k: v for k, v in payload.items() if k not in reserved}
+
     return AuthResult(
         user_id=user_id,
         scopes=parse_scopes(scopes_str),
         token_source=source,
         permissions=perms,
         token_version=token_ver,
+        extra_claims=extra,
     )
 
 

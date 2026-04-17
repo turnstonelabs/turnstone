@@ -2,6 +2,43 @@
 
 An MCP server that exposes tools for executing commands across a Turnstone cluster. Serves as a reference implementation for both MCP server patterns and Turnstone SDK usage.
 
+> [!NOTE]
+> **Superseded by the built-in coordinator workstream in Turnstone 1.5.**
+>
+> This MCP side-car is the pre-1.5 pattern for cluster-wide orchestration.
+> Turnstone 1.5 promotes coordinator behaviour to a first-class workstream
+> kind hosted inside `turnstone-console` — no external MCP server to
+> install or operate, proper per-user audit attribution, and a dedicated
+> UI at `/coordinator/{ws_id}`.
+>
+> The extension continues to work for 1.4-and-earlier clusters. On 1.5+:
+> grant the `admin.coordinator` permission, set `coordinator.model_alias`
+> in the admin Settings tab, and create sessions via the dashboard's
+> "new coordinator" button or `POST /v1/api/coordinator/new`. Full
+> removal of this example (including docker / compose references) is
+> planned once 1.5 is confirmed in production.
+>
+> | Concern | Built-in coordinator (1.5+) | This MCP extension (1.4-and-earlier) |
+> |---|---|---|
+> | Install | None — shipped in-tree | `pip install -e examples/mcp-cluster-ops` + MCP client config |
+> | Auth | Real creator's `user_id` + `admin.coordinator` permission | Shared service token |
+> | Audit | `coordinator.create` / `close` / `cancel` events on the console; `src="coordinator"` preserved on upstream hops | Service identity only |
+> | UI | `/coordinator/{ws_id}` one-pane HTML | No UI — model-only |
+> | Tool approvals | Inline approval bar in the coordinator pane | MCP approval flow |
+> | Configuration | `coordinator.model_alias`, `coordinator.max_active`, `coordinator.reasoning_effort`, `coordinator.session_jwt_ttl_seconds` | MCP server config file |
+>
+> Minimal 1.5 migration:
+>
+> ```bash
+> curl -X POST https://console.example/v1/api/coordinator/new \
+>   -H "Authorization: Bearer $TOKEN" \
+>   -H "Content-Type: application/json" \
+>   -d '{"name":"planner","initial_message":"Spawn a worker to check the build"}'
+> ```
+>
+> The response carries `ws_id`; open
+> `https://console.example/coordinator/{ws_id}` to watch the session.
+
 ## How it works
 
 This server uses the Turnstone console SDK (`TurnstoneConsole`) for node discovery and routing, and `TurnstoneServer` for per-node SSE streaming. The dispatch flow for each command is:

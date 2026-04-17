@@ -271,11 +271,22 @@ def register_workstream(
     state: str = "idle",
     skill_id: str = "",
     skill_version: int = 0,
+    user_id: str | None = None,
+    kind: str = "interactive",
+    parent_ws_id: str | None = None,
 ) -> None:
     """Persist a new workstream (no-op if already exists)."""
     try:
         get_storage().register_workstream(
-            ws_id, node_id, name, state, skill_id=skill_id, skill_version=skill_version
+            ws_id,
+            node_id,
+            name,
+            state,
+            user_id=user_id,
+            skill_id=skill_id,
+            skill_version=skill_version,
+            kind=kind,
+            parent_ws_id=parent_ws_id,
         )
     except Exception:
         log.warning("Failed to register workstream ws=%s", ws_id, exc_info=True)

@@ -1,0 +1,20 @@
+{
+  "name": "send_to_workstream",
+  "description": "Send a user-turn message to a child workstream. The child's worker thread dispatches it through its own ChatSession loop. Use to continue a conversation, provide feedback, or ask a follow-up. Requires approval — your message lands as the 'user' role on that workstream.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "ws_id": {
+        "type": "string",
+        "description": "Workstream id that should receive the message."
+      },
+      "message": {
+        "type": "string",
+        "description": "Message text to append as a user turn."
+      }
+    },
+    "required": ["ws_id", "message"]
+  },
+  "coordinator": true,
+  "primary_key": "message"
+}

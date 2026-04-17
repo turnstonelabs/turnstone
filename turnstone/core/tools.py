@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 _TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
-_META_KEYS = {"agent", "task_agent", "auto_approve", "primary_key"}
+_META_KEYS = {"agent", "task_agent", "coordinator", "auto_approve", "primary_key"}
 
 
 def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -15,7 +15,8 @@ def _load_tools() -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     Returns (tool_defs, metadata) where:
       - tool_defs: list of OpenAI function-calling dicts
-      - metadata: dict mapping tool_name -> {agent, task_agent, auto_approve, primary_key}
+      - metadata: dict mapping tool_name -> {agent, task_agent, coordinator,
+                  auto_approve, primary_key}
     """
     tools = []
     meta = {}
@@ -34,6 +35,7 @@ TOOLS, _META = _load_tools()
 
 AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("agent")]
 TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_agent")]
+COORDINATOR_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("coordinator")]
 AGENT_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}

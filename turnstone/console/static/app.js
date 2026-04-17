@@ -1,11 +1,18 @@
 // --- Shared hooks ---
 window.onLoginSuccess = function () {
   connectSSE();
+  // Refresh permission-gated header buttons (admin.coordinator etc).
+  if (typeof refreshCoordButtonVisibility === "function") {
+    refreshCoordButtonVisibility();
+  }
 };
 window.onLogout = function () {
   if (evtSource) {
     evtSource.close();
     evtSource = null;
+  }
+  if (typeof refreshCoordButtonVisibility === "function") {
+    refreshCoordButtonVisibility();
   }
 };
 window.onThemeChange = function (next) {
@@ -1472,6 +1479,137 @@ document.addEventListener("keydown", function (e) {
   }
 });
 
+// ---------------------------------------------------------------------------
+// New coordinator modal
+//
+// Header button is visibility-gated on the admin.coordinator permission.
+// Modal is small: optional name / skill / initial_message, POSTs to
+// /v1/api/coordinator/new, redirects to /coordinator/{ws_id} on success.
+// ---------------------------------------------------------------------------
+
+function _hasCoordPermission() {
+  var perms = sessionStorage.getItem("turnstone_permissions") || "";
+  return perms.split(",").indexOf("admin.coordinator") !== -1;
+}
+
+function refreshCoordButtonVisibility() {
+  var btn = document.getElementById("new-coord-btn");
+  if (!btn) return;
+  btn.style.display = _hasCoordPermission() ? "" : "none";
+}
+
+function showNewCoordModal() {
+  if (!_hasCoordPermission()) {
+    showToast("admin.coordinator permission required");
+    return;
+  }
+  var login = document.getElementById("login-overlay");
+  if (login && login.style.display !== "none") return;
+  var overlay = document.getElementById("new-coord-overlay");
+  overlay.style.display = "flex";
+  document.body.style.overflow = "hidden";
+  overlay.onclick = function (e) {
+    if (e.target === overlay) hideNewCoordModal();
+  };
+
+  // Reset form
+  document.getElementById("new-coord-name").value = "";
+  document.getElementById("new-coord-task").value = "";
+  var errEl = document.getElementById("new-coord-error");
+  errEl.style.display = "none";
+  errEl.textContent = "";
+  var btn = document.getElementById("new-coord-submit");
+  btn.disabled = false;
+  btn.textContent = "Create";
+
+  // Populate skill dropdown (same endpoint as new-ws modal)
+  var sel = document.getElementById("new-coord-skill");
+  sel.innerHTML = '<option value="">Use defaults</option>';
+  authFetch("/v1/api/skills")
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      (data.skills || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        opt.textContent = t.is_default ? t.name + " (default)" : t.name;
+        sel.appendChild(opt);
+      });
+    })
+    .catch(function () { /* defaults still work */ });
+
+  setTimeout(function () {
+    document.getElementById("new-coord-task").focus();
+  }, 50);
+}
+
+function hideNewCoordModal() {
+  document.getElementById("new-coord-overlay").style.display = "none";
+  document.body.style.overflow = "";
+  var triggerBtn = document.getElementById("new-coord-btn");
+  if (triggerBtn) triggerBtn.focus();
+}
+
+function submitNewCoord() {
+  var name = document.getElementById("new-coord-name").value.trim();
+  var skill = document.getElementById("new-coord-skill").value;
+  var task = document.getElementById("new-coord-task").value.trim();
+  var errEl = document.getElementById("new-coord-error");
+  var btn = document.getElementById("new-coord-submit");
+  btn.disabled = true;
+  btn.textContent = "Creating\u2026";
+  errEl.style.display = "none";
+  var body = {};
+  if (name) body.name = name;
+  if (skill) body.skill = skill;
+  if (task) body.initial_message = task;
+
+  authFetch("/v1/api/coordinator/new", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+    .then(function (r) {
+      return r.json().then(function (data) {
+        return { ok: r.ok, status: r.status, data: data };
+      });
+    })
+    .then(function (res) {
+      btn.disabled = false;
+      btn.textContent = "Create";
+      if (!res.ok || !res.data || !res.data.ws_id) {
+        errEl.textContent = (res.data && res.data.error) || "HTTP " + res.status;
+        errEl.style.display = "block";
+        return;
+      }
+      hideNewCoordModal();
+      window.location.href = "/coordinator/" + encodeURIComponent(res.data.ws_id);
+    })
+    .catch(function () {
+      btn.disabled = false;
+      btn.textContent = "Create";
+      errEl.textContent = "Request failed";
+      errEl.style.display = "block";
+    });
+}
+
+// Escape closes the new-coord modal; Enter submits
+document.addEventListener("keydown", function (e) {
+  var overlay = document.getElementById("new-coord-overlay");
+  if (!overlay || overlay.style.display === "none") return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    hideNewCoordModal();
+  }
+  if (e.key === "Enter") {
+    if (e.target.tagName === "SELECT") return;
+    if (e.target.tagName === "BUTTON") return;
+    if (e.target.tagName === "TEXTAREA" && !(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault();
+    var btn = document.getElementById("new-coord-submit");
+    if (btn && !btn.disabled) submitNewCoord();
+  }
+});
+
 // --- Init ---
 // SSE connects after auth is confirmed — either via onLoginSuccess after
 // login, or after the first successful data load (page refresh with valid cookie).
@@ -1485,6 +1623,10 @@ function _ensureSSE() {
 history.replaceState({ view: "overview" }, "");
 initLogin();
 loadOverview();
+// Refresh the coord button visibility after initial whoami lands in
+// sessionStorage (auth.js populates it asynchronously).  A short delay
+// is good enough — the shared pattern for permission-gated UI.
+setTimeout(refreshCoordButtonVisibility, 500);
 
 // --- Node Metadata Panel (read-only in node detail view) ---
 function _loadNodeMetadataPanel(nodeId) {

@@ -1,0 +1,32 @@
+{
+  "name": "spawn_workstream",
+  "description": "Create a new child workstream and optionally dispatch an initial message. Use this to kick off a focused sub-task on a separate workstream (different skill, model, or node) while your coordinator remains in charge of orchestration. The child runs independently; use send_to_workstream / inspect_workstream / close_workstream to drive and observe it.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "initial_message": {
+        "type": "string",
+        "description": "First user message to dispatch to the new workstream. If empty, the workstream is created idle and waits for send_to_workstream."
+      },
+      "skill": {
+        "type": "string",
+        "description": "Optional skill name to apply to the new workstream (overrides default skills, may select a model)."
+      },
+      "name": {
+        "type": "string",
+        "description": "Optional display name for the new workstream. Auto-generated when empty."
+      },
+      "model": {
+        "type": "string",
+        "description": "Optional model alias from the registry. Omit to use the coordinator's default model (or the one the skill prescribes)."
+      },
+      "target_node": {
+        "type": "string",
+        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node via generate_ws_id_for_node. Otherwise the hash ring picks."
+      }
+    },
+    "required": ["initial_message"]
+  },
+  "coordinator": true,
+  "primary_key": "initial_message"
+}

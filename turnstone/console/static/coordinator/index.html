@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en" data-ws-id="{{WS_ID}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coordinator · turnstone</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/shared/base.css">
+<link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  /* Coordinator-specific layout — one-pane variant of the server UI. */
+  body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
+  #coord-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elevated);
+  }
+  #coord-header h1 {
+    margin: 0;
+    font-family: 'Outfit', sans-serif;
+    font-size: 1.1rem;
+    font-weight: 600;
+  }
+  #coord-header h1 .dim { color: var(--fg-dim); }
+  #coord-status { color: var(--fg-dim); font-size: 0.85rem; }
+  #coord-header-spacer { flex: 1; }
+  #coord-main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #coord-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem 1.5rem;
+  }
+  .coord-msg {
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+  }
+  .coord-msg.role-user { border-color: var(--accent); }
+  .coord-msg.role-assistant { border-color: var(--border); }
+  .coord-msg.role-tool {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+    background: var(--code-bg);
+  }
+  .coord-msg.role-error {
+    border-color: var(--red);
+    color: var(--red);
+  }
+  .coord-msg .role-label {
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+    margin-bottom: 0.25rem;
+  }
+  .coord-msg .coord-ws-link {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  #coord-composer {
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg-elevated);
+  }
+  #coord-input {
+    flex: 1;
+    min-height: 2.5rem;
+    max-height: 10rem;
+    padding: 0.5rem 0.75rem;
+    font-family: inherit;
+    font-size: 0.95rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    resize: vertical;
+  }
+  #coord-send-btn {
+    padding: 0 1.2rem;
+    font-weight: 600;
+  }
+  #coord-approval-bar {
+    padding: 0.75rem 1rem;
+    background: var(--yellow-glow);
+    border-top: 1px solid var(--yellow);
+    display: none;
+  }
+  #coord-approval-bar.visible { display: block; }
+  #coord-approval-bar .label { font-weight: 600; margin-bottom: 0.25rem; }
+  #coord-approval-bar .tool-row { margin-bottom: 0.25rem; font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; }
+  #coord-approval-bar .btn-row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
+  #coord-approval-bar button { padding: 0.35rem 0.75rem; }
+  #coord-approval-bar button:disabled { opacity: 0.55; cursor: wait; }
+  #coord-approval-bar .approval-header {
+    font-weight: 600;
+    margin-bottom: 0.35rem;
+    font-family: inherit;
+  }
+  /* Deny-destructive button gets a red border so it reads faster than
+     the green/neutral approve variants. */
+  #coord-deny-btn { border-color: var(--red); color: var(--red); }
+  /* Reasoning bubbles are dimmed + italic so they read as pre-content
+     commentary rather than the final assistant reply. */
+  .coord-msg.role-reasoning {
+    color: var(--fg-dim);
+    font-style: italic;
+    border-style: dashed;
+  }
+  #coord-sse-status {
+    color: var(--fg-dim);
+    font-size: 0.8rem;
+  }
+  #coord-sse-status.ok { color: var(--green); }
+  #coord-sse-status.err { color: var(--red); }
+
+  /* Sub-700px: wrap the header so the buttons don't overflow off-screen
+     on phone-sized viewports. */
+  @media (max-width: 700px) {
+    #coord-header {
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
+    }
+    #coord-header h1 { font-size: 1rem; }
+    #coord-header-spacer { flex-basis: 100%; height: 0; }
+    #coord-messages { padding: 0.75rem 1rem; }
+    #coord-composer { padding: 0.5rem 0.75rem; }
+    /* On phones the soft keyboard eats vertical space — cap the input
+       and disable drag-resize so the composer stays in view. */
+    #coord-input {
+      resize: none;
+      max-height: 6rem;
+    }
+  }
+</style>
+</head>
+<body>
+
+<div id="coord-header">
+  <h1>turnstone <span class="dim">coordinator</span></h1>
+  <span id="coord-name"></span>
+  <span id="coord-status"></span>
+  <span id="coord-header-spacer"></span>
+  <span id="coord-sse-status" aria-live="polite">connecting…</span>
+  <button id="coord-cancel-btn" class="header-btn" style="display:none" onclick="coordCancel()">cancel</button>
+  <button id="coord-close-btn" class="header-btn" onclick="coordCloseSession()" title="Close this coordinator session">close</button>
+  <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
+</div>
+
+<div id="coord-main">
+  <!-- aria-live starts polite; coordinator.js flips it to "off" during
+       streaming and back to "polite" on stream_end so screen readers
+       don't re-announce partial content on every token. -->
+  <div id="coord-messages" role="log" aria-live="polite"></div>
+
+  <!-- Region (not alertdialog) because we don't trap focus; buttons are
+       reachable in normal tab order.  role=alertdialog implies a modal
+       focus trap per WAI-ARIA. -->
+  <div id="coord-approval-bar" role="region" aria-label="Approval required" aria-live="assertive">
+    <div id="coord-approval-label" class="label">Approval required</div>
+    <div id="coord-approval-tools"></div>
+    <div class="btn-row">
+      <button id="coord-approve-btn" onclick="coordApprove(true, false)">Approve</button>
+      <button id="coord-approve-always-btn" onclick="coordApprove(true, true)">Approve (always)</button>
+      <button id="coord-deny-btn" onclick="coordApprove(false, false)">Deny</button>
+    </div>
+  </div>
+
+  <form id="coord-composer" onsubmit="return coordSend(event)">
+    <textarea id="coord-input" rows="1" placeholder="Message the coordinator…" aria-label="Coordinator input"></textarea>
+    <button id="coord-send-btn" type="submit">send</button>
+  </form>
+</div>
+
+<!-- Shared-static import order matches the console dashboard
+     (console/static/index.html) so global shortcuts (kb.js) and helpers
+     register in the expected sequence. -->
+<script src="/shared/utils.js"></script>
+<script src="/shared/toast.js"></script>
+<script src="/shared/theme.js"></script>
+<script src="/shared/auth.js"></script>
+<script src="/shared/kb.js"></script>
+<script src="/static/coordinator/coordinator.js"></script>
+</body>
+</html>

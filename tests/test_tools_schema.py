@@ -72,13 +72,27 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        assert len(TOOLS) == 19
+        # 19 original tools + 6 coordinator tools
+        assert len(TOOLS) == 25
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 10
 
     def test_task_agent_tools_count(self):
         assert len(TASK_AGENT_TOOLS) == 13
+
+    def test_coordinator_tools_count(self):
+        from turnstone.core.tools import COORDINATOR_TOOLS
+
+        assert len(COORDINATOR_TOOLS) == 6
+        assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
+            "spawn_workstream",
+            "inspect_workstream",
+            "send_to_workstream",
+            "close_workstream",
+            "delete_workstream",
+            "list_workstreams",
+        }
 
     def test_auto_approve_sets_match(self):
         expected = {
@@ -90,6 +104,9 @@ class TestToolsMetadata:
             "web_fetch",
             "web_search",
             "notify",
+            # Coordinator read-only tools (no-mutation, safe to auto-approve):
+            "inspect_workstream",
+            "list_workstreams",
         }
         assert expected == AGENT_AUTO_TOOLS
         assert expected == TASK_AUTO_TOOLS
@@ -115,12 +132,18 @@ class TestToolsMetadata:
             "use_prompt": "name",
             "skill": "name",
             "diff_file": "path_a",
+            # Coordinator tools:
+            "spawn_workstream": "initial_message",
+            "inspect_workstream": "ws_id",
+            "send_to_workstream": "message",
+            "close_workstream": "ws_id",
+            "delete_workstream": "ws_id",
         }
         assert expected == PRIMARY_KEY_MAP
 
     def test_no_metadata_in_function_dicts(self):
         """Ensure turnstone metadata keys are stripped from the OpenAI schema."""
-        meta_keys = {"agent", "task_agent", "auto_approve", "primary_key"}
+        meta_keys = {"agent", "task_agent", "coordinator", "auto_approve", "primary_key"}
         for tool in TOOLS:
             func = tool["function"]
             leaked = meta_keys & set(func)

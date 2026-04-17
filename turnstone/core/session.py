@@ -95,6 +95,7 @@ from turnstone.core.tools import (
     AGENT_AUTO_TOOLS,
     AGENT_TOOLS,
     BUILTIN_TOOL_NAMES,
+    COORDINATOR_TOOLS,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
@@ -329,9 +330,18 @@ class ChatSession:
         web_search_backend: str = "",
         client_type: ClientType = ClientType.CLI,
         username: str = "",
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
+        coord_client: Any = None,
     ):
         self.client = client
         self.model = model
+        # Coordinator plumbing: populated by the console's session factory
+        # only — ``kind == "coordinator"`` sessions run COORDINATOR_TOOLS
+        # and dispatch tool execs through ``coord_client``.
+        self._kind = kind
+        self._parent_ws_id = parent_ws_id if parent_ws_id else None
+        self._coord_client: Any = coord_client
         self._registry = registry
         self._model_alias = model_alias
         self._health_registry = health_registry
@@ -457,6 +467,14 @@ class ChatSession:
             self._tools = TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
+        if kind == "coordinator":
+            # Coordinator sessions see only the coordinator tool set; task/
+            # plan sub-agents are intentionally disabled — a coordinator
+            # spawns real workstreams instead of in-process agents.
+            mcp_tools_for_coord = mcp_client.get_tools() if mcp_client else []
+            self._tools = merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools_for_coord)
+            self._task_tools = []
+            self._agent_tools = []
         # Inject the live alias list into plan_agent / task_agent tool
         # descriptions so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -3817,6 +3835,14 @@ class ChatSession:
             "read_resource": self._prepare_read_resource,
             "use_prompt": self._prepare_use_prompt,
             "skill": self._prepare_skill,
+            # Coordinator tools: only reachable when this session was
+            # constructed with kind="coordinator" (COORDINATOR_TOOLS set).
+            "spawn_workstream": self._prepare_spawn_workstream,
+            "inspect_workstream": self._prepare_inspect_workstream,
+            "send_to_workstream": self._prepare_send_to_workstream,
+            "close_workstream": self._prepare_close_workstream,
+            "delete_workstream": self._prepare_delete_workstream,
+            "list_workstreams": self._prepare_list_workstreams,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -4730,6 +4756,343 @@ class ChatSession:
             return ("completion", format_nudge("completion"))
 
         return None
+
+    # ------------------------------------------------------------------
+    # Coordinator tools — reachable only when ``kind == "coordinator"``.
+    # All six dispatch through ``self._coord_client`` which is None when
+    # the session is interactive, so the prepare methods guard defensively
+    # and return an error item on misuse.
+    # ------------------------------------------------------------------
+
+    def _coord_tool_error(self, call_id: str, func_name: str, msg: str) -> dict[str, Any]:
+        return {
+            "call_id": call_id,
+            "func_name": func_name,
+            "header": f"\u2717 {func_name}: {msg}",
+            "preview": "",
+            "needs_approval": False,
+            "error": f"Error: {msg}",
+        }
+
+    def _prepare_spawn_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "spawn_workstream", "coordinator client unavailable"
+            )
+        initial_message = (args.get("initial_message") or "").strip()
+        if not initial_message:
+            return self._coord_tool_error(
+                call_id, "spawn_workstream", "initial_message is required"
+            )
+        skill = (args.get("skill") or "").strip()
+        name = (args.get("name") or "").strip()
+        model = (args.get("model") or "").strip()
+        target_node = (args.get("target_node") or "").strip()
+        first_line = initial_message.splitlines()[0]
+        preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
+        header_bits = [f"\u2699 spawn_workstream: {preview_line}"]
+        if skill:
+            header_bits.append(f"skill={skill}")
+        if target_node:
+            header_bits.append(f"node={target_node}")
+        header = " ".join(header_bits)
+        preview_body = f"{DIM}{textwrap.indent(initial_message, '    ')}{RESET}"
+        return {
+            "call_id": call_id,
+            "func_name": "spawn_workstream",
+            "header": header,
+            "preview": preview_body,
+            "needs_approval": True,
+            "approval_label": "spawn_workstream",
+            "execute": self._exec_spawn_workstream,
+            "initial_message": initial_message,
+            "skill": skill,
+            "name": name,
+            "model": model,
+            "target_node": target_node,
+        }
+
+    def _exec_spawn_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.spawn(
+                initial_message=item["initial_message"],
+                parent_ws_id=self._ws_id,
+                user_id=self._user_id,
+                skill=item["skill"],
+                name=item["name"],
+                model=item["model"],
+                target_node=item["target_node"],
+            )
+        except Exception as e:
+            msg = f"Error: spawn_workstream failed: {e}"
+            self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
+            return call_id, msg
+        # Successful spawn — surface ws_id + node_id + name so the
+        # coordinator can follow up with inspect / send.
+        summary = json.dumps(
+            {
+                "ws_id": result.get("ws_id"),
+                "name": result.get("name"),
+                "node_id": result.get("node_id"),
+                "status": result.get("status"),
+            },
+            separators=(",", ":"),
+        )
+        self._report_tool_result(call_id, "spawn_workstream", f"spawned {result.get('ws_id', '?')}")
+        return call_id, summary
+
+    def _prepare_inspect_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "inspect_workstream", "coordinator client unavailable"
+            )
+        ws_id = (args.get("ws_id") or "").strip()
+        if not ws_id:
+            return self._coord_tool_error(call_id, "inspect_workstream", "ws_id is required")
+        try:
+            message_limit = int(args.get("message_limit") or 20)
+        except (TypeError, ValueError):
+            message_limit = 20
+        message_limit = max(1, min(message_limit, 200))
+        return {
+            "call_id": call_id,
+            "func_name": "inspect_workstream",
+            "header": f"\u2699 inspect_workstream: {ws_id}",
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_inspect_workstream,
+            "ws_id": ws_id,
+            "message_limit": message_limit,
+        }
+
+    def _exec_inspect_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        ws_id = item["ws_id"]
+        try:
+            result = self._coord_client.inspect(ws_id, message_limit=item["message_limit"])
+        except Exception as e:
+            msg = f"Error: inspect_workstream failed: {e}"
+            self._report_tool_result(call_id, "inspect_workstream", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(result, default=str, separators=(",", ":"))
+        # Summary for UI: state + message count
+        desc = f"{result.get('state', '?')} ({len(result.get('messages', []))} msgs)"
+        self._report_tool_result(call_id, "inspect_workstream", desc)
+        return call_id, self._truncate_output(output)
+
+    def _prepare_send_to_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "send_to_workstream", "coordinator client unavailable"
+            )
+        ws_id = (args.get("ws_id") or "").strip()
+        message = args.get("message") or ""
+        if not ws_id:
+            return self._coord_tool_error(call_id, "send_to_workstream", "ws_id is required")
+        if not message.strip():
+            return self._coord_tool_error(call_id, "send_to_workstream", "message is required")
+        first_line = message.splitlines()[0]
+        preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
+        header = f"\u2699 send_to_workstream {ws_id}: {preview_line}"
+        preview_body = f"{DIM}{textwrap.indent(message, '    ')}{RESET}"
+        return {
+            "call_id": call_id,
+            "func_name": "send_to_workstream",
+            "header": header,
+            "preview": preview_body,
+            "needs_approval": True,
+            "approval_label": "send_to_workstream",
+            "execute": self._exec_send_to_workstream,
+            "ws_id": ws_id,
+            "message": message,
+        }
+
+    def _exec_send_to_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.send(item["ws_id"], item["message"])
+        except Exception as e:
+            msg = f"Error: send_to_workstream failed: {e}"
+            self._report_tool_result(call_id, "send_to_workstream", msg, is_error=True)
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "send_to_workstream", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(
+            {"ws_id": item["ws_id"], "status": result.get("status", "ok")},
+            separators=(",", ":"),
+        )
+        self._report_tool_result(call_id, "send_to_workstream", f"sent to {item['ws_id']}")
+        return call_id, output
+
+    def _prepare_close_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "close_workstream", "coordinator client unavailable"
+            )
+        ws_id = (args.get("ws_id") or "").strip()
+        if not ws_id:
+            return self._coord_tool_error(call_id, "close_workstream", "ws_id is required")
+        reason = (args.get("reason") or "").strip()
+        header = f"\u2699 close_workstream: {ws_id}"
+        if reason:
+            header += f" ({reason[:80]})"
+        return {
+            "call_id": call_id,
+            "func_name": "close_workstream",
+            "header": header,
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": "close_workstream",
+            "execute": self._exec_close_workstream,
+            "ws_id": ws_id,
+            "reason": reason,
+        }
+
+    def _exec_close_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        reason = item.get("reason", "") or ""
+        try:
+            result = self._coord_client.close_workstream(item["ws_id"], reason=reason)
+        except Exception as e:
+            msg = f"Error: close_workstream failed: {e}"
+            self._report_tool_result(call_id, "close_workstream", msg, is_error=True)
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "close_workstream", msg, is_error=True)
+            return call_id, msg
+        # Include reason in the tool-result payload so the coordinator's
+        # own message stream records why the close happened.  The schema
+        # advertises "Recorded in the message stream for audit" — this
+        # is the seam that satisfies that contract.
+        summary_payload: dict[str, Any] = {
+            "ws_id": item["ws_id"],
+            "closed": True,
+            "status": result.get("status"),
+        }
+        if reason:
+            summary_payload["reason"] = reason
+        output = json.dumps(summary_payload, separators=(",", ":"))
+        desc = f"closed {item['ws_id']}"
+        if reason:
+            desc += f" ({reason[:60]})"
+        self._report_tool_result(call_id, "close_workstream", desc)
+        return call_id, output
+
+    def _prepare_delete_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "delete_workstream", "coordinator client unavailable"
+            )
+        ws_id = (args.get("ws_id") or "").strip()
+        if not ws_id:
+            return self._coord_tool_error(call_id, "delete_workstream", "ws_id is required")
+        return {
+            "call_id": call_id,
+            "func_name": "delete_workstream",
+            "header": f"\u2699 delete_workstream: {ws_id} (irreversible)",
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": "delete_workstream",
+            "execute": self._exec_delete_workstream,
+            "ws_id": ws_id,
+        }
+
+    def _exec_delete_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.delete(item["ws_id"])
+        except Exception as e:
+            msg = f"Error: delete_workstream failed: {e}"
+            self._report_tool_result(call_id, "delete_workstream", msg, is_error=True)
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "delete_workstream", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(
+            {"ws_id": item["ws_id"], "deleted": True, "status": result.get("status")},
+            separators=(",", ":"),
+        )
+        self._report_tool_result(call_id, "delete_workstream", f"deleted {item['ws_id']}")
+        return call_id, output
+
+    def _prepare_list_workstreams(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "list_workstreams", "coordinator client unavailable"
+            )
+        # parent_ws_id: omit or empty → caller's own ws_id (self).
+        # Tool docstring documents this.
+        parent_raw = args.get("parent_ws_id")
+        if parent_raw is None or parent_raw == "":
+            parent_ws_id = self._ws_id
+        else:
+            parent_ws_id = str(parent_raw).strip() or self._ws_id
+        state = (args.get("state") or "").strip() or None
+        skill = (args.get("skill") or "").strip() or None
+        try:
+            limit = int(args.get("limit") or 100)
+        except (TypeError, ValueError):
+            limit = 100
+        limit = max(1, min(limit, 500))
+        header_bits = [f"\u2699 list_workstreams: parent={parent_ws_id}"]
+        if state:
+            header_bits.append(f"state={state}")
+        if skill:
+            header_bits.append(f"skill={skill}")
+        header = " ".join(header_bits)
+        return {
+            "call_id": call_id,
+            "func_name": "list_workstreams",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_list_workstreams,
+            "parent_ws_id": parent_ws_id,
+            "state": state,
+            "skill": skill,
+            "limit": limit,
+        }
+
+    def _exec_list_workstreams(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.list_children(
+                item["parent_ws_id"],
+                state=item["state"],
+                skill=item["skill"],
+                limit=item["limit"],
+            )
+        except Exception as e:
+            msg = f"Error: list_workstreams failed: {e}"
+            self._report_tool_result(call_id, "list_workstreams", msg, is_error=True)
+            return call_id, msg
+        children = result.get("children", [])
+        truncated = bool(result.get("truncated"))
+        output = json.dumps(
+            {
+                "parent_ws_id": item["parent_ws_id"],
+                "children": children,
+                "truncated": truncated,
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+        summary = f"{len(children)} children"
+        if truncated:
+            summary += (
+                " (truncated — more may exist; re-run with a narrower filter or larger limit)"
+            )
+        self._report_tool_result(call_id, "list_workstreams", summary)
+        return call_id, self._truncate_output(output)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a memory tool action (save/get/search/delete/list)."""

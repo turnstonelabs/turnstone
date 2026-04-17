@@ -1130,6 +1130,8 @@ def main() -> None:
         *,
         skill: str | None = None,
         client_type: str = "",
+        kind: str = "interactive",
+        parent_ws_id: str | None = None,
     ) -> ChatSession:
         assert ui is not None, "session_factory requires a non-None UI"
         r_client, r_model, r_cfg = registry.resolve(model_alias)
@@ -1156,6 +1158,8 @@ def main() -> None:
             web_search_backend=args.web_search_backend,
             skill=skill or args.skill or None,
             judge_config=judge_config,
+            kind=kind,
+            parent_ws_id=parent_ws_id,
         )
 
     # Create workstream manager and initial workstream
