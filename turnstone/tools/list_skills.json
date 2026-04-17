@@ -1,0 +1,31 @@
+{
+  "name": "list_skills",
+  "description": "List skills (worker profiles) available in the cluster. Auto-approved — safe, read-only. Pass optional filters to narrow by category (e.g. 'engineering', 'ops'), tag (single tag from the skill's tags array), or scan_status ('clean', 'flagged', 'unscanned', 'pending'). Use to discover which skill names you can pass to spawn_workstream. Returns name, category, tags, version, description, model preference, enabled flag, scan_status, activation — enough for an informed pick.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "category": {
+        "type": "string",
+        "description": "Filter by category (exact match)."
+      },
+      "tag": {
+        "type": "string",
+        "description": "Filter by tag (must appear in the skill's tags array)."
+      },
+      "scan_status": {
+        "type": "string",
+        "description": "Filter by scan status: clean / flagged / unscanned / pending."
+      },
+      "enabled_only": {
+        "type": "boolean",
+        "description": "If true, return only enabled skills. Default false."
+      },
+      "limit": {
+        "type": "integer",
+        "description": "Max rows to return. Default 100, max 500."
+      }
+    }
+  },
+  "coordinator": true,
+  "auto_approve": true
+}

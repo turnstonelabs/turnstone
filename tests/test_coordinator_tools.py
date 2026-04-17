@@ -124,6 +124,9 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         "close_workstream",
         "delete_workstream",
         "list_workstreams",
+        "list_nodes",
+        "list_skills",
+        "task_list",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []
@@ -408,6 +411,361 @@ def test_prepare_fails_cleanly_when_coord_client_missing(monkeypatch):
         ("close_workstream", {"ws_id": "x"}),
         ("delete_workstream", {"ws_id": "x"}),
         ("list_workstreams", {}),
+        ("list_nodes", {}),
+        ("list_skills", {}),
+        ("task_list", {"action": "list"}),
     ):
         item = sess._prepare_tool(_tc(tool, args))
         assert "error" in item, f"{tool} did not error on missing coord_client"
+
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+
+def test_list_nodes_prepare_is_auto_approved(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_nodes", {}))
+    assert item["needs_approval"] is False
+    assert item["filters"] == {}
+    assert item["limit"] == 100
+
+
+def test_list_nodes_prepare_accepts_filters(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc("list_nodes", {"filters": {"arch": "x86_64", "capability": "gpu"}})
+    )
+    assert item["filters"] == {"arch": "x86_64", "capability": "gpu"}
+
+
+def test_list_nodes_prepare_drops_invalid_filter_types(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_nodes",
+            {"filters": {"arch": "x86_64", "bad": {"nested": "dict"}, "": "empty-key"}},
+        )
+    )
+    # Nested dict values + empty keys are filtered out; string + primitive kept.
+    assert item["filters"] == {"arch": "x86_64"}
+
+
+def test_list_nodes_prepare_clamps_limit(coord_session):
+    sess, _coord, _ui = coord_session
+    over = sess._prepare_tool(_tc("list_nodes", {"limit": 9999}))
+    assert over["limit"] == 500
+    # limit == 0 falls back to the default (100), not 1 — consistent with
+    # the other coordinator list tools' ``int(args.get("limit") or 100)``.
+    zero = sess._prepare_tool(_tc("list_nodes", {"limit": 0}))
+    assert zero["limit"] == 100
+    neg = sess._prepare_tool(_tc("list_nodes", {"limit": -5}))
+    assert neg["limit"] == 1  # negative values clamp to 1
+
+
+def test_list_nodes_exec_dispatches_to_client(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_nodes.return_value = {
+        "nodes": [{"node_id": "n1", "metadata": {"arch": {"value": "x86_64", "source": "auto"}}}],
+        "truncated": False,
+    }
+    item = sess._prepare_tool(_tc("list_nodes", {"filters": {"arch": "x86_64"}}))
+    call_id, output = sess._exec_list_nodes(item)
+    assert call_id == "call-1"
+    parsed = json.loads(output)
+    assert parsed["nodes"][0]["node_id"] == "n1"
+    assert parsed["truncated"] is False
+    coord.list_nodes.assert_called_once_with(filters={"arch": "x86_64"}, limit=100)
+
+
+def test_list_nodes_exec_surfaces_truncated_sentinel(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_nodes.return_value = {"nodes": [], "truncated": True}
+    item = sess._prepare_tool(_tc("list_nodes", {}))
+    _, _ = sess._exec_list_nodes(item)
+    # Summary reported to UI carries the "truncated" hint.
+    assert any("truncated" in r[2] for r in ui.tool_results)
+
+
+# ---------------------------------------------------------------------------
+# list_skills
+# ---------------------------------------------------------------------------
+
+
+def test_list_skills_prepare_is_auto_approved(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("list_skills", {}))
+    assert item["needs_approval"] is False
+    assert item["category"] is None
+    assert item["tag"] is None
+    assert item["scan_status"] is None
+    assert item["enabled_only"] is False
+    assert item["limit"] == 100
+
+
+def test_list_skills_prepare_accepts_filters(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_skills",
+            {"category": "ops", "tag": "gpu", "scan_status": "clean", "enabled_only": True},
+        )
+    )
+    assert item["category"] == "ops"
+    assert item["tag"] == "gpu"
+    assert item["scan_status"] == "clean"
+    assert item["enabled_only"] is True
+
+
+def test_list_skills_prepare_tolerates_non_string_filters(coord_session):
+    """A malformed model call with non-string filter values must NOT
+    raise AttributeError during ``.strip()`` — the prepare path should
+    coerce non-strings to ``None`` and proceed."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "list_skills",
+            {"category": 42, "tag": ["not", "a", "string"], "scan_status": {"bad": 1}},
+        )
+    )
+    assert "error" not in item
+    assert item["category"] is None
+    assert item["tag"] is None
+    assert item["scan_status"] is None
+
+
+def test_list_skills_prepare_parses_enabled_only_string_forms(coord_session):
+    """``bool("false")`` is True (non-empty string).  The prepare path
+    must interpret common string forms the way the model would expect."""
+    sess, _coord, _ui = coord_session
+    for raw, expected in (
+        ("true", True),
+        ("True", True),
+        ("1", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+        ("", False),
+        (True, True),
+        (False, False),
+    ):
+        item = sess._prepare_tool(_tc("list_skills", {"enabled_only": raw}))
+        assert item.get("enabled_only") is expected, (
+            f"enabled_only={raw!r} → {item.get('enabled_only')!r}, expected {expected!r}"
+        )
+
+
+def test_list_skills_exec_dispatches_to_client(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_skills.return_value = {
+        "skills": [{"name": "alpha", "tags": ["gpu"]}],
+        "truncated": False,
+    }
+    item = sess._prepare_tool(_tc("list_skills", {"category": "ops", "tag": "gpu"}))
+    call_id, output = sess._exec_list_skills(item)
+    assert call_id == "call-1"
+    parsed = json.loads(output)
+    assert parsed["skills"][0]["name"] == "alpha"
+    coord.list_skills.assert_called_once_with(
+        category="ops",
+        tag="gpu",
+        scan_status=None,
+        enabled_only=False,
+        limit=100,
+    )
+
+
+def test_list_skills_exec_surfaces_truncated_sentinel(coord_session):
+    sess, coord, ui = coord_session
+    coord.list_skills.return_value = {"skills": [], "truncated": True}
+    item = sess._prepare_tool(_tc("list_skills", {}))
+    _, _ = sess._exec_list_skills(item)
+    assert any("truncated" in r[2] for r in ui.tool_results)
+
+
+# ---------------------------------------------------------------------------
+# task_list
+# ---------------------------------------------------------------------------
+
+
+def test_task_list_list_is_auto_approved(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "list"}))
+    assert item["needs_approval"] is False
+    assert item["action"] == "list"
+
+
+def test_task_list_bare_string_fallback_uses_action_primary_key(coord_session):
+    """A model that emits an unquoted ``list`` as the arguments blob
+    lands on the ``primary_key=action`` fallback and recovers.  Before
+    the fix primary_key was ``title`` so the fallback produced
+    ``{"title": "list"}`` and hit the required-action rejection."""
+    sess, _coord, _ui = coord_session
+    call = {
+        "id": "c1",
+        "type": "function",
+        "function": {"name": "task_list", "arguments": "list"},
+    }
+    item = sess._prepare_tool(call)
+    assert "error" not in item
+    assert item["action"] == "list"
+
+
+def test_task_list_mutating_actions_need_approval(coord_session):
+    sess, _coord, _ui = coord_session
+    add_item = sess._prepare_tool(_tc("task_list", {"action": "add", "title": "plan"}))
+    assert add_item["needs_approval"] is True
+    update_item = sess._prepare_tool(
+        _tc("task_list", {"action": "update", "task_id": "tsk_1", "status": "done"})
+    )
+    assert update_item["needs_approval"] is True
+    remove_item = sess._prepare_tool(_tc("task_list", {"action": "remove", "task_id": "tsk_1"}))
+    assert remove_item["needs_approval"] is True
+    reorder_item = sess._prepare_tool(
+        _tc("task_list", {"action": "reorder", "task_ids": ["tsk_1"]})
+    )
+    assert reorder_item["needs_approval"] is True
+
+
+def test_task_list_unknown_action_errors(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "wat"}))
+    assert "error" in item
+
+
+def test_task_list_non_string_action_errors_cleanly(coord_session):
+    """A malformed ``action=42`` must NOT raise AttributeError during
+    ``.strip().lower()`` — coerce to the empty string and fall through
+    to the enum-check error."""
+    sess, _coord, _ui = coord_session
+    for bad_action in (42, None, ["list"], {"a": 1}, True):
+        item = sess._prepare_tool(_tc("task_list", {"action": bad_action}))
+        assert "error" in item, f"action={bad_action!r} did not produce a clean error"
+
+
+def test_task_list_add_rejects_non_string_title_and_status(coord_session):
+    """Add branch: ``title=42`` / ``status=0`` must NOT raise
+    AttributeError during ``.strip()``; produce a clean error item."""
+    sess, _coord, _ui = coord_session
+    for bad in ({"action": "add", "title": 42}, {"action": "add", "title": "ok", "status": 0}):
+        item = sess._prepare_tool(_tc("task_list", bad))
+        assert "error" in item, f"args={bad!r} did not produce a clean error"
+
+
+def test_task_list_remove_non_string_task_id_errors_cleanly(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "remove", "task_id": 42}))
+    assert "error" in item
+
+
+def test_task_list_add_requires_title(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "add", "title": ""}))
+    assert "error" in item
+
+
+def test_task_list_update_requires_task_id(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "update", "status": "done"}))
+    assert "error" in item
+
+
+def test_task_list_update_rejects_non_string_field_values(coord_session):
+    """Preview must not diverge from execute: reject non-string field
+    values at prepare time rather than silently coercing to None."""
+    sess, _coord, _ui = coord_session
+    for field in ("title", "status", "child_ws_id"):
+        item = sess._prepare_tool(
+            _tc("task_list", {"action": "update", "task_id": "t1", field: 42})
+        )
+        assert "error" in item, f"update with non-string {field} should error"
+
+
+def test_task_list_update_requires_at_least_one_field(coord_session):
+    """update with only task_id is a no-op — reject to save an approval prompt."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "update", "task_id": "t1"}))
+    assert "error" in item
+
+
+def test_task_list_remove_requires_task_id(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "remove"}))
+    assert "error" in item
+
+
+def test_task_list_reorder_requires_list_of_strings(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("task_list", {"action": "reorder", "task_ids": [1, 2]}))
+    assert "error" in item
+
+
+def test_task_list_exec_list_returns_tasks(coord_session):
+    sess, coord, _ui = coord_session
+    coord.task_list_get.return_value = {
+        "version": 1,
+        "tasks": [{"id": "tsk_1", "title": "do", "status": "pending"}],
+    }
+    item = sess._prepare_tool(_tc("task_list", {"action": "list"}))
+    _, output = sess._exec_task_list(item)
+    parsed = json.loads(output)
+    assert parsed["tasks"][0]["id"] == "tsk_1"
+    assert parsed["truncated"] is False
+
+
+def test_task_list_exec_list_page_caps_at_200(coord_session):
+    sess, coord, _ui = coord_session
+    coord.task_list_get.return_value = {
+        "version": 1,
+        "tasks": [{"id": f"tsk_{i}", "title": "x", "status": "pending"} for i in range(250)],
+    }
+    item = sess._prepare_tool(_tc("task_list", {"action": "list"}))
+    _, output = sess._exec_task_list(item)
+    parsed = json.loads(output)
+    assert len(parsed["tasks"]) == 200
+    assert parsed["truncated"] is True
+
+
+def test_task_list_exec_add_dispatches(coord_session):
+    sess, coord, _ui = coord_session
+    coord.task_list_add.return_value = {"id": "tsk_new", "title": "plan"}
+    item = sess._prepare_tool(
+        _tc("task_list", {"action": "add", "title": "plan", "status": "pending"})
+    )
+    _, _ = sess._exec_task_list(item)
+    coord.task_list_add.assert_called_once_with(
+        sess._ws_id, title="plan", status="pending", child_ws_id=""
+    )
+
+
+def test_task_list_exec_reorder_surfaces_permutation_error(coord_session):
+    sess, coord, _ui = coord_session
+    coord.task_list_reorder.return_value = {"error": "task_ids must be a permutation..."}
+    item = sess._prepare_tool(_tc("task_list", {"action": "reorder", "task_ids": ["wrong"]}))
+    _, output = sess._exec_task_list(item)
+    parsed = json.loads(output)
+    assert "error" in parsed
+
+
+def test_task_list_exec_remove_passes_client_dict_through(coord_session):
+    """The client returns a dict; exec must pass it through without
+    synthesising a generic 'not found' message that would mask corrupt-
+    envelope errors from the LLM."""
+    sess, coord, _ui = coord_session
+    coord.task_list_remove.return_value = {
+        "error": "task_list envelope is corrupt on disk; refusing to overwrite."
+    }
+    item = sess._prepare_tool(_tc("task_list", {"action": "remove", "task_id": "x"}))
+    _, output = sess._exec_task_list(item)
+    parsed = json.loads(output)
+    assert "corrupt" in parsed["error"]
+
+
+def test_task_list_exec_remove_success_dispatches(coord_session):
+    sess, coord, _ui = coord_session
+    coord.task_list_remove.return_value = {"ok": True, "task_id": "tsk_1"}
+    item = sess._prepare_tool(_tc("task_list", {"action": "remove", "task_id": "tsk_1"}))
+    _, output = sess._exec_task_list(item)
+    parsed = json.loads(output)
+    assert parsed.get("ok") is True

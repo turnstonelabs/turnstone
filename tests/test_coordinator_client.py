@@ -427,3 +427,390 @@ def test_list_children_truncated_signals_db_page_full(populated_storage):
     # always fills the page so truncated must fire.
     result = client.list_children("coord-1", limit=1)
     assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# list_nodes
+# ---------------------------------------------------------------------------
+
+
+def _set_meta(storage, node_id, entries):
+    """Write node metadata the way production writers do — JSON-encoded values.
+
+    ``server.py``, ``admin.py``, and ``console/server.py`` all call
+    ``set_node_metadata[_bulk]`` with ``json.dumps(value)``.  Tests have
+    to use the same encoding so coordinator filter semantics are
+    validated against realistic data.
+    """
+    storage.set_node_metadata_bulk(
+        node_id,
+        [(k, json.dumps(v), src) for (k, v, src) in entries],
+    )
+
+
+@pytest.fixture
+def storage_with_nodes(tmp_path):
+    st = SQLiteBackend(str(tmp_path / "nodes.db"))
+    _set_meta(
+        st,
+        "node-a",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 4, "auto"),
+            ("region", "us-east", "user"),
+        ],
+    )
+    _set_meta(
+        st,
+        "node-b",
+        [
+            ("arch", "x86_64", "auto"),
+            ("cpu_count", 16, "auto"),
+            ("region", "us-west", "user"),
+            ("capability", "gpu", "user"),
+        ],
+    )
+    _set_meta(
+        st,
+        "node-c",
+        [("arch", "arm64", "auto"), ("cpu_count", 8, "auto")],
+    )
+    return st
+
+
+def test_list_nodes_no_filters_returns_all_rows_decoded(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes()
+    assert set(result.keys()) == {"nodes", "truncated"}
+    node_ids = {n["node_id"] for n in result["nodes"]}
+    assert node_ids == {"node-a", "node-b", "node-c"}
+    assert result["truncated"] is False
+    # Values round-trip through json.loads — model sees natural types,
+    # not the raw stored JSON text.
+    node_b = next(n for n in result["nodes"] if n["node_id"] == "node-b")
+    assert node_b["metadata"]["arch"] == {"value": "x86_64", "source": "auto"}
+    assert node_b["metadata"]["cpu_count"] == {"value": 16, "source": "auto"}
+    assert node_b["metadata"]["capability"] == {"value": "gpu", "source": "user"}
+
+
+def test_list_nodes_filter_uses_natural_value_not_quoted(storage_with_nodes, monkeypatch):
+    """Model passes ``{"capability": "gpu"}`` — client re-encodes to
+    ``'"gpu"'`` before filter_nodes_by_metadata so the stored text
+    matches.  Also asserts the filtered path fetches metadata only for
+    the paginated slice (bounded at page_size) rather than the whole
+    cluster — no wide ``get_all_node_metadata`` scan on a narrow filter.
+    """
+    per_node_calls: list[str] = []
+    real = storage_with_nodes.get_node_metadata
+
+    def _spy(nid):  # type: ignore[no-untyped-def]
+        per_node_calls.append(nid)
+        return real(nid)
+
+    all_meta_calls: list[int] = []
+    real_all = storage_with_nodes.get_all_node_metadata
+
+    def _spy_all():  # type: ignore[no-untyped-def]
+        all_meta_calls.append(1)
+        return real_all()
+
+    monkeypatch.setattr(storage_with_nodes, "get_node_metadata", _spy)
+    monkeypatch.setattr(storage_with_nodes, "get_all_node_metadata", _spy_all)
+
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"capability": "gpu"})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-b"}
+    # Filtered path: no wide scan; per-node lookups bounded to the
+    # matching page (1 row matched the filter).
+    assert all_meta_calls == []
+    assert per_node_calls == ["node-b"]
+
+
+def test_list_nodes_filter_accepts_int_and_encodes_correctly(storage_with_nodes):
+    """Model passes ``{"cpu_count": 4}`` — int encoded to ``"4"``; match."""
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"cpu_count": 4})
+    assert {n["node_id"] for n in result["nodes"]} == {"node-a"}
+
+
+def test_list_nodes_int_and_string_filters_are_distinct(storage_with_nodes):
+    """The JSON schema for ``filters`` accepts primitives (string, integer,
+    number, boolean); stringified ints compare as strings, not as ints.
+    The tool description documents this as ``JSON-equal compare``.
+    """
+    client = _make_read_client(storage_with_nodes)
+    # Int filter against int-stored value matches.
+    assert {n["node_id"] for n in client.list_nodes(filters={"cpu_count": 4})["nodes"]} == {
+        "node-a"
+    }
+    # String filter against int-stored value is a distinct comparison and
+    # returns zero rows — ``"4"`` JSON-encodes to ``'"4"'`` but the stored
+    # row is ``'4'``.  Documented in the tool description.
+    assert client.list_nodes(filters={"cpu_count": "4"})["nodes"] == []
+
+
+def test_list_nodes_truncation_signal(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(limit=2)
+    assert len(result["nodes"]) == 2
+    assert result["truncated"] is True
+
+
+def test_list_nodes_empty_on_no_matching_filters(storage_with_nodes):
+    client = _make_read_client(storage_with_nodes)
+    result = client.list_nodes(filters={"region": "nowhere"})
+    assert result["nodes"] == []
+    assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# list_skills
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def storage_with_skills(tmp_path):
+    st = SQLiteBackend(str(tmp_path / "skills.db"))
+    st.create_prompt_template(
+        template_id="s1",
+        name="alpha",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags='["gpu", "fast"]',
+    )
+    st.create_prompt_template(
+        template_id="s2",
+        name="beta",
+        category="engineering",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags='["slow"]',
+    )
+    st.create_prompt_template(
+        template_id="s3",
+        name="gamma",
+        category="engineering",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        enabled=False,
+    )
+    return st
+
+
+def test_list_skills_returns_shape(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills()
+    assert set(result.keys()) == {"skills", "truncated"}
+    names = {s["name"] for s in result["skills"]}
+    assert names == {"alpha", "beta", "gamma"}
+    # Tags decoded to a list, not a string.
+    alpha = next(s for s in result["skills"] if s["name"] == "alpha")
+    assert alpha["tags"] == ["gpu", "fast"]
+    # Discovery projection only — not full row.
+    assert "content" not in alpha
+
+
+def test_list_skills_pushes_filters_to_storage_no_per_row_lookups(storage_with_skills, monkeypatch):
+    called = []
+    real_get = storage_with_skills.get_prompt_template
+
+    def _spy(tid):  # type: ignore[no-untyped-def]
+        called.append(tid)
+        return real_get(tid)
+
+    monkeypatch.setattr(storage_with_skills, "get_prompt_template", _spy)
+
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(tag="gpu")
+    assert {s["name"] for s in result["skills"]} == {"alpha"}
+    assert called == []  # no N+1
+
+
+def test_list_skills_enabled_only(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(enabled_only=True)
+    names = {s["name"] for s in result["skills"]}
+    assert names == {"alpha", "beta"}  # gamma is disabled
+
+
+def test_list_skills_truncation_signal(storage_with_skills):
+    client = _make_read_client(storage_with_skills)
+    result = client.list_skills(limit=2)
+    assert len(result["skills"]) == 2
+    assert result["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# task_list
+# ---------------------------------------------------------------------------
+
+
+def _task_client(tmp_path) -> CoordinatorClient:
+    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    return _make_read_client(st)
+
+
+def test_task_list_get_empty_envelope_on_fresh_ws(tmp_path):
+    client = _task_client(tmp_path)
+    env = client.task_list_get("coord-1")
+    assert env == {"version": 1, "tasks": []}
+
+
+def test_task_list_add_then_get_roundtrip(tmp_path):
+    client = _task_client(tmp_path)
+    task = client.task_list_add("coord-1", title="spawn worker")
+    assert task["title"] == "spawn worker"
+    assert task["status"] == "pending"
+    env = client.task_list_get("coord-1")
+    assert len(env["tasks"]) == 1
+    assert env["tasks"][0]["id"] == task["id"]
+
+
+def test_task_list_add_rejects_empty_title(tmp_path):
+    client = _task_client(tmp_path)
+    result = client.task_list_add("coord-1", title="   ")
+    assert "error" in result
+
+
+def test_task_list_add_rejects_invalid_status(tmp_path):
+    client = _task_client(tmp_path)
+    result = client.task_list_add("coord-1", title="x", status="nonsense")
+    assert "error" in result
+
+
+def test_task_list_add_clamps_title_to_200(tmp_path):
+    client = _task_client(tmp_path)
+    long_title = "a" * 500
+    task = client.task_list_add("coord-1", title=long_title)
+    assert len(task["title"]) == 200
+
+
+def test_task_list_update_by_id(tmp_path):
+    client = _task_client(tmp_path)
+    added = client.task_list_add("coord-1", title="plan")
+    updated = client.task_list_update(
+        "coord-1", task_id=added["id"], status="done", child_ws_id="ws-child"
+    )
+    assert updated["status"] == "done"
+    assert updated["child_ws_id"] == "ws-child"
+
+
+def test_task_list_update_missing_id(tmp_path):
+    client = _task_client(tmp_path)
+    result = client.task_list_update("coord-1", task_id="nope", status="done")
+    assert "error" in result
+
+
+def test_task_list_remove(tmp_path):
+    client = _task_client(tmp_path)
+    added = client.task_list_add("coord-1", title="plan")
+    first = client.task_list_remove("coord-1", task_id=added["id"])
+    assert first.get("ok") is True
+    assert first.get("task_id") == added["id"]
+    # Second remove of the same id returns a distinguishable not-found
+    # error (NOT a silent False that would mask a corrupt envelope).
+    second = client.task_list_remove("coord-1", task_id=added["id"])
+    assert "error" in second
+    assert "not found" in second["error"]
+    assert client.task_list_get("coord-1")["tasks"] == []
+
+
+def test_task_list_reorder_requires_permutation(tmp_path):
+    client = _task_client(tmp_path)
+    a = client.task_list_add("coord-1", title="a")
+    b = client.task_list_add("coord-1", title="b")
+    # Partial set — must reject.
+    bad = client.task_list_reorder("coord-1", task_ids=[a["id"]])
+    assert "error" in bad
+    # Wrong id — reject.
+    wrong = client.task_list_reorder("coord-1", task_ids=[a["id"], "ghost"])
+    assert "error" in wrong
+    # Valid permutation — accept.
+    ok = client.task_list_reorder("coord-1", task_ids=[b["id"], a["id"]])
+    assert ok.get("ok") is True
+    env = client.task_list_get("coord-1")
+    assert [t["id"] for t in env["tasks"]] == [b["id"], a["id"]]
+
+
+def test_task_list_cross_ws_scope_violation_is_noop(tmp_path):
+    client = _task_client(tmp_path)
+    # Client is bound to coord-1; anything else returns an empty envelope
+    # or an error without touching storage.
+    assert client.task_list_get("other-ws") == {"version": 1, "tasks": []}
+    res_add = client.task_list_add("other-ws", title="sneak")
+    assert "error" in res_add
+    res_remove = client.task_list_remove("other-ws", task_id="x")
+    assert "error" in res_remove
+    assert "scope violation" in res_remove["error"]
+
+
+def test_task_list_corrupt_json_returns_empty_envelope(tmp_path):
+    """A hand-edited / corrupt config row must not crash the tool."""
+    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"tasks": "{not json"})
+    client = _make_read_client(st)
+    env = client.task_list_get("coord-1")
+    assert env == {"version": 1, "tasks": []}
+
+
+def test_task_list_mutations_refuse_corrupt_envelope(tmp_path):
+    """When the envelope is corrupt on disk, mutators must error out
+    (rather than silently overwrite — lost-data safety)."""
+    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"tasks": "{not json"})
+    client = _make_read_client(st)
+    add_result = client.task_list_add("coord-1", title="new")
+    assert "error" in add_result
+    assert "corrupt" in add_result["error"]
+    # Also: the corrupt blob is preserved after the refused mutation.
+    assert st.load_workstream_config("coord-1").get("tasks") == "{not json"
+    update_result = client.task_list_update("coord-1", task_id="x", status="done")
+    assert "error" in update_result
+    reorder_result = client.task_list_reorder("coord-1", task_ids=[])
+    assert "error" in reorder_result
+    remove_result = client.task_list_remove("coord-1", task_id="x")
+    assert "error" in remove_result
+    assert "corrupt" in remove_result["error"]
+
+
+def test_task_list_add_enforces_capacity_cap(tmp_path, monkeypatch):
+    from turnstone.console import coordinator_client as cc_module
+
+    monkeypatch.setattr(cc_module, "_TASK_LIST_MAX", 3)
+    client = _task_client(tmp_path)
+    for i in range(3):
+        client.task_list_add("coord-1", title=f"t{i}")
+    overflow = client.task_list_add("coord-1", title="no-room")
+    assert "error" in overflow
+    assert "capacity" in overflow["error"]
+    # After a remove, add succeeds again.
+    env = client.task_list_get("coord-1")
+    client.task_list_remove("coord-1", task_id=env["tasks"][0]["id"])
+    added = client.task_list_add("coord-1", title="retry")
+    assert "error" not in added
+
+
+def test_task_list_save_preserves_other_workstream_config_keys(tmp_path):
+    """_save_task_list writes only the 'tasks' key so other keys survive."""
+    st = SQLiteBackend(str(tmp_path / "tasks.db"))
+    st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    st.save_workstream_config("coord-1", {"reasoning_effort": "high"})
+    client = _make_read_client(st)
+    client.task_list_add("coord-1", title="plan")
+    config = st.load_workstream_config("coord-1")
+    assert config.get("reasoning_effort") == "high"
+    assert config.get("tasks")  # task_list wrote its key too

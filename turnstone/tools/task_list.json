@@ -1,0 +1,39 @@
+{
+  "name": "task_list",
+  "description": "Lightweight, ordered task list for the coordinator's own planning state. Persisted on the coordinator workstream so it survives restarts. Use to track work decomposition, mark progress, and link tasks to spawned children (child_ws_id field). Five actions: add (append a task, needs approval), update (mutate title/status/child_ws_id by id, needs approval), remove (delete by id, needs approval), reorder (rearrange by id list, needs approval), list (read, auto-approved). Status enum: pending / in_progress / done / blocked.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "description": "One of: add / update / remove / reorder / list.",
+        "enum": ["add", "update", "remove", "reorder", "list"]
+      },
+      "title": {
+        "type": "string",
+        "description": "For 'add' and 'update': task title (max 200 chars)."
+      },
+      "task_id": {
+        "type": "string",
+        "description": "For 'update' and 'remove': target task id."
+      },
+      "status": {
+        "type": "string",
+        "description": "For 'add' and 'update': pending / in_progress / done / blocked.",
+        "enum": ["pending", "in_progress", "done", "blocked"]
+      },
+      "child_ws_id": {
+        "type": "string",
+        "description": "For 'add' and 'update': optional ws_id of the child workstream this task represents."
+      },
+      "task_ids": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "For 'reorder': new ordering by task_id (must be a permutation of existing task_ids)."
+      }
+    },
+    "required": ["action"]
+  },
+  "coordinator": true,
+  "primary_key": "action"
+}

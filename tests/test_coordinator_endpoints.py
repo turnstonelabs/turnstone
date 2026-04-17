@@ -28,6 +28,7 @@ from turnstone.console.server import (
     coordinator_detail,
     coordinator_history,
     coordinator_list,
+    coordinator_open,
     coordinator_send,
 )
 from turnstone.core.auth import AuthResult
@@ -134,6 +135,11 @@ def _make_client(
                 "/v1/api/coordinator/{ws_id}/history",
                 coordinator_history,
                 methods=["GET"],
+            ),
+            Route(
+                "/v1/api/coordinator/{ws_id}/open",
+                coordinator_open,
+                methods=["POST"],
             ),
             Route(
                 "/v1/api/coordinator/{ws_id}",
@@ -434,3 +440,99 @@ def test_cancel_resolves_pending_approval(storage):
     resp = client.post(f"/v1/api/coordinator/{ws.id}/cancel", headers=_COORD_HEADERS)
     assert resp.status_code == 200
     assert ws.ui._approval_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Open (explicit rehydration)
+# ---------------------------------------------------------------------------
+
+
+def test_open_returns_already_loaded_when_in_memory(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="user-1", name="live")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(f"/v1/api/coordinator/{ws.id}/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == ws.id
+    assert body.get("already_loaded") is True
+
+
+def test_open_returns_404_on_ownership_mismatch_in_memory(storage):
+    mgr = _build_mgr(storage)
+    ws = mgr.create(user_id="owner", name="theirs")
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        f"/v1/api/coordinator/{ws.id}/open",
+        headers={"X-Test-User": "stranger", "X-Test-Perms": "admin.coordinator"},
+    )
+    assert resp.status_code == 404  # not 403 — don't leak existence
+
+
+def test_open_rehydrates_when_not_in_memory(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    rehydrated = MagicMock()
+    rehydrated.id = "coord-rehy"
+    rehydrated.name = "rehydrated"
+    rehydrated.user_id = "user-1"
+    monkeypatch.setattr(mgr, "open", MagicMock(return_value=rehydrated))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/coordinator/coord-rehy/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == "coord-rehy"
+    assert body["name"] == "rehydrated"
+    assert "already_loaded" not in body
+    mgr.open.assert_called_once_with("coord-rehy", "user-1")
+
+
+def test_open_admin_uses_open_admin(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    rehydrated = MagicMock()
+    rehydrated.id = "coord-rehy"
+    rehydrated.name = "r"
+    rehydrated.user_id = "someone-else"
+    monkeypatch.setattr(mgr, "open_admin", MagicMock(return_value=rehydrated))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post(
+        "/v1/api/coordinator/coord-rehy/open",
+        headers={
+            "X-Test-User": "admin-1",
+            "X-Test-Perms": "admin.coordinator,admin.users",
+        },
+    )
+    assert resp.status_code == 200
+    mgr.open_admin.assert_called_once_with("coord-rehy")
+
+
+def test_open_returns_404_when_unknown_ws_id(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    monkeypatch.setattr(mgr, "open", MagicMock(return_value=None))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/coordinator/nonexistent/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 404
+
+
+def test_open_503_on_coord_mgr_unavailable(storage):
+    client = _make_client(storage, coord_mgr=None)
+    resp = client.post("/v1/api/coordinator/any-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+
+
+def test_open_correlation_id_on_factory_failure(storage, monkeypatch):
+    mgr = _build_mgr(storage)
+    monkeypatch.setattr(mgr, "open", MagicMock(side_effect=RuntimeError("boom")))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/coordinator/bad-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 500
+    assert "correlation_id=" in resp.json()["error"]
+
+
+def test_open_503_when_open_raises_value_error(storage, monkeypatch):
+    """ValueError from the factory surfaces as 503 with the remediation text."""
+    mgr = _build_mgr(storage)
+    monkeypatch.setattr(mgr, "open", MagicMock(side_effect=ValueError("coord registry missing")))
+    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    resp = client.post("/v1/api/coordinator/bad-ws/open", headers=_COORD_HEADERS)
+    assert resp.status_code == 503
+    assert "registry missing" in resp.json()["error"]

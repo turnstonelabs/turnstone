@@ -72,8 +72,8 @@ class TestToolsMetadata:
     """Validate the metadata extracted from JSON files."""
 
     def test_tool_count(self):
-        # 19 original tools + 6 coordinator tools
-        assert len(TOOLS) == 25
+        # 19 interactive tools + 9 coordinator tools
+        assert len(TOOLS) == 28
 
     def test_agent_tools_count(self):
         assert len(AGENT_TOOLS) == 10
@@ -84,7 +84,7 @@ class TestToolsMetadata:
     def test_coordinator_tools_count(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
 
-        assert len(COORDINATOR_TOOLS) == 6
+        assert len(COORDINATOR_TOOLS) == 9
         assert {t["function"]["name"] for t in COORDINATOR_TOOLS} == {
             "spawn_workstream",
             "inspect_workstream",
@@ -92,6 +92,9 @@ class TestToolsMetadata:
             "close_workstream",
             "delete_workstream",
             "list_workstreams",
+            "list_nodes",
+            "list_skills",
+            "task_list",
         }
 
     def test_auto_approve_sets_match(self):
@@ -107,6 +110,8 @@ class TestToolsMetadata:
             # Coordinator read-only tools (no-mutation, safe to auto-approve):
             "inspect_workstream",
             "list_workstreams",
+            "list_nodes",
+            "list_skills",
         }
         assert expected == AGENT_AUTO_TOOLS
         assert expected == TASK_AUTO_TOOLS
@@ -138,6 +143,7 @@ class TestToolsMetadata:
             "send_to_workstream": "message",
             "close_workstream": "ws_id",
             "delete_workstream": "ws_id",
+            "task_list": "action",
         }
         assert expected == PRIMARY_KEY_MAP
 
