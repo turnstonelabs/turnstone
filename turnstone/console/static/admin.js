@@ -35,19 +35,24 @@ var INHERIT_EMPTY_LABEL_KEYS = ["model.plan_effort", "model.task_effort"];
 // ---------------------------------------------------------------------------
 
 function showAdmin() {
-  /* global currentView, showOverview */
-  // Toggle: if already in admin view, go back to overview
+  /* global currentView, showHome */
+  // Toggle: if already in admin view, go back to the home landing
   if (currentView === "admin") {
     var adminBtn = document.getElementById("admin-btn");
     if (adminBtn) {
       adminBtn.classList.remove("active");
       adminBtn.setAttribute("aria-expanded", "false");
     }
-    showOverview();
+    showHome();
     return;
   }
 
   currentView = "admin";
+  if (typeof _stopActiveCoordsPolling === "function") {
+    _stopActiveCoordsPolling();
+  }
+  var homeView = document.getElementById("view-home");
+  if (homeView) homeView.style.display = "none";
   document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "none";

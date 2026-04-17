@@ -450,9 +450,10 @@
   overflow-wrap: break-word;
 }
 .msg-user {
-  background: var(--bg-highlight);
-  border: 1px solid var(--border-strong);
-  align-self: flex-end;
+  /* Alignment, border, background provided by .ts-msg / .ts-msg--user
+     (shared_static/chat.css).  Interactive UI only keeps the
+     brighter text colour here so the user message still reads as
+     "the thing I said" against the lower-chroma assistant colour. */
   color: var(--fg-bright);
 }
 .msg-queued {
@@ -487,9 +488,9 @@
 .queued-dismiss:hover {
   color: var(--red);
 }
-.msg-assistant { align-self: flex-start; }
-.msg-info { color: var(--cyan); font-size: 12px; padding: 4px 14px; white-space: pre-wrap; font-family: inherit; }
-.msg-error { color: var(--red); font-size: 12px; padding: 4px 14px; }
+/* .msg-assistant / .msg-info / .msg-error alignment + baseline visuals
+   come from .ts-msg--* in shared_static/chat.css. */
+.msg-info { white-space: pre-wrap; }
 .msg-tool {
   background: var(--bg-surface);
   border: 1px solid var(--border);
@@ -908,81 +909,20 @@ body { position: static; }
 }
 
 /* ==========================================================================
-   Input area
+   Input area — shared shell lives in /shared/chat.css (.ts-composer /
+   .ts-composer-row / .ts-composer-input / .ts-composer-send /
+   .ts-composer-attach).  Interactive UI only keeps the page-specific
+   bits below: the .pane-send queue-mode colour flip and the .pane-stop
+   button (cancel generation — doesn't exist on the coordinator).
    ========================================================================== */
-.pane-input-area {
-  padding: 12px 16px;
-  background: var(--bg-surface);
-  border-top: 1px solid var(--border-strong);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  flex-shrink: 0;
-}
-.pane-input-row {
-  display: flex;
-  gap: 8px;
-  align-items: flex-end;
-}
-.pane-input {
-  flex: 1;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-sm);
-  padding: 9px 12px;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  resize: none;
-  outline: none;
-  min-height: 40px;
-  max-height: 200px;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-.pane-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
-.pane-input-area button {
-  background: var(--accent);
-  color: var(--bg);
-  border: none;
-  border-radius: var(--radius-sm);
-  padding: 9px 18px;
-  font-family: var(--font-display);
-  font-size: 13px;
-  cursor: pointer;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  transition: filter 0.15s;
-}
-.pane-input-area button:hover { filter: brightness(1.1); }
-.pane-input-area button:disabled { opacity: 0.35; cursor: not-allowed; filter: none; }
 .pane-send.queue-mode {
   background: transparent;
   color: var(--accent);
   border: 1px solid var(--accent);
 }
-.pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; }
+.pane-stop { background: var(--red, #c94040); min-width: 120px; text-align: center; white-space: nowrap; color: var(--on-color); border: 1px solid var(--red); border-radius: var(--radius-sm); padding: 6px 16px; font-family: var(--font-mono); font-size: 12px; font-weight: 600; cursor: pointer; height: 32px; }
 .pane-stop:focus-visible { outline: 2px solid var(--fg-bright, #e8ecf4); outline-offset: 2px; }
 [data-theme="light"] .pane-stop { color: #fff; }
-
-/* Paperclip button — secondary action, same footprint as send button */
-.pane-attach {
-  background: transparent !important;
-  color: var(--fg-dim, var(--fg)) !important;
-  border: 1px solid var(--border-strong) !important;
-  padding: 9px 12px !important;
-  font-size: 15px !important;
-  line-height: 1;
-  flex-shrink: 0;
-}
-.pane-attach:hover {
-  color: var(--accent) !important;
-  border-color: var(--accent) !important;
-  filter: none !important;
-}
-.pane-attach:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
 
 /* Attachment chips — pill cluster above the textarea */
 .pane-attach-chips {
@@ -1217,7 +1157,9 @@ body { position: static; }
 .approval-block.denied { border-left-color: var(--red); }
 .approval-block.denied .approval-tool { opacity: 0.55; }
 .approval-block.denied .approval-tool .tool-name { color: var(--muted); }
-.approval-tool { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+/* .ts-approval (chat.css) stacks children with flex gap; the old
+   border-bottom would dangle between rows now. */
+.approval-tool { padding: 8px 12px; }
 .approval-tool:last-of-type { border-bottom: none; }
 .approval-tool .tool-name { color: var(--yellow); font-weight: 600; font-size: 11px; margin-bottom: 3px; }
 .approval-tool .tool-cmd { color: var(--fg-bright); white-space: pre-wrap; word-break: break-all; max-height: 120px; overflow: hidden; }
@@ -2035,8 +1977,10 @@ audio.media-player {
   display: flex;
   align-items: center;
   gap: 8px;
-  border-top: 1px solid var(--border);
   margin-top: 2px;
+  /* No top separator — .ts-verdict-badge (chat.css) shrinks to
+     max-content width, and a 1px border-top would extend only under
+     the badge text and read as a truncated line. */
 }
 .verdict-low      { color: var(--green);  border-left: 3px solid var(--green);  }
 .verdict-medium   { color: var(--yellow); border-left: 3px solid var(--yellow); }

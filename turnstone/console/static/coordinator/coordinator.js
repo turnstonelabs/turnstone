@@ -12,13 +12,12 @@
  * (toggleTheme), shared/toast.js (toast.info / toast.error),
  * shared/utils.js (escapeHtml, linkify helpers).
  *
- * Assistant content follows the renderer.js pipeline from the server UI
- * (ui/static/app.js): buffer the raw markdown as tokens stream in, keep
- * the visible text plain during streaming, and swap to the rendered
- * innerHTML + postRenderMarkdown() once the stream ends.  Reasoning
- * bubbles stay text-only because they're transient and styled dim/italic.
- * See turnstone/ui/static/app.js (search for renderMarkdown) for the
- * canonical pattern we mirror.
+ * Assistant content goes through the shared shared_static/renderer.js
+ * streaming helpers (streamingRender + streamingRenderFinalize): the
+ * helper coalesces renderMarkdown calls through requestAnimationFrame
+ * as tokens arrive, then runs the expensive post-render (hljs /
+ * mermaid / KaTeX) once on stream_end.  Reasoning bubbles stay
+ * text-only because they're transient and styled dim/italic.
  */
 (function () {
   "use strict";
@@ -125,19 +124,39 @@
   // Message append helpers
   // ------------------------------------------------------------------
 
+  // Map raw role → ts-msg modifier.  "error" overloads the role slot
+  // for styling; opts.label still carries the tool name so SR text
+  // like "error · bash" stays meaningful on the data-ts-role /
+  // aria-label attributes when labels stop rendering as DOM text.
+  const _TS_ROLE_VARIANTS = {
+    user: "ts-msg--user",
+    assistant: "ts-msg--assistant",
+    reasoning: "ts-msg--reasoning",
+    tool: "ts-msg--tool",
+    error: "ts-msg--error",
+  };
+
   function appendMsg(role, html, opts) {
     opts = opts || {};
     const el = document.createElement("div");
-    el.className = "coord-msg role-" + role;
+    const variant = _TS_ROLE_VARIANTS[role] || "ts-msg--assistant";
+    el.className = "coord-msg role-" + role + " ts-msg " + variant;
+    // role="article" makes aria-label reliably announced by screen
+    // readers — a generic <div> with no implicit role doesn't expose
+    // aria-label on its own.  "article" fits: each message is a
+    // self-contained content unit in the chat log.
+    el.setAttribute("role", "article");
     if (opts.callId) el.dataset.callId = opts.callId;
     if (opts.label) {
-      const labelEl = document.createElement("div");
-      labelEl.className = "role-label";
-      labelEl.textContent = opts.label;
-      el.appendChild(labelEl);
+      // The visible .role-label div is dropped in favour of
+      // border-colour differentiation.  Preserve the role text as
+      // data-ts-role + aria-label so AT and the SSE dedup-by-call-id
+      // path continue to carry the tool name.
+      el.setAttribute("data-ts-role", opts.label);
+      el.setAttribute("aria-label", opts.label);
     }
     const body = document.createElement("div");
-    body.className = "coord-body";
+    body.className = "coord-body ts-msg-body";
     body.innerHTML = html;
     el.appendChild(body);
     messagesEl.appendChild(el);
@@ -187,17 +206,20 @@
       messagesEl.setAttribute("aria-live", "off");
     }
     currentAssistantBuf += text;
-    // During streaming we keep the visible text as textContent (plain
-    // string, not rendered markdown).  Re-running renderMarkdown on every
-    // token would be expensive and also produces half-formed output for
-    // partial code fences / lists.  The raw buffer is stashed on the
-    // element so finishAssistantStream() can do one final render pass.
-    // Mirrors ui/static/app.js's `this.contentBuffer` approach — we just
-    // keep the buffer in a closure variable instead of on `this`.
+    // Re-render the buffer through the shared streaming helper on every
+    // token so the user sees live-formatted markdown instead of a final
+    // "pop" on stream_end.  Heavy post-processing (syntax highlighting,
+    // mermaid, KaTeX) stays deferred to streamingRenderFinalize below.
     const body = currentAssistantEl.querySelector(".coord-body");
-    if (body) {
+    if (body && typeof streamingRender === "function") {
+      try {
+        streamingRender(body, currentAssistantBuf);
+      } catch (e) {
+        console.warn("coordinator streamingRender failed", e);
+        body.textContent = currentAssistantBuf;
+      }
+    } else if (body) {
       body.textContent = currentAssistantBuf;
-      body._rawMarkdown = currentAssistantBuf;
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -220,22 +242,18 @@
   }
 
   function finishAssistantStream() {
-    // Promote the streamed plaintext buffer to rendered markdown (code
-    // fences, lists, KaTeX, mermaid, syntax highlighting).  renderMarkdown
-    // escapes HTML internally so innerHTML here is XSS-safe as long as
-    // renderer.js is trusted — same contract as ui/static/app.js.  Guard
-    // the call in a try/catch so a renderer bug can never brick the
-    // coordinator UI; on failure the visible textContent stays put.
+    // Finalize the streamed buffer through the shared helper — this also
+    // runs postRenderMarkdown (syntax highlighting, mermaid, KaTeX) once
+    // all tokens have arrived.  renderMarkdown escapes HTML internally so
+    // the innerHTML assignment inside the helper is XSS-safe as long as
+    // renderer.js is trusted — same contract as ui/static/app.js.
     if (currentAssistantEl && currentAssistantBuf) {
       const body = currentAssistantEl.querySelector(".coord-body");
-      if (body && typeof renderMarkdown === "function") {
+      if (body && typeof streamingRenderFinalize === "function") {
         try {
-          body.innerHTML = renderMarkdown(currentAssistantBuf);
-          if (typeof postRenderMarkdown === "function") {
-            postRenderMarkdown(body);
-          }
+          streamingRenderFinalize(body, currentAssistantBuf);
         } catch (e) {
-          console.warn("coordinator renderMarkdown failed", e);
+          console.warn("coordinator streamingRenderFinalize failed", e);
         }
       }
     }
@@ -257,7 +275,7 @@
     // approval applies to every row, not just the focused one.
     if (pending.length > 0) {
       const header = document.createElement("div");
-      header.className = "tool-row approval-header";
+      header.className = "tool-row approval-header ts-approval-header";
       header.textContent =
         pending.length === 1
           ? "Approve 1 tool call:"
@@ -268,7 +286,7 @@
     pending.forEach((it, idx) => {
       if (!firstCallId) firstCallId = it.call_id;
       const row = document.createElement("div");
-      row.className = "tool-row";
+      row.className = "tool-row ts-approval-tool";
       const label =
         it.header || it.approval_label || it.func_name || "(unknown tool)";
       row.textContent = pending.length > 1 ? idx + 1 + ". " + label : label;
@@ -383,7 +401,12 @@
   };
 
   window.coordCloseSession = async function () {
-    if (!window.confirm("Close this coordinator session?")) return;
+    if (
+      !window.confirm(
+        "End this coordinator session? The server will terminate it.",
+      )
+    )
+      return;
     try {
       const resp = await postJSON(
         "/v1/api/coordinator/" + encodeURIComponent(wsId) + "/close",
@@ -428,7 +451,12 @@
     // alone (WCAG 1.4.1).  ● connected, ○ connecting, ⚠ disconnected.
     const glyph = cls === "ok" ? "● " : cls === "err" ? "⚠ " : "○ ";
     sseEl.textContent = glyph + text;
-    sseEl.className = cls || "";
+    // Preserve the base .ts-header-status class + add the BEM modifier
+    // variant so chat.css's .ts-header-status--ok / --err colour rules
+    // actually win; setting className to just "ok"/"err" drops the
+    // base class and the green / red colour never applies.
+    var base = "ts-header-status";
+    sseEl.className = cls ? base + " " + base + "--" + cls : base;
   }
 
   function connectSSE() {
@@ -469,7 +497,24 @@
       } catch (_) {
         /* noop */
       }
-      scheduleReconnect();
+      // Probe the authed detail endpoint to distinguish an expired
+      // session (401) from a transient network error.  On 401, prompt
+      // for login via the shared auth.js overlay instead of spinning
+      // in backoff forever — match the console / server-UI pattern.
+      // On any other outcome, fall through to the normal reconnect
+      // schedule.
+      var probe = typeof authFetch === "function" ? authFetch : fetch;
+      probe("/v1/api/coordinator/" + encodeURIComponent(wsId))
+        .then(function (r) {
+          if (r.status === 401 && typeof showLogin === "function") {
+            showLogin("Session expired. Please sign in to reconnect.");
+            return;
+          }
+          scheduleReconnect();
+        })
+        .catch(function () {
+          scheduleReconnect();
+        });
     };
     evtSource.onmessage = function (event) {
       let data = null;
@@ -582,8 +627,8 @@
       case "tools_auto_approved":
         (ev.items || []).forEach((it) => appendToolCall(it));
         break;
-      // Phase 3 — child-workstream fan-out routed through the coordinator's
-      // own SSE stream.  CoordinatorManager filters the cluster event bus
+      // Child-workstream fan-out routed through the coordinator's own
+      // SSE stream.  CoordinatorManager filters the cluster event bus
       // by known child ws_ids so we never see unrelated noise here.
       case "child_ws_created":
         handleChildCreated(ev);
@@ -604,7 +649,7 @@
   }
 
   // ------------------------------------------------------------------
-  // Children tree + task list — phase 3 sidebar
+  // Children tree + task list — right sidebar
   // ------------------------------------------------------------------
 
   // ws_id -> child row snapshot.  Updated on initial /children load +
@@ -638,21 +683,22 @@
   let tasksState = { version: 1, tasks: [] };
 
   function stateGlyph(state) {
+    // cls comes from the shared .ui-glyph-* vocabulary in ui-base.css
+    // so the colour treatment matches wherever ui-glyph is used.
     switch (state) {
       case "running":
-        return { glyph: "\u25CF", cls: "glyph-running" };
+        return { glyph: "\u25CF", cls: "ui-glyph ui-glyph-running" };
       case "thinking":
-        return { glyph: "\u25D0", cls: "glyph-thinking" };
+        return { glyph: "\u25D0", cls: "ui-glyph ui-glyph-thinking" };
       case "attention":
-        return { glyph: "\u26A0", cls: "glyph-attention" };
+        return { glyph: "\u26A0", cls: "ui-glyph ui-glyph-attention" };
       case "error":
-        return { glyph: "\u2717", cls: "glyph-error" };
+        return { glyph: "\u2717", cls: "ui-glyph ui-glyph-error" };
       case "closed":
       case "deleted":
-        return { glyph: "\u25CB", cls: "" };
       case "idle":
       default:
-        return { glyph: "\u25CB", cls: "" };
+        return { glyph: "\u25CB", cls: "ui-glyph ui-glyph-idle" };
     }
   }
 
@@ -687,7 +733,7 @@
       a.href = "#";
     }
     const glyphSpan = document.createElement("span");
-    glyphSpan.className = "glyph " + g.cls;
+    glyphSpan.className = g.cls;
     glyphSpan.textContent = g.glyph;
     a.appendChild(glyphSpan);
     const nameSpan = document.createElement("span");
@@ -1177,6 +1223,18 @@
   }
 
   init();
+
+  // When the user re-authenticates after a 401 (see SSE onerror above),
+  // reset the backoff and force an immediate reconnect so the stream
+  // resumes without waiting out the current Math.pow backoff window.
+  window.onLoginSuccess = function () {
+    reconnectAttempts = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    connectSSE();
+  };
 
   // Plain Enter submits; Shift+Enter inserts a newline.  IME composition
   // (isComposing) is respected so users typing in CJK/other IMEs aren't

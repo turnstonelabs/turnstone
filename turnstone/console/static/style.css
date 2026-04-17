@@ -7,6 +7,13 @@
    Header overrides — wider padding for console layout
    ========================================================================== */
 #header { padding: 10px 20px; gap: 16px; }
+#header-home-link {
+  color: inherit;
+  text-decoration: none;
+  letter-spacing: inherit;
+}
+#header-home-link:hover { color: var(--accent); }
+#header-home-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #status-bar { font-size: 11px; color: var(--fg-dim); margin-left: auto; }
 #status-bar.disconnected { color: var(--red); }
 .header-dim {
@@ -32,6 +39,138 @@
   max-width: 1140px;
   margin: 0 auto;
   width: 100%;
+}
+
+/* ==========================================================================
+   Home landing — coordinator-first view
+   Stacked panels: composer → active coordinators → cluster summary.
+   ========================================================================== */
+#view-home { display: flex; flex-direction: column; gap: 22px; }
+
+.home-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Typography overlaps .ui-section-heading but renders flow-layout
+   without the sidebar-row background / border / padding that
+   .ui-section-heading adds — so it's a separate rule.  If more
+   flow-layout headings appear, consider a .ui-section-heading--flow
+   variant. */
+.home-panel-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.home-composer-banner {
+  background: var(--bg-surface);
+  border: 1px solid var(--yellow);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  color: var(--fg-bright);
+  font-size: 12px;
+}
+.home-composer-banner a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+}
+
+.home-composer-task { width: 100%; font-size: 13px; }
+
+.home-composer-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+  flex-wrap: wrap;
+}
+.home-composer-name { flex: 1 1 220px; min-width: 160px; }
+.home-composer-skill { flex: 0 0 180px; }
+.home-composer-submit { flex: 0 0 auto; min-width: 90px; }
+
+.home-composer-error {
+  color: var(--red);
+  font-size: 12px;
+  padding: 4px 2px 0;
+}
+
+.home-section { display: flex; flex-direction: column; gap: 8px; }
+.home-section-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.home-section-count { color: var(--fg-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.home-coord-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.home-coord-list .dashboard-empty { padding: 18px 0; }
+
+/* One-line cluster summary — button styled to look like an info strip
+   so the click affordance stays clear without dominating the layout. */
+.home-cluster-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 14px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  font-variant-numeric: tabular-nums;
+}
+.home-cluster-summary:hover {
+  background: var(--bg-highlight);
+  border-color: var(--accent-dim);
+  color: var(--fg);
+}
+.home-cluster-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.home-cluster-summary-line { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.home-cluster-summary-caret { color: var(--fg-dim); font-size: 10px; transition: transform 0.12s; }
+.home-cluster-summary:hover .home-cluster-summary-caret { transform: translateX(2px); }
+
+/* Sub-700px: collapse the composer row and tighten padding. */
+@media (max-width: 700px) {
+  #main { padding: 14px 12px 48px; }
+  #view-home { gap: 16px; }
+  .home-panel { padding: 12px 12px; }
+  .home-composer-row { flex-direction: column; gap: 6px; }
+  .home-composer-name, .home-composer-skill, .home-composer-submit { flex: none; width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-cluster-summary, .home-cluster-summary-caret { transition: none; }
+  .home-cluster-summary:hover .home-cluster-summary-caret { transform: none; }
 }
 
 /* ==========================================================================
@@ -467,7 +606,7 @@
 }
 .dash-cell-node:hover { text-decoration: underline; color: var(--fg-bright); }
 
-/* Phase 3 — coordinator / child / orphan tree grouping ------------------ */
+/* Coordinator / child / orphan tree grouping ---------------------------- */
 .dash-caret,
 .dash-caret-placeholder {
   display: inline-block;
@@ -1515,7 +1654,6 @@ h3.skill-spec-heading { font-size: inherit; margin-block: 0; }
 #mcp-create-overlay, #mcp-import-overlay, #mcp-detail-overlay, #mcp-install-overlay,
 #github-import-overlay,
 #model-create-overlay,
-#new-coord-overlay,
 #create-hr-overlay, #edit-hr-overlay, #create-ogp-overlay, #edit-ogp-overlay {
   position: fixed;
   inset: 0;

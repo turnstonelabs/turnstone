@@ -172,23 +172,23 @@ Pane.prototype._createDOM = function () {
 
   // Input area
   var inputArea = document.createElement("div");
-  inputArea.className = "pane-input-area";
+  inputArea.className = "pane-input-area ts-composer";
 
   // Attachment chips row — above the textarea, hidden unless populated
   this.attachChipsEl = document.createElement("div");
-  this.attachChipsEl.className = "pane-attach-chips";
+  this.attachChipsEl.className = "pane-attach-chips ts-composer-chips";
   this.attachChipsEl.setAttribute("role", "list");
   this.attachChipsEl.setAttribute("aria-label", "Pending attachments");
   inputArea.appendChild(this.attachChipsEl);
 
   var inputRow = document.createElement("div");
-  inputRow.className = "pane-input-row";
+  inputRow.className = "pane-input-row ts-composer-row";
   inputArea.appendChild(inputRow);
 
   // Paperclip button — opens the file picker
   this.attachBtn = document.createElement("button");
   this.attachBtn.type = "button";
-  this.attachBtn.className = "pane-attach";
+  this.attachBtn.className = "pane-attach ts-composer-attach";
   this.attachBtn.setAttribute("aria-label", "Attach files");
   this.attachBtn.setAttribute("title", "Attach files");
   this.attachBtn.textContent = "\ud83d\udcce"; // 📎
@@ -217,7 +217,7 @@ Pane.prototype._createDOM = function () {
   inputRow.appendChild(this.attachInput);
 
   this.inputEl = document.createElement("textarea");
-  this.inputEl.className = "pane-input";
+  this.inputEl.className = "pane-input ts-composer-input";
   this.inputEl.rows = 1;
   this._isTouch = window.matchMedia(
     "(hover: none) and (pointer: coarse)",
@@ -259,7 +259,7 @@ Pane.prototype._createDOM = function () {
   inputRow.appendChild(this.inputEl);
 
   this.sendBtn = document.createElement("button");
-  this.sendBtn.className = "pane-send";
+  this.sendBtn.className = "pane-send ts-composer-send";
   this.sendBtn.textContent = "Send";
   this.sendBtn.onclick = function () {
     self.sendMessage();
@@ -749,7 +749,8 @@ Pane.prototype.handleEvent = function (evt) {
       this.removeThinkingIndicator();
       if (!this.currentReasoningEl) {
         this.currentReasoningEl = document.createElement("div");
-        this.currentReasoningEl.className = "msg msg-assistant reasoning";
+        this.currentReasoningEl.className =
+          "msg msg-assistant reasoning ts-msg ts-msg--reasoning";
         this.messagesEl.appendChild(this.currentReasoningEl);
       }
       this.currentReasoningEl.textContent += evt.text;
@@ -763,11 +764,21 @@ Pane.prototype.handleEvent = function (evt) {
       }
       if (!this.currentAssistantEl) {
         this.currentAssistantEl = document.createElement("div");
-        this.currentAssistantEl.className = "msg msg-assistant";
+        this.currentAssistantEl.className =
+          "msg msg-assistant ts-msg ts-msg--assistant";
+        // streamingRender targets a .ts-msg-body inner wrapper so the
+        // shared markdown rules in chat.css (h1/h2/h3/code/blockquote
+        // scoped to .ts-msg-body *) actually match on this page —
+        // without the wrapper they'd fall through to the legacy
+        // .msg-assistant * vocabulary and diverge from the coordinator
+        // page, which already wraps in .coord-body.ts-msg-body.
+        this.currentAssistantBodyEl = document.createElement("div");
+        this.currentAssistantBodyEl.className = "ts-msg-body";
+        this.currentAssistantEl.appendChild(this.currentAssistantBodyEl);
         this.messagesEl.appendChild(this.currentAssistantEl);
       }
       this.contentBuffer += evt.text;
-      this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer);
+      streamingRender(this.currentAssistantBodyEl, this.contentBuffer);
       this.scrollToBottom();
       break;
 
@@ -783,10 +794,13 @@ Pane.prototype.handleEvent = function (evt) {
       // Finalize the current streaming segment's markdown.  This fires
       // per-segment (between tool calls), NOT per-turn.  Busy state is
       // managed by state_change events instead.
-      if (this.currentAssistantEl && this.contentBuffer) {
-        this.currentAssistantEl.innerHTML = renderMarkdown(this.contentBuffer); // sanitized by renderMarkdown — see renderer.js
-        postRenderMarkdown(this.currentAssistantEl);
+      if (this.currentAssistantBodyEl && this.contentBuffer) {
+        streamingRenderFinalize(
+          this.currentAssistantBodyEl,
+          this.contentBuffer,
+        );
       }
+      this.currentAssistantBodyEl = null;
       this.currentAssistantEl = null;
       this.currentReasoningEl = null;
       this.contentBuffer = "";
@@ -982,7 +996,7 @@ Pane.prototype.removeThinkingIndicator = function () {
 Pane.prototype.addUserMessage = function (text, attachments) {
   this.removeEmptyState();
   var el = document.createElement("div");
-  el.className = "msg msg-user";
+  el.className = "msg msg-user ts-msg ts-msg--user";
   var textEl = document.createElement("div");
   textEl.className = "msg-user-text";
   textEl.textContent = text;
@@ -1017,7 +1031,7 @@ Pane.prototype.addQueuedMessage = function (text, priority) {
   this.removeEmptyState();
   var self = this;
   var el = document.createElement("div");
-  el.className = "msg msg-user msg-queued";
+  el.className = "msg msg-user msg-queued ts-msg ts-msg--user";
   el.setAttribute("role", "status");
   if (priority === "important") {
     el.classList.add("msg-queued-important");
@@ -1084,12 +1098,12 @@ Pane.prototype._dequeueMessage = function (el) {
 Pane.prototype._addUserMsgActions = function (el, text) {
   var self = this;
   var bar = document.createElement("div");
-  bar.className = "msg-actions";
+  bar.className = "msg-actions ts-msg-actions";
   bar.setAttribute("role", "toolbar");
   bar.setAttribute("aria-label", "Message actions");
   // Edit button
   var editBtn = document.createElement("button");
-  editBtn.className = "msg-action-btn";
+  editBtn.className = "msg-action-btn ts-msg-action-btn";
   editBtn.title = "Edit & resend";
   editBtn.setAttribute("aria-label", "Edit and resend this message");
   var editIcon = document.createElement("span");
@@ -1103,7 +1117,7 @@ Pane.prototype._addUserMsgActions = function (el, text) {
   bar.appendChild(editBtn);
   // Rewind-to-here button
   var rewindBtn = document.createElement("button");
-  rewindBtn.className = "msg-action-btn";
+  rewindBtn.className = "msg-action-btn ts-msg-action-btn";
   rewindBtn.title = "Rewind to before this message";
   rewindBtn.setAttribute(
     "aria-label",
@@ -1126,13 +1140,13 @@ Pane.prototype._addRetryAction = function (el) {
   var bar = el.querySelector(".msg-actions");
   if (!bar) {
     bar = document.createElement("div");
-    bar.className = "msg-actions";
+    bar.className = "msg-actions ts-msg-actions";
     bar.setAttribute("role", "toolbar");
     bar.setAttribute("aria-label", "Message actions");
     el.appendChild(bar);
   }
   var btn = document.createElement("button");
-  btn.className = "msg-action-btn";
+  btn.className = "msg-action-btn ts-msg-action-btn";
   btn.title = "Retry (regenerate response)";
   btn.setAttribute("aria-label", "Retry last response");
   var icon = document.createElement("span");
@@ -1299,10 +1313,11 @@ Pane.prototype.replayHistory = function (messages) {
           var wasDenied = !!msg.denied;
           var block = document.createElement("div");
           block.className =
-            "msg approval-block " + (wasDenied ? "denied" : "approved");
+            "msg approval-block ts-msg ts-approval ts-approval--inline " +
+            (wasDenied ? "denied" : "approved");
           msg.tool_calls.forEach(function (tc) {
             var div = document.createElement("div");
-            div.className = "approval-tool";
+            div.className = "approval-tool ts-approval-tool";
             div.dataset.funcName = tc.name;
             div.dataset.callId = tc.id || "";
             var nameEl = document.createElement("div");
@@ -1340,10 +1355,12 @@ Pane.prototype.replayHistory = function (messages) {
           var badge = document.createElement("div");
           badge.setAttribute("role", "status");
           if (wasDenied) {
-            badge.className = "approval-badge badge-denied";
+            badge.className =
+              "approval-badge badge-denied ts-approval-badge ts-approval-badge--denied";
             badge.textContent = "\u2717 denied";
           } else {
-            badge.className = "approval-badge badge-approved";
+            badge.className =
+              "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
             badge.textContent = "\u2713 approved";
           }
           block.appendChild(badge);
@@ -1353,8 +1370,12 @@ Pane.prototype.replayHistory = function (messages) {
       }
       if (msg.content) {
         var el = document.createElement("div");
-        el.className = "msg msg-assistant";
-        el.innerHTML = renderMarkdown(msg.content);
+        el.className = "msg msg-assistant ts-msg ts-msg--assistant";
+        var bodyEl = document.createElement("div");
+        bodyEl.className = "ts-msg-body";
+        var rendered = renderMarkdown(msg.content);
+        bodyEl.innerHTML = rendered;
+        el.appendChild(bodyEl);
         postRenderMarkdown(el);
         self.messagesEl.appendChild(el);
         lastToolBlock = null;
@@ -1388,7 +1409,8 @@ Pane.prototype.replayHistory = function (messages) {
           lastToolBlock.classList.add("error");
           var errorBdg = lastToolBlock.querySelector(".approval-badge");
           if (errorBdg) {
-            errorBdg.className = "approval-badge badge-error";
+            errorBdg.className =
+              "approval-badge badge-error ts-approval-badge ts-approval-badge--error";
             errorBdg.textContent = "\u2717 error";
           }
         }
@@ -1421,7 +1443,9 @@ Pane.prototype.showInlineToolBlock = function (
 ) {
   var self = this;
   var block = document.createElement("div");
-  block.className = "msg approval-block" + (autoApproved ? " approved" : "");
+  block.className =
+    "msg approval-block ts-msg ts-approval ts-approval--inline" +
+    (autoApproved ? " approved" : "");
   if (!autoApproved) {
     block.setAttribute("role", "alertdialog");
     block.setAttribute("aria-label", "Tool approval required");
@@ -1452,12 +1476,13 @@ Pane.prototype.showInlineToolBlock = function (
   if (autoApproved) {
     var badge = document.createElement("div");
     badge.setAttribute("role", "status");
-    badge.className = "approval-badge badge-approved";
+    badge.className =
+      "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
     badge.textContent = "\u2713 auto-approved";
     block.appendChild(badge);
   } else {
     var prompt = document.createElement("div");
-    prompt.className = "approval-prompt";
+    prompt.className = "approval-prompt ts-approval-body";
 
     // Apply verdict glow on initial heuristic verdict
     if (glowRec) {
@@ -1484,10 +1509,11 @@ Pane.prototype.showInlineToolBlock = function (
       : "Always approve this tool type";
 
     var actionsDiv = document.createElement("div");
-    actionsDiv.className = "approval-actions";
+    actionsDiv.className = "approval-actions ts-approval-actions";
 
     var approveBtn = document.createElement("button");
-    approveBtn.className = "approval-btn btn-approve";
+    approveBtn.className =
+      "approval-btn btn-approve ts-approval-btn ts-approval-btn--approve";
     approveBtn.innerHTML = '<span class="key">y</span> Approve';
     approveBtn.onclick = function () {
       self.resolveApproval(true, false, self.getFeedback());
@@ -1495,7 +1521,8 @@ Pane.prototype.showInlineToolBlock = function (
     actionsDiv.appendChild(approveBtn);
 
     var denyBtn = document.createElement("button");
-    denyBtn.className = "approval-btn btn-deny";
+    denyBtn.className =
+      "approval-btn btn-deny ts-approval-btn ts-approval-btn--deny";
     denyBtn.innerHTML = '<span class="key">n</span> Deny';
     denyBtn.onclick = function () {
       self.resolveApproval(false, false, self.getFeedback());
@@ -1504,7 +1531,8 @@ Pane.prototype.showInlineToolBlock = function (
 
     if (alwaysNames.length) {
       var alwaysBtn = document.createElement("button");
-      alwaysBtn.className = "approval-btn btn-always";
+      alwaysBtn.className =
+        "approval-btn btn-always ts-approval-btn ts-approval-btn--always";
       alwaysBtn.title = alwaysTitle;
       alwaysBtn.setAttribute("aria-label", alwaysTitle);
       alwaysBtn.innerHTML = '<span class="key">a</span> Always';
@@ -1518,7 +1546,7 @@ Pane.prototype.showInlineToolBlock = function (
 
     var fbInput = document.createElement("input");
     fbInput.type = "text";
-    fbInput.className = "approval-feedback-input";
+    fbInput.className = "approval-feedback-input ts-approval-feedback";
     fbInput.placeholder = "feedback (optional)";
     prompt.appendChild(fbInput);
 
@@ -1553,7 +1581,8 @@ Pane.prototype.resolveApproval = function (
   var badge = document.createElement("div");
   badge.setAttribute("role", "status");
   if (approved) {
-    badge.className = "approval-badge badge-approved";
+    badge.className =
+      "approval-badge badge-approved ts-approval-badge ts-approval-badge--approved";
     var label = "\u2713 approved";
     if (always) {
       var raw = this.approvalBlockEl.dataset.alwaysNames;
@@ -1565,7 +1594,8 @@ Pane.prototype.resolveApproval = function (
     badge.textContent = feedback ? label + ": " + feedback : label;
     this.approvalBlockEl.classList.add("approved");
   } else {
-    badge.className = "approval-badge badge-denied";
+    badge.className =
+      "approval-badge badge-denied ts-approval-badge ts-approval-badge--denied";
     badge.textContent = "\u2717 denied" + (feedback ? ": " + feedback : "");
     this.approvalBlockEl.classList.add("denied");
   }
@@ -1708,7 +1738,8 @@ Pane.prototype.appendToolOutput = function (callId, name, output, isError) {
       parentBlock.classList.add("error");
       var badge = parentBlock.querySelector(".approval-badge");
       if (badge) {
-        badge.className = "approval-badge badge-error";
+        badge.className =
+          "approval-badge badge-error ts-approval-badge ts-approval-badge--error";
         badge.textContent = "\u2717 error";
       }
     }
@@ -1771,7 +1802,8 @@ Pane.prototype.updateVerdictBadge = function (verdict) {
   }
 
   var risk = verdict.risk_level || "medium";
-  badge.className = "verdict-badge verdict-" + risk;
+  badge.className = "verdict-badge verdict-" + risk + " ts-verdict-badge";
+  badge.setAttribute("data-risk", risk);
 
   var riskEl = badge.querySelector(".verdict-risk");
   var recEl = badge.querySelector(".verdict-rec");
@@ -1850,7 +1882,7 @@ Pane.prototype.updateVerdictGlow = function (recommendation) {
 
 Pane.prototype.addInfoMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "msg msg-info";
+  el.className = "msg msg-info ts-msg ts-msg--info";
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
   this.scrollToBottom();
@@ -1858,7 +1890,7 @@ Pane.prototype.addInfoMessage = function (text) {
 
 Pane.prototype.addErrorMessage = function (text) {
   var el = document.createElement("div");
-  el.className = "msg msg-error";
+  el.className = "msg msg-error ts-msg ts-msg--error";
   el.setAttribute("role", "alert");
   el.textContent = stripAnsi(text);
   this.messagesEl.appendChild(el);
@@ -4938,7 +4970,7 @@ function stripAnsi(s) {
 
 function buildToolDiv(item) {
   var div = document.createElement("div");
-  div.className = "approval-tool";
+  div.className = "approval-tool ts-approval-tool";
   div.dataset.funcName = item.func_name || "";
   div.dataset.callId = item.call_id || "";
 
@@ -4996,6 +5028,8 @@ function renderVerdictBadge(verdict, judgePending) {
   var callId = escapeHtml(verdict.call_id || "");
   return (
     '<div class="verdict-badge verdict-' +
+    escapeHtml(risk) +
+    ' ts-verdict-badge" data-risk="' +
     escapeHtml(risk) +
     '" data-call-id="' +
     callId +
@@ -5332,7 +5366,8 @@ function buildMediaResultsList(results, totalCount) {
 }
 
 // ---------------------------------------------------------------------------
-//  HLS lazy-loader (follows mermaid.js pattern from renderer.js:724-751)
+//  HLS lazy-loader (follows the mermaid.js lazy-load pattern in
+//  /shared/renderer.js)
 // ---------------------------------------------------------------------------
 var _hlsState = "idle";
 var _hlsQueue = [];

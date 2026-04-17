@@ -1,0 +1,176 @@
+/* ==========================================================================
+   turnstone — ui-base.css
+   Design-system layer shared between the coordinator page, per-node
+   server UI, and the console dashboard.  Tokens (colors, typography,
+   glows) live in base.css; this file layers the "flat" form-control +
+   button + state-glyph baseline.  Size scale matches the 11/12/13px
+   established elsewhere in the codebase so these components slot into
+   existing layouts without dominating them.
+
+   Namespace rubric:
+     .ui-*   — cross-page reusable controls (buttons, inputs, pills)
+     .dash-* — legacy dashboard-row vocabulary (base.css)
+     .ts-*   — chat-view vocabulary (chat.css)
+     page-local classes stay unprefixed within their own stylesheet.
+   ========================================================================== */
+
+/* ==========================================================================
+   Form controls — flat, monospace, 1px border, accent :focus-visible ring
+   ========================================================================== */
+.ui-input,
+.ui-textarea,
+.ui-select {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.ui-input::placeholder,
+.ui-textarea::placeholder { color: var(--fg-dim); opacity: 0.7; }
+.ui-input:focus-visible,
+.ui-textarea:focus-visible,
+.ui-select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+.ui-input:disabled,
+.ui-textarea:disabled,
+.ui-select:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.ui-textarea { resize: vertical; min-height: 32px; }
+
+/* ==========================================================================
+   Buttons — flat 1px border; accent-filled "primary" variant
+   ========================================================================== */
+.ui-btn {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+  letter-spacing: 0.01em;
+}
+.ui-btn:hover { background: var(--bg-highlight); border-color: var(--accent-dim); color: var(--fg-bright); }
+.ui-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ui-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.ui-btn--primary {
+  background: var(--accent);
+  color: var(--on-color);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.ui-btn--primary:hover { filter: brightness(1.08); background: var(--accent); color: var(--on-color); }
+
+.ui-btn--danger { border-color: var(--red); color: var(--red); }
+.ui-btn--danger:hover { background: var(--red-glow); color: var(--red); border-color: var(--red); }
+
+/* Compact "refresh" / icon button — inline affordance in sidebars and
+   section headings. */
+.ui-btn--icon {
+  font-size: 11px;
+  padding: 1px 5px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg);
+}
+.ui-btn--icon:hover { background: var(--bg-elevated); }
+
+/* ==========================================================================
+   State glyphs — unified vocabulary (● running / ◐ thinking / ⚠ attention /
+   ✗ error / ○ idle).  Pages that render tree rows use these directly; the
+   existing LED-dot .dash-state-dot (base.css) remains for tabular views.
+   ========================================================================== */
+.ui-glyph {
+  width: 14px;
+  text-align: center;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+.ui-glyph-running   { color: var(--green); }
+.ui-glyph-thinking  { color: var(--cyan); }
+.ui-glyph-attention { color: var(--yellow); font-weight: 700; }
+.ui-glyph-error     { color: var(--red); }
+.ui-glyph-idle      { color: var(--fg-dim); }
+
+/* ==========================================================================
+   Status pills — reusable chip for enum states (task status, run state)
+   ========================================================================== */
+.ui-pill {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-family: var(--font-mono);
+}
+.ui-pill--pending     { color: var(--fg-dim); }
+.ui-pill--in-progress { color: var(--yellow); border-color: var(--yellow); }
+.ui-pill--done        { color: var(--green); border-color: var(--green); }
+.ui-pill--blocked     { color: var(--red); border-color: var(--red); }
+.ui-pill--running     { color: var(--green); border-color: var(--green); }
+.ui-pill--thinking    { color: var(--cyan); border-color: var(--cyan); }
+.ui-pill--attention   { color: var(--yellow); border-color: var(--yellow); }
+.ui-pill--error       { color: var(--red); border-color: var(--red); }
+
+/* ==========================================================================
+   Section heading — used on tree/list sidebars.
+   ========================================================================== */
+.ui-section-heading {
+  margin: 0;
+  padding: 6px 10px 4px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ==========================================================================
+   Panel surfaces — flat, 1px border, subtle elevation
+   ========================================================================== */
+.ui-panel {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.ui-panel--flush { border-radius: 0; border-left: none; border-right: none; }
+
+/* ==========================================================================
+   Typography helpers — explicit tiers so the utility actually conveys size.
+   Body text still inherits var(--font-mono) at 13px from base.css; these
+   are opt-in overrides for headings / captions.
+   ========================================================================== */
+.ui-heading { font-family: var(--font-display); font-weight: 600; color: var(--fg-bright); }
+.ui-heading--sm { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-dim); }
+.ui-heading--md { font-size: 13px; }
+.ui-heading--lg { font-size: 15px; }
+.ui-dim { color: var(--fg-dim); }
+
+/* ==========================================================================
+   Reduced-motion — any animation declared in this file stays disabled.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ui-input, .ui-textarea, .ui-select,
+  .ui-btn { transition: none; }
+}

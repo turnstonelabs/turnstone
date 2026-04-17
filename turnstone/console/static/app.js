@@ -1,9 +1,31 @@
 // --- Shared hooks ---
 window.onLoginSuccess = function () {
   connectSSE();
-  // Refresh permission-gated header buttons (admin.coordinator etc).
-  if (typeof refreshCoordButtonVisibility === "function") {
-    refreshCoordButtonVisibility();
+  // Refresh permission-gated home-landing UI (admin.coordinator etc).
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
+  }
+  // Re-populate the home-composer skill dropdown and re-probe the
+  // coordinator subsystem now that auth has landed.  The initial
+  // page-load pass runs before login completes, so /v1/api/skills
+  // and /v1/api/coordinator both 401; without this re-run the
+  // dropdown stays empty and the 503 banner never flips correctly.
+  if (typeof _populateHomeSkillDropdown === "function") {
+    _populateHomeSkillDropdown();
+  }
+  if (typeof _probeCoordSubsystem === "function") {
+    _probeCoordSubsystem();
+  }
+  // Restart the active-coordinators poller: the initial load fired
+  // before auth resolved and 401'd, leaving the list empty.
+  if (typeof _stopActiveCoordsPolling === "function") {
+    _stopActiveCoordsPolling();
+  }
+  if (
+    currentView === "home" &&
+    typeof _startActiveCoordsPolling === "function"
+  ) {
+    _startActiveCoordsPolling();
   }
 };
 window.onLogout = function () {
@@ -11,8 +33,8 @@ window.onLogout = function () {
     evtSource.close();
     evtSource = null;
   }
-  if (typeof refreshCoordButtonVisibility === "function") {
-    refreshCoordButtonVisibility();
+  if (typeof _refreshHomeComposerVisibility === "function") {
+    _refreshHomeComposerVisibility();
   }
 };
 window.onThemeChange = function (next) {
@@ -49,7 +71,7 @@ window.onThemeChange = function (next) {
 })();
 
 // --- State ---
-var currentView = "overview"; // "overview" | "node" | "filtered"
+var currentView = "home"; // "home" | "overview" | "node" | "filtered" | "admin"
 var currentNodeId = null;
 var currentServerUrl = "";
 var currentFilter = { state: null, node: null, page: 1, per_page: 50 };
@@ -116,6 +138,13 @@ function patchClusterState(data) {
         activity: "",
         activity_state: "",
         tool_calls: 0,
+        // ws_created SSE events carry kind / parent_ws_id / user_id;
+        // preserve them on the in-memory ws so the home-landing
+        // active-coordinators list and the tree grouping both pick up
+        // newly-created rows without needing a snapshot refetch.
+        kind: data.kind || "interactive",
+        parent_ws_id: data.parent_ws_id || null,
+        user_id: data.user_id || null,
       });
     }
   } else if (t === "ws_closed") {
@@ -244,7 +273,11 @@ function buildNodeInfoFromSnapshot(node) {
 function renderFromState() {
   if (!clusterState) return;
   renderStatusBar(clusterState.overview);
-  if (currentView === "overview") {
+  if (currentView === "home") {
+    _renderHomeView();
+    // Home view also hosts the inline node-list (cluster details);
+    // render it so expanding the cluster-summary reveals the current
+    // state without waiting for the next SSE tick.
     var nodesList = Object.keys(clusterState.nodes).map(function (nid) {
       return buildNodeInfoFromSnapshot(clusterState.nodes[nid]);
     });
@@ -253,11 +286,6 @@ function renderFromState() {
       return d !== 0 ? d : a.node_id.localeCompare(b.node_id);
     });
     renderNodeGroups(nodesList, nodesList.length);
-    document.getElementById("cluster-summary").textContent =
-      clusterState.overview.nodes +
-      " nodes \u00b7 " +
-      formatCount(clusterState.overview.workstreams) +
-      " workstreams";
   } else if (currentView === "node" && currentNodeId) {
     var snapNode = clusterState.nodes[currentNodeId];
     if (snapNode) {
@@ -400,15 +428,19 @@ function handleClusterEvent(data) {
   }
 }
 
-// --- Overview View ---
-function showOverview() {
-  currentView = "overview";
+// --- Home View ---
+//
+// Coordinator-first landing: composer + active-coordinators list +
+// compact cluster summary.  The legacy #view-overview stays reachable
+// via the summary's expand button and the existing popstate / deep-
+// link wiring so `?view=overview` etc. still land on the node list.
+function showHome() {
+  currentView = "home";
   currentNodeId = null;
   currentServerUrl = "";
   currentFilter = { state: null, node: null, page: 1, per_page: 50 };
-  document.getElementById("view-overview").style.display = "";
-  document.getElementById("view-node").style.display = "none";
-  document.getElementById("view-filtered").style.display = "none";
+  _setLandingView("home");
+  _setClusterDetailsExpanded(false);
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -420,7 +452,81 @@ function showOverview() {
   document.getElementById("main").scrollTop = 0;
   if (clusterState) renderFromState();
   else loadOverview();
-  if (!_navigatingFromPopstate) history.pushState({ view: "overview" }, "");
+  _ensureHomeComposerInit();
+  _startActiveCoordsPolling();
+  if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
+}
+
+function _setLandingView(which) {
+  // Toggle the three top-level landing panes.  The "overview" (node
+  // list) is no longer its own pane — it's an expandable section
+  // inside #view-home, toggled by toggleClusterDetails() — so every
+  // view transition only needs to choose between home / node /
+  // filtered.
+  var views = ["home", "node", "filtered"];
+  views.forEach(function (name) {
+    var el = document.getElementById("view-" + name);
+    if (!el) return;
+    el.style.display = name === which ? "" : "none";
+  });
+}
+
+// Toggle the inline cluster-details (node list) panel inside
+// #view-home.  Replaces the old "swap to #view-overview" navigation so
+// operators never leave the landing page to see cluster state.
+function _setClusterDetailsExpanded(expanded) {
+  var details = document.getElementById("view-overview");
+  var btn = document.getElementById("cluster-summary-expand");
+  var caret = document.querySelector(".home-cluster-summary-caret");
+  if (!details) return;
+  if (expanded) {
+    details.removeAttribute("hidden");
+    if (btn) btn.setAttribute("aria-expanded", "true");
+    if (caret) caret.textContent = "\u25BE"; // ▾
+  } else {
+    details.setAttribute("hidden", "");
+    if (btn) btn.setAttribute("aria-expanded", "false");
+    if (caret) caret.textContent = "\u25B8"; // ▸
+  }
+}
+
+function toggleClusterDetails() {
+  var details = document.getElementById("view-overview");
+  if (!details) return;
+  _setClusterDetailsExpanded(details.hasAttribute("hidden"));
+}
+
+// --- Overview (alias: expanded cluster-details on the home view) ---
+// Preserved so breadcrumb "Cluster" links, popstate {view:"overview"},
+// and ?view=overview deep-links still land on a meaningful state.
+// Semantically equivalent to showHome() with the cluster-details
+// section forced open.
+function showOverview() {
+  currentView = "home";
+  currentNodeId = null;
+  currentServerUrl = "";
+  currentFilter = { state: null, node: null, page: 1, per_page: 50 };
+  _setLandingView("home");
+  _setClusterDetailsExpanded(true);
+  var adminView = document.getElementById("view-admin");
+  if (adminView) adminView.style.display = "none";
+  var adminBtn = document.getElementById("admin-btn");
+  if (adminBtn) {
+    adminBtn.classList.remove("active");
+    adminBtn.setAttribute("aria-expanded", "false");
+  }
+  document.getElementById("breadcrumb").style.display = "none";
+  if (clusterState) renderFromState();
+  else loadOverview();
+  _startActiveCoordsPolling();
+  if (!_navigatingFromPopstate) history.pushState({ view: "home" }, "");
+  // Scroll the details section into view so the click produces a
+  // visible reaction — the user expands the summary expecting to see
+  // the node list, not wonder whether the click worked.
+  var details = document.getElementById("view-overview");
+  if (details && typeof details.scrollIntoView === "function") {
+    details.scrollIntoView({ block: "start", behavior: "smooth" });
+  }
 }
 
 function loadOverview() {
@@ -950,9 +1056,8 @@ function drillDownToNode(nodeId, serverUrl) {
   currentView = "node";
   currentNodeId = nodeId;
   currentServerUrl = serverUrl || "";
-  document.getElementById("view-overview").style.display = "none";
-  document.getElementById("view-node").style.display = "";
-  document.getElementById("view-filtered").style.display = "none";
+  _stopActiveCoordsPolling();
+  _setLandingView("node");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -1005,9 +1110,8 @@ function loadNodeDetail(nodeId) {
 function drillDownByState(state) {
   currentView = "filtered";
   currentFilter = { state: state, node: null, page: 1, per_page: 50 };
-  document.getElementById("view-overview").style.display = "none";
-  document.getElementById("view-node").style.display = "none";
-  document.getElementById("view-filtered").style.display = "";
+  _stopActiveCoordsPolling();
+  _setLandingView("filtered");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -1032,9 +1136,8 @@ function drillDownByState(state) {
 function drillDownByNode(nodeId) {
   currentView = "filtered";
   currentFilter = { state: null, node: nodeId, page: 1, per_page: 50 };
-  document.getElementById("view-overview").style.display = "none";
-  document.getElementById("view-node").style.display = "none";
-  document.getElementById("view-filtered").style.display = "";
+  _stopActiveCoordsPolling();
+  _setLandingView("filtered");
   var adminView = document.getElementById("view-admin");
   if (adminView) adminView.style.display = "none";
   var adminBtn = document.getElementById("admin-btn");
@@ -1096,8 +1199,8 @@ function renderPagination(container, page, pages) {
 
 // --- Workstream table renderer (shared) ---
 //
-// Phase 3: group rows by parent_ws_id so coordinator workstreams render
-// with their spawned children nested beneath (tree grouping).  A
+// Group rows by parent_ws_id so coordinator workstreams render with
+// their spawned children nested beneath (tree grouping).  A
 // coordinator row gets an expand/collapse caret; its children render as
 // indented sub-rows when expanded.  Orphaned children (parent missing
 // from the pool) fall through to the top level with an "orphan" badge.
@@ -1313,11 +1416,13 @@ function _renderWsRow(ws, opts, container) {
   nameCell.className = "dash-cell-name";
   var nameText = ws.name || ws.title || ws.id || "";
   nameCell.textContent = nameText;
-  if (opts.isCoordinator && opts.childCount != null) {
-    // Always render the "(N children)" summary; CSS hides it when
-    // the row is expanded (see [data-expanded="true"] .dash-child-count
-    // in style.css).  Keeping it in the DOM means the caret toggle
-    // doesn't need to mutate this text on every click.
+  if (opts.isCoordinator && opts.childCount != null && opts.childCount > 0) {
+    // Render the "(N children)" summary only when there actually are
+    // children — the home view feeds a coordinator-only pool into
+    // renderWsTable so _bucketByParent sees no children and would
+    // otherwise always print "(0 children)".  CSS hides it when the
+    // row is expanded (see [data-expanded="true"] .dash-child-count
+    // in style.css).
     var summary = document.createElement("span");
     summary.className = "dash-child-count";
     summary.textContent =
@@ -1429,10 +1534,11 @@ window.addEventListener("popstate", function (e) {
   _navigatingFromPopstate = true;
   try {
     if (!e.state) {
-      showOverview();
+      showHome();
       return;
     }
-    if (e.state.view === "overview") showOverview();
+    if (e.state.view === "home") showHome();
+    else if (e.state.view === "overview") showOverview();
     else if (e.state.view === "admin" && typeof showAdmin === "function")
       showAdmin();
     else if (e.state.view === "node" && e.state.nodeId)
@@ -1683,11 +1789,9 @@ document.addEventListener("keydown", function (e) {
 });
 
 // ---------------------------------------------------------------------------
-// New coordinator modal
-//
-// Header button is visibility-gated on the admin.coordinator permission.
-// Modal is small: optional name / skill / initial_message, POSTs to
-// /v1/api/coordinator/new, redirects to /coordinator/{ws_id} on success.
+// Coordinator session creation — used by the home-landing composer.
+// Permission check lives in _hasCoordPermission (admin.coordinator);
+// _createCoordinator does the POST + redirect.
 // ---------------------------------------------------------------------------
 
 function _hasCoordPermission() {
@@ -1695,76 +1799,30 @@ function _hasCoordPermission() {
   return perms.split(",").indexOf("admin.coordinator") !== -1;
 }
 
-function refreshCoordButtonVisibility() {
-  var btn = document.getElementById("new-coord-btn");
-  if (!btn) return;
-  btn.style.display = _hasCoordPermission() ? "" : "none";
-}
+// POST /v1/api/coordinator/new.  Used by the home-landing composer
+// (submitHomeCoord).  Caller supplies the DOM elements + idle/busy
+// labels; on success we redirect to /coordinator/{ws_id}, on 503 we
+// invoke on503 so the caller can surface a "subsystem not configured"
+// remediation banner.
+function _createCoordinator(opts) {
+  var nameEl = opts.nameEl;
+  var skillEl = opts.skillEl;
+  var taskEl = opts.taskEl;
+  var errEl = opts.errEl;
+  var btn = opts.btn;
+  var idleLabel = opts.idleLabel;
+  var busyLabel = opts.busyLabel;
+  var on503 = opts.on503 || function () {};
+  var onSuccess = opts.onSuccess || function () {};
 
-function showNewCoordModal() {
-  if (!_hasCoordPermission()) {
-    showToast("admin.coordinator permission required");
-    return;
-  }
-  var login = document.getElementById("login-overlay");
-  if (login && login.style.display !== "none") return;
-  var overlay = document.getElementById("new-coord-overlay");
-  overlay.style.display = "flex";
-  document.body.style.overflow = "hidden";
-  overlay.onclick = function (e) {
-    if (e.target === overlay) hideNewCoordModal();
-  };
-
-  // Reset form
-  document.getElementById("new-coord-name").value = "";
-  document.getElementById("new-coord-task").value = "";
-  var errEl = document.getElementById("new-coord-error");
+  var name = (nameEl.value || "").trim();
+  var skill = skillEl.value || "";
+  var task = (taskEl.value || "").trim();
   errEl.style.display = "none";
   errEl.textContent = "";
-  var btn = document.getElementById("new-coord-submit");
-  btn.disabled = false;
-  btn.textContent = "Create";
-
-  // Populate skill dropdown (same endpoint as new-ws modal)
-  var sel = document.getElementById("new-coord-skill");
-  sel.innerHTML = '<option value="">Use defaults</option>';
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.skills || []).forEach(function (t) {
-        var opt = document.createElement("option");
-        opt.value = t.name;
-        opt.textContent = t.is_default ? t.name + " (default)" : t.name;
-        sel.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* defaults still work */
-    });
-
-  setTimeout(function () {
-    document.getElementById("new-coord-task").focus();
-  }, 50);
-}
-
-function hideNewCoordModal() {
-  document.getElementById("new-coord-overlay").style.display = "none";
-  document.body.style.overflow = "";
-  var triggerBtn = document.getElementById("new-coord-btn");
-  if (triggerBtn) triggerBtn.focus();
-}
-
-function submitNewCoord() {
-  var name = document.getElementById("new-coord-name").value.trim();
-  var skill = document.getElementById("new-coord-skill").value;
-  var task = document.getElementById("new-coord-task").value.trim();
-  var errEl = document.getElementById("new-coord-error");
-  var btn = document.getElementById("new-coord-submit");
   btn.disabled = true;
-  btn.textContent = "Creating\u2026";
-  errEl.style.display = "none";
+  btn.textContent = busyLabel;
+
   var body = {};
   if (name) body.name = name;
   if (skill) body.skill = skill;
@@ -1782,42 +1840,358 @@ function submitNewCoord() {
     })
     .then(function (res) {
       btn.disabled = false;
-      btn.textContent = "Create";
+      btn.textContent = idleLabel;
+      if (res.status === 503) {
+        on503(res);
+        return;
+      }
       if (!res.ok || !res.data || !res.data.ws_id) {
         errEl.textContent =
           (res.data && res.data.error) || "HTTP " + res.status;
         errEl.style.display = "block";
         return;
       }
-      hideNewCoordModal();
+      onSuccess(res);
       window.location.href =
         "/coordinator/" + encodeURIComponent(res.data.ws_id);
     })
     .catch(function () {
       btn.disabled = false;
-      btn.textContent = "Create";
+      btn.textContent = idleLabel;
       errEl.textContent = "Request failed";
       errEl.style.display = "block";
     });
 }
 
-// Escape closes the new-coord modal; Enter submits
+// ---------------------------------------------------------------------------
+// Home-landing composer + active-coordinators list + cluster summary.
+// The composer renders as a persistent panel on the home view.  The
+// active list and
+// cluster summary render from clusterState, so every SSE-driven patch
+// picks them up automatically via scheduleRender → renderFromState.
+// ---------------------------------------------------------------------------
+
+var _homeComposerInit = false;
+var _homeCoordReady = null; // tri-state: null = unknown, true = ready, false = 503
+
+function _ensureHomeComposerInit() {
+  if (_homeComposerInit) return;
+  _homeComposerInit = true;
+  _populateHomeSkillDropdown();
+  _probeCoordSubsystem();
+  _refreshHomeComposerVisibility();
+}
+
+function _populateHomeSkillDropdown() {
+  var sel = document.getElementById("home-coord-skill");
+  if (!sel) return;
+  authFetch("/v1/api/skills")
+    .then(function (r) {
+      return r.ok ? r.json() : { skills: [] };
+    })
+    .then(function (data) {
+      // Reset to just the fixed "Use defaults" first option so repeat
+      // calls (onLoginSuccess after an initial pre-auth run that
+      // 401'd) don't accumulate duplicate entries.
+      sel.replaceChildren(sel.options[0]);
+      (data.skills || []).forEach(function (t) {
+        var opt = document.createElement("option");
+        opt.value = t.name;
+        opt.textContent = t.is_default ? t.name + " (default)" : t.name;
+        sel.appendChild(opt);
+      });
+    })
+    .catch(function () {
+      /* defaults still work even without the dropdown populated */
+    });
+}
+
+// Probe GET /v1/api/coordinator — 200 = subsystem ready; 503 = no model
+// alias resolvable, show remediation banner.  4xx (auth / permission) is
+// treated as "unknown, don't flip the banner" because the probe cannot
+// actually tell us anything about subsystem readiness in that case —
+// the caller is expected to re-invoke this after login lands so a real
+// answer can arrive.  Leaving the submit button enabled on unknown
+// keeps first-paint usable; a subsequent 503 from the actual submit
+// flips the banner via _createCoordinator's on503 hook.
+//
+// Skip the probe entirely for users without admin.coordinator — they
+// can't see the composer anyway (see _refreshHomeComposerVisibility),
+// and the endpoint returns 403 for them, producing a useless network
+// round-trip on every login.
+function _probeCoordSubsystem() {
+  if (!_hasCoordPermission()) return;
+  authFetch("/v1/api/coordinator")
+    .then(function (r) {
+      if (r.status === 503) {
+        _homeCoordReady = false;
+      } else if (r.ok) {
+        _homeCoordReady = true;
+      } else {
+        _homeCoordReady = null;
+        return;
+      }
+      var banner = document.getElementById("coord-composer-503");
+      var submitBtn = document.getElementById("home-coord-submit");
+      if (banner) banner.style.display = _homeCoordReady ? "none" : "";
+      if (submitBtn) submitBtn.disabled = !_homeCoordReady;
+    })
+    .catch(function () {
+      /* network error — leave banner hidden; submit will surface a retryable error */
+    });
+}
+
+function _refreshHomeComposerVisibility() {
+  var panel = document.getElementById("coord-composer-panel");
+  if (!panel) return;
+  panel.style.display = _hasCoordPermission() ? "" : "none";
+}
+
+function submitHomeCoord() {
+  if (!_hasCoordPermission()) {
+    showToast("admin.coordinator permission required");
+    return;
+  }
+  _createCoordinator({
+    nameEl: document.getElementById("home-coord-name"),
+    skillEl: document.getElementById("home-coord-skill"),
+    taskEl: document.getElementById("home-coord-task"),
+    errEl: document.getElementById("home-coord-error"),
+    btn: document.getElementById("home-coord-submit"),
+    idleLabel: "Start",
+    busyLabel: "Starting\u2026",
+    on503: function () {
+      _homeCoordReady = false;
+      var banner = document.getElementById("coord-composer-503");
+      if (banner) banner.style.display = "";
+      var btn = document.getElementById("home-coord-submit");
+      if (btn) btn.disabled = true;
+    },
+  });
+}
+
+// Ctrl/Cmd+Enter inside the composer textarea submits — consistent with
+// the modal's Enter-submits-when-focused-outside-textarea shortcut.
 document.addEventListener("keydown", function (e) {
-  var overlay = document.getElementById("new-coord-overlay");
-  if (!overlay || overlay.style.display === "none") return;
-  if (e.key === "Escape") {
-    e.preventDefault();
-    hideNewCoordModal();
-  }
-  if (e.key === "Enter") {
-    if (e.target.tagName === "SELECT") return;
-    if (e.target.tagName === "BUTTON") return;
-    if (e.target.tagName === "TEXTAREA" && !(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
-    var btn = document.getElementById("new-coord-submit");
-    if (btn && !btn.disabled) submitNewCoord();
-  }
+  if (e.key !== "Enter" || !(e.ctrlKey || e.metaKey)) return;
+  if (!e.target || e.target.id !== "home-coord-task") return;
+  e.preventDefault();
+  var btn = document.getElementById("home-coord-submit");
+  if (btn && !btn.disabled) submitHomeCoord();
 });
+
+// Fingerprints of the last home-view render — skip DOM rebuilds when
+// nothing visible in either region has changed.  renderFromState fires
+// on every SSE patch (state_change, ws_created, ws_closed, cluster
+// aggregate update...) and most of those don't affect the coord list or
+// the summary line — short-circuiting here avoids a replaceChildren +
+// tree-group rebuild on every activity tick.
+var _homeCoordsFingerprint = "";
+var _homeSummaryFingerprint = "";
+
+// Active-coordinators list, kept separate from clusterState.nodes.
+// Coordinators live on the console process (node="console") and don't
+// flow through the per-node SSE streams the collector tracks, so the
+// cluster-snapshot -> clusterState.nodes path never surfaces them.
+// _loadActiveCoords fetches them directly from cluster_workstreams
+// (which merges _coordinator_rows via extra_rows).  Polling uses
+// recursive setTimeout with exponential backoff on failure — matches
+// the rest of turnstone's SSE reconnect pattern so a persistent
+// outage doesn't hammer the console with a fixed-interval retry.
+var _activeCoords = [];
+var _activeCoordsTimer = null;
+var _activeCoordsBackoff = 0;
+var _ACTIVE_COORDS_POLL_MS = 5000;
+var _ACTIVE_COORDS_MAX_BACKOFF_MS = 30000;
+
+function _loadActiveCoords() {
+  // In-flight guard not required — authFetch is stateless and the
+  // response is just replaced — but cancel any pending timer so
+  // we don't double-schedule.
+  if (_activeCoordsTimer) {
+    clearTimeout(_activeCoordsTimer);
+    _activeCoordsTimer = null;
+  }
+  authFetch("/v1/api/cluster/workstreams?node=console&per_page=200")
+    .then(function (r) {
+      if (r.status === 401 && typeof showLogin === "function") {
+        // Session expired — prompt for re-auth via the shared overlay.
+        // onLoginSuccess at the top of this file restarts the poller
+        // when the view is still home.
+        showLogin();
+        return null;
+      }
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function (data) {
+      if (data == null) return;
+      // Narrow to coord rows even though node=console should produce
+      // them exclusively — defensive in case a future server-side
+      // collector change surfaces other console-origin rows.
+      var rows = (data.workstreams || []).filter(function (ws) {
+        return ws.kind === "coordinator";
+      });
+      _activeCoords = rows;
+      _activeCoordsBackoff = 0;
+      if (currentView === "home") {
+        _renderHomeView();
+      }
+      _scheduleNextActiveCoordsPoll(_ACTIVE_COORDS_POLL_MS);
+    })
+    .catch(function () {
+      // Exponential backoff capped at _ACTIVE_COORDS_MAX_BACKOFF_MS.
+      // Reset on the next successful response above.
+      _activeCoordsBackoff = _activeCoordsBackoff
+        ? Math.min(_activeCoordsBackoff * 2, _ACTIVE_COORDS_MAX_BACKOFF_MS)
+        : _ACTIVE_COORDS_POLL_MS * 2;
+      _scheduleNextActiveCoordsPoll(_activeCoordsBackoff);
+    });
+}
+
+function _scheduleNextActiveCoordsPoll(ms) {
+  if (currentView !== "home") return;
+  _activeCoordsTimer = setTimeout(_loadActiveCoords, ms);
+}
+
+function _startActiveCoordsPolling() {
+  _activeCoordsBackoff = 0;
+  if (_activeCoordsTimer) {
+    clearTimeout(_activeCoordsTimer);
+    _activeCoordsTimer = null;
+  }
+  _loadActiveCoords();
+}
+
+function _stopActiveCoordsPolling() {
+  if (_activeCoordsTimer) {
+    clearTimeout(_activeCoordsTimer);
+    _activeCoordsTimer = null;
+  }
+}
+
+function _renderHomeView() {
+  // Active coordinators come from _loadActiveCoords (cluster_workstreams
+  // with node=console filter); clusterState.nodes never surfaces them
+  // because coordinators run on the console process, not on a cluster
+  // node that feeds the collector's SSE streams.
+  var coords = (_activeCoords || []).slice();
+  coords.sort(function (a, b) {
+    // Most-recently-active first.  updated is absent on freshly-created
+    // rows; fall back to id so the ordering is stable either way.
+    var au = a.updated || 0,
+      bu = b.updated || 0;
+    if (au !== bu) return bu - au;
+    return (a.id || "").localeCompare(b.id || "");
+  });
+
+  // Fingerprint: every field _renderWsRow actually consumes, so a
+  // cluster_state tick that only bumps tokens / context_ratio /
+  // activity (patchClusterState mutates those without touching
+  // ws.updated) doesn't leave the TOKENS / CTX / activity cells
+  // frozen.  Bucketing tokens by thousands keeps the fingerprint
+  // stable enough that unrelated sub-thousand drift doesn't trigger
+  // a full rebuild on every SSE tick; the value itself still
+  // re-renders when it crosses a threshold.
+  var coordsFp = coords.length + "|";
+  for (var i = 0; i < coords.length; i++) {
+    var c = coords[i];
+    coordsFp +=
+      (c.id || "") +
+      ":" +
+      (c.state || "") +
+      ":" +
+      (c.updated || 0) +
+      ":" +
+      (c.name || "") +
+      ":" +
+      Math.floor((c.tokens || 0) / 100) +
+      ":" +
+      Math.round((c.context_ratio || 0) * 100) +
+      ":" +
+      (c.activity_state || "") +
+      ":" +
+      (c.model_alias || c.model || "") +
+      ":" +
+      (c.node || "") +
+      ":" +
+      (c.title || "") +
+      ";";
+  }
+  if (coordsFp !== _homeCoordsFingerprint) {
+    _homeCoordsFingerprint = coordsFp;
+    var countEl = document.getElementById("active-coord-count");
+    if (countEl) {
+      countEl.textContent = coords.length ? "(" + coords.length + ")" : "";
+    }
+    var listEl = document.getElementById("active-coord-list");
+    if (listEl) {
+      listEl.replaceChildren();
+      if (!coords.length) {
+        var empty = document.createElement("div");
+        empty.className = "dashboard-empty";
+        empty.textContent = "No active coordinator sessions. Start one above.";
+        listEl.appendChild(empty);
+      } else {
+        // Reuse the shared tree-grouped renderer so coordinators on
+        // the landing page get the same glyphs, child-count badges,
+        // and row treatment as the legacy dashboard.
+        renderWsTable(listEl, coords);
+      }
+    }
+  }
+
+  // Cluster summary — one-line aggregate.  Mirrors the existing
+  // #cluster-summary header span (kept unchanged for deep-link callers)
+  // but with state counts inlined so operators don't have to expand
+  // to see the cluster's posture.
+  //
+  // The #cluster-summary header element is ALSO written by the overview
+  // branch of renderFromState with a different format ("1 nodes" vs
+  // "1 node").  Always rewrite it here so navigating overview → home
+  // doesn't leave the stale overview text behind when the cluster
+  // aggregate fingerprint hasn't actually changed.
+  var ovr = clusterState.overview || {};
+  var states = ovr.states || {};
+  var aggTokens = (ovr.aggregate || {}).total_tokens || 0;
+  var headerSum = document.getElementById("cluster-summary");
+  if (headerSum) {
+    headerSum.textContent =
+      (ovr.nodes || 0) +
+      " node" +
+      ((ovr.nodes || 0) === 1 ? "" : "s") +
+      " \u00b7 " +
+      formatCount(ovr.workstreams || 0) +
+      " workstreams";
+  }
+
+  var summaryFp =
+    (ovr.nodes || 0) +
+    "|" +
+    (ovr.workstreams || 0) +
+    "|" +
+    (states.running || 0) +
+    "|" +
+    (states.attention || 0) +
+    "|" +
+    (states.error || 0) +
+    "|" +
+    aggTokens;
+  if (summaryFp === _homeSummaryFingerprint) return;
+  _homeSummaryFingerprint = summaryFp;
+
+  var parts = [
+    (ovr.nodes || 0) + " node" + ((ovr.nodes || 0) === 1 ? "" : "s"),
+    formatCount(ovr.workstreams || 0) + " workstreams",
+  ];
+  if (states.running) parts.push(states.running + " running");
+  if (states.attention) parts.push(states.attention + " attention");
+  if (states.error) parts.push(states.error + " error");
+  if (aggTokens) parts.push(formatTokens(aggTokens) + " tokens");
+  var summaryText = parts.join(" \u00b7 ");
+  var line = document.getElementById("cluster-summary-line");
+  if (line) line.textContent = summaryText;
+}
 
 // --- Init ---
 // SSE connects after auth is confirmed — either via onLoginSuccess after
@@ -1829,13 +2203,20 @@ function _ensureSSE() {
     connectSSE();
   }
 }
-history.replaceState({ view: "overview" }, "");
+history.replaceState({ view: "home" }, "");
 initLogin();
+// loadOverview fetches the cluster snapshot for the cluster summary
+// aggregates; the active-coordinators list lives on a separate
+// cluster_workstreams fetch started by _startActiveCoordsPolling
+// because coordinator rows don't flow through the per-node SSE
+// streams the collector watches.
 loadOverview();
+_ensureHomeComposerInit();
+_startActiveCoordsPolling();
 // Refresh the coord button visibility after initial whoami lands in
 // sessionStorage (auth.js populates it asynchronously).  A short delay
 // is good enough — the shared pattern for permission-gated UI.
-setTimeout(refreshCoordButtonVisibility, 500);
+setTimeout(_refreshHomeComposerVisibility, 500);
 
 // --- Node Metadata Panel (read-only in node detail view) ---
 function _loadNodeMetadataPanel(nodeId) {

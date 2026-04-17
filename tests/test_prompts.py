@@ -350,6 +350,73 @@ def test_tools_excluded_when_no_tools() -> None:
     assert "TOOL PATTERNS" not in result
 
 
+def test_coordinator_kind_selects_coord_tools() -> None:
+    """kind='coordinator' swaps in tools_coordinator.md with the right patterns."""
+    coord_tools = frozenset(
+        {
+            "spawn_workstream",
+            "send_to_workstream",
+            "inspect_workstream",
+            "close_workstream",
+            "list_workstreams",
+            "list_nodes",
+            "list_skills",
+            "task_list",
+        }
+    )
+    result = compose_system_message(
+        ClientType.WEB,
+        _VALID_CTX,
+        coord_tools,
+        kind="coordinator",
+    )
+    # Coordinator tool patterns are present.
+    assert "spawn_workstream" in result
+    assert "inspect_workstream" in result
+    assert "task_list" in result
+    # IC tool patterns are NOT present — the model must not be instructed
+    # to call tools it doesn't have.
+    for phantom in (
+        "read_file",
+        "edit_file",
+        "write_file",
+        "bash",
+        "plan_agent",
+        "web_fetch",
+        "web_search",
+    ):
+        assert phantom not in result, (
+            f"coordinator prompt must not advertise phantom tool {phantom!r}"
+        )
+
+
+def test_coordinator_kind_uses_orchestrator_persona() -> None:
+    """kind='coordinator' swaps in base_coordinator.md."""
+    result = compose_system_message(
+        ClientType.CLI,
+        _VALID_CTX,
+        frozenset({"spawn_workstream"}),
+        kind="coordinator",
+    )
+    # IC-framing phrases from base.md should NOT appear.
+    for ic_phrase in ("read before you edit", "commits you make"):
+        assert ic_phrase not in result, f"coordinator persona leaked IC framing: {ic_phrase!r}"
+    # Orchestrator-framing phrases from base_coordinator.md should appear.
+    assert "orchestrate" in result
+    assert "delegate" in result
+
+
+def test_interactive_kind_default_still_loads_ic_tools() -> None:
+    """Default kind='interactive' still loads tools.md (no regression)."""
+    result = compose_system_message(
+        ClientType.CLI,
+        _VALID_CTX,
+        _ALL_TOOLS,
+    )
+    assert "read_file" in result
+    assert "bash" in result
+
+
 def test_tools_included_when_tools_available() -> None:
     """TOOLS module is included when available_tools is non-empty."""
     result = compose_system_message(

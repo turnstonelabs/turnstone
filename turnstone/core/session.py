@@ -1433,6 +1433,7 @@ class ChatSession:
                 available_tools=tool_names,
                 policies=["web_search"],
                 db_policies=db_policies,
+                kind=self._kind,
             )
             dev_parts = [composed]
         # Tool search hint (client-side mode only — native mode needs no hint).
@@ -1557,11 +1558,18 @@ class ChatSession:
             if relevant:
                 dev_parts.append("")
                 dev_parts.append(build_memory_context(relevant))
-            dev_parts.append("")
-            dev_parts.append(
-                f"You have {len(visible_mems)} memories in scope. "
-                "Use memory(action='search') or memory(action='list') for more."
-            )
+            # Only advertise the memory(...) tool invocations when the
+            # memory tool is actually in the session's schema.  The
+            # coordinator kind doesn't register memory; the preamble
+            # previously told the model to call a tool it doesn't have,
+            # producing "I don't have access to a memory tool" apologies
+            # or hallucinated calls.
+            if "memory" in tool_names:
+                dev_parts.append("")
+                dev_parts.append(
+                    f"You have {len(visible_mems)} memories in scope. "
+                    "Use memory(action='search') or memory(action='list') for more."
+                )
         if self._pending_nudge:
             types = []
             for nudge_type, nudge_text in self._pending_nudge:

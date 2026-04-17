@@ -8,28 +8,21 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/shared/base.css">
+<link rel="stylesheet" href="/shared/ui-base.css">
+<link rel="stylesheet" href="/shared/chat.css">
 <link rel="stylesheet" href="/shared/katex-0.16.45/katex.min.css">
 <link rel="stylesheet" href="/static/style.css">
 <style>
-  /* Coordinator-specific layout — one-pane variant of the server UI. */
+  /* Coordinator-specific layout — one-pane variant of the server UI.
+     Design-system rules (messages, composer, approval bar, header,
+     sidebar shell) come from /shared/chat.css via the .ts-* classes
+     on the corresponding elements.  Only the coordinator-page
+     layout glue and sidebar-list-item rules (.ch-row / .task-row)
+     live here. */
   body { display: flex; flex-direction: column; height: 100vh; margin: 0; }
-  #coord-header {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.5rem 1rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-elevated);
-  }
-  #coord-header h1 {
-    margin: 0;
-    font-family: 'Outfit', sans-serif;
-    font-size: 1.1rem;
-    font-weight: 600;
-  }
-  #coord-header h1 .dim { color: var(--fg-dim); }
-  #coord-status { color: var(--fg-dim); font-size: 0.85rem; }
-  #coord-header-spacer { flex: 1; }
+
+  /* Main layout — chat pane (2fr) + sidebar (1fr) with shared
+     #coord-main and #coord-body flex wiring. */
   #coord-body {
     flex: 1;
     display: flex;
@@ -45,63 +38,36 @@
     min-width: 0;
   }
   #coord-sidebar {
+    /* .ts-sidebar provides width / border / background; these fill in
+       the coordinator-only flex-grow behaviour so the sidebar occupies
+       its column of #coord-body. */
     flex: 1 1 0;
-    min-width: 260px;
-    max-width: 420px;
-    border-left: 1px solid var(--border);
-    background: var(--bg);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-  #coord-sidebar h2 {
-    margin: 0;
-    padding: 0.5rem 0.75rem 0.35rem;
-    font-family: 'Outfit', sans-serif;
-    font-size: 0.8rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--fg-dim);
-    background: var(--bg-elevated);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  #coord-sidebar .refresh-btn {
-    margin-left: auto;
-    font-size: 0.75rem;
-    padding: 0.1rem 0.4rem;
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: 3px;
-    cursor: pointer;
-    color: var(--fg);
-  }
-  #coord-sidebar .refresh-btn:hover { background: var(--bg-elevated); }
-  #coord-sidebar .section-body {
-    overflow-y: auto;
-    padding: 0.25rem 0.25rem 0.75rem;
   }
   #coord-children-wrap {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 auto;
     min-height: 40%;
     max-height: 60%;
   }
   #coord-tasks-wrap {
-    display: flex;
-    flex-direction: column;
-    flex: 1 1 auto;
     min-height: 30%;
-    border-top: 1px solid var(--border);
   }
+
+  #coord-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem 1.5rem;
+  }
+  .coord-msg .coord-ws-link {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+
+  /* Sidebar list rows — tree-view children + task list.  Coordinator-
+     only vocabulary; .ts-sidebar shells are shared but the row shape
+     is specific to this page's child + task data. */
   .ch-row, .task-row {
     padding: 0.35rem 0.5rem;
     border-radius: 4px;
-    font-family: 'IBM Plex Mono', monospace;
+    font-family: var(--font-mono);
     font-size: 0.82rem;
     line-height: 1.35;
     display: flex;
@@ -123,11 +89,8 @@
     align-items: baseline;
   }
   .ch-row a.ws-link:hover { color: var(--accent); }
-  .ch-row .glyph { width: 1rem; text-align: center; flex-shrink: 0; }
-  .ch-row .glyph-running { color: var(--green); }
-  .ch-row .glyph-thinking { color: var(--yellow); }
-  .ch-row .glyph-attention { color: var(--red); font-weight: 700; }
-  .ch-row .glyph-error { color: var(--red); }
+  /* glyph treatment (.ui-glyph / .ui-glyph-<state>) comes from
+     shared_static/ui-base.css; stateGlyph() emits those classes. */
   .ch-row .name { font-weight: 500; flex: 1; overflow: hidden; text-overflow: ellipsis; }
   .ch-row .meta {
     font-size: 0.72rem;
@@ -136,10 +99,7 @@
     gap: 0.5rem;
     padding-left: 1.35rem;
   }
-  .ch-row .badge-attention {
-    color: var(--red);
-    font-weight: 600;
-  }
+  .ch-row .badge-attention { color: var(--red); font-weight: 600; }
   .task-row .title { font-weight: 500; }
   .task-row .meta { font-size: 0.72rem; color: var(--fg-dim); }
   .task-row .status {
@@ -154,7 +114,7 @@
   }
   .task-row .status-pending { color: var(--fg-dim); }
   .task-row .status-in_progress { color: var(--yellow); border-color: var(--yellow); }
-  .task-row .status-done { color: var(--green); border-color: var(--green); opacity: 0.7; }
+  .task-row .status-done { color: var(--green); border-color: var(--green); }
   .task-row .status-blocked { color: var(--red); border-color: var(--red); }
   .sidebar-empty {
     padding: 0.5rem 0.75rem;
@@ -162,21 +122,23 @@
     color: var(--fg-dim);
     font-style: italic;
   }
-  /* Brief flash when a task-row "\u2192 child" link scrolls into the
+  /* Brief flash when a task-row "→ child" link scrolls into the
      tree — signals the click resolved without the user hunting for
      which row was the target. */
   .ch-row.highlight {
-    background: var(--yellow-glow);
-    border-color: var(--yellow);
+    /* accent-dim reads as "focused, not error" on both light and dark
+       themes; the prior --yellow-glow tinted light-theme rows amber
+       enough to look like an error state. */
+    background: var(--accent-dim);
+    border-color: var(--accent);
     transition: background 0.6s ease-out, border-color 0.6s ease-out;
   }
   @media (prefers-reduced-motion: reduce) {
     .ch-row.highlight { transition: none; }
   }
-  #coord-sidebar .refresh-btn:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-  }
+
+  /* Sidebar mobile toggle (desktop hides; mobile shows via media query
+     below). */
   #coord-sidebar-toggle {
     display: none;
     background: transparent;
@@ -191,123 +153,19 @@
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
-  [aria-busy="true"].section-body { opacity: 0.55; }
-  #coord-messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 1rem 1.5rem;
-  }
-  .coord-msg {
-    margin-bottom: 0.75rem;
-    padding: 0.5rem 0.75rem;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg-elevated);
-  }
-  .coord-msg.role-user { border-color: var(--accent); }
-  .coord-msg.role-assistant { border-color: var(--border); }
-  .coord-msg.role-tool {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.85rem;
-    background: var(--code-bg);
-  }
-  .coord-msg.role-error {
-    border-color: var(--red);
-    color: var(--red);
-  }
-  .coord-msg .role-label {
-    font-weight: 600;
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    color: var(--fg-dim);
-    margin-bottom: 0.25rem;
-  }
-  .coord-msg .coord-ws-link {
-    color: var(--accent);
-    text-decoration: underline;
-  }
-  #coord-composer {
-    display: flex;
-    gap: 0.5rem;
-    padding: 0.75rem 1rem;
-    border-top: 1px solid var(--border);
-    background: var(--bg-elevated);
-  }
-  #coord-input {
-    flex: 1;
-    min-height: 2.5rem;
-    max-height: 10rem;
-    padding: 0.5rem 0.75rem;
-    font-family: inherit;
-    font-size: 0.95rem;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    resize: vertical;
-  }
-  #coord-send-btn {
-    padding: 0 1.2rem;
-    font-weight: 600;
-  }
-  #coord-approval-bar {
-    padding: 0.75rem 1rem;
-    background: var(--yellow-glow);
-    border-top: 1px solid var(--yellow);
-    display: none;
-  }
-  #coord-approval-bar.visible { display: block; }
-  #coord-approval-bar .label { font-weight: 600; margin-bottom: 0.25rem; }
-  #coord-approval-bar .tool-row { margin-bottom: 0.25rem; font-family: 'IBM Plex Mono', monospace; font-size: 0.85rem; }
-  #coord-approval-bar .btn-row { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
-  #coord-approval-bar button { padding: 0.35rem 0.75rem; }
-  #coord-approval-bar button:disabled { opacity: 0.55; cursor: wait; }
-  #coord-approval-bar .approval-header {
-    font-weight: 600;
-    margin-bottom: 0.35rem;
-    font-family: inherit;
-  }
-  /* Deny-destructive button gets a red border so it reads faster than
-     the green/neutral approve variants. */
-  #coord-deny-btn { border-color: var(--red); color: var(--red); }
-  /* Reasoning bubbles are dimmed + italic so they read as pre-content
-     commentary rather than the final assistant reply. */
-  .coord-msg.role-reasoning {
-    color: var(--fg-dim);
-    font-style: italic;
-    border-style: dashed;
-  }
-  #coord-sse-status {
-    color: var(--fg-dim);
-    font-size: 0.8rem;
-  }
-  #coord-sse-status.ok { color: var(--green); }
-  #coord-sse-status.err { color: var(--red); }
+  [aria-busy="true"].ts-sidebar-section-body,
+  [aria-busy="true"] .section-body { opacity: 0.55; }
 
-  /* Sub-700px: wrap the header so the buttons don't overflow off-screen
-     on phone-sized viewports. */
+  /* Sub-700px: sidebar collapses to an accordion above the chat;
+     #coord-header wraps buttons; composer tightens. */
   @media (max-width: 700px) {
-    #coord-header {
-      flex-wrap: wrap;
-      gap: 0.5rem;
-      padding: 0.5rem 0.75rem;
-    }
-    #coord-header h1 { font-size: 1rem; }
+    #coord-header { flex-wrap: wrap; }
     #coord-header-spacer { flex-basis: 100%; height: 0; }
     #coord-messages { padding: 0.75rem 1rem; }
-    #coord-composer { padding: 0.5rem 0.75rem; }
-    /* On phones the soft keyboard eats vertical space — cap the input
-       and disable drag-resize so the composer stays in view. */
-    #coord-input {
-      resize: none;
-      max-height: 6rem;
-    }
-    /* Sidebar collapses to an accordion above the chat on phones; the
-       full tree is reachable by expanding but doesn't eat the chat view. */
     #coord-body { flex-direction: column; }
     #coord-sidebar {
-      max-width: none;
-      border-left: none;
-      border-bottom: 1px solid var(--border);
       max-height: 50vh;
+      flex: 0 0 auto;
     }
     #coord-sidebar-toggle { display: inline-flex; }
     #coord-sidebar[aria-expanded="false"] #coord-children-wrap,
@@ -320,14 +178,18 @@
 </head>
 <body>
 
-<div id="coord-header">
-  <h1>turnstone <span class="dim">coordinator</span></h1>
+<div id="coord-header" class="ts-header">
+  <a href="/" class="ts-header-back-link" aria-label="Back to console">
+    <span class="ts-header-back-link-arrow" aria-hidden="true">&larr;</span>
+    <span>Console</span>
+  </a>
+  <h1 class="ts-header-title">turnstone <span class="dim ts-header-title-dim">coordinator</span></h1>
   <span id="coord-name"></span>
   <span id="coord-status"></span>
-  <span id="coord-header-spacer"></span>
-  <span id="coord-sse-status" aria-live="polite">connecting…</span>
+  <span id="coord-header-spacer" class="ts-header-spacer"></span>
+  <span id="coord-sse-status" class="ts-header-status" aria-live="polite">connecting…</span>
   <button id="coord-cancel-btn" class="header-btn" style="display:none" onclick="coordCancel()">cancel</button>
-  <button id="coord-close-btn" class="header-btn" onclick="coordCloseSession()" title="Close this coordinator session">close</button>
+  <button id="coord-close-btn" class="header-btn" onclick="coordCloseSession()" title="End this coordinator session (terminates it on the server)">end</button>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
 </div>
 
@@ -341,23 +203,25 @@
     <!-- Region (not alertdialog) because we don't trap focus; buttons are
          reachable in normal tab order.  role=alertdialog implies a modal
          focus trap per WAI-ARIA. -->
-    <div id="coord-approval-bar" role="region" aria-label="Approval required" aria-live="assertive">
-      <div id="coord-approval-label" class="label">Approval required</div>
+    <div id="coord-approval-bar" class="ts-approval ts-approval--batch" role="region" aria-label="Approval required" aria-live="assertive">
+      <div id="coord-approval-label" class="label ts-approval-header">Approval required</div>
       <div id="coord-approval-tools"></div>
-      <div class="btn-row">
-        <button id="coord-approve-btn" onclick="coordApprove(true, false)">Approve</button>
-        <button id="coord-approve-always-btn" onclick="coordApprove(true, true)">Approve (always)</button>
-        <button id="coord-deny-btn" onclick="coordApprove(false, false)">Deny</button>
+      <div class="btn-row ts-approval-actions">
+        <button id="coord-approve-btn" class="ts-approval-btn ts-approval-btn--approve" onclick="coordApprove(true, false)">Approve</button>
+        <button id="coord-approve-always-btn" class="ts-approval-btn ts-approval-btn--always" onclick="coordApprove(true, true)">Approve (always)</button>
+        <button id="coord-deny-btn" class="ts-approval-btn ts-approval-btn--deny" onclick="coordApprove(false, false)">Deny</button>
       </div>
     </div>
 
-    <form id="coord-composer" onsubmit="return coordSend(event)">
-      <textarea id="coord-input" rows="1" placeholder="Message the coordinator…" aria-label="Coordinator input"></textarea>
-      <button id="coord-send-btn" type="submit">send</button>
+    <form id="coord-composer" class="ts-composer" onsubmit="return coordSend(event)">
+      <div class="ts-composer-row">
+        <textarea id="coord-input" class="ts-composer-input" rows="1" placeholder="Message the coordinator…" aria-label="Coordinator input"></textarea>
+        <button id="coord-send-btn" class="ts-composer-send" type="submit">send</button>
+      </div>
     </form>
   </div>
 
-  <aside id="coord-sidebar" aria-expanded="true" aria-label="Coordinator children and tasks">
+  <aside id="coord-sidebar" class="ts-sidebar" aria-expanded="true" aria-label="Coordinator children and tasks">
     <!-- Mobile-only toggle — on desktop the sidebar is always visible
          beside the chat pane; on <700px viewports it collapses into an
          accordion that only shows its heading row until tapped. -->
@@ -368,29 +232,29 @@
       <span id="coord-sidebar-toggle-glyph" aria-hidden="true">&#9662;</span>
       <span>Children &amp; tasks</span>
     </button>
-    <div id="coord-children-wrap">
-      <h2 id="coord-children-heading">
+    <div id="coord-children-wrap" class="ts-sidebar-section">
+      <h2 id="coord-children-heading" class="ts-sidebar-section-heading">
         <span>Children</span>
-        <span id="coord-children-count" class="dim"></span>
-        <button type="button" class="refresh-btn" id="coord-children-refresh" aria-label="Refresh children list" title="Refresh children">&#8635;</button>
+        <span id="coord-children-count" class="dim ts-sidebar-section-count"></span>
+        <button type="button" class="refresh-btn ui-btn--icon" id="coord-children-refresh" aria-label="Refresh children list" title="Refresh children">&#8635;</button>
       </h2>
       <!-- role="list" only — no aria-live.  The sidebar's DOM churns
            on every child state tick and fan-out re-render would flood
            screen readers.  If we need targeted announcements later,
            emit them via a dedicated off-screen polite live region. -->
       <div id="coord-children-tree"
-           class="section-body"
+           class="section-body ts-sidebar-section-body"
            role="list"
            aria-labelledby="coord-children-heading"></div>
     </div>
-    <div id="coord-tasks-wrap">
-      <h2 id="coord-tasks-heading">
+    <div id="coord-tasks-wrap" class="ts-sidebar-section">
+      <h2 id="coord-tasks-heading" class="ts-sidebar-section-heading">
         <span>Tasks</span>
-        <span id="coord-tasks-count" class="dim"></span>
-        <button type="button" class="refresh-btn" id="coord-tasks-refresh" aria-label="Refresh task list" title="Refresh tasks">&#8635;</button>
+        <span id="coord-tasks-count" class="dim ts-sidebar-section-count"></span>
+        <button type="button" class="refresh-btn ui-btn--icon" id="coord-tasks-refresh" aria-label="Refresh task list" title="Refresh tasks">&#8635;</button>
       </h2>
       <div id="coord-tasks"
-           class="section-body"
+           class="section-body ts-sidebar-section-body"
            role="list"
            aria-labelledby="coord-tasks-heading"></div>
     </div>
@@ -402,8 +266,8 @@
      register in the expected sequence.  The renderer libs (katex, hljs,
      renderer.js) match the server UI (ui/static/index.html) so the
      coordinator page can call renderMarkdown / postRenderMarkdown on
-     streamed assistant content.  renderer.js is mirrored from the ui
-     package — see its header comment. -->
+     streamed assistant content.  renderer.js is the single canonical
+     implementation shared across the two chat pages. -->
 <script src="/shared/utils.js"></script>
 <script src="/shared/toast.js"></script>
 <script src="/shared/theme.js"></script>
@@ -411,7 +275,7 @@
 <script src="/shared/kb.js"></script>
 <script src="/shared/katex-0.16.45/katex.min.js"></script>
 <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
-<script src="/static/coordinator/renderer.js"></script>
+<script src="/shared/renderer.js"></script>
 <script src="/static/coordinator/coordinator.js"></script>
 </body>
 </html>

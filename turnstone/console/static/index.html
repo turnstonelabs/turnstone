@@ -8,15 +8,16 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/shared/base.css">
+<link rel="stylesheet" href="/shared/ui-base.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <div id="header">
-  <h1>turnstone <span class="header-dim">console</span></h1>
+  <h1><a href="#" id="header-home-link" onclick="showHome(); return false"
+         aria-label="Home (coordinator landing)">turnstone <span class="header-dim">console</span></a></h1>
   <span id="cluster-summary" aria-live="polite"></span>
   <span id="status-bar" role="status" aria-live="polite"></span>
   <button id="new-ws-btn" class="header-btn header-btn-accent" onclick="showNewWsModal()" title="Create workstream">+ new</button>
-  <button id="new-coord-btn" class="header-btn" style="display:none" onclick="showNewCoordModal()" title="Create coordinator workstream (requires admin.coordinator)">+ coordinator</button>
   <button id="admin-btn" class="header-btn" onclick="showAdmin()" title="User &amp; token administration" aria-expanded="false" aria-controls="view-admin">admin</button>
   <button id="logout-btn" class="header-btn" onclick="logout()" style="display:none">logout</button>
   <button id="theme-toggle" class="header-btn" onclick="toggleTheme()" aria-label="Toggle light/dark theme">&#9790;</button>
@@ -29,11 +30,101 @@
 </nav>
 
 <div id="main">
-  <!-- CLUSTER OVERVIEW -->
-  <div id="view-overview">
-    <div class="section-header">NODES</div>
-    <div id="node-table" role="list" aria-label="Nodes" aria-live="polite">
-      <div class="dashboard-empty">Loading cluster data...</div>
+  <!-- HOME — coordinator-first landing.  The console's primary
+       workflow on page load is "start / continue a coordinator task";
+       the cluster node list is demoted to an expandable one-line
+       summary below.  #view-overview / #view-node / #view-filtered
+       remain for deep-link compatibility. -->
+  <div id="view-home">
+    <!-- Persistent "start a new coordinator task" composer.  Visibility is
+         gated on the admin.coordinator permission (same rule the existing
+         +coordinator header button + modal use).  Shows a remediation
+         banner when the create endpoint would return 503 (no coordinator
+         model alias resolves). -->
+    <section id="coord-composer-panel"
+             class="home-panel"
+             style="display:none"
+             aria-label="Start a new orchestration task">
+      <h2 class="home-panel-title">Start a new orchestration task</h2>
+      <div id="coord-composer-503"
+           class="home-composer-banner"
+           role="status"
+           style="display:none">
+        Coordinator subsystem not configured —
+        <a href="#" onclick="showAdmin(); switchAdminTab('models'); return false">open Admin → Models</a>
+        to set <code>coordinator.model_alias</code> or a registry default.
+      </div>
+      <label for="home-coord-task" class="sr-only">Initial task</label>
+      <textarea id="home-coord-task"
+                class="ui-textarea home-composer-task"
+                rows="3"
+                placeholder="What should this coordinator orchestrate?"></textarea>
+      <div class="home-composer-row">
+        <label for="home-coord-name" class="sr-only">Name</label>
+        <input id="home-coord-name"
+               class="ui-input home-composer-name"
+               type="text"
+               autocomplete="off"
+               placeholder="Name (optional)">
+        <label for="home-coord-skill" class="sr-only">Skill</label>
+        <select id="home-coord-skill" class="ui-select home-composer-skill">
+          <option value="">Use defaults</option>
+        </select>
+        <button id="home-coord-submit"
+                type="button"
+                class="ui-btn ui-btn--primary home-composer-submit"
+                onclick="submitHomeCoord()">Start</button>
+      </div>
+      <div id="home-coord-error"
+           class="home-composer-error"
+           role="alert"
+           aria-live="assertive"
+           style="display:none"></div>
+    </section>
+
+    <!-- Active coordinators list — SSE-driven.  Rows render via the shared
+         _renderWsRow helper so state glyph + name + child-count badge +
+         last-activity match the existing dashboard tree. -->
+    <section id="active-coordinators" class="home-section" aria-label="Active coordinators">
+      <h2 class="home-section-title">
+        <span>Active coordinators</span>
+        <span id="active-coord-count" class="home-section-count"></span>
+      </h2>
+      <div id="active-coord-list"
+           class="dash-table home-coord-list"
+           role="list"
+           aria-live="polite">
+        <div class="dashboard-empty">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Cluster summary — one-line aggregate that toggles the node
+         list inline below.  Lives inside #view-home so operators
+         never "leave" the landing page to see cluster state;
+         showOverview() is preserved as an alias that opens the
+         details section so ?view=overview deep-links still work. -->
+    <section id="cluster-summary-compact" class="home-section" aria-label="Cluster summary">
+      <button type="button"
+              id="cluster-summary-expand"
+              class="home-cluster-summary"
+              aria-expanded="false"
+              aria-controls="view-overview"
+              onclick="toggleClusterDetails()"
+              title="Show / hide cluster nodes">
+        <span id="cluster-summary-line" class="home-cluster-summary-line">Loading cluster…</span>
+        <span class="home-cluster-summary-caret" aria-hidden="true">&#9656;</span>
+      </button>
+    </section>
+
+    <!-- Cluster details — node list, inline below the summary.
+         Hidden by default; toggleClusterDetails() flips it and
+         showOverview() forces it open so popstate + breadcrumb
+         callers land on the expanded state. -->
+    <div id="view-overview" hidden>
+      <div class="section-header">NODES</div>
+      <div id="node-table" role="list" aria-label="Nodes" aria-live="polite">
+        <div class="dashboard-empty">Loading cluster data...</div>
+      </div>
     </div>
   </div>
 
@@ -816,26 +907,6 @@ window.TURNSTONE_KB_SHORTCUTS = [
     <div id="new-ws-buttons">
       <button id="new-ws-cancel" onclick="hideNewWsModal()">Cancel</button>
       <button id="new-ws-submit" onclick="submitNewWs()">Create</button>
-    </div>
-  </div>
-</div>
-
-<!-- New coordinator modal — gated by admin.coordinator permission -->
-<div id="new-coord-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="new-coord-title">
-  <div id="new-coord-box" class="admin-modal">
-    <h2 id="new-coord-title">New Coordinator</h2>
-    <div id="new-coord-error" role="alert" aria-live="assertive"></div>
-    <label for="new-coord-task">Initial task <span class="label-hint">optional &mdash; dispatched as the first message</span></label>
-    <textarea id="new-coord-task" rows="4" placeholder="What should this coordinator orchestrate?"></textarea>
-    <label for="new-coord-name">Name <span class="label-hint">optional</span></label>
-    <input id="new-coord-name" type="text" placeholder="Auto-generated if empty" autocomplete="off">
-    <label for="new-coord-skill">Skill <span class="label-hint">optional</span></label>
-    <select id="new-coord-skill">
-      <option value="">Use defaults</option>
-    </select>
-    <div id="new-coord-buttons">
-      <button id="new-coord-cancel" class="modal-cancel" onclick="hideNewCoordModal()">Cancel</button>
-      <button id="new-coord-submit" class="modal-submit" onclick="submitNewCoord()">Create</button>
     </div>
   </div>
 </div>

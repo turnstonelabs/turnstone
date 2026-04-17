@@ -1,0 +1,618 @@
+/* ==========================================================================
+   turnstone — chat.css
+   Shared chat-view vocabulary.  Used by the per-node server UI
+   (turnstone/ui/static/) and the coordinator page
+   (turnstone/console/static/coordinator/).  Tokens come from base.css;
+   chat.css layers component classes on top.
+   Sizing scale follows the 11/12/13px established elsewhere so
+   components slot into existing layouts without dominating them.
+   ========================================================================== */
+
+/* ==========================================================================
+   Messages — single-column left-aligned blocks
+   Differentiation is by left-border colour only (no role labels).
+   ========================================================================== */
+.ts-msg {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.ts-msg--user {
+  border-left-color: var(--accent);
+}
+.ts-msg--assistant {
+  border-left-color: var(--border-strong);
+}
+.ts-msg--reasoning {
+  /* Dashed on the left-accent only — the other three sides keep the
+     solid 1px outline so the block stays a crisp card rather than
+     turning into a fully dotted box. */
+  border-left-style: dashed;
+  border-left-color: var(--fg-dim);
+  color: var(--fg-dim);
+  font-style: italic;
+}
+.ts-msg--tool {
+  font-family: var(--font-mono);
+  background: var(--code-bg);
+  border-left-color: var(--cyan);
+}
+.ts-msg--error {
+  border-left-color: var(--red);
+  color: var(--red);
+}
+.ts-msg--info {
+  border-left-color: var(--cyan);
+  color: var(--cyan);
+  font-size: 12px;
+}
+
+/* Content container.  Markdown renders here (streamingRender writes
+   innerHTML; renderer.js is the trust boundary for that sink). */
+.ts-msg-body {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+.ts-msg-body > *:first-child { margin-top: 0; }
+.ts-msg-body > *:last-child { margin-bottom: 0; }
+.ts-msg-body pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  font-size: 12px;
+}
+.ts-msg-body code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-highlight);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.ts-msg-body pre code { background: none; padding: 0; border-radius: 0; }
+.ts-msg-body a { color: var(--accent); text-decoration: underline; }
+.ts-msg-body h1, .ts-msg-body h2, .ts-msg-body h3,
+.ts-msg-body h4, .ts-msg-body h5, .ts-msg-body h6 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  margin: 8px 0 4px;
+  color: var(--fg-bright);
+}
+.ts-msg-body h1 { font-size: 16px; }
+.ts-msg-body h2 { font-size: 14px; }
+.ts-msg-body h3 { font-size: 13px; }
+.ts-msg-body h4, .ts-msg-body h5, .ts-msg-body h6 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ts-msg-body ul, .ts-msg-body ol { margin: 4px 0 4px 20px; }
+.ts-msg-body li { margin: 2px 0; }
+.ts-msg-body strong { color: var(--fg-bright); }
+.ts-msg-body em { font-style: italic; }
+.ts-msg-body blockquote {
+  border-left: 2px solid var(--border-strong);
+  padding-left: 10px;
+  margin: 6px 0;
+  color: var(--fg-dim);
+}
+
+/* Floating action toolbar — edit / rewind / retry / copy slots.
+   Absolute top-right so the message body stays full-width. */
+.ts-msg-actions {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.ts-msg:hover .ts-msg-actions,
+.ts-msg:focus-within .ts-msg-actions { opacity: 1; }
+.ts-msg-action-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.1s, border-color 0.1s, color 0.1s;
+}
+.ts-msg-action-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--fg-bright);
+  border-color: var(--accent-dim);
+}
+.ts-msg-action-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* On coarse-pointer / hover-none devices, keep the toolbar visible — no hover. */
+@media (hover: none) and (pointer: coarse) {
+  .ts-msg-actions { opacity: 1; }
+  .ts-msg-action-btn { padding: 4px 8px; font-size: 12px; }
+}
+
+/* ==========================================================================
+   Approval shell — shared by inline (per-tool, interactive UI) and
+   batch (pinned bottom bar, coordinator).  Same visual vocabulary,
+   different layout hook.
+   ========================================================================== */
+.ts-approval {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Inline variant: an approval block living as a .ts-msg in the
+   message stream, one per tool call awaiting approval. */
+.ts-msg.ts-approval--inline {
+  border-left-color: var(--yellow);
+  background: var(--bg-elevated);
+}
+
+/* Batch variant: pinned to the bottom of the chat pane, batches all
+   pending approvals across child workstreams (coordinator). */
+.ts-approval--batch {
+  position: relative;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--yellow);
+  border-left: 3px solid var(--yellow);
+  display: none;
+}
+.ts-approval--batch.visible { display: flex; }
+
+.ts-approval-header {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--yellow);
+  margin-bottom: 2px;
+}
+.ts-approval-tool {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--code-bg);
+}
+.ts-approval-tool + .ts-approval-tool { margin-top: 4px; }
+.ts-approval-tool-name { color: var(--yellow); font-weight: 600; }
+.ts-approval-tool-cmd { color: var(--fg-bright); white-space: pre-wrap; }
+.ts-approval-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+.ts-approval-btn {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.ts-approval-btn:hover {
+  background: var(--bg-highlight);
+  color: var(--fg-bright);
+  border-color: var(--accent-dim);
+}
+.ts-approval-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ts-approval-btn--approve { border-color: var(--green); color: var(--green); }
+.ts-approval-btn--approve:hover { background: var(--green-glow); color: var(--green); }
+.ts-approval-btn--deny { border-color: var(--red); color: var(--red); }
+.ts-approval-btn--deny:hover { background: var(--red-glow); color: var(--red); }
+.ts-approval-btn--always { border-color: var(--accent); color: var(--accent); }
+.ts-approval-btn--always:hover { background: var(--accent-dim); color: var(--accent); }
+.ts-approval-btn .ts-approval-key {
+  display: inline-block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 0 4px;
+  margin-right: 4px;
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+.ts-approval-btn:disabled { opacity: 0.5; cursor: wait; }
+
+.ts-approval-feedback {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  width: 100%;
+}
+.ts-approval-feedback:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+.ts-approval-feedback::placeholder { color: var(--fg-dim); opacity: 0.7; }
+
+.ts-approval-badge {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.04em;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: max-content;
+}
+.ts-approval-badge--approved { color: var(--green); border: 1px solid var(--green); }
+.ts-approval-badge--denied { color: var(--red); border: 1px solid var(--red); }
+.ts-approval-badge--error { color: var(--red); background: var(--red-glow); border: 1px solid var(--red); }
+
+/* Verdict badge (LLM judge) — inline in the approval block on
+   interactive UI.  Coordinator doesn't render verdicts today but the
+   class is shared so it can opt in without duplication. */
+.ts-verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-left: 3px solid var(--fg-dim);
+  border-radius: 2px;
+  background: var(--bg-surface);
+  width: max-content;
+}
+.ts-verdict-badge[data-risk="low"] { border-left-color: var(--green); }
+.ts-verdict-badge[data-risk="medium"] { border-left-color: var(--yellow); }
+.ts-verdict-badge[data-risk="high"] { border-left-color: var(--red); }
+.ts-verdict-badge[data-risk="critical"] { border-left-color: var(--red); background: var(--red-glow); }
+.ts-verdict-risk { font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+.ts-verdict-rec { color: var(--fg-dim); }
+.ts-verdict-conf { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.ts-verdict-expand {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+}
+.ts-verdict-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  padding: 4px 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-top: 4px;
+}
+
+/* Verdict glow — highlight the recommended button while a judge
+   verdict is present.  Kept as a utility class so it can attach to
+   any .ts-approval button. */
+.ts-verdict-glow--approve .ts-approval-btn--approve {
+  box-shadow: 0 0 0 2px var(--green-glow);
+}
+.ts-verdict-glow--deny .ts-approval-btn--deny {
+  box-shadow: 0 0 0 2px var(--red-glow);
+}
+.ts-verdict-glow--review .ts-approval-btn--approve,
+.ts-verdict-glow--review .ts-approval-btn--deny {
+  box-shadow: 0 0 0 2px var(--yellow-glow);
+}
+
+/* ==========================================================================
+   Composer — shared form shell.
+   Slots: optional attachment chips row, optional paperclip, textarea,
+   send button.  Coordinator omits chips + paperclip; interactive
+   includes both.  Same wrapper, same textarea + send styling.
+   ========================================================================== */
+.ts-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 14px;
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+}
+
+.ts-composer-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.ts-composer-chips:empty { display: none; }
+
+.ts-composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+}
+.ts-composer-chip-size { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.ts-composer-chip-remove {
+  background: none;
+  border: none;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+}
+.ts-composer-chip-remove:hover { color: var(--red); }
+
+.ts-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.ts-composer-attach {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 4px 8px;
+  line-height: 1;
+  height: 32px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.ts-composer-attach:hover {
+  background: var(--bg-highlight);
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+.ts-composer-attach:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.ts-composer-input {
+  flex: 1;
+  min-height: 32px;
+  max-height: 160px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  /* resize: none — max-height + auto-resize handlers in app.js /
+     coordinator.js cap growth; letting the user drag-resize pushes
+     the messages pane off-screen on small viewports. */
+  resize: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.ts-composer-input:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-dim);
+}
+.ts-composer-input:disabled { opacity: 0.55; cursor: not-allowed; }
+.ts-composer-input::placeholder { color: var(--fg-dim); opacity: 0.7; }
+
+.ts-composer-send {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 16px;
+  background: var(--accent);
+  color: var(--on-color);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  height: 32px;
+  transition: filter 0.12s;
+  letter-spacing: 0.02em;
+}
+.ts-composer-send:hover { filter: brightness(1.08); }
+.ts-composer-send:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+.ts-composer-send:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
+.ts-composer-send--queue {
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.ts-composer-send--queue:hover { background: var(--accent-dim); filter: none; }
+
+/* ==========================================================================
+   Header — shared page-header shell.
+   Pages that want it add .ts-header to their existing #header wrapper.
+   Structure: logo + status region + actions region.  Already matches
+   the shape used by ui/static/index.html and console/static/index.html;
+   coordinator migrates into the same pattern.
+   ========================================================================== */
+.ts-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-strong);
+  flex-shrink: 0;
+  position: relative;
+}
+.ts-header::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent-dim), transparent);
+}
+/* Suppress the accent gradient when the header is immediately followed
+   by a #tab-bar (server UI) — the tab-bar already carries its own
+   border-bottom and the two decorative lines stack visually otherwise. */
+.ts-header:has(+ #tab-bar)::after { display: none; }
+.ts-header-title {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+  margin: 0;
+}
+.ts-header-title-dim { color: var(--fg-dim); font-weight: 400; }
+.ts-header-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  letter-spacing: 0.03em;
+}
+.ts-header-status--ok { color: var(--green); }
+.ts-header-status--err { color: var(--red); }
+.ts-header-spacer { flex: 1; }
+
+/* Back-to-console navigation — shared affordance used by the
+   coordinator page header and by the console's redirect banner
+   injected into the interactive UI proxy pages at /node/{id}/. */
+.ts-header-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  text-decoration: none;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.02em;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.ts-header-back-link:hover {
+  color: var(--accent);
+  background: var(--bg-highlight);
+  border-color: var(--accent-dim);
+}
+.ts-header-back-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ts-header-back-link-arrow { font-family: var(--font-mono); }
+.ts-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ==========================================================================
+   Sidebar — shared right-sidebar shell.
+   Currently only used by the coordinator page; extracted so other
+   pages can adopt.  Section headings reuse .ui-section-heading from
+   ui-base.css.
+   ========================================================================== */
+.ts-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: clamp(260px, 22vw, 420px);
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ts-sidebar-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 30%;
+  overflow: hidden;
+}
+.ts-sidebar-section + .ts-sidebar-section {
+  border-top: 1px solid var(--border);
+}
+.ts-sidebar-section-heading {
+  margin: 0;
+  padding: 6px 10px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ts-sidebar-section-count { color: var(--fg-dim); font-variant-numeric: tabular-nums; }
+.ts-sidebar-section-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 4px 4px 8px;
+}
+.ts-sidebar-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+
+/* ==========================================================================
+   Mobile (<700px) — chat.css components stack vertically.
+   ========================================================================== */
+@media (max-width: 700px) {
+  .ts-msg { padding: 6px 10px; }
+  .ts-msg-body pre { margin: 4px -6px; border-radius: 0; }
+  .ts-composer { padding: 6px 10px; }
+  .ts-composer-input { min-height: 40px; max-height: 120px; resize: none; }
+  .ts-composer-send { height: 40px; padding: 6px 14px; }
+  .ts-sidebar {
+    width: 100%;
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+  .ts-approval--batch { padding: 8px 10px; }
+}
+
+/* ==========================================================================
+   Reduced motion — disable chat.css transitions.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ts-msg-actions,
+  .ts-msg-action-btn,
+  .ts-approval-btn,
+  .ts-composer-attach,
+  .ts-composer-input,
+  .ts-composer-send { transition: none; }
+}

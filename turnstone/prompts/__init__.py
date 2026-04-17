@@ -88,6 +88,7 @@ def compose_system_message(
     available_tools: frozenset[str],
     policies: list[str] | None = None,
     db_policies: list[dict[str, Any]] | None = None,
+    kind: str = "interactive",
 ) -> str:
     """Compose a system message from modular components.
 
@@ -103,6 +104,15 @@ def compose_system_message(
         Explicit file-based policy names to include (e.g. ``["web_search"]``).
     db_policies:
         Database-backed policies from ``storage.list_prompt_policies()``.
+    kind:
+        Workstream kind — ``"interactive"`` (default) loads the
+        IC-focused ``tools.md`` with read_file / bash / write_file
+        patterns; ``"coordinator"`` loads ``tools_coordinator.md``
+        which documents spawn_workstream / send_to_workstream /
+        inspect_workstream / list_nodes / list_skills / task_list etc.
+        A coordinator session has a disjoint tool schema (see
+        COORDINATOR_TOOLS), so composing it with the IC tools block
+        would instruct the model to hallucinate tool calls that fail.
 
     Returns
     -------
@@ -111,8 +121,12 @@ def compose_system_message(
     """
     parts: list[str] = []
 
-    # 1. BASE — always included
-    parts.append(_load("base.md"))
+    # 1. BASE — kind-specific persona.  The default base.md frames the
+    #    model as an IC engineer ("you read before you edit, commits
+    #    you make..."); coordinators need an orchestrator framing
+    #    instead ("you decompose, delegate, monitor, synthesise").
+    base_module = "base_coordinator.md" if kind == "coordinator" else "base.md"
+    parts.append(_load(base_module))
 
     # 2. ENV — exactly one, selected by client type
     if client_type not in _ENV_MAP:
@@ -123,9 +137,11 @@ def compose_system_message(
     _validate_context(context)
     parts.append(_build_context(context))
 
-    # 4. TOOLS — if any tools are available
+    # 4. TOOLS — kind-specific patterns.  Coordinators get the
+    #    orchestrator block; interactive sessions get the IC block.
     if available_tools:
-        parts.append(_load("tools.md"))
+        tools_module = "tools_coordinator.md" if kind == "coordinator" else "tools.md"
+        parts.append(_load(tools_module))
 
     # 5. POLICIES — resolve from DB first, fall back to files
     #    DB policies indexed by name for O(1) override lookup.

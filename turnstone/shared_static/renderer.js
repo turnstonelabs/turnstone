@@ -308,19 +308,30 @@ function renderMarkdown(text) {
     text = result.join("\n");
   })();
 
-  // Protect code blocks
+  // Protect code blocks.  The opening-run length is captured and
+  // required on the close via backreference so a 4-backtick outer
+  // fence wrapping a 3-backtick inner (common when embedding
+  // markdown-about-markdown or lang-tagged snippets inside another
+  // code block) is tokenised as one outer block with the inner
+  // triple-backticks preserved verbatim — the prior `` ```...``` ``
+  // regex treated the outer-open and inner-open as a single fence
+  // pair, stranding the rest of the content with visible
+  // \x00CB{n}\x00 sentinels.
   var codeBlocks = [];
-  text = text.replace(/```([^\s`]*)\n([\s\S]*?)```/g, function (m, lang, code) {
-    var cssLang = _langToCssClass(lang);
-    codeBlocks.push(
-      "<pre><code" +
-        (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
-        ">" +
-        escapeHtml(code.replace(/\n$/, "")) +
-        "</code></pre>",
-    );
-    return "\x00CB" + (codeBlocks.length - 1) + "\x00";
-  });
+  text = text.replace(
+    /(```+)([^\s`]*)\n([\s\S]*?)\1/g,
+    function (m, _open, lang, code) {
+      var cssLang = _langToCssClass(lang);
+      codeBlocks.push(
+        "<pre><code" +
+          (cssLang ? ' class="language-' + escapeHtml(cssLang) + '"' : "") +
+          ">" +
+          escapeHtml(code.replace(/\n$/, "")) +
+          "</code></pre>",
+      );
+      return "\x00CB" + (codeBlocks.length - 1) + "\x00";
+    },
+  );
 
   // Protect <details> blocks (safe HTML — attribute-free only)
   var detailsBlocks = [];
@@ -863,4 +874,59 @@ function reRenderAllMermaid() {
     arr.push(els[i]);
   }
   _renderMermaidSequence(arr, 0);
+}
+
+// ---------------------------------------------------------------------------
+//  Streaming helpers — shared between the server-node UI and coordinator.
+//  Re-render the full buffer on each streamed token, but coalesce through
+//  requestAnimationFrame so fast producers (10-100 tokens/sec) don't
+//  trigger renderMarkdown + DOM replacement more than once per paint
+//  cycle.  renderMarkdown tolerates mid-stream partial fences / lists
+//  (they render as literal text and resolve once the closing tokens
+//  arrive), and the per-element buffer cache skips identical redundant
+//  renders (SSE retries / resumes).  postRenderMarkdown stays deferred
+//  to streamingRenderFinalize so syntax highlighting + mermaid + KaTeX
+//  don't thrash mid-stream.  renderMarkdown escapes HTML internally
+//  (see escapeHtml in utils.js); it is the trust boundary for the
+//  markup written to el below.
+// ---------------------------------------------------------------------------
+function _streamingRenderApply(el, buffer) {
+  if (el._lastRenderedBuffer === buffer) return;
+  el._lastRenderedBuffer = buffer;
+  var html = renderMarkdown(buffer);
+  el.innerHTML = html;
+}
+
+function streamingRender(el, buffer) {
+  if (!el) return;
+  // Short-circuit identical-buffer calls (e.g. SSE retry / resume).
+  // V8's string === length-compares internally so the explicit check is
+  // redundant.
+  if (el._lastRenderedBuffer === buffer) return;
+  el._pendingBuffer = buffer;
+  if (el._rafHandle) return; // one render per animation frame
+  el._rafHandle = requestAnimationFrame(function () {
+    el._rafHandle = 0;
+    // If the element has been removed from the tree between schedule
+    // and flush (pane cleared, message deleted, view swapped) skip the
+    // render so we don't mutate a detached node + keep its buffer
+    // strings alive until GC.
+    if (!el.isConnected) return;
+    _streamingRenderApply(el, el._pendingBuffer);
+  });
+}
+
+function streamingRenderFinalize(el, buffer) {
+  if (!el) return;
+  // Flush any pending rAF-scheduled render so the finalize sees the
+  // final buffer exactly once, then run the expensive post-render
+  // (hljs / mermaid / KaTeX) on the settled DOM.
+  if (el._rafHandle) {
+    cancelAnimationFrame(el._rafHandle);
+    el._rafHandle = 0;
+  }
+  _streamingRenderApply(el, buffer);
+  if (typeof postRenderMarkdown === "function") {
+    postRenderMarkdown(el);
+  }
 }

@@ -132,34 +132,35 @@ _JS_PROXY_SHIM = """\
 
 _CONSOLE_BANNER_TEMPLATE = (
     '<div class="console-banner">'
-    '<a href="/" class="console-banner-link" aria-label="Return to console">&larr; Console</a>'
-    '<span class="console-banner-sep">\u2502</span>'
+    '<a href="/" class="ts-header-back-link" aria-label="Return to console">'
+    '<span class="ts-header-back-link-arrow" aria-hidden="true">&larr;</span>'
+    "<span>Console</span>"
+    "</a>"
+    '<span class="console-banner-sep" aria-hidden="true">\u2502</span>'
     '<a href="NODE_LINK_PLACEHOLDER" class="console-banner-node"'
     ' aria-label="Node: NODE_ID_PLACEHOLDER">'
     "NODE_ID_PLACEHOLDER</a>"
     "</div>"
 )
 
-# Injected <style>: offsets fixed-position overlays and provides theme-aware
-# banner styling so the banner adapts to light/dark without inline colours.
+# Injected <style>: offsets fixed-position overlays + styles the console
+# return-banner against the server UI's existing design tokens.  The
+# banner uses the shared .ts-header-back-link class (defined in
+# shared_static/chat.css, loaded by the interactive UI) so both the
+# coordinator-page back-link and this banner present identical back-to-
+# console affordances.  Only the banner-local layout bits (sep + node
+# link typography) stay scoped here.
 _CONSOLE_PROXY_STYLE = (
     "<style>"
     ".dashboard-overlay{top:32px!important}"
-    ".console-banner{background:#111827;border-bottom:1px solid rgba(229,160,66,0.3);"
-    "padding:6px 20px;font-family:'IBM Plex Mono',monospace;font-size:12px;"
-    "display:flex;align-items:center;gap:12px;position:relative;z-index:200}"
-    ".console-banner-link,.console-banner-node{color:#9aa0b8;text-decoration:none}"
-    ".console-banner-link{font-weight:500;padding:2px 0}"
-    ".console-banner-node{font-size:11px}"
-    ".console-banner-sep{color:#3b4463}"
-    ".console-banner-link:hover,.console-banner-node:hover{color:#e5a042}"
-    ':root[data-theme="light"] .console-banner{background:#f8fafc;'
-    "border-bottom-color:rgba(229,160,66,0.5)}"
-    ':root[data-theme="light"] .console-banner-link,'
-    ':root[data-theme="light"] .console-banner-node{color:#64748b}'
-    ':root[data-theme="light"] .console-banner-sep{color:#cbd5e1}'
-    ':root[data-theme="light"] .console-banner-link:hover,'
-    ':root[data-theme="light"] .console-banner-node:hover{color:#8c5e1b}'
+    ".console-banner{background:var(--bg-surface);"
+    "border-bottom:1px solid var(--border-strong);"
+    "padding:4px 20px;font-family:var(--font-mono);font-size:11px;"
+    "display:flex;align-items:center;gap:8px;position:relative;z-index:200}"
+    ".console-banner-sep{color:var(--fg-dim);opacity:0.6}"
+    ".console-banner-node{color:var(--fg-dim);text-decoration:none;"
+    "font-size:10px;letter-spacing:0.02em}"
+    ".console-banner-node:hover{color:var(--accent)}"
     "</style>"
 )
 

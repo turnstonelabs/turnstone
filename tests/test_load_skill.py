@@ -430,6 +430,7 @@ class TestSkillCatalogDisclosure:
         session._tools = []
         session._client_type = ClientType.CLI
         session._username = ""
+        session._kind = "interactive"
 
         # Memory stubs
         session._memory_config = MagicMock()
