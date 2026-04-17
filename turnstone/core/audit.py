@@ -2,6 +2,37 @@
 
 Provides a fire-and-forget ``record_audit`` function that admin handlers
 call after mutations to create a persistent audit trail.
+
+Action-name conventions (non-exhaustive — grep
+``record_audit(`` in the tree for the live set):
+
+    coordinator.*       console-side coordinator lifecycle
+                        (``coordinator.create`` / ``.close`` /
+                        ``.cancel``).
+
+    route.*             multi-node routing proxy hops
+                        (``route.workstream.create`` / ``.send`` /
+                        ``.close`` / ``.delete``,
+                        ``route.approve`` / ``.cancel`` /
+                        ``.command`` / ``.plan``).  ``detail`` carries
+                        ``{src, node_id, coord_ws_id?}`` so coordinator-
+                        origin attribution is preserved without a
+                        schema migration.
+
+    <resource>.<verb>   per-resource CRUD on admin handlers — verbs
+                        are typically ``create`` / ``update`` /
+                        ``delete``.  Resource prefixes in tree today
+                        include ``user``, ``role``, ``policy``,
+                        ``skill``, ``skill_resource``,
+                        ``oidc_identity``, ``mcp_server``,
+                        ``model_definition``, ``channel``,
+                        ``heuristic_rule``, ``output_guard_pattern``,
+                        ``prompt_policy``, ``setting``, ``token``,
+                        ``conversation``, ``memory``, ``org``.
+
+When adding a new namespace, prefer extending an existing prefix over
+inventing a synonym (e.g. ``mcp_server.refresh`` rather than
+``mcp.refresh`` — ``mcp_server.*`` is already the established prefix).
 """
 
 from __future__ import annotations

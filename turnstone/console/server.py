@@ -216,6 +216,65 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
     return {}
 
 
+# Action-name map for the routing proxy.  See ``turnstone/core/audit.py``
+# module docstring for the canonical action-namespace registry.
+_ROUTE_PROXY_AUDIT_ACTIONS: dict[str, str] = {
+    "send": "route.workstream.send",
+    "approve": "route.approve",
+    "cancel": "route.cancel",
+    "command": "route.command",
+    "plan": "route.plan",
+    "close": "route.workstream.close",
+}
+
+
+def _emit_route_audit(
+    request: Request,
+    action: str,
+    ws_id: str,
+    node_id: str,
+) -> None:
+    """Record an audit event for a successful routing-proxy hop.
+
+    Caller must ensure the upstream response was 2xx; auditing failures
+    is deferred (4xx/5xx are observable via ``_record_route``'s metrics
+    path).  Reads the inbound ``auth_result`` directly so that
+    coordinator-origin attribution lands in ``detail.src`` without
+    relying on the ``_proxy_auth_headers`` re-mint.
+
+    ``detail`` carries ``{src, node_id, coord_ws_id?}`` — ``coord_ws_id``
+    only when the inbound JWT carried it (i.e. the call originated from
+    a coordinator session).  Failures are swallowed; the proxied
+    response must never break because of an audit-emission bug.
+    """
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    user_id: str = (getattr(auth, "user_id", "") or "") if auth is not None else ""
+    src: str = (getattr(auth, "token_source", "") or "") if auth is not None else ""
+    coord_ws_id: str = ""
+    if auth is not None:
+        coord_ws_id = (getattr(auth, "extra_claims", None) or {}).get("coord_ws_id", "") or ""
+    detail: dict[str, Any] = {"src": src, "node_id": node_id}
+    if coord_ws_id:
+        detail["coord_ws_id"] = coord_ws_id
+    try:
+        from turnstone.core.audit import record_audit
+
+        record_audit(
+            storage,
+            user_id,
+            action,
+            "workstream",
+            ws_id,
+            detail,
+            request.client.host if request.client else "",
+        )
+    except Exception:
+        log.debug("route.audit_failed action=%s", action, exc_info=True)
+
+
 def _get_server_url(request: Request, node_id: str) -> str | None:
     """Resolve node_id to its server_url via the collector."""
     if not node_id or not _VALID_NODE_ID.match(node_id) or len(node_id) > 256:
@@ -833,6 +892,15 @@ async def route_create(request: Request) -> Response:
         data = resp.json()
         data["node_url"] = ref.url
         data["node_id"] = ref.node_id
+        # Audit attribution — multipart sets ``ws_id`` from the query
+        # string; JSON sets it on the body (or carries ``resume_ws``
+        # for a rehydrate).  Either way, this is the workstream the
+        # caller actually landed on.
+        if is_multipart:
+            audit_ws_id = ws_id
+        else:
+            audit_ws_id = body.get("ws_id") or body.get("resume_ws", "") or ""
+        _emit_route_audit(request, "route.workstream.create", audit_ws_id, ref.node_id)
         return _record_route(request, "create", 200, t0, JSONResponse(data))
     return _record_route(
         request,
@@ -1094,7 +1162,12 @@ async def route_proxy(request: Request) -> Response:
                         status_code=502,
                     ),
                 )
+            ref = new_ref  # retried node — used for audit attribution (only emits on 2xx via the next block).
 
+    if 200 <= resp.status_code < 300:
+        action = _ROUTE_PROXY_AUDIT_ACTIONS.get(method)
+        if action:
+            _emit_route_audit(request, action, ws_id, ref.node_id)
     return _record_route(
         request,
         method,
@@ -1185,6 +1258,8 @@ async def route_workstream_delete(request: Request) -> Response:
             ),
         )
 
+    if 200 <= resp.status_code < 300:
+        _emit_route_audit(request, "route.workstream.delete", ws_id, ref.node_id)
     return _record_route(
         request,
         "delete",
