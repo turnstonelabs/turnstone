@@ -3794,6 +3794,7 @@ class ChatSession:
             # included so malformed coordinator tool calls aren't a
             # dead-end.
             for key in (
+                "action",
                 "command",
                 "code",
                 "content",
@@ -3806,6 +3807,9 @@ class ChatSession:
                 "pattern",
                 "prompt",
                 "query",
+                "status",
+                "task_id",
+                "title",
                 "uri",
                 "url",
                 "ws_id",
@@ -3884,6 +3888,7 @@ class ChatSession:
             "list_workstreams": self._prepare_list_workstreams,
             "list_nodes": self._prepare_list_nodes,
             "list_skills": self._prepare_list_skills,
+            "task_list": self._prepare_task_list,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -5290,6 +5295,176 @@ class ChatSession:
         if truncated:
             summary += " (truncated — narrow filters or raise limit)"
         self._report_tool_result(call_id, "list_skills", summary)
+        return call_id, self._truncate_output(output)
+
+    def _prepare_task_list(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Prepare a task_list action — list is auto-approved, mutations gated."""
+        if self._coord_client is None:
+            return self._coord_tool_error(call_id, "task_list", "coordinator client unavailable")
+        action = self._coord_str_arg(args, "action").strip().lower()
+        if action not in {"add", "update", "remove", "reorder", "list"}:
+            return self._coord_tool_error(
+                call_id,
+                "task_list",
+                "action must be one of: add, update, remove, reorder, list",
+            )
+        if action == "list":
+            return {
+                "call_id": call_id,
+                "func_name": "task_list",
+                "header": "\u2699 task_list list",
+                "preview": "",
+                "needs_approval": False,
+                "execute": self._exec_task_list,
+                "action": "list",
+            }
+        # --- mutating actions -------------------------------------------------
+        item: dict[str, Any] = {
+            "call_id": call_id,
+            "func_name": "task_list",
+            "needs_approval": True,
+            "execute": self._exec_task_list,
+            "action": action,
+        }
+        if action == "add":
+            # Reject non-string title / status / child_ws_id up front so
+            # a malformed model call (``title=42``) produces a clean tool
+            # error rather than an AttributeError during ``.strip()``.
+            for field_name in ("title", "status", "child_ws_id"):
+                raw = args.get(field_name)
+                if raw is not None and not isinstance(raw, str):
+                    return self._coord_tool_error(
+                        call_id, "task_list", f"add: {field_name} must be a string"
+                    )
+            title = self._coord_str_arg(args, "title").strip()
+            if not title:
+                return self._coord_tool_error(call_id, "task_list", "add: title is required")
+            status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
+            child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
+            item["header"] = f"\u2699 task_list add: {title[:60]}"
+            item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
+            item["title"] = title
+            item["status"] = status
+            item["child_ws_id"] = child_ws_id
+        elif action == "update":
+            task_id = self._coord_str_arg(args, "task_id").strip()
+            if not task_id:
+                return self._coord_tool_error(call_id, "task_list", "update: task_id is required")
+            # Reject non-string field values outright — avoids a
+            # preview/execute divergence where the approver sees
+            # ``title=42`` but the coercion below drops it to ``None`` and
+            # the mutation silently no-ops on that field.  Local names
+            # distinct from the ``add`` branch so mypy doesn't try to
+            # unify ``str`` and ``Any | None`` across mutually-exclusive
+            # branches.
+            upd_title: Any = args.get("title")
+            upd_status: Any = args.get("status")
+            upd_child: Any = args.get("child_ws_id")
+            for field_name, field_val in (
+                ("title", upd_title),
+                ("status", upd_status),
+                ("child_ws_id", upd_child),
+            ):
+                if field_val is not None and not isinstance(field_val, str):
+                    return self._coord_tool_error(
+                        call_id,
+                        "task_list",
+                        f"update: {field_name} must be a string",
+                    )
+            if upd_title is None and upd_status is None and upd_child is None:
+                return self._coord_tool_error(
+                    call_id,
+                    "task_list",
+                    "update: at least one of title / status / child_ws_id is required",
+                )
+            item["header"] = f"\u2699 task_list update: {task_id}"
+            bits: list[str] = []
+            if upd_title is not None:
+                bits.append(f"title={upd_title[:60]}")
+            if upd_status is not None:
+                bits.append(f"status={upd_status}")
+            if upd_child is not None:
+                bits.append(f"child_ws_id={upd_child or '-'}")
+            item["preview"] = " ".join(bits)
+            item["task_id"] = task_id
+            item["title"] = upd_title
+            item["status"] = upd_status
+            item["child_ws_id"] = upd_child
+        elif action == "remove":
+            task_id = self._coord_str_arg(args, "task_id").strip()
+            if not task_id:
+                return self._coord_tool_error(call_id, "task_list", "remove: task_id is required")
+            item["header"] = f"\u2699 task_list remove: {task_id}"
+            item["preview"] = ""
+            item["task_id"] = task_id
+        elif action == "reorder":
+            raw_ids = args.get("task_ids")
+            if not isinstance(raw_ids, list) or not all(isinstance(x, str) for x in raw_ids):
+                return self._coord_tool_error(
+                    call_id, "task_list", "reorder: task_ids must be a list of strings"
+                )
+            item["header"] = f"\u2699 task_list reorder: {len(raw_ids)} ids"
+            item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
+            item["task_ids"] = raw_ids
+        return item
+
+    def _exec_task_list(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        action = item["action"]
+        try:
+            if action == "list":
+                envelope = self._coord_client.task_list_get(self._ws_id)
+                tasks = envelope.get("tasks", [])
+                truncated = len(tasks) > 200
+                tasks = tasks[:200]
+                result: dict[str, Any] = {"tasks": tasks, "truncated": truncated}
+            elif action == "add":
+                result = self._coord_client.task_list_add(
+                    self._ws_id,
+                    title=item["title"],
+                    status=item["status"],
+                    child_ws_id=item["child_ws_id"],
+                )
+            elif action == "update":
+                result = self._coord_client.task_list_update(
+                    self._ws_id,
+                    task_id=item["task_id"],
+                    title=item["title"],
+                    status=item["status"],
+                    child_ws_id=item["child_ws_id"],
+                )
+            elif action == "remove":
+                result = self._coord_client.task_list_remove(self._ws_id, task_id=item["task_id"])
+            elif action == "reorder":
+                result = self._coord_client.task_list_reorder(
+                    self._ws_id, task_ids=item["task_ids"]
+                )
+            else:  # unreachable — _prepare validated the enum
+                result = {"error": f"unknown action: {action}"}
+        except Exception as e:
+            msg = f"Error: task_list {action} failed: {e}"
+            self._report_tool_result(call_id, "task_list", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(result, separators=(",", ":"), default=str)
+        if action == "list":
+            total = len(result.get("tasks", []))
+            summary = f"{total} tasks"
+            if result.get("truncated"):
+                summary += " (truncated at 200)"
+        elif "error" in result:
+            summary = f"{action} error: {result['error']}"
+        elif action == "add":
+            summary = f"added task {result.get('id', '?')}"
+        elif action == "update":
+            summary = f"updated task {result.get('id', item.get('task_id', '?'))}"
+        elif action == "remove":
+            summary = f"removed task {item.get('task_id', '?')}"
+        elif action == "reorder":
+            summary = f"reordered {len(item.get('task_ids', []))} tasks"
+        else:
+            summary = action
+        is_error = "error" in result
+        self._report_tool_result(call_id, "task_list", summary, is_error=is_error)
         return call_id, self._truncate_output(output)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
