@@ -38,9 +38,7 @@ def test_register_defaults_to_interactive_no_parent(storage):
 
 
 def test_register_coordinator_kind_and_parent(storage):
-    storage.register_workstream(
-        "ws-coord", node_id="console", user_id="user-1", kind="coordinator"
-    )
+    storage.register_workstream("ws-coord", node_id="console", user_id="user-1", kind="coordinator")
     storage.register_workstream(
         "ws-child",
         node_id="node-a",
@@ -148,9 +146,7 @@ def test_list_workstreams_filter_by_parent(storage):
 def test_list_workstreams_combined_filters(storage):
     storage.register_workstream("ws-coord", kind="coordinator")
     storage.register_workstream("child-1", parent_ws_id="ws-coord")
-    storage.register_workstream(
-        "child-coord", parent_ws_id="ws-coord", kind="coordinator"
-    )
+    storage.register_workstream("child-coord", parent_ws_id="ws-coord", kind="coordinator")
 
     # Children of ws-coord that are themselves interactive.
     rows = storage.list_workstreams(parent_ws_id="ws-coord", kind="interactive")
@@ -201,3 +197,136 @@ def test_workstream_dataclass_accepts_coordinator_kind():
 def test_workstream_dataclass_accepts_parent():
     ws = Workstream(parent_ws_id="parent-x")
     assert ws.parent_ws_id == "parent-x"
+
+
+# ---------------------------------------------------------------------------
+# Tool-namespace isolation between kinds
+# ---------------------------------------------------------------------------
+
+
+def test_interactive_and_coordinator_tool_sets_are_disjoint():
+    """Interactive sessions must not see coordinator tools and vice versa.
+
+    Regression guard for the latent threshold bug where coordinator tools
+    counted against the interactive session's tool-search threshold, and
+    a future reader might naively expose ``TOOLS`` (the union) to an
+    interactive session.
+    """
+    from turnstone.core.tools import COORDINATOR_TOOLS, INTERACTIVE_TOOLS, TOOLS
+
+    interactive_names = {t["function"]["name"] for t in INTERACTIVE_TOOLS}
+    coord_names = {t["function"]["name"] for t in COORDINATOR_TOOLS}
+
+    # No overlap.
+    assert interactive_names.isdisjoint(coord_names), (
+        f"interactive ∩ coordinator tools should be empty, got {interactive_names & coord_names}"
+    )
+    # Coordinator set is non-empty (spawn/inspect/send/close/delete/list).
+    assert coord_names, "expected at least one coordinator tool"
+    # Union covers every loaded tool (no tool is in neither set).
+    all_names = {t["function"]["name"] for t in TOOLS}
+    assert interactive_names | coord_names == all_names
+
+
+def test_chatsession_interactive_kind_excludes_coordinator_tools(tmp_db):
+    """An interactive ``ChatSession`` does not surface coordinator tools."""
+    from unittest.mock import MagicMock
+
+    from turnstone.core.session import ChatSession
+
+    class _NullUI:
+        def __getattr__(self, _name):
+            return lambda *a, **kw: None
+
+    sess = ChatSession(
+        client=MagicMock(),
+        model="test-model",
+        ui=_NullUI(),
+        instructions=None,
+        temperature=0.5,
+        max_tokens=4096,
+        tool_timeout=30,
+    )
+    names = {t["function"]["name"] for t in sess._tools}
+    # None of the coordinator-only names should be in the interactive
+    # session's tool set.
+    for coord_name in (
+        "spawn_workstream",
+        "inspect_workstream",
+        "send_to_workstream",
+        "close_workstream",
+        "delete_workstream",
+        "list_workstreams",
+    ):
+        assert coord_name not in names, f"{coord_name} leaked into interactive session tools"
+
+
+def test_chatsession_coordinator_kind_excludes_interactive_tools(tmp_db):
+    """A coordinator ``ChatSession`` sees only coordinator tools."""
+    from unittest.mock import MagicMock
+
+    from turnstone.core.session import ChatSession
+
+    class _NullUI:
+        def __getattr__(self, _name):
+            return lambda *a, **kw: None
+
+    sess = ChatSession(
+        client=MagicMock(),
+        model="test-model",
+        ui=_NullUI(),
+        instructions=None,
+        temperature=0.5,
+        max_tokens=4096,
+        tool_timeout=30,
+        kind="coordinator",
+    )
+    names = {t["function"]["name"] for t in sess._tools}
+    # Coordinator tools present, interactive tools absent.
+    assert "spawn_workstream" in names
+    assert "bash" not in names
+    assert "edit_file" not in names
+    assert "memory" not in names
+    # Sub-agent tool lists are zeroed for coordinators.
+    assert sess._task_tools == []
+    assert sess._agent_tools == []
+
+
+def test_chatsession_coordinator_kind_does_not_merge_mcp_tools(tmp_db):
+    """Coordinator ChatSession ignores any attached MCP client tool surface.
+
+    Coordinators are meta-orchestrators that spawn child workstreams;
+    MCP tools live on the children.  Giving the coordinator direct MCP
+    access defeats the child-spawning pattern.
+    """
+    from unittest.mock import MagicMock
+
+    from turnstone.core.session import ChatSession
+
+    class _NullUI:
+        def __getattr__(self, _name):
+            return lambda *a, **kw: None
+
+    mcp_client = MagicMock()
+    mcp_client.get_tools.return_value = [
+        {"type": "function", "function": {"name": "mcp__foo__bar", "parameters": {}}}
+    ]
+    sess = ChatSession(
+        client=MagicMock(),
+        model="test-model",
+        ui=_NullUI(),
+        instructions=None,
+        temperature=0.5,
+        max_tokens=4096,
+        tool_timeout=30,
+        kind="coordinator",
+        mcp_client=mcp_client,
+    )
+    names = {t["function"]["name"] for t in sess._tools}
+    # No MCP tools in the coordinator surface.
+    assert "mcp__foo__bar" not in names
+    # And no MCP listeners were registered (defence-in-depth: MCP tool
+    # refreshes can't mutate the coordinator's fixed tool set).
+    mcp_client.add_listener.assert_not_called()
+    mcp_client.add_resource_listener.assert_not_called()
+    mcp_client.add_prompt_listener.assert_not_called()

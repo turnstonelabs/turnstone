@@ -36,6 +36,14 @@ TOOLS, _META = _load_tools()
 AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("agent")]
 TASK_AGENT_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("task_agent")]
 COORDINATOR_TOOLS = [t for t in TOOLS if _META[t["function"]["name"]].get("coordinator")]
+# Interactive sessions — the default session kind — must NOT see coordinator
+# tools (``spawn_workstream`` et al.) in their tool set.  Coordinator tools
+# require a ``coord_client`` that only console-hosted coordinator sessions
+# have, and exposing them to interactive sessions also pollutes the
+# tool-search threshold count.  ``TOOLS`` stays as the union for
+# introspection / schema docs / eval catalogs.
+INTERACTIVE_TOOLS = [t for t in TOOLS if not _META[t["function"]["name"]].get("coordinator")]
+INTERACTIVE_TOOL_NAMES = frozenset(t["function"]["name"] for t in INTERACTIVE_TOOLS)
 AGENT_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 TASK_AUTO_TOOLS = {n for n, m in _META.items() if m.get("auto_approve")}
 PRIMARY_KEY_MAP = {n: m["primary_key"] for n, m in _META.items() if "primary_key" in m}

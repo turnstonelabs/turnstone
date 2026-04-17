@@ -836,6 +836,8 @@ class PostgreSQLBackend:
                     workstreams.c.updated,
                     workstreams.c.kind,
                     workstreams.c.parent_ws_id,
+                    workstreams.c.skill_id,
+                    workstreams.c.skill_version,
                 )
                 .order_by(workstreams.c.updated.desc())
                 .limit(limit)

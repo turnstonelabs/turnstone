@@ -187,12 +187,19 @@
 
 <!-- Shared-static import order matches the console dashboard
      (console/static/index.html) so global shortcuts (kb.js) and helpers
-     register in the expected sequence. -->
+     register in the expected sequence.  The renderer libs (katex, hljs,
+     renderer.js) match the server UI (ui/static/index.html) so the
+     coordinator page can call renderMarkdown / postRenderMarkdown on
+     streamed assistant content.  renderer.js is mirrored from the ui
+     package — see its header comment. -->
 <script src="/shared/utils.js"></script>
 <script src="/shared/toast.js"></script>
 <script src="/shared/theme.js"></script>
 <script src="/shared/auth.js"></script>
 <script src="/shared/kb.js"></script>
+<script src="/shared/katex-0.16.45/katex.min.js"></script>
+<script src="/shared/hljs-11.11.1/highlight.min.js"></script>
+<script src="/static/coordinator/renderer.js"></script>
 <script src="/static/coordinator/coordinator.js"></script>
 </body>
 </html>

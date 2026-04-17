@@ -35,7 +35,12 @@ from openai import OpenAI
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import init_storage, reset_storage
-from turnstone.core.tools import PRIMARY_KEY_MAP, TOOLS
+from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
+
+# Eval evaluates interactive-session agent behaviour — coordinator tools
+# require a console-hosted session and aren't exercised by the harness.
+# Re-export as ``TOOLS`` so all downstream references stay identical.
+TOOLS = INTERACTIVE_TOOLS
 
 # Tools that require MCP servers — excluded from headless eval
 _MCP_ONLY_TOOLS = frozenset({"read_resource", "use_prompt"})

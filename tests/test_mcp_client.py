@@ -17,7 +17,7 @@ from turnstone.core.mcp_client import (
     _mcp_to_openai,
     load_mcp_config,
 )
-from turnstone.core.tools import TOOLS, merge_mcp_tools
+from turnstone.core.tools import INTERACTIVE_TOOLS, TOOLS, merge_mcp_tools
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -349,14 +349,15 @@ class TestSessionIntegration:
 
     def test_session_without_mcp(self, tmp_db):
         session = self._make_session(mcp_client=None)
-        assert session._tools is TOOLS
+        # Interactive session surface — coordinator tools excluded.
+        assert session._tools is INTERACTIVE_TOOLS
         assert session._mcp_client is None
 
     def test_session_with_mcp(self, tmp_db):
         mock_mcp = MagicMock()
         mock_mcp.get_tools.return_value = [_fake_openai_tool()]
         session = self._make_session(mcp_client=mock_mcp)
-        assert len(session._tools) == len(TOOLS) + 1
+        assert len(session._tools) == len(INTERACTIVE_TOOLS) + 1
         assert session._tools[-1]["function"]["name"] == "mcp__test__search"
 
     def test_task_tools_include_mcp(self, tmp_db):

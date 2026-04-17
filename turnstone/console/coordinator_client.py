@@ -302,6 +302,8 @@ class CoordinatorClient:
                     "updated": row[5],
                     "kind": row[6] if len(row) > 6 else "interactive",
                     "parent_ws_id": row[7] if len(row) > 7 else None,
+                    "skill_id": row[8] if len(row) > 8 else None,
+                    "skill_version": row[9] if len(row) > 9 else None,
                 }
             if state is not None and m["state"] != state:
                 continue
@@ -316,14 +318,12 @@ class CoordinatorClient:
                 "parent_ws_id": m["parent_ws_id"],
             }
             if skill is not None:
-                # Filter on skill_id — pull it from get_workstream since
-                # list_workstreams doesn't project it.  Cheap: bounded by
-                # the already-filtered ``raw`` set.
-                full = self._storage.get_workstream(m["ws_id"])
-                if not full or full.get("skill_id") != skill:
+                # skill_id / skill_version are projected by list_workstreams —
+                # no per-row get_workstream round-trip needed.
+                if m["skill_id"] != skill:
                     continue
-                child["skill_id"] = full.get("skill_id")
-                child["skill_version"] = full.get("skill_version")
+                child["skill_id"] = m["skill_id"]
+                child["skill_version"] = m["skill_version"]
             children.append(child)
         # truncated is True when the DB returned a full page *and* post-
         # filtering dropped at least one row — the model should know more

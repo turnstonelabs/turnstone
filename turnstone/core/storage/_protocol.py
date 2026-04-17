@@ -371,8 +371,8 @@ class StorageBackend(Protocol):
         Returns a list of SQLAlchemy ``Row`` objects.  **Prefer dict access
         via ``row._mapping[<col>]``**; positional indexing is brittle against
         future SELECT reorders.  The current column order is ``ws_id,
-        node_id, name, state, created, updated, kind, parent_ws_id`` but
-        new code should not rely on that.
+        node_id, name, state, created, updated, kind, parent_ws_id,
+        skill_id, skill_version`` but new code should not rely on that.
         """
         ...
 

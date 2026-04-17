@@ -99,11 +99,7 @@ def build_console_session_factory(
         # override.  Empty string → raise so the caller (CoordinatorManager)
         # surfaces a 503 remediation message rather than constructing a
         # session that explodes on first LLM call.
-        effective_alias = (
-            model_alias
-            or config_store.get("coordinator.model_alias")
-            or ""
-        )
+        effective_alias = model_alias or config_store.get("coordinator.model_alias") or ""
         if not effective_alias:
             raise ValueError(
                 "coordinator.model_alias is not configured — set it in the "

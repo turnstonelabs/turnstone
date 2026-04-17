@@ -266,7 +266,10 @@ def test_cancel_unblocks_worker_blocked_on_approval(built_mgr):
 def test_close_removes_and_updates_state(built_mgr):
     mgr, _calls, storage = built_mgr
     ws = mgr.create(user_id="u1")
-    assert mgr.close(ws.id) is True
+    # Extract side-effectful call from the assert expression so
+    # python -O (which strips asserts) can't drop the close().
+    closed = mgr.close(ws.id)
+    assert closed is True
     assert mgr.get(ws.id) is None
     row = storage.get_workstream(ws.id)
     assert row["state"] == "closed"
@@ -281,7 +284,7 @@ def test_list_for_user_filters_by_owner(built_mgr):
     mgr, _calls, _s = built_mgr
     a = mgr.create(user_id="user-1")
     b = mgr.create(user_id="user-1")
-    _c = mgr.create(user_id="user-2")
+    mgr.create(user_id="user-2")  # non-owner — existence matters, value doesn't
     user1_rows = mgr.list_for_user("user-1")
     ids = {r.id for r in user1_rows}
     assert ids == {a.id, b.id}
@@ -321,16 +324,21 @@ def test_open_rehydrates_from_storage(built_mgr):
 def test_open_rejects_non_coordinator_kind(built_mgr):
     mgr, _calls, storage = built_mgr
     storage.register_workstream("interactive-ws", kind="interactive", user_id="user-1")
-    assert mgr.open("interactive-ws", "user-1") is None
+    # open() has side effects (factory call, slot reservation); keep it
+    # out of the assert expression so python -O can't strip it.
+    opened = mgr.open("interactive-ws", "user-1")
+    assert opened is None
 
 
 def test_open_enforces_ownership(built_mgr):
     mgr, _calls, storage = built_mgr
     storage.register_workstream("coord-x", kind="coordinator", user_id="owner")
     # Non-owner gets None.
-    assert mgr.open("coord-x", "stranger") is None
+    stranger_ws = mgr.open("coord-x", "stranger")
+    assert stranger_ws is None
     # Owner gets the row.
-    assert mgr.open("coord-x", "owner") is not None
+    owner_ws = mgr.open("coord-x", "owner")
+    assert owner_ws is not None
 
 
 def test_open_admin_ignores_ownership(built_mgr):

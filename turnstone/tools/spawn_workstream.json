@@ -25,7 +25,7 @@
         "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node via generate_ws_id_for_node. Otherwise the hash ring picks."
       }
     },
-    "required": ["initial_message"]
+    "required": []
   },
   "coordinator": true,
   "primary_key": "initial_message"

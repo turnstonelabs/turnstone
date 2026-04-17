@@ -338,6 +338,24 @@ def test_list_children_filters_by_skill_id(populated_storage):
     assert rows[0].get("skill_id") == "skill-x"
 
 
+def test_list_children_skill_filter_avoids_n_plus_one(populated_storage, monkeypatch):
+    """skill filter must read skill_id/skill_version from the list_workstreams
+    projection — no per-row get_workstream round-trip (Copilot review #7)."""
+    client = _make_read_client(populated_storage)
+    call_count = {"n": 0}
+    real_get = populated_storage.get_workstream
+
+    def _counting_get(ws_id: str):
+        call_count["n"] += 1
+        return real_get(ws_id)
+
+    monkeypatch.setattr(populated_storage, "get_workstream", _counting_get)
+    result = client.list_children("coord-1", skill="skill-x")
+    assert {r["ws_id"] for r in result["children"]} == {"child-a"}
+    assert result["children"][0]["skill_id"] == "skill-x"
+    assert call_count["n"] == 0
+
+
 def test_list_children_signals_truncation_when_page_full_and_filter_drops(
     populated_storage,
 ):

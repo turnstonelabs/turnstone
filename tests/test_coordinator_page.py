@@ -18,9 +18,7 @@ from turnstone.console.server import coordinator_page
 
 @pytest.fixture
 def client():
-    app = Starlette(
-        routes=[Route("/coordinator/{ws_id}", coordinator_page, methods=["GET"])]
-    )
+    app = Starlette(routes=[Route("/coordinator/{ws_id}", coordinator_page, methods=["GET"])])
     return TestClient(app)
 
 
@@ -28,7 +26,7 @@ def test_valid_ws_id_injects_data_attr(client):
     ws_id = "a" * 32
     resp = client.get(f"/coordinator/{ws_id}")
     assert resp.status_code == 200
-    assert 'text/html' in resp.headers["content-type"]
+    assert "text/html" in resp.headers["content-type"]
     body = resp.text
     # ws_id is injected into the html data-ws-id attribute.
     assert f'data-ws-id="{ws_id}"' in body

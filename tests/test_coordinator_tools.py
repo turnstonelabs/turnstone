@@ -148,11 +148,14 @@ def _tc(name: str, args: dict[str, Any], call_id: str = "call-1") -> dict[str, A
 # ---------------------------------------------------------------------------
 
 
-def test_spawn_prepare_requires_initial_message(coord_session):
+def test_spawn_prepare_allows_empty_initial_message(coord_session):
+    """Empty initial_message creates an idle child — matches tool JSON advertisement."""
     sess, _coord, _ui = coord_session
     item = sess._prepare_tool(_tc("spawn_workstream", {"initial_message": ""}))
-    assert "error" in item
-    assert item["needs_approval"] is False
+    assert "error" not in item
+    assert item["needs_approval"] is True
+    assert "idle workstream" in item["header"]
+    assert item["initial_message"] == ""
 
 
 def test_spawn_prepare_needs_approval(coord_session):

@@ -11,6 +11,14 @@
  * Depends on shared/auth.js (authFetch, fetchWithCreds), shared/theme.js
  * (toggleTheme), shared/toast.js (toast.info / toast.error),
  * shared/utils.js (escapeHtml, linkify helpers).
+ *
+ * Assistant content follows the renderer.js pipeline from the server UI
+ * (ui/static/app.js): buffer the raw markdown as tokens stream in, keep
+ * the visible text plain during streaming, and swap to the rendered
+ * innerHTML + postRenderMarkdown() once the stream ends.  Reasoning
+ * bubbles stay text-only because they're transient and styled dim/italic.
+ * See turnstone/ui/static/app.js (search for renderMarkdown) for the
+ * canonical pattern we mirror.
  */
 (function () {
   "use strict";
@@ -173,8 +181,18 @@
       messagesEl.setAttribute("aria-live", "off");
     }
     currentAssistantBuf += text;
+    // During streaming we keep the visible text as textContent (plain
+    // string, not rendered markdown).  Re-running renderMarkdown on every
+    // token would be expensive and also produces half-formed output for
+    // partial code fences / lists.  The raw buffer is stashed on the
+    // element so finishAssistantStream() can do one final render pass.
+    // Mirrors ui/static/app.js's `this.contentBuffer` approach — we just
+    // keep the buffer in a closure variable instead of on `this`.
     const body = currentAssistantEl.querySelector(".coord-body");
-    if (body) body.textContent = currentAssistantBuf;
+    if (body) {
+      body.textContent = currentAssistantBuf;
+      body._rawMarkdown = currentAssistantBuf;
+    }
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
@@ -196,6 +214,25 @@
   }
 
   function finishAssistantStream() {
+    // Promote the streamed plaintext buffer to rendered markdown (code
+    // fences, lists, KaTeX, mermaid, syntax highlighting).  renderMarkdown
+    // escapes HTML internally so innerHTML here is XSS-safe as long as
+    // renderer.js is trusted — same contract as ui/static/app.js.  Guard
+    // the call in a try/catch so a renderer bug can never brick the
+    // coordinator UI; on failure the visible textContent stays put.
+    if (currentAssistantEl && currentAssistantBuf) {
+      const body = currentAssistantEl.querySelector(".coord-body");
+      if (body && typeof renderMarkdown === "function") {
+        try {
+          body.innerHTML = renderMarkdown(currentAssistantBuf);
+          if (typeof postRenderMarkdown === "function") {
+            postRenderMarkdown(body);
+          }
+        } catch (e) {
+          console.warn("coordinator renderMarkdown failed", e);
+        }
+      }
+    }
     currentAssistantEl = null;
     currentAssistantBuf = "";
     currentReasoningEl = null;

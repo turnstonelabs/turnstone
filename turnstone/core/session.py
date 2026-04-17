@@ -96,10 +96,10 @@ from turnstone.core.tools import (
     AGENT_TOOLS,
     BUILTIN_TOOL_NAMES,
     COORDINATOR_TOOLS,
+    INTERACTIVE_TOOLS,
     PRIMARY_KEY_MAP,
     TASK_AGENT_TOOLS,
     TASK_AUTO_TOOLS,
-    TOOLS,
     merge_mcp_tools,
 )
 from turnstone.core.web import check_ssrf, strip_html
@@ -449,9 +449,24 @@ class ChatSession:
         self._mcp_refresh_cb: Any = None  # Callable | None (avoid import)
         self._mcp_resource_cb: Any = None
         self._mcp_prompt_cb: Any = None
-        if mcp_client:
+        # Tool-set selection is kind-aware:
+        #   * coordinator — fixed COORDINATOR_TOOLS, no MCP surface.
+        #     Coordinators are meta-orchestrators that spawn child
+        #     workstreams; MCP tools / resources / prompts live on the
+        #     children.  Giving the coordinator direct MCP access
+        #     defeats the child-spawning pattern, so we don't merge
+        #     MCP tools and don't register MCP listeners either.
+        #   * interactive + mcp — INTERACTIVE_TOOLS ∪ mcp tools; MCP
+        #     listeners register so tool/resource/prompt refreshes flow
+        #     through to this session.
+        #   * interactive (no mcp) — INTERACTIVE_TOOLS.
+        if kind == "coordinator":
+            self._tools = list(COORDINATOR_TOOLS)
+            self._task_tools = []
+            self._agent_tools = []
+        elif mcp_client:
             mcp_tools = mcp_client.get_tools()
-            self._tools = merge_mcp_tools(TOOLS, mcp_tools)
+            self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
             self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
             self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
             # Register for tool-change notifications from MCP servers
@@ -464,17 +479,9 @@ class ChatSession:
             self._mcp_prompt_cb = self._on_mcp_prompts_changed
             mcp_client.add_prompt_listener(self._mcp_prompt_cb)
         else:
-            self._tools = TOOLS
+            self._tools = INTERACTIVE_TOOLS
             self._task_tools = TASK_AGENT_TOOLS
             self._agent_tools = AGENT_TOOLS
-        if kind == "coordinator":
-            # Coordinator sessions see only the coordinator tool set; task/
-            # plan sub-agents are intentionally disabled — a coordinator
-            # spawns real workstreams instead of in-process agents.
-            mcp_tools_for_coord = mcp_client.get_tools() if mcp_client else []
-            self._tools = merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools_for_coord)
-            self._task_tools = []
-            self._agent_tools = []
         # Inject the live alias list into plan_agent / task_agent tool
         # descriptions so the calling LLM sees its `model` parameter options.
         # Replaces affected tool dicts with deep copies — module-level
@@ -490,9 +497,17 @@ class ChatSession:
         if tool_search == "on" or (
             tool_search == "auto" and len(self._tools) > tool_search_threshold
         ):
+            # always_on_names is the set of builtin tools present in
+            # *this* session — kind-aware, so coordinator sessions never
+            # keep interactive tool names "always on" and vice versa.
+            builtin_in_session = {
+                t["function"]["name"]
+                for t in self._tools
+                if t["function"]["name"] in BUILTIN_TOOL_NAMES
+            }
             self._tool_search = ToolSearchManager(
                 self._tools,
-                always_on_names=set(BUILTIN_TOOL_NAMES),
+                always_on_names=builtin_in_session,
                 max_results=tool_search_max_results,
             )
         # Skill: explicit name overrides is_default skills
@@ -800,8 +815,12 @@ class ChatSession:
         """
         if not self._mcp_client:
             return
+        # Coordinator sessions don't consume MCP tools — the tool set
+        # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
+        if self._kind == "coordinator":
+            return
         mcp_tools = self._mcp_client.get_tools()
-        self._tools = merge_mcp_tools(TOOLS, mcp_tools)
+        self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)
         self._task_tools = merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)
         self._agent_tools = merge_mcp_tools(AGENT_TOOLS, mcp_tools)
         self._render_agent_tool_descriptions()
@@ -817,7 +836,7 @@ class ChatSession:
         configured (CLI single-model case).
 
         Replaces affected tool dicts with deep copies so the module-level
-        ``TOOLS`` constant stays untouched across sessions.
+        tool-list constants stay untouched across sessions.
 
         plan_agent and task_agent live in ``self._tools`` (the main session's
         tool set) — not in ``self._agent_tools`` / ``self._task_tools``,
@@ -1411,9 +1430,14 @@ class ChatSession:
                 db_policies=db_policies,
             )
             dev_parts = [composed]
-        # Tool search hint (client-side mode only — native mode needs no hint)
+        # Tool search hint (client-side mode only — native mode needs no hint).
+        # Uses _resolve_capabilities directly rather than _get_capabilities so
+        # we don't populate self._cached_capabilities during __init__; that
+        # would make later patches of provider.get_capabilities (common in
+        # tests) silently no-op for the primary session model.  The flag we
+        # read here is cheap to recompute; no caching is required.
         if self._tool_search:
-            caps = self._get_capabilities()
+            caps = self._resolve_capabilities(self._provider, self.model, self._model_alias)
             if not caps.supports_tool_search:
                 dev_parts.append(
                     "\n\nAdditional tools are available via tool_search. "
@@ -4779,24 +4803,27 @@ class ChatSession:
             return self._coord_tool_error(
                 call_id, "spawn_workstream", "coordinator client unavailable"
             )
+        # Empty initial_message is allowed — creates an idle child
+        # workstream ready to receive the first turn via
+        # send_to_workstream.  The tool JSON advertises this explicitly.
         initial_message = (args.get("initial_message") or "").strip()
-        if not initial_message:
-            return self._coord_tool_error(
-                call_id, "spawn_workstream", "initial_message is required"
-            )
         skill = (args.get("skill") or "").strip()
         name = (args.get("name") or "").strip()
         model = (args.get("model") or "").strip()
         target_node = (args.get("target_node") or "").strip()
-        first_line = initial_message.splitlines()[0]
-        preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
-        header_bits = [f"\u2699 spawn_workstream: {preview_line}"]
+        if initial_message:
+            first_line = initial_message.splitlines()[0]
+            preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
+            header_bits = [f"\u2699 spawn_workstream: {preview_line}"]
+            preview_body = f"{DIM}{textwrap.indent(initial_message, '    ')}{RESET}"
+        else:
+            header_bits = ["\u2699 spawn idle workstream"]
+            preview_body = ""
         if skill:
             header_bits.append(f"skill={skill}")
         if target_node:
             header_bits.append(f"node={target_node}")
         header = " ".join(header_bits)
-        preview_body = f"{DIM}{textwrap.indent(initial_message, '    ')}{RESET}"
         return {
             "call_id": call_id,
             "func_name": "spawn_workstream",
