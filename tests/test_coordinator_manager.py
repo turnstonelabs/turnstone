@@ -810,11 +810,18 @@ def test_rebuild_registry_unions_with_concurrent_adds(built_mgr):
 
 def test_dispatch_ws_created_atomic_against_close(built_mgr):
     """Concurrent close() during a ws_created dispatch must not leave
-    the evicted coordinator's registry entry behind."""
+    the evicted coordinator's registry entry behind.
+
+    Regression for a race where the dispatch reads _active_coords
+    lock-free, close() runs (pops _children[parent]) between the
+    snapshot read and the _children_lock acquisition, then setdefault
+    resurrects the entry — leaking the registry key forever."""
     mgr, _calls, _storage = built_mgr
     ws = mgr.create(user_id="user-1")
-    # Close the coordinator — _children[ws.id] gets popped.
-    assert mgr.close(ws.id)
+    # Close the coordinator — _children[ws.id] gets popped and
+    # _active_coords loses the entry.
+    closed = mgr.close(ws.id)
+    assert closed
     # A ws_created event still arriving for the now-closed parent
     # must NOT resurrect the registry entry via setdefault.
     mgr._dispatch_child_event(
@@ -823,10 +830,11 @@ def test_dispatch_ws_created_atomic_against_close(built_mgr):
             "ws_id": "d" * 32,
             "parent_ws_id": ws.id,
             "node_id": "node-a",
+            "user_id": "user-1",
         }
     )
-    # No stale entry left behind.
     assert ws.id not in mgr._children
+    assert ws.id not in mgr._active_coords
 
 
 def test_open_impl_eviction_clears_children_registry(built_mgr):

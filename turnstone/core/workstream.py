@@ -8,6 +8,7 @@ states, and lets frontends (CLI, Web) multiplex user attention across them.
 from __future__ import annotations
 
 import enum
+import inspect
 import threading
 import time
 import uuid
@@ -212,12 +213,32 @@ class WorkstreamManager:
         if ui_factory:
             # Thread lineage metadata to the UI so broadcast events
             # can embed kind / parent_ws_id without a manager-lock
-            # round-trip per event.  Factory lambdas that only accept
-            # ws_id will KeyError on **kwargs; tolerate them via a
-            # TypeError fallback so older call sites keep working.
+            # round-trip per event.  Filter kwargs to what the factory
+            # actually accepts — legacy ``lambda wid: WebUI(ws_id=wid)``
+            # test factories don't take lineage kwargs, and the
+            # previous try/TypeError dance fired on every call with
+            # those factories.  Fall back to the bare ``ws.id`` call
+            # when signature introspection fails (C-callables, odd
+            # metaclass shenanigans) so we preserve the prior behaviour.
+            ui_kwargs: dict[str, Any] = {}
             try:
-                ws.ui = ui_factory(ws.id, kind=kind, parent_ws_id=ws.parent_ws_id)
+                sig = inspect.signature(ui_factory)
+                params = sig.parameters
+                accepts_var_kw = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+                )
+                if accepts_var_kw or "kind" in params:
+                    ui_kwargs["kind"] = kind
+                if accepts_var_kw or "parent_ws_id" in params:
+                    ui_kwargs["parent_ws_id"] = ws.parent_ws_id
+            except (TypeError, ValueError):
+                ui_kwargs = {}
+            try:
+                ws.ui = ui_factory(ws.id, **ui_kwargs)
             except TypeError:
+                # Defensive: signature-based filtering should remove
+                # the possibility, but keep the legacy fallback for
+                # factories inspect can't introspect.
                 ws.ui = ui_factory(ws.id)
         factory_kwargs: dict[str, Any] = {
             "skill": skill,

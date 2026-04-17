@@ -926,8 +926,18 @@ class CoordinatorManager:
                 return
             # Only _children_lock is needed for the registry write
             # now — the hot path no longer contends self._lock.
+            # Re-check the active-coords snapshot INSIDE the lock
+            # before mutating: a concurrent close()/eviction can pop
+            # _children[parent] between the lock-free read at line 912
+            # and the lock acquisition below, after which setdefault
+            # would resurrect the entry — leaking the registry key
+            # forever and enqueuing onto the now-closed coordinator's
+            # UI.  Re-reading _active_coords here catches that race
+            # without taking self._lock.
             newly_added = False
             with self._children_lock:
+                if parent not in self._active_coords:
+                    return
                 existing = self._children.setdefault(parent, set())
                 if ws_id not in existing:
                     existing.add(ws_id)
