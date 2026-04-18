@@ -46,6 +46,13 @@ class NodeSnapshot:
     health: dict[str, Any] = field(default_factory=dict)
     aggregate: dict[str, Any] = field(default_factory=dict)
     reachable: bool = True
+    # Last unreachable-reason string (e.g. ``"HTTP 403"``,
+    # ``"ConnectError"``, ``"node_id mismatch"``).  Surfaced through
+    # ``get_snapshot`` / ``get_nodes`` / ``get_node_detail`` so ops
+    # dashboards + the console node-list can show WHY a node is down
+    # without operators having to tail the collector log.  Cleared
+    # when the node reconnects successfully.
+    reachable_reason: str = ""
 
 
 class ClusterCollector:
@@ -236,10 +243,55 @@ class ClusterCollector:
                     params={"expected_node_id": node_id},
                     headers=self._auth_headers(),
                 ) as source:
-                    if source.response.status_code == 409:
+                    status = source.response.status_code
+                    if status == 409:
                         log.warning("Node identity mismatch for %s at %s", node_id, url)
-                        self._mark_unreachable(node_id)
+                        self._mark_unreachable(node_id, reason="node_id mismatch")
                         break  # stop reconnecting — wrong node at this URL
+                    # 4xx from upstream is ALWAYS an operator-actionable
+                    # configuration problem (missing service scope,
+                    # expired JWT secret mismatch, tenant misconfig) —
+                    # surface at warning so it shows up in ops logs
+                    # instead of silently burning SSE reconnect budget
+                    # at debug.  403 in particular was the long-standing
+                    # "console dashboard is empty" footgun when the
+                    # collector token lacked ``service`` scope.
+                    if 400 <= status < 500:
+                        # Bounded body read — iterate aiter_bytes() up
+                        # to the preview cap so a malicious / oversized
+                        # upstream can't force the collector to buffer
+                        # an arbitrary HTML error page just to log a
+                        # 200-char preview.  Stops pulling bytes as
+                        # soon as we have enough.
+                        body_preview = ""
+                        try:
+                            preview_cap = 256  # >200 chars after UTF-8 decode
+                            chunks: list[bytes] = []
+                            bytes_read = 0
+                            async for chunk in source.response.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                remaining = preview_cap - bytes_read
+                                if remaining <= 0:
+                                    break
+                                chunks.append(chunk[:remaining])
+                                bytes_read += len(chunks[-1])
+                                if bytes_read >= preview_cap:
+                                    break
+                            body_preview = b"".join(chunks).decode("utf-8", "replace")[:200]
+                        except Exception:
+                            body_preview = "<unreadable>"
+                        log.warning(
+                            "SSE %d from node %s at %s — %s",
+                            status,
+                            node_id,
+                            url,
+                            body_preview,
+                        )
+                        self._mark_unreachable(node_id, reason=f"HTTP {status}")
+                        await asyncio.sleep(min(backoff, 30) + random.random())
+                        backoff = min(backoff * 2, 30)
+                        continue
                     source.response.raise_for_status()
                     async for sse in source.aiter_sse():
                         if stop_event.is_set():
@@ -260,7 +312,7 @@ class ClusterCollector:
                                     node_id,
                                     data.get("node_id"),
                                 )
-                                self._mark_unreachable(node_id)
+                                self._mark_unreachable(node_id, reason="node_id mismatch")
                                 break
                             self._apply_snapshot(node_id, data)
                             backoff = 1.0
@@ -268,9 +320,14 @@ class ClusterCollector:
                             self._apply_delta(node_id, data)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                log.debug("SSE error for node %s", node_id, exc_info=True)
-                self._mark_unreachable(node_id)
+            except Exception as exc:
+                # Network / timeout / TLS errors — expected during brief
+                # node restarts.  Keep at debug so the log doesn't flood
+                # on every backoff cycle; the warning above already
+                # covers configuration-level failures operators need to
+                # see.
+                log.debug("SSE error for node %s: %r", node_id, exc, exc_info=True)
+                self._mark_unreachable(node_id, reason=type(exc).__name__)
                 await asyncio.sleep(min(backoff, 30) + random.random())
                 backoff = min(backoff * 2, 30)
 
@@ -280,12 +337,19 @@ class ClusterCollector:
             node = self._nodes.get(node_id)
             return node.server_url if node else ""
 
-    def _mark_unreachable(self, node_id: str) -> None:
-        """Mark a node as unreachable (thread-safe)."""
+    def _mark_unreachable(self, node_id: str, reason: str = "") -> None:
+        """Mark a node as unreachable (thread-safe).
+
+        ``reason`` is a short human-readable diagnostic (e.g.
+        ``"HTTP 403"``, ``"ConnectError"``) surfaced via the snapshot
+        + node endpoints so operators can see WHY a node is down.
+        """
         with self._lock:
             node = self._nodes.get(node_id)
             if node:
                 node.reachable = False
+                if reason:
+                    node.reachable_reason = reason
 
     # -- node discovery ------------------------------------------------------
 
@@ -441,6 +505,9 @@ class ClusterCollector:
                 return
             node.last_seen = time.monotonic()
             node.reachable = True
+            # Clear the diagnostic on successful reconnect so the
+            # snapshot doesn't keep reporting a stale cause.
+            node.reachable_reason = ""
             node.health = data.get("health", {})
             node.aggregate = data.get("aggregate", {})
             pending_events = self._reconcile_node(node_id, node, data.get("workstreams", []))
@@ -685,6 +752,7 @@ class ClusterCollector:
                         "started": node.started,
                         "last_seen": node.last_seen,
                         "reachable": node.reachable,
+                        "reachable_reason": node.reachable_reason,
                         "health": node.health,
                         "version": node.health.get("version", ""),
                     }
@@ -781,6 +849,7 @@ class ClusterCollector:
                 "workstreams": [dict(ws) for ws in node.workstreams.values()],
                 "aggregate": dict(node.aggregate),
                 "reachable": node.reachable,
+                "reachable_reason": node.reachable_reason,
             }
 
     def get_snapshot(self) -> dict[str, Any]:
@@ -848,6 +917,7 @@ class ClusterCollector:
                     "server_url": node.server_url,
                     "max_ws": node.max_ws,
                     "reachable": node.reachable,
+                    "reachable_reason": node.reachable_reason,
                     "version": ver,
                     "health": dict(node.health),
                     "aggregate": dict(node.aggregate),

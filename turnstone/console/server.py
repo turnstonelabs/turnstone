@@ -9712,9 +9712,18 @@ def main() -> None:
 
     from turnstone.core.auth import JWT_AUD_SERVER, ServiceTokenManager
 
+    # ``service`` scope is REQUIRED — ``/v1/api/events/global`` on every
+    # upstream node hard-gates on it (server.py global_events_sse), and
+    # ``/v1/api/dashboard`` / ``/v1/api/workstreams`` silently tenant-
+    # filter away all rows for non-service callers (server.py
+    # _visible_workstreams).  Without ``service`` here, every
+    # console→upstream SSE connect 403s, no dashboard rows flow, the
+    # browser's cluster-view is empty, and the failure surfaces only
+    # as DEBUG-level log lines in the collector (#sev-0).  ``read`` is
+    # kept for legacy read-path compatibility.
     collector_token_mgr = ServiceTokenManager(
         user_id="console-collector",
-        scopes=frozenset({"read"}),
+        scopes=frozenset({"read", "service"}),
         source="console",
         secret=jwt_secret,
         audience=JWT_AUD_SERVER,

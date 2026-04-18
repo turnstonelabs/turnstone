@@ -420,6 +420,36 @@ class TestGlobalEventsServiceGate:
         assert resp.status_code == 403
         assert "service" in resp.json()["error"].lower()
 
+    def test_service_scope_accepted(self, app_client):
+        """Regression for the console-collector 403 footgun: the
+        collector's ServiceTokenManager is configured in console/server.py
+        with scopes ``{"read", "service"}``.  This gate must accept
+        exactly that scope set so the collector's SSE subscription
+        doesn't silently 403 out (#sev-0).  Any future scope renaming
+        that would drop ``"service"`` from the node-side check breaks
+        this test before it breaks the dashboard.
+
+        Probe a deliberately-wrong ``expected_node_id`` — the handler
+        runs the scope gate first, then the node-identity check.  A
+        409 response proves we made it past the scope gate (which is
+        what this test is asserting), while also avoiding an
+        indefinitely-open SSE stream the TestClient would never close.
+        """
+        client, _mgr = app_client
+        # Exact scope set the collector uses today.
+        collector_scopes = frozenset({"read", "service"})
+        resp = client.get(
+            "/v1/api/events/global?expected_node_id=definitely-wrong-node-id",
+            headers=_auth("console-collector", scopes=collector_scopes),
+        )
+        # 409 = the scope gate passed and we hit the node-identity
+        # mismatch branch.  Anything else (403 / 500 / 200 stream)
+        # is a failure for this contract.
+        assert resp.status_code == 409, (
+            f"service-scoped token did not reach node-id check: "
+            f"{resp.status_code} {resp.text[:120]}"
+        )
+
 
 class TestPerWsSseGate:
     def test_non_owner_rejected(self, app_client):
