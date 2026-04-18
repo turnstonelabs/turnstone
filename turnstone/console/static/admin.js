@@ -53,7 +53,6 @@ function showAdmin() {
   }
   var homeView = document.getElementById("view-home");
   if (homeView) homeView.style.display = "none";
-  document.getElementById("view-overview").style.display = "none";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("view-filtered").style.display = "none";
   document.getElementById("view-admin").style.display = "";

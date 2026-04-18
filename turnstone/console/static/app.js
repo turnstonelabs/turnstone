@@ -2089,10 +2089,10 @@ function _renderHomeView() {
   // cluster_state tick that only bumps tokens / context_ratio /
   // activity (patchClusterState mutates those without touching
   // ws.updated) doesn't leave the TOKENS / CTX / activity cells
-  // frozen.  Bucketing tokens by thousands keeps the fingerprint
-  // stable enough that unrelated sub-thousand drift doesn't trigger
-  // a full rebuild on every SSE tick; the value itself still
-  // re-renders when it crosses a threshold.
+  // frozen.  Bucketing tokens by hundreds keeps the fingerprint
+  // stable enough that unrelated sub-hundred drift doesn't trigger
+  // a full rebuild on every SSE tick; the rendered value still
+  // re-renders when the bucket changes.
   var coordsFp = coords.length + "|";
   for (var i = 0; i < coords.length; i++) {
     var c = coords[i];
