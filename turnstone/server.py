@@ -1302,10 +1302,17 @@ async def dashboard(request: Request) -> JSONResponse:
 
 
 async def list_saved_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams/saved — list saved workstreams with conversation history."""
-    from turnstone.core.memory import list_workstreams_with_history
+    """GET /v1/api/workstreams/saved — list saved workstreams with conversation history.
 
-    rows = list_workstreams_with_history(limit=50)
+    Restricted to ``kind="interactive"`` — the interactive UI's "saved
+    workstreams" sidebar is not a coordinator surface, and coordinator
+    rows (which persist conversation history too) would otherwise leak
+    into it.
+    """
+    from turnstone.core.memory import list_workstreams_with_history
+    from turnstone.core.workstream import WorkstreamKind
+
+    rows = list_workstreams_with_history(limit=50, kind=WorkstreamKind.INTERACTIVE)
     result = [
         {
             "ws_id": wid,

@@ -300,7 +300,18 @@ class PostgreSQLBackend:
 
     # -- Workstream management -------------------------------------------------
 
-    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
+    def list_workstreams_with_history(
+        self,
+        limit: int = 20,
+        *,
+        kind: WorkstreamKind | str | None = None,
+    ) -> list[Any]:
+        # See SQLite sibling for the rationale on the kind filter.
+        params: dict[str, Any] = {"limit": limit}
+        kind_clause = ""
+        if kind is not None:
+            params["kind"] = WorkstreamKind(kind).value
+            kind_clause = "AND w.kind = :kind "
         with self._conn() as conn:
             return list(
                 conn.execute(
@@ -312,9 +323,10 @@ class PostgreSQLBackend:
                         "FROM workstreams w "
                         "WHERE EXISTS "
                         "  (SELECT 1 FROM conversations c WHERE c.ws_id = w.ws_id) "
+                        f"{kind_clause}"
                         "ORDER BY w.updated DESC LIMIT :limit"
                     ),
-                    {"limit": limit},
+                    params,
                 ).fetchall()
             )
 

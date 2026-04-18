@@ -207,8 +207,19 @@ class StorageBackend(Protocol):
 
     # -- Workstream management -------------------------------------------------
 
-    def list_workstreams_with_history(self, limit: int = 20) -> list[Any]:
-        """List workstreams that have messages, ordered by updated DESC."""
+    def list_workstreams_with_history(
+        self,
+        limit: int = 20,
+        *,
+        kind: WorkstreamKind | str | None = None,
+    ) -> list[Any]:
+        """List workstreams that have messages, ordered by updated DESC.
+
+        ``kind`` filters at the SQL layer — pass ``WorkstreamKind.INTERACTIVE``
+        from the interactive "saved workstreams" sidebar so coordinator rows
+        (which also persist conversation history) don't leak into that
+        surface.  Default ``None`` preserves the legacy all-kinds behaviour.
+        """
         ...
 
     def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:

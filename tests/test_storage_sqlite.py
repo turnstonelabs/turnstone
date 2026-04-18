@@ -309,6 +309,43 @@ class TestListWorkstreamsWithHistory:
         rows = backend.list_workstreams_with_history(limit=3)
         assert len(rows) == 3
 
+    def test_kind_filter_excludes_coordinators(self, backend):
+        """The interactive 'saved workstreams' sidebar calls this with
+        kind=INTERACTIVE so coordinator rows (which also persist
+        conversation history) don't leak into the interactive UI."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        backend.register_workstream("interactive-1", kind=WorkstreamKind.INTERACTIVE)
+        backend.save_message("interactive-1", "user", "hi")
+        backend.register_workstream("coord-1", kind=WorkstreamKind.COORDINATOR)
+        backend.save_message("coord-1", "user", "plan something")
+
+        # Default (no filter) returns both — preserves legacy behaviour.
+        rows_all = backend.list_workstreams_with_history()
+        assert {r[0] for r in rows_all} == {"interactive-1", "coord-1"}
+
+        # kind=INTERACTIVE drops the coordinator row at the SQL layer.
+        rows_i = backend.list_workstreams_with_history(kind=WorkstreamKind.INTERACTIVE)
+        assert {r[0] for r in rows_i} == {"interactive-1"}
+
+        # kind=COORDINATOR symmetric — for admin tooling that wants
+        # the opposite view.
+        rows_c = backend.list_workstreams_with_history(kind=WorkstreamKind.COORDINATOR)
+        assert {r[0] for r in rows_c} == {"coord-1"}
+
+    def test_kind_filter_accepts_string(self, backend):
+        """String form (``"interactive"``) works too — matches how the
+        memory.py helper forwards caller-supplied values."""
+        from turnstone.core.workstream import WorkstreamKind
+
+        backend.register_workstream("interactive-1", kind=WorkstreamKind.INTERACTIVE)
+        backend.save_message("interactive-1", "user", "hi")
+        backend.register_workstream("coord-1", kind=WorkstreamKind.COORDINATOR)
+        backend.save_message("coord-1", "user", "plan")
+
+        rows = backend.list_workstreams_with_history(kind="interactive")
+        assert {r[0] for r in rows} == {"interactive-1"}
+
 
 class TestDeleteWorkstream:
     def test_deletes_all_data(self, backend):

@@ -371,24 +371,35 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     them into the cluster view so the dashboard tree grouping can nest
     spawned children under their coordinator parent.
 
-    Ownership filter mirrors :meth:`CoordinatorManager.list_for_user`'s
-    invariant: non-admin callers must not see other tenants' coordinator
-    rows (``ws_id`` + name + state would otherwise leak cross-tenant via
-    the unified dashboard).  Admins (``admin.users`` / ``admin.roles``)
-    get the full set.  Unauthenticated callers shouldn't reach this path
-    — the endpoint sits behind the global auth middleware — but the
-    filter defaults to empty on a missing ``user_id`` rather than
-    leaking via ``list_all``.
+    Sources two lanes and merges by ws_id:
+
+    - **In-memory** via :meth:`CoordinatorManager.list_for_user` /
+      ``list_all`` — carries live session state (model / model_alias /
+      current workstream state) for currently-loaded coordinators.
+    - **Persisted** via ``storage.list_workstreams(kind=COORDINATOR)``
+      — includes closed / error / soft-deleted rows the manager has
+      evicted from memory.  Without this, closed coordinators
+      disappeared from the landing page the moment ``close`` fired.
+
+    In-memory wins on ws_id conflict so live state stays authoritative
+    for active sessions.
+
+    Ownership filter: non-admin callers must not see other tenants'
+    coordinator rows.  Admins (``admin.users`` / ``admin.roles``) get
+    the full set.  Unauthenticated callers shouldn't reach this path
+    — the endpoint sits behind global auth — but the filter defaults
+    to empty on a missing ``user_id`` rather than leaking.
     """
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
     if coord_mgr is None:
         return []
+    is_admin = _is_admin(request)
+    caller_uid = _auth_user_id(request)
     try:
-        if _is_admin(request):
+        if is_admin:
             wss = coord_mgr.list_all()
         else:
-            user_id = _auth_user_id(request)
-            wss = coord_mgr.list_for_user(user_id) if user_id else []
+            wss = coord_mgr.list_for_user(caller_uid) if caller_uid else []
     except Exception:
         log.debug("cluster_workstreams.coord_list_failed", exc_info=True)
         return []
@@ -398,6 +409,7 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         return val if isinstance(val, str) else ""
 
     rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for ws in wss:
         sess = getattr(ws, "session", None)
         rows.append(
@@ -417,6 +429,72 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
                 "tool_calls": 0,
                 "kind": WorkstreamKind.COORDINATOR.value,
                 "parent_ws_id": None,
+                "user_id": ws.user_id or "",
+            }
+        )
+        seen.add(ws.id)
+
+    # Second lane — persisted coordinator rows, used to surface
+    # closed / error / deleted coordinators the manager has already
+    # evicted from ``self._workstreams``.  Same ownership semantics as
+    # the in-memory lane (admin bypass, empty user_id fails closed).
+    storage = getattr(request.app.state, "auth_storage", None)
+    if storage is None:
+        return rows
+    if not is_admin and not caller_uid:
+        return rows
+    try:
+        persisted = storage.list_workstreams(
+            kind=WorkstreamKind.COORDINATOR,
+            user_id=None if is_admin else caller_uid,
+            limit=200,
+        )
+    except Exception:
+        log.debug("cluster_workstreams.coord_persisted_failed", exc_info=True)
+        return rows
+
+    for row in persisted:
+        try:
+            m = row._mapping  # SQLAlchemy Row
+        except AttributeError:
+            # Test-double fallback.
+            if len(row) < 2:
+                continue
+            m = {
+                "ws_id": row[0],
+                "node_id": row[1] if len(row) > 1 else "",
+                "name": row[2] if len(row) > 2 else "",
+                "state": row[3] if len(row) > 3 else "",
+                "user_id": row[10] if len(row) > 10 else "",
+            }
+        row_id = m.get("ws_id") or ""
+        if not row_id or row_id in seen:
+            continue
+        row_owner = m.get("user_id") or ""
+        # Defense-in-depth empty-string tenancy check — same pattern as
+        # _check_row_owner_or_404.  The SQL user_id filter above should
+        # already enforce this, but duplicate the check client-side for
+        # migration-artifact rows with blank owners.
+        if not is_admin and (not caller_uid or not row_owner or row_owner != caller_uid):
+            continue
+        rows.append(
+            {
+                "id": row_id,
+                "name": m.get("name") or f"coord-{row_id[:4]}",
+                "state": str(m.get("state") or "idle"),
+                "title": "",
+                "node": "console",
+                "server_url": "",
+                "model": "",
+                "model_alias": "",
+                "tokens": 0,
+                "context_ratio": 0.0,
+                "activity": "",
+                "activity_state": "",
+                "tool_calls": 0,
+                "kind": WorkstreamKind.COORDINATOR.value,
+                "parent_ws_id": None,
+                "user_id": row_owner,
             }
         )
     return rows

@@ -1056,3 +1056,162 @@ def test_coordinator_rows_empty_user_id_returns_empty(storage):
         permissions=frozenset({"read"}),
     )
     assert _coordinator_rows(request) == []
+
+
+def _persisted_rows_request(storage, mgr, user_id: str, perms: frozenset[str]):
+    """Build a _coordinator_rows-shaped request with auth_storage wired
+    up so the persisted-rows merge path fires."""
+    from unittest.mock import MagicMock
+
+    from turnstone.core.auth import AuthResult
+
+    request = MagicMock()
+    request.app.state.coord_mgr = mgr
+    request.app.state.auth_storage = storage
+    request.state.auth_result = AuthResult(
+        user_id=user_id,
+        scopes=frozenset({"read"}),
+        token_source="test",
+        permissions=perms,
+    )
+    return request
+
+
+def test_coordinator_rows_surfaces_closed_coordinators_from_storage(storage):
+    """Closed coordinators get popped from ``self._workstreams`` but
+    their persisted row stays in storage with ``state='closed'``.  The
+    landing page polls _coordinator_rows via
+    /v1/api/cluster/workstreams?node=console — the persisted-rows
+    merge path surfaces closed rows so the operator can still see
+    them alongside active ones."""
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+    # Seed a persisted-but-not-loaded closed coordinator directly —
+    # register + soft-close via storage primitives.
+    storage.register_workstream(
+        "a" * 32,
+        node_id="console",
+        user_id="alice",
+        name="historical-coord",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    # Also seed a live coordinator via the manager to prove merge.
+    mgr.create(user_id="alice", name="live-coord")
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = _coordinator_rows(request)
+    names = {r["name"] for r in rows}
+    assert names == {"live-coord", "historical-coord"}
+    # Closed coord carries its persisted state so the UI can render
+    # it with the correct state glyph.
+    closed = next(r for r in rows if r["name"] == "historical-coord")
+    assert closed["state"] == "closed"
+    assert closed["kind"] == "coordinator"
+
+
+def test_coordinator_rows_dedupes_by_ws_id_in_memory_wins(storage):
+    """When a coordinator is both in-memory (manager) AND in storage,
+    _coordinator_rows must prefer the in-memory row so live session
+    state (model / model_alias / current state) stays authoritative.
+    The storage row has stale fields after every restart / refresh,
+    so merging it twice is strictly worse."""
+    from turnstone.console.server import _coordinator_rows
+
+    mgr = _build_mgr(storage)
+    live = mgr.create(user_id="alice", name="alice-live")
+    # Persist an explicit storage-only shape for the SAME ws_id —
+    # mgr.create already did this, but we deliberately corrupt the
+    # stored row to prove the in-memory row wins.  Update the state
+    # to something the manager would never produce so the dedup check
+    # is unambiguous.
+    storage.update_workstream_state(live.id, "error")
+
+    request = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    rows = _coordinator_rows(request)
+    assert len(rows) == 1
+    assert rows[0]["id"] == live.id
+    # In-memory WorkstreamState wins over the persisted "error" tweak
+    # — the manager reports "idle" for a freshly-created coordinator.
+    assert rows[0]["state"] == "idle"
+
+
+def test_coordinator_rows_persisted_respects_tenant_filter(storage):
+    """Non-admin callers must not see OTHER tenants' persisted
+    (closed) coordinators either.  Regression lock — the user_id
+    kwarg on list_workstreams is pushed through; the defense-in-depth
+    client-side empty-string check catches the tail."""
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream(
+        "a" * 32,
+        node_id="console",
+        user_id="alice",
+        name="alice-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+    storage.register_workstream(
+        "b" * 32,
+        node_id="console",
+        user_id="bob",
+        name="bob-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+
+    alice_req = _persisted_rows_request(storage, mgr, "alice", frozenset({"read"}))
+    alice_rows = _coordinator_rows(alice_req)
+    assert {r["name"] for r in alice_rows} == {"alice-closed"}
+
+    bob_req = _persisted_rows_request(storage, mgr, "bob", frozenset({"read"}))
+    bob_rows = _coordinator_rows(bob_req)
+    assert {r["name"] for r in bob_rows} == {"bob-closed"}
+
+    admin_req = _persisted_rows_request(storage, mgr, "admin-1", frozenset({"read", "admin.users"}))
+    admin_rows = _coordinator_rows(admin_req)
+    assert {r["name"] for r in admin_rows} == {"alice-closed", "bob-closed"}
+
+
+def test_coordinator_rows_persisted_skips_orphan_rows_for_non_admin(storage):
+    """Defense-in-depth empty-string tenancy check — a persisted row
+    with empty user_id (migration-artifact / system-owned) must NOT
+    be visible to a non-admin caller with empty caller_uid either.
+    The SQL user_id filter above already enforces this, but duplicate
+    the check client-side so orphan rows never leak to any
+    hypothetical empty-sub JWT."""
+    from unittest.mock import MagicMock
+
+    from turnstone.console.server import _coordinator_rows
+    from turnstone.core.auth import AuthResult
+    from turnstone.core.workstream import WorkstreamKind
+
+    mgr = _build_mgr(storage)
+    storage.register_workstream(
+        "c" * 32,
+        node_id="console",
+        user_id="",  # orphan / system row
+        name="orphan-closed",
+        state="closed",
+        kind=WorkstreamKind.COORDINATOR,
+        parent_ws_id=None,
+    )
+
+    # Non-admin with empty caller_uid must not see the orphan.
+    request = MagicMock()
+    request.app.state.coord_mgr = mgr
+    request.app.state.auth_storage = storage
+    request.state.auth_result = AuthResult(
+        user_id="",
+        scopes=frozenset({"read"}),
+        token_source="test",
+        permissions=frozenset({"read"}),
+    )
+    assert _coordinator_rows(request) == []
