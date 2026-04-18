@@ -350,6 +350,9 @@ async def _run_gateway(
         )
     finally:
         heartbeat_task.cancel()
+        # Await the task so its CancelledError propagates before we tear
+        # down the adapters and the service registry below.  CancelledError
+        # is the expected outcome after task.cancel(); suppress it.
         with contextlib.suppress(asyncio.CancelledError):
             await heartbeat_task
 

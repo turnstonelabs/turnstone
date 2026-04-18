@@ -426,6 +426,10 @@ class TurnstoneBot:
         task = self._sse_tasks.pop(ws_id, None)
         if task is not None:
             task.cancel()
+            # Await the cancelled task so CancelledError propagates out of
+            # the SSE loop before we clear the per-ws state below.
+            # CancelledError is expected; other exceptions from the SSE
+            # loop are already logged there and must not block shutdown.
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
         await self._clear_ws_state(ws_id)

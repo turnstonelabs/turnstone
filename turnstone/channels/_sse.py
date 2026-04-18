@@ -129,8 +129,15 @@ async def run_sse_stream(
                             exc_info=True,
                         )
 
-        except httpx.HTTPStatusError:
-            pass
+        except httpx.HTTPStatusError as exc:
+            # Already logged at WARNING inside the try block (the raise
+            # was our own — status was captured there).  Caught here to
+            # fall through to backoff + retry.
+            log.debug(
+                f"{log_prefix}.sse_http_status_error",
+                ws_id=ws_id,
+                error=str(exc),
+            )
         except httpx.RemoteProtocolError:
             log.debug(f"{log_prefix}.sse_remote_closed", ws_id=ws_id)
         except asyncio.CancelledError:
