@@ -952,7 +952,7 @@ export interface SkillDiscoverListing {
   install_count: number;
   tags: string[];
   installed: boolean;
-  scan_status?: string;
+  risk_level?: string;
   template_id?: string;
 }
 

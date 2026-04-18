@@ -946,6 +946,25 @@ class CoordinatorManager:
         with self._children_lock:
             return self._child_to_coord.get(child_ws_id)
 
+    def children_snapshot(self, coord_ws_id: str) -> list[str]:
+        """Return a snapshot of the coordinator's direct child ws_ids.
+
+        Used by ``stop_cascade`` to iterate children without holding the
+        registry lock during the per-child HTTP dispatch.  A mutation
+        racing with the snapshot (child spawned mid-cascade) either
+        lands before the snapshot and gets cancelled, or lands after
+        and is out of scope for this batch — both outcomes are safe.
+        Returns an empty list for unknown coordinators.
+        """
+        with self._children_lock:
+            child_set = self._children.get(coord_ws_id)
+            return list(child_set) if child_set else []
+
+    def register_children(self, coord_ws_id: str, child_ws_ids: Iterable[str]) -> None:
+        """Merge ``child_ws_ids`` into the coordinator's child set.  Idempotent."""
+        with self._children_lock:
+            self._merge_child_ids_locked(coord_ws_id, child_ws_ids)
+
     def _pop_coord_registry_locked(self, coord_ws_id: str) -> None:
         """Remove a coordinator's forward set + reverse-index entries.
 

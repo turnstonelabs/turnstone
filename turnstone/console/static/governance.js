@@ -710,7 +710,7 @@ function _renderGovSkills(items) {
       '<span class="scope-badge">' + escapeHtml(t.category) + "</span>";
     // Build risk column content with tooltip
     var riskCell = "";
-    if (t.scan_status) {
+    if (t.risk_level) {
       var scanClass =
         {
           safe: "scope-scan-safe",
@@ -718,7 +718,7 @@ function _renderGovSkills(items) {
           medium: "scope-scan-medium",
           high: "scope-scan-high",
           critical: "scope-scan-critical",
-        }[t.scan_status] || "";
+        }[t.risk_level] || "";
       var scanIcon =
         {
           safe: "\u2713 ",
@@ -726,7 +726,7 @@ function _renderGovSkills(items) {
           medium: "\u25B2 ",
           high: "\u25C6 ",
           critical: "\u26A0 ",
-        }[t.scan_status] || "";
+        }[t.risk_level] || "";
       var tipParts = [];
       try {
         var report = JSON.parse(t.scan_report || "{}");
@@ -743,17 +743,17 @@ function _renderGovSkills(items) {
           }
         }
       } catch (e) {}
-      var tipText = tipParts.length ? tipParts.join("\n") : t.scan_status;
+      var tipText = tipParts.length ? tipParts.join("\n") : t.risk_level;
       riskCell =
         '<span class="scope-badge ' +
         scanClass +
         '" tabindex="0" role="button" aria-label="Risk: ' +
-        escapeHtml(t.scan_status) +
+        escapeHtml(t.risk_level) +
         (tipParts.length ? ". " + escapeHtml(tipParts.join(". ")) : "") +
         '" title="' +
         escapeHtml(tipText) +
         '">' +
-        escapeHtml(scanIcon + t.scan_status) +
+        escapeHtml(scanIcon + t.risk_level) +
         "</span>";
     } else {
       riskCell =
@@ -1126,7 +1126,7 @@ function showEditTemplateModal(tmplId) {
   // Scan report section
   var scanSection = document.getElementById("etm-scan-section");
   if (scanSection) {
-    if (tmpl.scan_status) {
+    if (tmpl.risk_level) {
       scanSection.style.display = "";
       var scanClassMap = {
         safe: "scope-scan-safe",
@@ -1141,9 +1141,9 @@ function showEditTemplateModal(tmplId) {
       } catch (e) {}
       var scanHtml =
         '<span class="scope-badge ' +
-        (scanClassMap[tmpl.scan_status] || "") +
+        (scanClassMap[tmpl.risk_level] || "") +
         '">' +
-        escapeHtml(tmpl.scan_status) +
+        escapeHtml(tmpl.risk_level) +
         "</span>";
       if (report.composite != null) {
         scanHtml +=
@@ -1193,11 +1193,11 @@ function showEditTemplateModal(tmplId) {
           return r.json();
         })
         .then(function (data) {
-          showToast("Scan complete: " + (data.scan_status || "unknown"));
+          showToast("Scan complete: " + (data.risk_level || "unknown"));
           // Refresh the modal by re-loading skills and re-opening
           loadGovSkills();
           // Update current tmpl in memory
-          tmpl.scan_status = data.scan_status;
+          tmpl.risk_level = data.risk_level;
           tmpl.scan_report = data.scan_report;
           tmpl.scan_version = data.scan_version;
           showEditTemplateModal(tmplId);
@@ -2262,7 +2262,7 @@ function _renderSkillDiscoverResults() {
     var actionHtml;
     if (s.installed) {
       var scanBadgeHtml = "";
-      if (s.scan_status) {
+      if (s.risk_level) {
         var scanCls =
           {
             safe: "scope-scan-safe",
@@ -2270,12 +2270,12 @@ function _renderSkillDiscoverResults() {
             medium: "scope-scan-medium",
             high: "scope-scan-high",
             critical: "scope-scan-critical",
-          }[s.scan_status] || "";
+          }[s.risk_level] || "";
         scanBadgeHtml =
           '<span class="scope-badge ' +
           scanCls +
           '" style="margin-right:4px">' +
-          escapeHtml(s.scan_status) +
+          escapeHtml(s.risk_level) +
           "</span>";
       }
       actionHtml =
@@ -2385,13 +2385,13 @@ function installDiscoveredSkill(skill) {
     })
     .then(function (data) {
       var first = (data.installed && data.installed[0]) || {};
-      var tierMsg = first.scan_status ? " [" + first.scan_status + "]" : "";
+      var tierMsg = first.risk_level ? " [" + first.risk_level + "]" : "";
       showToast("Skill installed: " + (skill.name || skill.id) + tierMsg);
       // Mark as installed in results with scan data
       for (var j = 0; j < _skillDiscoverResults.length; j++) {
         if (_skillDiscoverResults[j].id === skill.id) {
           _skillDiscoverResults[j].installed = true;
-          _skillDiscoverResults[j].scan_status = first.scan_status || "";
+          _skillDiscoverResults[j].risk_level = first.risk_level || "";
           break;
         }
       }
@@ -2462,8 +2462,8 @@ function submitGitHubImport() {
       var msg;
       if (count === 1 && !skipCount) {
         var name = data.installed[0].name || "";
-        var tierMsg = data.installed[0].scan_status
-          ? " [" + data.installed[0].scan_status + "]"
+        var tierMsg = data.installed[0].risk_level
+          ? " [" + data.installed[0].risk_level + "]"
           : "";
         msg = "Skill installed: " + name + tierMsg;
       } else if (count === 0 && skipCount) {

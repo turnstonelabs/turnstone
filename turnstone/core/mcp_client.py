@@ -1097,8 +1097,13 @@ class MCPClientManager:
                     token_estimate=len(content) // 4,
                 )
             else:
-                # Create new MCP-sourced template
+                # Create new MCP-sourced template.  Thread the prompt's
+                # upstream description through so the row satisfies the
+                # non-empty-description invariant; fall back to a
+                # synthetic marker when the MCP server didn't provide
+                # one.
                 template_id = str(uuid.uuid4())
+                template_description = desc.strip() or f"MCP prompt {name} from {server}"
                 storage.create_prompt_template(
                     template_id=template_id,
                     name=name,
@@ -1111,6 +1116,7 @@ class MCPClientManager:
                     origin="mcp",
                     mcp_server=server,
                     readonly=True,
+                    description=template_description,
                     activation="named",
                     token_estimate=len(content) // 4,
                 )

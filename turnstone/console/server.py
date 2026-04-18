@@ -25,6 +25,7 @@ import secrets
 import textwrap
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -43,20 +44,32 @@ from turnstone.console.collector import ClusterCollector
 from turnstone.console.coordinator_client import load_task_envelope
 from turnstone.console.metrics import ConsoleMetrics
 from turnstone.console.router import ConsoleRouter
+from turnstone.core.audit import record_audit
 from turnstone.core.auth import (
+    DENY_EMPTY_SUB,
     JWT_AUD_CONSOLE,
     JWT_AUD_SERVER,
     AuthMiddleware,
+    _DenyFilter,
     create_jwt,
     jwt_version_slot,
+    require_permission,
 )
 from turnstone.core.hash_ring import NoAvailableNodeError
+from turnstone.core.skill_kind import SkillKind
+from turnstone.core.web_helpers import (
+    read_json_or_400,
+    require_storage_or_503,
+)
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from starlette.requests import Request
+
+    from turnstone.core.session import ChatSession
+    from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.server")
 
@@ -170,6 +183,59 @@ _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
+
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+async def _bounded_stream_preview(response: httpx.Response, cap: int = 200) -> str:
+    """Streaming counterpart of :func:`_bounded_body_preview`.
+
+    Iterates ``response.aiter_bytes`` up to ``cap * 1.3`` bytes (enough
+    for ``cap`` chars post-UTF-8 decode) so a compromised / oversized
+    upstream can't force the proxy to buffer an arbitrary error page
+    just to populate a preview.  Shares the control-char scrub with
+    the non-streaming helper so the output shape is identical across
+    sites.
+    """
+    preview_chunks: list[bytes] = []
+    read = 0
+    byte_cap = int(cap * 1.3) + 1
+    try:
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            remaining = byte_cap - read
+            if remaining <= 0:
+                break
+            preview_chunks.append(chunk[:remaining])
+            read += len(preview_chunks[-1])
+            if read >= byte_cap:
+                break
+    except Exception:
+        return "<unreadable>"
+    decoded = b"".join(preview_chunks).decode("utf-8", "replace")
+    return _CONTROL_CHAR_RE.sub(" ", decoded)[:cap]
+
+
+def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
+    """Return a body preview for 4xx logs capped at ``cap`` chars.
+
+    Body is already in memory on a non-streaming httpx response; this
+    helper exists so every call-site produces the same shape.
+
+    Control characters (CR, LF, NUL, ...) are replaced with spaces
+    before the cap: the preview flows into both ``log.warning`` records
+    and the operator-facing 503 ``collector_scope_error`` body, and
+    upstream-controlled newlines in either surface would let a
+    compromised node forge additional log lines or masquerade as
+    embedded remediation text.
+    """
+    if not text:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
 
 
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
@@ -393,13 +459,12 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
     coord_mgr = getattr(request.app.state, "coord_mgr", None)
     if coord_mgr is None:
         return []
-    is_admin = _is_admin(request)
-    caller_uid = _auth_user_id(request)
+    filt = _effective_user_filter(request)
+    if filt is DENY_EMPTY_SUB:
+        return []
+    # filt is now ``None`` (admin / service) or a non-empty caller uid.
     try:
-        if is_admin:
-            wss = coord_mgr.list_all()
-        else:
-            wss = coord_mgr.list_for_user(caller_uid) if caller_uid else []
+        wss = coord_mgr.list_all() if filt is None else coord_mgr.list_for_user(filt)
     except Exception:
         log.debug("cluster_workstreams.coord_list_failed", exc_info=True)
         return []
@@ -436,17 +501,16 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
 
     # Second lane — persisted coordinator rows, used to surface
     # closed / error / deleted coordinators the manager has already
-    # evicted from ``self._workstreams``.  Same ownership semantics as
-    # the in-memory lane (admin bypass, empty user_id fails closed).
+    # evicted from ``self._workstreams``.  ``filt`` carries the same
+    # tenant decision as the in-memory lane above (None = admin /
+    # service; str = scoped caller).
     storage = getattr(request.app.state, "auth_storage", None)
     if storage is None:
-        return rows
-    if not is_admin and not caller_uid:
         return rows
     try:
         persisted = storage.list_workstreams(
             kind=WorkstreamKind.COORDINATOR,
-            user_id=None if is_admin else caller_uid,
+            user_id=filt,
             limit=200,
         )
     except Exception:
@@ -465,11 +529,11 @@ def _coordinator_rows(request: Request) -> list[dict[str, Any]]:
         if not row_id or row_id in seen:
             continue
         row_owner = m.get("user_id") or ""
-        # Defense-in-depth empty-string tenancy check — same pattern as
-        # _check_row_owner_or_404.  The SQL user_id filter above should
-        # already enforce this, but duplicate the check client-side for
-        # migration-artifact rows with blank owners.
-        if not is_admin and (not caller_uid or not row_owner or row_owner != caller_uid):
+        # Defense-in-depth empty-string tenancy check.  The SQL user_id
+        # filter above already enforces the match when ``filt`` is set;
+        # drop any rows whose owner still lands empty (migration
+        # artifacts) for non-admin callers.
+        if filt is not None and (not row_owner or row_owner != filt):
             continue
         rows.append(
             {
@@ -592,13 +656,32 @@ class _NodeDashboardCache:
                 )
             except (httpx.HTTPError, TimeoutError):
                 resp = None
-            if resp is not None and 200 <= resp.status_code < 300:
-                try:
-                    raw = resp.json()
-                except (ValueError, json.JSONDecodeError):
-                    raw = None
-                if isinstance(raw, dict):
-                    payload = raw
+            if resp is not None:
+                status = resp.status_code
+                if 200 <= status < 300:
+                    try:
+                        raw = resp.json()
+                    except (ValueError, json.JSONDecodeError):
+                        raw = None
+                    if isinstance(raw, dict):
+                        payload = raw
+                elif 400 <= status < 500:
+                    # 4xx on the /dashboard fetch means the caller's
+                    # JWT (user or service-token fallback) lacks the
+                    # required scopes — surface at WARNING so the
+                    # drift doesn't hide behind a silent empty
+                    # dashboard.  Return without caching so an
+                    # operator scope fix is visible on the next
+                    # request instead of after the TTL window; the
+                    # per-node lock above is the hot-loop guard.
+                    log.warning(
+                        "proxy.dashboard_cache.4xx node=%s status=%d url=%s body=%s",
+                        node_id,
+                        status,
+                        server_url,
+                        _bounded_body_preview(resp.text),
+                    )
+                    return None
             self._cache[node_id] = (time.monotonic(), payload)
             return payload
 
@@ -697,7 +780,20 @@ async def _fetch_live_block(
             )
         except (httpx.HTTPError, TimeoutError):
             return None
-        if not (200 <= resp.status_code < 300):
+        status = resp.status_code
+        if 400 <= status < 500:
+            # 4xx on the direct /dashboard fetch is the same class
+            # of auth/scope drift as the cached path above — surface
+            # at WARNING so operators see it in ops logs.
+            log.warning(
+                "proxy.live_block.4xx node=%s status=%d url=%s body=%s",
+                row_node_id,
+                status,
+                server_url,
+                _bounded_body_preview(resp.text),
+            )
+            return None
+        if not (200 <= status < 300):
             return None
         try:
             raw = resp.json()
@@ -890,8 +986,13 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
     if not cleaned:
         return JSONResponse({"results": {}, "denied": [], "truncated": False})
 
-    caller_uid = _auth_user_id(request)
-    is_admin = _is_admin(request)
+    filt = _effective_user_filter(request)
+    if filt is DENY_EMPTY_SUB:
+        # Non-admin, non-service caller with a blank sub — every row
+        # is denied by the empty-string rule.  Skip the batch fetch
+        # entirely and route all ids to ``denied`` (no existence
+        # oracle).
+        return JSONResponse({"results": {}, "denied": cleaned, "truncated": truncated})
 
     try:
         rows = await asyncio.to_thread(storage.get_workstreams_batch, cleaned)
@@ -916,13 +1017,12 @@ async def cluster_ws_live_bulk(request: Request) -> JSONResponse:
         if row is None:
             denied.append(wid)
             continue
-        # Empty-string defense — matches _check_row_owner_or_404 so
-        # an orphan / migration-artifact row (row_owner="") doesn't
-        # leak to a (hypothetical) caller whose JWT carries an empty
-        # sub claim.  Either side being empty → denied.  Admin bypass
-        # is applied via the ``is_admin`` flag below.
+        # Tenant check — admin / service (``filt is None``) sees all
+        # rows; scoped callers (``filt`` is a uid) see only matching
+        # rows.  An orphan / migration-artifact row with ``user_id=""``
+        # is denied for scoped callers by the ``not row_owner`` guard.
         row_owner = row.get("user_id") or ""
-        if not is_admin and (not caller_uid or not row_owner or row_owner != caller_uid):
+        if filt is not None and (not row_owner or row_owner != filt):
             denied.append(wid)
             continue
         owned_rows.append((wid, row))
@@ -982,12 +1082,35 @@ async def cluster_node_detail(request: Request) -> JSONResponse:
     return JSONResponse(detail)
 
 
+def _collector_scope_error(request: Request) -> JSONResponse | None:
+    """Return a 503 if the boot self-check detected collector scope drift.
+
+    Used by cluster-wide data endpoints so they refuse to serve an
+    empty dashboard when the operator's configuration is broken —
+    a clear 503 with remediation text is better than rendering a
+    blank table full of "missing data" bugs.
+    """
+    err = getattr(request.app.state, "collector_scope_error", "") or ""
+    if err:
+        return JSONResponse(
+            {"error": err, "reason": "collector_scope_drift"},
+            status_code=503,
+        )
+    return None
+
+
 async def cluster_snapshot(request: Request) -> JSONResponse:
+    err = _collector_scope_error(request)
+    if err is not None:
+        return err
     collector: ClusterCollector = request.app.state.collector
     return JSONResponse(collector.get_snapshot())
 
 
 async def cluster_events_sse(request: Request) -> Response:
+    err = _collector_scope_error(request)
+    if err is not None:
+        return err
     collector: ClusterCollector = request.app.state.collector
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=2000)
 
@@ -2127,12 +2250,20 @@ async def _proxy_sse(
                 timeout=httpx.Timeout(connect=10, read=None, write=5, pool=None),
             ) as response:
                 if response.status_code != 200:
-                    log.debug(
-                        "SSE proxy received status %s from %s",
-                        response.status_code,
+                    status = response.status_code
+                    body_preview = await _bounded_stream_preview(response)
+                    # Non-200 from a service-auth-backed SSE path is
+                    # operator-actionable: 4xx = scope/tenant drift,
+                    # 5xx = upstream outage.  Raise the log floor to
+                    # WARNING so it surfaces in ops logs; the browser
+                    # also receives the error event for UX.
+                    log.warning(
+                        "proxy.sse.non_200 status=%d url=%s body=%s",
+                        status,
                         target,
+                        body_preview,
                     )
-                    yield f"event: error\ndata: Upstream returned status {response.status_code}\n\n".encode()
+                    yield f"event: error\ndata: Upstream returned status {status}\n\n".encode()
                     return
                 async for chunk in response.aiter_bytes():
                     if await request.is_disconnected():
@@ -2208,11 +2339,18 @@ def _require_coord_mgr(request: Request) -> tuple[Any, JSONResponse | None]:
     return coord_mgr, None
 
 
-def _require_admin_coordinator(request: Request) -> JSONResponse | None:
-    """Gate a coordinator endpoint on the ``admin.coordinator`` permission."""
-    from turnstone.core.auth import require_permission
+def _require_admin_coordinator(
+    request: Request, *, allow_service_bypass: bool = True
+) -> JSONResponse | None:
+    """Gate a coordinator endpoint on the ``admin.coordinator`` permission.
 
-    return require_permission(request, "admin.coordinator")
+    Destructive endpoints (/restrict, /stop_cascade) pass
+    ``allow_service_bypass=False`` so a service-scoped caller whose
+    ``user_id`` matches the coord owner still needs an explicit grant.
+    """
+    return require_permission(
+        request, "admin.coordinator", allow_service_bypass=allow_service_bypass
+    )
 
 
 def _check_row_owner_or_404(
@@ -2296,10 +2434,56 @@ def _auth_user_id(request: Request) -> str:
     return getattr(auth, "user_id", "") or ""
 
 
+def _auth_scopes(request: Request) -> set[str]:
+    auth = getattr(getattr(request, "state", None), "auth_result", None)
+    return set(getattr(auth, "scopes", []) or [])
+
+
 def _is_admin(request: Request) -> bool:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     perms: frozenset[str] = getattr(auth, "permissions", frozenset())
     return "admin.users" in perms or "admin.roles" in perms
+
+
+def _effective_user_filter(request: Request) -> str | None | _DenyFilter:
+    """Resolve the effective ``user_id`` filter for a tenant-scoped aggregate.
+
+    Returns one of:
+
+    - ``None`` — admin (``admin.users`` / ``admin.roles``) or
+      service-scoped caller; no tenant filter — storage helpers see
+      cluster-wide rows.
+    - ``str`` — non-admin, non-service caller with a resolved uid;
+      storage helpers MUST receive ``user_id=<uid>`` and push the
+      filter into SQL.
+    - :data:`DENY_EMPTY_SUB` — non-admin, non-service caller whose
+      ``sub`` claim is blank.  Callers MUST short-circuit with their
+      endpoint's empty-shape response; passing ``None`` through to
+      storage would be a service-escape and passing ``""`` would
+      accidentally match legacy orphan rows with empty ``user_id``.
+
+    .. note::
+       The service-scope bypass is end-to-end only on endpoints that
+       do NOT first gate on :func:`_check_row_owner_or_404` (which
+       currently bypasses for ``admin.*`` permissions but not for
+       service scope).  A service-scoped non-admin caller to
+       ``coordinator_children`` / ``coordinator_metrics`` is 404'd
+       before the filter runs; the bypass there is reachable only by
+       admin callers.  ``_coordinator_rows`` and
+       ``cluster_ws_live_bulk`` honour the full three-way return.
+
+    See the class-level tenancy contract on
+    :class:`~turnstone.core.storage._protocol.StorageBackend` for the
+    storage-side requirement.
+    """
+    if _is_admin(request):
+        return None
+    if "service" in _auth_scopes(request):
+        return None
+    uid = _auth_user_id(request)
+    if not uid:
+        return DENY_EMPTY_SUB
+    return uid
 
 
 async def coordinator_create(request: Request) -> JSONResponse:
@@ -2845,12 +3029,13 @@ async def coordinator_children(request: Request) -> JSONResponse:
 
     # Tenant filter: push the caller's user_id into SQL so forged /
     # migration-era rows with the same parent_ws_id but a different
-    # owner can't leak through.  Admins bypass the filter — they're
-    # expected to see the full subtree.  _resolve_coordinator_or_404
-    # already validated that non-admin callers own the coord itself,
-    # so the caller's uid is the correct scope for children by the
-    # "children share the coord's owner by construction" invariant.
-    filter_user_id = None if _is_admin(request) else (user_id or None)
+    # owner can't leak through.  Admins / service scope bypass the
+    # filter (they're expected to see the full subtree).  The prior
+    # _resolve_coordinator_or_404 already rejected non-admin callers
+    # with a blank sub, so DENY here is defense-in-depth.
+    filter_user_id = _effective_user_filter(request)
+    if filter_user_id is DENY_EMPTY_SUB:
+        return JSONResponse({"items": [], "truncated": False})
     try:
         raw = storage.list_workstreams(
             limit=_CHILDREN_PAGE_LIMIT + 1,
@@ -2889,6 +3074,36 @@ async def coordinator_children(request: Request) -> JSONResponse:
         if len(items) >= _CHILDREN_PAGE_LIMIT:
             break
     return JSONResponse({"items": items, "truncated": truncated})
+
+
+def _coordinator_metrics_payload(
+    *,
+    ws_id: str,
+    spawns_total: int = 0,
+    spawns_last_hour: int = 0,
+    child_state_counts: dict[str, int] | None = None,
+    judge_fallback_rate: float = 0.0,
+    intent_verdicts_sample: int = 0,
+) -> dict[str, Any]:
+    """Build the ``coordinator_metrics`` response dict.
+
+    One source of truth for the response shape — the DENY short-circuit
+    and the happy path both call this so a new field added tomorrow
+    can't appear in one branch and not the other.  Wait-tool metrics
+    are always zero placeholders; the harness doesn't persist them
+    yet but scrapers key on the keys being present.
+    """
+    return {
+        "ws_id": ws_id,
+        "spawns_total": spawns_total,
+        "spawns_last_hour": spawns_last_hour,
+        "child_state_counts": child_state_counts or {},
+        "judge_fallback_rate": judge_fallback_rate,
+        "intent_verdicts_sample": intent_verdicts_sample,
+        "wait_completions": 0,
+        "wait_timeouts": 0,
+        "wait_avg_elapsed": 0.0,
+    }
 
 
 async def coordinator_metrics(request: Request) -> JSONResponse:
@@ -2946,16 +3161,20 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     # (#perf-1).  Two cheap queries instead of a ``list_workstreams``
     # scan up to 10k rows.
     #
-    # Tenant filter on the aggregates — matches the coordinator_children
-    # pattern where user_id is pushed into SQL so a non-admin caller
-    # can't observe cross-tenant counts via forged / migration-era
-    # rows sharing parent_ws_id.  Admin callers see the raw aggregate
-    # (no filter).  The 404-mask above already rejected foreign
-    # coord_ws_id, so the filter here is defense-in-depth against
-    # child rows with drifted user_id.
+    # Tenant filter on the aggregates — push user_id into SQL so a
+    # non-admin caller can't observe cross-tenant counts via forged /
+    # migration-era rows sharing parent_ws_id.  The 404-mask above
+    # already rejected foreign coord_ws_id, so the filter here is
+    # defense-in-depth against child rows with drifted user_id.
     from datetime import UTC, datetime
 
-    filter_user_id: str | None = None if _is_admin(request) else (user_id or "")
+    filter_user_id = _effective_user_filter(request)
+    if filter_user_id is DENY_EMPTY_SUB:
+        # Prior _resolve_coordinator_or_404 already rejected this
+        # shape, but belt-and-braces: never fall through to storage
+        # with ``user_id=""`` (matches legacy orphans) or ``None``
+        # (service escape).
+        return JSONResponse(_coordinator_metrics_payload(ws_id=ws_id))
     now_epoch = time.time()
     hour_ago_iso = datetime.fromtimestamp(now_epoch - 3600, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S")
     try:
@@ -3008,19 +3227,285 @@ async def coordinator_metrics(request: Request) -> JSONResponse:
     judge_fallback_rate = round(fallback_count / total_verdicts, 3) if total_verdicts > 0 else 0.0
 
     return JSONResponse(
+        _coordinator_metrics_payload(
+            ws_id=ws_id,
+            spawns_total=spawns_total,
+            spawns_last_hour=spawns_last_hour,
+            child_state_counts=state_counts,
+            judge_fallback_rate=judge_fallback_rate,
+            intent_verdicts_sample=total_verdicts,
+        )
+    )
+
+
+_RESTRICT_MAX_TOOLS = 256
+_RESTRICT_MAX_TOOL_NAME_LEN = 128
+# Bounded concurrency on the cascade dispatch.  Upstream coord_client
+# cancels have a 30s timeout; a 100-child cascade at this cap finishes
+# in ~200s worst case, comfortably inside typical 300s proxy limits.
+_STOP_CASCADE_MAX_CONCURRENCY = 16
+
+
+async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
+    """Parse the request body and require a JSON object.
+
+    ``read_json_or_400`` only validates that the body parses as JSON,
+    not that it's an object.  A ``null``/list/scalar body otherwise
+    reaches ``body.get(...)`` and raises ``AttributeError`` → 500.
+    """
+    body = await read_json_or_400(request)
+    if isinstance(body, JSONResponse):
+        return body
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+    return body
+
+
+async def _resolve_coord_session(
+    request: Request,
+    *,
+    allow_service_bypass: bool = True,
+) -> tuple[ChatSession, StorageBackend, str, str] | JSONResponse:
+    """Return ``(session, storage, user_id, ws_id)`` or a gate-failure response.
+
+    Destructive / capability-escalating handlers pass
+    ``allow_service_bypass=False`` so a service token whose ``user_id``
+    matches the coord owner still needs an explicit ``admin.coordinator``
+    grant — matching the treatment ``/trust`` gives its perm gate.
+    """
+    err = _require_admin_coordinator(request, allow_service_bypass=allow_service_bypass)
+    if err is not None:
+        return err
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503
+    storage, err503s = require_storage_or_503(request)
+    if err503s is not None:
+        return err503s
+    ws_id = request.path_params.get("ws_id", "")
+    if not _VALID_WS_ID_RE.match(ws_id):
+        return JSONResponse({"error": "invalid ws_id"}, status_code=400)
+    user_id = _auth_user_id(request)
+    ws, err404 = _resolve_coordinator_or_404(request, coord_mgr, storage, ws_id, user_id)
+    if err404 is not None:
+        return err404
+    if ws is None or ws.session is None:
+        return JSONResponse({"error": "coordinator not found"}, status_code=404)
+    return ws.session, storage, user_id, ws_id
+
+
+async def _emit_coord_audit(
+    storage: StorageBackend,
+    user_id: str,
+    action: str,
+    ws_id: str,
+    detail: dict[str, Any],
+    client_host: str,
+) -> None:
+    """Record a coordinator governance audit event off the event loop.
+
+    Uses the console's dedicated audit executor when available so
+    cancel-cascade bursts can't starve audit writes (and vice versa).
+    Falls back to the default executor for test harnesses that don't
+    wire one.
+    """
+    audit_exec = _audit_executor()
+    loop = asyncio.get_running_loop()
+    try:
+        if audit_exec is not None:
+            await loop.run_in_executor(
+                audit_exec,
+                record_audit,
+                storage,
+                user_id,
+                action,
+                "coordinator",
+                ws_id,
+                detail,
+                client_host,
+            )
+        else:
+            await asyncio.to_thread(
+                record_audit,
+                storage,
+                user_id,
+                action,
+                "coordinator",
+                ws_id,
+                detail,
+                client_host,
+            )
+    except Exception:
+        log.debug("coord.audit.dispatch_failed", exc_info=True)
+
+
+_audit_executor_ref: ThreadPoolExecutor | None = None
+
+
+def _audit_executor() -> ThreadPoolExecutor | None:
+    """Return the shared audit-writes executor, if the lifespan built one."""
+    return _audit_executor_ref
+
+
+def _set_audit_executor(executor: ThreadPoolExecutor | None) -> None:
+    """Install or clear the process-wide audit executor (lifespan-owned)."""
+    global _audit_executor_ref
+    _audit_executor_ref = executor
+
+
+async def coordinator_trust(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/trust — toggle trusted-session mode."""
+    trust_err = require_permission(request, "coordinator.trust.send", allow_service_bypass=False)
+    if trust_err is not None:
+        return trust_err
+    resolved = await _resolve_coord_session(request)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    session, storage, user_id, ws_id = resolved
+
+    body = await _require_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw_send = body.get("send")
+    if not isinstance(raw_send, bool):
+        return JSONResponse({"error": "body must carry {'send': bool}"}, status_code=400)
+
+    before = session.get_trust_send()
+    session.set_trust_send(raw_send)
+    await _emit_coord_audit(
+        storage,
+        user_id,
+        "coordinator.trust.toggled",
+        ws_id,
+        {"src": "coordinator", "send_before": before, "send_after": raw_send},
+        request.client.host if request.client else "",
+    )
+    return JSONResponse({"status": "ok", "trust_send": raw_send})
+
+
+async def coordinator_restrict(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/restrict — revoke tool access mid-session."""
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    session, storage, user_id, ws_id = resolved
+
+    body = await _require_json_object(request)
+    if isinstance(body, JSONResponse):
+        return body
+    raw_revoke = body.get("revoke")
+    if not isinstance(raw_revoke, list) or not all(isinstance(t, str) and t for t in raw_revoke):
+        return JSONResponse(
+            {"error": "body must carry {'revoke': [<tool_name>, ...]}"},
+            status_code=400,
+        )
+    if len(raw_revoke) > _RESTRICT_MAX_TOOLS:
+        return JSONResponse(
+            {"error": f"revoke list exceeds {_RESTRICT_MAX_TOOLS} entries"},
+            status_code=400,
+        )
+    if any(len(t) > _RESTRICT_MAX_TOOL_NAME_LEN for t in raw_revoke):
+        return JSONResponse(
+            {"error": f"tool names must be <= {_RESTRICT_MAX_TOOL_NAME_LEN} chars"},
+            status_code=400,
+        )
+
+    additions = frozenset(raw_revoke)
+    after = session.revoke_tools(additions)
+    await _emit_coord_audit(
+        storage,
+        user_id,
+        "coordinator.restricted",
+        ws_id,
         {
-            "ws_id": ws_id,
-            "spawns_total": spawns_total,
-            "spawns_last_hour": spawns_last_hour,
-            "child_state_counts": state_counts,
-            "judge_fallback_rate": judge_fallback_rate,
-            "intent_verdicts_sample": total_verdicts,
-            # Wait-tool metrics require explicit persistence the harness
-            # doesn't have yet — exposed as zero placeholders so
-            # downstream scrapers can key on the shape without failing.
-            "wait_completions": 0,
-            "wait_timeouts": 0,
-            "wait_avg_elapsed": 0.0,
+            "src": "coordinator",
+            "revoked": sorted(additions),
+            "revoked_total": sorted(after),
+        },
+        request.client.host if request.client else "",
+    )
+    return JSONResponse({"status": "ok", "revoked_tools": sorted(after)})
+
+
+async def coordinator_stop_cascade(request: Request) -> JSONResponse:
+    """POST /v1/api/coordinator/{ws_id}/stop_cascade — cancel the subtree."""
+    resolved = await _resolve_coord_session(request, allow_service_bypass=False)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    session, storage, user_id, ws_id = resolved
+
+    coord_mgr, err503 = _require_coord_mgr(request)
+    if err503 is not None:
+        return err503  # pragma: no cover — _resolve_coord_session already gated this
+
+    child_ids = list(coord_mgr.children_snapshot(ws_id))
+    coord_mgr.cancel(ws_id)
+
+    coord_client = getattr(session, "_coord_client", None)
+    cancelled: list[str] = []
+    failed: list[str] = []
+    skipped: list[str] = []
+
+    if not child_ids:
+        pass
+    elif coord_client is None:
+        failed = list(child_ids)
+    else:
+        sem = asyncio.Semaphore(_STOP_CASCADE_MAX_CONCURRENCY)
+
+        async def _cancel_one(cid: str) -> tuple[str, str]:
+            async with sem:
+                try:
+                    result = await asyncio.to_thread(coord_client.cancel, cid)
+                    if not isinstance(result, dict):
+                        return cid, "failed"
+                    if not result.get("error"):
+                        return cid, "cancelled"
+                    # A subtree-miss (stale _children entry after the
+                    # child's storage row was deleted) and an upstream
+                    # 404 both mean "already gone".  Route to skipped so
+                    # operators can distinguish from dispatch failures.
+                    if result.get("status") == 404:
+                        return cid, "skipped"
+                    return cid, "failed"
+                except Exception:
+                    log.debug(
+                        "coordinator_stop_cascade.child_failed ws=%s",
+                        cid[:8],
+                        exc_info=True,
+                    )
+                    return cid, "failed"
+
+        outcomes = await asyncio.gather(
+            *(_cancel_one(cid) for cid in child_ids), return_exceptions=False
+        )
+        for cid, bucket in outcomes:
+            if bucket == "cancelled":
+                cancelled.append(cid)
+            elif bucket == "skipped":
+                skipped.append(cid)
+            else:
+                failed.append(cid)
+
+    await _emit_coord_audit(
+        storage,
+        user_id,
+        "coordinator.stopped_cascade",
+        ws_id,
+        {
+            "src": "coordinator",
+            "cancelled": cancelled,
+            "failed": failed,
+            "skipped": skipped,
+        },
+        request.client.host if request.client else "",
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "cancelled": cancelled,
+            "failed": failed,
+            "skipped": skipped,
         }
     )
 
@@ -3063,6 +3548,152 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+
+
+_PROBE_ALLOWED_SCHEMES: frozenset[str] = frozenset({"http", "https"})
+_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+def _probe_candidate_url(services: list[dict[str, Any]] | None) -> tuple[str, str]:
+    """Pick the first service-registry entry usable as a scope-probe target.
+
+    Returns ``(url, service_id)`` or ``("", "")`` when nothing is usable.
+    The URL must carry an ``http``/``https`` scheme and a non-link-local
+    host; the service-registry integrity is the primary defense, but
+    the scheme + host filter here is defense-in-depth so a poisoned
+    entry can't redirect the probe to a cloud metadata endpoint.
+    """
+    for svc in services or []:
+        raw_url = (svc.get("url") or "").rstrip("/")
+        nid = svc.get("service_id") or ""
+        if not raw_url or not nid:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw_url)
+        except ValueError:
+            continue
+        if parsed.scheme not in _PROBE_ALLOWED_SCHEMES:
+            continue
+        host = (parsed.hostname or "").lower()
+        # 169.254.0.0/16 is the AWS / GCP instance metadata range;
+        # an http target there would turn a compromised registry into
+        # an SSRF to IMDS.  Loopback is retained for single-box dev.
+        if host.startswith("169.254."):
+            continue
+        return raw_url, nid
+    return "", ""
+
+
+async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
+    """Probe one upstream node to confirm the collector token's scopes.
+
+    The console's :class:`ClusterCollector` authenticates to upstream
+    nodes' ``/v1/api/events/global`` SSE endpoint, which is hard-gated
+    on the ``service`` scope.  A collector token missing that scope
+    silently 403s on every SSE connect and the cluster dashboard
+    renders empty; this probe surfaces the drift at boot.
+
+    Probes with ``expected_node_id=_scope-probe_`` so the upstream
+    returns 409 (identity mismatch) immediately — a 409 means the
+    scope gate was passed.  Any other 4xx = configuration drift:
+    ``app.state.collector_scope_error`` is set non-empty, ``log.error``
+    fires, and the cluster-snapshot endpoints return 503 with a
+    remediation hint so the operator sees the problem in the first
+    failing UI load instead of days later.
+
+    Transient failures (network errors, 5xx, no nodes discovered yet)
+    are logged at info/warning and do NOT refuse to serve — they
+    can't be distinguished from legitimate "cluster is coming up"
+    states.
+    """
+    storage = getattr(app.state, "auth_storage", None)
+    token_mgr = getattr(app.state, "collector_token_mgr", None)
+    if storage is None or token_mgr is None:
+        log.info("collector_scope_probe.skipped reason=storage_or_token_missing")
+        return
+    # list_services is blocking DB I/O — offload so a slow / Postgres
+    # backend doesn't stall the event loop during the probe window.
+    try:
+        services = await asyncio.to_thread(storage.list_services, "server", max_age_seconds=120)
+    except Exception:
+        # Storage-backend drift is itself a class of configuration
+        # error worth surfacing — the original silent-skip here hid
+        # exactly the kind of failure the probe was added to catch.
+        log.warning(
+            "collector_scope_probe.service_registry_unavailable",
+            exc_info=True,
+        )
+        return
+    probe_url, probe_node = _probe_candidate_url(services)
+    if not probe_url:
+        # Distinguish "registry empty" (normal pre-discovery) from
+        # "registry populated but every entry malformed" (operator-
+        # actionable drift) so the two aren't both logged as INFO
+        # silent-skips.
+        if services:
+            log.warning(
+                "collector_scope_probe.registry_malformed count=%d",
+                len(services),
+            )
+        else:
+            log.info("collector_scope_probe.skipped reason=no_nodes_registered")
+        return
+    headers = {"Authorization": f"Bearer {token_mgr.token}"}
+    probe_target = f"{probe_url}/v1/api/events/global"
+    try:
+        resp = await client.get(
+            probe_target,
+            params={"expected_node_id": "_scope-probe_"},
+            headers=headers,
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except (httpx.HTTPError, TimeoutError) as exc:
+        log.warning(
+            "collector_scope_probe.transient_error node=%s url=%s — %s",
+            probe_node,
+            probe_target,
+            exc,
+        )
+        return
+    status = resp.status_code
+    if status == 409:
+        # Identity mismatch is expected — it means the scope gate was
+        # accepted and the handler got as far as the node_id check.
+        log.info("collector_scope_probe.ok node=%s url=%s", probe_node, probe_target)
+        return
+    body_preview = _bounded_body_preview(resp.text)
+    if 400 <= status < 500:
+        # 403 = missing ``service`` scope on the collector token; 401 =
+        # JWT rejected outright (secret mismatch / audience drift).
+        # Either way refuse to serve the dashboard until the operator
+        # fixes it.  Upstream body is attacker-controllable so we
+        # delimit it explicitly in the 503 error text; the preview
+        # already passed through the control-char scrub in
+        # _bounded_body_preview.
+        app.state.collector_scope_error = (
+            f"collector token rejected by {probe_node} ({probe_target}): "
+            f"HTTP {status} — upstream_body=<<<{body_preview}>>>. "
+            "The collector's ServiceTokenManager scopes must include "
+            "'service' and the JWT audience must match what upstream "
+            "enforces."
+        )
+        log.error(
+            "collector_scope_probe.drift node=%s url=%s status=%d — %s",
+            probe_node,
+            probe_target,
+            status,
+            body_preview,
+        )
+        return
+    # 5xx / unexpected: likely a transient upstream problem rather
+    # than our configuration — warn but don't refuse to serve.
+    log.warning(
+        "collector_scope_probe.unexpected_status node=%s url=%s status=%d — %s",
+        probe_node,
+        probe_target,
+        status,
+        body_preview,
+    )
 
 
 @asynccontextmanager
@@ -3124,12 +3755,26 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # cluster_ws_detail fan-in so N concurrent child-inspect calls to
     # the same node collapse to one upstream GET per TTL window.
     app.state.dashboard_cache = _NodeDashboardCache()
+    # Dedicated small executor for governance audit writes.  Without
+    # this, audit dispatches share the default thread pool with
+    # ``coord_client.cancel`` calls from ``stop_cascade`` and any
+    # other ``asyncio.to_thread`` caller — a burst on one path can
+    # starve the other.  4 workers is ample headroom for
+    # admin-driven audit traffic.
+    audit_exec = ThreadPoolExecutor(max_workers=4, thread_name_prefix="coord-audit")
+    app.state.audit_executor = audit_exec
+    _set_audit_executor(audit_exec)
     # Populate hash-ring routing cache if a router is configured
     _router: ConsoleRouter | None = getattr(app.state, "router", None)
     if _router is not None:
         _router.refresh_cache()
         if not _router.is_ready():
             log.warning("Router cache is empty after refresh — no nodes assigned")
+    # Prove the collector's service-auth token is accepted by an
+    # upstream node before the lifespan yields — a scope mismatch
+    # otherwise only surfaces once an operator notices missing
+    # dashboard rows.  See :func:`_verify_collector_service_scope`.
+    await _verify_collector_service_scope(app, app.state.proxy_client)
     # Start scheduler if configured
     scheduler = getattr(app.state, "scheduler", None)
     if scheduler is not None:
@@ -3349,6 +3994,10 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
     app.state.collector.stop()
+    audit_exec_shutdown = getattr(app.state, "audit_executor", None)
+    if audit_exec_shutdown is not None:
+        _set_audit_executor(None)
+        audit_exec_shutdown.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
@@ -4989,7 +5638,8 @@ def _skill_to_response(r: dict[str, Any], resource_count: int = 0) -> dict[str, 
         "allowed_tools": r.get("allowed_tools", "[]"),
         "license": r.get("license", ""),
         "compatibility": r.get("compatibility", ""),
-        "scan_status": r.get("scan_status", ""),
+        "kind": r.get("kind", "any"),
+        "risk_level": r.get("risk_level", ""),
         "scan_report": r.get("scan_report", "{}"),
         "scan_version": r.get("scan_version", ""),
         "resource_count": resource_count,
@@ -5060,10 +5710,20 @@ async def admin_create_skill(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
 
-    name = str(body.get("name", "")).strip()[:256]
-    content = str(body.get("content", "")).strip()[:32768]
-    category = str(body.get("category", "general")).strip()[:64]
-    description = str(body.get("description", "")).strip()[:1024]
+    # Treat an explicit JSON null the same as a missing key — ``.get(k, "")``
+    # only falls back when the key is absent, so ``str(None)`` would otherwise
+    # yield the literal string "None" and slip past the non-empty guards.
+    name = str(body.get("name") or "").strip()[:256]
+    content = str(body.get("content") or "").strip()[:32768]
+    category = str(body.get("category") or "general").strip()[:64]
+    description = str(body.get("description") or "").strip()[:1024]
+    try:
+        kind = SkillKind(str(body.get("kind") or "any").strip().lower()).value
+    except ValueError:
+        return JSONResponse(
+            {"error": "kind must be one of: " + ", ".join(sorted(k.value for k in SkillKind))},
+            status_code=400,
+        )
     variables = str(body.get("variables", "[]")).strip()
     try:
         _json.loads(variables)
@@ -5109,6 +5769,8 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         return JSONResponse({"error": "name is required"}, status_code=400)
     if not content:
         return JSONResponse({"error": "content is required"}, status_code=400)
+    if not description:
+        return JSONResponse({"error": "description is required"}, status_code=400)
     if storage.get_prompt_template_by_name(name):
         return JSONResponse({"error": "Skill name already exists"}, status_code=409)
 
@@ -5133,6 +5795,7 @@ async def admin_create_skill(request: Request) -> JSONResponse:
         activation=activation,
         token_estimate=token_estimate,
         priority=priority,
+        kind=kind,
         **session_fields,
     )
 
@@ -5193,7 +5856,22 @@ async def admin_update_skill(request: Request) -> JSONResponse:
     if "category" in body:
         updates["category"] = str(body["category"]).strip()[:64]
     if "description" in body:
-        updates["description"] = str(body["description"]).strip()[:1024]
+        # Match create: an operator can rewrite the description but
+        # cannot blank it out — and ``null`` is treated the same as
+        # blank so it can't coerce to the literal string "None".
+        raw_description = body["description"]
+        new_description = str(raw_description or "").strip()[:1024]
+        if not new_description:
+            return JSONResponse({"error": "description must not be empty"}, status_code=400)
+        updates["description"] = new_description
+    if "kind" in body:
+        try:
+            updates["kind"] = SkillKind(str(body["kind"] or "").strip().lower()).value
+        except ValueError:
+            return JSONResponse(
+                {"error": "kind must be one of: " + ", ".join(sorted(k.value for k in SkillKind))},
+                status_code=400,
+            )
     if "variables" in body:
         var_str = str(body["variables"]).strip()
         try:
@@ -5564,16 +6242,16 @@ async def admin_rescan_skill(request: Request) -> JSONResponse:
 
     content = skill.get("content", "")
     allowed_tools = skill.get("allowed_tools", "[]")
-    scan_status, scan_report, scan_version = scan_skill_content(content, allowed_tools)
+    risk_level, scan_report, scan_version = scan_skill_content(content, allowed_tools)
     storage.update_prompt_template(
         skill_id,
-        scan_status=scan_status,
+        risk_level=risk_level,
         scan_report=scan_report,
         scan_version=scan_version,
     )
     return JSONResponse(
         {
-            "scan_status": scan_status,
+            "risk_level": risk_level,
             "scan_report": scan_report,
             "scan_version": scan_version,
         }
@@ -5823,7 +6501,7 @@ async def admin_skill_discover(request: Request) -> JSONResponse:
     installed_map: dict[str, dict[str, str]] = {}
     for row in storage.list_installed_skill_urls():
         installed_map[row["source_url"]] = {
-            "scan_status": row.get("scan_status", ""),
+            "risk_level": row.get("risk_level", ""),
             "template_id": row.get("template_id", ""),
         }
 
@@ -5843,7 +6521,7 @@ async def admin_skill_discover(request: Request) -> JSONResponse:
         }
         if is_installed and listing.source_url:
             info = installed_map[listing.source_url]
-            entry["scan_status"] = info["scan_status"]
+            entry["risk_level"] = info["risk_level"]
             entry["template_id"] = info["template_id"]
         skills_out.append(entry)
 
@@ -5932,6 +6610,12 @@ async def admin_skill_install(request: Request) -> JSONResponse:
         content = parsed.content[:32768]
         token_estimate = len(content) // 4 if content else 0
 
+        # Installer mirrors migration 043's placeholder — a SKILL.md
+        # with no description otherwise fails the new non-empty
+        # invariant, blocking installs from upstream catalogs the
+        # operator doesn't control.
+        skill_description = parsed.description.strip() or f"Skill: {parsed.name}"
+
         try:
             storage.create_prompt_template(
                 template_id=skill_id,
@@ -5944,7 +6628,7 @@ async def admin_skill_install(request: Request) -> JSONResponse:
                 created_by=audit_uid,
                 origin="source",
                 readonly=True,
-                description=parsed.description,
+                description=skill_description,
                 tags=tags_str,
                 source_url=pkg_source_url,
                 version=parsed.version,
@@ -9518,6 +10202,21 @@ def create_app(
                         methods=["GET"],
                     ),
                     Route(
+                        "/api/coordinator/{ws_id}/trust",
+                        coordinator_trust,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/restrict",
+                        coordinator_restrict,
+                        methods=["POST"],
+                    ),
+                    Route(
+                        "/api/coordinator/{ws_id}/stop_cascade",
+                        coordinator_stop_cascade,
+                        methods=["POST"],
+                    ),
+                    Route(
                         "/api/coordinator/{ws_id}",
                         coordinator_detail,
                         methods=["GET"],
@@ -9921,6 +10620,13 @@ def create_app(
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage
     app.state.proxy_token_mgr = proxy_token_mgr
+    # Used by the boot scope probe to mint a token with the same
+    # scopes the collector's SSE path uses.
+    app.state.collector_token_mgr = getattr(collector, "_token_manager", None)
+    # Set non-empty by the boot probe when upstream rejects the
+    # collector token; cluster-dashboard endpoints then 503 with the
+    # remediation hint until the operator fixes the scopes.
+    app.state.collector_scope_error = ""
     app.state.console_url = console_url
     app.state.tls_manager = tls_manager
     app.state.router = router

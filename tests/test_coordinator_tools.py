@@ -643,7 +643,7 @@ def test_list_skills_prepare_is_auto_approved(coord_session):
     assert item["needs_approval"] is False
     assert item["category"] is None
     assert item["tag"] is None
-    assert item["scan_status"] is None
+    assert item["risk_level"] is None
     assert item["enabled_only"] is False
     assert item["limit"] == 100
 
@@ -653,12 +653,12 @@ def test_list_skills_prepare_accepts_filters(coord_session):
     item = sess._prepare_tool(
         _tc(
             "list_skills",
-            {"category": "ops", "tag": "gpu", "scan_status": "clean", "enabled_only": True},
+            {"category": "ops", "tag": "gpu", "risk_level": "clean", "enabled_only": True},
         )
     )
     assert item["category"] == "ops"
     assert item["tag"] == "gpu"
-    assert item["scan_status"] == "clean"
+    assert item["risk_level"] == "clean"
     assert item["enabled_only"] is True
 
 
@@ -670,13 +670,13 @@ def test_list_skills_prepare_tolerates_non_string_filters(coord_session):
     item = sess._prepare_tool(
         _tc(
             "list_skills",
-            {"category": 42, "tag": ["not", "a", "string"], "scan_status": {"bad": 1}},
+            {"category": 42, "tag": ["not", "a", "string"], "risk_level": {"bad": 1}},
         )
     )
     assert "error" not in item
     assert item["category"] is None
     assert item["tag"] is None
-    assert item["scan_status"] is None
+    assert item["risk_level"] is None
 
 
 def test_list_skills_prepare_parses_enabled_only_string_forms(coord_session):
@@ -714,7 +714,7 @@ def test_list_skills_exec_dispatches_to_client(coord_session):
     coord.list_skills.assert_called_once_with(
         category="ops",
         tag="gpu",
-        scan_status=None,
+        risk_level=None,
         enabled_only=False,
         limit=100,
     )

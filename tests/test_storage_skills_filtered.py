@@ -18,9 +18,10 @@ def _create_skill(
     name: str,
     category: str = "general",
     tags: list[str] | None = None,
-    scan_status: str = "",
+    risk_level: str = "",
     enabled: bool = True,
     priority: int = 0,
+    kind: str = "any",
 ) -> None:
     storage.create_prompt_template(
         template_id=template_id,
@@ -34,9 +35,10 @@ def _create_skill(
         tags=json.dumps(tags or []),
         priority=priority,
         enabled=enabled,
+        kind=kind,
     )
-    if scan_status:
-        # scan_status is set by the scanner pipeline, not create_prompt_template;
+    if risk_level:
+        # risk_level is set by the scanner pipeline, not create_prompt_template;
         # patch it directly so tests can fix the value.
         with storage._conn() as conn:
             import sqlalchemy as sa
@@ -46,7 +48,7 @@ def _create_skill(
             conn.execute(
                 sa.update(prompt_templates)
                 .where(prompt_templates.c.template_id == template_id)
-                .values(scan_status=scan_status)
+                .values(risk_level=risk_level)
             )
             conn.commit()
 
@@ -136,11 +138,11 @@ class TestListSkillsFiltered:
         rows = storage.list_skills_filtered(tag="\u6f22\u5b57")
         assert {r["name"] for r in rows} == {"cjk"}
 
-    def test_scan_status_filter(self, storage):
-        _create_skill(storage, template_id="s1", name="a", scan_status="clean")
-        _create_skill(storage, template_id="s2", name="b", scan_status="flagged")
+    def test_risk_level_filter(self, storage):
+        _create_skill(storage, template_id="s1", name="a", risk_level="clean")
+        _create_skill(storage, template_id="s2", name="b", risk_level="flagged")
         _create_skill(storage, template_id="s3", name="c")
-        rows = storage.list_skills_filtered(scan_status="flagged")
+        rows = storage.list_skills_filtered(risk_level="flagged")
         assert {r["name"] for r in rows} == {"b"}
 
     def test_enabled_only_filter(self, storage):
@@ -166,3 +168,34 @@ class TestListSkillsFiltered:
         _create_skill(storage, template_id="s1", name="a", category="ops")
         rows = storage.list_skills_filtered(category="nonexistent")
         assert rows == []
+
+    def test_kinds_filter_narrows_to_listed_buckets(self, storage):
+        """The ``kinds`` filter narrows the result to rows whose ``kind``
+        column is in the supplied list — used by the coordinator client
+        to hide interactive-only skills and by any future interactive
+        lister to hide coordinator-only skills."""
+        _create_skill(storage, template_id="s1", name="interactive-only", kind="interactive")
+        _create_skill(storage, template_id="s2", name="coord-only", kind="coordinator")
+        _create_skill(storage, template_id="s3", name="universal", kind="any")
+
+        coord_view = storage.list_skills_filtered(kinds=["coordinator", "any"])
+        assert {r["name"] for r in coord_view} == {"coord-only", "universal"}
+
+        interactive_view = storage.list_skills_filtered(kinds=["interactive", "any"])
+        assert {r["name"] for r in interactive_view} == {"interactive-only", "universal"}
+
+    def test_kinds_none_returns_all_kinds(self, storage):
+        """``kinds=None`` (the default) applies no kind filter — admin
+        surfaces that want the full catalog leave it unset."""
+        _create_skill(storage, template_id="s1", name="interactive-only", kind="interactive")
+        _create_skill(storage, template_id="s2", name="coord-only", kind="coordinator")
+        _create_skill(storage, template_id="s3", name="universal", kind="any")
+        assert len(storage.list_skills_filtered()) == 3
+
+    def test_kinds_empty_list_behaves_like_none(self, storage):
+        """An empty ``kinds`` list is treated the same as None (no
+        filter).  Prevents an accidental empty-result from a caller
+        that defensively materialises a set / list."""
+        _create_skill(storage, template_id="s1", name="interactive", kind="interactive")
+        _create_skill(storage, template_id="s2", name="coord", kind="coordinator")
+        assert len(storage.list_skills_filtered(kinds=[])) == 2

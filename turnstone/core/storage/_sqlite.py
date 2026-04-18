@@ -2402,6 +2402,7 @@ class SQLiteBackend:
         skill_license: str = "",
         compatibility: str = "",
         priority: int = 0,
+        kind: str = "any",
     ) -> None:
         # Sync is_default from activation when activation is explicitly set
         if activation == "default":
@@ -2409,7 +2410,7 @@ class SQLiteBackend:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Scan skill content for risk signals
-        scan_status, scan_report, scan_version = _scan_skill_content(content, allowed_tools)
+        risk_level, scan_report, scan_version = _scan_skill_content(content, allowed_tools)
 
         with self._conn() as conn:
             conn.execute(
@@ -2436,7 +2437,8 @@ class SQLiteBackend:
                     "allowed_tools": allowed_tools,
                     "license": skill_license,
                     "compatibility": compatibility,
-                    "scan_status": scan_status,
+                    "kind": kind,
+                    "risk_level": risk_level,
                     "scan_report": scan_report,
                     "scan_version": scan_version,
                     "model": model,
@@ -2553,10 +2555,10 @@ class SQLiteBackend:
                     if allowed_tools is None:
                         allowed_tools = existing.get("allowed_tools", "[]")
             if content is not None:
-                scan_status, scan_report, scan_version = _scan_skill_content(
+                risk_level, scan_report, scan_version = _scan_skill_content(
                     content, allowed_tools or "[]"
                 )
-                fields["scan_status"] = scan_status
+                fields["risk_level"] = risk_level
                 fields["scan_report"] = scan_report
                 fields["scan_version"] = scan_version
         with self._conn() as conn:
@@ -2603,7 +2605,8 @@ class SQLiteBackend:
         *,
         category: str | None = None,
         tag: str | None = None,
-        scan_status: str | None = None,
+        risk_level: str | None = None,
+        kinds: list[str] | None = None,
         enabled_only: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -2613,8 +2616,10 @@ class SQLiteBackend:
             )
             if category:
                 q = q.where(prompt_templates.c.category == category)
-            if scan_status:
-                q = q.where(prompt_templates.c.scan_status == scan_status)
+            if risk_level:
+                q = q.where(prompt_templates.c.risk_level == risk_level)
+            if kinds:
+                q = q.where(prompt_templates.c.kind.in_(kinds))
             if enabled_only:
                 q = q.where(prompt_templates.c.enabled == 1)
             if tag:
@@ -2660,14 +2665,14 @@ class SQLiteBackend:
                 sa.select(
                     prompt_templates.c.source_url,
                     prompt_templates.c.template_id,
-                    prompt_templates.c.scan_status,
+                    prompt_templates.c.risk_level,
                 ).where(prompt_templates.c.source_url != "")
             ).fetchall()
             return [
                 {
                     "source_url": r[0],
                     "template_id": r[1],
-                    "scan_status": r[2] or "",
+                    "risk_level": r[2] or "",
                 }
                 for r in rows
             ]

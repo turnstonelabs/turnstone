@@ -121,18 +121,31 @@ def _permissions_to_scopes(permissions: set[str]) -> frozenset[str]:
     return frozenset(scopes)
 
 
-def require_permission(request: Request, permission: str) -> JSONResponse | None:
+def require_permission(
+    request: Request,
+    permission: str,
+    *,
+    allow_service_bypass: bool = True,
+) -> JSONResponse | None:
     """Return a 403 JSONResponse if the user lacks *permission*, else None.
 
     Call from admin handlers after the middleware scope check passes.
-    Service tokens (scope ``service``) bypass permission checks.
+    By default service tokens (scope ``service``) bypass the check so
+    internal cluster callers don't need per-permission grants.
+
+    Set ``allow_service_bypass=False`` on capability-escalating permissions
+    (e.g. ``coordinator.trust.send``) where a service token — even one
+    whose ``user_id`` happens to match a coord owner — should still
+    need an explicit permission grant.  The service scope is the
+    cluster-side trust boundary; capability-escalation gates have to
+    be held explicitly regardless of that trust.
     """
     from starlette.responses import JSONResponse
 
     auth_result: AuthResult | None = getattr(getattr(request, "state", None), "auth_result", None)
     if auth_result is None:
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    if auth_result.has_scope("service"):
+    if allow_service_bypass and auth_result.has_scope("service"):
         return None
     if auth_result.has_permission(permission):
         return None
@@ -225,6 +238,33 @@ class AuthResult:
     def has_permission(self, permission: str) -> bool:
         """Return True if this result includes *permission*."""
         return permission in self.permissions
+
+
+# ---------------------------------------------------------------------------
+# Tenant-filter sentinel
+# ---------------------------------------------------------------------------
+
+
+class _DenyFilter:
+    """Sentinel: caller must short-circuit with an empty-shape response.
+
+    Returned from the ``_effective_user_filter`` helpers on both the
+    console and node sides when a non-admin, non-service caller
+    carries a blank ``sub`` claim.  Callers compare with ``is``; a
+    fall-through to storage with ``user_id=None`` would be a service
+    escape, and ``user_id=""`` would match legacy orphan rows.  The
+    sentinel lives on :mod:`turnstone.core.auth` so both modules share
+    one identity — importing from a different module would silently
+    fail the ``is`` check.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover — debug only
+        return "<DENY_EMPTY_SUB>"
+
+
+DENY_EMPTY_SUB: _DenyFilter = _DenyFilter()
 
 
 # ---------------------------------------------------------------------------

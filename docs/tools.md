@@ -546,11 +546,11 @@ pre-configure skills at workstream creation.
 - `load` — Activate a skill by name. Calls `set_skill()` which handles content
   rendering with `{{model}}`/`{{ws_id}}`/`{{node_id}}` variables, system message
   reinitialization, and config persistence. Returns the skill name, description,
-  and security scan tier. Warns on high/critical scan status.
+  and security risk level. Warns on high/critical risk level.
 - `search` — Find available skills by query. Uses BM25 relevance ranking over
   name, description, tags, and category (same `BM25Index` used by memory
   relevance and tool search). Returns up to 10 results with name, description,
-  category, scan status, and activation type.
+  category, risk level, and activation type.
 
 - **Auto-approve**: `load` requires approval (changes session behavior); `search`
   is auto-approved (read-only).

@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Server API",
-    "version": "0.9.2",
+    "version": "1.5.0a1",
     "description": "Single-node workstream management, chat interaction, and real-time streaming."
   },
   "paths": {
@@ -55,6 +55,7 @@
         "tags": [
           "Workstreams"
         ],
+        "description": "Accepts two content types. Default is `application/json` with a `CreateWorkstreamRequest` body. Alternatively, `multipart/form-data` with one `meta` field (JSON-encoded `CreateWorkstreamRequest` shape) plus zero-or-more `file` parts saves each file as an attachment under the new workstream. When `initial_message` is also set, attachments are reserved onto that turn before the worker thread dispatches; otherwise they remain pending for a follow-up `POST /v1/api/send`.",
         "requestBody": {
           "required": true,
           "content": {
@@ -78,6 +79,26 @@
           },
           "400": {
             "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
             "content": {
               "application/json": {
                 "schema": {
@@ -408,10 +429,430 @@
         "tags": [
           "Streaming"
         ],
-        "description": "Global Server-Sent Events stream for state-change broadcasts across all workstreams. Returns text/event-stream.",
+        "description": "Server-Sent Events stream for node-level state broadcasts. Emits a node_snapshot event on connect (workstreams, health, aggregate), followed by real-time delta events (ws_state, ws_activity, ws_created, ws_closed, ws_rename, health_changed, aggregate). Pass ?expected_node_id=X for identity verification (returns 409 on mismatch).",
         "responses": {
           "200": {
             "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/delete": {
+      "post": {
+        "summary": "Permanently delete a saved workstream",
+        "operationId": "v1_api_workstreams_{ws_id}_delete_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/open": {
+      "post": {
+        "summary": "Load a saved workstream into memory",
+        "operationId": "v1_api_workstreams_{ws_id}_open_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/title": {
+      "post": {
+        "summary": "Set workstream title manually",
+        "operationId": "v1_api_workstreams_{ws_id}_title_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/refresh-title": {
+      "post": {
+        "summary": "Regenerate workstream title via LLM",
+        "operationId": "v1_api_workstreams_{ws_id}_refresh-title_post",
+        "tags": [
+          "Workstreams"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments": {
+      "post": {
+        "summary": "Upload a file (multipart/form-data, field 'file') and attach it to the caller's next user turn on this workstream.  Validates size, MIME, and UTF-8 for text; magic-byte sniff for images.  Ownership failures are masked as 404 so non-owners cannot enumerate workstream existence; a 403 indicates a scope/auth failure from the middleware layer.",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_post",
+        "tags": [
+          "Attachments"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadAttachmentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Error 413",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "summary": "List the caller's pending (unconsumed) attachments for this workstream.  Ownership failures are masked as 404.",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_get",
+        "tags": [
+          "Attachments"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListAttachmentsResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}/content": {
+      "get": {
+        "summary": "Return raw bytes of an attachment with its stored Content-Type.  Ownership failures are masked as 404.",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_content_get",
+        "tags": [
+          "Attachments"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/workstreams/{ws_id}/attachments/{attachment_id}": {
+      "delete": {
+        "summary": "Remove a pending attachment (consumed attachments return 404).  Ownership failures are also masked as 404.",
+        "operationId": "v1_api_workstreams_{ws_id}_attachments_{attachment_id}_delete",
+        "tags": [
+          "Attachments"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attachment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -891,6 +1332,106 @@
         }
       }
     },
+    "/v1/api/admin/settings": {
+      "get": {
+        "summary": "List interface.* settings with values and sources",
+        "operationId": "v1_api_admin_settings_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/settings/{key}": {
+      "put": {
+        "summary": "Update an interface.* setting",
+        "operationId": "v1_api_admin_settings_{key}_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Update an interface.* setting (alias for PUT)",
+        "operationId": "v1_api_admin_settings_{key}_post",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Server health check",
@@ -1132,6 +1673,22 @@
             "description": "Target workstream ID",
             "title": "Ws Id",
             "type": "string"
+          },
+          "attachment_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Explicit list of attachment ids to inject into this turn. When omitted, any pending attachments for the caller on this workstream are auto-consumed. An empty list disables auto-consumption for this send.",
+            "title": "Attachment Ids"
           }
         },
         "required": [
@@ -1144,13 +1701,57 @@
       "SendResponse": {
         "properties": {
           "status": {
-            "description": "'ok' or 'busy'",
+            "description": "'ok', 'busy', 'queued', or 'queue_full'",
             "examples": [
               "ok",
-              "busy"
+              "busy",
+              "queued",
+              "queue_full"
             ],
             "title": "Status",
             "type": "string"
+          },
+          "attached_ids": {
+            "description": "Attachment ids actually reserved onto this turn. Subset of the request's `attachment_ids` (or the auto-consumed pending set). Empty when the send carries no attachments.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attached Ids",
+            "type": "array"
+          },
+          "dropped_attachment_ids": {
+            "description": "Attachment ids the caller requested that the server could not reserve (lost a race, already consumed, or cross-scope). The request still proceeds with whatever was reserved; the client can retry uploads or surface a partial-attach warning.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Dropped Attachment Ids",
+            "type": "array"
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: relative priority of the queued message.",
+            "title": "Priority"
+          },
+          "msg_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Set on `queued` responses: id used to dequeue the message.",
+            "title": "Msg Id"
           }
         },
         "required": [
@@ -1289,10 +1890,74 @@
             "description": "Skill name (replaces default skills)",
             "title": "Skill",
             "type": "string"
+          },
+          "notify_targets": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "default": "[]",
+            "description": "Notification targets, accepted as either a JSON string or a structured array of objects containing channel_type + channel_id/user_id",
+            "title": "Notify Targets"
+          },
+          "client_type": {
+            "default": "",
+            "description": "Client surface type (web, cli, chat). Defaults to web for server-created sessions.",
+            "title": "Client Type",
+            "type": "string"
+          },
+          "initial_message": {
+            "default": "",
+            "description": "Optional first user message dispatched as a background turn after the workstream is created. When attachments are also provided (via the multipart variant), they are reserved onto this turn.",
+            "title": "Initial Message",
+            "type": "string"
+          },
+          "ws_id": {
+            "default": "",
+            "description": "Optional caller-supplied workstream id (32-hex). Required when creating with attachments via the cluster routing layer so the console can hash to the owning node before the multipart body lands. Auto-generated when omitted.",
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive",
+            "description": "Workstream kind \u2014 'interactive' (default) or 'coordinator'. Coordinator workstreams are created by the console's own /v1/api/coordinator/new endpoint; clients hitting /v1/api/workstreams/new should leave this at the default."
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional parent workstream id. Populated on children spawned by a coordinator so the parent/child relationship survives restart and appears in audit / list views.",
+            "title": "Parent Ws Id"
           }
         },
         "title": "CreateWorkstreamRequest",
         "type": "object"
+      },
+      "WorkstreamKind": {
+        "description": "Classifier for which manager hosts a workstream.\n\nStrEnum so members are drop-in ``str`` replacements for the DB column,\nJSON payloads, and existing ``==`` comparisons against raw strings.\nNarrow internal annotations to this type; wide boundaries (HTTP body,\nDB row) stay ``str`` and parse via ``WorkstreamKind(raw)`` / ``from_raw``\nat the edge.",
+        "enum": [
+          "interactive",
+          "coordinator"
+        ],
+        "title": "WorkstreamKind",
+        "type": "string"
       },
       "CreateWorkstreamResponse": {
         "properties": {
@@ -1317,6 +1982,14 @@
             "description": "Number of messages in the resumed workstream",
             "title": "Message Count",
             "type": "integer"
+          },
+          "attachment_ids": {
+            "description": "Ids of attachments saved by this request (multipart variant only). Already reserved onto the initial_message turn when one was provided; otherwise left pending for a follow-up POST /v1/api/send.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Attachment Ids",
+            "type": "array"
           }
         },
         "required": [
@@ -1369,6 +2042,22 @@
           "state": {
             "title": "State",
             "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Ws Id"
           }
         },
         "required": [
@@ -1493,6 +2182,27 @@
             "default": "",
             "title": "Model Alias",
             "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/WorkstreamKind",
+            "default": "interactive"
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Ws Id"
+          },
+          "user_id": {
+            "default": "",
+            "title": "User Id",
+            "type": "string"
           }
         },
         "required": [
@@ -1569,6 +2279,108 @@
           "message_count"
         ],
         "title": "SavedWorkstreamInfo",
+        "type": "object"
+      },
+      "UploadAttachmentResponse": {
+        "description": "Returned after a successful upload.",
+        "properties": {
+          "attachment_id": {
+            "description": "Opaque id for this attachment",
+            "title": "Attachment Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Original upload filename",
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "description": "Canonicalized MIME type",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Payload size in bytes",
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "'image' or 'text'",
+            "examples": [
+              "image",
+              "text"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachment_id",
+          "filename",
+          "mime_type",
+          "size_bytes",
+          "kind"
+        ],
+        "title": "UploadAttachmentResponse",
+        "type": "object"
+      },
+      "ListAttachmentsResponse": {
+        "properties": {
+          "attachments": {
+            "description": "Pending (unconsumed) attachments for caller+workstream",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentInfo"
+            },
+            "title": "Attachments",
+            "type": "array"
+          }
+        },
+        "required": [
+          "attachments"
+        ],
+        "title": "ListAttachmentsResponse",
+        "type": "object"
+      },
+      "AttachmentInfo": {
+        "properties": {
+          "attachment_id": {
+            "description": "Opaque id for this attachment",
+            "title": "Attachment Id",
+            "type": "string"
+          },
+          "filename": {
+            "description": "Original upload filename",
+            "title": "Filename",
+            "type": "string"
+          },
+          "mime_type": {
+            "description": "Canonicalized MIME type",
+            "title": "Mime Type",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Payload size in bytes",
+            "title": "Size Bytes",
+            "type": "integer"
+          },
+          "kind": {
+            "description": "'image' or 'text'",
+            "examples": [
+              "image",
+              "text"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "attachment_id",
+          "filename",
+          "mime_type",
+          "size_bytes",
+          "kind"
+        ],
+        "title": "AttachmentInfo",
         "type": "object"
       },
       "HealthResponse": {
@@ -1656,20 +2468,10 @@
             ],
             "title": "Status",
             "type": "string"
-          },
-          "circuit_state": {
-            "examples": [
-              "closed",
-              "open",
-              "half_open"
-            ],
-            "title": "Circuit State",
-            "type": "string"
           }
         },
         "required": [
-          "status",
-          "circuit_state"
+          "status"
         ],
         "title": "BackendStatus",
         "type": "object"
@@ -2036,6 +2838,16 @@
             },
             "title": "Models",
             "type": "array"
+          },
+          "default_alias": {
+            "default": "",
+            "title": "Default Alias",
+            "type": "string"
+          },
+          "channel_default_alias": {
+            "default": "",
+            "title": "Channel Default Alias",
+            "type": "string"
           }
         },
         "title": "ListAvailableModelsResponse",

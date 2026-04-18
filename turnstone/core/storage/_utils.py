@@ -112,9 +112,10 @@ SKILL_MUTABLE = frozenset(
         "license",
         "compatibility",
         "scan_version",
-        "scan_status",
+        "risk_level",
         "scan_report",
         "priority",
+        "kind",
     }
 )
 STRUCTURED_MEMORY_MUTABLE = frozenset({"content", "description", "type"})
@@ -204,7 +205,7 @@ VERDICT_MUTABLE = frozenset(
 
 
 def scan_skill_content(content: str, allowed_tools: str) -> tuple[str, str, str]:
-    """Run the skill scanner and return ``(scan_status, scan_report_json, scanner_version)``.
+    """Run the skill scanner and return ``(risk_level, scan_report_json, scanner_version)``.
 
     Uses a lazy import to avoid circular dependencies.  Silently returns
     empty results on import or scan errors so skill creation is never

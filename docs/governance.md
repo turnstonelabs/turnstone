@@ -91,7 +91,7 @@ etc.) since workstream templates were merged into the skills system in v0.8.0.
   time. The scanner evaluates four risk axes: content risk (command execution,
   data exfiltration), supply chain risk (pipe-to-shell, transitive installs),
   vulnerability risk (prompt injection, insecure credentials), and declared
-  capability risk (from `allowed-tools` in SKILL.md). Results populate the `scan_status`
+  capability risk (from `allowed-tools` in SKILL.md). Results populate the `risk_level`
   (safe/low/medium/high/critical) and `scan_report` (JSON breakdown) columns.
   These fields are system-managed and cannot be overwritten via the admin API.
 - **Discovery**: External skills can be discovered and installed from registries:

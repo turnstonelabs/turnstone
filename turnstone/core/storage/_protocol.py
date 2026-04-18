@@ -14,6 +14,30 @@ class StorageBackend(Protocol):
 
     Provides workstream management, conversation persistence, structured
     memories, and full-text search.
+
+    Cross-cutting contracts:
+
+    **Tenancy filter on aggregates.**  Every list / count / aggregate
+    method that can span rows from more than one ``user_id`` MUST
+    accept ``user_id: str | None = None`` as a keyword-only argument
+    and push ``WHERE user_id = :user_id`` into SQL when a uid is
+    supplied.  ``None`` is reserved for service-scoped callers that
+    legitimately need cluster-wide visibility.  Calling endpoints
+    MUST resolve the effective filter (typically via
+    ``_effective_user_filter`` in ``turnstone.console.server``) and
+    pass it through — never post-filter in Python; handler-side
+    filtering lets orphan rows, forged ``parent_ws_id`` references,
+    and empty-sub tokens leak cross-tenant counts.
+
+    **Row access via ``_mapping``.**  List-style methods return
+    SQLAlchemy ``Row`` objects; callers MUST access columns through
+    ``row._mapping[<col>]`` (or ``.get("<col>")`` on the mapping).
+    Positional indexing is not a supported access pattern — a SELECT
+    reorder or a new trailing column silently corrupts the
+    projection.  Test doubles for list-style storage methods MUST
+    expose a ``_mapping`` attribute matching the production ``Row``
+    shape; ``turnstone.testing.row_contract.assert_row_like`` is the
+    canonical check for fixtures and fakes.
     """
 
     # -- Core conversation operations ------------------------------------------
@@ -948,6 +972,7 @@ class StorageBackend(Protocol):
         skill_license: str = "",
         compatibility: str = "",
         priority: int = 0,
+        kind: str = "any",
     ) -> None:
         """Create a prompt template (skill)."""
         ...
@@ -1001,11 +1026,12 @@ class StorageBackend(Protocol):
         *,
         category: str | None = None,
         tag: str | None = None,
-        scan_status: str | None = None,
+        risk_level: str | None = None,
+        kinds: list[str] | None = None,
         enabled_only: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Return prompt templates filtered by optional category/tag/scan_status,
+        """Return prompt templates filtered by optional category/tag/risk_level/kinds,
         ordered by priority then name.
 
         Filters are pushed into SQL — no per-row Python filter loops.  The
@@ -1014,6 +1040,13 @@ class StorageBackend(Protocol):
         ``%"<tag>"%``).  Cheap and correct for tag values without quote
         characters; upgrade to true JSON-array containment if the
         convention ever needs to expand.
+
+        ``kinds`` (when non-empty) narrows the result to rows whose
+        ``kind`` column is in the supplied list.  Coordinator-side
+        callers typically pass ``["coordinator", "any"]`` and
+        interactive-side callers pass ``["interactive", "any"]`` so
+        skills tagged ``any`` remain visible to both.  ``None`` means
+        no kind filter — all rows regardless of kind.
         """
         ...
 
@@ -1026,7 +1059,7 @@ class StorageBackend(Protocol):
         ...
 
     def list_installed_skill_urls(self) -> list[dict[str, str]]:
-        """Return [{source_url, template_id, scan_status}] for skills with non-empty source_url."""
+        """Return [{source_url, template_id, risk_level}] for skills with non-empty source_url."""
         ...
 
     # -- Skill resources -------------------------------------------------------

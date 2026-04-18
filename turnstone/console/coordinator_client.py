@@ -328,6 +328,12 @@ class CoordinatorClient:
         node forgets to enforce ownership.  Read ops use the same gate
         inline (see ``inspect`` / ``wait_for_workstream``).
 
+        The child must match BOTH the coord's ws_id in ``parent_ws_id``
+        AND the coord's owner in ``user_id`` — a corrupted or
+        cross-tenant ``parent_ws_id`` alone is not enough, so the
+        trusted-send auto-approval path can't be fooled into sending
+        to a foreign-tenant workstream.
+
         404-shape on miss matches the shape inspect() uses to avoid
         being an existence oracle.
         """
@@ -342,7 +348,9 @@ class CoordinatorClient:
             return False
         if row is None:
             return False
-        return row.get("parent_ws_id") == self._coord_ws_id
+        if row.get("parent_ws_id") != self._coord_ws_id:
+            return False
+        return bool(row.get("user_id")) and row.get("user_id") == self._user_id
 
     # -- model-invoked mutating ops (HTTP) ---------------------------------
 
@@ -378,6 +386,25 @@ class CoordinatorClient:
         if not self._is_own_subtree(ws_id):
             return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("send", {"ws_id": ws_id, "message": message})
+
+    def emit_audit(self, action: str, detail: dict[str, Any]) -> None:
+        """Record an audit row attributed to this coordinator session.
+
+        Uses the client's own ``storage``, ``user_id``, and
+        ``coord_ws_id`` so callers don't need to reach into the client's
+        private attributes.  ``resource_type`` is always ``"coordinator"``
+        and ``resource_id`` is the coord's ws_id.
+        """
+        from turnstone.core.audit import record_audit
+
+        record_audit(
+            self._storage,
+            user_id=self._user_id,
+            action=action,
+            resource_type="coordinator",
+            resource_id=self._coord_ws_id,
+            detail=detail,
+        )
 
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
         if not self._is_own_subtree(ws_id):
@@ -893,11 +920,18 @@ class CoordinatorClient:
         *,
         category: str | None = None,
         tag: str | None = None,
-        scan_status: str | None = None,
+        risk_level: str | None = None,
         enabled_only: bool = False,
         limit: int = 100,
     ) -> dict[str, Any]:
         """Return ``{"skills": [...], "truncated": bool}``.
+
+        Coordinator-visible skills only: the storage filter narrows to
+        ``kind IN ('coordinator', 'any')``.  Skills tagged
+        ``interactive`` are hidden from the coordinator's
+        ``list_skills`` tool (they're meant for child workstreams, not
+        the orchestrator), while ``any``-tagged skills show up on both
+        sides for backwards compatibility with pre-tagging catalogs.
 
         Filters pushed into SQL via ``list_skills_filtered`` — no per-row
         lookups.  ``tag`` matches when the value appears in the
@@ -910,7 +944,8 @@ class CoordinatorClient:
         rows = self._storage.list_skills_filtered(
             category=category,
             tag=tag,
-            scan_status=scan_status,
+            risk_level=risk_level,
+            kinds=["coordinator", "any"],
             enabled_only=enabled_only,
             limit=page_size + 1,  # +1 to detect truncation
         )
@@ -948,8 +983,9 @@ class CoordinatorClient:
                     "description": r.get("description") or "",
                     "model": r.get("model") or "",
                     "enabled": bool(r.get("enabled")),
-                    "scan_status": r.get("scan_status") or "",
+                    "risk_level": r.get("risk_level") or "",
                     "activation": r.get("activation") or "",
+                    "kind": r["kind"],
                     "allowed_tools": allowed_tools,
                 }
             )

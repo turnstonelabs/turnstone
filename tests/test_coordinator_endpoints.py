@@ -8,18 +8,24 @@ enforcement, and lazy rehydration on GET /{ws_id}.
 
 from __future__ import annotations
 
-from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from turnstone.console.coordinator import CoordinatorManager
+# ---------------------------------------------------------------------------
+# Auth injection middleware
+# ---------------------------------------------------------------------------
+from tests._coord_test_helpers import (
+    _AuthMiddleware,
+    _build_mgr,
+    _fake_registry,
+    _FakeConfigStore,
+)
 from turnstone.console.coordinator_ui import ConsoleCoordinatorUI
 from turnstone.console.server import (
     cluster_ws_detail,
@@ -39,64 +45,13 @@ from turnstone.core.auth import AuthResult
 from turnstone.core.storage._sqlite import SQLiteBackend
 
 # ---------------------------------------------------------------------------
-# Auth injection middleware
-# ---------------------------------------------------------------------------
-
-
-class _AuthMiddleware(BaseHTTPMiddleware):
-    """Inject a configurable AuthResult from a header-based contract.
-
-    Tests set ``X-Test-Perms`` to a comma-separated permission list, and
-    ``X-Test-User`` to the user id.  Empty or missing → no auth.
-    """
-
-    async def dispatch(self, request, call_next):
-        perms = request.headers.get("X-Test-Perms", "")
-        user_id = request.headers.get("X-Test-User", "")
-        if perms or user_id:
-            request.state.auth_result = AuthResult(
-                user_id=user_id,
-                scopes=frozenset({"approve"}),
-                token_source="test",
-                permissions=frozenset(p for p in perms.split(",") if p),
-            )
-        return await call_next(request)
-
-
-# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-class _FakeConfigStore:
-    """Minimal ConfigStore stub — returns values from a dict."""
-
-    def __init__(self, values: dict[str, Any]) -> None:
-        self._values = values
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._values.get(key, default)
 
 
 @pytest.fixture
 def storage(tmp_path):
     return SQLiteBackend(str(tmp_path / "coord.db"))
-
-
-def _build_mgr(storage) -> CoordinatorManager:
-    """Build a CoordinatorManager with stub factories."""
-
-    def _sf(ui, model_alias=None, ws_id=None, **kw):
-        s = MagicMock()
-        s.send.return_value = None
-        return s
-
-    return CoordinatorManager(
-        session_factory=_sf,
-        ui_factory=lambda w, u: ConsoleCoordinatorUI(ws_id=w, user_id=u),
-        storage=storage,
-        max_active=3,
-    )
 
 
 def _make_client(
@@ -270,13 +225,6 @@ def test_unresolvable_alias_returns_503(storage):
 # ---------------------------------------------------------------------------
 # Happy path — create + list + send + close
 # ---------------------------------------------------------------------------
-
-
-def _fake_registry() -> MagicMock:
-    """MagicMock that returns success on .resolve() so the 503 gate passes."""
-    reg = MagicMock()
-    reg.resolve.return_value = (MagicMock(), "gpt-4", MagicMock())
-    return reg
 
 
 _COORD_HEADERS = {"X-Test-User": "user-1", "X-Test-Perms": "admin.coordinator"}
@@ -1003,7 +951,6 @@ def test_coordinator_rows_filters_by_caller_identity(storage):
     from unittest.mock import MagicMock
 
     from turnstone.console.server import _coordinator_rows
-    from turnstone.core.auth import AuthResult
 
     mgr = _build_mgr(storage)
     mgr.create(user_id="alice", name="alice-coord")
@@ -1042,7 +989,6 @@ def test_coordinator_rows_empty_user_id_returns_empty(storage):
     from unittest.mock import MagicMock
 
     from turnstone.console.server import _coordinator_rows
-    from turnstone.core.auth import AuthResult
 
     mgr = _build_mgr(storage)
     mgr.create(user_id="alice", name="alice-coord")
@@ -1063,7 +1009,6 @@ def _persisted_rows_request(storage, mgr, user_id: str, perms: frozenset[str]):
     up so the persisted-rows merge path fires."""
     from unittest.mock import MagicMock
 
-    from turnstone.core.auth import AuthResult
 
     request = MagicMock()
     request.app.state.coord_mgr = mgr
@@ -1190,7 +1135,6 @@ def test_coordinator_rows_persisted_skips_orphan_rows_for_non_admin(storage):
     from unittest.mock import MagicMock
 
     from turnstone.console.server import _coordinator_rows
-    from turnstone.core.auth import AuthResult
     from turnstone.core.workstream import WorkstreamKind
 
     mgr = _build_mgr(storage)

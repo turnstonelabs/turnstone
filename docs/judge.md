@@ -315,7 +315,7 @@ four independent risk axes:
    `Bash(*)` (unrestricted shell) is high risk. `Bash(git:*)` is low.
    Read-only tools are safe.
 
-Results are stored in `scan_status` (tier: safe/low/medium/high/critical) and
+Results are stored in `risk_level` (tier: safe/low/medium/high/critical) and
 `scan_report` (JSON breakdown) on the `prompt_templates` table. These fields are
 system-managed and not editable via the admin API.
 
@@ -400,11 +400,11 @@ level, annotations, output length, redaction status).
 
 ### Session-level skill scan warning
 
-When a skill with `scan_status` of `high` or `critical` is loaded into a
+When a skill with `risk_level` of `high` or `critical` is loaded into a
 session, a warning is emitted via `on_info`:
 
 ```
-⚠ Skill 'my-skill' has scan status: high.
+⚠ Skill 'my-skill' has risk level: high.
 Review scan report in admin panel before enabling in production.
 ```
 
@@ -421,7 +421,7 @@ All three evaluation systems persist their assessments for future calibration:
 |-------|--------|-------------|
 | `intent_verdicts` | Intent judge (heuristic + LLM) | `func_name`, `risk_level`, `confidence`, `user_decision` |
 | `output_assessments` | Output guard | `func_name`, `risk_level`, `flags`, `redacted` |
-| `prompt_templates` | Skill scanner | `scan_status`, `scan_report`, `scan_version` |
+| `prompt_templates` | Skill scanner | `risk_level`, `scan_report`, `scan_version` |
 
 Run v1 with all tools requiring manual approval to build a local dataset.
 In v2, calibration tooling will analyze this data to:

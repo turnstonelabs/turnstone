@@ -158,7 +158,7 @@ class TestExecLoadSkill:
                 "name": "code-review",
                 "description": "Reviews code for quality",
                 "content": "# Code Review\nReview all code.",
-                "scan_status": "safe",
+                "risk_level": "safe",
                 "category": "engineering",
             }
         ]
@@ -185,7 +185,7 @@ class TestExecLoadSkill:
         assert session._set_skill_called == []
 
     def test_load_calls_ui_on_tool_result(self) -> None:
-        skills = [{"name": "test", "content": "content", "description": "", "scan_status": ""}]
+        skills = [{"name": "test", "content": "content", "description": "", "risk_level": ""}]
         session, _, fake_get = _make_session(skills)
 
         with patch("turnstone.core.session.get_skill_by_name", side_effect=fake_get):
@@ -200,7 +200,7 @@ class TestExecLoadSkill:
                 "name": "code-review",
                 "description": "Reviews code",
                 "category": "eng",
-                "scan_status": "safe",
+                "risk_level": "safe",
                 "tags": "[]",
                 "activation": "named",
             },
@@ -208,7 +208,7 @@ class TestExecLoadSkill:
                 "name": "docs-writer",
                 "description": "Writes docs",
                 "category": "general",
-                "scan_status": "low",
+                "risk_level": "low",
                 "tags": "[]",
                 "activation": "named",
             },
@@ -232,7 +232,7 @@ class TestExecLoadSkill:
                 "name": f"skill-{i}",
                 "description": f"Desc {i}",
                 "category": "general",
-                "scan_status": "",
+                "risk_level": "",
                 "tags": "[]",
                 "activation": "named",
             }
@@ -262,13 +262,13 @@ class TestExecLoadSkill:
 
         assert "no skills found" in result.lower()
 
-    def test_search_includes_scan_status(self) -> None:
+    def test_search_includes_risk_level(self) -> None:
         skills = [
             {
                 "name": "risky",
                 "description": "Risky skill",
                 "category": "ops",
-                "scan_status": "high",
+                "risk_level": "high",
                 "tags": "[]",
                 "activation": "named",
             },
@@ -301,7 +301,7 @@ class TestExecLoadSkill:
                 "name": "disabled-skill",
                 "content": "x",
                 "description": "",
-                "scan_status": "",
+                "risk_level": "",
                 "enabled": False,
             }
         ]
@@ -315,7 +315,7 @@ class TestExecLoadSkill:
         assert session._set_skill_called == []
 
     def test_load_already_active_skill(self) -> None:
-        skills = [{"name": "active", "content": "x", "description": "", "scan_status": "safe"}]
+        skills = [{"name": "active", "content": "x", "description": "", "risk_level": "safe"}]
         session, _, fake_get = _make_session(skills)
         session._skill_name = "active"
 
@@ -332,7 +332,7 @@ class TestExecLoadSkill:
                 "name": "enabled-skill",
                 "description": "Good",
                 "category": "gen",
-                "scan_status": "",
+                "risk_level": "",
                 "tags": "[]",
                 "activation": "named",
                 "enabled": True,
@@ -341,7 +341,7 @@ class TestExecLoadSkill:
                 "name": "disabled-skill",
                 "description": "Bad",
                 "category": "gen",
-                "scan_status": "",
+                "risk_level": "",
                 "tags": "[]",
                 "activation": "named",
                 "enabled": False,
@@ -365,7 +365,7 @@ class TestExecLoadSkill:
                 "name": "code-review",
                 "description": "Reviews code for quality",
                 "category": "eng",
-                "scan_status": "",
+                "risk_level": "",
                 "tags": "[]",
                 "activation": "named",
             },

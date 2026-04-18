@@ -211,7 +211,7 @@ note over Session, Judge
   **Storage:**
   intent_verdicts table (migration 012), output_assessments table
   (migration 022). Both queryable via admin API endpoints
-  (requires admin.judge permission). Skills store scan_status,
+  (requires admin.judge permission). Skills store risk_level,
   scan_report, scan_version for install-time risk assessment.
 end note
 

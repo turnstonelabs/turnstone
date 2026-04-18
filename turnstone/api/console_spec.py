@@ -32,9 +32,14 @@ from turnstone.api.console_schemas import (
     CoordinatorInfo,
     CoordinatorListResponse,
     CoordinatorOpenResponse,
+    CoordinatorRestrictRequest,
+    CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
+    CoordinatorTrustRequest,
+    CoordinatorTrustResponse,
     CreateChannelUserRequest,
     CreateMcpServerRequest,
     CreateModelDefinitionRequest,
@@ -1297,6 +1302,64 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Coordinator"],
     ),
     EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/trust",
+        "POST",
+        "Toggle trusted-session mode for send_to_workstream",
+        description=(
+            "When enabled, ``send_to_workstream`` calls that target a "
+            "ws_id in the coordinator's own subtree skip the approval "
+            "prompt.  Foreign ws_ids continue to require approval — "
+            "trust only relaxes the guard for work the orchestrator "
+            "itself spawned.  Every auto-approved send still emits a "
+            "``coordinator.send.auto_approved`` audit row so the trail "
+            "isn't lost.  Gated on both ``admin.coordinator`` AND "
+            "``coordinator.trust.send`` so the trust feature is an "
+            "explicit opt-in capability separate from ordinary "
+            "coordinator administration."
+        ),
+        request_model=CoordinatorTrustRequest,
+        response_model=CoordinatorTrustResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/restrict",
+        "POST",
+        "Revoke tool access on a live coordinator session",
+        description=(
+            "Adds the named tools to the coordinator session's revoked set "
+            "without closing the session.  The model can keep working on "
+            "whatever is already in flight but cannot invoke the revoked "
+            "tools again.  Idempotent and additive — calling twice with "
+            "disjoint lists unions them.  Revocations do not survive a "
+            "session close / reopen; operators opt in per session.  Writes "
+            "``coordinator.restricted`` with the revocation delta and the "
+            "full post-state."
+        ),
+        request_model=CoordinatorRestrictRequest,
+        response_model=CoordinatorRestrictResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/stop_cascade",
+        "POST",
+        "Cancel the coordinator and every direct child",
+        description=(
+            "Cancels the coordinator's in-flight generation AND dispatches "
+            "``cancel_workstream`` through the routing proxy for every "
+            "direct child in the in-memory registry.  Grandchildren are "
+            "not touched directly — they sit behind their parent's cancel, "
+            "which propagates via the child's SSE stream.  Returns the "
+            "per-child disposition (``cancelled`` / ``failed``) so the UI "
+            "can show which children responded.  Writes "
+            "``coordinator.stopped_cascade`` with the two lists."
+        ),
+        response_model=CoordinatorStopCascadeResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
         "/v1/api/cluster/ws/{ws_id}/detail",
         "GET",
         "Cluster-wide live workstream detail (storage + live block + tail)",
@@ -1369,9 +1432,14 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CoordinatorInfo,
     CoordinatorListResponse,
     CoordinatorOpenResponse,
+    CoordinatorRestrictRequest,
+    CoordinatorRestrictResponse,
     CoordinatorSendRequest,
+    CoordinatorStopCascadeResponse,
     CoordinatorTaskInfo,
     CoordinatorTasksResponse,
+    CoordinatorTrustRequest,
+    CoordinatorTrustResponse,
     CreateScheduleRequest,
     UpdateScheduleRequest,
     ScheduleInfo,

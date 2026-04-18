@@ -376,7 +376,10 @@ prompt_templates = sa.Table(
     sa.Column("allowed_tools", sa.Text, nullable=False, server_default="[]"),  # JSON array
     sa.Column("license", sa.Text, nullable=False, server_default=""),
     sa.Column("compatibility", sa.Text, nullable=False, server_default=""),
-    sa.Column("scan_status", sa.Text, nullable=False, server_default=""),
+    # interactive / coordinator / any — governs which list_skills call
+    # sees this row.  Defaults to "any" so existing schemas keep working.
+    sa.Column("kind", sa.Text, nullable=False, server_default="any"),
+    sa.Column("risk_level", sa.Text, nullable=False, server_default=""),
     sa.Column("scan_report", sa.Text, nullable=False, server_default="{}"),  # JSON
     sa.Column("installed_at", sa.Text, nullable=False, server_default=""),
     sa.Column("installed_by", sa.Text, nullable=False, server_default=""),

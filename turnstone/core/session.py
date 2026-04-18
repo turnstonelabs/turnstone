@@ -110,7 +110,7 @@ from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan
 log = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
@@ -343,6 +343,9 @@ class ChatSession:
         self._kind = kind
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
         self._coord_client: Any = coord_client
+        self._trust_send: bool = False
+        self._revoked_tools: frozenset[str] = frozenset()
+        self._governance_lock = threading.Lock()
         self._registry = registry
         self._model_alias = model_alias
         self._health_registry = health_registry
@@ -667,15 +670,15 @@ class ChatSession:
                 self._skill_resources = self._load_skill_resources(
                     skill_data.get("template_id", "")
                 )
-                if skill_data.get("scan_status") in ("high", "critical"):
-                    scan_tier = skill_data["scan_status"]
+                if skill_data.get("risk_level") in ("high", "critical"):
+                    risk_tier = skill_data["risk_level"]
                     log.warning(
                         "skill.high_risk_loaded",
                         skill=skill_data["name"],
-                        scan_status=scan_tier,
+                        risk_level=risk_tier,
                     )
                     self.ui.on_info(
-                        f"⚠ Skill '{skill_data['name']}' has scan status: {scan_tier}. "
+                        f"⚠ Skill '{skill_data['name']}' has risk level: {risk_tier}. "
                         f"Review scan report in admin panel before enabling in production."
                     )
             else:
@@ -3874,6 +3877,24 @@ class ChatSession:
                     ),
                 }
 
+        # Short-circuit revoked tools before preparer dispatch so the
+        # model sees an unambiguous "revoked" error rather than a
+        # preparer-level validation message.
+        if func_name in self._revoked_tools:
+            return {
+                "call_id": call_id,
+                "func_name": func_name,
+                "header": f"\u2717 {func_name}: revoked",
+                "preview": "",
+                "needs_approval": False,
+                "error": (
+                    f"Tool '{func_name}' has been revoked on this "
+                    "coordinator session by an operator.  The session "
+                    "is still live but this tool is no longer "
+                    "available — continue with the tools you have."
+                ),
+            }
+
         preparers = {
             "bash": self._prepare_bash,
             "read_file": self._prepare_read_file,
@@ -4839,6 +4860,29 @@ class ChatSession:
             "error": f"Error: {msg}",
         }
 
+    # -- Coordinator governance (console-driven toggles) -----------------
+    #
+    # Writes hold ``_governance_lock``; reads are lock-free.  ``_trust_send``
+    # is a single bool and ``_revoked_tools`` is a frozenset swapped by
+    # reference on each write, so neither read can tear.
+
+    def set_trust_send(self, value: bool) -> None:
+        with self._governance_lock:
+            self._trust_send = bool(value)
+
+    def get_trust_send(self) -> bool:
+        return self._trust_send
+
+    def revoke_tools(self, names: Iterable[str]) -> frozenset[str]:
+        """Union ``names`` into the revoked-tools set; return the post-state."""
+        additions = frozenset(names)
+        with self._governance_lock:
+            self._revoked_tools = self._revoked_tools | additions
+            return self._revoked_tools
+
+    def get_revoked_tools(self) -> frozenset[str]:
+        return self._revoked_tools
+
     @staticmethod
     def _coord_str_arg(args: dict[str, Any], key: str, default: str = "") -> str:
         """Return ``args[key]`` if it's a string, else ``default``.
@@ -5011,20 +5055,44 @@ class ChatSession:
         preview_line = first_line[:120] + ("..." if len(first_line) > 120 else "")
         header = f"\u2699 send_to_workstream {ws_id}: {preview_line}"
         preview_body = f"{DIM}{textwrap.indent(message, '    ')}{RESET}"
+        # Trust only relaxes own-subtree sends; foreign ws_ids always
+        # prompt for approval even under trust.
+        needs_approval = True
+        trust_auto_approved = False
+        if self._trust_send and self._coord_client._is_own_subtree(ws_id):
+            needs_approval = False
+            trust_auto_approved = True
         return {
             "call_id": call_id,
             "func_name": "send_to_workstream",
             "header": header,
             "preview": preview_body,
-            "needs_approval": True,
+            "needs_approval": needs_approval,
             "approval_label": "send_to_workstream",
             "execute": self._exec_send_to_workstream,
             "ws_id": ws_id,
             "message": message,
+            "trust_auto_approved": trust_auto_approved,
         }
 
     def _exec_send_to_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
         call_id = item["call_id"]
+        if item.get("trust_auto_approved"):
+            # Audit before dispatch so a downstream failure doesn't drop the trail.
+            try:
+                message = item.get("message") or ""
+                preview_line = message.splitlines()[0] if message else ""
+                self._coord_client.emit_audit(
+                    "coordinator.send.auto_approved",
+                    {
+                        "src": "coordinator",
+                        "trust": True,
+                        "ws_id": item["ws_id"],
+                        "message_preview": preview_line[:120],
+                    },
+                )
+            except Exception:
+                log.debug("coord.trust_send.audit_failed", exc_info=True)
         try:
             result = self._coord_client.send(item["ws_id"], item["message"])
         except Exception as e:
@@ -5342,7 +5410,7 @@ class ChatSession:
             return self._coord_tool_error(call_id, "list_skills", "coordinator client unavailable")
         category = self._coord_str_arg(args, "category").strip() or None
         tag = self._coord_str_arg(args, "tag").strip() or None
-        scan_status = self._coord_str_arg(args, "scan_status").strip() or None
+        risk_level = self._coord_str_arg(args, "risk_level").strip() or None
         enabled_only = self._coord_bool_arg(args, "enabled_only")
         try:
             limit = int(args.get("limit") or 100)
@@ -5354,8 +5422,8 @@ class ChatSession:
             header_bits.append(f"category={category}")
         if tag:
             header_bits.append(f"tag={tag}")
-        if scan_status:
-            header_bits.append(f"scan_status={scan_status}")
+        if risk_level:
+            header_bits.append(f"risk_level={risk_level}")
         if enabled_only:
             header_bits.append("enabled_only=true")
         return {
@@ -5367,7 +5435,7 @@ class ChatSession:
             "execute": self._exec_list_skills,
             "category": category,
             "tag": tag,
-            "scan_status": scan_status,
+            "risk_level": risk_level,
             "enabled_only": enabled_only,
             "limit": limit,
         }
@@ -5378,7 +5446,7 @@ class ChatSession:
             result = self._coord_client.list_skills(
                 category=item["category"],
                 tag=item["tag"],
-                scan_status=item["scan_status"],
+                risk_level=item["risk_level"],
                 enabled_only=item["enabled_only"],
                 limit=item["limit"],
             )
@@ -6083,7 +6151,7 @@ class ChatSession:
             self.set_skill(name)
 
             desc = skill_data.get("description", "")
-            scan = skill_data.get("scan_status", "")
+            scan = skill_data.get("risk_level", "")
             parts = [f"Loaded skill '{name}'"]
             if desc:
                 parts.append(f"Description: {desc}")
@@ -6152,7 +6220,7 @@ class ChatSession:
             name_val = r.get("name", "")
             desc_val = r.get("description", "")
             cat_val = r.get("category", "")
-            scan_val = r.get("scan_status", "")
+            scan_val = r.get("risk_level", "")
             activation = r.get("activation", "named")
             line = f"- {name_val}"
             if cat_val:

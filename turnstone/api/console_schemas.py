@@ -6,6 +6,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from turnstone.core.skill_kind import SkillKind
+
 # ---------------------------------------------------------------------------
 # Cluster overview
 # ---------------------------------------------------------------------------
@@ -323,7 +325,8 @@ class SkillInfo(BaseModel):
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
-    scan_status: str = ""
+    kind: SkillKind = SkillKind.ANY
+    risk_level: str = ""
     scan_report: str = "{}"
     scan_version: str = ""
     resource_count: int = 0
@@ -335,7 +338,16 @@ class CreateSkillRequest(BaseModel):
     name: str
     content: str
     category: str = "general"
-    description: str = ""
+    description: str = Field(
+        min_length=1,
+        max_length=1024,
+        description=(
+            "Human-readable description surfaced by ``list_skills`` and "
+            "the admin UI.  Must be non-empty — catches skills registered "
+            "without thinking about discoverability before they reach a "
+            "model's tool-selection prompt."
+        ),
+    )
     tags: str = "[]"
     variables: str = "[]"
     is_default: bool = False
@@ -356,13 +368,32 @@ class CreateSkillRequest(BaseModel):
     allowed_tools: str = "[]"
     license: str = ""
     compatibility: str = ""
+    kind: SkillKind = Field(
+        default=SkillKind.ANY,
+        description=(
+            "Classifier routing the skill to ``list_skills`` calls.  "
+            "``interactive`` is visible only to the interactive-session "
+            "activation path; ``coordinator`` is visible only to the "
+            "coordinator's ``list_skills`` tool; ``any`` (default) is "
+            "visible on both sides, which preserves pre-upgrade "
+            "behaviour for legacy rows."
+        ),
+    )
 
 
 class UpdateSkillRequest(BaseModel):
     name: str | None = None
     content: str | None = None
     category: str | None = None
-    description: str | None = None
+    description: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=1024,
+        description=(
+            "When present, replaces the skill description.  Must be "
+            "non-empty — the admin endpoint rejects a blanking update."
+        ),
+    )
     tags: str | None = None
     variables: str | None = None
     is_default: bool | None = None
@@ -382,6 +413,13 @@ class UpdateSkillRequest(BaseModel):
     allowed_tools: str | None = None
     license: str | None = None
     compatibility: str | None = None
+    kind: SkillKind | None = Field(
+        default=None,
+        description=(
+            "When present, updates the skill's classifier.  Same "
+            "accepted values as ``CreateSkillRequest.kind``."
+        ),
+    )
 
 
 class ListSkillsResponse(BaseModel):
@@ -719,7 +757,7 @@ class SkillDiscoverListing(BaseModel):
     install_count: int = 0
     tags: list[str] = Field(default_factory=list)
     installed: bool = False
-    scan_status: str = ""
+    risk_level: str = ""
     template_id: str = ""
 
 
@@ -1084,6 +1122,72 @@ class CoordinatorTasksResponse(BaseModel):
 
     version: int = Field(default=1)
     tasks: list[CoordinatorTaskInfo] = Field(default_factory=list)
+
+
+class CoordinatorTrustRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/{ws_id}/trust."""
+
+    send: bool = Field(
+        description=(
+            "When true, ``send_to_workstream`` calls that target a ws_id "
+            "in the coordinator's own subtree skip the approval prompt.  "
+            "Foreign ws_ids continue to require approval — trust only "
+            "relaxes the guard for work the orchestrator itself spawned."
+        ),
+    )
+
+
+class CoordinatorTrustResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/{ws_id}/trust."""
+
+    status: str = Field(default="ok")
+    trust_send: bool = Field(description="Post-toggle value of the flag.")
+
+
+class CoordinatorRestrictRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/{ws_id}/restrict."""
+
+    revoke: list[str] = Field(
+        description=(
+            "Tool names to add to the session's revoked set.  Once "
+            "revoked the coordinator cannot invoke the named tools on "
+            "subsequent turns without closing and re-opening the session."
+        ),
+    )
+
+
+class CoordinatorRestrictResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/{ws_id}/restrict."""
+
+    status: str = Field(default="ok")
+    revoked_tools: list[str] = Field(description="Full post-revocation set of revoked tool names.")
+
+
+class CoordinatorStopCascadeResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade."""
+
+    status: str = Field(default="ok")
+    cancelled: list[str] = Field(
+        default_factory=list,
+        description="Child ws_ids that accepted the cancel dispatch.",
+    )
+    failed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids whose cancel dispatch returned an error other "
+            "than an already-gone 404 — the cascade continues on per-"
+            "child failure so a single unreachable node doesn't abort "
+            "the whole batch."
+        ),
+    )
+    skipped: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Child ws_ids that returned 404 on cancel (already gone).  "
+            "Reported separately from ``failed`` so operators can "
+            "distinguish already-done from dispatch-broken."
+        ),
+    )
 
 
 class ClusterWsDetailResponse(BaseModel):

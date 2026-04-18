@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "turnstone Console API",
-    "version": "0.9.2",
+    "version": "1.5.0a1",
     "description": "Cluster-wide visibility and control across all turnstone nodes."
   },
   "paths": {
@@ -220,7 +220,7 @@
     },
     "/v1/api/cluster/workstreams/new": {
       "post": {
-        "summary": "Create workstream via MQ dispatch",
+        "summary": "Create workstream via HTTP dispatch",
         "operationId": "v1_api_cluster_workstreams_new_post",
         "tags": [
           "Cluster"
@@ -3821,6 +3821,349 @@
         }
       }
     },
+    "/v1/api/admin/prompt-policies": {
+      "get": {
+        "summary": "List all prompt policies for system message composition",
+        "operationId": "v1_api_admin_prompt-policies_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a prompt policy",
+        "operationId": "v1_api_admin_prompt-policies_post",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/prompt-policies/{policy_id}": {
+      "get": {
+        "summary": "Get a single prompt policy",
+        "operationId": "v1_api_admin_prompt-policies_{policy_id}_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "policy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update a prompt policy",
+        "operationId": "v1_api_admin_prompt-policies_{policy_id}_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "policy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a prompt policy",
+        "operationId": "v1_api_admin_prompt-policies_{policy_id}_delete",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "policy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/node-metadata": {
+      "get": {
+        "summary": "Get metadata for all nodes (bulk)",
+        "operationId": "v1_api_admin_node-metadata_get",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          }
+        }
+      }
+    },
+    "/v1/api/admin/nodes/{node_id}/metadata": {
+      "get": {
+        "summary": "Get all metadata for a node",
+        "operationId": "v1_api_admin_nodes_{node_id}_metadata_get",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeMetadataResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Bulk set user metadata for a node",
+        "operationId": "v1_api_admin_nodes_{node_id}_metadata_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkSetNodeMetadataRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/admin/nodes/{node_id}/metadata/{key}": {
+      "put": {
+        "summary": "Set a single metadata key for a node",
+        "operationId": "v1_api_admin_nodes_{node_id}_metadata_{key}_put",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetNodeMetadataValueRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a single metadata key for a node",
+        "operationId": "v1_api_admin_nodes_{node_id}_metadata_{key}_delete",
+        "tags": [
+          "Admin"
+        ],
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/api/admin/tls/ca": {
       "get": {
         "summary": "CA status: initialization state, CN, cert count, cert inventory",
@@ -3930,6 +4273,1454 @@
           },
           "404": {
             "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/workstreams/new": {
+      "post": {
+        "summary": "Create workstream via hash-ring routing proxy",
+        "operationId": "v1_api_route_workstreams_new_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/send": {
+      "post": {
+        "summary": "Proxy send to routed node",
+        "operationId": "v1_api_route_send_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/approve": {
+      "post": {
+        "summary": "Proxy approve to routed node",
+        "operationId": "v1_api_route_approve_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/cancel": {
+      "post": {
+        "summary": "Proxy cancel to routed node",
+        "operationId": "v1_api_route_cancel_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/command": {
+      "post": {
+        "summary": "Proxy command to routed node",
+        "operationId": "v1_api_route_command_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route/workstreams/close": {
+      "post": {
+        "summary": "Proxy workstream close to routed node",
+        "operationId": "v1_api_route_workstreams_close_post",
+        "tags": [
+          "Routing"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/route": {
+      "get": {
+        "summary": "Look up which node owns a workstream",
+        "operationId": "v1_api_route_get",
+        "tags": [
+          "Routing"
+        ],
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Workstream ID to look up"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/new": {
+      "post": {
+        "summary": "Create a new coordinator workstream",
+        "operationId": "v1_api_coordinator_new_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Allocates a console-hosted ``kind=\"coordinator\"`` ChatSession.  201 on create; 429 when the ``coordinator.max_active`` cap is reached and no idle coordinator can be evicted.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorCreateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorCreateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Error 401",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator": {
+      "get": {
+        "summary": "List coordinator workstreams visible to the caller",
+        "operationId": "v1_api_coordinator_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns coordinators owned by the caller.  Callers with ``admin.system`` see every coordinator across tenants.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorListResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}": {
+      "get": {
+        "summary": "Get coordinator detail (rehydrates lazily on miss)",
+        "operationId": "v1_api_coordinator_{ws_id}_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns the persisted coordinator's display fields.  If the session isn't currently in memory the manager rehydrates it before responding; ``500`` on rehydrate failure carries a correlation id matching the server log line.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/open": {
+      "post": {
+        "summary": "Open (rehydrate) a coordinator workstream by ws_id",
+        "operationId": "v1_api_coordinator_{ws_id}_open_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` \u2014 gives SDK callers and operators a way to warm a coordinator without browsing to it.  Idempotent: ``already_loaded=true`` when the session was already in memory.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorOpenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/send": {
+      "post": {
+        "summary": "Queue a user message onto the coordinator session",
+        "operationId": "v1_api_coordinator_{ws_id}_send_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Worker thread picks up the message via the session's queue.  ``429`` when the worker queue is full \u2014 caller should back off.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorSendRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Error 429",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/approve": {
+      "post": {
+        "summary": "Resolve a pending tool approval on the coordinator session",
+        "operationId": "v1_api_coordinator_{ws_id}_approve_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Approves or denies the pending tool call(s).  Set ``always`` to True to also add the pending tool name(s) to the session's auto-approve set so subsequent calls of the same tool skip the prompt.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorApproveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/cancel": {
+      "post": {
+        "summary": "Cancel in-flight generation on the coordinator session",
+        "operationId": "v1_api_coordinator_{ws_id}_cancel_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Drops the in-flight LLM call and unblocks any pending approval or plan review.  The coordinator state moves to idle; storage is preserved.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/close": {
+      "post": {
+        "summary": "Soft-close the coordinator (unload from memory; storage preserved)",
+        "operationId": "v1_api_coordinator_{ws_id}_close_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Releases the worker thread + UI listeners and marks the row ``state=closed`` in storage.  The row remains queryable (audit / history) but cannot be reopened \u2014 a closed coordinator is terminal from the manager's perspective.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/events": {
+      "get": {
+        "summary": "Subscribe to the coordinator's SSE event stream",
+        "operationId": "v1_api_coordinator_{ws_id}_events_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Server-Sent Events stream carrying ``status``, ``message``, ``tool_call``, ``tool_result``, ``approval``, ``error``, and the phase-3 ``child_ws_*`` fan-out events.  Pings every 5s.  Body is text/event-stream \u2014 the response schema is omitted from the catalog because OpenAPI 3.1 has no first-class SSE type.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Error 409",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/history": {
+      "get": {
+        "summary": "Read the coordinator's reconstructed message history",
+        "operationId": "v1_api_coordinator_{ws_id}_history_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns the tail of the conversation in OpenAI-like message format.  Used by the page-load handshake; SSE handles updates after that.  Bounded by the ``limit`` query parameter.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 100
+            },
+            "description": "Max conversation rows to fetch from storage (default 100, max 500)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorHistoryResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/children": {
+      "get": {
+        "summary": "List the coordinator's spawned child workstreams",
+        "operationId": "v1_api_coordinator_{ws_id}_children_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns interactive child workstreams whose ``parent_ws_id`` is this coordinator.  Same row shape as the model-facing ``list_workstreams`` tool so the tree UI and the tool agree.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorChildrenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error 500",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/tasks": {
+      "get": {
+        "summary": "Read the coordinator's task list envelope",
+        "operationId": "v1_api_coordinator_{ws_id}_tasks_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Returns the ``{version, tasks}`` envelope persisted via the ``task_list`` model tool.  Corrupt envelopes return an empty list (the tool itself surfaces corruption errors on mutation).",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorTasksResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/trust": {
+      "post": {
+        "summary": "Toggle trusted-session mode for send_to_workstream",
+        "operationId": "v1_api_coordinator_{ws_id}_trust_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "When enabled, ``send_to_workstream`` calls that target a ws_id in the coordinator's own subtree skip the approval prompt.  Foreign ws_ids continue to require approval \u2014 trust only relaxes the guard for work the orchestrator itself spawned.  Every auto-approved send still emits a ``coordinator.send.auto_approved`` audit row so the trail isn't lost.  Gated on both ``admin.coordinator`` AND ``coordinator.trust.send`` so the trust feature is an explicit opt-in capability separate from ordinary coordinator administration.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorTrustRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorTrustResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/restrict": {
+      "post": {
+        "summary": "Revoke tool access on a live coordinator session",
+        "operationId": "v1_api_coordinator_{ws_id}_restrict_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Adds the named tools to the coordinator session's revoked set without closing the session.  The model can keep working on whatever is already in flight but cannot invoke the revoked tools again.  Idempotent and additive \u2014 calling twice with disjoint lists unions them.  Revocations do not survive a session close / reopen; operators opt in per session.  Writes ``coordinator.restricted`` with the revocation delta and the full post-state.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CoordinatorRestrictRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorRestrictResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/coordinator/{ws_id}/stop_cascade": {
+      "post": {
+        "summary": "Cancel the coordinator and every direct child",
+        "operationId": "v1_api_coordinator_{ws_id}_stop_cascade_post",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Cancels the coordinator's in-flight generation AND dispatches ``cancel_workstream`` through the routing proxy for every direct child in the in-memory registry.  Grandchildren are not touched directly \u2014 they sit behind their parent's cancel, which propagates via the child's SSE stream.  Returns the per-child disposition (``cancelled`` / ``failed``) so the UI can show which children responded.  Writes ``coordinator.stopped_cascade`` with the two lists.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CoordinatorStopCascadeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/api/cluster/ws/{ws_id}/detail": {
+      "get": {
+        "summary": "Cluster-wide live workstream detail (storage + live block + tail)",
+        "operationId": "v1_api_cluster_ws_{ws_id}_detail_get",
+        "tags": [
+          "Coordinator"
+        ],
+        "description": "Aggregates the persisted row, a best-effort live block from the owning node (or the in-process coordinator manager for ``kind=\"coordinator\"`` rows), and the tail of the message history.  Gated on the ``admin.cluster.inspect`` permission (granted to ``builtin-admin`` via migration 040; revoke or reassign to a custom role for tighter control).  ``live`` is null on node unreachability / 5xx so callers can degrade gracefully.",
+        "parameters": [
+          {
+            "name": "ws_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "message_limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            },
+            "description": "Max conversation rows in the tail (default 20, clamped to 200)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterWsDetailResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error 400",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Error 403",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Error 404",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Error 503",
             "content": {
               "application/json": {
                 "schema": {
@@ -4777,12 +6568,41 @@
             "default": true,
             "title": "Reachable",
             "type": "boolean"
+          },
+          "metadata": {
+            "items": {
+              "$ref": "#/components/schemas/NodeMetadataEntry"
+            },
+            "title": "Metadata",
+            "type": "array"
           }
         },
         "required": [
           "node_id"
         ],
         "title": "NodeDetailResponse",
+        "type": "object"
+      },
+      "NodeMetadataEntry": {
+        "properties": {
+          "key": {
+            "title": "Key",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          },
+          "source": {
+            "default": "user",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "value"
+        ],
+        "title": "NodeMetadataEntry",
         "type": "object"
       },
       "ClusterSnapshotResponse": {
@@ -4863,6 +6683,45 @@
         "title": "ClusterSnapshotNode",
         "type": "object"
       },
+      "ClusterWsDetailResponse": {
+        "description": "Response body for GET /v1/api/cluster/ws/{ws_id}/detail.\n\nAggregates the persisted workstream row with a best-effort live block\nfetched from the owning node (or the in-process coordinator manager\nfor ``kind=\"coordinator\"`` rows).  ``live`` is ``null`` when the\nowning node is unreachable, returns 5xx, or doesn't have the row in\nits in-memory dashboard cache \u2014 callers degrade gracefully without\ntreating it as an error.",
+        "properties": {
+          "persisted": {
+            "additionalProperties": true,
+            "description": "Full storage row for the workstream (state, kind, parent_ws_id, etc.).",
+            "title": "Persisted",
+            "type": "object"
+          },
+          "live": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Live in-flight counters (state, tokens, activity, pending_approval) when the owning node returns them; null on degrade.",
+            "title": "Live"
+          },
+          "messages": {
+            "description": "Tail of the workstream's reconstructed message history.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "persisted"
+        ],
+        "title": "ClusterWsDetailResponse",
+        "type": "object"
+      },
       "ConsoleCreateWsRequest": {
         "properties": {
           "node_id": {
@@ -4899,6 +6758,12 @@
             "default": "",
             "description": "Workstream ID to resume (loads previous conversation)",
             "title": "Resume Ws",
+            "type": "string"
+          },
+          "judge_model": {
+            "default": "",
+            "description": "Override judge model alias for this workstream",
+            "title": "Judge Model",
             "type": "string"
           }
         },
@@ -4968,6 +6833,551 @@
         "title": "ConsoleHealthResponse",
         "type": "object"
       },
+      "CoordinatorApproveRequest": {
+        "description": "Body for POST /v1/api/coordinator/{ws_id}/approve.",
+        "properties": {
+          "approved": {
+            "description": "True approves the pending tool call(s); False denies.",
+            "title": "Approved",
+            "type": "boolean"
+          },
+          "feedback": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional human feedback string forwarded to the model.",
+            "title": "Feedback"
+          },
+          "always": {
+            "default": false,
+            "description": "When approved=True, also adds the pending tool name(s) to the session's auto-approve set so subsequent calls of the same tool skip the prompt.",
+            "title": "Always",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "approved"
+        ],
+        "title": "CoordinatorApproveRequest",
+        "type": "object"
+      },
+      "CoordinatorChildInfo": {
+        "description": "Per-row shape in the coordinator children listing.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Node Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Name"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "State"
+          },
+          "created": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Created"
+          },
+          "updated": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Updated"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
+          },
+          "parent_ws_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Parent Ws Id"
+          },
+          "skill_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Skill Id"
+          },
+          "skill_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Skill Version"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "CoordinatorChildInfo",
+        "type": "object"
+      },
+      "CoordinatorChildrenResponse": {
+        "description": "Response body for GET /v1/api/coordinator/{ws_id}/children.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CoordinatorChildInfo"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "truncated": {
+            "default": false,
+            "description": "True when the storage page filled the cap; more rows may exist.",
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "title": "CoordinatorChildrenResponse",
+        "type": "object"
+      },
+      "CoordinatorCreateRequest": {
+        "description": "Body for POST /v1/api/coordinator/new.",
+        "properties": {
+          "name": {
+            "default": "",
+            "description": "Optional display name; auto-generated when empty.",
+            "title": "Name",
+            "type": "string"
+          },
+          "skill": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional skill name to apply to the coordinator session.",
+            "title": "Skill"
+          },
+          "initial_message": {
+            "default": "",
+            "description": "Optional first user message dispatched to the new coordinator session.",
+            "title": "Initial Message",
+            "type": "string"
+          }
+        },
+        "title": "CoordinatorCreateRequest",
+        "type": "object"
+      },
+      "CoordinatorCreateResponse": {
+        "description": "Response body for POST /v1/api/coordinator/new (201).",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name"
+        ],
+        "title": "CoordinatorCreateResponse",
+        "type": "object"
+      },
+      "CoordinatorDetailResponse": {
+        "description": "Response body for GET /v1/api/coordinator/{ws_id}.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          },
+          "kind": {
+            "default": "coordinator",
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state",
+          "user_id"
+        ],
+        "title": "CoordinatorDetailResponse",
+        "type": "object"
+      },
+      "CoordinatorHistoryResponse": {
+        "description": "Response body for GET /v1/api/coordinator/{ws_id}/history.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "messages": {
+            "description": "Tail of the coordinator's reconstructed message history (provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` query parameter (default 100, max 500).",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Messages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "ws_id"
+        ],
+        "title": "CoordinatorHistoryResponse",
+        "type": "object"
+      },
+      "CoordinatorInfo": {
+        "description": "Per-coordinator row in the list response.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name",
+          "state",
+          "user_id"
+        ],
+        "title": "CoordinatorInfo",
+        "type": "object"
+      },
+      "CoordinatorListResponse": {
+        "description": "Response body for GET /v1/api/coordinator.",
+        "properties": {
+          "coordinators": {
+            "items": {
+              "$ref": "#/components/schemas/CoordinatorInfo"
+            },
+            "title": "Coordinators",
+            "type": "array"
+          }
+        },
+        "title": "CoordinatorListResponse",
+        "type": "object"
+      },
+      "CoordinatorOpenResponse": {
+        "description": "Response body for POST /v1/api/coordinator/{ws_id}/open.",
+        "properties": {
+          "ws_id": {
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "already_loaded": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "True when the coordinator was already in memory; absent after a fresh rehydrate.",
+            "title": "Already Loaded"
+          }
+        },
+        "required": [
+          "ws_id",
+          "name"
+        ],
+        "title": "CoordinatorOpenResponse",
+        "type": "object"
+      },
+      "CoordinatorRestrictRequest": {
+        "description": "Body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "properties": {
+          "revoke": {
+            "description": "Tool names to add to the session's revoked set.  Once revoked the coordinator cannot invoke the named tools on subsequent turns without closing and re-opening the session.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Revoke",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revoke"
+        ],
+        "title": "CoordinatorRestrictRequest",
+        "type": "object"
+      },
+      "CoordinatorRestrictResponse": {
+        "description": "Response body for POST /v1/api/coordinator/{ws_id}/restrict.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "revoked_tools": {
+            "description": "Full post-revocation set of revoked tool names.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Revoked Tools",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revoked_tools"
+        ],
+        "title": "CoordinatorRestrictResponse",
+        "type": "object"
+      },
+      "CoordinatorSendRequest": {
+        "description": "Body for POST /v1/api/coordinator/{ws_id}/send.",
+        "properties": {
+          "message": {
+            "description": "User message to queue onto the coordinator's worker.",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "CoordinatorSendRequest",
+        "type": "object"
+      },
+      "CoordinatorStopCascadeResponse": {
+        "description": "Response body for POST /v1/api/coordinator/{ws_id}/stop_cascade.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "cancelled": {
+            "description": "Child ws_ids that accepted the cancel dispatch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled",
+            "type": "array"
+          },
+          "failed": {
+            "description": "Child ws_ids whose cancel dispatch returned an error other than an already-gone 404 \u2014 the cascade continues on per-child failure so a single unreachable node doesn't abort the whole batch.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Failed",
+            "type": "array"
+          },
+          "skipped": {
+            "description": "Child ws_ids that returned 404 on cancel (already gone).  Reported separately from ``failed`` so operators can distinguish already-done from dispatch-broken.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Skipped",
+            "type": "array"
+          }
+        },
+        "title": "CoordinatorStopCascadeResponse",
+        "type": "object"
+      },
+      "CoordinatorTaskInfo": {
+        "description": "Per-task row in the coordinator's task envelope.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "status": {
+            "description": "One of: pending / in_progress / done / blocked.",
+            "title": "Status",
+            "type": "string"
+          },
+          "child_ws_id": {
+            "default": "",
+            "title": "Child Ws Id",
+            "type": "string"
+          },
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "updated": {
+            "title": "Updated",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "status",
+          "created",
+          "updated"
+        ],
+        "title": "CoordinatorTaskInfo",
+        "type": "object"
+      },
+      "CoordinatorTasksResponse": {
+        "description": "Response body for GET /v1/api/coordinator/{ws_id}/tasks.\n\nMirrors the envelope the ``task_list(action='list')`` model tool returns.",
+        "properties": {
+          "version": {
+            "default": 1,
+            "title": "Version",
+            "type": "integer"
+          },
+          "tasks": {
+            "items": {
+              "$ref": "#/components/schemas/CoordinatorTaskInfo"
+            },
+            "title": "Tasks",
+            "type": "array"
+          }
+        },
+        "title": "CoordinatorTasksResponse",
+        "type": "object"
+      },
+      "CoordinatorTrustRequest": {
+        "description": "Body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "properties": {
+          "send": {
+            "description": "When true, ``send_to_workstream`` calls that target a ws_id in the coordinator's own subtree skip the approval prompt.  Foreign ws_ids continue to require approval \u2014 trust only relaxes the guard for work the orchestrator itself spawned.",
+            "title": "Send",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "send"
+        ],
+        "title": "CoordinatorTrustRequest",
+        "type": "object"
+      },
+      "CoordinatorTrustResponse": {
+        "description": "Response body for POST /v1/api/coordinator/{ws_id}/trust.",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          },
+          "trust_send": {
+            "description": "Post-toggle value of the flag.",
+            "title": "Trust Send",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "trust_send"
+        ],
+        "title": "CoordinatorTrustResponse",
+        "type": "object"
+      },
       "CreateScheduleRequest": {
         "description": "POST /v1/api/admin/schedules request body.",
         "properties": {
@@ -5033,6 +7443,17 @@
             "description": "Skill name (replaces default skills)",
             "title": "Skill",
             "type": "string"
+          },
+          "notify_targets": {
+            "description": "Notification targets on completion (channel_type + channel_id/user_id)",
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Notify Targets",
+            "type": "array"
           },
           "enabled": {
             "default": true,
@@ -5186,6 +7607,24 @@
             "default": null,
             "title": "Skill"
           },
+          "notify_targets": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Notify Targets"
+          },
           "enabled": {
             "anyOf": [
               {
@@ -5262,6 +7701,16 @@
             "default": "",
             "title": "Skill",
             "type": "string"
+          },
+          "notify_targets": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": "Notify Targets",
+            "type": "array"
           },
           "enabled": {
             "default": true,
@@ -6920,6 +9369,42 @@
             "title": "Enabled",
             "type": "boolean"
           },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
+          },
           "source": {
             "default": "",
             "title": "Source",
@@ -6988,6 +9473,42 @@
             "default": true,
             "title": "Enabled",
             "type": "boolean"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
           }
         },
         "required": [
@@ -7095,6 +9616,42 @@
             ],
             "default": null,
             "title": "Enabled"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Temperature"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "reasoning_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Effort"
           }
         },
         "title": "UpdateModelDefinitionRequest",
@@ -7308,6 +9865,16 @@
             },
             "title": "Models",
             "type": "array"
+          },
+          "default_alias": {
+            "default": "",
+            "title": "Default Alias",
+            "type": "string"
+          },
+          "channel_default_alias": {
+            "default": "",
+            "title": "Channel Default Alias",
+            "type": "string"
           }
         },
         "title": "ListAvailableModelsResponse",
@@ -7613,9 +10180,9 @@
             "title": "Installed",
             "type": "boolean"
           },
-          "scan_status": {
+          "risk_level": {
             "default": "",
-            "title": "Scan Status",
+            "title": "Risk Level",
             "type": "string"
           },
           "template_id": {
@@ -7857,9 +10424,13 @@
             "title": "Compatibility",
             "type": "string"
           },
-          "scan_status": {
+          "kind": {
+            "$ref": "#/components/schemas/SkillKind",
+            "default": "any"
+          },
+          "risk_level": {
             "default": "",
-            "title": "Scan Status",
+            "title": "Risk Level",
             "type": "string"
           },
           "scan_report": {
@@ -7918,6 +10489,16 @@
         "title": "SkillInstallSkipped",
         "type": "object"
       },
+      "SkillKind": {
+        "description": "Which ``list_skills`` surface a skill row is visible on.\n\n``INTERACTIVE`` \u2014 only the interactive-session activation path sees\nthis row.  ``COORDINATOR`` \u2014 only the coordinator's ``list_skills``\ntool sees this row.  ``ANY`` \u2014 both sides (default for legacy rows\npredating the classifier).",
+        "enum": [
+          "interactive",
+          "coordinator",
+          "any"
+        ],
+        "title": "SkillKind",
+        "type": "string"
+      },
       "SkillVersionInfo": {
         "properties": {
           "id": {
@@ -7972,7 +10553,9 @@
             "type": "string"
           },
           "description": {
-            "default": "",
+            "description": "Human-readable description surfaced by ``list_skills`` and the admin UI.  Must be non-empty \u2014 catches skills registered without thinking about discoverability before they reach a model's tool-selection prompt.",
+            "maxLength": 1024,
+            "minLength": 1,
             "title": "Description",
             "type": "string"
           },
@@ -8096,11 +10679,17 @@
             "default": "",
             "title": "Compatibility",
             "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SkillKind",
+            "default": "any",
+            "description": "Classifier routing the skill to ``list_skills`` calls.  ``interactive`` is visible only to the interactive-session activation path; ``coordinator`` is visible only to the coordinator's ``list_skills`` tool; ``any`` (default) is visible on both sides, which preserves pre-upgrade behaviour for legacy rows."
           }
         },
         "required": [
           "name",
-          "content"
+          "content",
+          "description"
         ],
         "title": "CreateSkillRequest",
         "type": "object"
@@ -8146,6 +10735,8 @@
           "description": {
             "anyOf": [
               {
+                "maxLength": 1024,
+                "minLength": 1,
                 "type": "string"
               },
               {
@@ -8153,6 +10744,7 @@
               }
             ],
             "default": null,
+            "description": "When present, replaces the skill description.  Must be non-empty \u2014 the admin endpoint rejects a blanking update.",
             "title": "Description"
           },
           "tags": {
@@ -8382,6 +10974,18 @@
             ],
             "default": null,
             "title": "Compatibility"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SkillKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "When present, updates the skill's classifier.  Same accepted values as ``CreateSkillRequest.kind``."
           }
         },
         "title": "UpdateSkillRequest",
@@ -8499,6 +11103,47 @@
           "resources"
         ],
         "title": "ListSkillResourcesResponse",
+        "type": "object"
+      },
+      "RouteResponse": {
+        "description": "Route lookup result \u2014 which node owns a workstream.",
+        "properties": {
+          "node_url": {
+            "title": "Node Url",
+            "type": "string"
+          },
+          "node_id": {
+            "title": "Node Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_url",
+          "node_id"
+        ],
+        "title": "RouteResponse",
+        "type": "object"
+      },
+      "RouteCreateResponse": {
+        "description": "Workstream creation via the routing proxy.",
+        "properties": {
+          "ws_id": {
+            "default": "",
+            "title": "Ws Id",
+            "type": "string"
+          },
+          "node_url": {
+            "default": "",
+            "title": "Node Url",
+            "type": "string"
+          },
+          "node_id": {
+            "default": "",
+            "title": "Node Id",
+            "type": "string"
+          }
+        },
+        "title": "RouteCreateResponse",
         "type": "object"
       },
       "SkillSummary": {

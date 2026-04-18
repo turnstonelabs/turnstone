@@ -42,7 +42,13 @@ from starlette.staticfiles import StaticFiles
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
 from turnstone.api.server_spec import build_server_spec
-from turnstone.core.auth import JWT_AUD_SERVER, AuthMiddleware, jwt_version_slot
+from turnstone.core.auth import (
+    DENY_EMPTY_SUB,
+    JWT_AUD_SERVER,
+    AuthMiddleware,
+    _DenyFilter,
+    jwt_version_slot,
+)
 from turnstone.core.log import get_logger
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.ratelimit import resolve_client_ip
@@ -3187,6 +3193,35 @@ def _auth_user_id(request: Request) -> str:
 def _auth_scopes(request: Request) -> set[str]:
     auth = getattr(getattr(request, "state", None), "auth_result", None)
     return set(getattr(auth, "scopes", []) or [])
+
+
+def _effective_user_filter(request: Request) -> str | None | _DenyFilter:
+    """Resolve the effective ``user_id`` filter for a tenant-scoped aggregate.
+
+    Server-side analog of the console helper of the same name.  Node
+    servers authenticate with JWTs that carry a ``sub`` (the workstream
+    owner) plus scopes; there is no "admin" role on the node side.
+    The service scope is the sole cluster-wide bypass (used by the
+    console routing proxy).
+
+    Returns:
+
+    - ``None`` — service-scoped caller; no tenant filter.
+    - ``str`` — end-user caller with a resolved uid; storage helpers
+      MUST receive ``user_id=<uid>`` and push the filter into SQL.
+    - :data:`DENY_EMPTY_SUB` — end-user caller whose ``sub`` claim is
+      blank.  Callers MUST short-circuit with their endpoint's
+      empty-shape response.
+
+    Mirrors the class-level tenancy contract on
+    :class:`~turnstone.core.storage._protocol.StorageBackend`.
+    """
+    if "service" in _auth_scopes(request):
+        return None
+    uid = _auth_user_id(request)
+    if not uid:
+        return DENY_EMPTY_SUB
+    return uid
 
 
 def _require_ws_access(

@@ -1611,7 +1611,7 @@ version. Requires the `admin.skills` permission.
 
 ```json
 {
-  "scan_status": "medium",
+  "risk_level": "medium",
   "scan_report": "{\"composite\": 1.75, \"details\": {...}}",
   "scan_version": "1"
 }

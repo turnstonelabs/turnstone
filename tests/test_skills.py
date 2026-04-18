@@ -794,7 +794,11 @@ class TestSkillAPI:
         content = "x" * 400  # 400 chars -> 100 tokens (400 // 4)
         resp = api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "estimated-skill", "content": content},
+            json={
+                "name": "estimated-skill",
+                "content": content,
+                "description": "estimation test",
+            },
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -804,7 +808,7 @@ class TestSkillAPI:
         """Creating without name returns 400."""
         resp = api_client.post(
             "/v1/api/admin/skills",
-            json={"content": "some content"},
+            json={"content": "some content", "description": "desc"},
         )
         assert resp.status_code == 400
         assert "name" in resp.json()["error"].lower()
@@ -813,10 +817,102 @@ class TestSkillAPI:
         """Creating without content returns 400."""
         resp = api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "no-content"},
+            json={"name": "no-content", "description": "desc"},
         )
         assert resp.status_code == 400
         assert "content" in resp.json()["error"].lower()
+
+    def test_create_skill_requires_description(self, api_client):
+        """Creating without description returns 400 — empty descriptions
+        break discoverability in list_skills."""
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={"name": "no-desc", "content": "some content"},
+        )
+        assert resp.status_code == 400
+        assert "description" in resp.json()["error"].lower()
+
+    def test_create_skill_rejects_blank_description(self, api_client):
+        """An all-whitespace description is treated the same as empty."""
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "blank-desc",
+                "content": "some content",
+                "description": "   \t  ",
+            },
+        )
+        assert resp.status_code == 400
+        assert "description" in resp.json()["error"].lower()
+
+    def test_update_skill_rejects_blanking_description(self, api_client, api_storage):
+        """An update cannot blank out the description — operators must
+        supply a non-empty replacement or omit the field."""
+        _create_template(api_storage, "s1", "keep-desc", "content", description="existing desc")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"description": "  "},
+        )
+        assert resp.status_code == 400
+        assert "description" in resp.json()["error"].lower()
+
+    def test_create_skill_default_kind_is_any(self, api_client):
+        """Skills without an explicit ``kind`` default to ``any`` so
+        pre-upgrade catalogs keep showing up on both interactive and
+        coordinator sides."""
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "kind-default",
+                "content": "content",
+                "description": "no explicit kind",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["kind"] == "any"
+
+    def test_create_skill_accepts_explicit_kind(self, api_client):
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "kind-coord",
+                "content": "content",
+                "description": "coord only",
+                "kind": "coordinator",
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["kind"] == "coordinator"
+
+    def test_create_skill_rejects_invalid_kind(self, api_client):
+        resp = api_client.post(
+            "/v1/api/admin/skills",
+            json={
+                "name": "kind-bad",
+                "content": "content",
+                "description": "bad kind",
+                "kind": "nonsense",
+            },
+        )
+        assert resp.status_code == 400
+        assert "kind" in resp.json()["error"].lower()
+
+    def test_update_skill_kind_round_trip(self, api_client, api_storage):
+        _create_template(api_storage, "s1", "kind-upd", "content", description="initial")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"kind": "interactive"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["kind"] == "interactive"
+
+    def test_update_skill_rejects_invalid_kind(self, api_client, api_storage):
+        _create_template(api_storage, "s1", "kind-upd-bad", "content", description="initial")
+        resp = api_client.put(
+            "/v1/api/admin/skills/s1",
+            json={"kind": "bogus"},
+        )
+        assert resp.status_code == 400
 
     def test_update_skill_endpoint(self, api_client, api_storage):
         """PUT /v1/api/admin/skills/{id} updates new fields."""
@@ -978,6 +1074,7 @@ class TestSkillAPI:
             json={
                 "name": "auto-default",
                 "content": "auto default content",
+                "description": "activation default",
                 "activation": "default",
             },
         )
@@ -993,6 +1090,7 @@ class TestSkillAPI:
             json={
                 "name": "default-derived",
                 "content": "derived content",
+                "description": "is_default derived",
                 "is_default": True,
             },
         )
@@ -1439,11 +1537,15 @@ class TestSkillAdminEndpoints:
         """POST with existing name returns 409."""
         full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "dup-skill", "content": "content"},
+            json={"name": "dup-skill", "content": "content", "description": "first"},
         )
         resp = full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "dup-skill", "content": "other content"},
+            json={
+                "name": "dup-skill",
+                "content": "other content",
+                "description": "second",
+            },
         )
         assert resp.status_code == 409
 
@@ -1471,7 +1573,7 @@ class TestSkillAdminEndpoints:
         """PUT with new fields updates the skill."""
         create_resp = full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "update-me", "content": "old content"},
+            json={"name": "update-me", "content": "old content", "description": "pre"},
         )
         skill_id = create_resp.json()["template_id"]
 
@@ -1493,7 +1595,7 @@ class TestSkillAdminEndpoints:
         """DELETE removes the skill and subsequent GET returns 404."""
         create_resp = full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "delete-me", "content": "content"},
+            json={"name": "delete-me", "content": "content", "description": "doomed"},
         )
         skill_id = create_resp.json()["template_id"]
 
@@ -1508,11 +1610,11 @@ class TestSkillAdminEndpoints:
         """GET /v1/api/skills excludes disabled skills."""
         full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "enabled-skill", "content": "content"},
+            json={"name": "enabled-skill", "content": "content", "description": "on"},
         )
         create_resp = full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "disabled-skill", "content": "content"},
+            json={"name": "disabled-skill", "content": "content", "description": "off"},
         )
         skill_id = create_resp.json()["template_id"]
         full_api_client.put(
@@ -1530,7 +1632,7 @@ class TestSkillAdminEndpoints:
         """GET /v1/api/admin/skills/{id}/versions returns version history."""
         create_resp = full_api_client.post(
             "/v1/api/admin/skills",
-            json={"name": "versioned-skill", "content": "v1 content"},
+            json={"name": "versioned-skill", "content": "v1 content", "description": "v1"},
         )
         skill_id = create_resp.json()["template_id"]
 
@@ -1568,7 +1670,11 @@ class TestSkillAdminEndpoints:
         for i in range(5):
             full_api_client.post(
                 "/v1/api/admin/skills",
-                json={"name": f"page-skill-{i}", "content": f"content {i}"},
+                json={
+                    "name": f"page-skill-{i}",
+                    "content": f"content {i}",
+                    "description": f"desc {i}",
+                },
             )
         # Limit
         resp = full_api_client.get("/v1/api/admin/skills?limit=2")

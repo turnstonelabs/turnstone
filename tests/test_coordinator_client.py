@@ -132,8 +132,12 @@ def _mock_client(
     http = httpx.Client(transport=transport)
     storage = SQLiteBackend(":memory:")
     storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
-    storage.register_workstream("ws-x", kind="interactive", parent_ws_id="coord-1")
-    storage.register_workstream("ws-y", kind="interactive", parent_ws_id="coord-1")
+    storage.register_workstream(
+        "ws-x", kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
+    storage.register_workstream(
+        "ws-y", kind="interactive", parent_ws_id="coord-1", user_id="user-1"
+    )
     client = CoordinatorClient(
         console_base_url="http://console",
         storage=storage,
@@ -899,6 +903,61 @@ def test_list_skills_truncation_signal(storage_with_skills):
     result = client.list_skills(limit=2)
     assert len(result["skills"]) == 2
     assert result["truncated"] is True
+
+
+def test_list_skills_hides_interactive_only_skills(tmp_path):
+    """CoordinatorClient.list_skills must narrow the storage query to
+    ``kinds=['coordinator', 'any']`` so interactive-only skills (which
+    are meant for child workstreams) don't pollute the orchestrator's
+    tool surface.  Regression lock for a load-bearing invariant that
+    the fixture-based tests above can't exercise because their skills
+    all default to ``kind='any'``."""
+    st = SQLiteBackend(str(tmp_path / "kinds.db"))
+    st.create_prompt_template(
+        template_id="k1",
+        name="interactive-only",
+        category="general",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        description="interactive only",
+        kind="interactive",
+    )
+    st.create_prompt_template(
+        template_id="k2",
+        name="coord-only",
+        category="general",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        description="coordinator only",
+        kind="coordinator",
+    )
+    st.create_prompt_template(
+        template_id="k3",
+        name="universal",
+        category="general",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        description="everywhere",
+        kind="any",
+    )
+
+    client = _make_read_client(st)
+    result = client.list_skills()
+    names = {s["name"] for s in result["skills"]}
+    assert "interactive-only" not in names
+    assert names == {"coord-only", "universal"}
+    # And the kind projection comes through on every returned row.
+    for skill in result["skills"]:
+        assert skill["kind"] in {"coordinator", "any"}
 
 
 def test_list_skills_projects_allowed_tools_capped_with_sentinel(tmp_path):
