@@ -191,6 +191,8 @@ class WorkstreamInfo(BaseModel):
     id: str
     name: str
     state: str
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    parent_ws_id: str | None = None
 
 
 class ListWorkstreamsResponse(BaseModel):
@@ -210,6 +212,9 @@ class DashboardWorkstream(BaseModel):
     node: str = ""
     model: str = ""
     model_alias: str = ""
+    kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    parent_ws_id: str | None = None
+    user_id: str = ""
 
 
 class DashboardAggregate(BaseModel):

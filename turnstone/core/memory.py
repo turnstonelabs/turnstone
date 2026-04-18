@@ -344,28 +344,6 @@ def update_workstream_name(ws_id: str, name: str) -> None:
         log.warning("Failed to update workstream name ws=%s", ws_id, exc_info=True)
 
 
-def list_workstreams(
-    node_id: str | None = None,
-    limit: int = 100,
-    *,
-    parent_ws_id: str | None = None,
-    kind: WorkstreamKind | str | None = None,
-    user_id: str | None = None,
-) -> list[Any]:
-    """List workstreams, optionally filtered by node/parent/kind/user."""
-    try:
-        return get_storage().list_workstreams(
-            node_id,
-            limit,
-            parent_ws_id=parent_ws_id,
-            kind=kind,
-            user_id=user_id,
-        )
-    except Exception:
-        log.warning("Failed to list workstreams", exc_info=True)
-        return []
-
-
 def list_workstreams_with_history(limit: int = 20) -> list[Any]:
     """List workstreams that have conversation messages."""
     try:

@@ -197,9 +197,12 @@ class TestDeleteWorkstream:
 class TestSetWorkstreamTitle:
     def test_set_title_success(self, title_client, storage):
         client, mock_mgr = title_client
-        storage.register_workstream("ws-abc", "node-1", name="test")
-        mock_ws = MagicMock()
-        mock_mgr.get.return_value = mock_ws
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        # mgr.get returning None makes _require_ws_access fall through to
+        # the storage-backed ownership check (caller == "test-user" matches
+        # the registered owner).  Tests that need a ws returned from the
+        # manager set up mock_ws.user_id explicitly.
+        mock_mgr.get.return_value = None
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
             json={"title": "New Title"},
@@ -208,8 +211,9 @@ class TestSetWorkstreamTitle:
         assert r.json()["title"] == "New Title"
 
     def test_set_title_empty(self, title_client, storage):
-        client, _ = title_client
+        client, mock_mgr = title_client
         storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        mock_mgr.get.return_value = None
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
             json={"title": ""},
@@ -218,8 +222,9 @@ class TestSetWorkstreamTitle:
         assert "required" in r.json()["error"].lower()
 
     def test_set_title_missing_body(self, title_client, storage):
-        client, _ = title_client
+        client, mock_mgr = title_client
         storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        mock_mgr.get.return_value = None
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
             json={},
@@ -228,8 +233,8 @@ class TestSetWorkstreamTitle:
 
     def test_set_title_truncation(self, title_client, storage):
         client, mock_mgr = title_client
-        storage.register_workstream("ws-abc", "node-1", name="test")
-        mock_mgr.get.return_value = MagicMock()
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        mock_mgr.get.return_value = None
         long_title = "x" * 200
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
@@ -239,10 +244,11 @@ class TestSetWorkstreamTitle:
         assert len(r.json()["title"]) <= 80
 
     def test_set_title_alias_conflict(self, title_client, storage):
-        client, _ = title_client
-        storage.register_workstream("ws-1", "node-1", name="first")
-        storage.register_workstream("ws-2", "node-1", name="second")
+        client, mock_mgr = title_client
+        storage.register_workstream("ws-1", "node-1", name="first", user_id="test-user")
+        storage.register_workstream("ws-2", "node-1", name="second", user_id="test-user")
         storage.set_workstream_alias("ws-1", "taken-name")
+        mock_mgr.get.return_value = None
         r = client.post(
             "/v1/api/workstreams/ws-2/title",
             json={"title": "taken-name"},
@@ -259,7 +265,11 @@ class TestRefreshWorkstreamTitle:
     def test_refresh_success(self, title_client, storage):
         client, mock_mgr = title_client
         storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
+        # The in-memory fast path on _require_ws_access checks ws.user_id
+        # before falling back to storage, so the mock returned by
+        # mgr.get must carry the expected owner.
         mock_ws = MagicMock()
+        mock_ws.user_id = "test-user"
         mock_ws.session = MagicMock()
         mock_mgr.get.return_value = mock_ws
         with patch("turnstone.core.memory.get_workstream_display_name", return_value="Old Title"):

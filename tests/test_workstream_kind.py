@@ -78,6 +78,29 @@ def test_register_rejects_unknown_kind(storage):
     assert storage.get_workstream("ws-bogus") is None
 
 
+def test_delete_workstream_nulls_child_parent_ws_id(storage):
+    """Deleting a coordinator must null-out its children's parent_ws_id
+    so list_workstreams(parent_ws_id=<deleted>) doesn't keep returning
+    ghost-parented rows."""
+    storage.register_workstream("coord", kind="coordinator", user_id="user-1")
+    storage.register_workstream(
+        "child-a", kind="interactive", parent_ws_id="coord", user_id="user-1"
+    )
+    storage.register_workstream(
+        "child-b", kind="interactive", parent_ws_id="coord", user_id="user-1"
+    )
+
+    assert storage.delete_workstream("coord") is True
+
+    # Children still exist but with NULL parent_ws_id.
+    for cid in ("child-a", "child-b"):
+        row = storage.get_workstream(cid)
+        assert row is not None, f"{cid} should survive parent deletion"
+        assert row["parent_ws_id"] is None, f"{cid} still points at ghost coord"
+    # No rows match the deleted coord's parent filter.
+    assert storage.list_workstreams(parent_ws_id="coord") == []
+
+
 def test_list_workstreams_filter_by_user_id(storage):
     """The user_id kwarg pushes tenant scoping into SQL so callers
     can't forget to filter client-side."""

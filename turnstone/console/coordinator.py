@@ -708,9 +708,18 @@ class CoordinatorManager:
                 coord_ws_id[:8],
             )
             return
+        # Cap is a sentinel, not a hard limit.  The rebuild runs at most
+        # once per console cold-start per coordinator, so the fetch cost
+        # is irrelevant; what matters is visibility when a coord has
+        # more children than the cap — previously the tail was dropped
+        # silently on every restart.  Fetch ``_rebuild_limit + 1`` so a
+        # coord with exactly ``_rebuild_limit`` children (no truncation
+        # yet) doesn't trigger a false-positive warning; the +1 is the
+        # sentinel that proves there's at least one more row in storage.
+        _rebuild_limit = 10_000
         try:
             rows = self._storage.list_workstreams(
-                limit=1000,
+                limit=_rebuild_limit + 1,
                 parent_ws_id=coord_ws_id,
                 kind=None,
                 user_id=coord_user_id,
@@ -722,6 +731,13 @@ class CoordinatorManager:
                 exc_info=True,
             )
             rows = []
+        if len(rows) > _rebuild_limit:
+            log.warning(
+                "coord_mgr.rebuild_children_truncated ws=%s limit=%d",
+                coord_ws_id[:8],
+                _rebuild_limit,
+            )
+            rows = rows[:_rebuild_limit]
         child_ids: list[str] = []
         for r in rows:
             try:
