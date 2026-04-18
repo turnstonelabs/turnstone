@@ -176,8 +176,9 @@ class TestDeleteWorkstream:
         assert r.status_code == 404
         assert "not found" in r.json()["error"].lower()
 
-    def test_delete_error_redacted(self, delete_client):
+    def test_delete_error_redacted(self, delete_client, storage):
         """500 response should not leak exception internals."""
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
         with patch(
             "turnstone.core.memory.delete_workstream",
             side_effect=RuntimeError("secret internal detail"),
@@ -206,8 +207,9 @@ class TestSetWorkstreamTitle:
         assert r.status_code == 200
         assert r.json()["title"] == "New Title"
 
-    def test_set_title_empty(self, title_client):
+    def test_set_title_empty(self, title_client, storage):
         client, _ = title_client
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
             json={"title": ""},
@@ -215,8 +217,9 @@ class TestSetWorkstreamTitle:
         assert r.status_code == 400
         assert "required" in r.json()["error"].lower()
 
-    def test_set_title_missing_body(self, title_client):
+    def test_set_title_missing_body(self, title_client, storage):
         client, _ = title_client
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
         r = client.post(
             "/v1/api/workstreams/ws-abc/title",
             json={},
@@ -253,8 +256,9 @@ class TestSetWorkstreamTitle:
 
 
 class TestRefreshWorkstreamTitle:
-    def test_refresh_success(self, title_client):
+    def test_refresh_success(self, title_client, storage):
         client, mock_mgr = title_client
+        storage.register_workstream("ws-abc", "node-1", name="test", user_id="test-user")
         mock_ws = MagicMock()
         mock_ws.session = MagicMock()
         mock_mgr.get.return_value = mock_ws

@@ -975,6 +975,12 @@ async def events_sse(request: Request) -> Response:
     """GET /v1/api/events — per-workstream SSE event stream."""
     mgr = request.app.state.workstreams
     ws_id = request.query_params.get("ws_id")
+    # Subscribing to another tenant's stream would leak their messages,
+    # tool calls, and pending approvals in real time.  Gate before
+    # _register_listener so non-owners get a flat 404 (no enumeration).
+    _owner, err = _require_ws_access(request, ws_id or "")
+    if err:
+        return err
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
@@ -1135,6 +1141,15 @@ async def global_events_sse(request: Request) -> Response:
     (workstreams, health, aggregate) followed by real-time delta events.
     The snapshot and listener registration are atomic — no events are lost.
     """
+    # -- Service-scope gate ---------------------------------------------------
+    # The global stream carries cluster-wide workstream inventory across
+    # every tenant (user_id, kind, parent_ws_id, token counts) — intended
+    # for the console's ClusterCollector, not end-user browsers.  Require
+    # a service-scoped token so an authenticated end-user can't subscribe
+    # and observe cluster state for other tenants.
+    if "service" not in _auth_scopes(request):
+        return JSONResponse({"error": "service scope required"}, status_code=403)
+
     # -- Node identity check --------------------------------------------------
     expected = request.query_params.get("expected_node_id")
     actual_node_id = getattr(request.app.state, "node_id", "")
@@ -1185,13 +1200,29 @@ async def global_events_sse(request: Request) -> Response:
     return EventSourceResponse(event_generator(), ping=5)
 
 
+def _visible_workstreams(request: Request, wss: list[Workstream]) -> list[Workstream]:
+    """Filter an in-memory workstream list to the caller's tenant view.
+
+    Service-scoped tokens see everything (internal cluster callers,
+    console routing proxy).  End-user tokens see only workstreams they
+    own — a blank ``ws.user_id`` (legacy / pre-migration rows) is
+    hidden from non-service callers to prevent orphan leakage.
+    """
+    if "service" in _auth_scopes(request):
+        return wss
+    caller = _auth_user_id(request)
+    if not caller:
+        return []
+    return [ws for ws in wss if ws.user_id and ws.user_id == caller]
+
+
 async def list_workstreams(request: Request) -> JSONResponse:
-    """GET /v1/api/workstreams — list all workstreams."""
+    """GET /v1/api/workstreams — list workstreams visible to the caller."""
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
     result = []
-    for ws in mgr.list_all():
+    for ws in _visible_workstreams(request, mgr.list_all()):
         title = get_workstream_display_name(ws.id) or ws.name
         result.append(
             {
@@ -1208,7 +1239,7 @@ async def dashboard(request: Request) -> JSONResponse:
     from turnstone.core.memory import get_workstream_display_name
 
     mgr: WorkstreamManager = request.app.state.workstreams
-    wss = mgr.list_all()
+    wss = _visible_workstreams(request, mgr.list_all())
     total_tokens = 0
     total_tool_calls = 0
     active_count = 0
@@ -1772,6 +1803,12 @@ async def approve(request: Request) -> JSONResponse:
     feedback = body.get("feedback")
     always = body.get("always", False)
     ws_id = body.get("ws_id")
+    # Cross-tenant guard: resolving a pending tool approval on another
+    # tenant's workstream is RCE-adjacent (the victim queued a command
+    # expecting to decide themselves).  Gate before touching the UI.
+    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    if err:
+        return err
     mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
@@ -1799,6 +1836,9 @@ async def plan_feedback(request: Request) -> JSONResponse:
         return body
     feedback = body.get("feedback", "")
     ws_id = body.get("ws_id")
+    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    if err:
+        return err
     mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
@@ -1815,6 +1855,9 @@ async def cancel_generation(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
     ws_id = body.get("ws_id")
+    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    if err:
+        return err
     mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
@@ -1857,6 +1900,9 @@ async def command(request: Request) -> JSONResponse:
     ws_id = body.get("ws_id")
     if not cmd:
         return JSONResponse({"error": "Empty command"}, status_code=400)
+    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    if err:
+        return err
 
     mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
@@ -2295,6 +2341,7 @@ async def create_workstream(request: Request) -> JSONResponse:
       ``initial_message`` turn (if provided) before the worker dispatches.
     """
     from turnstone.core.attachments import IMAGE_SIZE_CAP
+    from turnstone.core.audit import record_audit
     from turnstone.core.memory import get_workstream_display_name
     from turnstone.core.web_helpers import (
         read_json_or_400,
@@ -2492,6 +2539,21 @@ async def create_workstream(request: Request) -> JSONResponse:
                     "user_id": ws.user_id,
                 }
             )
+        # Tamper-evident audit trail.  Lives alongside the broadcast
+        # event (not replacing it — the broadcast is ephemeral UI
+        # signalling, the audit row survives for forensic review).
+        _audit_storage = getattr(request.app.state, "auth_storage", None)
+        if _audit_storage is not None:
+            _, _audit_ip = _audit_context(request)
+            record_audit(
+                _audit_storage,
+                uid,
+                "workstream.created",
+                "workstream",
+                ws.id,
+                {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
+                _audit_ip,
+            )
         # Emit eviction event if a workstream was evicted to make room
         evicted = mgr.last_evicted
         if evicted is not None:
@@ -2663,29 +2725,50 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 async def close_workstream(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/close — close a workstream."""
+    from turnstone.core.audit import record_audit
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     ws_id = str(body.get("ws_id", ""))
+    # Cross-tenant close would abort another tenant's running generation.
+    # _require_ws_access returns 404 on non-owner — same shape as the
+    # "last workstream" (400) / "not found" (404) branches below.
+    owner_uid, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
     mgr = request.app.state.workstreams
     # Distinguish "last workstream" (400) from "not found" (404).
     # Note: get() and close() acquire the manager lock independently, so a
     # concurrent close between the two could produce a wrong error code.
     # The failure mode is cosmetic (400 instead of 404), not data corruption.
-    if not mgr.get(ws_id):
+    ws_before = mgr.get(ws_id)
+    if not ws_before:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
     if mgr.close(ws_id):
         gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
         with contextlib.suppress(queue.Full):
             gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
+        storage = getattr(request.app.state, "auth_storage", None)
+        if storage is not None:
+            _, ip = _audit_context(request)
+            record_audit(
+                storage,
+                owner_uid,
+                "workstream.closed",
+                "workstream",
+                ws_id,
+                {"kind": str(ws_before.kind), "parent_ws_id": ws_before.parent_ws_id},
+                ip,
+            )
         return JSONResponse({"status": "ok"})
     return JSONResponse({"error": "Cannot close last workstream"}, status_code=400)
 
 
 async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     """POST /v1/api/workstreams/{ws_id}/delete — permanently delete a saved workstream."""
+    from turnstone.core.audit import record_audit
     from turnstone.core.log import get_logger
     from turnstone.core.memory import delete_workstream
 
@@ -2694,9 +2777,33 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     if not ws_id:
         log.warning("ws.delete.failed", reason="empty_ws_id")
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    # Cross-tenant delete would destroy another tenant's workstream,
+    # conversations, and attachments in one call.  _require_ws_access
+    # returns 404 on mismatch so existence isn't enumerable.
+    owner_uid, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
+    # Snapshot kind/parent for the audit record before deletion wipes the row.
+    storage = getattr(request.app.state, "auth_storage", None)
+    row: dict[str, Any] = {}
+    if storage is not None:
+        row = storage.get_workstream(ws_id) or {}
+    kind = row.get("kind", "")
+    parent_ws_id = row.get("parent_ws_id")
+    _, ip = _audit_context(request)
     try:
         if delete_workstream(ws_id):
             log.info("ws.deleted", ws_id=ws_id[:8])
+            if storage is not None:
+                record_audit(
+                    storage,
+                    owner_uid,
+                    "workstream.deleted",
+                    "workstream",
+                    ws_id,
+                    {"kind": str(kind), "parent_ws_id": parent_ws_id},
+                    ip,
+                )
             return JSONResponse({"deleted": ws_id})
         log.warning("ws.delete.failed", reason="not_found", ws_id=ws_id[:8])
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
@@ -2713,6 +2820,12 @@ async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONRes
     log = get_logger(__name__)
     ws_id = request.path_params.get("ws_id", "")
     log.info("ws.title.refresh_requested", ws_id=ws_id[:8] if ws_id else "empty")
+    # Cross-tenant rename is a phishing / denial-of-use vector — a
+    # malicious caller could push the victim's title to a misleading
+    # string visible in list/dashboard responses.
+    _owner, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
     mgr = request.app.state.workstreams
     ws = mgr.get(ws_id)
     if not ws or not ws.session:
@@ -2745,6 +2858,10 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
     log.info("ws.title.set_requested", ws_id=ws_id[:8] if ws_id else "empty")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    # Cross-tenant rename gate — same rationale as refresh-title above.
+    _owner, err = _require_ws_access(request, ws_id)
+    if err:
+        return err
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
@@ -3171,15 +3288,21 @@ async def open_workstream(request: Request) -> JSONResponse:
             status_code=400,
         )
 
-    auth = getattr(getattr(request, "state", None), "auth_result", None)
-    uid: str = getattr(auth, "user_id", "") or ""
+    uid: str = _auth_user_id(request)
+    scopes = _auth_scopes(request)
+
+    # Ownership gate: the stored owner must match the caller (or the
+    # caller must hold the service scope, which covers the console
+    # routing proxy and cluster rehydration paths).  A legacy row with
+    # a blank owner is claimable by the authenticated caller — same
+    # semantics as _require_ws_access for the interactive handlers.
+    # 404 (not 403) so existence isn't enumerable by non-owners.
+    stored_owner = (ws_row.get("user_id") or "").strip()
+    if stored_owner and "service" not in scopes and stored_owner != uid:
+        return JSONResponse({"error": "Workstream not found"}, status_code=404)
+    owner_uid = stored_owner or uid
 
     try:
-        # Prefer the persisted owner (this workstream may have been created
-        # by a trusted-service forwarder) and only fall back to the
-        # authenticated caller if the stored row has no owner recorded.
-        stored_owner = (ws_row.get("user_id") or "").strip()
-        owner_uid = stored_owner or uid
         ws = mgr.create(
             name=ws_row.get("name", ""),
             ui_factory=lambda wid, **kw: WebUI(ws_id=wid, user_id=owner_uid, **kw),
@@ -3217,6 +3340,24 @@ async def open_workstream(request: Request) -> JSONResponse:
                 "parent_ws_id": ws.parent_ws_id,
                 "user_id": ws.user_id,
             }
+        )
+
+    # Audit the rehydration so console-side forensic review can distinguish
+    # rehydrated workstreams from fresh creates (same broadcast shape; the
+    # audit action name is the disambiguator).
+    _audit_storage = getattr(request.app.state, "auth_storage", None)
+    if _audit_storage is not None:
+        from turnstone.core.audit import record_audit as _record_audit
+
+        _, _audit_ip = _audit_context(request)
+        _record_audit(
+            _audit_storage,
+            owner_uid,
+            "workstream.opened",
+            "workstream",
+            ws.id,
+            {"kind": str(ws.kind), "parent_ws_id": ws.parent_ws_id},
+            _audit_ip,
         )
 
     log.info("ws.opened", ws_id=resolved_id[:8])

@@ -13,15 +13,12 @@ Covers:
 
 from __future__ import annotations
 
-import pytest
-
-from turnstone.core.storage._sqlite import SQLiteBackend
 from turnstone.core.workstream import Workstream
 
-
-@pytest.fixture
-def storage(tmp_path):
-    return SQLiteBackend(str(tmp_path / "test.db"))
+# ``storage`` comes from tests/conftest.py — backend-parametrized fixture that
+# respects the ``--storage-backend`` flag so the same assertions run against
+# both SQLite (default) and PostgreSQL (CI), closing the q-3 drift risk that
+# sqlite↔postgres register/list/normalize semantics could diverge silently.
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +64,40 @@ def test_register_normalizes_empty_parent_to_null(storage):
     row = storage.get_workstream("ws-a")
     assert row is not None
     assert row["parent_ws_id"] is None
+
+
+def test_register_rejects_unknown_kind(storage):
+    """Storage edge validates kind via WorkstreamKind(kind).value —
+    SDK / restore / direct callers can't silently corrupt the NOT NULL column
+    with typos or unknown values the way pre-PR #1 they could."""
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        storage.register_workstream("ws-bogus", kind="interative")  # typo
+    # Row was never inserted — no side effects on failure.
+    assert storage.get_workstream("ws-bogus") is None
+
+
+def test_list_workstreams_filter_by_user_id(storage):
+    """The user_id kwarg pushes tenant scoping into SQL so callers
+    can't forget to filter client-side."""
+    storage.register_workstream("ws-a", user_id="user-1")
+    storage.register_workstream("ws-b", user_id="user-1")
+    storage.register_workstream("ws-c", user_id="user-2")
+    storage.register_workstream("ws-ownerless")  # no user_id
+
+    mine = storage.list_workstreams(user_id="user-1")
+    theirs = storage.list_workstreams(user_id="user-2")
+    ownerless = storage.list_workstreams(user_id="")
+    unfiltered = storage.list_workstreams()
+
+    assert {r[0] for r in mine} == {"ws-a", "ws-b"}
+    assert {r[0] for r in theirs} == {"ws-c"}
+    # Empty string is a real filter value (matches rows with stored "" owner).
+    # Rows with NULL owner are distinct and not matched.
+    assert "ws-ownerless" not in {r[0] for r in ownerless}
+    # No filter → all rows.
+    assert {r[0] for r in unfiltered} == {"ws-a", "ws-b", "ws-c", "ws-ownerless"}
 
 
 def test_get_workstream_missing_returns_none(storage):
