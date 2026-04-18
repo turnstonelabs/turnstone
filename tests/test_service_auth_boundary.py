@@ -170,7 +170,7 @@ def _scope_probe_app(
 
 
 class TestVerifyCollectorServiceScope:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_409_probe_leaves_scope_error_empty(self):
         """A 409 response means the scope gate passed; the probe's
         deliberately-wrong node_id tripped the identity check only
@@ -195,7 +195,7 @@ class TestVerifyCollectorServiceScope:
         await _verify_collector_service_scope(app, client)
         assert app.state.collector_scope_error == ""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_403_probe_sets_scope_error_and_logs_error(self, caplog):
         """403 from the probe means the collector token is missing the
         ``service`` scope (or the JWT audience is misconfigured).  The
@@ -222,7 +222,7 @@ class TestVerifyCollectorServiceScope:
             for rec in caplog.records
         ), "403 drift must log at ERROR so operators see it at boot"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_401_also_sets_scope_error(self):
         """401 (JWT audience / secret mismatch) is the same configuration
         class as 403 — refuse to serve."""
@@ -237,7 +237,7 @@ class TestVerifyCollectorServiceScope:
         await _verify_collector_service_scope(app, client)
         assert "HTTP 401" in app.state.collector_scope_error
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_no_registered_nodes_skips_silently(self, caplog):
         """Single-node or pre-discovery states have no upstream to
         probe.  The self-check must NOT refuse to serve — the dashboard
@@ -250,7 +250,7 @@ class TestVerifyCollectorServiceScope:
             await _verify_collector_service_scope(app, client)
         assert app.state.collector_scope_error == ""
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_network_error_does_not_refuse(self):
         """Transient httpx.ConnectError during probe is a "cluster is
         coming up" state; it must NOT be confused with scope drift.
@@ -273,7 +273,7 @@ class TestVerifyCollectorServiceScope:
 
 
 class TestClusterDashboardGate:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cluster_snapshot_503_when_scope_error(self):
         from turnstone.console.server import cluster_snapshot
 
@@ -287,7 +287,7 @@ class TestClusterDashboardGate:
         assert body["reason"] == "collector_scope_drift"
         assert "collector token rejected" in body["error"]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cluster_snapshot_200_when_scope_ok(self):
         from turnstone.console.server import cluster_snapshot
 
@@ -304,7 +304,7 @@ class TestClusterDashboardGate:
 
 
 class TestDashboardCache4xxLogLevel:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_403_logged_at_warning_with_preview(self, caplog):
         """A 4xx from the upstream dashboard fetch must log at WARNING
         with the upstream body preview — silence here hides auth/scope
@@ -331,7 +331,7 @@ class TestDashboardCache4xxLogLevel:
         assert matches, "4xx from dashboard fetch must log at WARNING"
         assert "service scope required" in matches[0].getMessage()
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_200_does_not_log(self, caplog):
         """The happy path stays quiet — only 4xx raises the log floor."""
         from turnstone.console.server import _NodeDashboardCache
@@ -348,7 +348,7 @@ class TestDashboardCache4xxLogLevel:
         assert payload == {"workstreams": []}
         assert not [r for r in caplog.records if "dashboard_cache" in r.getMessage()]
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_4xx_does_not_cache_payload_none(self):
         """On 4xx the dashboard cache must skip the TTL write so an
         operator scope fix shows up on the next request instead of
@@ -379,7 +379,7 @@ class TestDashboardCache4xxLogLevel:
 
 
 class TestFetchLiveBlock4xxLogLevel:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_direct_fallback_logs_warning_on_4xx(self, caplog, monkeypatch):
         """Test harnesses / legacy embeddings skip the dashboard cache
         and fall through to the direct-fetch path inside
@@ -434,7 +434,7 @@ class TestFetchLiveBlock4xxLogLevel:
 
 
 class TestProxySseNon200LogLevel:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_non_200_upstream_logs_warning_with_preview(self, caplog):
         """Non-200 on a service-auth SSE proxy hop is operator-
         actionable; the browser already sees the error event, but
@@ -491,7 +491,7 @@ class TestProxySseNon200LogLevel:
 
 
 class TestClusterEventsSseGate:
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_cluster_events_sse_503_when_scope_error(self):
         from turnstone.console.server import cluster_events_sse
 
