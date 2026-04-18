@@ -257,10 +257,28 @@ class ClusterCollector:
                     # "console dashboard is empty" footgun when the
                     # collector token lacked ``service`` scope.
                     if 400 <= status < 500:
+                        # Bounded body read — iterate aiter_bytes() up
+                        # to the preview cap so a malicious / oversized
+                        # upstream can't force the collector to buffer
+                        # an arbitrary HTML error page just to log a
+                        # 200-char preview.  Stops pulling bytes as
+                        # soon as we have enough.
                         body_preview = ""
                         try:
-                            body_bytes = await source.response.aread()
-                            body_preview = body_bytes.decode("utf-8", "replace")[:200]
+                            preview_cap = 256  # >200 chars after UTF-8 decode
+                            chunks: list[bytes] = []
+                            bytes_read = 0
+                            async for chunk in source.response.aiter_bytes():
+                                if not chunk:
+                                    continue
+                                remaining = preview_cap - bytes_read
+                                if remaining <= 0:
+                                    break
+                                chunks.append(chunk[:remaining])
+                                bytes_read += len(chunks[-1])
+                                if bytes_read >= preview_cap:
+                                    break
+                            body_preview = b"".join(chunks).decode("utf-8", "replace")[:200]
                         except Exception:
                             body_preview = "<unreadable>"
                         log.warning(
