@@ -87,7 +87,13 @@ class TestListSkillsFiltered:
         assert {r["name"] for r in storage.list_skills_filtered(tag="CPU")} == {"b"}
 
     def test_tag_filter_escapes_like_wildcards(self, storage):
-        """Literal ``%`` / ``_`` in the tag must NOT act as SQL wildcards."""
+        """Literal ``%`` / ``_`` in the tag must NOT act as SQL wildcards.
+
+        The current implementation uses JSON containment (``json_each`` on
+        SQLite, ``jsonb_array_elements_text`` on PostgreSQL) so SQL
+        wildcards never participate at all — but the contract still holds
+        and is worth pinning.
+        """
         _create_skill(storage, template_id="s1", name="literal", tags=["a%b"])
         _create_skill(storage, template_id="s2", name="underscore-tag", tags=["a_b"])
         _create_skill(storage, template_id="s3", name="decoy", tags=["axxb", "acb"])
@@ -95,6 +101,40 @@ class TestListSkillsFiltered:
         assert {r["name"] for r in storage.list_skills_filtered(tag="a%b")} == {"literal"}
         # Literal `_` matches only the literal tag, not any single char.
         assert {r["name"] for r in storage.list_skills_filtered(tag="a_b")} == {"underscore-tag"}
+
+    def test_tag_filter_handles_quote_in_tag_value(self, storage):
+        """Tag values containing ``"`` must match correctly.  The earlier
+        ``%"<tag>"%`` LIKE pattern depended on the absence of quotes in
+        the value — a tag like ``foo"bar`` would have been encoded as
+        ``"foo\\"bar"`` in the JSON column and either matched the wrong
+        thing or nothing at all.  JSON containment decodes element-by-
+        element so the literal value matches as written."""
+        _create_skill(storage, template_id="s1", name="quoted", tags=['foo"bar'])
+        _create_skill(storage, template_id="s2", name="other", tags=["foobar"])
+        rows = storage.list_skills_filtered(tag='foo"bar')
+        assert {r["name"] for r in rows} == {"quoted"}
+        # And the unrelated row doesn't false-positive.
+        rows2 = storage.list_skills_filtered(tag="foobar")
+        assert {r["name"] for r in rows2} == {"other"}
+
+    def test_tag_filter_handles_backslash_in_tag_value(self, storage):
+        """A backslash in the tag would have been doubled in the stored
+        JSON text (``\\\\``); the substring LIKE pattern would have
+        searched for ``\\`` in the input and missed the doubled form."""
+        _create_skill(storage, template_id="s1", name="bs", tags=["a\\b"])
+        _create_skill(storage, template_id="s2", name="other", tags=["ab"])
+        rows = storage.list_skills_filtered(tag="a\\b")
+        assert {r["name"] for r in rows} == {"bs"}
+
+    def test_tag_filter_handles_unicode_in_tag_value(self, storage):
+        """Multi-byte UTF-8 tag values round-trip through JSON
+        containment.  A previous regression would have hit if the JSON
+        encoder escaped non-ASCII to ``\\uXXXX`` and the substring
+        pattern was supplied as the raw character."""
+        _create_skill(storage, template_id="s1", name="cjk", tags=["\u6f22\u5b57"])
+        _create_skill(storage, template_id="s2", name="other", tags=["ab"])
+        rows = storage.list_skills_filtered(tag="\u6f22\u5b57")
+        assert {r["name"] for r in rows} == {"cjk"}
 
     def test_scan_status_filter(self, storage):
         _create_skill(storage, template_id="s1", name="a", scan_status="clean")

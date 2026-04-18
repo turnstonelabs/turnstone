@@ -115,7 +115,13 @@ def test_token_manager_rejects_nonpositive_ttl():
 def _mock_client(
     handler: Callable[[httpx.Request], httpx.Response],
 ) -> tuple[CoordinatorClient, list[httpx.Request]]:
-    """Build a CoordinatorClient with an httpx MockTransport recorder."""
+    """Build a CoordinatorClient with an httpx MockTransport recorder.
+
+    Pre-registers the canonical test ws_ids (``ws-x``, ``ws-y``) under
+    ``coord-1`` so the client-side tenant guard on send / close / cancel
+    / delete passes.  The mutating-op tests want to verify the route
+    map + body shape, not the guard.
+    """
     captured: list[httpx.Request] = []
 
     def _trapping(req: httpx.Request) -> httpx.Response:
@@ -124,9 +130,10 @@ def _mock_client(
 
     transport = httpx.MockTransport(_trapping)
     http = httpx.Client(transport=transport)
-    # Minimal storage stub for read ops is OK — mutating-op tests don't
-    # touch storage, so a SQLiteBackend would also be fine.
     storage = SQLiteBackend(":memory:")
+    storage.register_workstream("coord-1", kind="coordinator", user_id="user-1")
+    storage.register_workstream("ws-x", kind="interactive", parent_ws_id="coord-1")
+    storage.register_workstream("ws-y", kind="interactive", parent_ws_id="coord-1")
     client = CoordinatorClient(
         console_base_url="http://console",
         storage=storage,
@@ -261,6 +268,46 @@ def test_non_2xx_response_populates_error():
     result = client.send("ws-x", "hi")
     assert result["status"] == 500
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Tenant guard — defense in depth on every model-invoked mutating op
+# ---------------------------------------------------------------------------
+
+
+def test_mutating_ops_reject_foreign_ws_id_without_hitting_proxy():
+    """A coordinator must not be able to drive a foreign tenant's
+    workstream even if the upstream node forgets to enforce ownership.
+    Confirm that send / close / cancel / delete short-circuit before
+    the HTTP round-trip when the ws_id isn't in the coordinator's own
+    subtree.  Same 404-shape that inspect / wait_for_workstream use, so
+    the model can't distinguish 'foreign' from 'missing' (no oracle).
+    """
+    client, captured = _mock_client(_ok_json({"status": 200}))
+    # ``ws-foreign`` is not in the coordinator's subtree (the fixture
+    # only registers ws-x and ws-y under coord-1).
+    for call, kwargs in [
+        (client.send, {"message": "hi"}),
+        (client.close_workstream, {"reason": "x"}),
+        (client.cancel, {}),
+        (client.delete, {}),
+    ]:
+        result = call("ws-foreign", **kwargs)  # type: ignore[arg-type]
+        assert result["status"] == 404
+        assert "not in coordinator subtree" in result["error"]
+    # No HTTP requests issued — guard rejected before _post.
+    assert captured == []
+
+
+def test_mutating_ops_accept_self_ws_id():
+    """The coordinator's own ws_id is in its subtree (trivially true);
+    operations against self should pass the guard.  Currently only send
+    has a meaningful self-targeted use, but the contract should hold
+    uniformly."""
+    client, captured = _mock_client(_ok_json({"status": 200}))
+    client.send("coord-1", "hi")
+    assert len(captured) == 1
+    assert captured[0].url.path == "/v1/api/route/send"
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +899,333 @@ def test_list_skills_truncation_signal(storage_with_skills):
     result = client.list_skills(limit=2)
     assert len(result["skills"]) == 2
     assert result["truncated"] is True
+
+
+def test_list_skills_projects_allowed_tools_capped_with_sentinel(tmp_path):
+    """Each row carries the skill's allowed_tools (capped at the projection
+    cap with a +N more sentinel) so coordinators can pick a skill without
+    speculating which tools it brings.  The cap keeps the per-row payload
+    bounded for skills that whitelist a wide MCP surface."""
+    from turnstone.console.coordinator_client import _SKILL_TOOLS_PROJECTION_CAP
+
+    st = SQLiteBackend(str(tmp_path / "skills_tools.db"))
+    st.create_prompt_template(
+        template_id="s-short",
+        name="short-skill",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        allowed_tools='["read_file", "search"]',
+    )
+    long_tools = [f"tool_{i:03d}" for i in range(_SKILL_TOOLS_PROJECTION_CAP + 7)]
+    st.create_prompt_template(
+        template_id="s-long",
+        name="long-skill",
+        category="ops",
+        content="",
+        variables="[]",
+        is_default=False,
+        org_id="",
+        created_by="test",
+        tags="[]",
+        allowed_tools=json.dumps(long_tools),
+    )
+    client = _make_read_client(st)
+    result = client.list_skills()
+    by_name = {s["name"]: s for s in result["skills"]}
+    assert by_name["short-skill"]["allowed_tools"] == ["read_file", "search"]
+    long_skill = by_name["long-skill"]["allowed_tools"]
+    # Cap items + 1 sentinel.
+    assert len(long_skill) == _SKILL_TOOLS_PROJECTION_CAP + 1
+    assert long_skill[-1] == f"+{7} more"
+    assert long_skill[0] == "tool_000"
+
+
+# ---------------------------------------------------------------------------
+# inspect — close_reason + token fallback
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_surfaces_close_reason_when_persisted(populated_storage):
+    """Operator-supplied close reason is persisted to workstream_config
+    by the server's close handler and surfaced by inspect for terminal
+    workstreams (closed/error/deleted).  Live workstreams skip the
+    config read on the hot path."""
+    populated_storage.update_workstream_state("child-a", "closed")
+    populated_storage.save_workstream_config("child-a", {"close_reason": "task complete"})
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert result.get("close_reason") == "task complete"
+
+
+def test_inspect_omits_close_reason_when_absent(populated_storage):
+    populated_storage.update_workstream_state("child-a", "closed")
+    client = _make_read_client(populated_storage)
+    result = client.inspect("child-a")
+    assert "close_reason" not in result
+
+
+def test_inspect_skips_workstream_config_read_for_live_workstreams(populated_storage, monkeypatch):
+    """Hot-path optimisation: live (non-terminal) workstreams must NOT
+    pay the per-inspect load_workstream_config round-trip.  close_reason
+    can only be set via the server's close handler, so reading the
+    config row for a still-running child is pure waste."""
+    calls: list[str] = []
+    real = populated_storage.load_workstream_config
+
+    def _spy(ws_id: str):  # type: ignore[no-untyped-def]
+        calls.append(ws_id)
+        return real(ws_id)
+
+    monkeypatch.setattr(populated_storage, "load_workstream_config", _spy)
+    client = _make_read_client(populated_storage)
+    # child-a is idle (per the populated_storage fixture) — non-terminal.
+    client.inspect("child-a")
+    assert calls == []
+
+
+def test_inspect_live_falls_back_to_persisted_tokens(populated_storage):
+    """live block carries tokens=0 for an idle child whose node hasn't
+    published a fresh tick — fall back to SUM(usage_events) so the
+    coordinator doesn't read 0 for a child that already burned tokens."""
+    populated_storage.record_usage_event(
+        event_id="ev1",
+        ws_id="child-a",
+        prompt_tokens=100,
+        completion_tokens=50,
+    )
+    populated_storage.record_usage_event(
+        event_id="ev2",
+        ws_id="child-a",
+        prompt_tokens=200,
+        completion_tokens=80,
+    )
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={"persisted": {"ws_id": "child-a"}, "live": {"state": "idle", "tokens": 0}},
+    )
+    result = client.inspect("child-a")
+    assert result["live"]["tokens"] == 100 + 50 + 200 + 80
+
+
+def test_inspect_live_keeps_nonzero_live_tokens(populated_storage):
+    """When the live counter is non-zero, the persisted aggregate is
+    NOT consulted — live wins for in-flight workstreams."""
+    populated_storage.record_usage_event(
+        event_id="ev1",
+        ws_id="child-a",
+        prompt_tokens=999,
+        completion_tokens=999,
+    )
+    client = _make_client_with_cluster_response(
+        populated_storage,
+        status=200,
+        body={
+            "persisted": {"ws_id": "child-a"},
+            "live": {"state": "running", "tokens": 17},
+        },
+    )
+    result = client.inspect("child-a")
+    assert result["live"]["tokens"] == 17
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_workstream_returns_immediately_when_already_terminal(
+    populated_storage,
+):
+    """Idle / closed children must not block — wait returns at once."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["mode"] == "any"
+    assert result["results"]["child-a"]["state"] == "idle"
+    # Must finish in well under the requested timeout.
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_any_mode_returns_when_first_terminal(
+    populated_storage,
+):
+    """child-a is idle (terminal), child-b is running (non-terminal) —
+    mode='any' should return without blocking on child-b."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-b", "child-a"], timeout=5, mode="any")
+    assert result["complete"] is True
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-b"]["state"] == "running"
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_all_mode_times_out_on_running_child(populated_storage):
+    """child-b stays running indefinitely — mode='all' must hit timeout
+    rather than block forever."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=1.0, mode="all")
+    assert result["complete"] is False
+    assert result["elapsed"] >= 1.0
+    # Both states still observed.
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["child-b"]["state"] == "running"
+
+
+def test_wait_for_workstream_denies_foreign_ws_id(populated_storage):
+    """A ws_id outside the coordinator's subtree returns state='denied'.
+    With mode='any' on a pure-denied list there's no real work to wait
+    for, so the wait short-circuits sub-second with complete=False —
+    the model sees the denied state immediately and can correct rather
+    than spinning the timeout."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["unrelated"], timeout=5, mode="any")
+    assert result["results"]["unrelated"]["state"] == "denied"
+    assert result["complete"] is False
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_missing_ws_id_indistinguishable_from_denied(populated_storage):
+    """A ws_id that doesn't exist collapses into the same 'denied'
+    shape as a foreign ws_id so wait can't be used as an existence
+    oracle (matches the 404-mask contract inspect uses).  Same
+    short-circuit semantics as the pure-foreign case."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["does-not-exist"], timeout=5, mode="any")
+    assert result["results"]["does-not-exist"]["state"] == "denied"
+    assert result["complete"] is False
+    assert result["elapsed"] < 1.0
+
+
+def test_wait_for_workstream_any_does_not_short_circuit_on_mixed_denied(populated_storage):
+    """Regression for the bug-2 false-positive: mode='any' with one
+    real (running) child and one denied id must NOT return
+    complete=True on the denied id — wait until the real child reaches
+    a real terminal state, or time out."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-b", "unrelated"], timeout=1.0, mode="any")
+    # child-b never reaches terminal in the test fixture; denied alone
+    # must not satisfy the any condition; wait must hit the timeout.
+    assert result["complete"] is False
+    assert result["elapsed"] >= 1.0
+    assert result["results"]["unrelated"]["state"] == "denied"
+    assert result["results"]["child-b"]["state"] == "running"
+
+
+def test_wait_for_workstream_all_completes_when_real_terminal_and_denied_mixed(
+    populated_storage,
+):
+    """mode='all' should consider denied ids as 'settled' so a wait on
+    [real-idle, denied] completes after the first tick instead of
+    waiting out the timeout — the model gets the full results dict
+    and can act on the per-id state."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "unrelated"], timeout=5, mode="all")
+    assert result["complete"] is True
+    assert result["elapsed"] < 1.0
+    assert result["results"]["child-a"]["state"] == "idle"
+    assert result["results"]["unrelated"]["state"] == "denied"
+
+
+def test_wait_for_workstream_rejects_invalid_mode(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], mode="bogus")
+    assert "error" in result
+    assert result["complete"] is False
+
+
+def test_wait_for_workstream_rejects_empty_ws_ids(populated_storage):
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream([], timeout=5)
+    assert "error" in result
+
+
+def test_wait_for_workstream_rejects_overflow(populated_storage):
+    """Overflow returns an explicit error rather than silently truncating —
+    a mode='all' wait that polled only the first cap entries would have
+    returned complete=True with N>cap dropped ids never tracked."""
+    client = _make_read_client(populated_storage)
+    huge = [f"phantom-{i}" for i in range(CoordinatorClient._WAIT_MAX_WS_IDS + 5)]
+    result = client.wait_for_workstream(huge, timeout=5, mode="any")
+    assert "error" in result
+    assert "too many ws_ids" in result["error"]
+    assert result["complete"] is False
+
+
+def test_wait_for_workstream_caps_timeout(populated_storage):
+    """timeout > _WAIT_MAX_TIMEOUT clamps silently — an oversized
+    timeout is benign (caller can wait less than they asked) so it
+    doesn't deserve an explicit error."""
+    client = _make_read_client(populated_storage)
+    # child-a is already terminal, so the wait completes before any
+    # clamped timeout matters; just verify the call doesn't error.
+    result = client.wait_for_workstream(["child-a"], timeout=9999, mode="any")
+    assert "error" not in result
+    assert result["complete"] is True
+
+
+def test_wait_for_workstream_dedupes_ws_ids(populated_storage):
+    """Duplicate ids collapse before polling so the resolved-count
+    denominator and the polled set agree."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a", "child-a", "child-a"], timeout=5, mode="any")
+    assert "error" not in result
+    assert list(result["results"].keys()) == ["child-a"]
+
+
+def test_wait_for_workstream_uses_batched_storage_calls(populated_storage, monkeypatch):
+    """Per-tick polling must issue batched storage calls — at the
+    documented cap (32 ws_ids over a 600s wait) the naive per-id
+    shape produced ~38k row reads.  Guard against regression."""
+    client = _make_read_client(populated_storage)
+    batch_calls: list[list[str]] = []
+    sum_calls: list[list[str]] = []
+    real_get_batch = populated_storage.get_workstreams_batch
+    real_sum_batch = populated_storage.sum_workstream_tokens_batch
+
+    def _spy_get(ws_ids):  # type: ignore[no-untyped-def]
+        batch_calls.append(list(ws_ids))
+        return real_get_batch(ws_ids)
+
+    def _spy_sum(ws_ids):  # type: ignore[no-untyped-def]
+        sum_calls.append(list(ws_ids))
+        return real_sum_batch(ws_ids)
+
+    monkeypatch.setattr(populated_storage, "get_workstreams_batch", _spy_get)
+    monkeypatch.setattr(populated_storage, "sum_workstream_tokens_batch", _spy_sum)
+    # Fail loudly if anything still calls the non-batched paths.
+    monkeypatch.setattr(
+        populated_storage,
+        "get_workstream",
+        lambda *a, **kw: pytest.fail("wait_for_workstream must use batched get"),
+    )
+    monkeypatch.setattr(
+        populated_storage,
+        "sum_workstream_tokens",
+        lambda *a, **kw: pytest.fail("wait_for_workstream must use batched sum"),
+    )
+
+    result = client.wait_for_workstream(["child-a", "child-b"], timeout=5, mode="any")
+    assert result["complete"] is True
+    # One tick is enough since child-a is already idle (terminal).
+    assert len(batch_calls) == 1
+    assert len(sum_calls) == 1
+    assert set(batch_calls[0]) == {"child-a", "child-b"}
+    assert set(sum_calls[0]) == {"child-a", "child-b"}
+
+
+def test_wait_for_workstream_handles_non_string_mode(populated_storage):
+    """A model that emits ``mode=123`` or ``mode=['any']`` produces a
+    clean error rather than crashing with AttributeError on .strip()."""
+    client = _make_read_client(populated_storage)
+    result = client.wait_for_workstream(["child-a"], mode=123)  # type: ignore[arg-type]
+    assert "error" in result
+    assert "invalid mode" in result["error"]
 
 
 # ---------------------------------------------------------------------------

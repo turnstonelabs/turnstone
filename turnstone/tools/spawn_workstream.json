@@ -22,7 +22,7 @@
       },
       "target_node": {
         "type": "string",
-        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node via generate_ws_id_for_node. Otherwise the hash ring picks."
+        "description": "Optional node_id hint. When provided, the routing proxy pins the workstream to that node via generate_ws_id_for_node. Otherwise the hash ring picks. CAVEAT: pinning is a hard constraint — if the named node has dropped out of the 120s service-registry heartbeat window between your `list_nodes` call and this spawn, the spawn fails with \"No available node for routing\" rather than falling back. Omit `target_node` if you can tolerate landing on any node; pin only when the workload truly requires that specific node's capabilities/region/tenancy."
       }
     },
     "required": []

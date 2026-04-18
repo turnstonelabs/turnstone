@@ -560,8 +560,9 @@
         // from GET /tasks — re-fetch so the operator sees
         // add/update/remove/reorder without clicking the refresh icon.
         // list is a read-only action; skip to avoid redundant fetches.
+        // Debounced so a burst of mutations coalesces into one fetch.
         if (ev.name === "task_list" && !ev.is_error) {
-          loadTasks();
+          loadTasksDebounced();
         }
         break;
       case "approve_request":
@@ -673,6 +674,14 @@
   const TERMINAL_CHILD_STATES = new Set(["closed", "deleted"]);
   const LIVE_BADGE_TTL_MS = 5000;
   const LIVE_BADGE_DEBOUNCE_MS = 250;
+  // Debounce window for /tasks refreshes triggered by ``task_list``
+  // tool_result SSE events.  Without it, a model that runs
+  // ``add → list`` (or any back-to-back mutation pair) double-fetches
+  // the same envelope.  150ms is short enough to feel instant to a
+  // human watching the sidebar and long enough to coalesce realistic
+  // tool-batch sequences (which fire within tens of ms of each other).
+  const TASKS_REFRESH_DEBOUNCE_MS = 150;
+  let tasksRefreshTimer = null;
   // Sweep every 60s; drop terminal-state entries older than 10min so
   // an operator who scrolls past them later still sees them briefly
   // (they won't vanish mid-read) but we cap the long-tail growth.
@@ -961,6 +970,24 @@
     } finally {
       renderTasks();
     }
+  }
+
+  // Debounced wrapper for SSE-triggered refreshes.  A burst of
+  // task_list mutations (the model's typical add → update → list
+  // pattern, or a coordinator that re-renders the whole list) lands
+  // multiple tool_result events within tens of ms; without this each
+  // one would fire its own /tasks fetch.  Coalescing into one fetch
+  // per 150ms window keeps the sidebar responsive without amplifying
+  // load.  Direct UI actions (refresh button, initial load) keep
+  // calling ``loadTasks`` directly so user clicks are never delayed.
+  function loadTasksDebounced() {
+    if (tasksRefreshTimer !== null) {
+      clearTimeout(tasksRefreshTimer);
+    }
+    tasksRefreshTimer = setTimeout(() => {
+      tasksRefreshTimer = null;
+      loadTasks();
+    }, TASKS_REFRESH_DEBOUNCE_MS);
   }
 
   function scheduleLiveFetch(childWsId) {

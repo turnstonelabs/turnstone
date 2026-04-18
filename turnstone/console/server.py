@@ -1112,6 +1112,10 @@ async def route_create(request: Request) -> Response:
     pin = False
     body: dict[str, Any] = {}
     raw_body: bytes = b""
+    # Routing strategy is surfaced on the response so callers (the
+    # coordinator's spawn_workstream tool especially) can explain why a
+    # given node was chosen.  Set on every branch below.
+    routing_strategy = "hash_ring"
 
     if is_multipart:
         # Multipart: caller must pass ws_id as a query param so we can
@@ -1142,6 +1146,10 @@ async def route_create(request: Request) -> Response:
                     status_code=503,
                 ),
             )
+        # Multipart callers pre-allocate ws_id (typically an attachment
+        # follow-up against an existing workstream) — same hash-of-known-id
+        # path resume_ws takes on the JSON branch.
+        routing_strategy = "resume"
         raw_body = await request.body()
         # Forward the raw header verbatim — the multipart `boundary=` parameter
         # is case-sensitive and must match the bytes in the body exactly.
@@ -1180,11 +1188,13 @@ async def route_create(request: Request) -> Response:
         try:
             if body.get("resume_ws"):
                 ref = router.route(body["resume_ws"])
+                routing_strategy = "resume"
             elif body.get("target_node"):
                 ws_id = router.generate_ws_id_for_node(body["target_node"])
                 body["ws_id"] = ws_id
                 ref = router.route(ws_id)
                 pin = True
+                routing_strategy = "target_node"
             else:
                 ws_id = secrets.token_hex(16)
                 body["ws_id"] = ws_id
@@ -1295,6 +1305,7 @@ async def route_create(request: Request) -> Response:
                     exc_info=True,
                 )
         data["node_id"] = bound_node_id
+        data["routing_strategy"] = routing_strategy
         _emit_route_audit(request, "route.workstream.create", audit_ws_id, bound_node_id)
         return _record_route(request, "create", 200, t0, JSONResponse(data))
     return _record_route(

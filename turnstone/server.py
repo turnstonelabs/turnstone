@@ -2733,14 +2733,38 @@ async def create_workstream(request: Request) -> JSONResponse:
 
 
 async def close_workstream(request: Request) -> JSONResponse:
-    """POST /v1/api/workstreams/close — close a workstream."""
+    """POST /v1/api/workstreams/close — close a workstream.
+
+    Optional ``reason`` from the request body is persisted on the
+    workstream's config row so post-mortem tooling (and the coordinator's
+    ``inspect_workstream``) can surface why the workstream was retired
+    without scraping the audit log.
+    """
     from turnstone.core.audit import record_audit
+    from turnstone.core.output_guard import redact_credentials
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     ws_id = str(body.get("ws_id", ""))
+    raw_reason = body.get("reason", "")
+    # Cap reason length so a model that accidentally / maliciously dumps
+    # a multi-KB blob (or a captured secret) can't grow workstream_config
+    # rows without bound.  512 BYTES is enough for any human-readable
+    # close reason; anything longer is suspicious.  Slice on UTF-8 bytes
+    # (not code points) so a CJK / emoji-heavy payload can't sneak past
+    # the cap at 3-4x the documented budget.  ``errors="ignore"`` drops
+    # any partial code point left at the truncation boundary.  Then run
+    # the same credential-redaction the output guard applies to tool
+    # output — a model under prompt injection that dumps a captured
+    # secret in ``reason`` doesn't get to plant it in plaintext audit
+    # logs / workstream_config.
+    if isinstance(raw_reason, str):
+        capped = raw_reason.strip().encode("utf-8")[:512].decode("utf-8", errors="ignore")
+        reason = redact_credentials(capped)
+    else:
+        reason = ""
     mgr = request.app.state.workstreams
     # Cross-tenant close would abort another tenant's running generation.
     # _require_ws_access returns 404 on non-owner — same shape as the
@@ -2756,19 +2780,40 @@ async def close_workstream(request: Request) -> JSONResponse:
     if not ws_before:
         return JSONResponse({"error": "Workstream not found"}, status_code=404)
     if mgr.close(ws_id):
+        # Single storage handle for both the close-reason persist and
+        # the audit emit — avoids a duplicate getattr() and a future
+        # third storage call mistakenly using a different binding.
+        storage = getattr(request.app.state, "auth_storage", None)
+        # Persist before emitting the global ws_closed event so any
+        # downstream consumer that re-reads workstream_config sees the
+        # reason in the same observation window as the state change.
+        if reason and storage is not None:
+            try:
+                storage.save_workstream_config(ws_id, {"close_reason": reason})
+            except Exception:
+                log.debug(
+                    "ws.close.reason_persist_failed ws=%s",
+                    ws_id[:8] if ws_id else "",
+                    exc_info=True,
+                )
         gq: queue.Queue[dict[str, Any]] = request.app.state.global_queue
         with contextlib.suppress(queue.Full):
             gq.put_nowait({"type": "ws_closed", "ws_id": ws_id, "reason": "closed"})
-        storage = getattr(request.app.state, "auth_storage", None)
         if storage is not None:
             _, ip = _audit_context(request)
+            audit_detail: dict[str, Any] = {
+                "kind": str(ws_before.kind),
+                "parent_ws_id": ws_before.parent_ws_id,
+            }
+            if reason:
+                audit_detail["reason"] = reason
             record_audit(
                 storage,
                 owner_uid,
                 "workstream.closed",
                 "workstream",
                 ws_id,
-                {"kind": str(ws_before.kind), "parent_ws_id": ws_before.parent_ws_id},
+                audit_detail,
                 ip,
             )
         return JSONResponse({"status": "ok"})
@@ -4911,11 +4956,21 @@ def main() -> None:
         if live_judge_config and judge_model:
             import dataclasses
 
+            # Override the config-default judge model with the per-call
+            # alias, but DON'T replace the alias with the resolved
+            # underlying model id.  IntentJudge.__init__ does the full
+            # resolution (alias → client + provider + model) and
+            # pre-rewriting ``model`` to the underlying id strands the
+            # alias context — IntentJudge then has no way to recover the
+            # alias's provider/client and falls back to the session's
+            # provider with a model name that provider may not support
+            # (silent ``llm_fallback`` verdicts).  ``registry.resolve``
+            # is called purely as a typo / unknown-alias guard.
             try:
-                _jm_client, j_model, _jm_cfg = registry.resolve(judge_model)
+                registry.resolve(judge_model)
                 live_judge_config = dataclasses.replace(
                     live_judge_config,
-                    model=j_model,
+                    model=judge_model,
                 )
             except Exception as e:
                 log.warning("Failed to resolve judge_model %r: %s", judge_model, e)

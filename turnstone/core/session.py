@@ -3901,11 +3901,13 @@ class ChatSession:
             "inspect_workstream": self._prepare_inspect_workstream,
             "send_to_workstream": self._prepare_send_to_workstream,
             "close_workstream": self._prepare_close_workstream,
+            "cancel_workstream": self._prepare_cancel_workstream,
             "delete_workstream": self._prepare_delete_workstream,
             "list_workstreams": self._prepare_list_workstreams,
             "list_nodes": self._prepare_list_nodes,
             "list_skills": self._prepare_list_skills,
             "task_list": self._prepare_task_list,
+            "wait_for_workstream": self._prepare_wait_for_workstream,
         }
         preparer = preparers.get(func_name)
         if not preparer:
@@ -4933,13 +4935,15 @@ class ChatSession:
             msg = f"Error: {result['error']}"
             self._report_tool_result(call_id, "spawn_workstream", msg, is_error=True)
             return call_id, msg
-        # Successful spawn — surface ws_id + node_id + name so the
-        # coordinator can follow up with inspect / send.
+        # Successful spawn — surface ws_id + node_id + name + routing
+        # strategy so the coordinator can follow up with inspect / send
+        # and explain why a given node was chosen.
         summary = json.dumps(
             {
                 "ws_id": result.get("ws_id"),
                 "name": result.get("name"),
                 "node_id": result.get("node_id"),
+                "routing_strategy": result.get("routing_strategy"),
                 "status": result.get("status"),
             },
             separators=(",", ":"),
@@ -5091,6 +5095,44 @@ class ChatSession:
         if reason:
             desc += f" ({reason[:60]})"
         self._report_tool_result(call_id, "close_workstream", desc)
+        return call_id, output
+
+    def _prepare_cancel_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "cancel_workstream", "coordinator client unavailable"
+            )
+        ws_id = (args.get("ws_id") or "").strip()
+        if not ws_id:
+            return self._coord_tool_error(call_id, "cancel_workstream", "ws_id is required")
+        return {
+            "call_id": call_id,
+            "func_name": "cancel_workstream",
+            "header": f"\u2699 cancel_workstream: {ws_id}",
+            "preview": "",
+            "needs_approval": True,
+            "approval_label": "cancel_workstream",
+            "execute": self._exec_cancel_workstream,
+            "ws_id": ws_id,
+        }
+
+    def _exec_cancel_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.cancel(item["ws_id"])
+        except Exception as e:
+            msg = f"Error: cancel_workstream failed: {e}"
+            self._report_tool_result(call_id, "cancel_workstream", msg, is_error=True)
+            return call_id, msg
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "cancel_workstream", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(
+            {"ws_id": item["ws_id"], "cancelled": True, "status": result.get("status")},
+            separators=(",", ":"),
+        )
+        self._report_tool_result(call_id, "cancel_workstream", f"cancelled {item['ws_id']}")
         return call_id, output
 
     def _prepare_delete_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -5503,6 +5545,88 @@ class ChatSession:
             summary = action
         is_error = "error" in result
         self._report_tool_result(call_id, "task_list", summary, is_error=is_error)
+        return call_id, self._truncate_output(output)
+
+    def _prepare_wait_for_workstream(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Thin pass-through to ``CoordinatorClient.wait_for_workstream``.
+
+        The client owns input validation (mode whitelist, ws_ids
+        dedup + cap, timeout coerce + clamp) — keeping it as the single
+        source of truth means the rules can't drift between layers.
+        Bad input surfaces at exec time as a normal tool error via the
+        ``result.get("error")`` branch below.
+        """
+        if self._coord_client is None:
+            return self._coord_tool_error(
+                call_id, "wait_for_workstream", "coordinator client unavailable"
+            )
+        # Best-effort header — uses raw args so the approval UI shows
+        # the model's stated request even if validation will reject it.
+        raw_ids = args.get("ws_ids") or []
+        ws_count = len(raw_ids) if isinstance(raw_ids, list) else 0
+        raw_mode = args.get("mode") or "any"
+        mode_label = raw_mode.strip().lower() if isinstance(raw_mode, str) else str(raw_mode)
+        try:
+            to_label = int(float(args.get("timeout") or 60.0))
+        except (TypeError, ValueError):
+            to_label = 60
+        header = (
+            f"\u2699 wait_for_workstream: {ws_count} ws (mode={mode_label}, timeout={to_label}s)"
+        )
+        return {
+            "call_id": call_id,
+            "func_name": "wait_for_workstream",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "execute": self._exec_wait_for_workstream,
+            "ws_ids": raw_ids if isinstance(raw_ids, list) else [],
+            "timeout": args.get("timeout"),
+            "mode": args.get("mode"),
+        }
+
+    def _exec_wait_for_workstream(self, item: dict[str, Any]) -> tuple[str, str]:
+        call_id = item["call_id"]
+        try:
+            result = self._coord_client.wait_for_workstream(
+                item["ws_ids"],
+                timeout=item["timeout"] if item["timeout"] is not None else 60.0,
+                mode=item["mode"] if item["mode"] is not None else "any",
+            )
+        except Exception as e:
+            msg = f"Error: wait_for_workstream failed: {e}"
+            self._report_tool_result(call_id, "wait_for_workstream", msg, is_error=True)
+            return call_id, msg
+        # Surface client-side validation errors as tool errors rather
+        # than rendering them as a "successful" wait result.
+        if result.get("error"):
+            msg = f"Error: {result['error']}"
+            self._report_tool_result(call_id, "wait_for_workstream", msg, is_error=True)
+            return call_id, msg
+        output = json.dumps(result, separators=(",", ":"), default=str)
+        elapsed = result.get("elapsed", 0.0)
+        complete = result.get("complete", False)
+        # Count children that genuinely finished work (real terminals
+        # only — ``denied`` is a rejection, not a resolution).  Earlier
+        # versions counted any non-empty ``state`` and inverted the
+        # truth on timeout (rendered as ``"timeout (N/N resolved)"``).
+        # Inline import — ``turnstone.core`` shouldn't import from
+        # ``turnstone.console`` at module load (layering), so the
+        # tool-exec read pulls the canonical state set lazily.
+        from turnstone.console.coordinator_client import CoordinatorClient
+
+        results_dict = result.get("results") or {}
+        resolved_count = sum(
+            1
+            for snap in results_dict.values()
+            if isinstance(snap, dict)
+            and snap.get("state") in CoordinatorClient._WAIT_REAL_TERMINAL_STATES
+        )
+        verb = "complete" if complete else "timeout"
+        # Denominator = polled set (not raw item['ws_ids']) so the ratio
+        # stays coherent with what the client actually tracked after dedup.
+        summary = f"{verb} after {elapsed}s ({resolved_count}/{len(results_dict)} resolved)"
+        self._report_tool_result(call_id, "wait_for_workstream", summary)
         return call_id, self._truncate_output(output)
 
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:

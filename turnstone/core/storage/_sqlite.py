@@ -582,42 +582,14 @@ class SQLiteBackend:
             return None
 
     def get_workstream(self, ws_id: str) -> dict[str, Any] | None:
-        """Return the full workstreams row as a dict, or None if missing."""
-        with self._conn() as conn:
-            row = conn.execute(
-                sa.select(
-                    workstreams.c.ws_id,
-                    workstreams.c.node_id,
-                    workstreams.c.user_id,
-                    workstreams.c.alias,
-                    workstreams.c.title,
-                    workstreams.c.name,
-                    workstreams.c.state,
-                    workstreams.c.skill_id,
-                    workstreams.c.skill_version,
-                    workstreams.c.kind,
-                    workstreams.c.parent_ws_id,
-                    workstreams.c.created,
-                    workstreams.c.updated,
-                ).where(workstreams.c.ws_id == ws_id)
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "ws_id": row[0],
-            "node_id": row[1],
-            "user_id": row[2],
-            "alias": row[3],
-            "title": row[4],
-            "name": row[5],
-            "state": row[6],
-            "skill_id": row[7],
-            "skill_version": row[8],
-            "kind": row[9],
-            "parent_ws_id": row[10],
-            "created": row[11],
-            "updated": row[12],
-        }
+        """Return the full workstreams row as a dict, or None if missing.
+
+        Delegates to ``get_workstreams_batch`` so the 13-column projection
+        + row→dict mapping live in one place — a future migration
+        adding/renaming a column only has to be applied once per
+        backend instead of in two parallel selects that can drift.
+        """
+        return self.get_workstreams_batch([ws_id]).get(ws_id)
 
     def update_workstream_title(self, ws_id: str, title: str) -> None:
         with self._conn() as conn:
@@ -2573,15 +2545,23 @@ class SQLiteBackend:
             if enabled_only:
                 q = q.where(prompt_templates.c.enabled == 1)
             if tag:
-                # Quote-bracketed substring match against the JSON-array text:
-                # `["foo"]` matches `tag="foo"` but not `["foobar"]`.
-                # Escape LIKE metacharacters (``%`` / ``_``) so a literal
-                # tag like ``a%b`` doesn't over-match, and lowercase both
-                # sides so the filter is case-insensitive on both backends
-                # (PostgreSQL ``LIKE`` is case-sensitive; SQLite is not —
-                # normalising here prevents dev/prod divergence).
-                pattern = f'%"{_escape_like(tag.lower())}"%'
-                q = q.where(sa.func.lower(prompt_templates.c.tags).like(pattern, escape="\\"))
+                # True JSON-array containment via SQLite's JSON1
+                # ``json_each`` table-valued function (built into SQLite
+                # 3.38+; the runtime here is 3.46+).  Replaces the
+                # earlier quote-bracketed LIKE pattern, which broke as
+                # soon as a tag value contained a ``"`` character (or
+                # any value the JSON encoder escaped) and could be
+                # subverted by carefully-crafted neighbouring tags.
+                # Lateral expansion (vs. SQLite's JSON containment ``@>``
+                # operator, which doesn't ship with the JSON1 build) so
+                # ``lower(value) = :tag_lower`` runs case-insensitively
+                # without case-folding the JSON literal at the call site.
+                q = q.where(
+                    sa.text(
+                        "EXISTS (SELECT 1 FROM json_each(prompt_templates.tags) "
+                        "WHERE lower(value) = :tag_lower)"
+                    ).bindparams(tag_lower=tag.lower())
+                )
             if limit > 0:
                 q = q.limit(limit)
             rows = conn.execute(q).fetchall()
@@ -2866,6 +2846,89 @@ class SQLiteBackend:
             result = conn.execute(sa.delete(usage_events).where(usage_events.c.timestamp < cutoff))
             conn.commit()
             return result.rowcount
+
+    def sum_workstream_tokens(self, ws_id: str) -> int:
+        if not ws_id:
+            return 0
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(
+                    sa.func.coalesce(
+                        sa.func.sum(
+                            usage_events.c.prompt_tokens + usage_events.c.completion_tokens
+                        ),
+                        0,
+                    )
+                ).where(usage_events.c.ws_id == ws_id)
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def sum_workstream_tokens_batch(self, ws_ids: list[str]) -> dict[str, int]:
+        if not ws_ids:
+            return {}
+        # Drop empty / non-string ids defensively — same shape the caller
+        # already enforces, but a missing guard would land an empty
+        # parameter in the IN clause and quietly skew the result.
+        clean = [w for w in ws_ids if isinstance(w, str) and w]
+        out: dict[str, int] = {w: 0 for w in clean}
+        if not clean:
+            return out
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    usage_events.c.ws_id,
+                    sa.func.sum(usage_events.c.prompt_tokens + usage_events.c.completion_tokens),
+                )
+                .where(usage_events.c.ws_id.in_(clean))
+                .group_by(usage_events.c.ws_id)
+            ).fetchall()
+        for r in rows:
+            if r[0] is not None and r[1] is not None:
+                out[r[0]] = int(r[1])
+        return out
+
+    def get_workstreams_batch(self, ws_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+        if not ws_ids:
+            return {}
+        clean = [w for w in ws_ids if isinstance(w, str) and w]
+        out: dict[str, dict[str, Any] | None] = {w: None for w in clean}
+        if not clean:
+            return out
+        with self._conn() as conn:
+            rows = conn.execute(
+                sa.select(
+                    workstreams.c.ws_id,
+                    workstreams.c.node_id,
+                    workstreams.c.user_id,
+                    workstreams.c.alias,
+                    workstreams.c.title,
+                    workstreams.c.name,
+                    workstreams.c.state,
+                    workstreams.c.skill_id,
+                    workstreams.c.skill_version,
+                    workstreams.c.kind,
+                    workstreams.c.parent_ws_id,
+                    workstreams.c.created,
+                    workstreams.c.updated,
+                ).where(workstreams.c.ws_id.in_(clean))
+            ).fetchall()
+        for r in rows:
+            out[r[0]] = {
+                "ws_id": r[0],
+                "node_id": r[1],
+                "user_id": r[2],
+                "alias": r[3],
+                "title": r[4],
+                "name": r[5],
+                "state": r[6],
+                "skill_id": r[7],
+                "skill_version": r[8],
+                "kind": r[9],
+                "parent_ws_id": r[10],
+                "created": r[11],
+                "updated": r[12],
+            }
+        return out
 
     # -- Audit events ----------------------------------------------------------
 

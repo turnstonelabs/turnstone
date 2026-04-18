@@ -10,7 +10,7 @@
       },
       "reason": {
         "type": "string",
-        "description": "Optional human-readable reason for closing. Recorded in the message stream for audit."
+        "description": "Optional human-readable reason for closing. Persisted on the workstream's config row and surfaced as `close_reason` on subsequent inspect_workstream calls so post-mortems don't have to scrape the audit log."
       }
     },
     "required": ["ws_id"]

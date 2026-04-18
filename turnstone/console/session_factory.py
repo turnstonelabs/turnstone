@@ -19,7 +19,6 @@ registry.
 
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING
 
 from turnstone.core.log import get_logger
@@ -127,19 +126,14 @@ def build_console_session_factory(
 
         live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
-        if live_judge_config and live_judge_config.enabled and live_judge_config.model:
-            # Allow per-coordinator judge model override via registry alias
-            # if the admin points judge.model at an alias rather than a
-            # model id.  Matches the server factory's shape.
-            try:
-                _jc, j_model, _jcfg = registry.resolve(live_judge_config.model)
-                live_judge_config = dataclasses.replace(live_judge_config, model=j_model)
-            except Exception:
-                log.debug(
-                    "coord_factory.judge_resolve_failed model=%s",
-                    live_judge_config.model,
-                    exc_info=True,
-                )
+        # NOTE: do not pre-resolve ``live_judge_config.model`` against the
+        # registry here.  ``IntentJudge.__init__`` does a richer resolution
+        # that also picks up the alias's *provider + client*; rewriting
+        # ``model`` to the underlying model id strands the alias and forces
+        # IntentJudge to fall back to the session's provider with a model
+        # name that provider may not even know about (e.g. coordinator on
+        # Anthropic, judge alias pointing at OpenAI gpt-5-mini → silent
+        # ``llm_fallback`` verdicts on every tool call).
 
         eff_temperature = (
             r_cfg.temperature

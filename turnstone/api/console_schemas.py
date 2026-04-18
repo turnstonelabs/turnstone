@@ -955,3 +955,159 @@ class CoordinatorOpenResponse(BaseModel):
         default=None,
         description="True when the coordinator was already in memory; absent after a fresh rehydrate.",
     )
+
+
+class CoordinatorCreateRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/new."""
+
+    name: str = Field(default="", description="Optional display name; auto-generated when empty.")
+    skill: str | None = Field(
+        default=None,
+        description="Optional skill name to apply to the coordinator session.",
+    )
+    initial_message: str = Field(
+        default="",
+        description="Optional first user message dispatched to the new coordinator session.",
+    )
+
+
+class CoordinatorCreateResponse(BaseModel):
+    """Response body for POST /v1/api/coordinator/new (201)."""
+
+    ws_id: str
+    name: str
+
+
+class CoordinatorInfo(BaseModel):
+    """Per-coordinator row in the list response."""
+
+    ws_id: str
+    name: str
+    state: str
+    user_id: str
+
+
+class CoordinatorListResponse(BaseModel):
+    """Response body for GET /v1/api/coordinator."""
+
+    coordinators: list[CoordinatorInfo] = Field(default_factory=list)
+
+
+class CoordinatorDetailResponse(BaseModel):
+    """Response body for GET /v1/api/coordinator/{ws_id}."""
+
+    ws_id: str
+    name: str
+    state: str
+    user_id: str
+    kind: str = Field(default="coordinator")
+
+
+class CoordinatorSendRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/{ws_id}/send."""
+
+    message: str = Field(description="User message to queue onto the coordinator's worker.")
+
+
+class CoordinatorApproveRequest(BaseModel):
+    """Body for POST /v1/api/coordinator/{ws_id}/approve."""
+
+    approved: bool = Field(description="True approves the pending tool call(s); False denies.")
+    feedback: str | None = Field(
+        default=None,
+        description="Optional human feedback string forwarded to the model.",
+    )
+    always: bool = Field(
+        default=False,
+        description=(
+            "When approved=True, also adds the pending tool name(s) to the session's "
+            "auto-approve set so subsequent calls of the same tool skip the prompt."
+        ),
+    )
+
+
+class CoordinatorHistoryResponse(BaseModel):
+    """Response body for GET /v1/api/coordinator/{ws_id}/history."""
+
+    ws_id: str
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Tail of the coordinator's reconstructed message history "
+            "(provider-fidelity OpenAI-like shape).  Bounded by the ``limit`` "
+            "query parameter (default 100, max 500)."
+        ),
+    )
+
+
+class CoordinatorChildInfo(BaseModel):
+    """Per-row shape in the coordinator children listing."""
+
+    ws_id: str
+    node_id: str | None = None
+    name: str | None = None
+    state: str | None = None
+    created: str | None = None
+    updated: str | None = None
+    kind: str | None = None
+    parent_ws_id: str | None = None
+    skill_id: str | None = None
+    skill_version: int | None = None
+
+
+class CoordinatorChildrenResponse(BaseModel):
+    """Response body for GET /v1/api/coordinator/{ws_id}/children."""
+
+    items: list[CoordinatorChildInfo] = Field(default_factory=list)
+    truncated: bool = Field(
+        default=False,
+        description="True when the storage page filled the cap; more rows may exist.",
+    )
+
+
+class CoordinatorTaskInfo(BaseModel):
+    """Per-task row in the coordinator's task envelope."""
+
+    id: str
+    title: str
+    status: str = Field(description="One of: pending / in_progress / done / blocked.")
+    child_ws_id: str = Field(default="")
+    created: str
+    updated: str
+
+
+class CoordinatorTasksResponse(BaseModel):
+    """Response body for GET /v1/api/coordinator/{ws_id}/tasks.
+
+    Mirrors the envelope the ``task_list(action='list')`` model tool returns.
+    """
+
+    version: int = Field(default=1)
+    tasks: list[CoordinatorTaskInfo] = Field(default_factory=list)
+
+
+class ClusterWsDetailResponse(BaseModel):
+    """Response body for GET /v1/api/cluster/ws/{ws_id}/detail.
+
+    Aggregates the persisted workstream row with a best-effort live block
+    fetched from the owning node (or the in-process coordinator manager
+    for ``kind="coordinator"`` rows).  ``live`` is ``null`` when the
+    owning node is unreachable, returns 5xx, or doesn't have the row in
+    its in-memory dashboard cache — callers degrade gracefully without
+    treating it as an error.
+    """
+
+    persisted: dict[str, Any] = Field(
+        description="Full storage row for the workstream (state, kind, parent_ws_id, etc.)."
+    )
+    live: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Live in-flight counters (state, tokens, activity, pending_approval) when "
+            "the owning node returns them; null on degrade."
+        ),
+    )
+    messages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Tail of the workstream's reconstructed message history.",
+    )

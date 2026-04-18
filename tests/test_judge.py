@@ -703,3 +703,113 @@ class TestHeuristicNewLowRules:
     def test_web_search(self):
         v = evaluate_heuristic("web_search", {"query": "python"}, "web_search")
         assert v.risk_level == "low"
+
+
+# ---------------------------------------------------------------------------
+# Alias resolution — regression guard for the "did not return a verdict"
+# silent no-op surfaced during coordinator harness testing.
+# ---------------------------------------------------------------------------
+
+
+class TestModelAliasResolution:
+    """When ``judge.model`` points at a registry alias whose underlying
+    provider differs from the session's, the judge MUST resolve through
+    the registry — not fall back to the session provider with the
+    underlying model id.  Pre-resolving the alias to the model id in the
+    session_factory stranded the alias and made every coordinator tool
+    verdict come back ``llm_fallback / "did not return a verdict"``.
+    """
+
+    def _make_alias_registry(
+        self,
+        alias: str,
+        alias_provider: MagicMock,
+        alias_client: MagicMock,
+        underlying_model: str,
+    ) -> MagicMock:
+        registry = MagicMock()
+        cfg = MagicMock()
+        cfg.context_window = 50_000
+        registry.has_alias.side_effect = lambda a: a == alias
+        registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        registry.get_provider.return_value = alias_provider
+        return registry
+
+    def test_alias_uses_registry_provider_not_session_provider(self):
+        """Judge with model=alias should resolve via registry — provider, client,
+        and concrete model name all come from the alias."""
+        # Session provider/client — would be used if resolution falls back.
+        session_provider = _make_mock_provider(
+            response_content=_good_verdict_json(intent_summary="from-session"),
+        )
+        session_provider.provider_name = "anthropic"
+        session_client = MagicMock()
+        session_client.base_url = "https://session.example/v1"
+        session_client.api_key = "session-key"
+
+        # Alias provider/client — what the judge SHOULD use.
+        alias_provider = _make_mock_provider(
+            response_content=_good_verdict_json(intent_summary="from-alias"),
+        )
+        alias_provider.provider_name = "openai"
+        alias_client = MagicMock()
+        alias_client.base_url = "https://alias.example/v1"
+        alias_client.api_key = "alias-key"
+
+        registry = self._make_alias_registry(
+            "judge-mini", alias_provider, alias_client, "gpt-5-mini-resolved"
+        )
+
+        config = JudgeConfig(enabled=True, model="judge-mini")
+        judge = IntentJudge(
+            config=config,
+            session_provider=session_provider,
+            session_client=session_client,
+            session_model="session-default-model",
+            context_window=100_000,
+            model_registry=registry,
+        )
+
+        assert judge._provider is alias_provider
+        assert judge._model == "gpt-5-mini-resolved"
+        # Client factory args reflect the alias's client, not the session's.
+        assert judge._client_factory_args["base_url"] == "https://alias.example/v1"
+        assert judge._client_factory_args["api_key"] == "alias-key"
+        assert judge._client_factory_args["provider_name"] == "openai"
+
+    def test_coordinator_tool_call_returns_llm_verdict_not_fallback(self):
+        """Happy-path regression for coordinator tool calls: with a properly
+        resolved provider, the verdict tier must be ``llm`` — the
+        ``llm_fallback`` failure mode flagged in the harness was uniform
+        across every coordinator tool, so guard the happy path explicitly.
+        """
+        provider = _make_mock_provider(
+            response_content=_good_verdict_json(
+                intent_summary="Spawn a child workstream",
+                risk_level="medium",
+                recommendation="approve",
+            ),
+        )
+        judge = _make_judge(provider)
+
+        callback_results: list[IntentVerdict] = []
+        coord_item = _make_item(
+            func_name="spawn_workstream",
+            func_args={"initial_message": "do the thing", "skill": "engineer"},
+            approval_label="spawn_workstream",
+        )
+        judge.evaluate(
+            [coord_item],
+            [{"role": "user", "content": "delegate the audit"}],
+            callback_results.append,
+        )
+        # Wait for daemon thread.
+        for _ in range(20):
+            if callback_results:
+                break
+            time.sleep(0.1)
+
+        assert callback_results, "judge never delivered a verdict"
+        assert callback_results[0].tier == "llm"
+        assert callback_results[0].tier != "llm_fallback"
+        assert "did not return a verdict" not in callback_results[0].reasoning

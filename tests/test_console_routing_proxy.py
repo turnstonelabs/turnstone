@@ -178,6 +178,49 @@ class TestRouteCreate:
         router.generate_ws_id_for_node.assert_called_with("node-c")
         client.close()
 
+    def test_route_create_routing_strategy_hash_ring(self, client):
+        """Default fan-out (no resume_ws / no target_node) reports
+        routing_strategy='hash_ring' so the coordinator's spawn tool can
+        explain why the node was chosen."""
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"name": "test-ws"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["routing_strategy"] == "hash_ring"
+
+    def test_route_create_routing_strategy_target_node(self):
+        router = _make_mock_router()
+        router.generate_ws_id_for_node.return_value = "00ff" + "0" * 28
+        router.route.return_value = NodeRef("node-c", "http://c:8080")
+        app = _make_app(router=router)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "00ff" + "0" * 28, "name": "pinned"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"target_node": "node-c"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["routing_strategy"] == "target_node"
+        client.close()
+
+    def test_route_create_routing_strategy_resume(self):
+        router = _make_mock_router()
+        router.route.return_value = NodeRef("node-b", "http://b:8080")
+        app = _make_app(router=router)
+        _wire_proxy(app, _make_proxy_post(json_data={"ws_id": "old_ws_resumed", "name": "resumed"}))
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/api/route/workstreams/new",
+            json={"resume_ws": "old_ws_id"},
+            headers=_TEST_AUTH_HEADERS,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["routing_strategy"] == "resume"
+        client.close()
+
 
 class TestRouteCreate503Retry:
     """503 retry logic in route_create."""

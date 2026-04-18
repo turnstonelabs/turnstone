@@ -542,6 +542,91 @@ class TestTouchStructuredMemory:
         assert int(mem["access_count"]) == 2
 
 
+# -- Per-workstream usage aggregation -----------------------------------------
+
+
+class TestSumWorkstreamTokens:
+    """``sum_workstream_tokens`` powers the inspect-time token fallback for
+    idle children — a regression here would surface as wrong tokens in
+    the coordinator's inspect output rather than a focused test failure,
+    so guard it directly."""
+
+    def test_empty_ws_id_returns_zero(self, backend):
+        assert backend.sum_workstream_tokens("") == 0
+
+    def test_no_events_returns_zero(self, backend):
+        assert backend.sum_workstream_tokens("never-seen") == 0
+
+    def test_sums_prompt_and_completion_across_events(self, backend):
+        backend.record_usage_event(
+            event_id="e1", ws_id="ws-a", prompt_tokens=10, completion_tokens=5
+        )
+        backend.record_usage_event(
+            event_id="e2", ws_id="ws-a", prompt_tokens=200, completion_tokens=80
+        )
+        assert backend.sum_workstream_tokens("ws-a") == 10 + 5 + 200 + 80
+
+    def test_scoped_to_requested_ws_id(self, backend):
+        """Other workstreams' usage events must not leak into the sum."""
+        backend.record_usage_event(
+            event_id="e1", ws_id="ws-a", prompt_tokens=100, completion_tokens=50
+        )
+        backend.record_usage_event(
+            event_id="e2", ws_id="ws-b", prompt_tokens=999, completion_tokens=999
+        )
+        assert backend.sum_workstream_tokens("ws-a") == 150
+        assert backend.sum_workstream_tokens("ws-b") == 1998
+
+
+class TestBatchPrimitives:
+    """``get_workstreams_batch`` and ``sum_workstream_tokens_batch`` power
+    ``wait_for_workstream``'s per-tick polling.  Direct backend coverage
+    here so a regression surfaces as a focused failure rather than as
+    wrong tokens / spurious denied states in a coordinator session."""
+
+    def test_get_workstreams_batch_empty_input(self, backend):
+        assert backend.get_workstreams_batch([]) == {}
+
+    def test_get_workstreams_batch_returns_row_per_id(self, backend):
+        backend.register_workstream("a", title="A", kind="interactive")
+        backend.register_workstream("b", title="B", kind="interactive", parent_ws_id="a")
+        result = backend.get_workstreams_batch(["a", "b"])
+        assert set(result.keys()) == {"a", "b"}
+        assert result["a"]["ws_id"] == "a"
+        assert result["b"]["parent_ws_id"] == "a"
+
+    def test_get_workstreams_batch_missing_id_returns_none(self, backend):
+        backend.register_workstream("a")
+        result = backend.get_workstreams_batch(["a", "missing"])
+        assert result["a"] is not None
+        assert result["missing"] is None
+
+    def test_get_workstreams_batch_drops_empty_strings(self, backend):
+        """Empty / non-string ids must not pollute the IN clause."""
+        backend.register_workstream("a")
+        result = backend.get_workstreams_batch(["a", "", "  "])
+        # Only the non-empty id is kept; whitespace-only strings are
+        # passed through (the helper only strips truly-empty entries).
+        assert "a" in result
+        assert result["a"] is not None
+
+    def test_sum_workstream_tokens_batch_empty_input(self, backend):
+        assert backend.sum_workstream_tokens_batch([]) == {}
+
+    def test_sum_workstream_tokens_batch_aggregates_per_id(self, backend):
+        backend.record_usage_event(event_id="e1", ws_id="a", prompt_tokens=10, completion_tokens=5)
+        backend.record_usage_event(event_id="e2", ws_id="a", prompt_tokens=20, completion_tokens=10)
+        backend.record_usage_event(
+            event_id="e3", ws_id="b", prompt_tokens=100, completion_tokens=50
+        )
+        result = backend.sum_workstream_tokens_batch(["a", "b", "c"])
+        assert result == {"a": 45, "b": 150, "c": 0}
+
+    def test_sum_workstream_tokens_batch_missing_id_defaults_zero(self, backend):
+        result = backend.sum_workstream_tokens_batch(["never-seen"])
+        assert result == {"never-seen": 0}
+
+
 # -- Lifecycle -----------------------------------------------------------------
 
 

@@ -18,10 +18,23 @@ from turnstone.api.console_schemas import (
     ClusterOverviewResponse,
     ClusterSnapshotResponse,
     ClusterWorkstreamsResponse,
+    ClusterWsDetailResponse,
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    CoordinatorApproveRequest,
+    CoordinatorChildInfo,
+    CoordinatorChildrenResponse,
+    CoordinatorCreateRequest,
+    CoordinatorCreateResponse,
+    CoordinatorDetailResponse,
+    CoordinatorHistoryResponse,
+    CoordinatorInfo,
+    CoordinatorListResponse,
     CoordinatorOpenResponse,
+    CoordinatorSendRequest,
+    CoordinatorTaskInfo,
+    CoordinatorTasksResponse,
     CreateChannelUserRequest,
     CreateMcpServerRequest,
     CreateModelDefinitionRequest,
@@ -1108,12 +1121,205 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Routing"],
     ),
     # --- Coordinator workstream API ---
+    # All require the ``admin.coordinator`` permission.  Ownership is
+    # enforced per-row (callers without ``admin.system`` see only their
+    # own coordinators); cross-tenant misses 404-mask.
+    EndpointSpec(
+        "/v1/api/coordinator/new",
+        "POST",
+        "Create a new coordinator workstream",
+        description=(
+            'Allocates a console-hosted ``kind="coordinator"`` ChatSession.  '
+            "201 on create; 429 when the ``coordinator.max_active`` cap is "
+            "reached and no idle coordinator can be evicted."
+        ),
+        request_model=CoordinatorCreateRequest,
+        response_model=CoordinatorCreateResponse,
+        response_code=201,
+        error_codes=[400, 401, 403, 429, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator",
+        "GET",
+        "List coordinator workstreams visible to the caller",
+        description=(
+            "Returns coordinators owned by the caller.  Callers with "
+            "``admin.system`` see every coordinator across tenants."
+        ),
+        response_model=CoordinatorListResponse,
+        error_codes=[403, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}",
+        "GET",
+        "Get coordinator detail (rehydrates lazily on miss)",
+        description=(
+            "Returns the persisted coordinator's display fields.  If the "
+            "session isn't currently in memory the manager rehydrates it "
+            "before responding; ``500`` on rehydrate failure carries a "
+            "correlation id matching the server log line."
+        ),
+        response_model=CoordinatorDetailResponse,
+        error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
     EndpointSpec(
         "/v1/api/coordinator/{ws_id}/open",
         "POST",
         "Open (rehydrate) a coordinator workstream by ws_id",
+        description=(
+            "Parity with ``POST /v1/api/workstreams/{ws_id}/open`` — gives "
+            "SDK callers and operators a way to warm a coordinator without "
+            "browsing to it.  Idempotent: ``already_loaded=true`` when the "
+            "session was already in memory."
+        ),
         response_model=CoordinatorOpenResponse,
         error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/send",
+        "POST",
+        "Queue a user message onto the coordinator session",
+        description=(
+            "Worker thread picks up the message via the session's queue.  "
+            "``429`` when the worker queue is full — caller should back off."
+        ),
+        request_model=CoordinatorSendRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 429, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/approve",
+        "POST",
+        "Resolve a pending tool approval on the coordinator session",
+        description=(
+            "Approves or denies the pending tool call(s).  Set ``always`` to "
+            "True to also add the pending tool name(s) to the session's "
+            "auto-approve set so subsequent calls of the same tool skip the "
+            "prompt."
+        ),
+        request_model=CoordinatorApproveRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 409, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/cancel",
+        "POST",
+        "Cancel in-flight generation on the coordinator session",
+        description=(
+            "Drops the in-flight LLM call and unblocks any pending approval "
+            "or plan review.  The coordinator state moves to idle; storage "
+            "is preserved."
+        ),
+        response_model=StatusResponse,
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/close",
+        "POST",
+        "Soft-close the coordinator (unload from memory; storage preserved)",
+        description=(
+            "Releases the worker thread + UI listeners and marks the row "
+            "``state=closed`` in storage.  The row remains queryable (audit "
+            "/ history) but cannot be reopened — a closed coordinator is "
+            "terminal from the manager's perspective."
+        ),
+        response_model=StatusResponse,
+        error_codes=[403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/events",
+        "GET",
+        "Subscribe to the coordinator's SSE event stream",
+        description=(
+            "Server-Sent Events stream carrying ``status``, ``message``, "
+            "``tool_call``, ``tool_result``, ``approval``, ``error``, and "
+            "the phase-3 ``child_ws_*`` fan-out events.  Pings every 5s.  "
+            "Body is text/event-stream — the response schema is omitted "
+            "from the catalog because OpenAPI 3.1 has no first-class SSE "
+            "type."
+        ),
+        error_codes=[403, 404, 409, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/history",
+        "GET",
+        "Read the coordinator's reconstructed message history",
+        description=(
+            "Returns the tail of the conversation in OpenAI-like message "
+            "format.  Used by the page-load handshake; SSE handles updates "
+            "after that.  Bounded by the ``limit`` query parameter."
+        ),
+        response_model=CoordinatorHistoryResponse,
+        query_params=[
+            QueryParam(
+                "limit",
+                "Max conversation rows to fetch from storage (default 100, max 500).",
+                schema_type="integer",
+                default=100,
+            ),
+        ],
+        error_codes=[403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/children",
+        "GET",
+        "List the coordinator's spawned child workstreams",
+        description=(
+            "Returns interactive child workstreams whose ``parent_ws_id`` "
+            "is this coordinator.  Same row shape as the model-facing "
+            "``list_workstreams`` tool so the tree UI and the tool agree."
+        ),
+        response_model=CoordinatorChildrenResponse,
+        error_codes=[400, 403, 404, 500, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/coordinator/{ws_id}/tasks",
+        "GET",
+        "Read the coordinator's task list envelope",
+        description=(
+            "Returns the ``{version, tasks}`` envelope persisted via the "
+            "``task_list`` model tool.  Corrupt envelopes return an empty "
+            "list (the tool itself surfaces corruption errors on mutation)."
+        ),
+        response_model=CoordinatorTasksResponse,
+        error_codes=[400, 403, 404, 503],
+        tags=["Coordinator"],
+    ),
+    EndpointSpec(
+        "/v1/api/cluster/ws/{ws_id}/detail",
+        "GET",
+        "Cluster-wide live workstream detail (storage + live block + tail)",
+        description=(
+            "Aggregates the persisted row, a best-effort live block from "
+            "the owning node (or the in-process coordinator manager for "
+            '``kind="coordinator"`` rows), and the tail of the message '
+            "history.  Gated on the ``admin.cluster.inspect`` permission "
+            "(granted to ``builtin-admin`` via migration 040; revoke or "
+            "reassign to a custom role for tighter control).  ``live`` "
+            "is null on node unreachability / 5xx so callers can degrade "
+            "gracefully."
+        ),
+        response_model=ClusterWsDetailResponse,
+        query_params=[
+            QueryParam(
+                "message_limit",
+                "Max conversation rows in the tail (default 20, clamped to 200).",
+                schema_type="integer",
+                default=20,
+            ),
+        ],
+        error_codes=[400, 403, 404, 503],
         tags=["Coordinator"],
     ),
     # --- Observability ---
@@ -1149,10 +1355,23 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ClusterWorkstreamsResponse,
     NodeDetailResponse,
     ClusterSnapshotResponse,
+    ClusterWsDetailResponse,
     ConsoleCreateWsRequest,
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
+    CoordinatorApproveRequest,
+    CoordinatorChildInfo,
+    CoordinatorChildrenResponse,
+    CoordinatorCreateRequest,
+    CoordinatorCreateResponse,
+    CoordinatorDetailResponse,
+    CoordinatorHistoryResponse,
+    CoordinatorInfo,
+    CoordinatorListResponse,
     CoordinatorOpenResponse,
+    CoordinatorSendRequest,
+    CoordinatorTaskInfo,
+    CoordinatorTasksResponse,
     CreateScheduleRequest,
     UpdateScheduleRequest,
     ScheduleInfo,

@@ -1,0 +1,27 @@
+{
+  "name": "wait_for_workstream",
+  "description": "Block until one or all of the named child workstreams reach a terminal state (idle, error, closed). Auto-approved — safe, read-only. Use this INSTEAD OF a busy-poll loop of inspect_workstream when you've spawned children and need to wait for them: the tool call absorbs the wait, so the model sees exactly one call + one result regardless of how long the children take. Returns a dict mapping ws_id -> {state, tokens, updated}, plus elapsed seconds and `complete` (whether the wait condition was satisfied vs. the timeout fired). For `mode='any'`, returns as soon as the first child reaches a REAL terminal state (idle / error / closed) — a denied id alone never satisfies the condition, so a typo'd or foreign id can't false-positive a fan-out wait. For `mode='all'`, returns once every named child has settled (real terminal OR denied). Cross-tenant guard: only the coordinator's own children (or the coordinator itself) are visible — a foreign or non-existent ws_id is reported with state='denied'. Capped at 32 ws_ids per call (excess is rejected as an error rather than silently truncated) and 600s timeout.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "ws_ids": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Workstream ids to wait on. Accepts 1 or more; capped at 32 per call."
+      },
+      "timeout": {
+        "type": "number",
+        "description": "Maximum seconds to block. Default 60. Capped at 600 — for longer waits, call again with the same ws_ids."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["any", "all"],
+        "default": "any",
+        "description": "'any' (default) returns when the first child reaches a real terminal state (idle / error / closed); 'all' returns once every named child has settled (real terminal OR denied). A pure-denied list with mode='any' short-circuits to complete=false rather than spinning the timeout."
+      }
+    },
+    "required": ["ws_ids"]
+  },
+  "coordinator": true,
+  "auto_approve": true
+}

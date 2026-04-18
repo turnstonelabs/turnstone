@@ -1,6 +1,6 @@
 {
   "name": "list_skills",
-  "description": "List skills (worker profiles) available in the cluster. Auto-approved — safe, read-only. Pass optional filters to narrow by category (e.g. 'engineering', 'ops'), tag (single tag from the skill's tags array), or scan_status ('clean', 'flagged', 'unscanned', 'pending'). Use to discover which skill names you can pass to spawn_workstream. Returns name, category, tags, version, description, model preference, enabled flag, scan_status, activation — enough for an informed pick.",
+  "description": "List skills (worker profiles) available in the cluster. Auto-approved — safe, read-only. Pass optional filters to narrow by category (e.g. 'engineering', 'ops'), tag (single tag from the skill's tags array), or scan_status ('clean', 'flagged', 'unscanned', 'pending'). Use to discover which skill names you can pass to spawn_workstream. Returns name, category, tags, version, description, model preference, enabled flag, scan_status, activation, and allowed_tools (capped at 20 tool names with a '+N more' sentinel when truncated) — enough for an informed pick without speculating which tools a skill brings.",
   "parameters": {
     "type": "object",
     "properties": {

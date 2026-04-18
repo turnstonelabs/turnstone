@@ -1,0 +1,16 @@
+{
+  "name": "cancel_workstream",
+  "description": "Cancel in-flight generation on a child workstream and unblock any pending approval / plan review. Does NOT close or delete the workstream — state moves to 'idle' so you can immediately follow up with send_to_workstream. Pair with close_workstream afterwards if you also want to retire the child. Approval required — cancelling drops tokens already spent on the in-flight call. Use when a child is stuck waiting on an approval you no longer want to grant, has gone off the rails on a long thinking turn, or simply needs a fresh prompt.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "ws_id": {
+        "type": "string",
+        "description": "Workstream id to cancel."
+      }
+    },
+    "required": ["ws_id"]
+  },
+  "coordinator": true,
+  "primary_key": "ws_id"
+}

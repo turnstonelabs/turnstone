@@ -111,3 +111,64 @@ class TestConsoleSpec:
         param_names = [p["name"] for p in nodes["parameters"]]
         assert "sort" in param_names
         assert "limit" in param_names
+
+    def test_has_coordinator_endpoints(self):
+        """Phase 1-3 coordinator routes must appear in the OpenAPI catalog —
+        the spec was missing every coordinator endpoint except ``/open``,
+        so SDK consumers and operators couldn't discover the surface
+        from /docs.  Pin the full set so a future regression that drops
+        one fails loudly."""
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        paths = set(spec["paths"].keys())
+        expected = {
+            "/v1/api/coordinator/new",
+            "/v1/api/coordinator",
+            "/v1/api/coordinator/{ws_id}",
+            "/v1/api/coordinator/{ws_id}/open",
+            "/v1/api/coordinator/{ws_id}/send",
+            "/v1/api/coordinator/{ws_id}/approve",
+            "/v1/api/coordinator/{ws_id}/cancel",
+            "/v1/api/coordinator/{ws_id}/close",
+            "/v1/api/coordinator/{ws_id}/events",
+            "/v1/api/coordinator/{ws_id}/history",
+            "/v1/api/coordinator/{ws_id}/children",
+            "/v1/api/coordinator/{ws_id}/tasks",
+            "/v1/api/cluster/ws/{ws_id}/detail",
+        }
+        assert expected.issubset(paths), f"Missing: {expected - paths}"
+
+    def test_coordinator_create_has_request_body_and_201(self):
+        """Coordinator create returns 201 (not 200) and accepts a body."""
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        op = spec["paths"]["/v1/api/coordinator/new"]["post"]
+        assert "requestBody" in op
+        assert "application/json" in op["requestBody"]["content"]
+        # Pin the 201 success code.
+        assert "201" in op["responses"]
+
+    def test_coordinator_history_has_limit_query_param(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        op = spec["paths"]["/v1/api/coordinator/{ws_id}/history"]["get"]
+        param_names = [p["name"] for p in op.get("parameters", [])]
+        assert "ws_id" in param_names  # auto-added from path
+        assert "limit" in param_names
+
+    def test_coordinator_endpoints_share_tag(self):
+        """All coordinator endpoints (including the cluster-inspect one)
+        live under the same OpenAPI tag so /docs groups them together."""
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        coord_paths = [p for p in spec["paths"] if "/coordinator" in p]
+        coord_paths.append("/v1/api/cluster/ws/{ws_id}/detail")
+        for path in coord_paths:
+            for op in spec["paths"][path].values():
+                assert "Coordinator" in op.get("tags", []), (
+                    f"{path} missing Coordinator tag (tags={op.get('tags')})"
+                )

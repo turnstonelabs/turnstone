@@ -53,6 +53,13 @@ _TASK_TITLE_MAX = 200
 # enough to bound one stall per child per turn regardless of how many
 # inspect calls the model fires.
 _LIVE_CACHE_TTL_SECONDS = 2.0
+# Cap on the number of tool names projected per skill in list_skills.
+# A skill that whitelists a wide MCP surface (Slack/Gmail/Drive +
+# dozens of helpers) would otherwise bloat the per-row payload and
+# defeat the bounded-output contract.  Anything beyond the cap is
+# rolled into a "+N more" sentinel so the model knows to fetch the
+# full row if the inventory matters.
+_SKILL_TOOLS_PROJECTION_CAP = 20
 
 
 def _utc_now_iso() -> str:
@@ -270,6 +277,32 @@ class CoordinatorClient:
         data.setdefault("status", resp.status_code)
         return data
 
+    # -- tenant guard -------------------------------------------------------
+
+    def _is_own_subtree(self, ws_id: str) -> bool:
+        """Return True if ``ws_id`` is the coordinator itself or one of its
+        own children.  Defense-in-depth gate for every model-invoked
+        mutating op (send / close / cancel / delete) so a coordinator
+        can't drive a foreign tenant's workstream even if the upstream
+        node forgets to enforce ownership.  Read ops use the same gate
+        inline (see ``inspect`` / ``wait_for_workstream``).
+
+        404-shape on miss matches the shape inspect() uses to avoid
+        being an existence oracle.
+        """
+        if not ws_id:
+            return False
+        if ws_id == self._coord_ws_id:
+            return True
+        try:
+            row = self._storage.get_workstream(ws_id)
+        except Exception:
+            log.debug("coord_client.is_own_subtree.lookup_failed ws=%s", ws_id, exc_info=True)
+            return False
+        if row is None:
+            return False
+        return row.get("parent_ws_id") == self._coord_ws_id
+
     # -- model-invoked mutating ops (HTTP) ---------------------------------
 
     def spawn(
@@ -301,19 +334,21 @@ class CoordinatorClient:
         return self._post("spawn", body)
 
     def send(self, ws_id: str, message: str) -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("send", {"ws_id": ws_id, "message": message})
 
     def close_workstream(self, ws_id: str, reason: str = "") -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         body: dict[str, Any] = {"ws_id": ws_id}
         if reason:
-            # Forwarded for audit / future server-side use.  The server's
-            # close handler currently ignores the key but the routing
-            # proxy re-mint preserves the payload so downstream audit
-            # middleware (when it lands) can read it.
             body["reason"] = reason
         return self._post("close", body)
 
     def delete(self, ws_id: str) -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("delete", {"ws_id": ws_id})
 
     # -- console-endpoint helpers (NOT model-invoked tools) -----------------
@@ -337,7 +372,219 @@ class CoordinatorClient:
         return self._post("approve", body)
 
     def cancel(self, ws_id: str) -> dict[str, Any]:
+        if not self._is_own_subtree(ws_id):
+            return {"error": f"workstream not in coordinator subtree: {ws_id}", "status": 404}
         return self._post("cancel", {"ws_id": ws_id})
+
+    # -- model-invoked block-wait -----------------------------------------
+
+    # Real terminal states for the wait_for_workstream tool — these
+    # drive the any/all completion condition.  A workstream in one of
+    # these states has actually finished work the coordinator can
+    # observe.
+    _WAIT_REAL_TERMINAL_STATES: ClassVar[frozenset[str]] = frozenset(
+        {"idle", "error", "closed", "deleted"}
+    )
+    # Reportable terminal states — superset of the real ones, also
+    # includes the ``denied`` short-circuit shape returned for foreign
+    # / missing ws_ids.  Used by the resolved-count summary so the
+    # operator-facing "X/Y resolved" matches what they see in the
+    # results dict.  NOT used for the any/all condition: a single
+    # typo'd / foreign id shouldn't satisfy ``mode="any"`` and let
+    # the model declare a wait complete while every real child is
+    # still running.
+    _WAIT_TERMINAL_STATES: ClassVar[frozenset[str]] = _WAIT_REAL_TERMINAL_STATES | frozenset(
+        {"denied"}
+    )
+    # Hard cap on ws_ids per call.  Polling happens once per ws_id per
+    # tick, so a runaway list would amplify storage load without
+    # giving the model anything useful — coordinators rarely fan out
+    # past a handful of children at once.
+    _WAIT_MAX_WS_IDS: ClassVar[int] = 32
+    # Cap on the total wait so a stuck child can't pin a coordinator
+    # worker thread indefinitely.  Coordinators that need a longer wait
+    # call wait_for_workstream again with the same ws_ids — each call
+    # re-arms freshly.
+    _WAIT_MAX_TIMEOUT: ClassVar[float] = 600.0
+    # Storage-poll cadence.  500ms is short enough that the wait
+    # terminates promptly after a child finishes (well under the
+    # human-perceptible-latency floor), and long enough that a 60s
+    # wait incurs at most 120 cheap row reads — still cheaper than
+    # the 20+ inspect_workstream model turns the tool replaces.
+    _WAIT_POLL_INTERVAL: ClassVar[float] = 0.5
+
+    def wait_for_workstream(
+        self,
+        ws_ids: list[str],
+        *,
+        timeout: float = 60.0,
+        mode: str = "any",
+    ) -> dict[str, Any]:
+        """Block until child workstreams reach a terminal state.
+
+        ``mode='any'`` returns as soon as the first ws_id reaches
+        ``idle`` / ``error`` / ``closed``; ``mode='all'`` returns once
+        every ws_id has.  Returns
+        ``{"results": {ws_id: {state, tokens, updated}},
+        "elapsed": float, "complete": bool, "mode": mode}``.  ``complete``
+        is True when the wait condition was met before the deadline,
+        False when the timeout fired (results carry whatever last state
+        was observed).
+
+        Cross-tenant guard: a ws_id that's neither the coordinator
+        itself nor one of its own children appears with
+        ``state="denied"`` and never blocks the wait — a model that
+        emits a foreign id learns immediately rather than spinning
+        until timeout.  A ws_id that doesn't exist at all collapses
+        into the same ``denied`` shape so wait can't be used as an
+        existence oracle.
+
+        Performance: each tick issues exactly two storage calls
+        (``get_workstreams_batch`` + ``sum_workstream_tokens_batch``),
+        independent of ``len(ws_ids)``.  At the
+        ``_WAIT_MAX_WS_IDS`` / ``_WAIT_MAX_TIMEOUT`` cap that's ~2400
+        round-trips for a 600s wait — far below the ~38k of the naive
+        per-id polling shape.
+        """
+        # Single source of truth for input validation — the session-side
+        # tool prepare just builds a header and dispatches.  Returns an
+        # error-shaped dict (matching the rest of the client surface) on
+        # bad input rather than raising, so the session exec can surface
+        # it through ``_report_tool_result`` like any other tool error.
+        mode = str(mode if mode is not None else "any").strip().lower()
+        if mode not in {"any", "all"}:
+            return {
+                "error": f"invalid mode: {mode!r} (must be 'any' or 'all')",
+                "results": {},
+                "complete": False,
+                "elapsed": 0.0,
+                "mode": mode,
+            }
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in ws_ids or []:
+            if not isinstance(raw, str):
+                continue
+            wid = raw.strip()
+            if not wid or wid in seen:
+                continue
+            seen.add(wid)
+            cleaned.append(wid)
+        if not cleaned:
+            return {
+                "error": "ws_ids must contain at least one valid id",
+                "results": {},
+                "complete": False,
+                "elapsed": 0.0,
+                "mode": mode,
+            }
+        # Reject overflow rather than silently truncating — a mode='all'
+        # wait with N>cap ids that returns complete=True after polling
+        # only the first cap would falsely signal "all done" while the
+        # dropped ids were never tracked.
+        if len(cleaned) > self._WAIT_MAX_WS_IDS:
+            return {
+                "error": (f"too many ws_ids ({len(cleaned)}); cap is {self._WAIT_MAX_WS_IDS}"),
+                "results": {},
+                "complete": False,
+                "elapsed": 0.0,
+                "mode": mode,
+            }
+        try:
+            timeout_f = float(timeout)
+        except (TypeError, ValueError):
+            timeout_f = 60.0
+        timeout_f = max(0.0, min(timeout_f, self._WAIT_MAX_TIMEOUT))
+        start = time.monotonic()
+        deadline = start + timeout_f
+
+        def _snapshot_all() -> dict[str, dict[str, Any]]:
+            """One-tick snapshot for every cleaned ws_id.
+
+            Issues two storage calls per tick (workstreams batch + token
+            aggregate batch) instead of two-per-id, cutting per-tick
+            round-trips from O(N) to O(1) at the documented cap.
+            Cross-tenant + missing-row cases collapse into a single
+            ``denied`` shape so wait can't be used as an existence oracle.
+            """
+            try:
+                rows = self._storage.get_workstreams_batch(cleaned)
+            except Exception:
+                log.debug("coord_client.wait.get_ws_batch_failed", exc_info=True)
+                rows = {wid: None for wid in cleaned}
+            try:
+                tokens_by_wid = self._storage.sum_workstream_tokens_batch(cleaned)
+            except Exception:
+                log.debug("coord_client.wait.sum_tokens_batch_failed", exc_info=True)
+                tokens_by_wid = {}
+            snaps: dict[str, dict[str, Any]] = {}
+            for wid in cleaned:
+                row = rows.get(wid)
+                if row is None:
+                    snaps[wid] = {"state": "denied", "tokens": 0}
+                    continue
+                is_self = wid == self._coord_ws_id
+                is_own_child = row.get("parent_ws_id") == self._coord_ws_id
+                if not (is_self or is_own_child):
+                    snaps[wid] = {"state": "denied", "tokens": 0}
+                    continue
+                snaps[wid] = {
+                    "state": str(row.get("state") or ""),
+                    "tokens": int(tokens_by_wid.get(wid, 0) or 0),
+                    "updated": row.get("updated") or "",
+                }
+            return snaps
+
+        def _is_real_terminal(snap: dict[str, Any]) -> bool:
+            # Real-terminal — these states drive ``complete=True``.
+            # ``denied`` is intentionally excluded so a single typo'd /
+            # foreign / nonexistent ws_id can't satisfy ``mode="any"``
+            # while every real child is still running.
+            return snap.get("state", "") in self._WAIT_REAL_TERMINAL_STATES
+
+        def _is_settled(snap: dict[str, Any]) -> bool:
+            # Settled — terminal OR denied.  Used to decide when the
+            # wait should give up because there's nothing left to
+            # observe (no real ws_ids in the polled set, or every real
+            # one has already finished).
+            return snap.get("state", "") in self._WAIT_TERMINAL_STATES
+
+        last_results: dict[str, dict[str, Any]] = {}
+        complete = False
+        while True:
+            results = _snapshot_all()
+            last_results = results
+            real_terminal = [_is_real_terminal(snap) for snap in results.values()]
+            settled = [_is_settled(snap) for snap in results.values()]
+            if mode == "any":
+                if any(real_terminal):
+                    complete = True
+                    break
+                # Pure-denied list: every snap is settled but none is a
+                # real terminal — no work to wait for.  Short-circuit so
+                # the model sees the denied results immediately rather
+                # than spinning the timeout (``complete=False`` because
+                # the wait condition never had a real chance to fire).
+                if all(settled):
+                    break
+            else:  # mode == "all"
+                if all(settled):
+                    # Every ws_id is settled (real-terminal or denied).
+                    # The wait condition is met — the model gets the
+                    # full results dict and decides what each terminal
+                    # state means.
+                    complete = True
+                    break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self._WAIT_POLL_INTERVAL, remaining))
+        return {
+            "results": last_results,
+            "complete": complete,
+            "elapsed": round(time.monotonic() - start, 3),
+            "mode": mode,
+        }
 
     # -- model-invoked read ops (direct storage) ---------------------------
 
@@ -353,11 +600,12 @@ class CoordinatorClient:
         """Return children of ``parent_ws_id`` excluding other coordinators.
 
         ``skill`` matches on ``skill_id`` (template id) when provided.
-        ``include_closed`` controls whether soft-closed and deleted
-        children appear; default False so the common "what's active?"
-        query doesn't have to filter them out post-hoc.  Explicit
-        ``state="closed"`` / ``state="deleted"`` filters still work
-        regardless (they override the default).
+        ``include_closed`` controls whether soft-closed children appear;
+        default False so the common "what's active?" query doesn't have
+        to filter them out post-hoc.  Explicit ``state="closed"`` filter
+        still works regardless (overrides the default).  Deleted rows
+        are never returned because hard-delete cascades the row out of
+        storage.
 
         Returns a dict ``{"children": [...], "truncated": bool}``.  The
         ``truncated`` flag is ``True`` when the SQL fetch returned a full
@@ -384,6 +632,10 @@ class CoordinatorClient:
             kind=WorkstreamKind.INTERACTIVE,
             user_id=self._user_id or None,
         )
+        # ``deleted`` stays in the filter set so any legacy/synthetic row
+        # that still carries that state (e.g. unmigrated data) is treated
+        # as terminal.  Hard-delete cascades the row out of storage in the
+        # normal path, so this only affects edge cases.
         _terminal_states = {"closed", "deleted"}
         children: list[dict[str, Any]] = []
         for row in raw:
@@ -590,6 +842,22 @@ class CoordinatorClient:
                 tags = json.loads(tags_raw) if isinstance(tags_raw, str) else list(tags_raw)
             except (TypeError, ValueError):
                 tags = []
+            allowed_raw = r.get("allowed_tools") or "[]"
+            try:
+                allowed_full = (
+                    json.loads(allowed_raw) if isinstance(allowed_raw, str) else list(allowed_raw)
+                )
+            except (TypeError, ValueError):
+                allowed_full = []
+            if not isinstance(allowed_full, list):
+                allowed_full = []
+            # Cap the projected tool list so a skill that whitelists a
+            # large MCP surface doesn't bloat the coordinator's
+            # list_skills payload.  Coordinators that need the full
+            # inventory can fetch the skill row directly.
+            allowed_tools: list[str] = [str(t) for t in allowed_full[:_SKILL_TOOLS_PROJECTION_CAP]]
+            if len(allowed_full) > _SKILL_TOOLS_PROJECTION_CAP:
+                allowed_tools.append(f"+{len(allowed_full) - _SKILL_TOOLS_PROJECTION_CAP} more")
             skills.append(
                 {
                     "name": r.get("name") or "",
@@ -601,6 +869,7 @@ class CoordinatorClient:
                     "enabled": bool(r.get("enabled")),
                     "scan_status": r.get("scan_status") or "",
                     "activation": r.get("activation") or "",
+                    "allowed_tools": allowed_tools,
                 }
             )
         return {"skills": skills, "truncated": truncated}
@@ -857,6 +1126,19 @@ class CoordinatorClient:
             ),
             "verdicts": _serialize_verdicts(verdicts),
         }
+        # Surface the operator-supplied close reason (persisted via
+        # workstream_config by the server's close handler).  Only the
+        # terminal-state shapes can carry a close_reason — gating on
+        # state avoids a per-inspect DB read on the hot live-child path.
+        if full.get("state") in {"closed", "error", "deleted"}:
+            try:
+                cfg = self._storage.load_workstream_config(ws_id) or {}
+            except Exception:
+                log.debug("coord_client.load_workstream_config.failed ws=%s", ws_id, exc_info=True)
+                cfg = {}
+            close_reason = cfg.get("close_reason")
+            if close_reason:
+                result["close_reason"] = close_reason
         live = self._fetch_cluster_live(ws_id)
         if live is not None:
             result["live"] = live
@@ -914,6 +1196,21 @@ class CoordinatorClient:
             return None
         live = payload.get("live")
         result: dict[str, Any] | None = live if isinstance(live, dict) else None
+        if result is not None and not result.get("tokens"):
+            # Idle children's live block carries tokens=0 because the
+            # node-dashboard counters only surface in-flight values; fall
+            # back to the persisted aggregate so a child that already
+            # burned thousands doesn't read as 0.  Folded into the live
+            # cache (not done at the inspect call site) so back-to-back
+            # inspects of an idle child don't each fire a fresh
+            # ``sum_workstream_tokens`` aggregation.
+            try:
+                persisted = self._storage.sum_workstream_tokens(ws_id)
+            except Exception:
+                log.debug("coord_client.sum_tokens.failed ws=%s", ws_id, exc_info=True)
+                persisted = 0
+            if persisted:
+                result = {**result, "tokens": persisted}
         self._store_live_cache(ws_id, now, result)
         return result
 

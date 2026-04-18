@@ -1066,6 +1066,52 @@ class StorageBackend(Protocol):
         """Delete usage events older than retention_days. Returns count deleted."""
         ...
 
+    def sum_workstream_tokens(self, ws_id: str) -> int:
+        """Return SUM(prompt_tokens + completion_tokens) across all usage_events
+        for ``ws_id``.  Returns 0 when no events exist or the ws_id is empty.
+
+        Used as a fallback when the live token counter on a child workstream is
+        zero (e.g. an idle child whose node hasn't published a fresh tick) so
+        coordinator inspect doesn't report 0 tokens for a child that's already
+        burned thousands.
+        """
+        ...
+
+    def sum_workstream_tokens_batch(self, ws_ids: list[str]) -> dict[str, int]:
+        """Bulk variant of ``sum_workstream_tokens`` — returns
+        ``{ws_id: total_tokens}`` for every id in ``ws_ids``.  Missing ids
+        default to 0.  Empty input returns ``{}``.
+
+        Used by ``wait_for_workstream`` to amortize per-tick polling
+        across N children into a single ``WHERE ws_id IN (...) GROUP BY``
+        query — at the 32-ws/600s/0.5s-tick cap this cuts per-wait
+        storage round-trips from ~38k to ~1200.
+
+        SECURITY: this primitive does NO ownership / authorization
+        check — callers MUST gate the input ws_ids against the caller's
+        tenant subtree before invoking, the same way ``sum_workstream_tokens``
+        and ``get_workstream`` rely on caller-side gating.  The single
+        in-tree caller (``CoordinatorClient.wait_for_workstream``)
+        enforces this via its own dedup + cap path; new callers must
+        do the same.
+        """
+        ...
+
+    def get_workstreams_batch(self, ws_ids: list[str]) -> dict[str, dict[str, Any] | None]:
+        """Bulk variant of ``get_workstream`` — returns ``{ws_id: row | None}``
+        for every id in ``ws_ids``.  Missing rows surface as ``None``.
+        Empty input returns ``{}``.
+
+        Pairs with ``sum_workstream_tokens_batch`` to give the
+        coordinator wait-loop one query per tick instead of two-per-id.
+        Row shape matches ``get_workstream`` (same projection).
+
+        SECURITY: same caveat as ``sum_workstream_tokens_batch`` —
+        no ownership / authorization check inside the batch result.
+        Callers MUST enforce subtree ownership before invoking.
+        """
+        ...
+
     # -- Audit events ----------------------------------------------------------
 
     def record_audit_event(

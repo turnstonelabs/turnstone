@@ -1,6 +1,6 @@
 {
   "name": "list_workstreams",
-  "description": "List ACTIVE child workstreams. Auto-approved — safe, read-only. By default returns your own children (workstreams you spawned) that are NOT closed or deleted — this matches the common \"what's still running?\" query. Explicitly pass parent_ws_id to list another parent's children. Pass include_closed=true to also return soft-closed and deleted rows (useful for audit / history views). An explicit state filter (e.g. state=\"closed\") overrides the default and returns matching terminal rows regardless of include_closed. Coordinator-kind workstreams are excluded from the results.",
+  "description": "List ACTIVE child workstreams. Auto-approved — safe, read-only. By default returns your own children (workstreams you spawned) that are NOT closed — this matches the common \"what's still running?\" query. Explicitly pass parent_ws_id to list another parent's children. Pass include_closed=true to also return soft-closed rows (useful for audit / history views). An explicit state filter (e.g. state=\"closed\") overrides the default and returns matching terminal rows regardless of include_closed. Note: deleted rows cannot appear here — delete cascades the row out of storage. Coordinator-kind workstreams are excluded from the results.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       },
       "state": {
         "type": "string",
-        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed', 'deleted'. Matched exactly. An explicit state filter OVERRIDES the default-exclude-terminal behavior, so state=\"closed\" still returns closed rows."
+        "description": "Optional state filter — 'idle', 'thinking', 'running', 'attention', 'error', 'closed'. Matched exactly. An explicit state filter OVERRIDES the default-exclude-closed behavior, so state=\"closed\" still returns closed rows. Deleted workstreams are not stored, so 'deleted' is not a valid filter."
       },
       "skill": {
         "type": "string",
@@ -22,7 +22,7 @@
       },
       "include_closed": {
         "type": "boolean",
-        "description": "When true, include soft-closed and deleted children in the default (no-state-filter) listing. Default false — \"what's still running?\" is the common coordinator query. Ignored when an explicit state filter is set."
+        "description": "When true, include soft-closed children in the default (no-state-filter) listing. Default false — \"what's still running?\" is the common coordinator query. Ignored when an explicit state filter is set. (Deleted children are not stored — they cascade out — so they never appear here regardless of this flag.)"
       }
     }
   },

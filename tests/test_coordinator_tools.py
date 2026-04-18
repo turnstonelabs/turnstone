@@ -122,11 +122,13 @@ def test_coordinator_session_uses_coordinator_tools(coord_session):
         "inspect_workstream",
         "send_to_workstream",
         "close_workstream",
+        "cancel_workstream",
         "delete_workstream",
         "list_workstreams",
         "list_nodes",
         "list_skills",
         "task_list",
+        "wait_for_workstream",
     }
     # Sub-agent tool sets are zeroed on coordinator sessions.
     assert sess._task_tools == []
@@ -306,6 +308,132 @@ def test_close_exec_forwards_reason(coord_session):
 # ---------------------------------------------------------------------------
 # delete_workstream
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# cancel_workstream
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_prepare_needs_approval(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("cancel_workstream", {"ws_id": "x"}))
+    assert item["needs_approval"] is True
+    assert "cancel_workstream" in item["header"]
+
+
+def test_cancel_prepare_requires_ws_id(coord_session):
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(_tc("cancel_workstream", {}))
+    assert "error" in item
+
+
+def test_cancel_exec_dispatches(coord_session):
+    sess, coord, _ui = coord_session
+    coord.cancel.return_value = {"status": 200}
+    item = sess._prepare_tool(_tc("cancel_workstream", {"ws_id": "x"}))
+    _call_id, output = sess._exec_cancel_workstream(item)
+    coord.cancel.assert_called_once_with("x")
+    parsed = json.loads(output)
+    assert parsed["cancelled"] is True
+    assert parsed["ws_id"] == "x"
+
+
+def test_cancel_exec_surfaces_client_error(coord_session):
+    sess, coord, ui = coord_session
+    coord.cancel.return_value = {"error": "ws not found", "status": 404}
+    item = sess._prepare_tool(_tc("cancel_workstream", {"ws_id": "x"}))
+    _call_id, output = sess._exec_cancel_workstream(item)
+    assert "ws not found" in output
+    assert ui.tool_results[-1][3] is True  # is_error
+
+
+# ---------------------------------------------------------------------------
+# wait_for_workstream
+# ---------------------------------------------------------------------------
+
+
+def test_wait_prepare_is_auto_approved(coord_session):
+    """Prepare is a thin pass-through — auto-approved, no validation;
+    the client owns ws_ids dedup / cap / timeout clamp / mode whitelist."""
+    sess, _coord, _ui = coord_session
+    item = sess._prepare_tool(
+        _tc(
+            "wait_for_workstream",
+            {"ws_ids": ["a", "b"], "timeout": 5, "mode": "all"},
+        )
+    )
+    assert item["needs_approval"] is False
+    # Raw args pass through verbatim — the client validates / dedups.
+    assert item["ws_ids"] == ["a", "b"]
+    assert item["mode"] == "all"
+    assert item["timeout"] == 5
+
+
+def test_wait_exec_surfaces_client_validation_error(coord_session):
+    """Bad input is rejected by the client and surfaced as a tool error
+    via the result.get('error') branch in exec — single source of truth
+    for validation."""
+    sess, coord, ui = coord_session
+    coord.wait_for_workstream.return_value = {
+        "error": "ws_ids must contain at least one valid id",
+        "results": {},
+        "complete": False,
+        "elapsed": 0.0,
+        "mode": "any",
+    }
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": []}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    assert "must contain at least one" in output
+    assert ui.tool_results[-1][3] is True  # is_error
+
+
+def test_wait_exec_dispatches_raw_args_to_client(coord_session):
+    sess, coord, _ui = coord_session
+    coord.wait_for_workstream.return_value = {
+        "results": {"a": {"state": "idle", "tokens": 0}},
+        "complete": True,
+        "elapsed": 0.5,
+        "mode": "any",
+    }
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "timeout": 30}))
+    _call_id, output = sess._exec_wait_for_workstream(item)
+    # Args forwarded raw (timeout int, default mode="any") — client
+    # handles the float coerce + clamp.
+    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=30, mode="any")
+    parsed = json.loads(output)
+    assert parsed["complete"] is True
+    assert parsed["mode"] == "any"
+
+
+def test_wait_exec_default_timeout_when_omitted(coord_session):
+    """timeout=None (omitted) becomes 60.0 in exec so the client receives
+    a numeric value — explicit ``timeout=0`` is preserved (one-shot
+    poll) by passing the raw arg straight through."""
+    sess, coord, _ui = coord_session
+    coord.wait_for_workstream.return_value = {
+        "results": {"a": {"state": "idle", "tokens": 0}},
+        "complete": True,
+        "elapsed": 0.0,
+        "mode": "any",
+    }
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"]}))
+    sess._exec_wait_for_workstream(item)
+    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=60.0, mode="any")
+
+
+def test_wait_exec_preserves_explicit_zero_timeout(coord_session):
+    """Explicit ``timeout=0`` reaches the client untouched."""
+    sess, coord, _ui = coord_session
+    coord.wait_for_workstream.return_value = {
+        "results": {"a": {"state": "idle", "tokens": 0}},
+        "complete": True,
+        "elapsed": 0.0,
+        "mode": "any",
+    }
+    item = sess._prepare_tool(_tc("wait_for_workstream", {"ws_ids": ["a"], "timeout": 0}))
+    sess._exec_wait_for_workstream(item)
+    coord.wait_for_workstream.assert_called_once_with(["a"], timeout=0, mode="any")
 
 
 def test_delete_prepare_needs_approval(coord_session):

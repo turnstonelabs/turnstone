@@ -470,6 +470,17 @@ def _check_credentials(
     return risk, _redact_credentials(text) if found else None
 
 
+def redact_credentials(text: str) -> str:
+    """Public entry point — apply the credential-redaction pattern set
+    to an arbitrary string and return the sanitized form.
+
+    Used by call sites (close_reason persistence, audit details) that
+    want the same secret-scrubbing the output guard applies to tool
+    output without paying for the full evaluate_output assessment.
+    """
+    return _redact_credentials(text)
+
+
 def _redact_credentials(text: str) -> str:
     """Replace detected credentials with redaction markers."""
     result = _RE_PRIVATE_KEY_BLOCK.sub("[REDACTED:private_key]", text)

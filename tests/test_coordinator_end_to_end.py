@@ -210,6 +210,13 @@ def test_coordinator_client_spawn_close_delete(tmp_path):
     """CoordinatorClient.spawn / close_workstream / delete produce correct
     upstream HTTP requests to the mocked server node."""
     storage = SQLiteBackend(str(tmp_path / "client.db"))
+    # Register the coordinator + the soon-to-be-spawned child so the
+    # client-side tenant guard on close/delete passes.  In production
+    # the spawn route adds the child row before the model can call
+    # close on it; the test stub doesn't run that side-effect, so we
+    # set it up here.
+    storage.register_workstream("coord-42", kind="coordinator", user_id="user-1")
+    storage.register_workstream("child-99", kind="interactive", parent_ws_id="coord-42")
     captured: list[httpx.Request] = []
 
     def _handler(req: httpx.Request) -> httpx.Response:
