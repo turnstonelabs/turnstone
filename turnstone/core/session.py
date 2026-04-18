@@ -103,6 +103,7 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.web import check_ssrf, strip_html
+from turnstone.core.workstream import WorkstreamKind
 from turnstone.prompts import ClientType, SessionContext, compose_system_message
 from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan, dim
 
@@ -330,14 +331,14 @@ class ChatSession:
         web_search_backend: str = "",
         client_type: ClientType = ClientType.CLI,
         username: str = "",
-        kind: str = "interactive",
+        kind: WorkstreamKind = WorkstreamKind.INTERACTIVE,
         parent_ws_id: str | None = None,
         coord_client: Any = None,
     ):
         self.client = client
         self.model = model
         # Coordinator plumbing: populated by the console's session factory
-        # only — ``kind == "coordinator"`` sessions run COORDINATOR_TOOLS
+        # only — ``kind == COORDINATOR`` sessions run COORDINATOR_TOOLS
         # and dispatch tool execs through ``coord_client``.
         self._kind = kind
         self._parent_ws_id = parent_ws_id if parent_ws_id else None
@@ -460,7 +461,7 @@ class ChatSession:
         #     listeners register so tool/resource/prompt refreshes flow
         #     through to this session.
         #   * interactive (no mcp) — INTERACTIVE_TOOLS.
-        if kind == "coordinator":
+        if kind == WorkstreamKind.COORDINATOR:
             self._tools = list(COORDINATOR_TOOLS)
             self._task_tools = []
             self._agent_tools = []
@@ -817,7 +818,7 @@ class ChatSession:
             return
         # Coordinator sessions don't consume MCP tools — the tool set
         # is fixed at COORDINATOR_TOOLS.  Ignore MCP server changes.
-        if self._kind == "coordinator":
+        if self._kind == WorkstreamKind.COORDINATOR:
             return
         mcp_tools = self._mcp_client.get_tools()
         self._tools = merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)

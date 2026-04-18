@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from turnstone.core.workstream import WorkstreamKind
 
 
 @runtime_checkable
@@ -351,12 +354,14 @@ class StorageBackend(Protocol):
         title: str | None = None,
         skill_id: str = "",
         skill_version: int = 0,
-        kind: str = "interactive",
+        kind: WorkstreamKind | str = "interactive",
         parent_ws_id: str | None = None,
     ) -> None:
         """Create a workstreams row (no-op if already exists).
 
-        ``kind`` is ``"interactive"`` (default) or ``"coordinator"``.
+        ``kind`` accepts a ``WorkstreamKind`` member or its raw string value
+        (``"interactive"`` / ``"coordinator"``); the storage edge validates
+        the value and rejects unknown kinds with ``ValueError``.
         ``parent_ws_id`` is non-NULL for children spawned by a coordinator;
         the storage edge normalizes the empty string to ``None``.
         """
@@ -380,19 +385,24 @@ class StorageBackend(Protocol):
         limit: int = 100,
         *,
         parent_ws_id: str | None = None,
-        kind: str | None = None,
+        kind: WorkstreamKind | str | None = None,
+        user_id: str | None = None,
     ) -> list[Any]:
         """List workstreams, optionally filtered.
 
-        Filters are additive.  When ``parent_ws_id`` / ``kind`` are ``None``
-        (default) they are not applied — behavior is identical to the
-        pre-1.5 two-arg call shape.
+        Filters are additive.  When ``parent_ws_id`` / ``kind`` / ``user_id``
+        are ``None`` (default) they are not applied — behavior is identical
+        to the pre-1.5 two-arg call shape.
+
+        ``user_id`` pushes ``WHERE user_id = :user_id`` into SQL so tenant
+        scoping is enforced server-side rather than relying on every
+        handler to remember a client-side filter.  Pass the authenticated
+        caller's uid unless the caller holds a service scope.
 
         Returns a list of SQLAlchemy ``Row`` objects.  **Prefer dict access
         via ``row._mapping[<col>]``**; positional indexing is brittle against
-        future SELECT reorders.  The current column order is ``ws_id,
-        node_id, name, state, created, updated, kind, parent_ws_id,
-        skill_id, skill_version`` but new code should not rely on that.
+        future SELECT reorders and against new columns appearing in the
+        tail (the select currently ends with ``user_id``).
         """
         ...
 

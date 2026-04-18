@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 from turnstone.core.log import get_logger
 from turnstone.core.workstream import (
     Workstream,
+    WorkstreamKind,
     WorkstreamManager,
     WorkstreamState,
 )
@@ -177,7 +178,7 @@ class CoordinatorManager:
                 node_id=self.NODE_ID,
                 user_id=user_id,
                 name=ws.name,
-                kind="coordinator",
+                kind=WorkstreamKind.COORDINATOR,
                 parent_ws_id=None,
             )
         except Exception:
@@ -196,7 +197,7 @@ class CoordinatorManager:
                 None,  # model_alias — factory reads coordinator.model_alias
                 ws_id,
                 skill=skill,
-                kind="coordinator",
+                kind=WorkstreamKind.COORDINATOR,
                 parent_ws_id=None,
             )
         except Exception:
@@ -278,7 +279,7 @@ class CoordinatorManager:
                         return existing
 
                 row = self._storage.get_workstream(ws_id)
-                if row is None or row.get("kind") != "coordinator":
+                if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
                     return None
                 # close()/delete() only soft-mark the row — refuse to
                 # resurrect those sessions on any subsequent GET, or the
@@ -325,7 +326,7 @@ class CoordinatorManager:
                         None,
                         ws_id,
                         skill=None,
-                        kind="coordinator",
+                        kind=WorkstreamKind.COORDINATOR,
                         parent_ws_id=None,
                     )
                 except Exception:
@@ -577,7 +578,7 @@ class CoordinatorManager:
                 self._order.remove(oldest.id)
             evicted = oldest
         ws = Workstream(id=ws_id, name=name or f"coord-{ws_id[:4]}")
-        ws.kind = "coordinator"
+        ws.kind = WorkstreamKind.COORDINATOR
         ws.user_id = user_id
         ws.parent_ws_id = None
         # ui_factory is fast (just allocates a ConsoleCoordinatorUI)
@@ -690,18 +691,29 @@ class CoordinatorManager:
         would drop that child.
         """
         # Tenant filter: only accept persisted children whose owning
-        # user_id matches the coordinator's.  A forged parent_ws_id
-        # that slipped past the server-side create gate (migration-era
-        # data, downgrade path) would otherwise keep re-leaking into
-        # the fan-out set on every console restart.
+        # user_id matches the coordinator's.  Pushed into SQL via the
+        # ``user_id`` kwarg so cross-tenant rows never leave the DB —
+        # previously we fetched everything and filtered in Python, which
+        # depended on the in-loop user_id check catching forged
+        # parent_ws_id rows (migration-era data, downgrade path).  An
+        # empty coord_user_id is fail-closed: skip the rebuild entirely
+        # rather than matching rows with blank owners (system-owned or
+        # legacy rows would otherwise leak into the fan-out set).
         with self._lock:
             coord_ws = self._workstreams.get(coord_ws_id)
         coord_user_id = coord_ws.user_id if coord_ws is not None else ""
+        if not coord_user_id:
+            log.debug(
+                "coord_mgr.rebuild_skipped_empty_owner coord=%s",
+                coord_ws_id[:8],
+            )
+            return
         try:
             rows = self._storage.list_workstreams(
                 limit=1000,
                 parent_ws_id=coord_ws_id,
                 kind=None,
+                user_id=coord_user_id,
             )
         except Exception:
             log.debug(
@@ -715,22 +727,9 @@ class CoordinatorManager:
             try:
                 m = r._mapping
                 child_id = m["ws_id"]
-                row_user = m.get("user_id", "") or ""
-            except (AttributeError, KeyError):
+            except AttributeError:
                 child_id = r[0] if r else ""
-                row_user = ""
             if not child_id:
-                continue
-            # Fail-closed: empty coord owner or mismatch → skip.  If
-            # coord_user_id was unavailable (coordinator evicted
-            # mid-rebuild) we'd rather lose the registry seed than
-            # leak cross-tenant.
-            if not coord_user_id or row_user != coord_user_id:
-                log.debug(
-                    "coord_mgr.rebuild_skipped_cross_tenant coord=%s child=%s",
-                    coord_ws_id[:8],
-                    str(child_id)[:8],
-                )
                 continue
             child_ids.append(child_id)
         with self._children_lock:

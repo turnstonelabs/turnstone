@@ -884,7 +884,7 @@ and are the single source of truth for both backends and Alembic migrations.
 | `update_workstream_title(ws_id, title)` | Set/update LLM-generated title |
 | `update_workstream_state(ws_id, state)` | Update workstream state and bump timestamp |
 | `update_workstream_name(ws_id, name)` | Update workstream display name |
-| `list_workstreams(node_id, limit)` | List workstreams, optionally by node |
+| `list_workstreams(node_id, limit, *, parent_ws_id, kind, user_id)` | List workstreams, optionally filtered by node, parent, kind, or owning user |
 | `kv_get(key)` / `kv_set(key, value)` / `kv_delete(key)` | Generic key-value store (backs memories table) |
 | `kv_list()` / `kv_search(query)` | List or search key-value pairs |
 | `search_history(query, limit)` | Full-text search (FTS5 on SQLite, tsvector on PostgreSQL) |

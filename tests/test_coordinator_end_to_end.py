@@ -289,13 +289,16 @@ def seeded_storage(tmp_path):
     st = SQLiteBackend(str(tmp_path / "seed.db"))
     # Parent coordinator.
     st.register_workstream("coord-root", kind="coordinator", user_id="user-1")
-    # Two interactive children — one idle, one running.
+    # Two interactive children — one idle, one running.  Children inherit
+    # the coord's user_id by construction (server-side create gate), which
+    # the list_children SQL filter now enforces.
     st.register_workstream(
         "child-idle",
         kind="interactive",
         parent_ws_id="coord-root",
         state="idle",
         skill_id="skill-alpha",
+        user_id="user-1",
     )
     st.register_workstream(
         "child-running",
@@ -303,15 +306,17 @@ def seeded_storage(tmp_path):
         parent_ws_id="coord-root",
         state="running",
         skill_id="skill-beta",
+        user_id="user-1",
     )
     # Coordinator child — MUST be excluded from list_children results.
     st.register_workstream(
         "child-coord",
         kind="coordinator",
         parent_ws_id="coord-root",
+        user_id="user-1",
     )
     # Unrelated workstream with no parent — MUST be excluded.
-    st.register_workstream("unrelated-ws", kind="interactive")
+    st.register_workstream("unrelated-ws", kind="interactive", user_id="user-1")
     return st
 
 

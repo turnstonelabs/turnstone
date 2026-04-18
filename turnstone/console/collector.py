@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import httpx_sse
 
+from turnstone.core.workstream import WorkstreamKind
+
 if TYPE_CHECKING:
     from turnstone.console.metrics import ConsoleMetrics
     from turnstone.console.router import ConsoleRouter
@@ -397,7 +399,7 @@ class ClusterCollector:
                     "name": ws.get("title", "") or ws.get("name", ""),
                     "title": ws.get("title", ""),
                     "node_id": node_id,
-                    "kind": ws.get("kind", "interactive"),
+                    "kind": WorkstreamKind.from_raw(ws.get("kind")),
                     "parent_ws_id": ws.get("parent_ws_id"),
                 }
             )
@@ -419,7 +421,7 @@ class ClusterCollector:
                         "node_id": node_id,
                         "tokens": new_w.get("tokens", 0),
                         "content": new_w.get("content", ""),
-                        "kind": new_w.get("kind", "interactive"),
+                        "kind": WorkstreamKind.from_raw(new_w.get("kind")),
                         "parent_ws_id": new_w.get("parent_ws_id"),
                     }
                 )
@@ -485,7 +487,7 @@ class ClusterCollector:
                             "node_id": node_id,
                             "tokens": data.get("tokens", 0),
                             "content": data.get("content", ""),
-                            "kind": ws.get("kind", "interactive"),
+                            "kind": WorkstreamKind.from_raw(ws.get("kind")),
                             "parent_ws_id": ws.get("parent_ws_id"),
                         }
                     )
@@ -500,7 +502,7 @@ class ClusterCollector:
 
             elif etype == "ws_created":
                 ws_id = data.get("ws_id", "")
-                ws_kind = data.get("kind", "interactive")
+                ws_kind = WorkstreamKind.from_raw(data.get("kind"))
                 ws_parent = data.get("parent_ws_id")
                 # user_id travels on the event so console-side fan-out
                 # can enforce tenant isolation — a coordinator must

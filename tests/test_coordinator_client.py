@@ -272,7 +272,8 @@ def test_non_2xx_response_populates_error():
 def populated_storage(tmp_path):
     st = SQLiteBackend(str(tmp_path / "coord.db"))
     # Coord + 2 interactive children + 1 child coordinator (excluded) +
-    # 1 unrelated ws.
+    # 1 unrelated ws + 1 cross-tenant child (excluded by the user_id SQL
+    # filter: belongs to user-2 but forged parent_ws_id=coord-1).
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
     st.register_workstream(
         "child-a",
@@ -280,6 +281,7 @@ def populated_storage(tmp_path):
         parent_ws_id="coord-1",
         state="idle",
         skill_id="skill-x",
+        user_id="user-1",
     )
     st.register_workstream(
         "child-b",
@@ -287,13 +289,21 @@ def populated_storage(tmp_path):
         parent_ws_id="coord-1",
         state="running",
         skill_id="skill-y",
+        user_id="user-1",
     )
     st.register_workstream(
         "child-coord",
         kind="coordinator",
         parent_ws_id="coord-1",
+        user_id="user-1",
     )
-    st.register_workstream("unrelated", kind="interactive")
+    st.register_workstream("unrelated", kind="interactive", user_id="user-1")
+    st.register_workstream(
+        "cross-tenant-child",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        user_id="user-2",
+    )
     return st
 
 
@@ -316,12 +326,22 @@ def test_list_children_returns_only_interactive_children(populated_storage):
     assert set(result.keys()) == {"children", "truncated"}
     rows = result["children"]
     names = {r["ws_id"] for r in rows}
-    assert names == {"child-a", "child-b"}  # excludes child-coord + unrelated
+    # Excludes child-coord (kind filter), unrelated (parent filter),
+    # cross-tenant-child (user_id filter).
+    assert names == {"child-a", "child-b"}
     for r in rows:
         assert r["kind"] == "interactive"
         assert r["parent_ws_id"] == "coord-1"
     # Well under limit and no filters → not truncated.
     assert result["truncated"] is False
+
+
+def test_list_children_excludes_cross_tenant_child(populated_storage):
+    """SQL-level user_id filter drops forged parent_ws_id rows owned by another user."""
+    client = _make_read_client(populated_storage)
+    result = client.list_children("coord-1")
+    names = {r["ws_id"] for r in result["children"]}
+    assert "cross-tenant-child" not in names
 
 
 def test_list_children_filters_by_state(populated_storage):
@@ -385,12 +405,26 @@ def test_list_children_excludes_closed_by_default(tmp_path):
     post-hoc filter them.  An explicit state filter still wins."""
     st = SQLiteBackend(str(tmp_path / "closed.db"))
     st.register_workstream("coord-1", kind="coordinator", user_id="user-1")
-    st.register_workstream("child-active", kind="interactive", parent_ws_id="coord-1", state="idle")
     st.register_workstream(
-        "child-closed", kind="interactive", parent_ws_id="coord-1", state="closed"
+        "child-active",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="idle",
+        user_id="user-1",
     )
     st.register_workstream(
-        "child-deleted", kind="interactive", parent_ws_id="coord-1", state="deleted"
+        "child-closed",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="closed",
+        user_id="user-1",
+    )
+    st.register_workstream(
+        "child-deleted",
+        kind="interactive",
+        parent_ws_id="coord-1",
+        state="deleted",
+        user_id="user-1",
     )
     client = _make_read_client(st)
     result = client.list_children("coord-1")
