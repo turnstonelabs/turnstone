@@ -420,6 +420,30 @@ class TestGlobalEventsServiceGate:
         assert resp.status_code == 403
         assert "service" in resp.json()["error"].lower()
 
+    def test_service_scope_accepted(self, app_client):
+        """Regression for the console-collector 403 footgun: the
+        collector's ServiceTokenManager is configured in console/server.py
+        with scopes ``{"read", "service"}``.  This gate must accept
+        exactly that scope set so the collector's SSE subscription
+        doesn't silently 403 out (#sev-0).  Any future scope renaming
+        that would drop ``"service"`` from the node-side check breaks
+        this test before it breaks the dashboard."""
+        client, _mgr = app_client
+        # Exact scope set the collector uses today.
+        collector_scopes = frozenset({"read", "service"})
+        resp = client.get(
+            "/v1/api/events/global",
+            headers=_auth("console-collector", scopes=collector_scopes),
+            # No ``?expected_node_id`` — the gate runs before node-id
+            # check, so a pass here proves the scope accepted.
+        )
+        # Anything but 403 is a pass for the scope-gate purposes.  SSE
+        # streams stay open indefinitely; TestClient hands us the
+        # first-chunk status.
+        assert resp.status_code != 403, (
+            f"service-scoped token rejected: {resp.status_code} {resp.text[:120]}"
+        )
+
 
 class TestPerWsSseGate:
     def test_non_owner_rejected(self, app_client):

@@ -265,6 +265,7 @@ function buildNodeInfoFromSnapshot(node) {
     max_ws: node.max_ws || 10,
     started: node.started || 0,
     reachable: node.reachable !== false,
+    reachable_reason: node.reachable_reason || "",
     health: node.health || {},
     version: node.version || "",
   };
