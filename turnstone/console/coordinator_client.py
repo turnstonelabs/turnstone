@@ -422,9 +422,13 @@ class CoordinatorClient:
     ) -> dict[str, Any]:
         """Block until child workstreams reach a terminal state.
 
-        ``mode='any'`` returns as soon as the first ws_id reaches
-        ``idle`` / ``error`` / ``closed``; ``mode='all'`` returns once
-        every ws_id has.  Returns
+        ``mode='any'`` returns as soon as the first ws_id reaches a
+        real terminal state (``idle`` / ``error`` / ``closed`` /
+        ``deleted``; the last is unreachable in normal operation
+        because hard-delete cascades the row out of storage, but it
+        stays in the set so a legacy / synthetic-test row carrying
+        that state still counts).  ``mode='all'`` returns once every
+        ws_id has settled (real terminal OR ``denied``).  Returns
         ``{"results": {ws_id: {state, tokens, updated}},
         "elapsed": float, "complete": bool, "mode": mode}``.  ``complete``
         is True when the wait condition was met before the deadline,

@@ -1084,8 +1084,10 @@ class StorageBackend(Protocol):
 
         Used by ``wait_for_workstream`` to amortize per-tick polling
         across N children into a single ``WHERE ws_id IN (...) GROUP BY``
-        query — at the 32-ws/600s/0.5s-tick cap this cuts per-wait
-        storage round-trips from ~38k to ~1200.
+        query — at the 32-ws/600s/0.5s-tick cap (1200 ticks × two
+        storage calls per tick — ``get_workstreams_batch`` paired with
+        this one) that's ~2400 round-trips per wait, down from ~38k
+        under the naive per-id polling shape.
 
         SECURITY: this primitive does NO ownership / authorization
         check — callers MUST gate the input ws_ids against the caller's
