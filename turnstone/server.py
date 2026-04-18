@@ -978,7 +978,8 @@ async def events_sse(request: Request) -> Response:
     # Subscribing to another tenant's stream would leak their messages,
     # tool calls, and pending approvals in real time.  Gate before
     # _register_listener so non-owners get a flat 404 (no enumeration).
-    _owner, err = _require_ws_access(request, ws_id or "")
+    # In-memory fast path via mgr= keeps SSE resilient to DB blips.
+    _owner, err = _require_ws_access(request, ws_id or "", mgr=mgr)
     if err:
         return err
     ws, ui = _get_ws(mgr, ws_id)
@@ -1224,11 +1225,17 @@ async def list_workstreams(request: Request) -> JSONResponse:
     result = []
     for ws in _visible_workstreams(request, mgr.list_all()):
         title = get_workstream_display_name(ws.id) or ws.name
+        # kind + parent_ws_id mirror the shape /dashboard returns below so
+        # client consumers (SDK, frontend, integrators) see one consistent
+        # row schema across adjacent endpoints instead of a subset here
+        # and a superset there.
         result.append(
             {
                 "id": ws.id,
                 "name": title,
                 "state": ws.state.value,
+                "kind": ws.kind,
+                "parent_ws_id": ws.parent_ws_id,
             }
         )
     return JSONResponse({"workstreams": result})
@@ -1803,13 +1810,15 @@ async def approve(request: Request) -> JSONResponse:
     feedback = body.get("feedback")
     always = body.get("always", False)
     ws_id = body.get("ws_id")
+    mgr = request.app.state.workstreams
     # Cross-tenant guard: resolving a pending tool approval on another
     # tenant's workstream is RCE-adjacent (the victim queued a command
     # expecting to decide themselves).  Gate before touching the UI.
-    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    # Pass mgr= so the check uses the in-memory ws.user_id and survives
+    # transient storage outages.
+    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
-    mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
@@ -1836,10 +1845,10 @@ async def plan_feedback(request: Request) -> JSONResponse:
         return body
     feedback = body.get("feedback", "")
     ws_id = body.get("ws_id")
-    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    mgr = request.app.state.workstreams
+    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
-    mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
@@ -1855,10 +1864,10 @@ async def cancel_generation(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
     ws_id = body.get("ws_id")
-    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    mgr = request.app.state.workstreams
+    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
-    mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
@@ -1900,11 +1909,11 @@ async def command(request: Request) -> JSONResponse:
     ws_id = body.get("ws_id")
     if not cmd:
         return JSONResponse({"error": "Empty command"}, status_code=400)
-    _owner, err = _require_ws_access(request, str(ws_id or ""))
+    mgr = request.app.state.workstreams
+    _owner, err = _require_ws_access(request, str(ws_id or ""), mgr=mgr)
     if err:
         return err
 
-    mgr = request.app.state.workstreams
     ws, ui = _get_ws(mgr, ws_id)
     if not ws or not ui:
         return JSONResponse({"error": "Unknown workstream"}, status_code=404)
@@ -2732,13 +2741,13 @@ async def close_workstream(request: Request) -> JSONResponse:
     if isinstance(body, JSONResponse):
         return body
     ws_id = str(body.get("ws_id", ""))
+    mgr = request.app.state.workstreams
     # Cross-tenant close would abort another tenant's running generation.
     # _require_ws_access returns 404 on non-owner — same shape as the
     # "last workstream" (400) / "not found" (404) branches below.
-    owner_uid, err = _require_ws_access(request, ws_id)
+    owner_uid, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
-    mgr = request.app.state.workstreams
     # Distinguish "last workstream" (400) from "not found" (404).
     # Note: get() and close() acquire the manager lock independently, so a
     # concurrent close between the two could produce a wrong error code.
@@ -2783,15 +2792,19 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
     owner_uid, err = _require_ws_access(request, ws_id)
     if err:
         return err
-    # Snapshot kind/parent for the audit record before deletion wipes the row.
     storage = getattr(request.app.state, "auth_storage", None)
-    row: dict[str, Any] = {}
-    if storage is not None:
-        row = storage.get_workstream(ws_id) or {}
-    kind = row.get("kind", "")
-    parent_ws_id = row.get("parent_ws_id")
+    kind: str = ""
+    parent_ws_id: str | None = None
     _, ip = _audit_context(request)
     try:
+        # Snapshot kind/parent for the audit record before the delete
+        # wipes the row.  Inside the try so a transient storage error
+        # surfaces through the endpoint's redacted 500 handler below
+        # rather than as an unhandled exception.
+        if storage is not None:
+            row = storage.get_workstream(ws_id) or {}
+            kind = row.get("kind", "")
+            parent_ws_id = row.get("parent_ws_id")
         if delete_workstream(ws_id):
             log.info("ws.deleted", ws_id=ws_id[:8])
             if storage is not None:
@@ -2820,13 +2833,13 @@ async def refresh_workstream_title(request: Request, ws_id: str = "") -> JSONRes
     log = get_logger(__name__)
     ws_id = request.path_params.get("ws_id", "")
     log.info("ws.title.refresh_requested", ws_id=ws_id[:8] if ws_id else "empty")
+    mgr = request.app.state.workstreams
     # Cross-tenant rename is a phishing / denial-of-use vector — a
     # malicious caller could push the victim's title to a misleading
     # string visible in list/dashboard responses.
-    _owner, err = _require_ws_access(request, ws_id)
+    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
-    mgr = request.app.state.workstreams
     ws = mgr.get(ws_id)
     if not ws or not ws.session:
         log.warning(
@@ -2858,8 +2871,9 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
     log.info("ws.title.set_requested", ws_id=ws_id[:8] if ws_id else "empty")
     if not ws_id:
         return JSONResponse({"error": "ws_id is required"}, status_code=400)
+    mgr = request.app.state.workstreams
     # Cross-tenant rename gate — same rationale as refresh-title above.
-    _owner, err = _require_ws_access(request, ws_id)
+    _owner, err = _require_ws_access(request, ws_id, mgr=mgr)
     if err:
         return err
     body = await read_json_or_400(request)
@@ -2876,7 +2890,6 @@ async def set_workstream_title(request: Request, ws_id: str = "") -> JSONRespons
             status_code=409,
         )
     log.info("ws.title.set_alias_updated", ws_id=ws_id[:8])
-    mgr = request.app.state.workstreams
     ws = mgr.get(ws_id)
     if ws and ws.session and ws.session.ui:
         ws.session.ui.on_rename(title)
@@ -3034,21 +3047,48 @@ def _auth_scopes(request: Request) -> set[str]:
     return set(getattr(auth, "scopes", []) or [])
 
 
-def _require_ws_access(request: Request, ws_id: str) -> tuple[str, JSONResponse | None]:
+def _require_ws_access(
+    request: Request,
+    ws_id: str,
+    *,
+    mgr: WorkstreamManager | None = None,
+) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner after verifying the caller has access.
 
     Service-scoped tokens (internal callers) bypass ownership checks.
     Returns ``(owner_user_id, None)`` on success.  The owner id is what
     attachments should be filed under.
+
+    When ``mgr`` is provided and the workstream is live in the manager,
+    trust its cached ``user_id`` instead of round-tripping storage —
+    keeps in-memory-only handlers (approve / plan / cancel / command /
+    close / SSE / title) functional during transient DB outages and
+    trims the hot-path by one query.  Handlers that act on
+    persisted-but-not-loaded workstreams (``/delete``, ``/open``) omit
+    ``mgr`` and fall through to the storage path.
     """
+    caller = _auth_user_id(request)
+    scopes = _auth_scopes(request)
+    is_service = "service" in scopes
+
+    if mgr is not None:
+        ws_mem = mgr.get(ws_id)
+        if ws_mem is not None:
+            owner_mem = ws_mem.user_id
+            if is_service:
+                return owner_mem or caller, None
+            if owner_mem and owner_mem != caller:
+                return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+            return caller, None
+        # Not in memory — fall through to storage so /delete etc.
+        # still resolve persisted-but-not-loaded rows.
+
     from turnstone.core.memory import get_workstream_owner
 
     owner = get_workstream_owner(ws_id)
     if owner is None:
         return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
-    caller = _auth_user_id(request)
-    scopes = _auth_scopes(request)
-    if "service" in scopes:
+    if is_service:
         # Trust the service caller; file under its own user_id if no owner
         # is set, otherwise under the existing owner.
         return owner or caller, None

@@ -2637,11 +2637,20 @@ async def coordinator_children(request: Request) -> JSONResponse:
     if err404 is not None:
         return err404
 
+    # Tenant filter: push the caller's user_id into SQL so forged /
+    # migration-era rows with the same parent_ws_id but a different
+    # owner can't leak through.  Admins bypass the filter — they're
+    # expected to see the full subtree.  _resolve_coordinator_or_404
+    # already validated that non-admin callers own the coord itself,
+    # so the caller's uid is the correct scope for children by the
+    # "children share the coord's owner by construction" invariant.
+    filter_user_id = None if _is_admin(request) else (user_id or None)
     try:
         raw = storage.list_workstreams(
             limit=_CHILDREN_PAGE_LIMIT + 1,
             parent_ws_id=ws_id,
             kind=None,
+            user_id=filter_user_id,
         )
     except Exception:
         correlation_id = secrets.token_hex(4)

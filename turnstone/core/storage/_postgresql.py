@@ -603,6 +603,12 @@ class PostgreSQLBackend:
             conn.execute(
                 sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
             )
+            # Null-out parent_ws_id on children — see sqlite sibling for rationale.
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.parent_ws_id == ws_id)
+                .values(parent_ws_id=None)
+            )
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0

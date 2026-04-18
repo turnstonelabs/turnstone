@@ -12,6 +12,20 @@ filters stay cheap on both SQLite and PostgreSQL backends.  ``NOT NULL``
 default ``'interactive'`` on ``kind`` keeps existing rows valid; ``parent_ws_id``
 is nullable because most workstreams have no parent.
 
+.. warning::
+
+   ``downgrade()`` drops both columns, which **irreversibly destroys**
+   every ``parent_ws_id`` value.  Coordinator → child lineage cannot be
+   reconstructed after a downgrade on a populated DB.  If you need to
+   roll back on a production cluster, export the workstreams table
+   first (``SELECT ws_id, kind, parent_ws_id FROM workstreams``) so
+   the relationships can be re-applied after re-upgrading.
+
+   The index-tuning follow-up (migration 041) assumes this migration
+   is applied — downgrading past 039 also invalidates 041's downgrade
+   path, so revert migrations in order (041 → 040 → 039) rather than
+   skipping.
+
 Revision ID: 039
 Revises: 038
 Create Date: 2026-04-16

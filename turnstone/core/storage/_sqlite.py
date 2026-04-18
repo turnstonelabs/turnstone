@@ -704,6 +704,17 @@ class SQLiteBackend:
             conn.execute(
                 sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id)
             )
+            # Null-out parent_ws_id on children before dropping the row —
+            # otherwise a deleted coordinator leaves orphaned pointers and
+            # ``list_workstreams(parent_ws_id=<deleted>)`` keeps returning
+            # ghost-parented rows.  Cheaper than a schema-level FK with
+            # ON DELETE SET NULL and avoids rewriting the workstreams
+            # table on SQLite.
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.parent_ws_id == ws_id)
+                .values(parent_ws_id=None)
+            )
             result = conn.execute(sa.delete(workstreams).where(workstreams.c.ws_id == ws_id))
             conn.commit()
             return result.rowcount > 0
