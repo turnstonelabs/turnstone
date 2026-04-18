@@ -1009,7 +1009,6 @@ def _persisted_rows_request(storage, mgr, user_id: str, perms: frozenset[str]):
     up so the persisted-rows merge path fires."""
     from unittest.mock import MagicMock
 
-
     request = MagicMock()
     request.app.state.coord_mgr = mgr
     request.app.state.auth_storage = storage

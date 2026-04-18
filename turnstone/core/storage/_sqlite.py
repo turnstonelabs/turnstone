@@ -2670,9 +2670,9 @@ class SQLiteBackend:
             ).fetchall()
             return [
                 {
-                    "source_url": r[0],
-                    "template_id": r[1],
-                    "risk_level": r[2] or "",
+                    "source_url": r._mapping["source_url"],
+                    "template_id": r._mapping["template_id"],
+                    "risk_level": r._mapping["risk_level"] or "",
                 }
                 for r in rows
             ]

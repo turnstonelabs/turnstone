@@ -99,12 +99,14 @@ class TestConsoleEffectiveUserFilter:
 
     def test_deny_sentinel_is_singleton(self):
         """Callers compare with ``is``; equality against a bare object()
-        must never match the sentinel."""
-        import turnstone.console.server as cs
+        must never match the sentinel, and two separate reads of the
+        attribute return the same instance (ruling out a property /
+        factory that would break ``is`` identity)."""
+        from turnstone.console.server import DENY_EMPTY_SUB as FIRST_READ
+        from turnstone.console.server import DENY_EMPTY_SUB as SECOND_READ
 
-        assert cs.DENY_EMPTY_SUB is not object()
-        # Re-reading the attribute must return the same instance.
-        assert cs.DENY_EMPTY_SUB is cs.DENY_EMPTY_SUB
+        assert FIRST_READ is not object()
+        assert FIRST_READ is SECOND_READ
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +380,7 @@ class TestDashboardCache4xxLogLevel:
 
 class TestFetchLiveBlock4xxLogLevel:
     @pytest.mark.asyncio
-    async def test_direct_fallback_logs_warning_on_4xx(self, caplog):
+    async def test_direct_fallback_logs_warning_on_4xx(self, caplog, monkeypatch):
         """Test harnesses / legacy embeddings skip the dashboard cache
         and fall through to the direct-fetch path inside
         ``_fetch_live_block``.  4xx there must surface at WARNING —
@@ -403,18 +405,17 @@ class TestFetchLiveBlock4xxLogLevel:
         )
 
         # Shim _get_server_url so we don't need the full cluster-
-        # router wiring to resolve node_id → URL.
-        import turnstone.console.server as cs
+        # router wiring to resolve node_id → URL.  monkeypatch handles
+        # the restore automatically.
+        monkeypatch.setattr(
+            "turnstone.console.server._get_server_url",
+            lambda _req, _nid: "http://node-1:8001",
+        )
 
-        orig_get = cs._get_server_url
-        cs._get_server_url = lambda _req, _nid: "http://node-1:8001"
-        try:
-            with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
-                live = await _fetch_live_block(
-                    request, {"node_id": "node-1", "kind": "interactive"}, "ws-abc"
-                )
-        finally:
-            cs._get_server_url = orig_get
+        with caplog.at_level(logging.WARNING, logger="turnstone.console.server"):
+            live = await _fetch_live_block(
+                request, {"node_id": "node-1", "kind": "interactive"}, "ws-abc"
+            )
 
         assert live is None
         matches = [
@@ -516,12 +517,12 @@ class TestDenySentinelSharedIdentity:
         """The sentinel is compared with ``is``; a future refactor
         that re-introduced per-module duplicates would silently break
         the identity check.  Lock the cross-module invariant."""
-        import turnstone.console.server as console_mod
-        import turnstone.core.auth as core_mod
-        import turnstone.server as server_mod
+        from turnstone.console.server import DENY_EMPTY_SUB as CONSOLE_DENY
+        from turnstone.core.auth import DENY_EMPTY_SUB as CORE_DENY
+        from turnstone.server import DENY_EMPTY_SUB as SERVER_DENY
 
-        assert core_mod.DENY_EMPTY_SUB is console_mod.DENY_EMPTY_SUB
-        assert core_mod.DENY_EMPTY_SUB is server_mod.DENY_EMPTY_SUB
+        assert CORE_DENY is CONSOLE_DENY
+        assert CORE_DENY is SERVER_DENY
 
 
 # ---------------------------------------------------------------------------

@@ -139,10 +139,13 @@ class TestListSkillsFiltered:
         assert {r["name"] for r in rows} == {"cjk"}
 
     def test_risk_level_filter(self, storage):
-        _create_skill(storage, template_id="s1", name="a", risk_level="clean")
-        _create_skill(storage, template_id="s2", name="b", risk_level="flagged")
+        # Use the scanner's real taxonomy (safe / low / medium / high / critical)
+        # rather than the legacy ``scan_status`` values the column used to
+        # carry — see turnstone/core/skill_scanner.py for the source.
+        _create_skill(storage, template_id="s1", name="a", risk_level="safe")
+        _create_skill(storage, template_id="s2", name="b", risk_level="high")
         _create_skill(storage, template_id="s3", name="c")
-        rows = storage.list_skills_filtered(risk_level="flagged")
+        rows = storage.list_skills_filtered(risk_level="high")
         assert {r["name"] for r in rows} == {"b"}
 
     def test_enabled_only_filter(self, storage):

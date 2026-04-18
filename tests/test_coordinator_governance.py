@@ -510,7 +510,7 @@ def test_restrict_empty_revoke_is_noop_but_audits(storage):
     didn't actually revoke anything' events."""
     mgr = _build_mgr(storage)
     coord = mgr.create(user_id="user-1", name="coord-a")
-    coord.session, state = _make_session_mock(revoked=frozenset({"spawn_workstream"}))
+    coord.session, _state = _make_session_mock(revoked=frozenset({"spawn_workstream"}))
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
     resp = client.post(
         f"/v1/api/coordinator/{coord.id}/restrict",

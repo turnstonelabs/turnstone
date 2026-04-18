@@ -1,6 +1,6 @@
 {
   "name": "list_skills",
-  "description": "List skills (worker profiles) available in the cluster. Auto-approved — safe, read-only. Pass optional filters to narrow by category (e.g. 'engineering', 'ops'), tag (single tag from the skill's tags array), or risk_level ('safe', 'low', 'medium', 'high', 'critical'; empty for unscanned). Use to discover which skill names you can pass to spawn_workstream. Results are pre-filtered to skills tagged for coordinator use (kind='coordinator') or universal skills (kind='any'); interactive-only skills are hidden here because they're meant for child workstreams rather than the orchestrator. Returns name, category, tags, version, description, model preference, enabled flag, risk_level, activation, kind, and allowed_tools (capped at 20 tool names with a '+N more' sentinel when truncated) — enough for an informed pick without speculating which tools a skill brings.",
+  "description": "List skills (worker profiles) available in the cluster. Auto-approved — safe, read-only. Pass optional filters to narrow by category (e.g. 'engineering', 'ops'), tag (single tag from the skill's tags array), or risk_level ('safe', 'low', 'medium', 'high', 'critical'). Omit risk_level to include skills regardless of scan state (including unscanned rows that carry an empty value). Use to discover which skill names you can pass to spawn_workstream. Results are pre-filtered to skills tagged for coordinator use (kind='coordinator') or universal skills (kind='any'); interactive-only skills are hidden here because they're meant for child workstreams rather than the orchestrator. Returns name, category, tags, version, description, model preference, enabled flag, risk_level, activation, kind, and allowed_tools (capped at 20 tool names with a '+N more' sentinel when truncated) — enough for an informed pick without speculating which tools a skill brings.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -14,7 +14,8 @@
       },
       "risk_level": {
         "type": "string",
-        "description": "Filter by risk level: safe / low / medium / high / critical (empty for unscanned)."
+        "enum": ["safe", "low", "medium", "high", "critical"],
+        "description": "Filter by risk level: safe / low / medium / high / critical. Omit entirely to include unscanned skills (which carry an empty value)."
       },
       "enabled_only": {
         "type": "boolean",
